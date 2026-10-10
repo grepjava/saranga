@@ -1,7 +1,12 @@
 [package]
 name = "saranga-buffer"
+description = "Artemis buffer encodings: SimpleString, Java strings, TypedProperties"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
