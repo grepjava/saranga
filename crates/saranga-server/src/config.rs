@@ -229,6 +229,8 @@ impl BrokerConfig {
                 .persistence_enabled
                 .then(|| storage_config(config, instance)),
             message_expiry_scan_period: config.message_expiry_scan_period,
+            id_cache_size: config.id_cache_size,
+            persist_id_cache: config.persist_id_cache,
         })
     }
 }

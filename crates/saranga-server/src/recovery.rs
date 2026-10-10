@@ -183,6 +183,7 @@ pub async fn load_messages(
         messages,
         queues,
         prepared,
+        duplicates,
     } = storage
         .load_messages()
         .map_err(|e| corrupt("loading the message journal", e))?;
@@ -195,6 +196,22 @@ pub async fn load_messages(
         .into_iter()
         .map(|(id, m)| (id, ServerMessage::new(m)))
         .collect();
+    // The duplicate-ID caches, per address in journal order.
+    let mut by_address: Vec<(String, Vec<(Vec<u8>, i64)>)> = Vec::new();
+    for d in duplicates {
+        match by_address.iter_mut().find(|(a, _)| *a == d.address) {
+            Some((_, ids)) => ids.push((d.id, d.record)),
+            None => by_address.push((d.address, vec![(d.id, d.record)])),
+        }
+    }
+    for (address, ids) in by_address {
+        let cache = post_office.duplicate_cache(&address);
+        let mut c = crate::duplicate::lock(&cache);
+        if c.is_persistent() {
+            c.load(ids, || post_office.ids().next())
+                .map_err(|e| corrupt("duplicate IDs", e))?;
+        }
+    }
     let now = message::now_millis();
     for (queue_id, refs) in queues {
         let Some(queue) = by_id.get(&queue_id) else {
@@ -251,6 +268,13 @@ pub async fn load_messages(
                 Some(r) => tx.acks.push((q.clone(), r)),
                 None => tracing::warn!("AMQ222036: Unable to remove reference {message_id}"),
             }
+        }
+        for d in p.duplicates {
+            tx.duplicates.push(crate::duplicate::PendingId {
+                cache: post_office.duplicate_cache(&d.address),
+                id: d.id,
+                record: d.record,
+            });
         }
         tx.state = TxState::Prepared;
         resource_manager.put(p.xid, Arc::new(std::sync::Mutex::new(tx)));

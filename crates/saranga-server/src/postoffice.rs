@@ -331,6 +331,7 @@ pub struct PostOffice {
     filters: Arc<dyn FilterFactory>,
     ids: Arc<IdGenerator>,
     wildcard: WildcardConfig,
+    duplicates: crate::duplicate::DuplicateIdCaches,
 }
 
 impl PostOffice {
@@ -339,6 +340,7 @@ impl PostOffice {
         filters: Arc<dyn FilterFactory>,
         ids: Arc<IdGenerator>,
         wildcard: WildcardConfig,
+        duplicates: crate::duplicate::DuplicateIdCaches,
     ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
@@ -347,7 +349,14 @@ impl PostOffice {
             filters,
             ids,
             wildcard,
+            duplicates,
         })
+    }
+
+    /// The duplicate-ID cache of `address` (`getDuplicateIDCache`).
+    pub fn duplicate_cache(&self, address: &str) -> crate::duplicate::CacheRef {
+        let size = self.settings(address).id_cache_size;
+        self.duplicates.get(address, size)
     }
 
     pub fn settings(&self, address: &str) -> Arc<AddressSettings> {

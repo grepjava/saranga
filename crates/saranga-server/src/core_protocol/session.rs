@@ -735,6 +735,7 @@ impl CoreSession {
             .settings(crate::postoffice::split_fqqn(&address).0);
         crate::message::apply_expiry_delay(&mut message, &settings, crate::message::now_millis());
         let scheduled_time = crate::message::scheduled_delivery_time(&message);
+        let duplicate_id = crate::duplicate::duplicate_id_bytes(&message);
         let mut r = MessageRef::new(ServerMessage::new(message));
         r.scheduled_time = scheduled_time;
         // doSend: outside a transaction when auto-committing or when an XA
@@ -744,18 +745,64 @@ impl CoreSession {
         } else {
             self.tx.clone()
         };
+        let storage = self.storage();
+        // checkDuplicateID: a send outside a transaction gets one of its own
+        // so the ID is journaled with the message.
+        let mut own_tx: Option<(i64, bool)> = None;
+        if let Some(id) = duplicate_id {
+            let po = self.broker.post_office();
+            let cache = po.duplicate_cache(crate::postoffice::split_fqqn(&address).0);
+            let mut c = crate::duplicate::lock(&cache);
+            if c.contains(&id) {
+                tracing::warn!(
+                    "AMQ222059: Duplicate message detected - message will not be routed. Message information:\n{}",
+                    r.message.message_id()
+                );
+                if let Some(tx) = &tx {
+                    transaction::lock(tx).mark_rollback_only(&BrokerError::new(
+                        ErrorType::DuplicateIdRejected,
+                        format!(
+                            "Duplicate message detected - message will not be routed. Message information:{}",
+                            r.message.message_id()
+                        ),
+                    ));
+                }
+                return Ok(None);
+            }
+            let record = po.ids().next();
+            match &tx {
+                None => {
+                    let jtx = po.ids().next();
+                    c.store_tx(jtx, &id, record).map_err(io_error)?;
+                    own_tx = Some((jtx, c.is_persistent()));
+                    c.add_in_memory(id, record);
+                }
+                Some(tx) => {
+                    let mut t = transaction::lock(tx);
+                    c.store_tx(t.id, &id, record).map_err(io_error)?;
+                    t.persistent |= c.is_persistent();
+                    t.duplicates.push(crate::duplicate::PendingId {
+                        cache: cache.clone(),
+                        id,
+                        record,
+                    });
+                }
+            }
+        }
         let queues = match self.broker.post_office().route(&r, &address, routing_type) {
             Ok(queues) => queues,
             Err(e) => {
                 if let Some(tx) = &tx {
                     transaction::lock(tx).mark_rollback_only(&e);
                 }
+                if let (Some((jtx, true)), Some(s)) = (own_tx, &storage) {
+                    let _ = s.rollback(jtx);
+                }
                 return Err(e);
             }
         };
         // processRouteToDurableQueues: the message record with its first
         // durable reference, then one reference per durable queue.
-        let storage = self.storage();
         let durable: Vec<Queue> = queues
             .iter()
             .filter(|q| q.is_durable_ref(&r))
@@ -767,26 +814,43 @@ impl CoreSession {
                 if let Some(s) = &storage {
                     let last = durable.len().saturating_sub(1);
                     for (i, q) in durable.iter().enumerate() {
+                        let mid = message.message_id();
+                        if let Some((jtx, persistent)) = &mut own_tx {
+                            if message.durable_up() == 1 {
+                                s.store_message_tx(*jtx, message.core(), message.encoded())
+                                    .map_err(io_error)?;
+                            }
+                            s.store_reference_tx(*jtx, q.id(), mid).map_err(io_error)?;
+                            if scheduled_time > 0 {
+                                s.update_scheduled_delivery_time_tx(
+                                    *jtx,
+                                    q.id(),
+                                    mid,
+                                    scheduled_time,
+                                )
+                                .map_err(io_error)?;
+                            }
+                            *persistent = true;
+                            continue;
+                        }
                         if message.durable_up() == 1 {
                             s.store_message(message.core(), message.encoded())
                                 .map_err(io_error)?;
                         }
                         self.ops.push(
-                            s.store_reference(q.id(), message.message_id(), i == last)
+                            s.store_reference(q.id(), mid, i == last)
                                 .map_err(io_error)?,
                         );
                         if scheduled_time > 0
                             && let Some(p) = s
-                                .update_scheduled_delivery_time(
-                                    q.id(),
-                                    message.message_id(),
-                                    scheduled_time,
-                                    0,
-                                )
+                                .update_scheduled_delivery_time(q.id(), mid, scheduled_time, 0)
                                 .map_err(io_error)?
                         {
                             self.ops.push(p);
                         }
+                    }
+                    if let Some((jtx, true)) = own_tx {
+                        self.ops.push(s.commit(jtx).map_err(io_error)?);
                     }
                     // The references join their queues once journaled.
                     self.actions.push(Box::new(move || {

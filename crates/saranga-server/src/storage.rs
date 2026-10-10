@@ -10,7 +10,8 @@ use saranga_journal::{Completion, Journal, JournalConfig, JournalError, Prepared
 use saranga_message::CoreMessage;
 use saranga_storage::RecordCodec;
 use saranga_storage::codec::{
-    DeliveryCountUpdateEncoding, IdCounterEncoding, RefEncoding, ScheduledDeliveryEncoding,
+    DeliveryCountUpdateEncoding, DuplicateIdEncoding, IdCounterEncoding, RefEncoding,
+    ScheduledDeliveryEncoding,
 };
 use saranga_storage::message::PersistedMessage;
 use saranga_storage::{BatchingIdGenerator, CHECKPOINT_BATCH_SIZE, IdCounterStore};
@@ -155,6 +156,26 @@ pub struct RecoveredTx {
     pub sends: Vec<(i64, i64)>,
     /// (queue ID, message ID) acknowledged by the transaction.
     pub acks: Vec<(i64, i64)>,
+    pub duplicates: Vec<RecoveredDuplicate>,
+}
+
+/// A `DUPLICATE_ID` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredDuplicate {
+    pub address: String,
+    pub id: Vec<u8>,
+    pub record: i64,
+}
+
+impl RecoveredDuplicate {
+    fn decode(record: i64, data: &[u8]) -> StoreResult<Self> {
+        let d = DuplicateIdEncoding::decode(data).map_err(corrupt("duplicate ID"))?;
+        Ok(Self {
+            address: d.address.to_string_lossy(),
+            id: d.duplicate_id,
+            record,
+        })
+    }
 }
 
 /// What the message journal holds (`loadMessageJournal`).
@@ -164,6 +185,8 @@ pub struct RecoveredMessages {
     /// Per queue, in journal order.
     pub queues: HashMap<i64, Vec<RecoveredRef>>,
     pub prepared: Vec<RecoveredTx>,
+    /// Committed duplicate IDs, in journal order.
+    pub duplicates: Vec<RecoveredDuplicate>,
 }
 
 /// The broker's journals.
@@ -288,7 +311,9 @@ impl Storage {
                         },
                     }
                 }
-                // Duplicate IDs are loaded by the duplicate-ID caches.
+                ids::DUPLICATE_ID => out
+                    .duplicates
+                    .push(RecoveredDuplicate::decode(r.id, &r.data)?),
                 other => tracing::debug!("Extra record type {other}"),
             }
         }
@@ -349,6 +374,7 @@ impl Storage {
             xid,
             sends: Vec::new(),
             acks: Vec::new(),
+            duplicates: Vec::new(),
         };
         for r in p.records {
             match r.user_record_type {
@@ -357,6 +383,9 @@ impl Storage {
                 }
                 ids::ADD_REF => tx.sends.push((ref_queue(&r.data)?, r.id)),
                 ids::ACKNOWLEDGE_REF => tx.acks.push((ref_queue(&r.data)?, r.id)),
+                ids::DUPLICATE_ID => tx
+                    .duplicates
+                    .push(RecoveredDuplicate::decode(r.id, &r.data)?),
                 other => tracing::debug!("prepared transaction {} record type {other}", p.id),
             }
         }

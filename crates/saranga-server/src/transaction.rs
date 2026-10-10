@@ -103,6 +103,8 @@ pub struct Transaction {
     pub acks: Vec<(Queue, MessageRef)>,
     /// Why the transaction can only roll back.
     pub exception: Option<BrokerError>,
+    /// Duplicate IDs that join their caches on commit.
+    pub duplicates: Vec<crate::duplicate::PendingId>,
 }
 
 pub type TxRef = Arc<Mutex<Transaction>>;
@@ -125,6 +127,8 @@ pub struct Outcome {
     pub acked: Vec<(Queue, MessageRef)>,
     /// Rollback: references to return to their queues.
     pub cancel: Vec<(Queue, MessageRef)>,
+    /// Commit: duplicate IDs for their caches.
+    pub duplicates: Vec<crate::duplicate::PendingId>,
 }
 
 impl Outcome {
@@ -147,6 +151,9 @@ impl Outcome {
     /// final, rolled-back references return to their queues, which check
     /// them for redelivery.
     pub fn apply(self) {
+        for d in self.duplicates {
+            d.apply();
+        }
         for (q, r) in self.add {
             q.add(r);
         }
@@ -210,6 +217,7 @@ impl Transaction {
             sends: Vec::new(),
             acks: Vec::new(),
             exception: None,
+            duplicates: Vec::new(),
         }
     }
 
@@ -239,6 +247,7 @@ impl Transaction {
         let journaled = self.persistent || (self.xid.is_some() && self.state == TxState::Prepared);
         self.state = TxState::RolledBack;
         self.sends.clear();
+        self.duplicates.clear();
         Outcome {
             record: journaled.then_some(TxRecord::Rollback(self.id)),
             cancel: std::mem::take(&mut self.acks),
@@ -280,6 +289,7 @@ impl Transaction {
             add: std::mem::take(&mut self.sends),
             acked: std::mem::take(&mut self.acks),
             cancel: Vec::new(),
+            duplicates: std::mem::take(&mut self.duplicates),
         })
     }
 

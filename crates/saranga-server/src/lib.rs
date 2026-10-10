@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod core_protocol;
+pub mod duplicate;
 pub mod error;
 pub mod message;
 pub mod node;
@@ -126,6 +127,10 @@ pub struct BrokerConfig {
     pub storage: Option<storage::StorageConfig>,
     /// `message-expiry-scan-period` in milliseconds; `-1` for none.
     pub message_expiry_scan_period: i64,
+    /// `id-cache-size`.
+    pub id_cache_size: i32,
+    /// `persist-id-cache`.
+    pub persist_id_cache: bool,
 }
 
 impl BrokerConfig {
@@ -139,6 +144,8 @@ impl BrokerConfig {
             addresses: Vec::new(),
             storage: None,
             message_expiry_scan_period: 30000,
+            id_cache_size: 20000,
+            persist_id_cache: true,
         }
     }
 }
@@ -198,7 +205,16 @@ impl Broker {
             }
             None => (Arc::new(IdGenerator::new(1)), None, None),
         };
-        let post_office = PostOffice::new(config.settings, config.filters, ids, config.wildcard);
+        let post_office = PostOffice::new(
+            config.settings,
+            config.filters,
+            ids,
+            config.wildcard,
+            duplicate::DuplicateIdCaches::new(
+                config.id_cache_size,
+                storage.clone().filter(|_| config.persist_id_cache),
+            ),
+        );
         if let Some(s) = &storage {
             recovery::load_bindings(s, &post_office)?;
         }
