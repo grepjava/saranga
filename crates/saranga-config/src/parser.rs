@@ -428,6 +428,9 @@ fn parse_core(
     if let Some(v) = s.i64("transaction-timeout-scan-period", Check::GtZero)? {
         config.transaction_timeout_scan_period = v;
     }
+    if let Some(v) = s.i64("address-queue-scan-period", Check::MinusOneOrGtZero)? {
+        config.address_queue_scan_period = v;
+    }
     if let Some(v) = s.i32("id-cache-size", Check::GeZero)? {
         config.id_cache_size = v;
     }

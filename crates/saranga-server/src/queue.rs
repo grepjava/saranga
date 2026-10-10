@@ -200,6 +200,15 @@ struct Shared {
     paging: Option<Arc<PageSubscription>>,
     consumer_count: AtomicI32,
     deleted: AtomicBool,
+    /// When the queue was created, in epoch milliseconds.
+    created_at: i64,
+    /// When a consumer last left (`consumerRemovedTimestamp`); -1 never.
+    consumer_removed_at: AtomicI64,
+    /// Whether a message ever left it: acknowledged, expired or killed
+    /// (`queueWasUsed`).
+    used: AtomicBool,
+    /// Found deletable by the last reaper pass (`isSwept`).
+    swept: AtomicBool,
 }
 
 /// A handle to a queue actor.
@@ -248,6 +257,10 @@ impl Queue {
             paging,
             consumer_count: AtomicI32::new(0),
             deleted: AtomicBool::new(false),
+            created_at: crate::message::now_millis(),
+            consumer_removed_at: AtomicI64::new(-1),
+            used: AtomicBool::new(false),
+            swept: AtomicBool::new(false),
         }));
         let actor = Actor {
             shared: queue.0.clone(),
@@ -300,6 +313,28 @@ impl Queue {
         self.0.consumer_count.load(Ordering::SeqCst)
     }
 
+    pub fn created_at(&self) -> i64 {
+        self.0.created_at
+    }
+
+    /// When a consumer last left, -1 if none ever did.
+    pub fn consumer_removed_at(&self) -> i64 {
+        self.0.consumer_removed_at.load(Ordering::SeqCst)
+    }
+
+    /// Whether a message was ever acknowledged, expired or killed here.
+    pub fn was_used(&self) -> bool {
+        self.0.used.load(Ordering::SeqCst)
+    }
+
+    pub fn swept(&self) -> bool {
+        self.0.swept.load(Ordering::SeqCst)
+    }
+
+    pub fn set_swept(&self, swept: bool) {
+        self.0.swept.store(swept, Ordering::SeqCst);
+    }
+
     pub fn is_deleted(&self) -> bool {
         self.0.deleted.load(Ordering::SeqCst)
     }
@@ -337,6 +372,7 @@ impl Queue {
     /// synced; recovery deletes what a crash missed). A paged message is
     /// acknowledged on its page instead.
     pub fn post_acknowledge(&self, r: &MessageRef) {
+        self.0.used.store(true, Ordering::SeqCst);
         if let Some(position) = &r.paged {
             if let Some(sub) = &self.0.paging
                 && let Some(store) = sub.store()
@@ -500,6 +536,9 @@ impl Queue {
         self.send(Cmd::RemoveConsumer { id, failed, done });
         let _ = wait.await;
         self.0.consumer_count.fetch_sub(1, Ordering::SeqCst);
+        self.0
+            .consumer_removed_at
+            .store(crate::message::now_millis(), Ordering::SeqCst);
     }
 
     pub fn credits(&self, id: ConsumerId, credits: i32) {

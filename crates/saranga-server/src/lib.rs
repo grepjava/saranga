@@ -145,6 +145,9 @@ pub struct BrokerConfig {
     pub transaction_timeout: i64,
     /// `transaction-timeout-scan-period` in milliseconds.
     pub transaction_timeout_scan_period: i64,
+    /// `address-queue-scan-period` in milliseconds: how often unused
+    /// auto-created queues and addresses are looked for; -1 for never.
+    pub address_queue_scan_period: i64,
     /// `id-cache-size`.
     pub id_cache_size: i32,
     /// `persist-id-cache`.
@@ -179,6 +182,7 @@ impl BrokerConfig {
             message_expiry_scan_period: 30000,
             transaction_timeout: 300000,
             transaction_timeout_scan_period: 1000,
+            address_queue_scan_period: 30000,
             id_cache_size: 20000,
             persist_id_cache: true,
             global_max_size: -1,
@@ -204,6 +208,23 @@ fn spawn_expiry_reaper(post_office: &Arc<PostOffice>, period_ms: i64) {
             for q in po.queues() {
                 q.expire_scan();
             }
+        }
+    });
+}
+
+/// `PostOfficeImpl.AddressQueueReaper`: every period, removes the
+/// auto-created queues and addresses no longer used. It stops with the post
+/// office.
+fn spawn_address_queue_reaper(post_office: &Arc<PostOffice>, period_ms: i64) {
+    let post_office = Arc::downgrade(post_office);
+    let period = std::time::Duration::from_millis(period_ms as u64);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(period).await;
+            let Some(po) = post_office.upgrade() else {
+                break;
+            };
+            po.reap(false);
         }
     });
 }
@@ -346,6 +367,11 @@ impl Broker {
         }
         if config.message_expiry_scan_period > 0 {
             spawn_expiry_reaper(&post_office, config.message_expiry_scan_period);
+        }
+        // Empty auto-created queues and addresses go before clients come.
+        post_office.reap(true);
+        if config.address_queue_scan_period > 0 {
+            spawn_address_queue_reaper(&post_office, config.address_queue_scan_period);
         }
         let node_id = match &node_lock {
             Some(l) => l.node_id().to_owned(),

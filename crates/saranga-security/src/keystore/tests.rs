@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use rustls::pki_types::CertificateDer;
-use rustls::pki_types::pem::PemObject;
+use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject;
 
 use super::*;
 

@@ -10,7 +10,10 @@
 //! Ported from `org.apache.activemq.artemis.core.security` and
 //! `org.apache.activemq.artemis.spi.core.security`.
 
+mod der;
+pub mod dn;
 pub mod jaas;
+pub mod keystore;
 pub mod manager;
 pub mod properties;
 pub mod store;

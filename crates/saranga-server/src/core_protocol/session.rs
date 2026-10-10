@@ -1665,9 +1665,6 @@ impl CoreSession {
             return;
         };
         c.queue.remove_consumer(c.id, failed).await;
-        if c.queue.consumer_count() == 0 {
-            self.broker.post_office().check_auto_delete(&c.queue);
-        }
     }
 
     /// `ServerSessionImpl.createQueue`.

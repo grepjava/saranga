@@ -338,6 +338,13 @@ enum AutoCreate {
 
 struct AddressEntry {
     info: AddressInfo,
+    /// When the address was created, in epoch milliseconds.
+    created_at: i64,
+    /// When a queue or divert last left it (`bindingRemovedTimestamp`); -1
+    /// never.
+    binding_removed_at: i64,
+    /// Found removable by the last reaper pass.
+    swept: bool,
     /// Bound queues, in binding order.
     queues: Vec<Queue>,
     /// Round-robin position over the anycast queues (they share one routing
@@ -350,6 +357,9 @@ impl AddressEntry {
     fn new(info: AddressInfo) -> Self {
         Self {
             info,
+            created_at: crate::message::now_millis(),
+            binding_removed_at: -1,
+            swept: false,
             queues: Vec::new(),
             anycast_next: AtomicUsize::new(0),
             diverts: Vec::new(),
@@ -750,6 +760,7 @@ impl PostOffice {
             state.queues.remove(name);
             if let Some(entry) = state.addresses.get_mut(&address) {
                 entry.queues.retain(|q| q != &queue);
+                entry.binding_removed_at = crate::message::now_millis();
             }
         }
         if queue.is_durable()
@@ -775,38 +786,88 @@ impl PostOffice {
             && self.settings(address).auto_delete_addresses_delay == 0
     }
 
-    /// `QueueManagerImpl`: deletes an auto-delete queue once it has no
-    /// consumers and few enough messages, after its delay.
-    pub fn check_auto_delete(self: &Arc<Self>, queue: &Queue) {
-        let c = queue.config();
-        if !c.auto_delete || queue.is_deleted() {
-            return;
-        }
-        let eligible = |q: &Queue| {
-            q.consumer_count() == 0
-                && (q.config().auto_delete_message_count == -1
-                    || q.message_count() <= q.config().auto_delete_message_count)
-        };
-        if !eligible(queue) {
-            return;
-        }
-        let delay = c.auto_delete_delay;
-        let this = self.clone();
-        let queue = queue.clone();
-        let delete = move || {
-            if eligible(&queue) && !queue.is_deleted() {
-                let address = queue.config().address.clone();
-                let auto_delete_address = this.settings(&address).auto_delete_addresses;
-                let _ = this.delete_queue(queue.name(), true, auto_delete_address);
+    /// `PostOfficeImpl.reapAddresses`: removes the auto-delete queues and
+    /// auto-created addresses nothing uses any more. A queue or address
+    /// must be found removable on two passes in a row, except on the
+    /// `initial` pass at startup, which removes empty ones at once.
+    pub fn reap(&self, initial: bool) {
+        let now = crate::message::now_millis();
+        for q in self.queues() {
+            let c = q.config();
+            let s = self.settings(&c.address);
+            let delay_passed = if s.auto_delete_queues_skip_usage_check {
+                now - q.created_at() >= c.auto_delete_delay
+            } else {
+                now - q.consumer_removed_at() >= c.auto_delete_delay
+            };
+            let used = q.was_used()
+                || q.consumer_removed_at() != -1
+                || s.auto_delete_queues_skip_usage_check;
+            let eligible = c.auto_delete
+                && !q.is_deleted()
+                && q.consumer_count() == 0
+                && (initial || delay_passed)
+                && (c.auto_delete_message_count == -1
+                    || q.message_count() <= c.auto_delete_message_count)
+                && (initial || used);
+            if !eligible {
+                q.set_swept(false);
+                continue;
             }
-        };
-        if delay <= 0 {
-            delete();
-        } else {
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
-                delete();
-            });
+            let valid_initial =
+                initial && q.message_count() == 0 && !self.paging_store(&c.address).is_paging();
+            if valid_initial || q.swept() {
+                tracing::info!(
+                    "AMQ224112: Auto removing queue {} with queueID={} on address={}",
+                    q.name(),
+                    q.id(),
+                    c.address
+                );
+                if let Err(e) = self.delete_queue(q.name(), true, false) {
+                    tracing::warn!(
+                        "AMQ222241: Unable to remove auto-created queue {}: {e}",
+                        q.name()
+                    );
+                }
+            } else {
+                q.set_swept(true);
+            }
+        }
+        let names: Vec<Name> = self.read().addresses.keys().cloned().collect();
+        for name in names {
+            let s = self.settings(&name);
+            let remove = {
+                let mut state = self.write();
+                let Some(entry) = state.addresses.get_mut(&name) else {
+                    continue;
+                };
+                let delay_passed = if s.auto_delete_addresses_skip_usage_check {
+                    now - entry.created_at >= s.auto_delete_addresses_delay
+                } else {
+                    now - entry.binding_removed_at >= s.auto_delete_addresses_delay
+                };
+                let used =
+                    entry.binding_removed_at != -1 || s.auto_delete_addresses_skip_usage_check;
+                let removable = s.auto_delete_addresses
+                    && entry.info.auto_created
+                    && entry.queues.is_empty()
+                    && entry.diverts.is_empty()
+                    && (initial || used)
+                    && (initial || delay_passed);
+                if !removable {
+                    entry.swept = false;
+                    false
+                } else if initial || entry.swept {
+                    true
+                } else {
+                    entry.swept = true;
+                    false
+                }
+            };
+            if remove {
+                tracing::info!("AMQ224113: Auto removing address {name}");
+                self.remove_address(&name);
+            }
         }
     }
 

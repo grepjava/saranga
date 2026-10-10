@@ -8,7 +8,7 @@ mod jks;
 
 use std::path::{Path, PathBuf};
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 #[derive(Debug, thiserror::Error)]
 pub enum KeyStoreError {
@@ -190,7 +190,7 @@ pub(crate) fn pkcs8(der: &[u8]) -> PrivateKeyDer<'static> {
 
 /// The private key and the certificates of a PEM file, in order.
 fn pem_items(data: &[u8]) -> Result<(Option<PrivateKeyDer<'static>>, Vec<Vec<u8>>), KeyStoreError> {
-    use rustls::pki_types::pem::{PemObject, SectionKind};
+    use rustls_pki_types::pem::{PemObject, SectionKind};
     let mut key = None;
     let mut certs = Vec::new();
     for item in <(SectionKind, Vec<u8>)>::pem_slice_iter(data) {
@@ -264,7 +264,7 @@ fn pem_config(data: &[u8], config: &Path) -> Result<KeyStore, KeyStoreError> {
 }
 
 fn saranga_security_properties(data: &[u8]) -> Vec<(String, String)> {
-    saranga_security::properties::parse(data)
+    crate::properties::parse(data)
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@
 mod certificate;
 pub mod config;
 mod guest;
+mod ldap;
 mod properties_module;
 
 use std::collections::HashMap;
@@ -177,6 +178,7 @@ impl ModuleFactory {
             Some("ExternalCertificateLoginModule") => Ok(Box::new(
                 certificate::ExternalCertificateLoginModule::new(entry),
             )),
+            Some("LDAPLoginModule") => Ok(Box::new(ldap::LdapLoginModule::new(entry))),
             _ => Err(LoginError::new(format!(
                 "unable to instantiate LoginModule {class}: not supported by Saranga"
             ))),
@@ -194,6 +196,7 @@ impl ModuleFactory {
                     | "GuestLoginModule"
                     | "TextFileCertificateLoginModule"
                     | "ExternalCertificateLoginModule"
+                    | "LDAPLoginModule"
             )
         )
     }

@@ -1,0 +1,46 @@
+# The directory of the LDAP suite (scripts/ldap-interop.sh), under the
+# OpenLDAP container's dc=example,dc=com. Passwords equal the user names.
+dn: ou=People,dc=example,dc=com
+objectClass: organizationalUnit
+ou: People
+
+dn: ou=Groups,dc=example,dc=com
+objectClass: organizationalUnit
+ou: Groups
+
+dn: uid=jdoe,ou=People,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: jdoe
+cn: John Doe
+sn: Doe
+userPassword: jdoe
+
+dn: uid=ann,ou=People,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: ann
+cn: Ann Other
+sn: Other
+userPassword: ann
+
+dn: uid=x(y)*,ou=People,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: x(y)*
+cn: Odd Name
+sn: Name
+userPassword: odd
+
+dn: cn=amq,ou=Groups,dc=example,dc=com
+objectClass: groupOfNames
+cn: amq
+member: uid=jdoe,ou=People,dc=example,dc=com
+
+dn: cn=staff,ou=Groups,dc=example,dc=com
+objectClass: groupOfNames
+cn: staff
+member: uid=ann,ou=People,dc=example,dc=com
+member: uid=x(y)*,ou=People,dc=example,dc=com
+
+dn: cn=senders,ou=Groups,dc=example,dc=com
+objectClass: groupOfNames
+cn: senders
+member: cn=staff,ou=Groups,dc=example,dc=com

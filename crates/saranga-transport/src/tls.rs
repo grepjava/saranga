@@ -18,7 +18,7 @@ use saranga_security::PeerCertificate;
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 
-use crate::keystore::{KeyStore, KeyStoreError};
+use saranga_security::keystore::{KeyStore, KeyStoreError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
@@ -392,12 +392,12 @@ pub fn peer_certificates(certs: Option<&[CertificateDer<'_>]>) -> Option<Vec<Pee
         certs
             .iter()
             .map(|c| {
-                let (rfc, legacy) = crate::dn::subject_names(c).unwrap_or_default();
+                let (rfc, legacy) = saranga_security::dn::subject_names(c).unwrap_or_default();
                 PeerCertificate {
                     der: c.to_vec(),
                     subject_dn: rfc,
                     subject_dn_legacy: legacy,
-                    san_uris: crate::dn::san_uris(c),
+                    san_uris: saranga_security::dn::san_uris(c),
                 }
             })
             .collect(),

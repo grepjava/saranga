@@ -317,6 +317,8 @@ pub struct BrokerConfig {
     pub transaction_timeout: i64,
     /// `transaction-timeout-scan-period` in milliseconds.
     pub transaction_timeout_scan_period: i64,
+    /// `address-queue-scan-period` in milliseconds; -1 turns the reaper off.
+    pub address_queue_scan_period: i64,
     /// `id-cache-size`: duplicate IDs remembered per address.
     pub id_cache_size: i32,
     /// `persist-id-cache`: duplicate IDs are journaled.
@@ -362,6 +364,7 @@ impl BrokerConfig {
     pub const DEFAULT_ID_CACHE_SIZE: i32 = 20000;
     pub const DEFAULT_TRANSACTION_TIMEOUT: i64 = 300000;
     pub const DEFAULT_TRANSACTION_TIMEOUT_SCAN_PERIOD: i64 = 1000;
+    pub const DEFAULT_ADDRESS_QUEUE_SCAN_PERIOD: i64 = 30000;
     pub const DEFAULT_PERSIST_ID_CACHE: bool = true;
     pub const DEFAULT_SECURITY_INVALIDATION_INTERVAL: i64 = 10000;
     pub const DEFAULT_CONFIGURATION_FILE_REFRESH_PERIOD: i64 = 5000;
@@ -445,6 +448,7 @@ impl Default for BrokerConfig {
             message_expiry_scan_period: Self::DEFAULT_MESSAGE_EXPIRY_SCAN_PERIOD,
             transaction_timeout: Self::DEFAULT_TRANSACTION_TIMEOUT,
             transaction_timeout_scan_period: Self::DEFAULT_TRANSACTION_TIMEOUT_SCAN_PERIOD,
+            address_queue_scan_period: Self::DEFAULT_ADDRESS_QUEUE_SCAN_PERIOD,
             id_cache_size: Self::DEFAULT_ID_CACHE_SIZE,
             persist_id_cache: Self::DEFAULT_PERSIST_ID_CACHE,
             large_message_sync: true,
