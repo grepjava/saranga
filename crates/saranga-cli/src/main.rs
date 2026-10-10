@@ -1,7 +1,10 @@
 //! The `saranga` command (the counterpart of `artemis`).
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+use anyhow::Context;
 
 use clap::{Parser, Subcommand};
 use saranga_server::postoffice::SelectorFilters;
@@ -24,9 +27,12 @@ struct Cli {
 enum Command {
     /// Runs the broker in the foreground.
     Run {
-        /// Where the Core acceptor listens.
-        #[arg(long, default_value = "0.0.0.0:61616")]
-        bind: SocketAddr,
+        /// A broker.xml; its acceptors that speak CORE are opened.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Listen here instead of on the configured acceptors.
+        #[arg(long)]
+        bind: Option<SocketAddr>,
     },
 }
 
@@ -38,18 +44,54 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     match Cli::parse().command {
-        Command::Run { bind } => run(bind).await,
+        Command::Run { config, bind } => run(config, bind).await,
     }
 }
 
-async fn run(bind: SocketAddr) -> anyhow::Result<()> {
-    let broker = Broker::new(BrokerConfig::new(Arc::new(SelectorFilters)))?;
-    let listener = TcpListener::bind(bind).await?;
-    // Artemis's log IDs, so log-based tooling keeps working (ADR 0003).
-    tracing::info!("AMQ221020: Started Core Acceptor at {bind} for protocols [CORE]");
+async fn run(config: Option<PathBuf>, bind: Option<SocketAddr>) -> anyhow::Result<()> {
+    let filters = Arc::new(SelectorFilters);
+    let (broker_config, mut binds) = match &config {
+        Some(path) => {
+            let file = saranga_config::BrokerConfig::from_file(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            for w in &file.warnings {
+                tracing::warn!("{}: {w}", path.display());
+            }
+            let binds = file
+                .acceptors
+                .iter()
+                .filter(|a| {
+                    let p = a.protocols();
+                    p.is_empty() || p.iter().any(|p| p.eq_ignore_ascii_case("CORE"))
+                })
+                .map(|a| {
+                    let host = a.host.as_deref().unwrap_or("localhost");
+                    let port = a.port.unwrap_or(61616);
+                    (a.name.clone().unwrap_or_default(), format!("{host}:{port}"))
+                })
+                .collect();
+            (BrokerConfig::from_file_config(&file, filters)?, binds)
+        }
+        None => (BrokerConfig::new(filters), Vec::new()),
+    };
+    if let Some(bind) = bind {
+        binds = vec![("core".to_owned(), bind.to_string())];
+    } else if binds.is_empty() {
+        binds = vec![("artemis".to_owned(), "0.0.0.0:61616".to_owned())];
+    }
+    let broker = Broker::new(broker_config)?;
+    let mut servers = tokio::task::JoinSet::new();
+    for (name, address) in binds {
+        let listener = TcpListener::bind(&address)
+            .await
+            .with_context(|| format!("acceptor {name} on {address}"))?;
+        // Artemis's log IDs, so log-based tooling keeps working (ADR 0003).
+        tracing::info!("AMQ221020: Started Core Acceptor at {address} for protocols [CORE]");
+        servers.spawn(broker.clone().serve(listener));
+    }
     tracing::info!("AMQ221007: Server is now active");
     tokio::select! {
-        result = broker.serve(listener) => result?,
+        Some(result) = servers.join_next() => result??,
         _ = tokio::signal::ctrl_c() => tracing::info!("AMQ221002: Saranga Message Broker is stopped"),
     }
     Ok(())

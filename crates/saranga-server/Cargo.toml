@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 saranga-buffer = { path = "../saranga-buffer" }
+saranga-config = { path = "../saranga-config" }
 saranga-core-protocol = { path = "../saranga-core-protocol" }
 saranga-filter = { path = "../saranga-filter" }
 saranga-message = { path = "../saranga-message" }

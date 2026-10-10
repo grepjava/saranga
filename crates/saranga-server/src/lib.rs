@@ -4,6 +4,7 @@
 //! Phase 2 keeps everything in memory. The structure follows ADR 0001:
 //! one task per connection and per session, one actor per queue.
 
+pub mod config;
 pub mod core_protocol;
 pub mod error;
 pub mod message;

@@ -553,6 +553,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "saranga-config",
  "saranga-server",
  "tokio",
  "tracing",
@@ -642,6 +643,7 @@ name = "saranga-server"
 version = "0.0.1"
 dependencies = [
  "saranga-buffer",
+ "saranga-config",
  "saranga-core-protocol",
  "saranga-filter",
  "saranga-message",

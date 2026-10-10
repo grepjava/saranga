@@ -26,7 +26,7 @@ trap cleanup EXIT
 case "$TARGET" in
   saranga)
     cargo build -q --release -p saranga-cli --manifest-path "$(native "$ROOT/Cargo.toml")"
-    "$ROOT/target/release/saranga" run --bind "127.0.0.1:$PORT" &
+    "$ROOT/target/release/saranga" run --config "$(native "$ROOT/tests/golden/etc/broker.xml")" --bind "127.0.0.1:$PORT" &
     BROKER_PID=$!
     for _ in $(seq 1 50); do (echo > "/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break; sleep 0.1; done
     ;;
