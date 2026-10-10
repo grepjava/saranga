@@ -86,8 +86,30 @@ packet_enum! {
     // ---- session ----
     // ---- end session ----
     // ---- xa ----
+    SessionXAAfterFailedMessage,
+    SessionXACommitMessage,
+    SessionXAEndMessage,
+    SessionXAForgetMessage,
+    SessionXAGetInDoubtXidsResponseMessage,
+    SessionXAGetTimeoutResponseMessage,
+    SessionXAJoinMessage,
+    SessionXAPrepareMessage,
+    SessionXAResponseMessage,
+    SessionXAResponseMessageV2,
+    SessionXAResumeMessage,
+    SessionXARollbackMessage,
+    SessionXASetTimeoutMessage,
+    SessionXASetTimeoutResponseMessage,
+    SessionXAStartMessage,
     // ---- end xa ----
     // ---- large ----
+    SessionSendContinuationMessage,
+    SessionSendContinuationMessageV2,
+    SessionSendContinuationMessageV3,
+    SessionReceiveContinuationMessage,
+    SessionSendLargeMessage,
+    SessionReceiveLargeMessage,
+    SessionReceiveClientLargeMessage,
     // ---- end large ----
     // ---- cluster ----
     // ---- end cluster ----
@@ -157,8 +179,41 @@ impl Packet {
             // ---- session ----
             // ---- end session ----
             // ---- xa ----
+            types::SESS_XA_START => body::<SessionXAStartMessage>(r, ctx),
+            types::SESS_XA_FAILED => body::<SessionXAAfterFailedMessage>(r, ctx),
+            types::SESS_XA_END => body::<SessionXAEndMessage>(r, ctx),
+            types::SESS_XA_COMMIT => body::<SessionXACommitMessage>(r, ctx),
+            types::SESS_XA_PREPARE => body::<SessionXAPrepareMessage>(r, ctx),
+            types::SESS_XA_RESP if async_v1 => body::<SessionXAResponseMessage>(r, ctx),
+            types::SESS_XA_RESP => body::<SessionXAResponseMessageV2>(r, ctx),
+            types::SESS_XA_ROLLBACK => body::<SessionXARollbackMessage>(r, ctx),
+            types::SESS_XA_JOIN => body::<SessionXAJoinMessage>(r, ctx),
+            types::SESS_XA_RESUME => body::<SessionXAResumeMessage>(r, ctx),
+            types::SESS_XA_FORGET => body::<SessionXAForgetMessage>(r, ctx),
+            types::SESS_XA_INDOUBT_XIDS_RESP => {
+                body::<SessionXAGetInDoubtXidsResponseMessage>(r, ctx)
+            }
+            types::SESS_XA_SET_TIMEOUT => body::<SessionXASetTimeoutMessage>(r, ctx),
+            types::SESS_XA_SET_TIMEOUT_RESP => body::<SessionXASetTimeoutResponseMessage>(r, ctx),
+            types::SESS_XA_GET_TIMEOUT_RESP => body::<SessionXAGetTimeoutResponseMessage>(r, ctx),
             // ---- end xa ----
             // ---- large ----
+            types::SESS_SEND_CONTINUATION if async_v1 => {
+                body::<SessionSendContinuationMessage>(r, ctx)
+            }
+            types::SESS_SEND_CONTINUATION if ctx.is_before_producer_metrics_changed() => {
+                body::<SessionSendContinuationMessageV2>(r, ctx)
+            }
+            types::SESS_SEND_CONTINUATION => body::<SessionSendContinuationMessageV3>(r, ctx),
+            types::SESS_RECEIVE_CONTINUATION => body::<SessionReceiveContinuationMessage>(r, ctx),
+            // Only ServerPacketDecoder knows SESS_SEND_LARGE.
+            types::SESS_SEND_LARGE if ctx.direction == Direction::ToServer => {
+                body::<SessionSendLargeMessage>(r, ctx)
+            }
+            // ClientPacketDecoder; SessionReceiveLargeMessage is encode-only.
+            types::SESS_RECEIVE_LARGE_MSG if ctx.direction == Direction::ToClient => {
+                body::<SessionReceiveClientLargeMessage>(r, ctx)
+            }
             // ---- end large ----
             // ---- cluster ----
             // ---- end cluster ----
