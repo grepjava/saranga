@@ -10,6 +10,7 @@ use std::str::FromStr;
 use crate::acceptor::AcceptorConfig;
 use crate::address_settings::AddressSettings;
 use crate::repository::{HierarchicalRepository, extract_address_name};
+use crate::security::{SecuritySetting, SecuritySettingPluginConfig};
 use crate::wildcard::WildcardConfiguration;
 use crate::{ConfigError, Result, RoutingType};
 
@@ -198,6 +199,8 @@ pub enum Warning {
     DuplicateAddressSetting { r#match: String },
     /// A schema element Saranga parses but does not act on yet.
     Unsupported { name: String, reason: &'static str },
+    /// A `<permission type>` that names no permission; its roles get none.
+    UnknownPermission { r#type: String },
 }
 
 impl fmt::Display for Warning {
@@ -220,6 +223,9 @@ impl fmt::Display for Warning {
                 )
             }
             Self::Unsupported { name, reason } => write!(f, "<{name}> was ignored: {reason}"),
+            Self::UnknownPermission { r#type } => {
+                write!(f, "unknown permission type {type:?} in a security-setting")
+            }
         }
     }
 }
@@ -318,6 +324,25 @@ pub struct BrokerConfig {
     /// `large-message-sync`: a large message's file is synced before it is
     /// routed.
     pub large_message_sync: bool,
+    /// Milliseconds an authentication or authorization stays cached.
+    pub security_invalidation_interval: i64,
+    /// Entries in the authentication cache; 0 disables it.
+    pub authentication_cache_size: i64,
+    /// Entries in the authorization cache; 0 disables it.
+    pub authorization_cache_size: i64,
+    pub cluster_user: String,
+    /// Resolved: an `ENC(...)` value is decoded.
+    pub cluster_password: String,
+    /// `mask-password`: unset means `ENC(...)` marks masked values.
+    pub mask_password: Option<bool>,
+    /// `password-codec`: the codec class and its `;key=value` settings.
+    pub password_codec: String,
+    pub populate_validated_user: bool,
+    pub reject_empty_validated_user: bool,
+    /// Match string and roles, in document order; a repeated match
+    /// replaces the earlier one.
+    pub security_settings: Vec<(String, SecuritySetting)>,
+    pub security_setting_plugins: Vec<SecuritySettingPluginConfig>,
     pub warnings: Vec<Warning>,
 }
 
@@ -335,6 +360,11 @@ impl BrokerConfig {
     pub const DEFAULT_TRANSACTION_TIMEOUT: i64 = 300000;
     pub const DEFAULT_TRANSACTION_TIMEOUT_SCAN_PERIOD: i64 = 1000;
     pub const DEFAULT_PERSIST_ID_CACHE: bool = true;
+    pub const DEFAULT_SECURITY_INVALIDATION_INTERVAL: i64 = 10000;
+    pub const DEFAULT_AUTHENTICATION_CACHE_SIZE: i64 = 1000;
+    pub const DEFAULT_AUTHORIZATION_CACHE_SIZE: i64 = 1000;
+    pub const DEFAULT_CLUSTER_USER: &str = "ACTIVEMQ.CLUSTER.ADMIN.USER";
+    pub const DEFAULT_CLUSTER_PASSWORD: &str = "CHANGE ME!!";
 
     /// Parses `broker.xml` text, resolving `${...}` from environment
     /// variables.
@@ -375,6 +405,20 @@ impl BrokerConfig {
     }
 }
 
+impl BrokerConfig {
+    /// The security-settings repository, set up as `ActiveMQServerImpl`
+    /// does: this config's wildcard syntax, no literal markers, and no
+    /// roles as the default.
+    pub fn security_repository(&self) -> Result<HierarchicalRepository<SecuritySetting>> {
+        let mut repo = HierarchicalRepository::new(self.wildcard_addresses);
+        repo.set_default(Some(SecuritySetting::default()));
+        for (m, setting) in &self.security_settings {
+            repo.add_match(m, setting.clone())?;
+        }
+        Ok(repo)
+    }
+}
+
 impl Default for BrokerConfig {
     fn default() -> Self {
         Self {
@@ -400,6 +444,17 @@ impl Default for BrokerConfig {
             id_cache_size: Self::DEFAULT_ID_CACHE_SIZE,
             persist_id_cache: Self::DEFAULT_PERSIST_ID_CACHE,
             large_message_sync: true,
+            security_invalidation_interval: Self::DEFAULT_SECURITY_INVALIDATION_INTERVAL,
+            authentication_cache_size: Self::DEFAULT_AUTHENTICATION_CACHE_SIZE,
+            authorization_cache_size: Self::DEFAULT_AUTHORIZATION_CACHE_SIZE,
+            cluster_user: Self::DEFAULT_CLUSTER_USER.to_owned(),
+            cluster_password: Self::DEFAULT_CLUSTER_PASSWORD.to_owned(),
+            mask_password: None,
+            password_codec: crate::mask::DEFAULT_CODEC.to_owned(),
+            populate_validated_user: false,
+            reject_empty_validated_user: false,
+            security_settings: Vec::new(),
+            security_setting_plugins: Vec::new(),
             warnings: Vec::new(),
         }
     }

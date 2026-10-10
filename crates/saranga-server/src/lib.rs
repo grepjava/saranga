@@ -145,6 +145,14 @@ pub struct BrokerConfig {
     pub global_max_size: i64,
     /// `global-max-messages`; -1 for no limit.
     pub global_max_messages: i64,
+    /// Authentication and authorization; `None` lets everyone do anything.
+    pub security: Option<Arc<saranga_security::SecurityStore>>,
+    /// `populate-validated-user`: sent messages carry the user that sent
+    /// them (`_AMQ_VALIDATED_USER`).
+    pub populate_validated_user: bool,
+    /// `reject-empty-validated-user`: messages without a validated user are
+    /// refused.
+    pub reject_empty_validated_user: bool,
 }
 
 impl BrokerConfig {
@@ -166,6 +174,9 @@ impl BrokerConfig {
             persist_id_cache: true,
             global_max_size: -1,
             global_max_messages: -1,
+            security: None,
+            populate_validated_user: false,
+            reject_empty_validated_user: false,
         }
     }
 }
@@ -226,6 +237,9 @@ pub struct Broker {
     /// Where large-message bodies go.
     large_messages: Arc<large::LargeMessageStore>,
     node_lock: Mutex<Option<node::NodeLock>>,
+    security: Option<Arc<saranga_security::SecurityStore>>,
+    populate_validated_user: bool,
+    reject_empty_validated_user: bool,
 }
 
 impl Broker {
@@ -338,6 +352,9 @@ impl Broker {
             storage,
             large_messages,
             node_lock: Mutex::new(node_lock),
+            security: config.security.clone(),
+            populate_validated_user: config.populate_validated_user,
+            reject_empty_validated_user: config.reject_empty_validated_user,
         });
         spawn_transaction_reaper(&broker, config.transaction_timeout_scan_period);
         Ok(broker)
@@ -366,6 +383,19 @@ impl Broker {
 
     pub fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// The security store, when security is enabled.
+    pub fn security(&self) -> Option<&Arc<saranga_security::SecurityStore>> {
+        self.security.as_ref().filter(|s| s.is_enabled())
+    }
+
+    pub fn populate_validated_user(&self) -> bool {
+        self.populate_validated_user
+    }
+
+    pub fn reject_empty_validated_user(&self) -> bool {
+        self.reject_empty_validated_user
     }
 
     pub fn post_office(&self) -> &Arc<PostOffice> {

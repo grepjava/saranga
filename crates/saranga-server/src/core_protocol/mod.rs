@@ -28,6 +28,7 @@ use saranga_core_protocol::packets::session::{
 use saranga_core_protocol::{
     Context, Direction, Flagged, HANDSHAKE, Packet, encode_frame, read_frame, types, version,
 };
+use saranga_security::{Authenticated, ConnectionInfo, SecurityError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedWriteHalf;
@@ -62,6 +63,8 @@ pub(crate) struct ConnShared {
     /// Temporary queues, deleted when the connection goes away.
     temp_queues: Mutex<Vec<Name>>,
     remote_address: String,
+    /// What the security store knows of this connection.
+    security_info: Arc<ConnectionInfo>,
 }
 
 impl ConnShared {
@@ -97,6 +100,10 @@ impl ConnShared {
 
     pub(crate) fn remote_address(&self) -> &str {
         &self.remote_address
+    }
+
+    pub(crate) fn security_info(&self) -> Arc<ConnectionInfo> {
+        self.security_info.clone()
     }
 }
 
@@ -173,10 +180,13 @@ impl DeliverySink for CoreDeliverySink {
 
 /// Serves one Core connection until it closes or fails.
 pub async fn serve_connection(broker: Arc<Broker>, stream: TcpStream) {
-    let remote_address = stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
+    let peer = stream.peer_addr().ok();
+    let remote_address = peer.map(|a| a.to_string()).unwrap_or_default();
+    let security_info = Arc::new(ConnectionInfo {
+        remote_address: peer.map(java_socket_address).unwrap_or_default(),
+        certificates: None,
+        security_domain: None,
+    });
     let _ = stream.set_nodelay(true);
     let (mut rd, wr) = stream.into_split();
     let (out, rx) = mpsc::unbounded_channel();
@@ -187,6 +197,7 @@ pub async fn serve_connection(broker: Arc<Broker>, stream: TcpStream) {
         client_id: Mutex::default(),
         temp_queues: Mutex::default(),
         remote_address,
+        security_info,
     });
     let mut conn = Connection {
         broker,
@@ -312,7 +323,7 @@ impl Connection {
     ) -> Result<(), ConnError> {
         match channel_id {
             CHANNEL_PING => self.handle_channel0(packet),
-            CHANNEL_SESSION => self.handle_channel1(packet),
+            CHANNEL_SESSION => self.handle_channel1(packet).await,
             _ => {
                 if let Packet::PacketsConfirmedMessage(_) = packet {
                     // We keep no resend cache, so there is nothing to clear.
@@ -398,36 +409,44 @@ impl Connection {
     }
 
     /// `ActiveMQPacketHandler`.
-    fn handle_channel1(&mut self, packet: Packet) -> Result<(), ConnError> {
+    async fn handle_channel1(&mut self, packet: Packet) -> Result<(), ConnError> {
         match packet {
-            Packet::CreateSessionMessage(p) => self.create_session(session::CreateSession {
-                name: p.name.to_string_lossy(),
-                channel_id: p.session_channel_id,
-                version: p.version,
-                username: p.username.map(|u| u.to_string_lossy()),
-                min_large_message_size: p.min_large_message_size,
-                xa: p.xa,
-                auto_commit_sends: p.auto_commit_sends,
-                auto_commit_acks: p.auto_commit_acks,
-                confirmation_window_size: p.window_size,
-                pre_acknowledge: p.pre_acknowledge,
-                default_address: p.default_address.map(|a| a.to_string_lossy()),
-                client_id: None,
-            }),
-            Packet::CreateSessionMessageV2(p) => self.create_session(session::CreateSession {
-                name: p.name.to_string_lossy(),
-                channel_id: p.session_channel_id,
-                version: p.version,
-                username: p.username.map(|u| u.to_string_lossy()),
-                min_large_message_size: p.min_large_message_size,
-                xa: p.xa,
-                auto_commit_sends: p.auto_commit_sends,
-                auto_commit_acks: p.auto_commit_acks,
-                confirmation_window_size: p.window_size,
-                pre_acknowledge: p.pre_acknowledge,
-                default_address: p.default_address.map(|a| a.to_string_lossy()),
-                client_id: p.client_id.map(|c| c.to_string_lossy()),
-            }),
+            Packet::CreateSessionMessage(p) => {
+                self.create_session(session::CreateSession {
+                    name: p.name.to_string_lossy(),
+                    channel_id: p.session_channel_id,
+                    version: p.version,
+                    username: p.username.map(|u| u.to_string_lossy()),
+                    password: p.password.map(|u| u.to_string_lossy()),
+                    min_large_message_size: p.min_large_message_size,
+                    xa: p.xa,
+                    auto_commit_sends: p.auto_commit_sends,
+                    auto_commit_acks: p.auto_commit_acks,
+                    confirmation_window_size: p.window_size,
+                    pre_acknowledge: p.pre_acknowledge,
+                    default_address: p.default_address.map(|a| a.to_string_lossy()),
+                    client_id: None,
+                })
+                .await
+            }
+            Packet::CreateSessionMessageV2(p) => {
+                self.create_session(session::CreateSession {
+                    name: p.name.to_string_lossy(),
+                    channel_id: p.session_channel_id,
+                    version: p.version,
+                    username: p.username.map(|u| u.to_string_lossy()),
+                    password: p.password.map(|u| u.to_string_lossy()),
+                    min_large_message_size: p.min_large_message_size,
+                    xa: p.xa,
+                    auto_commit_sends: p.auto_commit_sends,
+                    auto_commit_acks: p.auto_commit_acks,
+                    confirmation_window_size: p.window_size,
+                    pre_acknowledge: p.pre_acknowledge,
+                    default_address: p.default_address.map(|a| a.to_string_lossy()),
+                    client_id: p.client_id.map(|c| c.to_string_lossy()),
+                })
+                .await
+            }
             Packet::ConnectMessage(p) => {
                 // No connection-level authentication yet: accept.
                 if self.shared.version() == 0 {
@@ -464,7 +483,7 @@ impl Connection {
     }
 
     /// `ActiveMQPacketHandler.handleCreateSession`.
-    fn create_session(&mut self, request: session::CreateSession) {
+    async fn create_session(&mut self, request: session::CreateSession) {
         if !version::COMPATIBLE.contains(&request.version) {
             let e = BrokerError::incompatible_client_server();
             self.shared.send(
@@ -486,9 +505,44 @@ impl Connection {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(client_id.clone());
         }
+        // `validateUser`: a refused login gets the security exception and
+        // no session. Login modules may block (LDAP), so they run off the
+        // connection's task.
+        let authenticated = match self.broker.security() {
+            None => Authenticated::default(),
+            Some(store) => {
+                let store = store.clone();
+                let (user, password) = (request.username.clone(), request.password.clone());
+                let info = self.shared.security_info();
+                let result = tokio::task::spawn_blocking(move || {
+                    store.authenticate(user.as_deref(), password.as_deref(), &info)
+                })
+                .await
+                .unwrap_or_else(|e| Err(SecurityError(format!("login failed: {e}"))));
+                match result {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let e = BrokerError::security(e);
+                        self.shared.send(
+                            CHANNEL_SESSION,
+                            ActiveMQExceptionMessage {
+                                code: e.kind.code(),
+                                message: Some(e.message.as_str().into()),
+                            },
+                        );
+                        return;
+                    }
+                }
+            }
+        };
         let channel_id = request.channel_id;
         let (tx, rx) = mpsc::unbounded_channel();
-        let session = CoreSession::new(self.broker.clone(), self.shared.clone(), request);
+        let session = CoreSession::new(
+            self.broker.clone(),
+            self.shared.clone(),
+            request,
+            authenticated,
+        );
         self.session_tasks.push(tokio::spawn(session.run(rx)));
         self.sessions.insert(channel_id, tx);
         self.shared.send(
@@ -528,6 +582,23 @@ impl Connection {
             let _ = post_office.delete_queue(&name, false, auto_delete_address);
         }
         let _ = self.shared.out.send(Outgoing::Close);
+    }
+}
+
+/// `InetSocketAddress.toString` as Netty's `remoteAddress` prints it:
+/// `/127.0.0.1:5672`, `/0:0:0:0:0:0:0:1:5672`.
+pub(crate) fn java_socket_address(a: std::net::SocketAddr) -> String {
+    match a {
+        std::net::SocketAddr::V4(v4) => format!("/{}:{}", v4.ip(), v4.port()),
+        std::net::SocketAddr::V6(v6) => {
+            let s: Vec<String> = v6
+                .ip()
+                .segments()
+                .iter()
+                .map(|s| format!("{s:x}"))
+                .collect();
+            format!("/{}:{}", s.join(":"), v6.port())
+        }
     }
 }
 

@@ -61,6 +61,8 @@ case "$TARGET" in
   saranga)
     # A broker instance around the extracted data: etc/broker.xml and data/.
     mkdir -p "$WORK/etc" && cp "$CONFIG" "$WORK/etc/broker.xml"
+    # The login files the image makes for ANONYMOUS_LOGIN=true.
+    cp "$ROOT"/tests/interop/etc/* "$WORK/etc/"
     cargo build -q -p saranga-cli --manifest-path "$(native "$ROOT/Cargo.toml")"
     "$ROOT/target/debug/saranga" run --config "$(native "$WORK/etc/broker.xml")" --bind "127.0.0.1:$PORT" >&2 &
     BROKER_PID=$!

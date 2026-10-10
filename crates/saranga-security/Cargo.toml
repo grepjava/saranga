@@ -1,7 +1,15 @@
 [package]
 name = "saranga-security"
+description = "Authentication and authorization: JAAS login modules, security settings and the security store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+saranga-config = { path = "../saranga-config" }
+sha2 = "0.10"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

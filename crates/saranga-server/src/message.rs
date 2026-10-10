@@ -11,6 +11,9 @@ use crate::RoutingType;
 use crate::large::LargeBody;
 use crate::settings::AddressSettings;
 
+/// `Message.HDR_VALIDATED_USER`.
+pub const HDR_VALIDATED_USER: &str = "_AMQ_VALIDATED_USER";
+
 /// `Message.HDR_ROUTING_TYPE`.
 pub const HDR_ROUTING_TYPE: &str = "_AMQ_ROUTING_TYPE";
 /// `Message.HDR_ORIG_ROUTING_TYPE`.

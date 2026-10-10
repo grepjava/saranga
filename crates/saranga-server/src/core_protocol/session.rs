@@ -3,6 +3,9 @@
 //! confirmations) and `ServerSessionImpl` (sends, consumers, acknowledgement
 //! and local transactions).
 
+use saranga_config::CheckType;
+use saranga_security::{Authenticated, SecurityAuth};
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -30,7 +33,7 @@ use super::{ConnShared, CoreDeliverySink};
 use crate::large::{LargeBody, LargeWriter};
 use crate::message::{MessageRef, ServerMessage, routing_type};
 use crate::postoffice::{
-    BindingQueryResult, QueueQueryResult, QueueSpec, RoutingTypes, queue_name_of,
+    BindingQueryResult, Creator, QueueQueryResult, QueueSpec, RoutingTypes, queue_name_of,
 };
 use crate::queue::{ConsumerId, ConsumerRegistration, Queue};
 use crate::storage::{Pending, Storage};
@@ -50,6 +53,7 @@ pub(crate) struct CreateSession {
     pub channel_id: i64,
     pub version: i32,
     pub username: Option<String>,
+    pub password: Option<String>,
     pub min_large_message_size: i32,
     pub xa: bool,
     pub auto_commit_sends: bool,
@@ -170,9 +174,10 @@ pub(crate) struct CoreSession {
     conn: Arc<ConnShared>,
     channel_id: i64,
     name: String,
-    /// Kept for security checks (Phase 6).
-    #[allow(dead_code)]
-    username: Option<String>,
+    /// Who the session acts as, for permission checks.
+    auth: SecurityAuth,
+    /// The user the security manager validated (`getValidatedUser`).
+    validated_user: Option<String>,
     /// The size of the chunks large messages are sent to consumers in.
     min_large_message_size: i32,
     /// XA sessions work in the transaction of the last `xaStart`, or in
@@ -239,10 +244,16 @@ impl Request {
 }
 
 impl CoreSession {
-    pub(crate) fn new(broker: Arc<Broker>, conn: Arc<ConnShared>, request: CreateSession) -> Self {
+    pub(crate) fn new(
+        broker: Arc<Broker>,
+        conn: Arc<ConnShared>,
+        request: CreateSession,
+        authenticated: Authenticated,
+    ) -> Self {
         let tx =
             (!request.xa).then(|| Transaction::new_ref(broker.post_office().ids().next(), None));
         let (completer_tx, completer_rx) = mpsc::unbounded_channel();
+        let security_info = conn.security_info();
         tokio::spawn(completer(
             conn.clone(),
             request.channel_id,
@@ -258,7 +269,13 @@ impl CoreSession {
             conn,
             channel_id: request.channel_id,
             name: request.name,
-            username: request.username,
+            auth: SecurityAuth {
+                username: request.username,
+                password: request.password,
+                connection: security_info,
+                subject: authenticated.subject,
+            },
+            validated_user: authenticated.validated_user,
             min_large_message_size: request.min_large_message_size,
             xa: request.xa,
             auto_commit_sends: request.auto_commit_sends,
@@ -297,6 +314,19 @@ impl CoreSession {
         if !self.closed {
             self.close(true).await;
         }
+    }
+
+    /// Routing on behalf of this session: its security checks and user.
+    fn creator(&self) -> Creator<'_> {
+        Creator {
+            security: self.broker.security().map(|s| (&**s, &self.auth)),
+            user: self.validated_user.as_deref(),
+        }
+    }
+
+    /// `ServerSessionImpl.securityCheck`.
+    fn security_check(&self, address: &str, queue: Option<&str>, check: CheckType) -> Result<()> {
+        self.creator().check(address, queue, check)
     }
 
     fn send(&self, packet: impl Into<Packet>) {
@@ -473,15 +503,17 @@ impl CoreSession {
                     .iter()
                     .filter_map(|&b| RoutingType::from_byte(b))
                     .for_each(|t| types.add(t));
+                let address = p.address.to_string_lossy();
                 let result = self
-                    .broker
-                    .post_office()
-                    .add_or_update_address(
-                        &p.address.to_string_lossy(),
-                        types,
-                        p.auto_created,
-                        false,
-                    )
+                    .security_check(&address, None, CheckType::CreateAddress)
+                    .and_then(|()| {
+                        self.broker.post_office().add_or_update_address(
+                            &address,
+                            types,
+                            p.auto_created,
+                            false,
+                        )
+                    })
                     .map(|_| None);
                 (p.requires_response, result, false)
             }
@@ -904,6 +936,33 @@ impl CoreSession {
                 a
             }
         };
+        // doSend: the user must be allowed to send to the address (and to
+        // the queue a fully qualified name picks).
+        let (bare_address, fqqn_queue) = crate::postoffice::split_fqqn(&address);
+        if let Err(e) = self.security_check(bare_address, fqqn_queue, CheckType::Send) {
+            if !self.auto_commit_sends
+                && let Some(tx) = &self.tx
+            {
+                transaction::lock(tx).mark_rollback_only(&e);
+            }
+            return Err(e);
+        }
+        if self.broker.populate_validated_user()
+            && let Some(user) = &self.validated_user
+        {
+            message.properties.insert(
+                crate::message::HDR_VALIDATED_USER.into(),
+                saranga_buffer::PropertyValue::String(user.as_str().into()),
+            );
+        }
+        if self.broker.reject_empty_validated_user()
+            && message
+                .properties
+                .get(&SimpleString::from(crate::message::HDR_VALIDATED_USER))
+                .is_none()
+        {
+            return Err(BrokerError::reject_empty_validated_user());
+        }
         let routing_type = routing_type(&message);
         // PostOfficeImpl.route: the address's expiry settings apply first.
         let settings = self
@@ -969,12 +1028,11 @@ impl CoreSession {
                 }
             }
         }
-        let routed = match self
+        let routed = self
             .broker
             .post_office()
-            .route(&r, &address, routing_type)
-            .and_then(|routed| self.page_routed(routed, tx.as_ref()))
-        {
+            .route(&r, &address, routing_type, self.creator());
+        let routed = match routed.and_then(|routed| self.page_routed(routed, tx.as_ref())) {
             Ok(routed) => routed,
             Err(e) => {
                 if let Some(tx) = &tx {
@@ -1552,6 +1610,24 @@ impl CoreSession {
         let queue = post_office
             .queue(name)
             .ok_or_else(|| BrokerError::no_such_queue(name))?;
+        let check = if browse_only {
+            CheckType::Browse
+        } else {
+            CheckType::Consume
+        };
+        let address = queue.config().address.clone();
+        if let Err(e) = self.security_check(&address, Some(name), check) {
+            // The pre-FQQN syntax (ARTEMIS-592): a security setting matching
+            // exactly `address.queue` still applies. Artemis appends the name
+            // as the client gave it, so an FQQN never matches.
+            let exact = format!("{address}.{queue_name}");
+            match self.broker.security() {
+                Some(s) if s.contains_exact_match(&exact) => {
+                    self.security_check(&exact, Some(name), check)?
+                }
+                _ => return Err(e),
+            }
+        }
         let filter = post_office.filters().create(filter.as_deref())?;
         let c = queue.config();
         if !browse_only && c.max_consumers != -1 && queue.consumer_count() >= c.max_consumers {
@@ -1595,7 +1671,23 @@ impl CoreSession {
     }
 
     /// `ServerSessionImpl.createQueue`.
-    fn create_queue(&mut self, spec: QueueSpec) -> Result<()> {
+    fn create_queue(&mut self, mut spec: QueueSpec) -> Result<()> {
+        // The user must be allowed to create the queue, and the address too
+        // if the queue's creation would create or extend it.
+        self.security_check(&spec.address, Some(&spec.name), create_check(spec.durable))?;
+        let post_office = self.broker.post_office();
+        let settings = post_office.settings(&spec.address);
+        let routing_type = spec
+            .routing_type
+            .unwrap_or(settings.default_queue_routing_type);
+        if settings.auto_create_addresses
+            && post_office
+                .address_info(&spec.address)
+                .is_none_or(|i| !i.routing_types.contains(routing_type))
+        {
+            self.security_check(&spec.address, Some(&spec.name), CheckType::CreateAddress)?;
+        }
+        spec.user = self.validated_user.clone();
         let temporary = spec.temporary;
         let queue = self.broker.post_office().create_queue(spec, false)?;
         if temporary {
@@ -1606,7 +1698,9 @@ impl CoreSession {
 
     /// `CREATE_SHARED_QUEUE`: creates the queue unless one with the same
     /// address and filter exists.
-    fn create_shared_queue(&mut self, spec: QueueSpec) -> Result<()> {
+    fn create_shared_queue(&mut self, mut spec: QueueSpec) -> Result<()> {
+        self.security_check(&spec.address, Some(&spec.name), create_check(spec.durable))?;
+        spec.user = self.validated_user.clone();
         let existing = self.broker.post_office().queue_query(&spec.name);
         if existing.exists
             && existing.address == spec.address
@@ -1623,16 +1717,25 @@ impl CoreSession {
     fn delete_queue(&mut self, name: &str) -> Result<()> {
         let post_office = self.broker.post_office();
         let name = queue_name_of(name);
-        let auto_delete_address = post_office
+        let queue = post_office
             .queue(name)
-            .map(|q| {
-                post_office
-                    .settings(&q.config().address)
-                    .auto_delete_addresses
-            })
             .ok_or_else(|| BrokerError::no_such_queue(name))?;
-        post_office.delete_queue(name, true, auto_delete_address)?;
+        let address = queue.config().address.clone();
+        let check = if queue.is_durable() {
+            CheckType::DeleteDurableQueue
+        } else {
+            CheckType::DeleteNonDurableQueue
+        };
+        self.security_check(&address, Some(name), check)?;
+        post_office.delete_queue(name, true, false)?;
         self.conn.remove_temp_queue(name);
+        // `destroyQueue(forceAutoDeleteAddress)`: a client's delete takes an
+        // auto-created address along whatever `auto-delete-addresses` says,
+        // if the user may delete it.
+        if post_office.address_auto_deletable(&address) {
+            self.security_check(&address, None, CheckType::DeleteAddress)?;
+            post_office.remove_address(&address);
+        }
         Ok(())
     }
 
@@ -1858,6 +1961,15 @@ impl CoreSession {
 }
 
 /// A journal failure as the client sees it (`ActiveMQIOErrorException`).
+/// The check that creating a queue of this durability needs.
+fn create_check(durable: bool) -> CheckType {
+    if durable {
+        CheckType::CreateDurableQueue
+    } else {
+        CheckType::CreateNonDurableQueue
+    }
+}
+
 fn io_error(e: saranga_journal::JournalError) -> BrokerError {
     BrokerError::new(ErrorType::IoError, e.to_string())
 }

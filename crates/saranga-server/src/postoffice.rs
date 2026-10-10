@@ -26,6 +26,35 @@ pub fn split_fqqn(name: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Who routing auto-creates addresses and queues for: the sending
+/// session's security checks (`ServerSessionImpl.createAddress` and
+/// `createQueue` check `CREATE_ADDRESS` and `CREATE_DURABLE_QUEUE`) and the
+/// user its queues are created for.
+#[derive(Clone, Copy, Default)]
+pub struct Creator<'a> {
+    pub security: Option<(
+        &'a saranga_security::SecurityStore,
+        &'a saranga_security::SecurityAuth,
+    )>,
+    pub user: Option<&'a str>,
+}
+
+impl Creator<'_> {
+    pub fn check(
+        &self,
+        address: &str,
+        queue: Option<&str>,
+        check: saranga_config::CheckType,
+    ) -> Result<()> {
+        match self.security {
+            Some((store, auth)) => store
+                .check(address, queue, check, auth)
+                .map_err(BrokerError::security),
+            None => Ok(()),
+        }
+    }
+}
+
 /// `CompositeAddress.extractQueueName`.
 pub fn queue_name_of(name: &str) -> &str {
     split_fqqn(name).1.unwrap_or(name)
@@ -731,10 +760,19 @@ impl PostOffice {
         }
         queue.unsubscribe();
         queue.shutdown();
-        if auto_delete_address && self.address_info(&address).is_some_and(|i| i.auto_created) {
+        if auto_delete_address && self.address_auto_deletable(&address) {
             self.remove_address(&address);
         }
         Ok(())
+    }
+
+    /// Whether deleting a queue takes its address along: the address was
+    /// auto-created, nothing is bound to it any more and it is not to wait
+    /// (`auto-delete-addresses-delay` 0).
+    pub fn address_auto_deletable(&self, address: &str) -> bool {
+        self.address_info(address).is_some_and(|i| i.auto_created)
+            && !self.has_bindings(address)
+            && self.settings(address).auto_delete_addresses_delay == 0
     }
 
     /// `QueueManagerImpl`: deletes an auto-delete queue once it has no
@@ -896,7 +934,9 @@ impl PostOffice {
         &self,
         address: &str,
         routing_type: Option<RoutingType>,
+        creator: Creator<'_>,
     ) -> Result<AutoCreate> {
+        use saranga_config::CheckType;
         let Some(routing_type) = routing_type else {
             return Ok(AutoCreate::Existed);
         };
@@ -905,12 +945,14 @@ impl PostOffice {
         let s = self.settings(real);
         let mut result = match self.address_info(real) {
             None if s.auto_create_addresses => {
+                creator.check(real, None, CheckType::CreateAddress)?;
                 self.add_routing_type(real, routing_type, false)?;
                 AutoCreate::Created
             }
             None => return Ok(AutoCreate::NotFound),
             Some(info) if info.routing_types.contains(routing_type) => AutoCreate::Existed,
             Some(info) if s.auto_create_addresses => {
+                creator.check(real, None, CheckType::CreateAddress)?;
                 self.add_routing_type(real, routing_type, info.temporary)?;
                 AutoCreate::Updated
             }
@@ -925,6 +967,13 @@ impl PostOffice {
                         let mut spec = QueueSpec::new(queue_name, real);
                         spec.routing_type = Some(routing_type);
                         spec.auto_created = true;
+                        spec.user = creator.user.map(str::to_owned);
+                        let check = if spec.durable {
+                            CheckType::CreateDurableQueue
+                        } else {
+                            CheckType::CreateNonDurableQueue
+                        };
+                        creator.check(real, Some(queue_name), check)?;
                         match self.create_queue(spec, true) {
                             Ok(_) => result = AutoCreate::Created,
                             Err(e) => return Err(e),
@@ -972,9 +1021,16 @@ impl PostOffice {
         message: &MessageRef,
         address: &str,
         routing_type: Option<RoutingType>,
+        creator: Creator<'_>,
     ) -> Result<Routed> {
         let mut out = Vec::new();
-        self.route_into(message, address, routing_type, Hop::client(), &mut out)?;
+        self.route_into(
+            message,
+            address,
+            routing_type,
+            Hop::client(creator),
+            &mut out,
+        )?;
         Ok(out)
     }
 
@@ -995,26 +1051,27 @@ impl PostOffice {
         message: &MessageRef,
         address: &str,
         routing_type: Option<RoutingType>,
-        hop: Hop,
+        hop: Hop<'_>,
         out: &mut Routed,
     ) -> Result<()> {
         let Hop {
             auto_create,
             depth,
             to_dla,
+            creator,
         } = hop;
         let (real, _) = split_fqqn(address);
         // checkAddress
         if auto_create
             && self.address_info(real).is_none()
-            && self.check_auto_create(address, routing_type)? == AutoCreate::NotFound
+            && self.check_auto_create(address, routing_type, creator)? == AutoCreate::NotFound
         {
             return Err(BrokerError::address_does_not_exist(real));
         }
         // simpleRoute
         let mut bindings = self.bindings_route(message, address);
         if bindings.is_none() && auto_create {
-            if self.check_auto_create(address, routing_type)? == AutoCreate::NotFound {
+            if self.check_auto_create(address, routing_type, creator)? == AutoCreate::NotFound {
                 return Err(BrokerError::address_does_not_exist(real));
             }
             bindings = self.bindings_route(message, address);
@@ -1279,26 +1336,28 @@ impl PostOffice {
 /// One step of a route: whether addresses and queues may be auto-created
 /// (a client's send may, a broker-made copy may not), how many diverts
 /// deep it is, and whether it already goes to a dead-letter address.
-#[derive(Debug, Clone, Copy)]
-struct Hop {
+#[derive(Clone, Copy)]
+struct Hop<'a> {
     auto_create: bool,
     depth: usize,
     to_dla: bool,
+    creator: Creator<'a>,
 }
 
-impl Hop {
-    fn client() -> Self {
+impl<'a> Hop<'a> {
+    fn client(creator: Creator<'a>) -> Self {
         Self {
             auto_create: true,
             depth: 0,
             to_dla: false,
+            creator,
         }
     }
 
     fn internal() -> Self {
         Self {
             auto_create: false,
-            ..Self::client()
+            ..Self::client(Creator::default())
         }
     }
 }

@@ -25,6 +25,20 @@ impl BrokerError {
         Self::new(kind, format!("AMQ{id}: {text}"))
     }
 
+    /// `ActiveMQSecurityException`.
+    pub fn security(e: saranga_security::SecurityError) -> Self {
+        Self::new(ErrorType::SecurityException, e.0)
+    }
+
+    /// `rejectEmptyValidatedUser`.
+    pub fn reject_empty_validated_user() -> Self {
+        Self::bundle(
+            ErrorType::IllegalState,
+            229225,
+            "Validated User is not set".to_owned(),
+        )
+    }
+
     /// `ActiveMQIllegalStateException` with a plain message.
     pub fn illegal_state(text: impl Into<String>) -> Self {
         Self::new(ErrorType::IllegalState, text)

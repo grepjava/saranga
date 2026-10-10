@@ -7,6 +7,7 @@ use std::sync::Arc;
 use anyhow::Context;
 
 mod data;
+mod instance;
 
 use clap::{Parser, Subcommand};
 use saranga_server::postoffice::SelectorFilters;
@@ -31,10 +32,16 @@ enum Command {
     Run {
         /// A broker.xml; its acceptors that speak CORE are opened. Its
         /// relative data directories are under the broker instance, the
-        /// directory above the file's (`<instance>/etc/broker.xml`). Without
-        /// one the broker keeps everything in memory.
-        #[arg(long)]
+        /// directory above the file's (`<instance>/etc/broker.xml`), and
+        /// `login.config` and `bootstrap.xml` next to it apply. Without a
+        /// configuration the broker keeps everything in memory and has no
+        /// security.
+        #[arg(long, conflicts_with = "etc")]
         config: Option<PathBuf>,
+        /// An Artemis instance's etc directory, used as `artemis run` uses
+        /// it: `bootstrap.xml` names `broker.xml` and the security domain.
+        #[arg(long)]
+        etc: Option<PathBuf>,
         /// Listen here instead of on the configured acceptors.
         #[arg(long)]
         bind: Option<SocketAddr>,
@@ -57,20 +64,16 @@ async fn main() -> anyhow::Result<()> {
         logs.init();
     }
     match cli.command {
-        Command::Run { config, bind } => run(config, bind).await,
+        Command::Run { config, etc, bind } => {
+            let instance = match (config, etc) {
+                (Some(c), _) => Some(instance::Instance::from_broker_xml(&c)?),
+                (None, Some(e)) => Some(instance::Instance::from_etc(&e)?),
+                (None, None) => None,
+            };
+            run(instance, bind).await
+        }
         Command::Data(cmd) => data::run(cmd),
     }
-}
-
-/// `<instance>/etc/broker.xml` -> `<instance>`.
-fn instance_dir(config: &Path) -> PathBuf {
-    let etc = config
-        .canonicalize()
-        .unwrap_or_else(|_| config.to_path_buf())
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default();
-    etc.parent().map(Path::to_path_buf).unwrap_or(etc)
 }
 
 /// How the broker was asked to stop.
@@ -99,15 +102,11 @@ async fn watch_stop_files(dir: PathBuf) -> Stop {
     }
 }
 
-async fn run(config: Option<PathBuf>, bind: Option<SocketAddr>) -> anyhow::Result<()> {
+async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> anyhow::Result<()> {
     let filters = Arc::new(SelectorFilters);
-    let (broker_config, mut binds) = match &config {
-        Some(path) => {
-            let file = saranga_config::BrokerConfig::from_file(path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            for w in &file.warnings {
-                tracing::warn!("{}: {w}", path.display());
-            }
+    let (broker_config, mut binds) = match &instance {
+        Some(instance) => {
+            let file = instance.broker_config()?;
             let binds = file
                 .acceptors
                 .iter()
@@ -121,10 +120,9 @@ async fn run(config: Option<PathBuf>, bind: Option<SocketAddr>) -> anyhow::Resul
                     (a.name.clone().unwrap_or_default(), format!("{host}:{port}"))
                 })
                 .collect();
-            (
-                BrokerConfig::from_file_config(&file, filters, &instance_dir(path))?,
-                binds,
-            )
+            let mut config = BrokerConfig::from_file_config(&file, filters, &instance.dir)?;
+            config.security = instance.security(&file)?;
+            (config, binds)
         }
         None => (BrokerConfig::new(filters), Vec::new()),
     };
@@ -144,10 +142,9 @@ async fn run(config: Option<PathBuf>, bind: Option<SocketAddr>) -> anyhow::Resul
         servers.spawn(broker.clone().serve(listener));
     }
     tracing::info!("AMQ221007: Server is now active");
-    let stop_dir = config
-        .as_deref()
-        .and_then(|c| c.canonicalize().ok())
-        .and_then(|c| c.parent().map(Path::to_path_buf));
+    let stop_dir = instance
+        .as_ref()
+        .and_then(|i| i.broker_xml.parent().map(Path::to_path_buf));
     let stop_files = async {
         match stop_dir {
             Some(dir) => watch_stop_files(dir).await,

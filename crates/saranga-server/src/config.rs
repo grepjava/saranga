@@ -284,6 +284,12 @@ impl BrokerConfig {
             // 2 GiB heap of an instance `artemis create` makes.
             global_max_size: config.global_max_size.unwrap_or(1 << 30),
             global_max_messages: config.global_max_messages,
+            // The security manager comes from outside broker.xml
+            // (`login.config`, `bootstrap.xml`): whoever starts the broker
+            // sets it.
+            security: None,
+            populate_validated_user: config.populate_validated_user,
+            reject_empty_validated_user: config.reject_empty_validated_user,
         })
     }
 }

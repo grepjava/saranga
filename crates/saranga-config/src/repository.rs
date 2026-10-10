@@ -226,6 +226,17 @@ impl<T> HierarchicalRepository<T> {
     }
 }
 
+impl<T> HierarchicalRepository<T> {
+    /// `getMatch` for values that do not merge: the most specific value
+    /// that applies, or the default.
+    pub fn get_most_specific(&self, address: &str) -> Option<&T> {
+        self.matches(address)
+            .into_iter()
+            .next()
+            .or(self.default.as_ref())
+    }
+}
+
 impl<T: Mergeable + Clone> HierarchicalRepository<T> {
     /// `getMatch`: merges every applicable value from most to least specific,
     /// or returns the default when nothing applies.

@@ -32,6 +32,8 @@ native() { command -v cygpath >/dev/null && cygpath -m "$1" || echo "$1"; }
 WORK="$(mktemp -d)"
 INSTANCE="$WORK/instance"          # Saranga's instance: etc/ and data/
 mkdir -p "$INSTANCE/etc" && cp "$CONFIG" "$INSTANCE/etc/broker.xml"
+# The login files the image makes for ANONYMOUS_LOGIN=true.
+cp "$ROOT"/tests/interop/etc/* "$INSTANCE/etc/"
 BROKER_PID=""
 cleanup() {
   [[ -n "$BROKER_PID" ]] && kill "$BROKER_PID" 2>/dev/null || true

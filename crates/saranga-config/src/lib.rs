@@ -13,11 +13,14 @@
 
 mod acceptor;
 mod address_settings;
+mod bootstrap;
 mod broker;
 mod bytes;
+pub mod mask;
 mod matcher;
 mod parser;
 mod repository;
+mod security;
 mod substitute;
 mod wildcard;
 
@@ -26,6 +29,7 @@ pub use address_settings::{
     AddressFullMessagePolicy, AddressSettings, DeletionPolicy, DiskFullMessagePolicy,
     PageFullMessagePolicy, SlowConsumerPolicy, SlowConsumerThresholdMeasurementUnit,
 };
+pub use bootstrap::{BootstrapConfig, BootstrapSecurity, file_uri_path};
 pub use broker::{
     AddressConfig, BrokerConfig, DivertConfig, DivertRoutingType, JournalConfig, JournalType,
     QueueConfig, TransformerConfig, Warning,
@@ -33,6 +37,7 @@ pub use broker::{
 pub use bytes::convert_text_bytes;
 pub use matcher::Match;
 pub use repository::{HierarchicalRepository, Mergeable, extract_address_name};
+pub use security::{CheckType, Role, SecuritySetting, SecuritySettingPluginConfig};
 pub use substitute::{replace_system_props, replace_system_props_from_env};
 pub use wildcard::WildcardConfiguration;
 
@@ -157,4 +162,20 @@ pub(crate) fn java_split(s: &str, sep: char) -> Vec<&str> {
 /// `Boolean.parseBoolean`: true only for "true" ignoring case, never fails.
 pub(crate) fn java_parse_bool(s: &str) -> bool {
     s.eq_ignore_ascii_case("true")
+}
+
+/// `ByteUtil.bytesToHex`: uppercase, two digits a byte.
+pub fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+/// `ByteUtil.hexToBytes`; `None` for an odd length or a non-hex digit.
+pub fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) || !hex.is_ascii() {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
 }

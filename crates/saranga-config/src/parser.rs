@@ -16,6 +16,8 @@ use crate::broker::{
     TransformerConfig, Warning,
 };
 use crate::bytes::convert_text_bytes;
+use crate::mask::{self, MaskError};
+use crate::security::{CheckType, Role, SecuritySetting, SecuritySettingPluginConfig};
 use crate::{ConfigError, Result, RoutingType, java_len, java_parse_bool, java_trim};
 
 const XINCLUDE_NS: &str = "http://www.w3.org/2001/XInclude";
@@ -435,6 +437,7 @@ fn parse_core(
     if let Some(v) = s.bool("large-message-sync") {
         config.large_message_sync = v;
     }
+    parse_security_options(&s, config)?;
 
     if let Some(v) = s.non_empty_string("large-messages-directory")? {
         config.large_messages_directory = v;
@@ -476,6 +479,7 @@ fn parse_core(
     }
 
     parse_acceptors(core, config, warnings)?;
+    parse_security_settings(core, config, warnings)?;
     parse_address_settings(core, config, warnings)?;
     parse_addresses(core, config, warnings)?;
     parse_diverts(core, config, warnings)?;
@@ -538,6 +542,167 @@ fn parse_acceptors(
         let mut acceptor = AcceptorConfig::parse(name, uri)?;
         acceptor.lock_coordinator = node.attribute("lock-coordinator").map(str::to_owned);
         config.acceptors.push(acceptor);
+    }
+    Ok(())
+}
+
+fn mask_error(name: &str, value: &str, e: MaskError) -> ConfigError {
+    ConfigError::invalid(name, value, e.to_string())
+}
+
+/// The security options of `<core>`, in the order `parseMainConfig` reads
+/// them: the codec settings come before `cluster-password`, which they
+/// decode.
+fn parse_security_options(s: &Settings<'_, '_>, config: &mut BrokerConfig) -> Result<()> {
+    if let Some(v) = s.i64("security-invalidation-interval", Check::GeZero)? {
+        config.security_invalidation_interval = v;
+    }
+    if let Some(v) = s.i64("authentication-cache-size", Check::GeZero)? {
+        config.authentication_cache_size = v;
+    }
+    if let Some(v) = s.i64("authorization-cache-size", Check::GeZero)? {
+        config.authorization_cache_size = v;
+    }
+    config.mask_password = s.bool("mask-password");
+    if let Some(v) = s.non_empty_string("password-codec")? {
+        config.password_codec = v;
+    }
+    if let Some(v) = s.bool("populate-validated-user") {
+        config.populate_validated_user = v;
+    }
+    if let Some(v) = s.bool("reject-empty-validated-user") {
+        config.reject_empty_validated_user = v;
+    }
+    if let Some(text) = s.string("cluster-password") {
+        config.cluster_password =
+            mask::resolve_mask(config.mask_password, &text, Some(&config.password_codec))
+                .map_err(|e| mask_error("cluster-password", &text, e))?;
+    }
+    if let Some(v) = s.string("cluster-user") {
+        config.cluster_user = v;
+    }
+    Ok(())
+}
+
+fn required_attribute(n: Node<'_, '_>, attribute: &str) -> Result<String> {
+    n.attribute(attribute)
+        .map(str::to_owned)
+        .ok_or_else(|| ConfigError::MissingAttribute {
+            element: n.tag_name().name().to_owned(),
+            attribute: attribute.to_owned(),
+        })
+}
+
+/// `parseSecurity`: role mappings first, then each `<security-setting>`
+/// with its role names mapped, then the plugins.
+fn parse_security_settings(
+    core: Node<'_, '_>,
+    config: &mut BrokerConfig,
+    warnings: &mut Vec<Warning>,
+) -> Result<()> {
+    let Some(list) = first(core, "security-settings") else {
+        return Ok(());
+    };
+    warn_unknown_children(
+        warnings,
+        list,
+        &[
+            "security-setting",
+            "security-setting-plugin",
+            "role-mapping",
+        ],
+    );
+
+    // Internal role -> the external role names mapped onto it.
+    let mut mappings: Vec<(String, Vec<String>)> = Vec::new();
+    for node in all(list, "role-mapping") {
+        let external = java_trim(&required_attribute(node, "from")?).to_owned();
+        let to = required_attribute(node, "to")?;
+        for internal in crate::java_split(&to, ',') {
+            let internal = java_trim(internal);
+            match mappings.iter_mut().find(|(k, _)| k == internal) {
+                Some((_, names)) => {
+                    if !names.contains(&external) {
+                        names.push(external.clone());
+                    }
+                }
+                None if !internal.is_empty() && !external.is_empty() => {
+                    mappings.push((internal.to_owned(), vec![external.clone()]));
+                }
+                None => {}
+            }
+        }
+    }
+
+    for node in all(list, "security-setting") {
+        let m = required_attribute(node, "match")?;
+        let mut roles: Vec<Role> = Vec::new();
+        let permissions =
+            elements(node).filter(|c| c.tag_name().name().eq_ignore_ascii_case("permission"));
+        for permission in permissions {
+            let kind = required_attribute(permission, "type")?;
+            let names = required_attribute(permission, "roles")?;
+            let check = CheckType::from_permission(&kind);
+            if check.is_none() {
+                warnings.push(Warning::UnknownPermission {
+                    r#type: kind.clone(),
+                });
+            }
+            // `getMappedRoleNames`: the mapped names, then the name itself.
+            let mut mapped: Vec<&str> = Vec::new();
+            for name in crate::java_split(&names, ',') {
+                if let Some((_, external)) = mappings.iter().find(|(k, _)| k == name) {
+                    mapped.extend(external.iter().map(String::as_str));
+                }
+                mapped.push(name);
+            }
+            for name in mapped {
+                let name = java_trim(name);
+                let i = match roles.iter().position(|r| r.name == name) {
+                    Some(i) => i,
+                    None => {
+                        roles.push(Role::new(name, []));
+                        roles.len() - 1
+                    }
+                };
+                if let Some(check) = check {
+                    roles[i].grant(check);
+                }
+            }
+        }
+        // `putSecurityRoles` is a map put: a repeated match replaces.
+        let setting = SecuritySetting { roles };
+        match config.security_settings.iter_mut().find(|(k, _)| *k == m) {
+            Some(entry) => entry.1 = setting,
+            None => config.security_settings.push((m, setting)),
+        }
+    }
+
+    for node in all(list, "security-setting-plugin") {
+        let class_name = required_attribute(node, "class-name")?;
+        let mut settings = Vec::new();
+        let children =
+            elements(node).filter(|c| c.tag_name().name().eq_ignore_ascii_case("setting"));
+        for setting in children {
+            let name = setting.attribute("name").unwrap_or_default().to_owned();
+            let mut value = setting.attribute("value").unwrap_or_default().to_owned();
+            if mask::is_enc_masked(&value) {
+                value =
+                    mask::resolve_mask(config.mask_password, &value, Some(&config.password_codec))
+                        .map_err(|e| mask_error(&name, &value, e))?;
+            }
+            settings.push((name, value));
+        }
+        warnings.push(Warning::Unsupported {
+            name: "security-setting-plugin".to_owned(),
+            reason: "security setting plugins are not supported; use <security-setting>",
+        });
+        config
+            .security_setting_plugins
+            .push(SecuritySettingPluginConfig {
+                class_name,
+                settings,
+            });
     }
     Ok(())
 }

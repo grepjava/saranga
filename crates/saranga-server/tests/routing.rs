@@ -87,7 +87,7 @@ async fn exclusive_divert_takes_matching_messages() {
     let b = broker(true).await;
     let routed = b
         .post_office()
-        .route(&message(1, "red"), "src", None)
+        .route(&message(1, "red"), "src", None, Default::default())
         .unwrap();
     assert_eq!(queues(&routed), ["dst"]);
     let copy = routed[0].0.message.core();
@@ -103,7 +103,7 @@ async fn exclusive_divert_takes_matching_messages() {
     // A message the filter does not match stays on its address.
     let routed = b
         .post_office()
-        .route(&message(2, "blue"), "src", None)
+        .route(&message(2, "blue"), "src", None, Default::default())
         .unwrap();
     assert_eq!(queues(&routed), ["src"]);
 }
@@ -113,7 +113,7 @@ async fn non_exclusive_divert_copies() {
     let b = broker(false).await;
     let routed = b
         .post_office()
-        .route(&message(1, "red"), "src", None)
+        .route(&message(1, "red"), "src", None, Default::default())
         .unwrap();
     assert_eq!(queues(&routed), ["src", "dst"]);
     assert_eq!(routed[0].0.message_id(), 1);
