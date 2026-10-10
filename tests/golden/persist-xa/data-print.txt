@@ -1,0 +1,159 @@
+     _        _               _
+    / \  ____| |_  ___ __  __(_) _____
+   / _ \|  _ \ __|/ _ \  \/  | |/  __/
+  / ___ \ | \/ |_/  __/ |\/| | |\___ \
+ /_/   \_\|   \__\____|_|  |_|_|/___ /
+ Apache Artemis 2.57.0
+
+
+
+********************************************
+Server's ID=fa085b1c-c4a7-11f1-b4f4-de1c6c8aa691
+********************************************
+
+********************************************
+B I N D I N G S  J O U R N A L
+********************************************
+Journal path: /golden/data/bindings
+#JournalFileImpl: (activemq-bindings-1.bindings id = 1, recordID = 1) (size=1048576)
+operation@AddRecord;recordID=1;userRecordType=24;isUpdate=false;compactCount=0;IDCounterEncoding [id=2147483647]
+operation@AddRecordTX;txID=0,recordID=2;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=2, name=DLQ, routingTypes={ANYCAST}, autoCreated=false, internal=false]
+operation@Commit;txID=0,numberOfRecords=1
+operation@AddRecordTX;txID=4,recordID=3;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=3, name=DLQ, address=DLQ, routingType=ANYCAST, filterString=null, durable=null, user=null, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=true, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=false, fqqn=null]]
+operation@Commit;txID=4,numberOfRecords=1
+operation@AddRecordTX;txID=5,recordID=6;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=6, name=ExpiryQueue, routingTypes={ANYCAST}, autoCreated=false, internal=false]
+operation@Commit;txID=5,numberOfRecords=1
+operation@AddRecordTX;txID=8,recordID=7;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=7, name=ExpiryQueue, address=ExpiryQueue, routingType=ANYCAST, filterString=null, durable=null, user=null, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=true, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=false, fqqn=null]]
+operation@Commit;txID=8,numberOfRecords=1
+operation@AddRecordTX;txID=9,recordID=10;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=10, name=activemq.notifications, routingTypes={MULTICAST}, autoCreated=false, internal=false]
+operation@Commit;txID=9,numberOfRecords=1
+operation@AddRecordTX;txID=11,recordID=12;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=12, name=$sys.mqtt.sessions, routingTypes={ANYCAST}, autoCreated=true, internal=true]
+operation@Commit;txID=11,numberOfRecords=1
+operation@AddRecordTX;txID=14,recordID=13;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=13, name=$sys.mqtt.sessions, address=$sys.mqtt.sessions, routingType=ANYCAST, filterString=null, durable=null, user=null, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=true, lastValueKey=_AMQ_LVQ_NAME, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=true, transient=null, autoCreated=false, fqqn=null]]
+operation@Commit;txID=14,numberOfRecords=1
+operation@AddRecordTX;txID=19,recordID=20;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=20, name=persist.xa, routingTypes={ANYCAST}, autoCreated=true, internal=false]
+operation@Commit;txID=19,numberOfRecords=1
+operation@AddRecordTX;txID=22,recordID=21;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=21, name=persist.xa, address=persist.xa, routingType=ANYCAST, filterString=null, durable=null, user=artemis, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=true, fqqn=null]]
+operation@Commit;txID=22,numberOfRecords=1
+operation@AddRecordTX;txID=30,recordID=31;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=31, name=persist.xa.other, routingTypes={ANYCAST}, autoCreated=true, internal=false]
+operation@Commit;txID=30,numberOfRecords=1
+operation@AddRecordTX;txID=33,recordID=32;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=32, name=persist.xa.other, address=persist.xa.other, routingType=ANYCAST, filterString=null, durable=null, user=artemis, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=true, fqqn=null]]
+operation@Commit;txID=33,numberOfRecords=1
+operation@AddRecord;recordID=80;userRecordType=24;isUpdate=false;compactCount=0;IDCounterEncoding [id=80]
+#JournalFileImpl: (activemq-bindings-2.bindings id = 2, recordID = 2) (size=1048576)
+
+### Surviving Records Summary ###
+recordID=1;userRecordType=24;isUpdate=false;compactCount=0;IDCounterEncoding [id=2147483647]
+recordID=2;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=2, name=DLQ, routingTypes={ANYCAST}, autoCreated=false, internal=false]
+recordID=3;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=3, name=DLQ, address=DLQ, routingType=ANYCAST, filterString=null, durable=null, user=null, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=true, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=false, fqqn=null]]
+recordID=6;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=6, name=ExpiryQueue, routingTypes={ANYCAST}, autoCreated=false, internal=false]
+recordID=7;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=7, name=ExpiryQueue, address=ExpiryQueue, routingType=ANYCAST, filterString=null, durable=null, user=null, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=true, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=false, fqqn=null]]
+recordID=10;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=10, name=activemq.notifications, routingTypes={MULTICAST}, autoCreated=false, internal=false]
+recordID=12;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=12, name=$sys.mqtt.sessions, routingTypes={ANYCAST}, autoCreated=true, internal=true]
+recordID=13;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=13, name=$sys.mqtt.sessions, address=$sys.mqtt.sessions, routingType=ANYCAST, filterString=null, durable=null, user=null, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=true, lastValueKey=_AMQ_LVQ_NAME, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=true, transient=null, autoCreated=false, fqqn=null]]
+recordID=20;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=20, name=persist.xa, routingTypes={ANYCAST}, autoCreated=true, internal=false]
+recordID=21;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=21, name=persist.xa, address=persist.xa, routingType=ANYCAST, filterString=null, durable=null, user=artemis, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=true, fqqn=null]]
+recordID=31;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=31, name=persist.xa.other, routingTypes={ANYCAST}, autoCreated=true, internal=false]
+recordID=32;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=32, name=persist.xa.other, address=persist.xa.other, routingType=ANYCAST, filterString=null, durable=null, user=artemis, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=true, fqqn=null]]
+recordID=80;userRecordType=24;isUpdate=false;compactCount=0;IDCounterEncoding [id=80]
+
+### Prepared TX ###
+
+### Message Counts ###
+message count=0
+large message count=0
+message reference count
+prepared message count=0
+prepared large message count=0
+prepared message reference count
+
+********************************************
+M E S S A G E S   J O U R N A L
+********************************************
+Journal path: /golden/data/journal
+#JournalFileImpl: (activemq-data-1.amq id = 1, recordID = 1) (size=10485760)
+operation@AddRecord;recordID=24;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=24;userMessageID=fd27277f-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=24, durable=true, userID=fd27277f-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=240, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, _AMQ_ROUTING_TYPE=1]]@1186339926
+operation@Update;recordID=24;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@AddRecord;recordID=25;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=25;userMessageID=fd299880-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=25, durable=true, userID=fd299880-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=240, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, _AMQ_ROUTING_TYPE=1]]@872669868
+operation@Update;recordID=25;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@AddRecord;recordID=26;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=26;userMessageID=fd2a34c1-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=26, durable=true, userID=fd2a34c1-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=240, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, _AMQ_ROUTING_TYPE=1]]@1706099897
+operation@Update;recordID=26;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@AddRecord;recordID=27;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=27;userMessageID=fd2ad102-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=27, durable=true, userID=fd2ad102-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=240, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, _AMQ_ROUTING_TYPE=1]]@1816756435
+operation@Update;recordID=27;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@AddRecord;recordID=28;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=28;userMessageID=fd2b6d43-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=28, durable=true, userID=fd2b6d43-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=240, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, _AMQ_ROUTING_TYPE=1]]@846974653
+operation@Update;recordID=28;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@AddRecord;recordID=29;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=29;userMessageID=fd2be274-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=29, durable=true, userID=fd2be274-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=240, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, _AMQ_ROUTING_TYPE=1]]@432430300
+operation@Update;recordID=29;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@AddRecordTX;txID=40,recordID=41;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=41;userMessageID=fd329936-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=41, durable=true, userID=fd329936-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=273, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, tag=x1-send-1, _AMQ_ROUTING_TYPE=1]]@1958680465
+operation@UpdateTX;txID=40,recordID=41;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@AddRecordTX;txID=40,recordID=42;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=42;userMessageID=fd32e757-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=42, durable=true, userID=fd32e757-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=273, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, tag=x1-send-2, _AMQ_ROUTING_TYPE=1]]@1414549197
+operation@UpdateTX;txID=40,recordID=42;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@UpdateTX;txID=40,recordID=24;userRecordType=33;isUpdate=true;compactCount=0;ACK;QueueEncoding [queueID=21]
+operation@Prepare,txID=40,numberOfRecords=5,extraData=UEVSUwAAABBwZXJzaXN0LWJyYW5jaC0xAAAAEHBlcnNpc3QtZ2xvYmFsLTE=, xid=XidImpl (1489933928 bq:112.101.114.115.105.115.116.45.98.114.97.110.99.104.45.49 formatID:1346720339 gtxid:112.101.114.115.105.115.116.45.103.108.111.98.97.108.45.49 base64:cGVyc2lzdC1icmFuY2gtMXBlcnNpc3QtZ2xvYmFsLTE755VQ
+operation@AddRecordTX;txID=47,recordID=48;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=48;userMessageID=fd38dac8-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=48, durable=true, userID=fd38dac8-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=273, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, tag=x2-send-1, _AMQ_ROUTING_TYPE=1]]@1741786839
+operation@UpdateTX;txID=47,recordID=48;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@UpdateTX;txID=47,recordID=25;userRecordType=33;isUpdate=true;compactCount=0;ACK;QueueEncoding [queueID=21]
+operation@Prepare,txID=47,numberOfRecords=3,extraData=UEVSUwAAABBwZXJzaXN0LWJyYW5jaC0yAAAAEHBlcnNpc3QtZ2xvYmFsLTI=, xid=XidImpl (746115872 bq:112.101.114.115.105.115.116.45.98.114.97.110.99.104.45.50 formatID:1346720339 gtxid:112.101.114.115.105.115.116.45.103.108.111.98.97.108.45.50 base64:cGVyc2lzdC1icmFuY2gtMnBlcnNpc3QtZ2xvYmFsLTI755VQ
+operation@Commit;txID=47,numberOfRecords=3
+operation@DeleteRecord;recordID=25
+operation@AddRecordTX;txID=53,recordID=54;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=54;userMessageID=fd3d4799-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=54, durable=true, userID=fd3d4799-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=273, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, tag=x3-send-1, _AMQ_ROUTING_TYPE=1]]@20111564
+operation@UpdateTX;txID=53,recordID=54;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@UpdateTX;txID=53,recordID=26;userRecordType=33;isUpdate=true;compactCount=0;ACK;QueueEncoding [queueID=21]
+operation@Prepare,txID=53,numberOfRecords=3,extraData=UEVSUwAAABBwZXJzaXN0LWJyYW5jaC0zAAAAEHBlcnNpc3QtZ2xvYmFsLTM=, xid=XidImpl (2065718717 bq:112.101.114.115.105.115.116.45.98.114.97.110.99.104.45.51 formatID:1346720339 gtxid:112.101.114.115.105.115.116.45.103.108.111.98.97.108.45.51 base64:cGVyc2lzdC1icmFuY2gtM3BlcnNpc3QtZ2xvYmFsLTM755VQ
+operation@Rollback;txID=53
+operation@Update;recordID=26;userRecordType=34;isUpdate=true;compactCount=0;DeliveryCountUpdateEncoding [queueID=21, count=1]
+operation@AddRecordTX;txID=59,recordID=60;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=60;userMessageID=fd40f11a-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=60, durable=true, userID=fd40f11a-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa.other, size=301, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, tag=x4-send-other, _AMQ_ROUTING_TYPE=1]]@359742806
+operation@UpdateTX;txID=59,recordID=60;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=32]
+operation@UpdateTX;txID=59,recordID=26;userRecordType=33;isUpdate=true;compactCount=0;ACK;QueueEncoding [queueID=21]
+operation@Prepare,txID=59,numberOfRecords=3,extraData=UEVSUwAAABBwZXJzaXN0LWJyYW5jaC00AAAAEHBlcnNpc3QtZ2xvYmFsLTQ=, xid=XidImpl (1676827075 bq:112.101.114.115.105.115.116.45.98.114.97.110.99.104.45.52 formatID:1346720339 gtxid:112.101.114.115.105.115.116.45.103.108.111.98.97.108.45.52 base64:cGVyc2lzdC1icmFuY2gtNHBlcnNpc3QtZ2xvYmFsLTQ755VQ
+operation@AddRecordTX;txID=65,recordID=66;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=66;userMessageID=fd43d74b-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=66, durable=true, userID=fd43d74b-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=285, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, tag=x5-one-phase, _AMQ_ROUTING_TYPE=1]]@651100072
+operation@UpdateTX;txID=65,recordID=66;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@Commit;txID=65,numberOfRecords=2
+operation@AddRecordTX;txID=67,recordID=68;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=68;userMessageID=fd44c1ac-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=68, durable=true, userID=fd44c1ac-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=293, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, tag=x6-rolled-back, _AMQ_ROUTING_TYPE=1]]@1611370719
+operation@UpdateTX;txID=67,recordID=68;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@Rollback;txID=67
+#JournalFileImpl: (activemq-data-2.amq id = 2, recordID = 2) (size=10485760)
+
+### Surviving Records Summary ###
+recordID=24;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=24;userMessageID=fd27277f-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=24, durable=true, userID=fd27277f-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=240, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, _AMQ_ROUTING_TYPE=1]]@1971519316
+recordID=24;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+recordID=26;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=26;userMessageID=fd2a34c1-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=26, durable=true, userID=fd2a34c1-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=240, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, _AMQ_ROUTING_TYPE=1]]@1733581655
+recordID=26;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+recordID=27;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=27;userMessageID=fd2ad102-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=27, durable=true, userID=fd2ad102-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=240, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, _AMQ_ROUTING_TYPE=1]]@1814827909
+recordID=27;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+recordID=28;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=28;userMessageID=fd2b6d43-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=28, durable=true, userID=fd2b6d43-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=240, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, _AMQ_ROUTING_TYPE=1]]@1597328335
+recordID=28;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+recordID=29;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=29;userMessageID=fd2be274-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=29, durable=true, userID=fd2be274-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=240, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, _AMQ_ROUTING_TYPE=1]]@1034909474
+recordID=29;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+recordID=48;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=48;userMessageID=fd38dac8-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=48, durable=true, userID=fd38dac8-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=273, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, tag=x2-send-1, _AMQ_ROUTING_TYPE=1]]@2019826979
+recordID=48;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+recordID=26;userRecordType=34;isUpdate=true;compactCount=0;DeliveryCountUpdateEncoding [queueID=21, count=1]
+recordID=66;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=66;userMessageID=fd43d74b-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=66, durable=true, userID=fd43d74b-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=285, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, tag=x5-one-phase, _AMQ_ROUTING_TYPE=1]]@1951963537
+recordID=66;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+
+### Prepared TX ###
+40
+- recordID=41;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=41;userMessageID=fd329936-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=41, durable=true, userID=fd329936-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=273, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, tag=x1-send-1, _AMQ_ROUTING_TYPE=1]]@21422054
+- recordID=41;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+- recordID=42;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=42;userMessageID=fd32e757-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=42, durable=true, userID=fd32e757-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa, size=273, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, tag=x1-send-2, _AMQ_ROUTING_TYPE=1]]@1192672907
+- recordID=42;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+- recordID=24;userRecordType=33;isUpdate=true;compactCount=0;ACK;QueueEncoding [queueID=21]
+59
+- recordID=60;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=60;userMessageID=fd40f11a-c4a7-11f1-a0cf-00155d1c7a2e;msg=CoreMessage[messageID=60, durable=true, userID=fd40f11a-c4a7-11f1-a0cf-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 12:42:01 UTC 2026, expiration=0, durable=true, address=persist.xa.other, size=301, properties=TypedProperties[__AMQ_CID=fd15c25b-c4a7-11f1-a0cf-00155d1c7a2e, tag=x4-send-other, _AMQ_ROUTING_TYPE=1]]@532885071
+- recordID=60;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=32]
+- recordID=26;userRecordType=33;isUpdate=true;compactCount=0;ACK;QueueEncoding [queueID=21]
+
+### Message Counts ###
+message count=7
+large message count=0
+message reference count
+queue id 21,count=7
+prepared message count=3
+prepared large message count=0
+prepared message reference count
+queue id 32,count=1
+queue id 21,count=2
+
+********************************************
+P A G I N G
+********************************************
