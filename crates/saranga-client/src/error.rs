@@ -5,87 +5,8 @@ use std::sync::Arc;
 
 use saranga_buffer::DecodeError;
 
-macro_rules! error_types {
-    ($($variant:ident = $code:expr),* $(,)?) => {
-        /// `ActiveMQExceptionType`, with the same numeric codes.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        #[non_exhaustive]
-        pub enum ErrorType {
-            $($variant,)*
-        }
-
-        impl ErrorType {
-            /// The Artemis exception code.
-            pub fn code(self) -> i32 {
-                match self {
-                    $(Self::$variant => $code,)*
-                }
-            }
-
-            /// The type for an Artemis exception code, if it is a known one.
-            pub fn from_code(code: i32) -> Option<Self> {
-                match code {
-                    $($code => Some(Self::$variant),)*
-                    _ => None,
-                }
-            }
-        }
-    };
-}
-
-error_types! {
-    InternalError = 0,
-    UnsupportedPacket = 1,
-    NotConnected = 2,
-    ConnectionTimedOut = 3,
-    Disconnected = 4,
-    Unblocked = 5,
-    IoError = 6,
-    QueueDoesNotExist = 100,
-    QueueExists = 101,
-    ObjectClosed = 102,
-    InvalidFilterExpression = 103,
-    IllegalState = 104,
-    SecurityException = 105,
-    AddressDoesNotExist = 106,
-    AddressExists = 107,
-    IncompatibleClientServerVersions = 108,
-    LargeMessageErrorBody = 110,
-    TransactionRolledBack = 111,
-    SessionCreationRejected = 112,
-    DuplicateIdRejected = 113,
-    DuplicateMetadata = 114,
-    TransactionOutcomeUnknown = 115,
-    AlreadyReplicating = 116,
-    InterceptorRejectedPacket = 117,
-    InvalidTransientQueueUse = 118,
-    RemoteDisconnect = 119,
-    TransactionTimeout = 120,
-    GenericException = 999,
-    NativeErrorInternal = 200,
-    NativeErrorInvalidBuffer = 201,
-    NativeErrorNotAligned = 202,
-    NativeErrorCantInitializeAio = 203,
-    NativeErrorCantReleaseAio = 204,
-    NativeErrorCantOpenCloseFile = 205,
-    NativeErrorCantAllocateQueue = 206,
-    NativeErrorPreallocateFile = 208,
-    NativeErrorAllocateMemory = 209,
-    AddressFull = 210,
-    LargeMessageInterrupted = 211,
-    ClusterSecurityException = 212,
-    NotImplementedException = 213,
-    MaxConsumerLimitExceeded = 214,
-    UnexpectedRoutingTypeForAddress = 215,
-    InvalidQueueConfiguration = 216,
-    DeleteAddressError = 217,
-    NullRef = 218,
-    ShutdownError = 219,
-    ReplicationTimeoutError = 220,
-    DivertDoesNotExist = 221,
-    RoutingException = 222,
-    TimeoutException = 223,
-}
+/// `ActiveMQExceptionType`, shared with the broker (ADR 0003).
+pub use saranga_core_protocol::ErrorType;
 
 /// A client error. Broker exceptions and the client-side failures Artemis
 /// reports as `ActiveMQException` keep their exception code.
@@ -135,9 +56,10 @@ impl Error {
         }
     }
 
-    /// The Artemis exception type, when the code is a known one.
+    /// The Artemis exception type (`ActiveMQExceptionType.getType`:
+    /// unknown codes are `GenericException`).
     pub fn kind(&self) -> Option<ErrorType> {
-        self.code().and_then(ErrorType::from_code)
+        self.code().map(ErrorType::from_code)
     }
 
     // `ActiveMQClientMessageBundle` messages the client raises itself.
@@ -227,9 +149,9 @@ mod tests {
     #[test]
     fn codes_roundtrip() {
         for code in [0, 5, 100, 113, 210, 223, 999] {
-            assert_eq!(ErrorType::from_code(code).unwrap().code(), code);
+            assert_eq!(ErrorType::from_code(code).code(), code);
         }
-        assert_eq!(ErrorType::from_code(207), None);
+        assert_eq!(ErrorType::from_code(207), ErrorType::GenericException);
         let e = Error::amq(ErrorType::QueueDoesNotExist, "x");
         assert_eq!(e.code(), Some(100));
         assert_eq!(e.kind(), Some(ErrorType::QueueDoesNotExist));

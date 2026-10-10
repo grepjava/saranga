@@ -6,7 +6,7 @@ Saranga is built in twelve phases. Each one ends with something runnable, and it
 |---|---|---|
 | 0 | Foundation | Done |
 | 1 | Encoding primitives | Done |
-| 2 | Single-node in-memory broker (Core) | In progress |
+| 2 | Single-node in-memory broker (Core) | Done |
 | 3 | Persistence, on-disk compatible (first usable release) | Not started |
 | 4 | Queue semantics parity | Not started |
 | 5 | Paging and large messages | Not started |
@@ -45,7 +45,7 @@ Phase 3 is the first release anyone could adopt. Every phase after it can ship a
 - 208 fixtures encoded by the Java classes re-encode byte for byte (`tests/golden_packets.rs`).
 - Every packet type constant in Artemis has a decoder.
 
-## Phase 2: Single-node in-memory broker, Core protocol (in progress)
+## Phase 2: Single-node in-memory broker, Core protocol (done)
 
 **Scope**
 - TCP acceptor (`saranga-transport`) that accepts the `ARTEMIS` handshake and Core frames.
@@ -63,9 +63,9 @@ Phase 3 is the first release anyone could adopt. Every phase after it can ship a
 - The Artemis JMS client passes send/receive, queue, topic, durable-subscription, transacted and client-ack tests against `saranga run`. `scripts/interop.sh saranga` runs [tests/interop/jms/Phase2.java](tests/interop/jms/Phase2.java) (24 tests) and the `core-basic` golden scenario; `scripts/interop.sh artemis` runs the same suite against the reference broker, so a wrong test shows up there first.
 - The Rust client sends and receives through Saranga.
 
-**Progress**
-- Done: the broker core, `saranga run --config`, selectors. All 24 JMS interop tests and `core-basic` pass against Saranga, as they do against Artemis 2.57.0.
-- Remaining: the Rust client and its CI tests against Saranga.
+**Exit check (met)**
+- All 24 JMS interop tests and the `core-basic` golden scenario pass against `saranga run`, as they do against Artemis 2.57.0.
+- The Rust client (`saranga-client`) passes the same 9 broker tests against Saranga and against Artemis. CI runs them against `saranga run` on Linux and Windows.
 
 **Deferred to later phases on purpose:** XA (Phase 3), large messages (Phase 5), expiry and dead-letter addresses, redelivery delay and max delivery attempts (Phase 4), acceptor address prefixes and the 1.x client prefixes (Phase 6), security (Phase 6).
 
