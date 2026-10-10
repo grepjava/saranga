@@ -133,6 +133,22 @@ packet_enum! {
     FederationDownstreamConnectMessage,
     // ---- end cluster ----
     // ---- replication ----
+    ReplicationResponseMessage,
+    ReplicationResponseMessageV2,
+    ReplicationAddMessage,
+    ReplicationAddTXMessage,
+    ReplicationDeleteMessage,
+    ReplicationDeleteTXMessage,
+    ReplicationPrepareMessage,
+    ReplicationCommitMessage,
+    ReplicationPageWriteMessage,
+    ReplicationPageEventMessage,
+    ReplicationLargeMessageBeginMessage,
+    ReplicationLargeMessageEndMessage,
+    ReplicationLargeMessageWriteMessage,
+    ReplicationSyncFileMessage,
+    ReplicationStartSyncMessage,
+    ReplicationPrimaryIsStoppingMessage,
     // ---- end replication ----
 }
 
@@ -268,6 +284,32 @@ impl Packet {
             types::SCALEDOWN_ANNOUNCEMENT => body::<ScaleDownAnnounceMessage>(r, ctx),
             // ---- end cluster ----
             // ---- replication ----
+            // ServerPacketDecoder only; both ends of a replication connection
+            // use it, so these decode the same in either direction.
+            types::REPLICATION_APPEND => body::<ReplicationAddMessage>(r, ctx),
+            types::REPLICATION_APPEND_TX => body::<ReplicationAddTXMessage>(r, ctx),
+            types::REPLICATION_DELETE => body::<ReplicationDeleteMessage>(r, ctx),
+            types::REPLICATION_DELETE_TX => body::<ReplicationDeleteTXMessage>(r, ctx),
+            types::REPLICATION_PREPARE => body::<ReplicationPrepareMessage>(r, ctx),
+            types::REPLICATION_COMMIT_ROLLBACK => body::<ReplicationCommitMessage>(r, ctx),
+            types::REPLICATION_RESPONSE => body::<ReplicationResponseMessage>(r, ctx),
+            types::REPLICATION_RESPONSE_V2 => body::<ReplicationResponseMessageV2>(r, ctx),
+            types::REPLICATION_PAGE_WRITE => body::<ReplicationPageWriteMessage>(r, ctx),
+            types::REPLICATION_PAGE_EVENT => body::<ReplicationPageEventMessage>(r, ctx),
+            types::REPLICATION_LARGE_MESSAGE_BEGIN => {
+                body::<ReplicationLargeMessageBeginMessage>(r, ctx)
+            }
+            types::REPLICATION_LARGE_MESSAGE_END => {
+                body::<ReplicationLargeMessageEndMessage>(r, ctx)
+            }
+            types::REPLICATION_LARGE_MESSAGE_WRITE => {
+                body::<ReplicationLargeMessageWriteMessage>(r, ctx)
+            }
+            types::REPLICATION_START_FINISH_SYNC => body::<ReplicationStartSyncMessage>(r, ctx),
+            types::REPLICATION_SYNC_FILE => body::<ReplicationSyncFileMessage>(r, ctx),
+            types::REPLICATION_SCHEDULED_FAILOVER => {
+                body::<ReplicationPrimaryIsStoppingMessage>(r, ctx)
+            }
             // ---- end replication ----
             _ => Ok(Self::unknown(ty, r)),
         }
