@@ -328,6 +328,13 @@ version = "0.0.1"
 [[package]]
 name = "saranga-client"
 version = "0.0.1"
+dependencies = [
+ "saranga-buffer",
+ "saranga-core-protocol",
+ "saranga-message",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "saranga-cluster"
