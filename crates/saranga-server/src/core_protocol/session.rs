@@ -28,6 +28,7 @@ use crate::postoffice::{
     BindingQueryResult, QueueQueryResult, QueueSpec, RoutingTypes, queue_name_of,
 };
 use crate::queue::{ConsumerId, ConsumerRegistration, Queue};
+use crate::storage::Pending;
 use crate::{Broker, BrokerError, Name, Result, RoutingType};
 
 /// What the connection hands a session task.
@@ -83,6 +84,89 @@ struct Confirmations {
     received_bytes: i64,
 }
 
+/// A request's confirmation and response, sent once the journal writes it
+/// lined up are done (`OperationContext.executeOnCompletion` with
+/// `doConfirmAndResponse`).
+struct Done {
+    waits: Vec<Pending>,
+    request: Request,
+    response: Option<Packet>,
+    flush: bool,
+}
+
+/// Sends confirmations and responses in request order, each after the
+/// journal writes its request lined up. The session goes on with the next
+/// packets meanwhile, as Artemis's handler does.
+async fn completer(
+    conn: Arc<ConnShared>,
+    channel_id: i64,
+    mut confirmations: Confirmations,
+    mut rx: mpsc::UnboundedReceiver<Done>,
+) {
+    while let Some(done) = rx.recv().await {
+        let mut failure = None;
+        for w in done.waits {
+            if let Err(e) = w.wait().await {
+                failure.get_or_insert(e);
+            }
+        }
+        let response = match failure {
+            // OperationContext.onError: the client gets the I/O error.
+            Some(e) => Some(exception_packet(
+                done.request,
+                &BrokerError::new(ErrorType::IoError, e.to_string()),
+            )),
+            None => done.response,
+        };
+        let failed = matches!(
+            response,
+            Some(Packet::ActiveMQExceptionMessage(_) | Packet::ActiveMQExceptionMessageV2(_))
+        );
+        if !failed && let Some(id) = confirmations.confirm(done.request, done.flush) {
+            conn.send(channel_id, PacketsConfirmedMessage { command_id: id });
+        }
+        if let Some(response) = response {
+            conn.send(channel_id, response);
+        }
+    }
+}
+
+impl Confirmations {
+    /// `ChannelImpl.confirm` / `flushConfirmations`: the command ID to
+    /// confirm, when it is time to send one.
+    fn confirm(&mut self, request: Request, flush: bool) -> Option<i32> {
+        if self.window == -1 || !request.requires_confirmations {
+            return None;
+        }
+        self.last_command_id += 1;
+        self.received_bytes += request.size as i64;
+        if self.received_bytes >= i64::from(self.window) || (flush && self.received_bytes != 0) {
+            self.received_bytes = 0;
+            return Some(self.last_command_id);
+        }
+        None
+    }
+}
+
+/// `convertToExceptionPacket`.
+fn exception_packet(request: Request, e: &BrokerError) -> Packet {
+    let message = Some(JString::from(e.message.as_str()));
+    if request.response_async {
+        ActiveMQExceptionMessageV2 {
+            code: e.kind.code(),
+            message,
+            correlation_id: Some(request.correlation_id),
+        }
+        .into()
+    } else {
+        ActiveMQExceptionMessage {
+            code: e.kind.code(),
+            message,
+        }
+        .into()
+    }
+}
+
 pub(crate) struct CoreSession {
     broker: Arc<Broker>,
     conn: Arc<ConnShared>,
@@ -105,7 +189,9 @@ pub(crate) struct CoreSession {
     consumers: BTreeMap<i64, ServerConsumer>,
     producers: HashMap<i32, Option<String>>,
     tx: Transaction,
-    confirmations: Confirmations,
+    /// Journal writes lined up by the request being handled.
+    ops: Vec<Pending>,
+    completer: mpsc::UnboundedSender<Done>,
 }
 
 /// How a request packet wants its response (`Packet.getCorrelationID`,
@@ -144,6 +230,17 @@ impl Request {
 
 impl CoreSession {
     pub(crate) fn new(broker: Arc<Broker>, conn: Arc<ConnShared>, request: CreateSession) -> Self {
+        let (completer_tx, completer_rx) = mpsc::unbounded_channel();
+        tokio::spawn(completer(
+            conn.clone(),
+            request.channel_id,
+            Confirmations {
+                window: request.confirmation_window_size,
+                last_command_id: -1,
+                received_bytes: 0,
+            },
+            completer_rx,
+        ));
         Self {
             broker,
             conn,
@@ -161,11 +258,8 @@ impl CoreSession {
             consumers: BTreeMap::new(),
             producers: HashMap::new(),
             tx: Transaction::default(),
-            confirmations: Confirmations {
-                window: request.confirmation_window_size,
-                last_command_id: -1,
-                received_bytes: 0,
-            },
+            ops: Vec::new(),
+            completer: completer_tx,
         }
     }
 
@@ -208,53 +302,19 @@ impl CoreSession {
         }
     }
 
-    /// `convertToExceptionPacket`.
     fn exception(&self, request: Request, e: &BrokerError) -> Packet {
-        let message = Some(JString::from(e.message.as_str()));
-        if request.response_async {
-            ActiveMQExceptionMessageV2 {
-                code: e.kind.code(),
-                message,
-                correlation_id: Some(request.correlation_id),
-            }
-            .into()
-        } else {
-            ActiveMQExceptionMessage {
-                code: e.kind.code(),
-                message,
-            }
-            .into()
-        }
+        exception_packet(request, e)
     }
 
-    /// `doConfirmAndResponse`: confirms the request unless it failed, then
-    /// sends the response.
+    /// `doConfirmAndResponse`, after the journal writes this request lined
+    /// up.
     fn respond(&mut self, request: Request, response: Option<Packet>, flush: bool) {
-        let failed = matches!(
+        let _ = self.completer.send(Done {
+            waits: std::mem::take(&mut self.ops),
+            request,
             response,
-            Some(Packet::ActiveMQExceptionMessage(_) | Packet::ActiveMQExceptionMessageV2(_))
-        );
-        if !failed {
-            self.confirm(request, flush);
-        }
-        if let Some(response) = response {
-            self.send(response);
-        }
-    }
-
-    /// `ChannelImpl.confirm` / `flushConfirmations`.
-    fn confirm(&mut self, request: Request, flush: bool) {
-        let c = &mut self.confirmations;
-        if c.window == -1 || !request.requires_confirmations {
-            return;
-        }
-        c.last_command_id += 1;
-        c.received_bytes += request.size as i64;
-        if c.received_bytes >= i64::from(c.window) || (flush && c.received_bytes != 0) {
-            c.received_bytes = 0;
-            let command_id = c.last_command_id;
-            self.send(PacketsConfirmedMessage { command_id });
-        }
+            flush,
+        });
     }
 
     /// The response for a request that may fail: the given success

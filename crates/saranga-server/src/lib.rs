@@ -11,6 +11,7 @@ pub mod message;
 pub mod postoffice;
 pub mod queue;
 pub mod settings;
+pub mod storage;
 pub mod wildcard;
 
 use std::collections::HashMap;

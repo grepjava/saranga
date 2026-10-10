@@ -671,6 +671,7 @@ dependencies = [
  "saranga-config",
  "saranga-core-protocol",
  "saranga-filter",
+ "saranga-journal",
  "saranga-message",
  "thiserror",
  "tokio",
