@@ -21,6 +21,7 @@ pub mod reload;
 pub mod settings;
 pub mod storage;
 pub mod transaction;
+pub mod users;
 pub mod wildcard;
 
 use std::collections::HashMap;
@@ -203,6 +204,12 @@ pub struct BrokerConfig {
     /// `reject-empty-validated-user`: messages without a validated user are
     /// refused.
     pub reject_empty_validated_user: bool,
+    /// The basic security manager's users, loaded from and stored in the
+    /// bindings journal; `None` when JAAS does security.
+    pub users: Option<Arc<users::Users>>,
+    /// Its bootstrap credentials: user, password and roles, added or
+    /// updated once the journals are loaded (`completeInit`).
+    pub bootstrap_users: Vec<(String, String, Vec<String>)>,
 }
 
 impl BrokerConfig {
@@ -228,6 +235,8 @@ impl BrokerConfig {
             security: None,
             populate_validated_user: false,
             reject_empty_validated_user: false,
+            users: None,
+            bootstrap_users: Vec::new(),
         }
     }
 }
@@ -369,7 +378,7 @@ impl Broker {
             paging.clone(),
         );
         if let Some(s) = &storage {
-            recovery::load_bindings(s, &post_office)?;
+            recovery::load_bindings(s, &post_office, config.users.as_deref())?;
         }
         reload::deploy_addresses(&post_office, &config.addresses);
         for d in &config.diverts {
@@ -396,6 +405,17 @@ impl Broker {
             paging.set_loaded();
         }
         reload::undeploy_not_configured(&post_office, &config.addresses);
+        // ActiveMQBasicSecurityManager.completeInit.
+        if let (Some(users), Some(s)) = (&config.users, &storage) {
+            users.attach(s.clone());
+            for (user, password, roles) in &config.bootstrap_users {
+                if let Err(e) = users.add_or_update(user, password, roles) {
+                    tracing::warn!(
+                        "AMQ222298: Failed to create bootstrap user \"{user}\". User management may not function. {e}"
+                    );
+                }
+            }
+        }
         if config.message_expiry_scan_period > 0 {
             spawn_expiry_reaper(&post_office, config.message_expiry_scan_period);
         }

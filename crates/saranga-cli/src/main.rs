@@ -291,7 +291,10 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
             let file = instance.broker_config()?;
             let binds = core_acceptors(&file)?;
             let mut config = BrokerConfig::from_file_config(&file, filters, &instance.dir)?;
-            config.security = instance.security(&file)?;
+            let security = instance.security(&file)?;
+            config.security = security.store;
+            config.users = security.users;
+            config.bootstrap_users = security.bootstrap_users;
             let period = file.configuration_file_refresh_period.max(1) as u64;
             (config, binds, std::time::Duration::from_millis(period))
         }

@@ -13,7 +13,25 @@ use std::sync::Arc;
 use anyhow::{Context, bail};
 use saranga_config::{BootstrapConfig, BootstrapSecurity, BrokerConfig, broker_properties};
 use saranga_security::jaas::{ControlFlag, ModuleEntry, ModuleFactory};
-use saranga_security::{JaasSecurityManager, LoginConfig, SecurityStore, SecurityStoreConfig};
+use saranga_security::{
+    BasicSecurityManager, JaasSecurityManager, LoginConfig, SecurityManager, SecurityStore,
+    SecurityStoreConfig,
+};
+use saranga_server::users::Users;
+
+/// `ActiveMQBasicSecurityManager`'s class name in `bootstrap.xml`.
+const BASIC_SECURITY_MANAGER: &str =
+    "org.apache.activemq.artemis.spi.core.security.ActiveMQBasicSecurityManager";
+
+/// What `bootstrap.xml` and `login.config` make of security.
+#[derive(Default)]
+pub struct Security {
+    /// `None` with security off.
+    pub store: Option<Arc<SecurityStore>>,
+    /// The basic security manager's users, for the broker to load.
+    pub users: Option<Arc<Users>>,
+    pub bootstrap_users: Vec<(String, String, Vec<String>)>,
+}
 
 /// What `saranga run` adds to the instance's files.
 #[derive(Debug, Default)]
@@ -216,22 +234,33 @@ impl Instance {
             })
     }
 
-    /// The security store for this instance, `None` with security off.
-    pub fn security(&self, config: &BrokerConfig) -> anyhow::Result<Option<Arc<SecurityStore>>> {
+    /// The security of this instance.
+    pub fn security(&self, config: &BrokerConfig) -> anyhow::Result<Security> {
         if !config.security_enabled {
-            return Ok(None);
+            return Ok(Security::default());
         }
-        let (domain, certificate_domain) =
-            match self.bootstrap.as_ref().and_then(|b| b.security.clone()) {
-                None => (JaasSecurityManager::DEFAULT_DOMAIN.to_owned(), None),
-                Some(BootstrapSecurity::Jaas {
-                    domain,
-                    certificate_domain,
-                }) => (domain, certificate_domain),
-                Some(BootstrapSecurity::Manager { class_name, .. }) => {
-                    bail!("security manager {class_name} is not supported; use <jaas-security>")
-                }
-            };
+        let (domain, certificate_domain) = match self
+            .bootstrap
+            .as_ref()
+            .and_then(|b| b.security.clone())
+        {
+            None => (JaasSecurityManager::DEFAULT_DOMAIN.to_owned(), None),
+            Some(BootstrapSecurity::Jaas {
+                domain,
+                certificate_domain,
+            }) => (domain, certificate_domain),
+            Some(BootstrapSecurity::Manager {
+                class_name,
+                properties,
+            }) if class_name == BASIC_SECURITY_MANAGER => {
+                return self.basic_security(config, &properties);
+            }
+            Some(BootstrapSecurity::Manager { class_name, .. }) => {
+                bail!(
+                    "security manager {class_name} is not supported; use <jaas-security> or ActiveMQBasicSecurityManager"
+                )
+            }
+        };
         let path = self.etc.join("login.config");
         let mut login = if path.exists() {
             let text = std::fs::read_to_string(&path)
@@ -285,12 +314,82 @@ impl Instance {
             }
         }
         let manager = JaasSecurityManager::new(login, Some(&self.etc), domain, certificate_domain);
-        let store = SecurityStore::new(
+        Ok(Security {
+            store: Some(self.store(config, Arc::new(manager))?),
+            ..Security::default()
+        })
+    }
+
+    fn store(
+        &self,
+        config: &BrokerConfig,
+        manager: Arc<dyn SecurityManager>,
+    ) -> anyhow::Result<Arc<SecurityStore>> {
+        Ok(Arc::new(SecurityStore::new(
             SecurityStoreConfig::from_broker(config),
             config.security_repository()?,
-            Arc::new(manager),
-        );
-        Ok(Some(Arc::new(store)))
+            manager,
+        )))
+    }
+
+    /// `ActiveMQBasicSecurityManager.init`: users live in the bindings
+    /// journal; the bootstrap credentials (`bootstrapUser`,
+    /// `bootstrapPassword` and `bootstrapRole`, or `bootstrapUserFile` and
+    /// `bootstrapRoleFile`) are added or updated at startup.
+    fn basic_security(
+        &self,
+        config: &BrokerConfig,
+        properties: &[(String, String)],
+    ) -> anyhow::Result<Security> {
+        let get = |k: &str| {
+            properties
+                .iter()
+                .rev()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+        };
+        let mut bootstrap_users = Vec::new();
+        if let (Some(users), Some(roles)) = (get("bootstrapUserFile"), get("bootstrapRoleFile")) {
+            // ClassloadingUtil.loadProperties: from the classpath, which
+            // holds etc/.
+            let read = |name: &str| -> anyhow::Result<Vec<(String, String)>> {
+                let path = self.etc.join(name);
+                let bytes =
+                    std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+                Ok(saranga_security::properties::parse(&bytes))
+            };
+            let roles = read(&roles)?;
+            for (user, password) in read(&users)? {
+                let user_roles = roles
+                    .iter()
+                    .filter(|(_, members)| members.split(',').any(|m| m == user))
+                    .map(|(role, _)| role.clone())
+                    .collect();
+                bootstrap_users.push((user, password, user_roles));
+            }
+        } else if let (Some(user), Some(password), Some(role)) = (
+            get("bootstrapUser"),
+            get("bootstrapPassword"),
+            get("bootstrapRole"),
+        ) {
+            bootstrap_users.push((user, password, vec![role]));
+        } else {
+            tracing::warn!(
+                "AMQ222299: No bootstrap credentials found. User management may not function."
+            );
+        }
+        if !config.persistence_enabled {
+            tracing::warn!(
+                "the basic security manager keeps users in the journal, and persistence is off: every login will fail"
+            );
+        }
+        let users = Users::new();
+        let manager = BasicSecurityManager::new(users.clone());
+        Ok(Security {
+            store: Some(self.store(config, Arc::new(manager))?),
+            users: Some(users),
+            bootstrap_users,
+        })
     }
 }
 

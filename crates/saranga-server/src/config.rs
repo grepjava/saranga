@@ -309,6 +309,8 @@ impl BrokerConfig {
             security: None,
             populate_validated_user: config.populate_validated_user,
             reject_empty_validated_user: config.reject_empty_validated_user,
+            users: None,
+            bootstrap_users: Vec::new(),
         })
     }
 }

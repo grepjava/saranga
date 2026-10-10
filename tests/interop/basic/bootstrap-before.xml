@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- ActiveMQBasicSecurityManager with the bootstrap user admin (scripts/basic-security.sh). -->
+<broker xmlns="http://activemq.apache.org/schema">
+   <security-manager class-name="org.apache.activemq.artemis.spi.core.security.ActiveMQBasicSecurityManager">
+      <property key="bootstrapUser" value="admin"/>
+      <property key="bootstrapPassword" value="secret"/>
+      <property key="bootstrapRole" value="amq"/>
+   </security-manager>
+   <server configuration="file:/var/lib/artemis-instance/etc/broker.xml"/>
+</broker>

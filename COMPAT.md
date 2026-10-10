@@ -61,6 +61,6 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 
 ## Security differences
 - **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule` and `LDAPLoginModule` are supported. `Krb5LoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.
-- **Security managers.** Only the JAAS security manager (`<jaas-security>` in `bootstrap.xml`) is supported. A `<security-manager>` element stops the broker from starting.
+- **Security managers.** The JAAS security manager (`<jaas-security>`) and `ActiveMQBasicSecurityManager` are supported. The basic manager keeps its users in the bindings journal, so its users move with the data directory in both directions. Any other `<security-manager>` class stops the broker from starting. As in Artemis, the basic manager has no users without persistence. Users can be added only through the bootstrap credentials until management arrives in Phase 8.
 - **A role named `*`** in a security setting grants nothing in Artemis 2.57, despite looking like a wildcard. Saranga matches this.
 - **Security setting plugins** (`<security-setting-plugin>`) are not supported and produce a warning.

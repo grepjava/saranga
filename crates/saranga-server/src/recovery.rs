@@ -146,7 +146,11 @@ fn corrupt(what: &str, e: impl std::fmt::Display) -> BrokerError {
 
 /// `loadBindingJournal` with `initAddresses` and `initQueues`: addresses
 /// first, then their queues, each with its persisted ID.
-pub fn load_bindings(storage: &Storage, post_office: &PostOffice) -> Result<()> {
+pub fn load_bindings(
+    storage: &Storage,
+    post_office: &PostOffice,
+    users: Option<&crate::users::Users>,
+) -> Result<()> {
     let records = storage
         .load_bindings()
         .map_err(|e| corrupt("loading the bindings journal", e))?;
@@ -167,6 +171,13 @@ pub fn load_bindings(storage: &Storage, post_office: &PostOffice) -> Result<()> 
                 match queues.iter_mut().find(|(id, _)| *id == r.id) {
                     Some(q) => q.1 = config,
                     None => queues.push((r.id, config)),
+                }
+            }
+            ids::USER_RECORD | ids::ROLE_RECORD => {
+                if let Some(users) = users {
+                    users
+                        .load(r.id, r.user_record_type, &r.data)
+                        .map_err(|e| corrupt("user record", e))?;
                 }
             }
             other => tracing::debug!("bindings record type {other} is not used yet"),
