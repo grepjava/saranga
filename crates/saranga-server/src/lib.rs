@@ -117,6 +117,15 @@ pub struct AddressDeployment {
     pub queues: Vec<QueueSpec>,
 }
 
+/// How an acceptor treats its connections.
+#[derive(Clone, Default)]
+pub struct Acceptor {
+    /// `sslEnabled`: the handshake to run first.
+    pub tls: Option<Arc<saranga_transport::TlsAcceptor>>,
+    /// `securityDomain`: the JAAS domain its clients log in through.
+    pub security_domain: Option<String>,
+}
+
 pub struct BrokerConfig {
     pub settings: Arc<dyn SettingsRepository>,
     pub filters: Arc<dyn FilterFactory>,
@@ -459,10 +468,53 @@ impl Broker {
 
     /// Accepts Core connections until the listener fails.
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> std::io::Result<()> {
+        self.serve_acceptor(listener, Acceptor::default()).await
+    }
+
+    /// Accepts Core connections the way `acceptor` says: with TLS, under a
+    /// security domain.
+    pub async fn serve_acceptor(
+        self: Arc<Self>,
+        listener: TcpListener,
+        acceptor: Acceptor,
+    ) -> std::io::Result<()> {
         loop {
             let (stream, peer) = listener.accept().await?;
             tracing::debug!(%peer, "connection accepted");
-            tokio::spawn(core_protocol::serve_connection(self.clone(), stream));
+            let _ = stream.set_nodelay(true);
+            let mut info = saranga_security::ConnectionInfo {
+                remote_address: core_protocol::java_socket_address(peer),
+                certificates: None,
+                security_domain: acceptor.security_domain.clone(),
+            };
+            let broker = self.clone();
+            match &acceptor.tls {
+                None => {
+                    tokio::spawn(core_protocol::serve_stream(
+                        broker,
+                        stream,
+                        Some(peer),
+                        info,
+                    ));
+                }
+                Some(tls) => {
+                    let tls = tls.clone();
+                    tokio::spawn(async move {
+                        let stream = match tls.accept(stream).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::debug!(%peer, "TLS handshake failed: {e}");
+                                return;
+                            }
+                        };
+                        info.certificates = saranga_transport::tls::peer_certificates(
+                            stream.get_ref().1.peer_certificates(),
+                        )
+                        .map(Arc::from);
+                        core_protocol::serve_stream(broker, stream, Some(peer), info).await;
+                    });
+                }
+            }
         }
     }
 }

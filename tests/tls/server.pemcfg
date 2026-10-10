@@ -1,0 +1,3 @@
+alias=server
+source.key=server-key.pem
+source.cert=server-cert.pem

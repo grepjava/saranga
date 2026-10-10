@@ -324,6 +324,9 @@ pub struct BrokerConfig {
     /// `large-message-sync`: a large message's file is synced before it is
     /// routed.
     pub large_message_sync: bool,
+    /// `configuration-file-refresh-period`: how often, in milliseconds,
+    /// files are checked for changes.
+    pub configuration_file_refresh_period: i64,
     /// Milliseconds an authentication or authorization stays cached.
     pub security_invalidation_interval: i64,
     /// Entries in the authentication cache; 0 disables it.
@@ -361,6 +364,7 @@ impl BrokerConfig {
     pub const DEFAULT_TRANSACTION_TIMEOUT_SCAN_PERIOD: i64 = 1000;
     pub const DEFAULT_PERSIST_ID_CACHE: bool = true;
     pub const DEFAULT_SECURITY_INVALIDATION_INTERVAL: i64 = 10000;
+    pub const DEFAULT_CONFIGURATION_FILE_REFRESH_PERIOD: i64 = 5000;
     pub const DEFAULT_AUTHENTICATION_CACHE_SIZE: i64 = 1000;
     pub const DEFAULT_AUTHORIZATION_CACHE_SIZE: i64 = 1000;
     pub const DEFAULT_CLUSTER_USER: &str = "ACTIVEMQ.CLUSTER.ADMIN.USER";
@@ -444,6 +448,7 @@ impl Default for BrokerConfig {
             id_cache_size: Self::DEFAULT_ID_CACHE_SIZE,
             persist_id_cache: Self::DEFAULT_PERSIST_ID_CACHE,
             large_message_sync: true,
+            configuration_file_refresh_period: Self::DEFAULT_CONFIGURATION_FILE_REFRESH_PERIOD,
             security_invalidation_interval: Self::DEFAULT_SECURITY_INVALIDATION_INTERVAL,
             authentication_cache_size: Self::DEFAULT_AUTHENTICATION_CACHE_SIZE,
             authorization_cache_size: Self::DEFAULT_AUTHORIZATION_CACHE_SIZE,

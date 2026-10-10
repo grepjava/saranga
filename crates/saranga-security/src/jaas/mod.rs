@@ -7,6 +7,7 @@
 //! succeeded, which is how a `PropertiesLoginModule` placed after a
 //! certificate module adds roles for the user the certificate identified.
 
+mod certificate;
 pub mod config;
 mod guest;
 mod properties_module;
@@ -76,8 +77,10 @@ pub struct PeerCertificate {
     /// `X500Principal.getName()`: the subject DN in RFC 2253 form.
     pub subject_dn: String,
     /// `X509Certificate.getSubjectDN().getName()`, the form Artemis uses in
-    /// messages.
+    /// messages and the certificate login modules match.
     pub subject_dn_legacy: String,
+    /// The certificate's subject alternative name URIs.
+    pub san_uris: Vec<String>,
 }
 
 /// What the callback handler (`JaasCallbackHandler`) offers modules.
@@ -168,6 +171,12 @@ impl ModuleFactory {
                 properties_module::PropertiesLoginModule::new(self, entry),
             )),
             Some("GuestLoginModule") => Ok(Box::new(guest::GuestLoginModule::new(entry))),
+            Some("TextFileCertificateLoginModule") => Ok(Box::new(
+                certificate::TextFileCertificateLoginModule::new(self, entry),
+            )),
+            Some("ExternalCertificateLoginModule") => Ok(Box::new(
+                certificate::ExternalCertificateLoginModule::new(entry),
+            )),
             _ => Err(LoginError::new(format!(
                 "unable to instantiate LoginModule {class}: not supported by Saranga"
             ))),
@@ -180,7 +189,12 @@ impl ModuleFactory {
             class
                 .strip_prefix(ARTEMIS_JAAS)
                 .and_then(|s| s.strip_prefix('.')),
-            Some("PropertiesLoginModule" | "GuestLoginModule")
+            Some(
+                "PropertiesLoginModule"
+                    | "GuestLoginModule"
+                    | "TextFileCertificateLoginModule"
+                    | "ExternalCertificateLoginModule"
+            )
         )
     }
 }
@@ -256,6 +270,11 @@ impl LoadedProperties {
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
+    }
+
+    /// `looksLikeRegexp`: `/.../`.
+    pub fn is_regexp(value: &str) -> bool {
+        value.len() > 2 && value.starts_with('/') && value.ends_with('/')
     }
 
     /// `invertedPropertiesValuesMap`: each comma-separated (untrimmed) value

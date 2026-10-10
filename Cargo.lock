@@ -1281,6 +1281,7 @@ dependencies = [
  "saranga-security",
  "saranga-server",
  "saranga-storage",
+ "saranga-transport",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1390,6 +1391,7 @@ version = "0.0.1"
 name = "saranga-security"
 version = "0.0.1"
 dependencies = [
+ "regex",
  "saranga-config",
  "sha2 0.10.9",
  "tempfile",
@@ -1410,6 +1412,7 @@ dependencies = [
  "saranga-paging",
  "saranga-security",
  "saranga-storage",
+ "saranga-transport",
  "tempfile",
  "thiserror",
  "tokio",

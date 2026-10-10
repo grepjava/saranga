@@ -29,9 +29,9 @@ use saranga_core_protocol::{
     Context, Direction, Flagged, HANDSHAKE, Packet, encode_frame, read_frame, types, version,
 };
 use saranga_security::{Authenticated, ConnectionInfo, SecurityError};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -178,17 +178,31 @@ impl DeliverySink for CoreDeliverySink {
     }
 }
 
-/// Serves one Core connection until it closes or fails.
+/// Serves one plain TCP Core connection until it closes or fails.
 pub async fn serve_connection(broker: Arc<Broker>, stream: TcpStream) {
     let peer = stream.peer_addr().ok();
-    let remote_address = peer.map(|a| a.to_string()).unwrap_or_default();
-    let security_info = Arc::new(ConnectionInfo {
+    let _ = stream.set_nodelay(true);
+    let info = ConnectionInfo {
         remote_address: peer.map(java_socket_address).unwrap_or_default(),
         certificates: None,
         security_domain: None,
-    });
-    let _ = stream.set_nodelay(true);
-    let (mut rd, wr) = stream.into_split();
+    };
+    serve_stream(broker, stream, peer, info).await;
+}
+
+/// Serves one Core connection over any byte stream (TCP or TLS) until it
+/// closes or fails. `info` is what security sees of it.
+pub async fn serve_stream<S>(
+    broker: Arc<Broker>,
+    stream: S,
+    peer: Option<std::net::SocketAddr>,
+    info: ConnectionInfo,
+) where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let remote_address = peer.map(|a| a.to_string()).unwrap_or_default();
+    let security_info = Arc::new(info);
+    let (mut rd, wr) = tokio::io::split(stream);
     let (out, rx) = mpsc::unbounded_channel();
     let writer = tokio::spawn(write_loop(wr, rx));
     let shared = Arc::new(ConnShared {
@@ -217,7 +231,7 @@ pub async fn serve_connection(broker: Arc<Broker>, stream: TcpStream) {
     let _ = writer.await;
 }
 
-async fn write_loop(mut wr: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Outgoing>) {
+async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedReceiver<Outgoing>) {
     let mut buf = Vec::with_capacity(64 * 1024);
     'outer: while let Some(first) = rx.recv().await {
         let mut close = false;
@@ -269,10 +283,7 @@ enum ConnError {
 }
 
 impl Connection {
-    async fn read_loop(
-        &mut self,
-        rd: &mut tokio::net::tcp::OwnedReadHalf,
-    ) -> Result<(), ConnError> {
+    async fn read_loop<R: AsyncRead + Unpin>(&mut self, rd: &mut R) -> Result<(), ConnError> {
         let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
         while buf.len() < HANDSHAKE.len() {
             if self.read_more(rd, &mut buf).await? == 0 {
@@ -300,9 +311,9 @@ impl Connection {
 
     /// Reads more bytes, failing the connection if nothing arrives within
     /// the TTL (`RemotingServiceImpl.FailureCheckAndFlushThread`).
-    async fn read_more(
+    async fn read_more<R: AsyncRead + Unpin>(
         &self,
-        rd: &mut tokio::net::tcp::OwnedReadHalf,
+        rd: &mut R,
         buf: &mut Vec<u8>,
     ) -> Result<usize, ConnError> {
         let read = rd.read_buf(buf);

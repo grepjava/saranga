@@ -155,3 +155,81 @@ fn missing_files_mean_no_users() {
     let e = login(&entries, &factory, &creds(Some("admin"), Some("secret"))).unwrap_err();
     assert_eq!(e.message, "User does not exist: admin");
 }
+
+fn cert(dn: &str, san_uris: &[&str]) -> PeerCertificate {
+    PeerCertificate {
+        der: Vec::new(),
+        subject_dn: dn.replace(", ", ","),
+        subject_dn_legacy: dn.to_owned(),
+        san_uris: san_uris.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[test]
+fn text_file_certificate() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("cert-users.properties"),
+        "client = CN=client, OU=Test, O=Saranga\nanyone = /CN=.*, OU=Ops, O=Saranga/\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("cert-roles.properties"),
+        "amq = client\nops = anyone\n",
+    )
+    .unwrap();
+    let entries = config(
+        "activemq { org.apache.activemq.artemis.spi.core.security.jaas.TextFileCertificateLoginModule required org.apache.activemq.jaas.textfiledn.user=\"cert-users.properties\" org.apache.activemq.jaas.textfiledn.role=\"cert-roles.properties\"; };",
+    );
+    let factory = ModuleFactory::new(Some(dir.path().to_path_buf()));
+    let login_with = |c: Option<&[PeerCertificate]>| {
+        login(
+            &entries,
+            &factory,
+            &Callbacks {
+                certificates: c,
+                ..Callbacks::default()
+            },
+        )
+    };
+    let subject = login_with(Some(&[cert("CN=client, OU=Test, O=Saranga", &[])])).unwrap();
+    assert_eq!(subject.user(), Some("client"));
+    assert_eq!(subject.roles().collect::<Vec<_>>(), vec!["amq"]);
+    let subject = login_with(Some(&[cert("CN=bob, OU=Ops, O=Saranga", &[])])).unwrap();
+    assert_eq!(subject.user(), Some("anyone"));
+    let e = login_with(Some(&[cert("CN=eve, O=Elsewhere", &[])])).unwrap_err();
+    assert_eq!(
+        e.message,
+        "No user for client certificate: CN=eve, O=Elsewhere"
+    );
+    let e = login_with(None).unwrap_err();
+    assert_eq!(
+        e.message,
+        "Client certificates not found. Cannot authenticate."
+    );
+}
+
+#[test]
+fn external_certificate() {
+    let entries = config(
+        "activemq { org.apache.activemq.artemis.spi.core.security.jaas.ExternalCertificateLoginModule required sanUriRolePrefix=\"urn:role:\"; };",
+    );
+    let factory = ModuleFactory::new(None);
+    let certs = [cert(
+        "CN=svc, O=Saranga",
+        &["urn:role:admin", "urn:other:x", "urn:role:ops"],
+    )];
+    let subject = login(
+        &entries,
+        &factory,
+        &Callbacks {
+            certificates: Some(&certs),
+            ..Callbacks::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(subject.user(), Some("CN=svc, O=Saranga"));
+    assert_eq!(subject.roles().collect::<Vec<_>>(), vec!["admin", "ops"]);
+    // No certificate: the module is ignored, so nothing logs in.
+    assert!(login(&entries, &factory, &Callbacks::default()).is_err());
+}

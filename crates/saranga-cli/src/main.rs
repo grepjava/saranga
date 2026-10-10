@@ -11,7 +11,8 @@ mod instance;
 
 use clap::{Parser, Subcommand};
 use saranga_server::postoffice::SelectorFilters;
-use saranga_server::{Broker, BrokerConfig};
+use saranga_server::{Acceptor, Broker, BrokerConfig};
+use saranga_transport::{TlsAcceptor, TlsSettings};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -76,6 +77,55 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// An acceptor to open.
+struct Bind {
+    name: String,
+    address: String,
+    acceptor: Acceptor,
+}
+
+/// The configured acceptors that speak Core, with their TLS settings
+/// (`NettyAcceptor`) and security domain.
+fn core_acceptors(file: &saranga_config::BrokerConfig) -> anyhow::Result<Vec<Bind>> {
+    let mut out = Vec::new();
+    for a in &file.acceptors {
+        let protocols = a.protocols();
+        if !(protocols.is_empty() || protocols.iter().any(|p| p.eq_ignore_ascii_case("CORE"))) {
+            continue;
+        }
+        let name = a.name.clone().unwrap_or_default();
+        let host = a.host.as_deref().unwrap_or("localhost");
+        let port = a.port.unwrap_or(61616);
+        // `ConfigurationHelper.getPasswordProperty`: `mask-password` and
+        // `password-codec` from the broker, unless the URI sets its own.
+        let use_mask = a
+            .param("activemq.usemaskedpassword")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .or(file.mask_password);
+        let codec = a
+            .param("activemq.passwordcodec")
+            .unwrap_or(&file.password_codec);
+        let tls = TlsSettings::from_params(
+            |k| a.param(k).map(str::to_owned),
+            |v| {
+                saranga_config::mask::resolve_mask(use_mask, v, Some(codec))
+                    .map_err(|e| e.to_string())
+            },
+        )
+        .and_then(|s| s.map(TlsAcceptor::new).transpose())
+        .with_context(|| format!("acceptor {name}"))?;
+        out.push(Bind {
+            name,
+            address: format!("{host}:{port}"),
+            acceptor: Acceptor {
+                tls,
+                security_domain: a.param("securityDomain").map(str::to_owned),
+            },
+        });
+    }
+    Ok(out)
+}
+
 /// How the broker was asked to stop.
 enum Stop {
     Clean,
@@ -104,42 +154,57 @@ async fn watch_stop_files(dir: PathBuf) -> Stop {
 
 async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> anyhow::Result<()> {
     let filters = Arc::new(SelectorFilters);
-    let (broker_config, mut binds) = match &instance {
+    let (broker_config, mut binds, reload_period) = match &instance {
         Some(instance) => {
             let file = instance.broker_config()?;
-            let binds = file
-                .acceptors
-                .iter()
-                .filter(|a| {
-                    let p = a.protocols();
-                    p.is_empty() || p.iter().any(|p| p.eq_ignore_ascii_case("CORE"))
-                })
-                .map(|a| {
-                    let host = a.host.as_deref().unwrap_or("localhost");
-                    let port = a.port.unwrap_or(61616);
-                    (a.name.clone().unwrap_or_default(), format!("{host}:{port}"))
-                })
-                .collect();
+            let binds = core_acceptors(&file)?;
             let mut config = BrokerConfig::from_file_config(&file, filters, &instance.dir)?;
             config.security = instance.security(&file)?;
-            (config, binds)
+            let period = file.configuration_file_refresh_period.max(1) as u64;
+            (config, binds, std::time::Duration::from_millis(period))
         }
-        None => (BrokerConfig::new(filters), Vec::new()),
+        None => (
+            BrokerConfig::new(filters),
+            Vec::new(),
+            std::time::Duration::from_secs(5),
+        ),
     };
     if let Some(bind) = bind {
-        binds = vec![("core".to_owned(), bind.to_string())];
+        // The first Core acceptor's settings (TLS, security domain), at
+        // this address instead.
+        let first = binds.into_iter().next().unwrap_or_else(|| Bind {
+            name: "core".to_owned(),
+            address: String::new(),
+            acceptor: Acceptor::default(),
+        });
+        binds = vec![Bind {
+            address: bind.to_string(),
+            ..first
+        }];
     } else if binds.is_empty() {
-        binds = vec![("artemis".to_owned(), "0.0.0.0:61616".to_owned())];
+        binds = vec![Bind {
+            name: "artemis".to_owned(),
+            address: "0.0.0.0:61616".to_owned(),
+            acceptor: Acceptor::default(),
+        }];
     }
     let broker = Broker::start(broker_config).await?;
     let mut servers = tokio::task::JoinSet::new();
-    for (name, address) in binds {
+    for Bind {
+        name,
+        address,
+        acceptor,
+    } in binds
+    {
         let listener = TcpListener::bind(&address)
             .await
             .with_context(|| format!("acceptor {name} on {address}"))?;
+        if let Some(tls) = &acceptor.tls {
+            tls.spawn_reloader(reload_period);
+        }
         // Artemis's log IDs, so log-based tooling keeps working (ADR 0003).
         tracing::info!("AMQ221020: Started Core Acceptor at {address} for protocols [CORE]");
-        servers.spawn(broker.clone().serve(listener));
+        servers.spawn(broker.clone().serve_acceptor(listener, acceptor));
     }
     tracing::info!("AMQ221007: Server is now active");
     let stop_dir = instance

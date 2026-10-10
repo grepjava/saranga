@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+regex = "1"
 saranga-config = { path = "../saranga-config" }
 sha2 = "0.10"
 thiserror = "2"

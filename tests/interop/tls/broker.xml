@@ -1,0 +1,51 @@
+<?xml version='1.0'?>
+<!-- Phase 6 TLS suite (tests/interop/jms/Tls.java, scripts/tls-interop.sh).
+     Store paths are under the instance's etc/; ports come from system
+     properties or environment variables, defaulting to 61616-61621. -->
+<configuration xmlns="urn:activemq"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+   <core xmlns="urn:activemq:core">
+      <name>tls</name>
+      <persistence-enabled>false</persistence-enabled>
+      <security-enabled>true</security-enabled>
+      <populate-validated-user>true</populate-validated-user>
+
+      <acceptors>
+         <!-- plain -->
+         <acceptor name="plain">tcp://0.0.0.0:${tls.port.plain:61616}?protocols=CORE</acceptor>
+         <!-- TLS, PKCS#12 keystore -->
+         <acceptor name="p12">tcp://0.0.0.0:${tls.port.p12:61617}?protocols=CORE;sslEnabled=true;keyStorePath=${artemis.instance}/etc/server.p12;keyStorePassword=changeit;keyStoreType=PKCS12</acceptor>
+         <!-- TLS, JKS keystore with its own key password; the store password
+              is masked (`artemis mask changeit`) -->
+         <acceptor name="jks">tcp://0.0.0.0:${tls.port.jks:61618}?protocols=CORE;sslEnabled=true;keyStorePath=${artemis.instance}/etc/server.jks;keyStorePassword=ENC(14dd946cd17fd15122fa49a8d8fa115d);keyPassword=keypass</acceptor>
+         <!-- TLS, PEM keystore, only for clients asking for localhost (or no name) -->
+         <acceptor name="pem">tcp://0.0.0.0:${tls.port.pem:61619}?protocols=CORE;sslEnabled=true;keyStorePath=${artemis.instance}/etc/server.pem;keyStoreType=PEM;sniHost=localhost</acceptor>
+         <!-- mutual TLS: clients log in by certificate through the "cert" domain -->
+         <acceptor name="mtls">tcp://0.0.0.0:${tls.port.mtls:61620}?protocols=CORE;sslEnabled=true;keyStorePath=${artemis.instance}/etc/server.p12;keyStorePassword=changeit;keyStoreType=PKCS12;needClientAuth=true;trustStorePath=${artemis.instance}/etc/truststore.jks;trustStorePassword=changeit;securityDomain=cert</acceptor>
+         <!-- mutual TLS with a certificate revocation list -->
+         <acceptor name="crl">tcp://0.0.0.0:${tls.port.crl:61621}?protocols=CORE;sslEnabled=true;keyStorePath=${artemis.instance}/etc/server.p12;keyStorePassword=changeit;keyStoreType=PKCS12;needClientAuth=true;trustStorePath=${artemis.instance}/etc/truststore.p12;trustStorePassword=changeit;trustStoreType=PKCS12;crlPath=${artemis.instance}/etc/revoked.crl;securityDomain=cert</acceptor>
+      </acceptors>
+
+      <security-settings>
+         <security-setting match="#">
+            <permission type="createNonDurableQueue" roles="amq"/>
+            <permission type="deleteNonDurableQueue" roles="amq"/>
+            <permission type="createDurableQueue" roles="amq"/>
+            <permission type="deleteDurableQueue" roles="amq"/>
+            <permission type="createAddress" roles="amq"/>
+            <permission type="deleteAddress" roles="amq"/>
+            <permission type="consume" roles="amq"/>
+            <permission type="browse" roles="amq"/>
+            <permission type="send" roles="amq"/>
+         </security-setting>
+      </security-settings>
+
+      <address-settings>
+         <address-setting match="#">
+            <auto-create-queues>true</auto-create-queues>
+            <auto-create-addresses>true</auto-create-addresses>
+         </address-setting>
+      </address-settings>
+   </core>
+</configuration>

@@ -438,6 +438,9 @@ fn parse_core(
         config.large_message_sync = v;
     }
     parse_security_options(&s, config)?;
+    if let Some(v) = s.i64("configuration-file-refresh-period", Check::GtZero)? {
+        config.configuration_file_refresh_period = v;
+    }
 
     if let Some(v) = s.non_empty_string("large-messages-directory")? {
         config.large_messages_directory = v;
