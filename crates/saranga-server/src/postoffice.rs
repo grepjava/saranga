@@ -866,3 +866,25 @@ impl PostOffice {
         Some(targets)
     }
 }
+
+/// The JMS selector engine (`FilterImpl`).
+pub struct SelectorFilters;
+
+impl crate::queue::MessageFilter for saranga_filter::Filter {
+    fn matches(&self, message: &saranga_message::CoreMessage) -> bool {
+        saranga_filter::Filter::matches(self, message)
+    }
+
+    fn text(&self) -> &str {
+        saranga_filter::Filter::text(self)
+    }
+}
+
+impl FilterFactory for SelectorFilters {
+    fn create(&self, text: Option<&str>) -> Result<Option<FilterRef>> {
+        match saranga_filter::Filter::create(text) {
+            Ok(f) => Ok(f.map(|f| Arc::new(f) as FilterRef)),
+            Err(_) => Err(BrokerError::invalid_filter(text.unwrap_or_default())),
+        }
+    }
+}

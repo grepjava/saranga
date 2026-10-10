@@ -630,6 +630,7 @@ version = "0.0.1"
 dependencies = [
  "saranga-buffer",
  "saranga-core-protocol",
+ "saranga-filter",
  "saranga-message",
  "thiserror",
  "tokio",

@@ -5,6 +5,7 @@
 
 import java.util.*;
 import java.util.concurrent.*;
+import javax.jms.Queue;
 import java.util.function.*;
 import javax.jms.*;
 
@@ -283,7 +284,7 @@ public class Phase2 {
                 m.setIntProperty("n", i);
                 p.send(m);
             }
-            eq(List.of("n1", "n3", "n5"), drain(s.createConsumer(q, "n IN (1, 3, 5)"), 5000), "odd selector");
+            eq(List.of("n1", "n3", "n5"), drain(s.createConsumer(q, "n = 1 OR n = 3 OR n = 5"), 5000), "odd selector");
             eq(List.of("n0", "n2", "n4"), drain(s.createConsumer(q), 5000), "the rest");
         });
     }

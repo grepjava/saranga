@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use saranga_server::postoffice::NoFilters;
+use saranga_server::postoffice::SelectorFilters;
 use saranga_server::{Broker, BrokerConfig};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run(bind: SocketAddr) -> anyhow::Result<()> {
-    let broker = Broker::new(BrokerConfig::new(Arc::new(NoFilters)))?;
+    let broker = Broker::new(BrokerConfig::new(Arc::new(SelectorFilters)))?;
     let listener = TcpListener::bind(bind).await?;
     // Artemis's log IDs, so log-based tooling keeps working (ADR 0003).
     tracing::info!("AMQ221020: Started Core Acceptor at {bind} for protocols [CORE]");
