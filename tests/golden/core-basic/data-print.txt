@@ -1,0 +1,160 @@
+     _        _               _
+    / \  ____| |_  ___ __  __(_) _____
+   / _ \|  _ \ __|/ _ \  \/  | |/  __/
+  / ___ \ | \/ |_/  __/ |\/| | |\___ \
+ /_/   \_\|   \__\____|_|  |_|_|/___ /
+ Apache Artemis 2.57.0
+
+
+
+********************************************
+Server's ID=0f0f34e1-c492-11f1-81b3-3e90b6cb8c8d
+********************************************
+
+********************************************
+B I N D I N G S  J O U R N A L
+********************************************
+Journal path: /golden/data/bindings
+#JournalFileImpl: (activemq-bindings-1.bindings id = 1, recordID = 1) (size=1048576)
+operation@AddRecord;recordID=1;userRecordType=24;isUpdate=false;compactCount=0;IDCounterEncoding [id=2147483647]
+operation@AddRecordTX;txID=0,recordID=2;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=2, name=DLQ, routingTypes={ANYCAST}, autoCreated=false, internal=false]
+operation@Commit;txID=0,numberOfRecords=1
+operation@AddRecordTX;txID=4,recordID=3;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=3, name=DLQ, address=DLQ, routingType=ANYCAST, filterString=null, durable=null, user=null, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=true, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=false, fqqn=null]]
+operation@Commit;txID=4,numberOfRecords=1
+operation@AddRecordTX;txID=5,recordID=6;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=6, name=ExpiryQueue, routingTypes={ANYCAST}, autoCreated=false, internal=false]
+operation@Commit;txID=5,numberOfRecords=1
+operation@AddRecordTX;txID=8,recordID=7;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=7, name=ExpiryQueue, address=ExpiryQueue, routingType=ANYCAST, filterString=null, durable=null, user=null, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=true, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=false, fqqn=null]]
+operation@Commit;txID=8,numberOfRecords=1
+operation@AddRecordTX;txID=9,recordID=10;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=10, name=activemq.notifications, routingTypes={MULTICAST}, autoCreated=false, internal=false]
+operation@Commit;txID=9,numberOfRecords=1
+operation@AddRecordTX;txID=11,recordID=12;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=12, name=$sys.mqtt.sessions, routingTypes={ANYCAST}, autoCreated=true, internal=true]
+operation@Commit;txID=11,numberOfRecords=1
+operation@AddRecordTX;txID=14,recordID=13;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=13, name=$sys.mqtt.sessions, address=$sys.mqtt.sessions, routingType=ANYCAST, filterString=null, durable=null, user=null, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=true, lastValueKey=_AMQ_LVQ_NAME, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=true, transient=null, autoCreated=false, fqqn=null]]
+operation@Commit;txID=14,numberOfRecords=1
+operation@AddRecordTX;txID=19,recordID=20;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=20, name=golden.q1, routingTypes={ANYCAST}, autoCreated=true, internal=false]
+operation@Commit;txID=19,numberOfRecords=1
+operation@AddRecordTX;txID=22,recordID=21;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=21, name=golden.q1, address=golden.q1, routingType=ANYCAST, filterString=null, durable=null, user=artemis, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=true, fqqn=null]]
+operation@Commit;txID=22,numberOfRecords=1
+operation@AddRecordTX;txID=41,recordID=42;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=42, name=golden.q2, routingTypes={ANYCAST}, autoCreated=true, internal=false]
+operation@Commit;txID=41,numberOfRecords=1
+operation@AddRecordTX;txID=44,recordID=43;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=43, name=golden.q2, address=golden.q2, routingType=ANYCAST, filterString=null, durable=null, user=artemis, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=true, fqqn=null]]
+operation@Commit;txID=44,numberOfRecords=1
+operation@AddRecordTX;txID=58,recordID=59;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=59, name=golden.q3, routingTypes={ANYCAST}, autoCreated=true, internal=false]
+operation@Commit;txID=58,numberOfRecords=1
+operation@AddRecordTX;txID=61,recordID=60;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=60, name=golden.q3, address=golden.q3, routingType=ANYCAST, filterString=null, durable=null, user=artemis, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=true, fqqn=null]]
+operation@Commit;txID=61,numberOfRecords=1
+operation@AddRecordTX;txID=69,recordID=70;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=70, name=golden.topic, routingTypes={MULTICAST}, autoCreated=true, internal=false]
+operation@Commit;txID=69,numberOfRecords=1
+operation@AddRecordTX;txID=72,recordID=71;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=71, name=golden-client.golden-sub, address=golden.topic, routingType=MULTICAST, filterString=colour = 'red', durable=null, user=artemis, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=false, fqqn=null]]
+operation@Commit;txID=72,numberOfRecords=1
+operation@AddRecord;recordID=98;userRecordType=24;isUpdate=false;compactCount=0;IDCounterEncoding [id=98]
+#JournalFileImpl: (activemq-bindings-2.bindings id = 2, recordID = 2) (size=1048576)
+
+### Surviving Records Summary ###
+recordID=1;userRecordType=24;isUpdate=false;compactCount=0;IDCounterEncoding [id=2147483647]
+recordID=2;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=2, name=DLQ, routingTypes={ANYCAST}, autoCreated=false, internal=false]
+recordID=3;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=3, name=DLQ, address=DLQ, routingType=ANYCAST, filterString=null, durable=null, user=null, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=true, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=false, fqqn=null]]
+recordID=6;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=6, name=ExpiryQueue, routingTypes={ANYCAST}, autoCreated=false, internal=false]
+recordID=7;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=7, name=ExpiryQueue, address=ExpiryQueue, routingType=ANYCAST, filterString=null, durable=null, user=null, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=true, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=false, fqqn=null]]
+recordID=10;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=10, name=activemq.notifications, routingTypes={MULTICAST}, autoCreated=false, internal=false]
+recordID=12;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=12, name=$sys.mqtt.sessions, routingTypes={ANYCAST}, autoCreated=true, internal=true]
+recordID=13;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=13, name=$sys.mqtt.sessions, address=$sys.mqtt.sessions, routingType=ANYCAST, filterString=null, durable=null, user=null, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=true, lastValueKey=_AMQ_LVQ_NAME, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=true, transient=null, autoCreated=false, fqqn=null]]
+recordID=20;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=20, name=golden.q1, routingTypes={ANYCAST}, autoCreated=true, internal=false]
+recordID=21;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=21, name=golden.q1, address=golden.q1, routingType=ANYCAST, filterString=null, durable=null, user=artemis, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=true, fqqn=null]]
+recordID=42;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=42, name=golden.q2, routingTypes={ANYCAST}, autoCreated=true, internal=false]
+recordID=43;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=43, name=golden.q2, address=golden.q2, routingType=ANYCAST, filterString=null, durable=null, user=artemis, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=true, fqqn=null]]
+recordID=59;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=59, name=golden.q3, routingTypes={ANYCAST}, autoCreated=true, internal=false]
+recordID=60;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=60, name=golden.q3, address=golden.q3, routingType=ANYCAST, filterString=null, durable=null, user=artemis, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=true, fqqn=null]]
+recordID=70;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=70, name=golden.topic, routingTypes={MULTICAST}, autoCreated=true, internal=false]
+recordID=71;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=71, name=golden-client.golden-sub, address=golden.topic, routingType=MULTICAST, filterString=colour = 'red', durable=null, user=artemis, maxConsumers=-1, exclusive=false, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=false, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=false, temporary=null, autoCreateAddress=null, internal=false, transient=null, autoCreated=false, fqqn=null]]
+recordID=98;userRecordType=24;isUpdate=false;compactCount=0;IDCounterEncoding [id=98]
+
+### Prepared TX ###
+
+### Message Counts ###
+message count=0
+large message count=0
+message reference count
+prepared message count=0
+prepared large message count=0
+prepared message reference count
+
+********************************************
+M E S S A G E S   J O U R N A L
+********************************************
+Journal path: /golden/data/journal
+#JournalFileImpl: (activemq-data-1.amq id = 1, recordID = 1) (size=10485760)
+operation@AddRecord;recordID=24;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=24;userMessageID=125dc326-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=24, durable=true, userID=125dc326-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q1, size=478, properties=TypedProperties[pShort=1234, pDouble=-2.25, __AMQ_CID=golden-client, pByte=-1, pInt=-2147483648, _AMQ_ROUTING_TYPE=1, pString=ünïcødé ✓, pLong=9223372036854775807, pFloat=1.5, JMSCorrelationID=corr-1, JMSType=golden-type, pBool=true]]@1094674892
+operation@Update;recordID=24;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@AddRecord;recordID=25;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=25;userMessageID=12616ca7-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=25, durable=true, userID=12616ca7-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q1, size=174, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_ROUTING_TYPE=1]]@951221468
+operation@Update;recordID=25;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@AddRecord;recordID=26;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=26;userMessageID=12627e18-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=26, durable=true, userID=12627e18-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q1, size=198, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_ROUTING_TYPE=1]]@322561962
+operation@Update;recordID=26;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@AddRecord;recordID=27;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=27;userMessageID=12634169-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=27, durable=true, userID=12634169-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q1, size=180, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_ROUTING_TYPE=1]]@532048323
+operation@Update;recordID=27;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@AddRecordTX;txID=30,recordID=31;userRecordType=37;isUpdate=false;compactCount=0;DuplicateIDEncoding [address=golden.q1, duplID=6700 6F00 6C00 6400 6500 6E00 2D00 6400 7500 7000 2D00 3100]
+operation@AddRecordTX;txID=30,recordID=29;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=29;userMessageID=126404bb-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=29, durable=true, userID=126404bb-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q1, size=237, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_DUPL_ID=golden-dup-1, _AMQ_ROUTING_TYPE=1]]@305502850
+operation@UpdateTX;txID=30,recordID=29;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@Commit;txID=30,numberOfRecords=3
+operation@AddRecord;recordID=33;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=33;userMessageID=1266eaed-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=33, durable=true, userID=1266eaed-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q1, size=243, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_SCHED_DELIVERY=1791630307820, _AMQ_ROUTING_TYPE=1]]@1759482496
+operation@Update;recordID=33;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+operation@Update;recordID=33;userRecordType=36;isUpdate=true;compactCount=0;ScheduledDeliveryEncoding [scheduledDeliveryTime=1791630307820, queueID=21]
+operation@AddRecordTX;txID=39,recordID=46;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=46;userMessageID=1270d5ff-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=46, durable=true, userID=1270d5ff-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q2, size=196, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_ROUTING_TYPE=1]]@1752182275
+operation@UpdateTX;txID=39,recordID=46;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=43]
+operation@AddRecordTX;txID=39,recordID=47;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=47;userMessageID=12714b30-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=47, durable=true, userID=12714b30-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q2, size=196, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_ROUTING_TYPE=1]]@2049051802
+operation@UpdateTX;txID=39,recordID=47;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=43]
+operation@Commit;txID=39,numberOfRecords=4
+operation@AddRecordTX;txID=48,recordID=49;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=49;userMessageID=12720e81-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=49, durable=true, userID=12720e81-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q2, size=196, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_ROUTING_TYPE=1]]@37887172
+operation@UpdateTX;txID=48,recordID=49;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=43]
+operation@Rollback;txID=48
+operation@UpdateTX;txID=50,recordID=46;userRecordType=33;isUpdate=true;compactCount=0;ACK;QueueEncoding [queueID=43]
+operation@Rollback;txID=50
+operation@Update;recordID=46;userRecordType=34;isUpdate=true;compactCount=0;DeliveryCountUpdateEncoding [queueID=43, count=1]
+operation@AddRecord;recordID=63;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=63;userMessageID=12789e33-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=63, durable=true, userID=12789e33-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q3, size=194, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_ROUTING_TYPE=1]]@1449605932
+operation@Update;recordID=63;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=60]
+operation@UpdateTX;txID=56,recordID=63;userRecordType=33;isUpdate=true;compactCount=0;ACK;QueueEncoding [queueID=60]
+operation@Commit;txID=56,numberOfRecords=1
+operation@DeleteRecord;recordID=63
+operation@AddRecord;recordID=78;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=78;userMessageID=1280b485-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=78, durable=true, userID=1280b485-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.topic, size=213, properties=TypedProperties[__AMQ_CID=golden-client, colour=red, _AMQ_ROUTING_TYPE=0]]@664186542
+operation@Update;recordID=78;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=71]
+#JournalFileImpl: (activemq-data-2.amq id = 2, recordID = 2) (size=10485760)
+
+### Surviving Records Summary ###
+recordID=24;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=24;userMessageID=125dc326-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=24, durable=true, userID=125dc326-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q1, size=478, properties=TypedProperties[pShort=1234, pDouble=-2.25, __AMQ_CID=golden-client, pByte=-1, pInt=-2147483648, _AMQ_ROUTING_TYPE=1, pString=ünïcødé ✓, pLong=9223372036854775807, pFloat=1.5, JMSCorrelationID=corr-1, JMSType=golden-type, pBool=true]]@1548010882
+recordID=24;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+recordID=25;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=25;userMessageID=12616ca7-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=25, durable=true, userID=12616ca7-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q1, size=174, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_ROUTING_TYPE=1]]@1741786839
+recordID=25;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+recordID=26;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=26;userMessageID=12627e18-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=26, durable=true, userID=12627e18-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q1, size=198, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_ROUTING_TYPE=1]]@746115872
+recordID=26;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+recordID=27;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=27;userMessageID=12634169-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=27, durable=true, userID=12634169-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q1, size=180, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_ROUTING_TYPE=1]]@20111564
+recordID=27;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+recordID=31;userRecordType=37;isUpdate=false;compactCount=0;DuplicateIDEncoding [address=golden.q1, duplID=6700 6F00 6C00 6400 6500 6E00 2D00 6400 7500 7000 2D00 3100]
+recordID=29;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=29;userMessageID=126404bb-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=29, durable=true, userID=126404bb-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q1, size=237, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_DUPL_ID=golden-dup-1, _AMQ_ROUTING_TYPE=1]]@2065718717
+recordID=29;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+recordID=33;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=33;userMessageID=1266eaed-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=33, durable=true, userID=1266eaed-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q1, size=243, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_SCHED_DELIVERY=1791630307820, _AMQ_ROUTING_TYPE=1]]@275563320
+recordID=33;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=21]
+recordID=33;userRecordType=36;isUpdate=true;compactCount=0;ScheduledDeliveryEncoding [scheduledDeliveryTime=1791630307820, queueID=21]
+recordID=46;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=46;userMessageID=1270d5ff-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=46, durable=true, userID=1270d5ff-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q2, size=196, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_ROUTING_TYPE=1]]@2053628870
+recordID=46;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=43]
+recordID=47;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=47;userMessageID=12714b30-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=47, durable=true, userID=12714b30-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.q2, size=196, properties=TypedProperties[__AMQ_CID=golden-client, _AMQ_ROUTING_TYPE=1]]@1824872646
+recordID=47;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=43]
+recordID=46;userRecordType=34;isUpdate=true;compactCount=0;DeliveryCountUpdateEncoding [queueID=43, count=1]
+recordID=78;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=78;userMessageID=1280b485-c492-11f1-8fb1-00155d1c7a2e;msg=CoreMessage[messageID=78, durable=true, userID=1280b485-c492-11f1-8fb1-00155d1c7a2e, priority=4, timestamp=Sat Oct 10 10:05:07 UTC 2026, expiration=0, durable=true, address=golden.topic, size=213, properties=TypedProperties[__AMQ_CID=golden-client, colour=red, _AMQ_ROUTING_TYPE=0]]@359742806
+recordID=78;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=71]
+
+### Prepared TX ###
+
+### Message Counts ###
+message count=9
+large message count=0
+message reference count
+queue id 21,count=6
+queue id 71,count=1
+queue id 43,count=2
+prepared message count=0
+prepared large message count=0
+prepared message reference count
+
+********************************************
+P A G I N G
+********************************************

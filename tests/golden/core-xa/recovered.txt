@@ -1,0 +1,5 @@
+xids count=1
+xid formatId=4871261 gtrid=676c6f62616c2d7472616e73616374696f6e2d35 bqual=6272616e63682d35
+queue golden.xa exists=true address=golden.xa routingType=ANYCAST filter=null durable=true temporary=false autoCreated=true consumers=0 messageCount=1 maxConsumers=-1 purgeOnNoConsumers=false exclusive=false lastValue=false lastValueKey=null nonDestructive=false consumersBeforeDispatch=0 delayBeforeDispatch=-1 groupRebalance=false groupRebalancePauseDispatch=false groupBuckets=-1 groupFirstKey=null autoDelete=false autoDeleteDelay=0 autoDeleteMessageCount=0 ringSize=-1 enabled=true configurationManaged=false
+msg golden.xa id=26 userID=1096df1e-c495-11f1-9dd2-00155d1c7a2e address=golden.xa durable=true priority=4 deliveryCount=1 timestamp=1791627993269 expiration=0 large=false props={_AMQ_ROUTING_TYPE:byte=1, __AMQ_CID:string=107d1589-c495-11f1-9dd2-00155d1c7a2e} type=TEXT body=29:0100000018780061002d006f006e0065002d0070006800610073006500 text="xa-one-phase"
+drained golden.xa messages=1
