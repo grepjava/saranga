@@ -144,8 +144,8 @@ impl Outcome {
 
     /// Applies the outcome to the queues (`afterCommit` / `afterRollback`):
     /// committed sends join their queues, committed acknowledgements are
-    /// final, rolled-back references return with their delivery count
-    /// journaled (`checkRedelivery`).
+    /// final, rolled-back references return to their queues, which check
+    /// them for redelivery.
     pub fn apply(self) {
         for (q, r) in self.add {
             q.add(r);
@@ -161,15 +161,7 @@ impl Outcome {
         for (q, n) in acked {
             q.acked(n);
         }
-        let cancel = self
-            .cancel
-            .into_iter()
-            .map(|(q, mut r)| {
-                persist_delivery_count(&q, &mut r);
-                (q, r)
-            })
-            .collect();
-        return_refs(cancel);
+        return_refs(self.cancel);
     }
 }
 

@@ -407,13 +407,15 @@ impl CoreSession {
                 false,
             ),
             Packet::SessionExpireMessage(p) => {
-                // Expiry addresses come with the Phase 4 queue semantics;
-                // until then an expired message is simply removed.
-                (
-                    false,
-                    self.acknowledge(p.consumer_id, p.message_id, true).await,
-                    false,
-                )
+                // ServerSessionImpl.expire
+                let result = match self.consumers.get(&p.consumer_id) {
+                    Some(c) => {
+                        c.queue.expire(c.id, p.message_id);
+                        Ok(None)
+                    }
+                    None => Err(BrokerError::consumer_doesnt_exist(p.consumer_id)),
+                };
+                (false, result, false)
             }
             Packet::SessionRequestProducerCreditsMessage(p) => {
                 // No paging yet, so credits are always granted.
@@ -726,7 +728,15 @@ impl CoreSession {
             }
         };
         let routing_type = routing_type(&message);
-        let r = MessageRef::new(ServerMessage::new(message));
+        // PostOfficeImpl.route: the address's expiry settings apply first.
+        let settings = self
+            .broker
+            .post_office()
+            .settings(crate::postoffice::split_fqqn(&address).0);
+        crate::message::apply_expiry_delay(&mut message, &settings, crate::message::now_millis());
+        let scheduled_time = crate::message::scheduled_delivery_time(&message);
+        let mut r = MessageRef::new(ServerMessage::new(message));
+        r.scheduled_time = scheduled_time;
         // doSend: outside a transaction when auto-committing or when an XA
         // session has none.
         let tx = if self.auto_commit_sends {
@@ -765,6 +775,18 @@ impl CoreSession {
                             s.store_reference(q.id(), message.message_id(), i == last)
                                 .map_err(io_error)?,
                         );
+                        if scheduled_time > 0
+                            && let Some(p) = s
+                                .update_scheduled_delivery_time(
+                                    q.id(),
+                                    message.message_id(),
+                                    scheduled_time,
+                                    0,
+                                )
+                                .map_err(io_error)?
+                        {
+                            self.ops.push(p);
+                        }
                     }
                     // The references join their queues once journaled.
                     self.actions.push(Box::new(move || {
@@ -790,6 +812,15 @@ impl CoreSession {
                     if let Some(s) = &storage {
                         s.store_reference_tx(t.id, q.id(), message.message_id())
                             .map_err(io_error)?;
+                        if scheduled_time > 0 {
+                            s.update_scheduled_delivery_time_tx(
+                                t.id,
+                                q.id(),
+                                message.message_id(),
+                                scheduled_time,
+                            )
+                            .map_err(io_error)?;
+                        }
                         t.persistent = true;
                     }
                 }

@@ -10,7 +10,7 @@ use saranga_buffer::SimpleString;
 use saranga_storage::RecordCodec;
 use saranga_storage::codec::{PersistentAddressBindingEncoding, PersistentQueueBindingEncoding};
 
-use crate::message::{MessageRef, ServerMessage};
+use crate::message::{self, MessageRef, ServerMessage};
 use crate::postoffice::{AddressInfo, PostOffice, RoutingTypes};
 use crate::queue::{Queue, QueueConfig};
 use crate::storage::{RecoveredMessages, Storage, StoreResult, ids};
@@ -195,6 +195,7 @@ pub async fn load_messages(
         .into_iter()
         .map(|(id, m)| (id, ServerMessage::new(m)))
         .collect();
+    let now = message::now_millis();
     for (queue_id, refs) in queues {
         let Some(queue) = by_id.get(&queue_id) else {
             if !refs.is_empty() {
@@ -207,11 +208,20 @@ pub async fn load_messages(
                 continue;
             };
             m.durable_up();
+            // A journaled delivery time already past is dropped; without
+            // one the message's own property counts (`PostOfficeJournalLoader`
+            // then `reload`).
+            let scheduled_time = match r.scheduled_time {
+                0 => message::scheduled_delivery_time(m.core()),
+                t if t <= now => 0,
+                t => t,
+            };
             // setDeliveryCount also sets the persisted count.
             queue.add(MessageRef {
                 message: m.clone(),
                 delivery_count: r.delivery_count,
                 persisted_count: r.delivery_count,
+                scheduled_time,
             });
         }
     }
@@ -226,7 +236,9 @@ pub async fn load_messages(
                 continue;
             };
             m.durable_up();
-            tx.sends.push((q.clone(), MessageRef::new(m.clone())));
+            let mut r = MessageRef::new(m.clone());
+            r.scheduled_time = message::scheduled_delivery_time(m.core());
+            tx.sends.push((q.clone(), r));
         }
         for (queue_id, message_id) in p.acks {
             let Some(q) = by_id.get(&queue_id) else {

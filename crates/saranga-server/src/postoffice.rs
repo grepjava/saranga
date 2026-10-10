@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 
 use crate::error::{BrokerError, Result};
 use crate::message::MessageRef;
@@ -323,6 +323,9 @@ struct State {
 }
 
 pub struct PostOffice {
+    /// Handed to queues, which route through the post office when they
+    /// move messages.
+    me: Weak<PostOffice>,
     state: RwLock<State>,
     settings: Arc<dyn SettingsRepository>,
     filters: Arc<dyn FilterFactory>,
@@ -336,14 +339,15 @@ impl PostOffice {
         filters: Arc<dyn FilterFactory>,
         ids: Arc<IdGenerator>,
         wildcard: WildcardConfig,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             state: RwLock::default(),
             settings,
             filters,
             ids,
             wildcard,
-        }
+        })
     }
 
     pub fn settings(&self, address: &str) -> Arc<AddressSettings> {
@@ -414,7 +418,7 @@ impl PostOffice {
                 anycast_next: AtomicUsize::new(0),
             });
         entry.info.routing_types.add(config.routing_type);
-        let queue = Queue::spawn(id, config, filter, self.ids.clone());
+        let queue = Queue::spawn(id, config, filter, self.ids.clone(), self.me.clone());
         entry.queues.push(queue.clone());
         state.queues.insert(queue.name().clone(), queue.clone());
         Ok(queue)
@@ -608,7 +612,7 @@ impl PostOffice {
             )
             .map_err(Self::io)?;
         }
-        let queue = Queue::spawn(id, config, filter, self.ids.clone());
+        let queue = Queue::spawn(id, config, filter, self.ids.clone(), self.me.clone());
         entry.queues.push(queue.clone());
         state.queues.insert(queue.name().clone(), queue.clone());
         Ok(queue)
@@ -903,6 +907,22 @@ impl PostOffice {
             targets = self.bindings_route(message, address);
         }
         Ok(targets.unwrap_or_default())
+    }
+
+    /// Whether anything is bound to `address`
+    /// (`lookupBindingsForAddress` not empty).
+    pub fn has_bindings(&self, address: &str) -> bool {
+        self.read()
+            .addresses
+            .get(address)
+            .is_some_and(|e| !e.queues.is_empty())
+    }
+
+    /// `PostOfficeImpl.route` for a message the broker itself sends (a
+    /// dead-letter or expiry copy): no auto-creation, and no bindings means
+    /// no queues.
+    pub fn route_internal(&self, message: &MessageRef, address: &str) -> Vec<Queue> {
+        self.bindings_route(message, address).unwrap_or_default()
     }
 
     /// Routes through the bindings of `address` and of every wildcard

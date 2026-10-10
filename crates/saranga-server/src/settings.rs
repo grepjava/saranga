@@ -1,6 +1,6 @@
 //! Address settings, resolved for one address. Ported from the subset of
-//! `AddressSettings` that the Phase 2 broker uses; the values and defaults
-//! are Artemis's.
+//! `AddressSettings` that the broker acts on; the values and defaults are
+//! Artemis's.
 
 use std::sync::Arc;
 
@@ -37,6 +37,28 @@ pub struct AddressSettings {
     pub max_delivery_attempts: i32,
     pub dead_letter_address: Option<String>,
     pub expiry_address: Option<String>,
+    pub redelivery_delay: i64,
+    pub redelivery_multiplier: f64,
+    pub redelivery_collision_avoidance_factor: f64,
+    pub max_redelivery_delay: i64,
+    pub expiry_delay: i64,
+    pub min_expiry_delay: i64,
+    pub max_expiry_delay: i64,
+    pub no_expiry: bool,
+    pub send_to_dla_on_no_route: bool,
+    pub auto_create_dead_letter_resources: bool,
+    pub dead_letter_queue_prefix: String,
+    pub dead_letter_queue_suffix: String,
+    pub auto_create_expiry_resources: bool,
+    pub expiry_queue_prefix: String,
+    pub expiry_queue_suffix: String,
+    /// `id-cache-size` for this address; the broker's when unset.
+    pub id_cache_size: Option<i32>,
+}
+
+impl AddressSettings {
+    /// `DEFAULT_MIN_EXPIRY_DELAY` / `DEFAULT_MAX_EXPIRY_DELAY`: unset.
+    pub const NO_EXPIRY_DELAY: i64 = -1;
 }
 
 impl Default for AddressSettings {
@@ -70,6 +92,22 @@ impl Default for AddressSettings {
             max_delivery_attempts: 10,
             dead_letter_address: None,
             expiry_address: None,
+            redelivery_delay: 0,
+            redelivery_multiplier: 1.0,
+            redelivery_collision_avoidance_factor: 0.0,
+            max_redelivery_delay: 0,
+            expiry_delay: -1,
+            min_expiry_delay: -1,
+            max_expiry_delay: -1,
+            no_expiry: false,
+            send_to_dla_on_no_route: false,
+            auto_create_dead_letter_resources: false,
+            dead_letter_queue_prefix: "DLQ.".into(),
+            dead_letter_queue_suffix: String::new(),
+            auto_create_expiry_resources: false,
+            expiry_queue_prefix: "EXP.".into(),
+            expiry_queue_suffix: String::new(),
+            id_cache_size: None,
         }
     }
 }

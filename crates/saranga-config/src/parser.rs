@@ -414,6 +414,15 @@ fn parse_core(
     if let Some(v) = s.i64("global-max-messages", Check::MinusOneOrGtZero)? {
         config.global_max_messages = v;
     }
+    if let Some(v) = s.i64("message-expiry-scan-period", Check::MinusOneOrGtZero)? {
+        config.message_expiry_scan_period = v;
+    }
+    if let Some(v) = s.i32("id-cache-size", Check::GeZero)? {
+        config.id_cache_size = v;
+    }
+    if let Some(v) = s.bool("persist-id-cache") {
+        config.persist_id_cache = v;
+    }
 
     if let Some(v) = s.non_empty_string("large-messages-directory")? {
         config.large_messages_directory = v;

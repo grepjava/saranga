@@ -247,6 +247,13 @@ pub struct BrokerConfig {
     /// Match string and settings, in document order.
     pub address_settings: Vec<(String, AddressSettings)>,
     pub addresses: Vec<AddressConfig>,
+    /// `message-expiry-scan-period` in milliseconds; `-1` turns the expiry
+    /// reaper off.
+    pub message_expiry_scan_period: i64,
+    /// `id-cache-size`: duplicate IDs remembered per address.
+    pub id_cache_size: i32,
+    /// `persist-id-cache`: duplicate IDs are journaled.
+    pub persist_id_cache: bool,
     pub warnings: Vec<Warning>,
 }
 
@@ -259,6 +266,9 @@ impl BrokerConfig {
     pub const DEFAULT_PAGING_DIR: &str = "data/paging";
     pub const DEFAULT_LARGE_MESSAGES_DIR: &str = "data/largemessages";
     pub const DEFAULT_GLOBAL_MAX_MESSAGES: i64 = -1;
+    pub const DEFAULT_MESSAGE_EXPIRY_SCAN_PERIOD: i64 = 30000;
+    pub const DEFAULT_ID_CACHE_SIZE: i32 = 20000;
+    pub const DEFAULT_PERSIST_ID_CACHE: bool = true;
 
     /// Parses `broker.xml` text, resolving `${...}` from environment
     /// variables.
@@ -317,6 +327,9 @@ impl Default for BrokerConfig {
             acceptors: Vec::new(),
             address_settings: Vec::new(),
             addresses: Vec::new(),
+            message_expiry_scan_period: Self::DEFAULT_MESSAGE_EXPIRY_SCAN_PERIOD,
+            id_cache_size: Self::DEFAULT_ID_CACHE_SIZE,
+            persist_id_cache: Self::DEFAULT_PERSIST_ID_CACHE,
             warnings: Vec::new(),
         }
     }

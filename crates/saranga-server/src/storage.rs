@@ -9,7 +9,9 @@ use saranga_buffer::{Reader, Writer};
 use saranga_journal::{Completion, Journal, JournalConfig, JournalError, PreparedTransactionInfo};
 use saranga_message::CoreMessage;
 use saranga_storage::RecordCodec;
-use saranga_storage::codec::{DeliveryCountUpdateEncoding, IdCounterEncoding, RefEncoding};
+use saranga_storage::codec::{
+    DeliveryCountUpdateEncoding, IdCounterEncoding, RefEncoding, ScheduledDeliveryEncoding,
+};
 use saranga_storage::message::PersistedMessage;
 use saranga_storage::{BatchingIdGenerator, CHECKPOINT_BATCH_SIZE, IdCounterStore};
 use tokio::sync::oneshot;
@@ -140,6 +142,8 @@ pub fn decode_xid(data: &[u8]) -> StoreResult<Xid> {
 pub struct RecoveredRef {
     pub message_id: i64,
     pub delivery_count: i32,
+    /// From `SET_SCHEDULED_DELIVERY_TIME`; 0 when none was written.
+    pub scheduled_time: i64,
 }
 
 /// A prepared XA transaction recovered from the journal.
@@ -225,7 +229,8 @@ impl Storage {
         let mut out = RecoveredMessages::default();
         // Per queue: message IDs in ADD_REF order, as a LinkedHashMap.
         let mut order: HashMap<i64, Vec<i64>> = HashMap::new();
-        let mut refs: HashMap<i64, HashMap<i64, i32>> = HashMap::new();
+        // Per queue: message ID to (delivery count, scheduled time).
+        let mut refs: HashMap<i64, HashMap<i64, (i32, i64)>> = HashMap::new();
         for r in loaded.committed {
             match r.user_record_type {
                 ids::ADD_MESSAGE_PROTOCOL => {
@@ -243,7 +248,7 @@ impl Storage {
                         continue;
                     }
                     let q = refs.entry(queue).or_default();
-                    if q.insert(r.id, 0).is_none() {
+                    if q.insert(r.id, (0, 0)).is_none() {
                         order.entry(queue).or_default().push(r.id);
                     }
                 }
@@ -265,11 +270,25 @@ impl Storage {
                     let u = DeliveryCountUpdateEncoding::decode(&r.data)
                         .map_err(corrupt("delivery count"))?;
                     if let Some(c) = refs.get_mut(&u.queue_id).and_then(|q| q.get_mut(&r.id)) {
-                        *c = u.count;
+                        c.0 = u.count;
                     }
                 }
-                // Scheduled delivery and duplicate detection come with the
-                // Phase 4 queue semantics; their records stay in the journal.
+                ids::SET_SCHEDULED_DELIVERY_TIME => {
+                    let s = ScheduledDeliveryEncoding::decode(&r.data)
+                        .map_err(corrupt("scheduled delivery"))?;
+                    match refs.get_mut(&s.queue_id) {
+                        None => tracing::error!(
+                            "AMQ224011: Cannot find queue messages {} for message {} while processing scheduled messages",
+                            s.queue_id,
+                            r.id
+                        ),
+                        Some(q) => match q.get_mut(&r.id) {
+                            Some(c) => c.1 = s.scheduled_delivery_time,
+                            None => tracing::warn!("AMQ222031: Cannot find message {}", r.id),
+                        },
+                    }
+                }
+                // Duplicate IDs are loaded by the duplicate-ID caches.
                 other => tracing::debug!("Extra record type {other}"),
             }
         }
@@ -280,9 +299,10 @@ impl Storage {
             let list: Vec<RecoveredRef> = ids
                 .into_iter()
                 .filter_map(|id| {
-                    live.get(&id).map(|&c| RecoveredRef {
+                    live.get(&id).map(|&(c, t)| RecoveredRef {
                         message_id: id,
                         delivery_count: c,
+                        scheduled_time: t,
                     })
                 })
                 .collect();
@@ -433,15 +453,68 @@ impl Storage {
             return Ok(false);
         }
         let body = DeliveryCountUpdateEncoding { queue_id, count }.encode();
+        // With a completion the append never waits for the sync, so a queue
+        // calling this is not held up.
         self.messages.append_update(
             message_id,
             ids::UPDATE_DELIVERY_COUNT,
             body,
             self.cfg.sync_non_transactional,
             true,
-            None,
+            Some(Box::new(|_| {})),
         )?;
         Ok(true)
+    }
+
+    /// `updateScheduledDeliveryTime`: not written past
+    /// `max-redelivery-records` deliveries.
+    pub fn update_scheduled_delivery_time(
+        &self,
+        queue_id: i64,
+        message_id: i64,
+        time: i64,
+        delivery_count: i32,
+    ) -> StoreResult<Option<Pending>> {
+        let max = self.cfg.max_redelivery_records;
+        if max >= 0 && delivery_count > max {
+            return Ok(None);
+        }
+        let sync = self.cfg.sync_non_transactional;
+        let (c, p) = self.completion(sync);
+        let body = ScheduledDeliveryEncoding {
+            queue_id,
+            scheduled_delivery_time: time,
+        }
+        .encode();
+        let found = self.messages.append_update(
+            message_id,
+            ids::SET_SCHEDULED_DELIVERY_TIME,
+            body,
+            sync,
+            true,
+            c,
+        )?;
+        if !found {
+            tracing::debug!("Record {message_id} not found");
+        }
+        Ok(p)
+    }
+
+    /// `updateScheduledDeliveryTimeTransactional`.
+    pub fn update_scheduled_delivery_time_tx(
+        &self,
+        tx: i64,
+        queue_id: i64,
+        message_id: i64,
+        time: i64,
+    ) -> StoreResult<()> {
+        let body = ScheduledDeliveryEncoding {
+            queue_id,
+            scheduled_delivery_time: time,
+        }
+        .encode();
+        self.messages
+            .append_update_tx(tx, message_id, ids::SET_SCHEDULED_DELIVERY_TIME, body)
     }
 
     /// `storeMessageTransactional`.

@@ -84,6 +84,22 @@ fn resolve(s: &cfg::AddressSettings) -> AddressSettings {
         max_delivery_attempts: s.max_delivery_attempts(),
         dead_letter_address: s.dead_letter_address.clone(),
         expiry_address: s.expiry_address.clone(),
+        redelivery_delay: s.redelivery_delay(),
+        redelivery_multiplier: s.redelivery_multiplier(),
+        redelivery_collision_avoidance_factor: s.redelivery_collision_avoidance_factor(),
+        max_redelivery_delay: s.max_redelivery_delay(),
+        expiry_delay: s.expiry_delay(),
+        min_expiry_delay: s.min_expiry_delay(),
+        max_expiry_delay: s.max_expiry_delay(),
+        no_expiry: s.no_expiry(),
+        send_to_dla_on_no_route: s.send_to_dla_on_no_route(),
+        auto_create_dead_letter_resources: s.auto_create_dead_letter_resources(),
+        dead_letter_queue_prefix: s.dead_letter_queue_prefix().to_owned(),
+        dead_letter_queue_suffix: s.dead_letter_queue_suffix().to_owned(),
+        auto_create_expiry_resources: s.auto_create_expiry_resources(),
+        expiry_queue_prefix: s.expiry_queue_prefix().to_owned(),
+        expiry_queue_suffix: s.expiry_queue_suffix().to_owned(),
+        id_cache_size: s.id_cache_size,
     }
 }
 
@@ -212,6 +228,7 @@ impl BrokerConfig {
             storage: config
                 .persistence_enabled
                 .then(|| storage_config(config, instance)),
+            message_expiry_scan_period: config.message_expiry_scan_period,
         })
     }
 }

@@ -4,18 +4,23 @@
 //! the order the caller's operations happen.
 //!
 //! Ported from the delivery and acknowledgement paths of `QueueImpl`,
-//! `ServerConsumerImpl`, `QueueConsumersImpl` and `RefsOperation`.
+//! `ServerConsumerImpl`, `QueueConsumersImpl`, `RefsOperation` and
+//! `ScheduledDeliveryHandlerImpl`, with redelivery, dead-letter and expiry
+//! handling (`checkRedelivery`, `sendToDeadLetterAddress`, `expire`, `move`).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use saranga_buffer::PropertyValue;
 use saranga_message::CoreMessage;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::message::{MessageRef, ServerMessage};
+use crate::message::{self, MessageRef, ServerMessage, now_millis};
+use crate::postoffice::{PostOffice, QueueSpec};
+use crate::settings::AddressSettings;
 use crate::{IdGenerator, Name, RoutingType};
 
 /// `ClientConsumerImpl.FORCED_DELIVERY_MESSAGE`.
@@ -135,6 +140,13 @@ enum Cmd {
         message_id: i64,
         reply: oneshot::Sender<Option<MessageRef>>,
     },
+    /// The client found a delivered message expired (`SESS_EXPIRED`).
+    Expire {
+        id: ConsumerId,
+        message_id: i64,
+    },
+    /// The expiry reaper's pass (`expireReferences`).
+    ExpireScan,
     Shutdown,
 }
 
@@ -143,6 +155,9 @@ struct Shared {
     config: QueueConfig,
     filter: Option<FilterRef>,
     ids: Arc<IdGenerator>,
+    /// For address settings and for moving messages to the dead-letter and
+    /// expiry addresses.
+    post_office: Weak<PostOffice>,
     tx: mpsc::UnboundedSender<Cmd>,
     /// `getMessageCount`: queued, delivering and acked-in-transaction.
     message_count: AtomicI64,
@@ -175,6 +190,7 @@ impl Queue {
         config: QueueConfig,
         filter: Option<FilterRef>,
         ids: Arc<IdGenerator>,
+        post_office: Weak<PostOffice>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let queue = Self(Arc::new(Shared {
@@ -182,6 +198,7 @@ impl Queue {
             config,
             filter,
             ids,
+            post_office,
             tx,
             message_count: AtomicI64::new(0),
             consumer_count: AtomicI32::new(0),
@@ -193,6 +210,9 @@ impl Queue {
             consumers: Vec::new(),
             browsers: Vec::new(),
             round_robin: HashMap::new(),
+            scheduled: BTreeMap::new(),
+            scheduled_seq: 0,
+            expiry_warned: false,
         };
         tokio::spawn(actor.run(rx));
         queue
@@ -239,6 +259,14 @@ impl Queue {
 
     pub fn ids(&self) -> &Arc<IdGenerator> {
         &self.0.ids
+    }
+
+    /// The queue's address settings (`cachedAddressSettings`).
+    pub fn settings(&self) -> Arc<AddressSettings> {
+        match self.0.post_office.upgrade() {
+            Some(po) => po.settings(&self.0.config.address),
+            None => Arc::default(),
+        }
     }
 
     /// `postAcknowledge`: once no durable queue refers to the message, its
@@ -360,6 +388,17 @@ impl Queue {
         self.send(Cmd::ForceDelivery { id, sequence });
     }
 
+    /// `ServerSessionImpl.expire`: a delivered message the client found
+    /// expired.
+    pub fn expire(&self, id: ConsumerId, message_id: i64) {
+        self.send(Cmd::Expire { id, message_id });
+    }
+
+    /// Expires every queued message whose time has passed.
+    pub fn expire_scan(&self) {
+        self.send(Cmd::ExpireScan);
+    }
+
     /// Stops the actor. Its messages are dropped.
     pub fn shutdown(&self) {
         self.0.deleted.store(true, Ordering::SeqCst);
@@ -377,6 +416,27 @@ struct MessageList {
 impl MessageList {
     fn push_back(&mut self, r: MessageRef) {
         self.levels[r.message.priority_level()].push_back(r);
+    }
+
+    fn push_front(&mut self, r: MessageRef) {
+        self.levels[r.message.priority_level()].push_front(r);
+    }
+
+    /// Takes out every reference `pred` selects, in list order.
+    fn take_where(&mut self, mut pred: impl FnMut(&MessageRef) -> bool) -> Vec<MessageRef> {
+        let mut out = Vec::new();
+        for level in self.levels.iter_mut().rev() {
+            let mut keep = VecDeque::with_capacity(level.len());
+            for r in level.drain(..) {
+                if pred(&r) {
+                    out.push(r);
+                } else {
+                    keep.push_back(r);
+                }
+            }
+            *level = keep;
+        }
+        out
     }
 
     /// `addSorted`: inserts in message ID order within its priority.
@@ -407,10 +467,6 @@ impl MessageList {
 
     fn len(&self) -> usize {
         self.levels.iter().map(VecDeque::len).sum()
-    }
-
-    fn clear(&mut self) {
-        self.levels.iter_mut().for_each(VecDeque::clear);
     }
 }
 
@@ -446,11 +502,33 @@ struct Actor {
     browsers: Vec<Consumer>,
     /// Next consumer to try within each priority group.
     round_robin: HashMap<i32, usize>,
+    /// References waiting for their delivery time, ordered by time, then
+    /// redeliveries before new messages, then arrival
+    /// (`ScheduledDeliveryHandlerImpl`).
+    scheduled: BTreeMap<(i64, bool, u64), MessageRef>,
+    scheduled_seq: u64,
+    /// AMQ222147 is logged once per queue.
+    expiry_warned: bool,
 }
 
 impl Actor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Cmd>) {
-        while let Some(cmd) = rx.recv().await {
+        loop {
+            let cmd = match self.scheduled.keys().next().map(|k| k.0) {
+                None => rx.recv().await,
+                Some(at) => {
+                    let wait = Duration::from_millis((at - now_millis()).max(0) as u64);
+                    tokio::select! {
+                        cmd = rx.recv() => cmd,
+                        _ = tokio::time::sleep(wait) => {
+                            self.deliver_scheduled();
+                            self.deliver();
+                            continue;
+                        }
+                    }
+                }
+            };
+            let Some(cmd) = cmd else { break };
             if !self.handle(cmd) {
                 break;
             }
@@ -466,22 +544,298 @@ impl Actor {
             if !running {
                 break;
             }
+            self.deliver_scheduled();
             self.deliver();
         }
+    }
+
+    fn queue(&self) -> Queue {
+        Queue(self.shared.clone())
+    }
+
+    /// Holds a reference until its delivery time (`checkAndSchedule`);
+    /// `tail` marks a new message, which goes after redeliveries due at the
+    /// same time.
+    fn schedule(&mut self, r: MessageRef, tail: bool) {
+        self.scheduled_seq += 1;
+        self.scheduled
+            .insert((r.scheduled_time, tail, self.scheduled_seq), r);
+    }
+
+    /// `ScheduledDeliveryRunnable`: references whose time has come go to the
+    /// head of the queue, in delivery-time order.
+    fn deliver_scheduled(&mut self) {
+        let now = now_millis();
+        let mut due = Vec::new();
+        while let Some(entry) = self.scheduled.first_entry() {
+            if entry.key().0 > now {
+                break;
+            }
+            let mut r = entry.remove();
+            r.scheduled_time = 0;
+            due.push(r);
+        }
+        for r in due.into_iter().rev() {
+            self.messages.push_front(r);
+        }
+    }
+
+    /// `addTail`: scheduled references wait for their time.
+    fn add_tail(&mut self, r: MessageRef) {
+        if r.scheduled_time > 0 {
+            self.schedule(r, true);
+        } else {
+            self.messages.push_back(r);
+        }
+    }
+
+    /// `addSorted`: a returned reference goes back in message ID order, or
+    /// waits out its redelivery delay.
+    fn add_sorted(&mut self, r: MessageRef) {
+        if r.scheduled_time > 0 {
+            self.schedule(r, false);
+        } else {
+            self.messages.insert_sorted(r);
+        }
+    }
+
+    /// References coming back from consumers or a rolled-back transaction
+    /// (`RefsOperation.afterRollback`): each is checked for redelivery
+    /// (`checkRedelivery`), then the survivors return (`postRollback`).
+    fn return_refs(&mut self, refs: Vec<MessageRef>) {
+        let now = now_millis();
+        let back: Vec<MessageRef> = refs
+            .into_iter()
+            .filter_map(|r| self.check_redelivery(r, now))
+            .collect();
+        if self.shared.config.purge_on_no_consumers && self.consumers.is_empty() {
+            back.into_iter().for_each(|r| self.kill(r));
+        } else {
+            back.into_iter().for_each(|r| self.add_sorted(r));
+        }
+    }
+
+    /// `checkRedelivery`: journals the delivery count, then sends the
+    /// reference to the dead-letter address once it has used its delivery
+    /// attempts, or delays its redelivery. `None` when it has left the queue.
+    fn check_redelivery(&mut self, mut r: MessageRef, time_base: i64) -> Option<MessageRef> {
+        let queue = self.queue();
+        crate::transaction::persist_delivery_count(&queue, &mut r);
+        let s = queue.settings();
+        if s.max_delivery_attempts > 0 && r.delivery_count >= s.max_delivery_attempts {
+            self.send_to_dead_letter_address(r, &s);
+            return None;
+        }
+        if s.redelivery_delay > 0 {
+            r.scheduled_time = time_base + redelivery_delay(&s, r.delivery_count);
+            if queue.is_durable_ref(&r)
+                && let Some(st) = self.shared.ids.storage()
+                && let Err(e) = st.update_scheduled_delivery_time(
+                    self.shared.id,
+                    r.message_id(),
+                    r.scheduled_time,
+                    r.delivery_count,
+                )
+            {
+                tracing::warn!("updating the scheduled delivery time: {e}");
+            }
+        }
+        Some(r)
+    }
+
+    /// `acknowledge` outside any transaction, for a reference the broker
+    /// drops (`AckReason.KILLED` / `EXPIRED`).
+    fn kill(&mut self, r: MessageRef) {
+        let queue = self.queue();
+        if queue.is_durable_ref(&r)
+            && let Some(s) = self.shared.ids.storage()
+            && let Err(e) = s.store_acknowledge(self.shared.id, r.message_id())
+        {
+            tracing::warn!(
+                "AMQ222178: Cannot find message {} on the journal: {e}",
+                r.message_id()
+            );
+        }
+        queue.post_acknowledge(&r);
+        self.count_removed(1);
+    }
+
+    /// `sendToDeadLetterAddress`.
+    fn send_to_dead_letter_address(&mut self, r: MessageRef, s: &AddressSettings) {
+        let name = &self.shared.config.name;
+        let Some(dla) = s.dead_letter_address.clone() else {
+            tracing::warn!(
+                "AMQ222150: Sending message {} to Dead Letter Address, but there is no Dead Letter Address configured for queue {name} so dropping it",
+                r.message_id()
+            );
+            self.kill(r);
+            return;
+        };
+        let address = self.shared.config.address.clone();
+        self.create_resources(
+            &address,
+            s.auto_create_dead_letter_resources,
+            &dla,
+            &s.dead_letter_queue_prefix,
+            &s.dead_letter_queue_suffix,
+        );
+        if !self.has_bindings(&dla) {
+            tracing::warn!(
+                "AMQ222148: Sending message {} to Dead Letter Address {dla}, but it has no bindings so dropping it",
+                r.message_id()
+            );
+            self.kill(r);
+        } else {
+            tracing::warn!(
+                "AMQ222149: Sending message {} to Dead Letter Address {dla} from {name}",
+                r.message_id()
+            );
+            self.move_to(&dla, r, false);
+        }
+    }
+
+    /// `expire`: to the expiry address of the message's own address, or
+    /// dropped.
+    fn expire(&mut self, r: MessageRef) {
+        let queue = self.queue();
+        let message_address = r
+            .message
+            .core()
+            .address
+            .as_ref()
+            .map(|a| a.to_string_lossy())
+            .unwrap_or_else(|| self.shared.config.address.to_string());
+        let s = if *message_address == *self.shared.config.address {
+            queue.settings()
+        } else {
+            match self.shared.post_office.upgrade() {
+                Some(po) => po.settings(&message_address),
+                None => Arc::default(),
+            }
+        };
+        match s.expiry_address.clone().filter(|a| !a.is_empty()) {
+            Some(expiry) => {
+                self.create_resources(
+                    &message_address,
+                    s.auto_create_expiry_resources,
+                    &expiry,
+                    &s.expiry_queue_prefix,
+                    &s.expiry_queue_suffix,
+                );
+                if self.has_bindings(&expiry) {
+                    self.move_to(&expiry, r, true);
+                } else {
+                    if !self.expiry_warned {
+                        self.expiry_warned = true;
+                        tracing::warn!(
+                            "AMQ222146: Message has expired. No bindings for Expiry Address {expiry} so dropping it"
+                        );
+                    }
+                    self.kill(r);
+                }
+            }
+            None => {
+                if !self.expiry_warned {
+                    self.expiry_warned = true;
+                    tracing::warn!(
+                        "AMQ222147: Messages are being expired on queue {}, but there is no Expiry Address configured so messages will be dropped.",
+                        self.shared.config.name
+                    );
+                }
+                self.kill(r);
+            }
+        }
+    }
+
+    fn has_bindings(&self, address: &str) -> bool {
+        self.shared
+            .post_office
+            .upgrade()
+            .is_some_and(|po| po.has_bindings(address))
+    }
+
+    /// `createResources`: with auto-creation on, a queue on the dead-letter
+    /// or expiry address for this address's messages only.
+    fn create_resources(
+        &self,
+        address: &str,
+        auto_create: bool,
+        destination: &str,
+        prefix: &str,
+        suffix: &str,
+    ) {
+        if !auto_create || address == destination || destination.is_empty() {
+            return;
+        }
+        let Some(po) = self.shared.post_office.upgrade() else {
+            return;
+        };
+        let mut spec = QueueSpec::new(format!("{prefix}{address}{suffix}"), destination);
+        spec.filter_string = Some(format!("{} = '{address}'", message::HDR_ORIGINAL_ADDRESS));
+        spec.auto_created = true;
+        spec.auto_create_address = Some(true);
+        if let Err(e) = po.create_queue(spec, true) {
+            tracing::debug!("creating a resource queue on {destination}: {e}");
+        }
+    }
+
+    /// `move`: a copy of the message goes to `address` and the reference is
+    /// acknowledged, in one transaction.
+    fn move_to(&mut self, address: &str, r: MessageRef, expiry: bool) {
+        let Some(po) = self.shared.post_office.upgrade() else {
+            self.kill(r);
+            return;
+        };
+        let now = now_millis();
+        let mut copy = message::make_copy(
+            r.message.core(),
+            self.shared.ids.next(),
+            address,
+            &self.shared.config.name,
+            expiry,
+            now,
+        );
+        message::apply_expiry_delay(&mut copy, &po.settings(address), now);
+        let mut copy = MessageRef::new(ServerMessage::new(copy));
+        copy.scheduled_time = message::scheduled_delivery_time(copy.message.core());
+        let targets = po.route_internal(&copy, address);
+        let queue = self.queue();
+        if let Some(s) = self.shared.ids.storage() {
+            let tx = self.shared.ids.next();
+            let mut persistent = false;
+            let mut written = || -> crate::storage::StoreResult<()> {
+                for q in targets.iter().filter(|q| q.is_durable_ref(&copy)) {
+                    if copy.message.durable_up() == 1 {
+                        s.store_message_tx(tx, copy.message.core(), copy.message.encoded())?;
+                    }
+                    s.store_reference_tx(tx, q.id(), copy.message_id())?;
+                    persistent = true;
+                }
+                if queue.is_durable_ref(&r) {
+                    s.store_acknowledge_tx(tx, self.shared.id, r.message_id())?;
+                    persistent = true;
+                }
+                if persistent {
+                    s.commit(tx)?;
+                }
+                Ok(())
+            };
+            if let Err(e) = written() {
+                tracing::warn!("moving message {} to {address}: {e}", r.message_id());
+            }
+        }
+        for q in &targets {
+            q.add(copy.clone());
+        }
+        queue.post_acknowledge(&r);
+        self.count_removed(1);
     }
 
     /// Handles one command; returns false to stop the actor.
     fn handle(&mut self, cmd: Cmd) -> bool {
         match cmd {
-            Cmd::Add(r) => self.messages.push_back(r),
-            Cmd::Reinsert(refs) => {
-                if self.shared.config.purge_on_no_consumers && self.consumers.is_empty() {
-                    self.count_removed(refs.len());
-                } else {
-                    refs.into_iter()
-                        .for_each(|r| self.messages.insert_sorted(r));
-                }
-            }
+            Cmd::Add(r) => self.add_tail(r),
+            Cmd::Reinsert(refs) => self.return_refs(refs),
             Cmd::AddConsumer(reg) => {
                 let consumer = Consumer {
                     credits: Some(0),
@@ -503,13 +857,11 @@ impl Actor {
             }
             Cmd::RemoveConsumer { id, failed, done } => {
                 if let Some(c) = self.take_consumer(id) {
-                    let refs = cancel(c.delivering, false, failed);
-                    refs.into_iter()
-                        .for_each(|r| self.messages.insert_sorted(r));
+                    self.return_refs(cancel(c.delivering, false, failed));
                 }
                 if self.shared.config.purge_on_no_consumers && self.consumers.is_empty() {
-                    self.count_removed(self.messages.len());
-                    self.messages.clear();
+                    let refs = self.messages.take_where(|_| true);
+                    refs.into_iter().for_each(|r| self.kill(r));
                 }
                 let _ = done.send(());
             }
@@ -562,11 +914,37 @@ impl Actor {
                 self.force_delivery(id, sequence);
             }
             Cmd::Remove { message_id, reply } => {
-                let r = self
+                let mut r = self
                     .messages
                     .find(|r| r.message_id() == message_id)
                     .map(|at| self.messages.remove(at));
+                if r.is_none()
+                    && let Some(k) = self
+                        .scheduled
+                        .iter()
+                        .find(|(_, r)| r.message_id() == message_id)
+                        .map(|(k, _)| *k)
+                {
+                    r = self.scheduled.remove(&k);
+                }
                 let _ = reply.send(r);
+            }
+            Cmd::Expire { id, message_id } => {
+                let r = self.consumer_mut(id).and_then(|c| {
+                    let i = c
+                        .delivering
+                        .iter()
+                        .position(|r| r.message_id() == message_id)?;
+                    c.delivering.remove(i)
+                });
+                if let Some(r) = r {
+                    self.expire(r);
+                }
+            }
+            Cmd::ExpireScan => {
+                let now = now_millis();
+                let expired = self.messages.take_where(|r| r.message.is_expired(now));
+                expired.into_iter().for_each(|r| self.expire(r));
             }
             Cmd::Shutdown => {
                 self.delete_all_references();
@@ -677,6 +1055,11 @@ impl Actor {
             return false;
         };
         let mut r = self.messages.remove(at);
+        // An expired message is never delivered (`checkExpired`).
+        if r.message.is_expired(now_millis()) {
+            self.expire(r);
+            return true;
+        }
         let c = &mut self.consumers[index];
         r.delivery_count += 1;
         let size = c
@@ -716,7 +1099,7 @@ impl Actor {
     fn delete_all_references(&mut self) {
         let queue = Queue(self.shared.clone());
         let storage = self.shared.ids.storage().cloned();
-        let mut refs: Vec<MessageRef> = Vec::new();
+        let mut refs: Vec<MessageRef> = std::mem::take(&mut self.scheduled).into_values().collect();
         for level in &mut self.messages.levels {
             refs.extend(level.drain(..));
         }
@@ -778,6 +1161,29 @@ impl Actor {
             .sink
             .deliver(c.reg.client_id, &ServerMessage::new(core), 0);
     }
+}
+
+/// `calculateRedeliveryDelay`: the delay grows by the multiplier with each
+/// delivery, varied by the collision-avoidance factor, up to the maximum.
+fn redelivery_delay(s: &AddressSettings, delivery_count: i32) -> i64 {
+    let n = (delivery_count - 1).max(0);
+    let mut delay = (s.redelivery_delay as f64 * s.redelivery_multiplier.powi(n)) as i64;
+    if s.redelivery_collision_avoidance_factor > 0.0 {
+        let random = rand_unit();
+        let sign = if rand_unit() < 0.5 { 1.0 } else { -1.0 };
+        let variance = sign * s.redelivery_collision_avoidance_factor * random;
+        delay += (delay as f64 * variance) as i64;
+    }
+    delay.min(s.max_redelivery_delay)
+}
+
+/// A number in [0, 1) for the collision-avoidance factor; the quality of
+/// the randomness does not matter.
+fn rand_unit() -> f64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(now_millis() as u64);
+    (h.finish() >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// Takes a consumer's delivering references back (`cancelRefs`). With

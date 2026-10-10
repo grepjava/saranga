@@ -124,6 +124,8 @@ pub struct BrokerConfig {
     /// The journals; `None` keeps everything in memory
     /// (`persistence-enabled` false).
     pub storage: Option<storage::StorageConfig>,
+    /// `message-expiry-scan-period` in milliseconds; `-1` for none.
+    pub message_expiry_scan_period: i64,
 }
 
 impl BrokerConfig {
@@ -136,8 +138,27 @@ impl BrokerConfig {
             connection_ttl_override: -1,
             addresses: Vec::new(),
             storage: None,
+            message_expiry_scan_period: 30000,
         }
     }
+}
+
+/// `PostOfficeImpl.ExpiryReaper`: every period, each queue expires the
+/// messages whose time has passed. It stops with the post office.
+fn spawn_expiry_reaper(post_office: &Arc<PostOffice>, period_ms: i64) {
+    let post_office = Arc::downgrade(post_office);
+    let period = std::time::Duration::from_millis(period_ms as u64);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(period).await;
+            let Some(po) = post_office.upgrade() else {
+                break;
+            };
+            for q in po.queues() {
+                q.expire_scan();
+            }
+        }
+    });
 }
 
 pub struct Broker {
@@ -177,12 +198,7 @@ impl Broker {
             }
             None => (Arc::new(IdGenerator::new(1)), None, None),
         };
-        let post_office = Arc::new(PostOffice::new(
-            config.settings,
-            config.filters,
-            ids,
-            config.wildcard,
-        ));
+        let post_office = PostOffice::new(config.settings, config.filters, ids, config.wildcard);
         if let Some(s) = &storage {
             recovery::load_bindings(s, &post_office)?;
         }
@@ -200,6 +216,9 @@ impl Broker {
         let resource_manager = transaction::ResourceManager::default();
         if let Some(s) = &storage {
             recovery::load_messages(s, &post_office, &resource_manager).await?;
+        }
+        if config.message_expiry_scan_period > 0 {
+            spawn_expiry_reaper(&post_office, config.message_expiry_scan_period);
         }
         let node_id = match &node_lock {
             Some(l) => l.node_id().to_owned(),
