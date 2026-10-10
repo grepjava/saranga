@@ -41,6 +41,8 @@ public class Phase6 {
         tests.put("guest", Phase6::guest);
         tests.put("guestWithPasswordFails", Phase6::guestWithPasswordFails);
         tests.put("coreSessionLogin", Phase6::coreSessionLogin);
+        tests.put("frameLimitBeforeLogin", Phase6::frameLimitBeforeLogin);
+        tests.put("preAuthTopology", Phase6::preAuthTopology);
         // authorization
         tests.put("sendDenied", Phase6::sendDenied);
         tests.put("consumeDenied", Phase6::consumeDenied);
@@ -195,6 +197,55 @@ public class Phase6 {
             unableToValidate(m, "admin");
             // A failed login leaves the connection usable.
             sf.createSession("sender", "sender", false, true, true, false, 0).close();
+        }
+    }
+
+    static void frameLimitBeforeLogin() throws Exception {
+        java.net.URI u = new java.net.URI(url);
+        // Before a login, a frame over 4 KiB closes the connection.
+        try (java.net.Socket socket = new java.net.Socket(u.getHost(), u.getPort())) {
+            socket.setSoTimeout(5000);
+            java.io.DataOutputStream out = new java.io.DataOutputStream(socket.getOutputStream());
+            out.write("ARTEMIS".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            out.writeInt(5000);
+            out.write(new byte[5000]);
+            out.flush();
+            int read;
+            try {
+                read = socket.getInputStream().read();
+            } catch (java.net.SocketException e) {
+                read = -1;
+            }
+            eq(-1, read, "connection closed");
+        }
+    }
+
+    static void preAuthTopology() throws Exception {
+        List<String> events = Collections.synchronizedList(new ArrayList<>());
+        try (ServerLocator locator = ActiveMQClient.createServerLocator(url)) {
+            locator.addClusterTopologyListener(new org.apache.activemq.artemis.api.core.client.ClusterTopologyListener() {
+                @Override
+                public void nodeUP(org.apache.activemq.artemis.api.core.client.TopologyMember member, boolean last) {
+                    events.add("up " + member.getNodeId());
+                }
+
+                @Override
+                public void nodeDown(long eventUID, String nodeID) {
+                    events.add("down " + nodeID);
+                }
+            });
+            ClientSessionFactory sf = locator.createSessionFactory();
+            // Before a login the broker sends a placeholder node, which the
+            // client keeps to itself: nothing about the broker leaks.
+            Thread.sleep(1000);
+            eq(List.of(), new ArrayList<>(events), "before login");
+            sf.createSession("admin", "admin", false, true, true, false, 0).close();
+            for (int i = 0; i < 50 && events.isEmpty(); i++) Thread.sleep(100);
+            check(!events.isEmpty(), "the real node after login");
+            for (String e : events) {
+                check(e.startsWith("up ") && !e.contains("00000000-0000-0000-0000-000000000000"), "real node only: " + events);
+            }
+            sf.close();
         }
     }
 

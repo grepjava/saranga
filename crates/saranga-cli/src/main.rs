@@ -120,10 +120,29 @@ fn core_acceptors(file: &saranga_config::BrokerConfig) -> anyhow::Result<Vec<Bin
             acceptor: Acceptor {
                 tls,
                 security_domain: a.param("securityDomain").map(str::to_owned),
+                host: host.to_owned(),
+                port,
+                core_connection_security: a
+                    .param("coreConnectionSecurityEnabled")
+                    .is_none_or(|v| v.eq_ignore_ascii_case("true")),
+                core_initial_max_frame_size: size_param(a, "coreInitialMaxFrameSize")?
+                    .unwrap_or(Acceptor::CORE_INITIAL_MAX_FRAME_SIZE),
+                core_max_frame_size: size_param(a, "coreMaxFrameSize")?
+                    .unwrap_or(Acceptor::CORE_MAX_FRAME_SIZE),
             },
         });
     }
     Ok(out)
+}
+
+/// A frame size acceptor parameter, in bytes.
+fn size_param(a: &saranga_config::AcceptorConfig, name: &str) -> anyhow::Result<Option<usize>> {
+    a.param(name)
+        .map(|v| {
+            v.parse::<usize>()
+                .with_context(|| format!("acceptor parameter {name}={v:?}"))
+        })
+        .transpose()
 }
 
 /// How the broker was asked to stop.

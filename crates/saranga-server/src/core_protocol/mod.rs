@@ -187,7 +187,7 @@ pub async fn serve_connection(broker: Arc<Broker>, stream: TcpStream) {
         certificates: None,
         security_domain: None,
     };
-    serve_stream(broker, stream, peer, info).await;
+    serve_stream(broker, stream, peer, info, Arc::default()).await;
 }
 
 /// Serves one Core connection over any byte stream (TCP or TLS) until it
@@ -197,6 +197,7 @@ pub async fn serve_stream<S>(
     stream: S,
     peer: Option<std::net::SocketAddr>,
     info: ConnectionInfo,
+    acceptor: Arc<crate::Acceptor>,
 ) where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
@@ -213,6 +214,10 @@ pub async fn serve_stream<S>(
         remote_address,
         security_info,
     });
+    // `CoreFrameWithSizeLimitDecoder`: with connection security, frames are
+    // limited from the start.
+    let connection_security = broker.security().is_some() && acceptor.core_connection_security;
+    let frame_limit = connection_security.then_some(acceptor.core_initial_max_frame_size);
     let mut conn = Connection {
         broker,
         shared,
@@ -220,6 +225,13 @@ pub async fn serve_stream<S>(
         session_tasks: Vec::new(),
         ttl: DEFAULT_CONNECTION_TTL,
         topology_subscribed: false,
+        acceptor,
+        connection_security,
+        frame_limit,
+        authenticated: false,
+        connect_received: false,
+        pre_auth_topology_sent: false,
+        post_auth_topology_sent: false,
     };
     if let Err(e) = conn.read_loop(&mut rd).await {
         tracing::debug!(
@@ -266,6 +278,16 @@ struct Connection {
     /// The connection TTL in milliseconds; -1 never expires.
     ttl: i64,
     topology_subscribed: bool,
+    acceptor: Arc<crate::Acceptor>,
+    /// Security is on and the acceptor applies it to connections.
+    connection_security: bool,
+    /// The largest frame accepted now, `None` for no limit.
+    frame_limit: Option<usize>,
+    /// A login succeeded on this connection (`isAuthenticated`).
+    authenticated: bool,
+    connect_received: bool,
+    pre_auth_topology_sent: bool,
+    post_auth_topology_sent: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -295,17 +317,46 @@ impl Connection {
         }
         let mut start = HANDSHAKE.len();
         loop {
+            self.check_frame_size(&buf[start..])?;
             while let Some((frame, used)) = read_frame(&buf[start..])? {
                 let ctx = Context::new(Direction::ToServer, self.shared.version());
                 let packet = Packet::decode(&frame, &ctx)?;
                 self.dispatch(frame.channel_id, packet, used).await?;
                 start += used;
+                self.check_frame_size(&buf[start..])?;
             }
             buf.drain(..start);
             start = 0;
             if self.read_more(rd, &mut buf).await? == 0 {
                 return Ok(());
             }
+        }
+    }
+
+    /// `CoreFrameWithSizeLimitDecoder.getUnadjustedFrameLength`: a frame
+    /// longer than the limit fails the connection.
+    fn check_frame_size(&self, pending: &[u8]) -> Result<(), ConnError> {
+        if let (Some(limit), Some(prefix)) = (self.frame_limit, pending.get(..4)) {
+            let len = u32::from_be_bytes(prefix.try_into().expect("4 bytes")) as usize;
+            if len > limit {
+                return Err(ConnError::Protocol(format!("Frame size exceeded: {len}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// A login succeeded (`setAuthenticated`): the larger frame limit
+    /// applies and a subscriber gets the real topology.
+    fn on_authenticated(&mut self) {
+        if self.authenticated {
+            return;
+        }
+        self.authenticated = true;
+        if self.connection_security {
+            self.frame_limit = Some(self.acceptor.core_max_frame_size);
+        }
+        if self.topology_subscribed {
+            self.send_post_auth_topology();
         }
     }
 
@@ -377,22 +428,97 @@ impl Connection {
         Ok(())
     }
 
-    /// `sendPostAuthTopology` for a broker without a cluster connection: a
-    /// single node with no connectors, so the client learns the node ID.
+    /// `LocalChannelHandler`: one topology subscription per connection;
+    /// before login, only a placeholder topology.
     fn subscribe_topology(&mut self) -> Result<(), ConnError> {
         if self.topology_subscribed {
+            tracing::warn!(
+                "AMQ224166: Multiple topology subscriptions to connection from {}. Closing connection.",
+                self.shared.security_info.remote_address
+            );
             return Err(ConnError::Protocol(
                 "multiple topology subscriptions".into(),
             ));
         }
         self.topology_subscribed = true;
-        let node_id = JString::from(self.broker.node_id());
-        let now = now_millis();
+        if self.connection_security && !self.authenticated {
+            self.send_pre_auth_topology();
+        } else {
+            self.send_post_auth_topology();
+        }
+        Ok(())
+    }
+
+    /// `sendPreAuthTopology`: a placeholder node, so the client's wait for
+    /// a topology ends without learning anything about the broker.
+    fn send_pre_auth_topology(&mut self) {
+        use saranga_core_protocol::transport::{ParamValue, TransportConfiguration};
+        self.pre_auth_topology_sent = true;
+        let factory: JString = NETTY_CONNECTOR_FACTORY.into();
+        let primary = TransportConfiguration {
+            name: JString::from(uuid::Uuid::new_v4().to_string().as_str()),
+            factory_class_name: factory.clone(),
+            // The acceptor's parameters, in `HashMap` order.
+            params: vec![
+                ("port".into(), ParamValue::Int(self.acceptor.port as i32)),
+                (
+                    "host".into(),
+                    ParamValue::String(self.acceptor.host.as_str().into()),
+                ),
+            ],
+        };
+        let backup = TransportConfiguration {
+            name: PRE_AUTH_CONNECTOR_NAME.into(),
+            factory_class_name: factory,
+            params: Vec::new(),
+        };
+        let update = Some(TopologyUpdate {
+            primary: Flagged(Some(primary)),
+            backup: Flagged(Some(backup)),
+            last: true,
+        });
+        self.send_topology(PRE_AUTH_NODE_ID.into(), update);
+    }
+
+    /// `sendPostAuthTopology` for a broker without a cluster connection: a
+    /// single node with no connectors, so the client learns the node ID.
+    /// The placeholder goes first, if one was sent.
+    fn send_post_auth_topology(&mut self) {
+        if self.post_auth_topology_sent {
+            return;
+        }
+        self.post_auth_topology_sent = true;
+        if self.pre_auth_topology_sent {
+            let node_id: JString = PRE_AUTH_NODE_ID.into();
+            let packet: Packet = if self.shared.version() >= 122 {
+                ClusterTopologyChangeMessageV2 {
+                    node_id,
+                    unique_event_id: now_millis(),
+                    update: None,
+                    backup_group_name: Some(None),
+                }
+                .into()
+            } else {
+                ClusterTopologyChangeMessage {
+                    node_id,
+                    update: None,
+                }
+                .into()
+            };
+            self.shared.send(CHANNEL_PING, packet);
+        }
         let update = Some(TopologyUpdate {
             primary: Flagged(None),
             backup: Flagged(None),
             last: true,
         });
+        let node_id = JString::from(self.broker.node_id());
+        self.send_topology(node_id, update);
+    }
+
+    /// A topology change in the newest form the client understands.
+    fn send_topology(&self, node_id: JString, update: Option<TopologyUpdate>) {
+        let now = now_millis();
         let version = self.shared.version();
         let packet: Packet = if version >= version::ARTEMIS_2_18_0 {
             ClusterTopologyChangeMessageV4 {
@@ -416,7 +542,6 @@ impl Connection {
             ClusterTopologyChangeMessage { node_id, update }.into()
         };
         self.shared.send(CHANNEL_PING, packet);
-        Ok(())
     }
 
     /// `ActiveMQPacketHandler`.
@@ -459,11 +584,45 @@ impl Connection {
                 .await
             }
             Packet::ConnectMessage(p) => {
-                // No connection-level authentication yet: accept.
-                if self.shared.version() == 0 {
-                    self.shared
-                        .version
-                        .store(p.client_version(), Ordering::SeqCst);
+                // `handleConnect`.
+                if self.connect_received {
+                    tracing::error!("AMQ224017: Invalid packet {}", Packet::from(p).name());
+                    return Err(ConnError::Protocol("a second CONNECT".into()));
+                }
+                self.connect_received = true;
+                self.shared
+                    .version
+                    .store(p.client_version(), Ordering::SeqCst);
+                // Older clients send no mechanism and log in with their
+                // sessions.
+                if self.connection_security
+                    && let Some(mechanism) = p.auth_mechanism()
+                {
+                    let mechanism = mechanism.to_string_lossy();
+                    let result = if mechanism == "PLAIN" {
+                        let (user, password) = decode_plain(p.auth_data());
+                        self.authenticate(Some(user), Some(password)).await
+                    } else {
+                        Err(SecurityError(format!(
+                            "AMQ229261: Authentication mechanism not supported: {mechanism}"
+                        )))
+                    };
+                    match result {
+                        Ok(_) => self.on_authenticated(),
+                        Err(e) => {
+                            let e = BrokerError::security(e);
+                            self.shared.send(
+                                CHANNEL_SESSION,
+                                ActiveMQExceptionMessage {
+                                    code: e.kind.code(),
+                                    message: Some(e.message.as_str().into()),
+                                },
+                            );
+                            return Err(ConnError::Protocol(
+                                "connection authentication failed".into(),
+                            ));
+                        }
+                    }
                 }
                 self.shared.send(
                     CHANNEL_SESSION,
@@ -521,17 +680,15 @@ impl Connection {
         // connection's task.
         let authenticated = match self.broker.security() {
             None => Authenticated::default(),
-            Some(store) => {
-                let store = store.clone();
-                let (user, password) = (request.username.clone(), request.password.clone());
-                let info = self.shared.security_info();
-                let result = tokio::task::spawn_blocking(move || {
-                    store.authenticate(user.as_deref(), password.as_deref(), &info)
-                })
-                .await
-                .unwrap_or_else(|e| Err(SecurityError(format!("login failed: {e}"))));
+            Some(_) => {
+                let result = self
+                    .authenticate(request.username.clone(), request.password.clone())
+                    .await;
                 match result {
-                    Ok(a) => a,
+                    Ok(a) => {
+                        self.on_authenticated();
+                        a
+                    }
                     Err(e) => {
                         let e = BrokerError::security(e);
                         self.shared.send(
@@ -564,6 +721,24 @@ impl Connection {
         );
     }
 
+    /// `validateUser`. Login modules may block (LDAP), so they run off the
+    /// connection's task.
+    async fn authenticate(
+        &self,
+        user: Option<String>,
+        password: Option<String>,
+    ) -> Result<Authenticated, SecurityError> {
+        let Some(store) = self.broker.security().cloned() else {
+            return Ok(Authenticated::default());
+        };
+        let info = self.shared.security_info();
+        tokio::task::spawn_blocking(move || {
+            store.authenticate(user.as_deref(), password.as_deref(), &info)
+        })
+        .await
+        .unwrap_or_else(|e| Err(SecurityError(format!("login failed: {e}"))))
+    }
+
     /// The connection is gone: fail the sessions still open, then remove the
     /// temporary queues (`TempResourceCleanerUpper`).
     async fn destroy(&mut self) {
@@ -594,6 +769,27 @@ impl Connection {
         }
         let _ = self.shared.out.send(Outgoing::Close);
     }
+}
+
+/// `Topology.PRE_AUTH_NODE_ID`.
+const PRE_AUTH_NODE_ID: &str = "00000000-0000-0000-0000-000000000000";
+/// `Topology.PRE_AUTH_CONNECTOR_NAME`.
+const PRE_AUTH_CONNECTOR_NAME: &str = "PRE_AUTH_CONNECTOR";
+const NETTY_CONNECTOR_FACTORY: &str =
+    "org.apache.activemq.artemis.core.remoting.impl.netty.NettyConnectorFactory";
+
+/// `ConnectMessage.decodePlainAuthData`: RFC 4616 `authzid NUL authcid NUL
+/// passwd`.
+fn decode_plain(data: Option<&[u8]>) -> (String, String) {
+    let Some(data) = data.filter(|d| !d.is_empty()) else {
+        return (String::new(), String::new());
+    };
+    let text = String::from_utf8_lossy(data);
+    let mut fields = text.splitn(3, '\0');
+    let _authzid = fields.next();
+    let user = fields.next().unwrap_or_default().to_owned();
+    let password = fields.next().unwrap_or_default().to_owned();
+    (user, password)
 }
 
 /// `InetSocketAddress.toString` as Netty's `remoteAddress` prints it:

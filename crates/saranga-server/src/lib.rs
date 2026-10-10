@@ -118,12 +118,44 @@ pub struct AddressDeployment {
 }
 
 /// How an acceptor treats its connections.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Acceptor {
     /// `sslEnabled`: the handshake to run first.
     pub tls: Option<Arc<saranga_transport::TlsAcceptor>>,
     /// `securityDomain`: the JAAS domain its clients log in through.
     pub security_domain: Option<String>,
+    /// The acceptor's `host` and `port`, which the topology given to
+    /// clients before they log in names.
+    pub host: String,
+    pub port: u16,
+    /// `coreConnectionSecurityEnabled`: with security on, frames are
+    /// limited and the topology withheld until a connection logs in.
+    pub core_connection_security: bool,
+    /// `coreInitialMaxFrameSize`: the largest frame before login.
+    pub core_initial_max_frame_size: usize,
+    /// `coreMaxFrameSize`: the largest frame after login.
+    pub core_max_frame_size: usize,
+}
+
+impl Acceptor {
+    /// `CoreProtocolManager.CORE_INITIAL_MAX_FRAME_SIZE`.
+    pub const CORE_INITIAL_MAX_FRAME_SIZE: usize = 4 * 1024;
+    /// `CoreProtocolManager.CORE_MAX_FRAME_SIZE`.
+    pub const CORE_MAX_FRAME_SIZE: usize = 128 * 1024;
+}
+
+impl Default for Acceptor {
+    fn default() -> Self {
+        Self {
+            tls: None,
+            security_domain: None,
+            host: "localhost".to_owned(),
+            port: 61616,
+            core_connection_security: true,
+            core_initial_max_frame_size: Self::CORE_INITIAL_MAX_FRAME_SIZE,
+            core_max_frame_size: Self::CORE_MAX_FRAME_SIZE,
+        }
+    }
 }
 
 pub struct BrokerConfig {
@@ -504,6 +536,7 @@ impl Broker {
         listener: TcpListener,
         acceptor: Acceptor,
     ) -> std::io::Result<()> {
+        let acceptor = Arc::new(acceptor);
         loop {
             let (stream, peer) = listener.accept().await?;
             tracing::debug!(%peer, "connection accepted");
@@ -521,10 +554,12 @@ impl Broker {
                         stream,
                         Some(peer),
                         info,
+                        acceptor.clone(),
                     ));
                 }
                 Some(tls) => {
                     let tls = tls.clone();
+                    let acceptor = acceptor.clone();
                     tokio::spawn(async move {
                         let stream = match tls.accept(stream).await {
                             Ok(s) => s,
@@ -537,7 +572,8 @@ impl Broker {
                             stream.get_ref().1.peer_certificates(),
                         )
                         .map(Arc::from);
-                        core_protocol::serve_stream(broker, stream, Some(peer), info).await;
+                        core_protocol::serve_stream(broker, stream, Some(peer), info, acceptor)
+                            .await;
                     });
                 }
             }
