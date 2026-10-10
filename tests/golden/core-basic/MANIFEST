@@ -1,0 +1,4 @@
+scenario: core-basic
+artemis-version: 2.57.0
+artemis-commit: 20cab945f0944d669a0aac383a7578e2a6fd7346
+generated: 2026-10-10T10:05:09Z
