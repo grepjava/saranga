@@ -432,6 +432,9 @@ fn parse_core(
     if let Some(v) = s.bool("persist-id-cache") {
         config.persist_id_cache = v;
     }
+    if let Some(v) = s.bool("large-message-sync") {
+        config.large_message_sync = v;
+    }
 
     if let Some(v) = s.non_empty_string("large-messages-directory")? {
         config.large_messages_directory = v;

@@ -27,6 +27,7 @@ use saranga_message::CoreMessage;
 use tokio::sync::mpsc;
 
 use super::{ConnShared, CoreDeliverySink};
+use crate::large::{LargeBody, LargeWriter};
 use crate::message::{MessageRef, ServerMessage, routing_type};
 use crate::postoffice::{
     BindingQueryResult, QueueQueryResult, QueueSpec, RoutingTypes, queue_name_of,
@@ -172,8 +173,7 @@ pub(crate) struct CoreSession {
     /// Kept for security checks (Phase 6).
     #[allow(dead_code)]
     username: Option<String>,
-    /// Large messages arrive in Phase 5.
-    #[allow(dead_code)]
+    /// The size of the chunks large messages are sent to consumers in.
     min_large_message_size: i32,
     /// XA sessions work in the transaction of the last `xaStart`, or in
     /// none.
@@ -192,6 +192,9 @@ pub(crate) struct CoreSession {
     /// (`pendingTX`), rolled back if the client fails.
     pending_tx: Option<TxRef>,
     timeout_seconds: i32,
+    /// The large message being received (`currentLargeMessage`): its
+    /// headers, and its body so far.
+    large: Option<(CoreMessage, LargeWriter)>,
     /// Journal writes lined up by the request being handled.
     ops: Vec<Pending>,
     /// Queue updates to make once those writes are done.
@@ -215,6 +218,8 @@ impl Request {
             Packet::SessionSendMessageV2(p) => (p.correlation_id, true),
             Packet::SessionSendMessageV3(p) => (p.correlation_id, true),
             Packet::SessionCommitMessageV2(p) => (p.correlation_id.unwrap_or(-1), true),
+            Packet::SessionSendContinuationMessageV2(p) => (p.correlation_id.unwrap_or(-1), true),
+            Packet::SessionSendContinuationMessageV3(p) => (p.correlation_id.unwrap_or(-1), true),
             _ => (-1, false),
         };
         let requires_confirmations = match packet {
@@ -267,6 +272,7 @@ impl CoreSession {
             tx,
             pending_tx: None,
             timeout_seconds: -1,
+            large: None,
             ops: Vec::new(),
             actions: Vec::new(),
             completer: completer_tx,
@@ -378,22 +384,22 @@ impl CoreSession {
         let (requires_response, result, flush) = match packet {
             Packet::SessionSendMessage(p) => (
                 p.requires_response,
-                self.send_message(p.message).await,
+                self.send_message(p.message, None).await,
                 false,
             ),
             Packet::SessionSendMessageV2(p) => (
                 p.requires_response,
-                self.send_message(p.message).await,
+                self.send_message(p.message, None).await,
                 false,
             ),
             Packet::SessionSendMessageV3(p) => (
                 p.requires_response,
-                self.send_message(p.message).await,
+                self.send_message(p.message, None).await,
                 false,
             ),
             Packet::SessionSendMessage1X(p) => (
                 p.requires_response,
-                self.send_message(p.message).await,
+                self.send_message(p.message, None).await,
                 false,
             ),
             Packet::SessionAcknowledgeMessage(p) => (
@@ -699,6 +705,25 @@ impl CoreSession {
                     false,
                 )
             }
+            Packet::SessionSendLargeMessage(p) => (false, self.send_large(p.message), false),
+            Packet::SessionSendContinuationMessage(p) => (
+                p.requires_response,
+                self.send_continuation(p.body, p.continues, p.message_body_size)
+                    .await,
+                false,
+            ),
+            Packet::SessionSendContinuationMessageV2(p) => (
+                p.requires_response,
+                self.send_continuation(p.body, p.continues, p.message_body_size)
+                    .await,
+                false,
+            ),
+            Packet::SessionSendContinuationMessageV3(p) => (
+                p.requires_response,
+                self.send_continuation(p.body, p.continues, p.message_body_size)
+                    .await,
+                false,
+            ),
             other => {
                 tracing::warn!(session = %self.name, "unsupported packet {}", other.name());
                 let e = BrokerError::new(
@@ -712,10 +737,130 @@ impl CoreSession {
         self.respond(request, response, flush);
     }
 
+    /// `sendLarge`: a large message's headers. Its body follows in
+    /// continuations.
+    fn send_large(&mut self, mut message: CoreMessage) -> Result<Option<Packet>> {
+        let id = self.broker.post_office().ids().next();
+        message.message_id = id;
+        // onLargeMessageCreate: a durable message's headers must fit a
+        // journal record.
+        if message.durable
+            && let Some(max) = self.broker.max_record_size()
+        {
+            let mut w = saranga_buffer::Writer::new();
+            message.encode_headers_and_properties(&mut w);
+            if w.len() > max {
+                tracing::warn!(
+                    "AMQ224099: Message with ID {id} has a header too large. More information available on debug level for class {}",
+                    module_path!()
+                );
+                return Err(BrokerError::new(
+                    ErrorType::IoError,
+                    format!(
+                        "AMQ149005: Message of {} bytes is bigger than the max record size of {max} bytes. You should try to move large application properties to the message body.",
+                        w.len()
+                    ),
+                ));
+            }
+        }
+        let writer = self
+            .broker
+            .large_messages()
+            .create(id, message.durable)
+            .map_err(|e| BrokerError::new(ErrorType::IoError, e.to_string()))?;
+        if let Some((old, _)) = self.large.replace((message, writer)) {
+            tracing::warn!(
+                "AMQ222106: Replacing incomplete LargeMessage with ID={}",
+                old.message_id
+            );
+        }
+        Ok(None)
+    }
+
+    /// `sendContinuations`: a chunk of the large message's body; with the
+    /// last one the message is sent.
+    async fn send_continuation(
+        &mut self,
+        body: Vec<u8>,
+        continues: bool,
+        body_size: i64,
+    ) -> Result<Option<Packet>> {
+        let Some((_, writer)) = &mut self.large else {
+            return Err(BrokerError::new(
+                ErrorType::IllegalState,
+                "AMQ229030: large-message not initialized on server",
+            ));
+        };
+        if let Err(e) = writer.append(&body) {
+            self.large = None;
+            return Err(BrokerError::new(ErrorType::IoError, e.to_string()));
+        }
+        if continues {
+            return Ok(None);
+        }
+        let (mut message, writer) = self.large.take().expect("checked above");
+        let body = writer
+            .finish()
+            .map_err(|e| BrokerError::new(ErrorType::IoError, e.to_string()))?;
+        if body_size >= 0 {
+            message.properties.insert(
+                crate::message::HDR_LARGE_BODY_SIZE.into(),
+                saranga_buffer::PropertyValue::Long(body_size),
+            );
+        }
+        self.send_message(message, Some(body)).await
+    }
+
+    /// `LargeServerMessageImpl.checkLargeMessage`: a message too big for a
+    /// journal record becomes a large message.
+    fn check_large_message(&self, message: &mut CoreMessage) -> Result<Option<Arc<LargeBody>>> {
+        let Some(max) = self.broker.max_record_size() else {
+            return Ok(None);
+        };
+        let mut w = saranga_buffer::Writer::new();
+        message.encode(&mut w);
+        if w.len() + 512 <= max {
+            return Ok(None);
+        }
+        let id = self.broker.post_office().ids().next();
+        let io = |e: std::io::Error| BrokerError::new(ErrorType::IoError, e.to_string());
+        let mut writer = self
+            .broker
+            .large_messages()
+            .create(id, message.durable)
+            .map_err(io)?;
+        for chunk in message.body.chunks(crate::large::CHUNK_SIZE) {
+            writer.append(chunk).map_err(io)?;
+        }
+        let size = message.body.len() as i64;
+        message.body = Vec::new();
+        message.message_id = id;
+        let key = SimpleString::from(crate::message::HDR_LARGE_BODY_SIZE);
+        if message.properties.get(&key).is_none() {
+            message
+                .properties
+                .insert(key, saranga_buffer::PropertyValue::Long(size));
+        }
+        Ok(Some(writer.finish().map_err(io)?))
+    }
+
     /// `ServerSessionImpl.send`: assigns the ID, routes, and either adds to
     /// the queues or holds the message in the transaction.
-    async fn send_message(&mut self, mut message: CoreMessage) -> Result<Option<Packet>> {
-        message.message_id = self.broker.post_office().ids().next();
+    async fn send_message(
+        &mut self,
+        mut message: CoreMessage,
+        large: Option<Arc<LargeBody>>,
+    ) -> Result<Option<Packet>> {
+        let large = match large {
+            Some(body) => Some(body),
+            None => {
+                let body = self.check_large_message(&mut message)?;
+                if body.is_none() {
+                    message.message_id = self.broker.post_office().ids().next();
+                }
+                body
+            }
+        };
         let address: Name = match &message.address {
             Some(a) => {
                 let a: Name = a.to_string_lossy().into();
@@ -740,7 +885,10 @@ impl CoreSession {
         crate::message::apply_expiry_delay(&mut message, &settings, crate::message::now_millis());
         let scheduled_time = crate::message::scheduled_delivery_time(&message);
         let duplicate_id = crate::duplicate::duplicate_id_bytes(&message);
-        let mut r = MessageRef::new(ServerMessage::new(message));
+        let mut r = MessageRef::new(match large {
+            Some(body) => ServerMessage::new_large(message, body),
+            None => ServerMessage::new(message),
+        });
         r.scheduled_time = scheduled_time;
         // doSend: outside a transaction when auto-committing or when an XA
         // session has none.
@@ -821,8 +969,7 @@ impl CoreSession {
                             let mid = message.message_id();
                             if let Some((jtx, persistent)) = &mut own_tx {
                                 if message.durable_up() == 1 {
-                                    s.store_message_tx(*jtx, message.core(), message.encoded())
-                                        .map_err(io_error)?;
+                                    s.store_message_tx(*jtx, message).map_err(io_error)?;
                                 }
                                 s.store_reference_tx(*jtx, q.id(), mid).map_err(io_error)?;
                                 if scheduled_time > 0 {
@@ -838,8 +985,7 @@ impl CoreSession {
                                 continue;
                             }
                             if message.durable_up() == 1 {
-                                s.store_message(message.core(), message.encoded())
-                                    .map_err(io_error)?;
+                                s.store_message(message).map_err(io_error)?;
                             }
                             self.ops.push(
                                 s.store_reference(q.id(), mid, i == last)
@@ -880,8 +1026,7 @@ impl CoreSession {
                     for q in queues.iter().filter(|q| q.is_durable_ref(&r)) {
                         let Some(s) = &storage else { break };
                         if message.durable_up() == 1 {
-                            s.store_message_tx(t.id, message.core(), message.encoded())
-                                .map_err(io_error)?;
+                            s.store_message_tx(t.id, message).map_err(io_error)?;
                         }
                         s.store_reference_tx(t.id, q.id(), message.message_id())
                             .map_err(io_error)?;
@@ -1391,6 +1536,7 @@ impl CoreSession {
             sink: Arc::new(CoreDeliverySink {
                 conn: self.conn.clone(),
                 channel_id: self.channel_id,
+                chunk_size: self.min_large_message_size.max(1) as usize,
             }),
             filter,
             priority,

@@ -9,7 +9,7 @@ Saranga is built in twelve phases. Each one ends with something runnable, and it
 | 2 | Single-node in-memory broker (Core) | Done |
 | 3 | Persistence, on-disk compatible (first usable release) | Done |
 | 4 | Queue semantics parity | Done |
-| 5 | Paging and large messages | Not started |
+| 5 | Paging and large messages | In progress |
 | 6 | Config and security | Not started |
 | 7 | Protocols (AMQP, MQTT, STOMP, OpenWire, WebSockets) | Not started |
 | 8 | Management and operations | Not started |

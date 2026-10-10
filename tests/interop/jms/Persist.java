@@ -42,6 +42,8 @@ public class Persist {
         tests.put("xaPrepared", new Test(Persist::xaBefore, Persist::xaAfter));
         tests.put("queueAttributes", new Test(Persist::attributesBefore, Persist::attributesAfter));
         tests.put("manyMessages", new Test(Persist::manyBefore, Persist::manyAfter));
+        tests.put("largeMessages", new Test(Persist::largeBefore, Persist::largeAfter));
+        tests.put("largeXaPrepared", new Test(Persist::largeXaBefore, Persist::largeXaAfter));
 
         int failed = 0;
         for (Map.Entry<String, Test> t : tests.entrySet()) {
@@ -347,6 +349,118 @@ public class Persist {
                 check(mc.receive(5000).getIntProperty("i") == i, "consumed in order");
             }
         });
+    }
+
+    static byte[] pattern(int length, int seed) {
+        byte[] b = new byte[length];
+        for (int i = 0; i < length; i++) b[i] = (byte) (i * 31 + seed * 7 + (i >> 13));
+        return b;
+    }
+
+    static BytesMessage bytes(Session s, byte[] body, int n) throws JMSException {
+        BytesMessage m = s.createBytesMessage();
+        m.writeBytes(body);
+        m.setIntProperty("n", n);
+        return m;
+    }
+
+    /** Receives and checks large messages {@code ns}, in order, then nothing more. */
+    static void receiveLarge(Session s, Destination d, int... ns) throws Exception {
+        MessageConsumer mc = s.createConsumer(d);
+        for (int n : ns) {
+            BytesMessage m = (BytesMessage) mc.receive(5000);
+            check(m != null, "large message " + n);
+            check(m.getIntProperty("n") == n, "large message " + n + " in order, got " + m.getIntProperty("n"));
+            byte[] expected = pattern(300_000 * n + n, n);
+            byte[] got = new byte[(int) m.getBodyLength()];
+            m.readBytes(got);
+            check(Arrays.equals(expected, got), "large message " + n + " body");
+        }
+        check(mc.receive(500) == null, "nothing more on " + d);
+        mc.close();
+    }
+
+    /**
+     * Large messages: their bodies are files beside the journal. Covers an acked one (its
+     * file goes), one delivered but not acked, one on two durable subscriptions, and a
+     * compressed one.
+     */
+    static void largeBefore() throws Exception {
+        session(s -> {
+            Queue q = s.createQueue(name("large"));
+            MessageProducer p = s.createProducer(q);
+            for (int n = 1; n <= 4; n++) p.send(bytes(s, pattern(300_000 * n + n, n), n));
+            MessageConsumer mc = s.createConsumer(q);
+            check(mc.receive(5000).getIntProperty("n") == 1, "first large message consumed");
+            mc.close();
+            // Topic with two durable subscriptions sharing one message.
+            Topic t = s.createTopic(name("large.topic"));
+            s.createDurableSubscriber(t, "one").close();
+            s.createDurableSubscriber(t, "two").close();
+            s.createProducer(t).send(bytes(s, pattern(300_000 * 5 + 5, 5), 5));
+        });
+        session(false, Session.CLIENT_ACKNOWLEDGE, s -> {
+            // Delivered but never acknowledged.
+            MessageConsumer mc = s.createConsumer(s.createQueue(name("large")));
+            Message m = mc.receive(5000);
+            check(m != null && m.getIntProperty("n") == 2, "second large message delivered");
+        });
+        try (Connection c = new ActiveMQConnectionFactory(url + "?compressLargeMessage=true").createConnection()) {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                s.createProducer(s.createQueue(name("large.zip"))).send(bytes(s, pattern(300_000 * 6 + 6, 6), 6));
+            }
+        }
+    }
+
+    static void largeAfter() throws Exception {
+        session(s -> {
+            receiveLarge(s, s.createQueue(name("large")), 2, 3, 4);
+            Topic t = s.createTopic(name("large.topic"));
+            receiveLargeSub(s, t, "one", 5);
+            receiveLargeSub(s, t, "two", 5);
+            receiveLarge(s, s.createQueue(name("large.zip")), 6);
+        });
+    }
+
+    static void receiveLargeSub(Session s, Topic t, String sub, int n) throws Exception {
+        MessageConsumer mc = s.createDurableSubscriber(t, sub);
+        BytesMessage m = (BytesMessage) mc.receive(5000);
+        check(m != null && m.getIntProperty("n") == n, "subscription " + sub + " has large message " + n);
+        byte[] got = new byte[(int) m.getBodyLength()];
+        m.readBytes(got);
+        check(Arrays.equals(pattern(300_000 * n + n, n), got), "subscription " + sub + " body");
+        check(mc.receive(500) == null, "nothing more on " + sub);
+        mc.close();
+        s.unsubscribe(sub);
+    }
+
+    /** A large message sent in a prepared XA branch survives with the branch. */
+    static void largeXaBefore() throws Exception {
+        try (XAConnection xc = new ActiveMQXAConnectionFactory(url).createXAConnection()) {
+            xc.start();
+            XASession xs = xc.createXASession();
+            XAResource xa = xs.getXAResource();
+            Xid x = xid(11);
+            xa.start(x, XAResource.TMNOFLAGS);
+            xs.createProducer(xs.createQueue(name("large.xa"))).send(bytes(xs, pattern(300_000 * 7 + 7, 7), 7));
+            xa.end(x, XAResource.TMSUCCESS);
+            xa.prepare(x);
+        }
+    }
+
+    static void largeXaAfter() throws Exception {
+        try (Connection plain = new ActiveMQConnectionFactory(url).createConnection();
+             XAConnection xc = new ActiveMQXAConnectionFactory(url).createXAConnection()) {
+            plain.start();
+            xc.start();
+            XAResource xa = xc.createXASession().getXAResource();
+            List<Xid> inDoubt = Arrays.asList(xa.recover(XAResource.TMSTARTRSCAN | XAResource.TMENDRSCAN));
+            check(inDoubt.contains(xid(11)), "large branch in doubt: " + inDoubt);
+            xa.commit(xid(11), false);
+            try (Session s = plain.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                receiveLarge(s, s.createQueue(name("large.xa")), 7);
+            }
+        }
     }
 
     static void manyAfter() throws Exception {

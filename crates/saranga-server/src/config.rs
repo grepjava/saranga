@@ -223,6 +223,8 @@ pub fn storage_config(config: &cfg::BrokerConfig, instance: &Path) -> StorageCon
         max_redelivery_records: j
             .max_redelivery_records
             .unwrap_or(J::DEFAULT_MAX_REDELIVERY_RECORDS),
+        large_messages: dir(&config.large_messages_directory),
+        large_message_sync: config.large_message_sync,
     }
 }
 

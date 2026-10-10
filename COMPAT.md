@@ -45,4 +45,6 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **Message groups.** While a group's consumer has no credit, only that group's messages wait. Artemis ends the whole delivery pass at that point.
 - **Duplicate detection** checks the message a client sends. Copies a divert makes are not checked against the forwarding address's cache.
 - **A prepared XA branch's duplicate IDs** keep their own journal record IDs after recovery. Artemis files them under the transaction's ID.
+- **Large-message files** are deleted once nothing holds the message any more, which is when Artemis's reference count releases it. When the broker stops, the files of messages still in memory are kept, as Artemis keeps them.
+- **Core frame size.** With security enabled, Artemis rejects Core frames over 4 KiB before a connection authenticates and over 128 KiB afterwards (`coreInitialMaxFrameSize`, `coreMaxFrameSize`). Saranga has no limit until security arrives in Phase 6.
 - **Divert transformers** are Rust plugins, not Java classes. The embedding application registers a `Transformer` under the class name that `broker.xml` gives. A divert whose transformer is not registered is not deployed, and a warning is logged.

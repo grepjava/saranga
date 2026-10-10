@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
 use crate::error::{BrokerError, Result};
-use crate::message::{MessageRef, ServerMessage, routing_type};
+use crate::message::{MessageRef, routing_type};
 use crate::queue::{FilterRef, Queue, QueueConfig};
 use crate::settings::{AddressSettings, SettingsRepository};
 use crate::wildcard::WildcardConfig;
@@ -973,7 +973,7 @@ impl PostOffice {
                     let mut core = d.copy(message.message.core(), self.ids.next(), forward);
                     let s = self.settings(forward);
                     crate::message::apply_expiry_delay(&mut core, &s, now);
-                    let mut r = MessageRef::new(ServerMessage::new(core));
+                    let mut r = MessageRef::new(message.message.copy(core));
                     r.scheduled_time = crate::message::scheduled_delivery_time(r.message.core());
                     r
                 };
@@ -1039,7 +1039,8 @@ impl PostOffice {
         core.address = Some(SimpleString::from(dla.as_str()));
         let now = m::now_millis();
         m::apply_expiry_delay(&mut core, &self.settings(&dla), now);
-        let mut r = MessageRef::new(ServerMessage::new(core));
+        // The same message, rerouted: a large body is shared.
+        let mut r = MessageRef::new(message.message.with_core(core));
         r.scheduled_time = message.scheduled_time;
         self.route_into(
             &r,

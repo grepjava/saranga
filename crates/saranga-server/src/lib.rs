@@ -10,6 +10,7 @@ pub mod config;
 pub mod core_protocol;
 pub mod duplicate;
 pub mod error;
+pub mod large;
 pub mod message;
 pub mod node;
 pub mod postoffice;
@@ -214,6 +215,8 @@ pub struct Broker {
     session_metadata: Mutex<HashMap<String, HashMap<String, String>>>,
     resource_manager: transaction::ResourceManager,
     storage: Option<Arc<storage::Storage>>,
+    /// Where large-message bodies go.
+    large_messages: Arc<large::LargeMessageStore>,
     node_lock: Mutex<Option<node::NodeLock>>,
 }
 
@@ -272,8 +275,14 @@ impl Broker {
         }
         let resource_manager =
             transaction::ResourceManager::new((config.transaction_timeout / 1000) as i32);
+        let large_messages = match &config.storage {
+            Some(sc) => {
+                large::LargeMessageStore::new(sc.large_messages.clone(), sc.large_message_sync)
+            }
+            None => large::LargeMessageStore::in_memory(),
+        };
         if let Some(s) = &storage {
-            recovery::load_messages(s, &post_office, &resource_manager).await?;
+            recovery::load_messages(s, &post_office, &resource_manager, &large_messages).await?;
         }
         if config.message_expiry_scan_period > 0 {
             spawn_expiry_reaper(&post_office, config.message_expiry_scan_period);
@@ -290,6 +299,7 @@ impl Broker {
             session_metadata: Mutex::default(),
             resource_manager,
             storage,
+            large_messages,
             node_lock: Mutex::new(node_lock),
         });
         spawn_transaction_reaper(&broker, config.transaction_timeout_scan_period);
@@ -299,6 +309,7 @@ impl Broker {
     /// A clean stop: the ID generator's checkpoint and the journals are
     /// written out, and `server.lock` marked paused.
     pub fn stop(&self) -> Result<()> {
+        self.large_messages.stop();
         if let Some(s) = &self.storage {
             s.stop()
                 .map_err(|e| BrokerError::internal(format!("stopping the journals: {e}")))?;
@@ -321,6 +332,15 @@ impl Broker {
 
     pub fn post_office(&self) -> &Arc<PostOffice> {
         &self.post_office
+    }
+
+    pub fn large_messages(&self) -> &Arc<large::LargeMessageStore> {
+        &self.large_messages
+    }
+
+    /// `getMaxRecordSize`: larger messages are stored as large messages.
+    pub fn max_record_size(&self) -> Option<usize> {
+        self.storage.as_ref().map(|s| s.max_record_size())
     }
 
     /// XA transactions by Xid.

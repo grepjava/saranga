@@ -8,6 +8,7 @@ use saranga_buffer::{PropertyValue, SimpleString, Writer};
 use saranga_message::CoreMessage;
 
 use crate::RoutingType;
+use crate::large::LargeBody;
 use crate::settings::AddressSettings;
 
 /// `Message.HDR_ROUTING_TYPE`.
@@ -34,6 +35,8 @@ pub const HDR_LAST_VALUE_NAME: &str = "_AMQ_LVQ_NAME";
 pub const HDR_GROUP_ID: &str = "_AMQ_GROUP_ID";
 /// `Message.HDR_GROUP_SEQUENCE`.
 pub const HDR_GROUP_SEQUENCE: &str = "_AMQ_GROUP_SEQUENCE";
+/// `Message.HDR_LARGE_BODY_SIZE`.
+pub const HDR_LARGE_BODY_SIZE: &str = "_AMQ_LARGE_SIZE";
 
 /// `System.currentTimeMillis`.
 pub fn now_millis() -> i64 {
@@ -89,6 +92,11 @@ pub fn group_id(message: &CoreMessage) -> Option<Vec<u8>> {
 /// `Message.getGroupSequence`: 0 when unset.
 pub fn group_sequence(message: &CoreMessage) -> i64 {
     long_property(message, HDR_GROUP_SEQUENCE).unwrap_or(0)
+}
+
+/// `_AMQ_ORIG_MESSAGE_ID`, when set.
+pub fn orig_message_id(message: &CoreMessage) -> Option<i64> {
+    long_property(message, HDR_ORIG_MESSAGE_ID)
 }
 
 /// `CoreMessage.getScheduledDeliveryTime`: 0 when unset.
@@ -178,11 +186,16 @@ pub fn make_copy(
 pub struct ServerMessage {
     core: CoreMessage,
     /// `core` encoded as `CoreMessage.encode` writes it, the form carried by
-    /// `SESS_RECEIVE_MSG`.
+    /// `SESS_RECEIVE_MSG`. For a large message, only its headers and
+    /// properties (`encodeHeadersAndProperties`), the form `ADD_LARGE_MESSAGE`
+    /// and `SESS_RECEIVE_LARGE_MSG` carry.
     encoded: Vec<u8>,
     /// References on durable queues not yet acknowledged
     /// (`RefCountMessage.durableUp/Down`); the record is deleted at zero.
     durable_refs: AtomicI32,
+    /// A large message's body (`LargeServerMessageImpl`); `core.body` is
+    /// then empty.
+    large: Option<Arc<LargeBody>>,
 }
 
 impl ServerMessage {
@@ -193,7 +206,56 @@ impl ServerMessage {
             core,
             encoded: w.into_vec(),
             durable_refs: AtomicI32::new(0),
+            large: None,
         })
+    }
+
+    /// A large message: `core` holds the headers and properties, `body` the
+    /// body.
+    pub fn new_large(core: CoreMessage, body: Arc<LargeBody>) -> Arc<Self> {
+        let mut w = Writer::new();
+        core.encode_headers_and_properties(&mut w);
+        Arc::new(Self {
+            core,
+            encoded: w.into_vec(),
+            durable_refs: AtomicI32::new(0),
+            large: Some(body),
+        })
+    }
+
+    /// The same message with other headers or properties, sharing a large
+    /// body.
+    pub fn with_core(&self, core: CoreMessage) -> Arc<Self> {
+        match &self.large {
+            Some(body) => Self::new_large(core, body.clone()),
+            None => Self::new(core),
+        }
+    }
+
+    /// A copy with its own message ID (`Message.copy(newID)`): a large
+    /// message's body is copied to a file of its own.
+    pub fn copy(&self, core: CoreMessage) -> Arc<Self> {
+        match &self.large {
+            None => Self::new(core),
+            Some(body) => match body.copy(core.message_id, core.durable) {
+                Ok(copy) => Self::new_large(core, copy),
+                Err(e) => {
+                    tracing::warn!(
+                        "AMQ222181: Unable to copy large message {}: {e}",
+                        self.message_id()
+                    );
+                    Self::new_large(core, body.clone())
+                }
+            },
+        }
+    }
+
+    pub fn large(&self) -> Option<&Arc<LargeBody>> {
+        self.large.as_ref()
+    }
+
+    pub fn is_large(&self) -> bool {
+        self.large.is_some()
     }
 
     pub fn core(&self) -> &CoreMessage {

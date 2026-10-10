@@ -13,10 +13,11 @@ use saranga_storage::codec::{
     DeliveryCountUpdateEncoding, DuplicateIdEncoding, IdCounterEncoding, RefEncoding,
     ScheduledDeliveryEncoding,
 };
-use saranga_storage::message::PersistedMessage;
+use saranga_storage::message::{LargeMessageRecord, PersistedMessage};
 use saranga_storage::{BatchingIdGenerator, CHECKPOINT_BATCH_SIZE, IdCounterStore};
 use tokio::sync::oneshot;
 
+use crate::message::ServerMessage;
 use crate::transaction::Xid;
 
 pub use saranga_storage::ids;
@@ -61,6 +62,10 @@ pub struct StorageConfig {
     pub sync_non_transactional: bool,
     /// `max-redelivery-records`; negative for no limit.
     pub max_redelivery_records: i32,
+    /// `large-messages-directory`.
+    pub large_messages: std::path::PathBuf,
+    /// `large-message-sync`.
+    pub large_message_sync: bool,
 }
 
 /// Where `BatchingIDGenerator` keeps its counter: `ID_COUNTER_RECORD`s in
@@ -97,6 +102,26 @@ fn encode_message(message: &CoreMessage, encoded: &[u8]) -> Vec<u8> {
         .i32(encoded.len() as i32)
         .bytes(encoded);
     w.into_vec()
+}
+
+/// A message's record: `ADD_LARGE_MESSAGE` for a large message
+/// (`LargeMessagePersister`), `ADD_MESSAGE_PROTOCOL` otherwise.
+fn message_record(m: &ServerMessage) -> (u8, Vec<u8>) {
+    if m.is_large() {
+        (ids::ADD_LARGE_MESSAGE, m.encoded().to_vec())
+    } else {
+        (
+            ids::ADD_MESSAGE_PROTOCOL,
+            encode_message(m.core(), m.encoded()),
+        )
+    }
+}
+
+/// Decodes an `ADD_LARGE_MESSAGE` body (`parseLargeMessage`).
+fn decode_large_message(data: &[u8]) -> StoreResult<CoreMessage> {
+    LargeMessageRecord::decode(data)
+        .map(|r| r.message)
+        .map_err(corrupt("large message"))
 }
 
 /// Decodes an `ADD_MESSAGE_PROTOCOL` body (`MessagePersister.decode`).
@@ -182,6 +207,8 @@ impl RecoveredDuplicate {
 #[derive(Debug, Default)]
 pub struct RecoveredMessages {
     pub messages: HashMap<i64, CoreMessage>,
+    /// The messages that are large: their bodies are files.
+    pub large: HashSet<i64>,
     /// Per queue, in journal order.
     pub queues: HashMap<i64, Vec<RecoveredRef>>,
     pub prepared: Vec<RecoveredTx>,
@@ -259,6 +286,10 @@ impl Storage {
                 ids::ADD_MESSAGE_PROTOCOL => {
                     out.messages.insert(r.id, decode_message(&r.data)?);
                 }
+                ids::ADD_LARGE_MESSAGE => {
+                    out.messages.insert(r.id, decode_large_message(&r.data)?);
+                    out.large.insert(r.id);
+                }
                 ids::ADD_MESSAGE => {
                     return Err(JournalError::Corrupt(
                         "This is using old journal data, export your data and import at the correct version".into(),
@@ -335,7 +366,7 @@ impl Storage {
         }
         for p in loaded.prepared {
             out.prepared
-                .push(self.recover_prepared(p, &mut out.messages)?);
+                .push(self.recover_prepared(p, &mut out.messages, &mut out.large)?);
         }
         // Messages with no reference left, and none held by a prepared
         // transaction, are deleted.
@@ -357,6 +388,7 @@ impl Storage {
         for id in unreferenced {
             tracing::warn!("AMQ222129: Message {id} has no references, it will be deleted");
             out.messages.remove(&id);
+            out.large.remove(&id);
             let _ = self.messages.append_delete(id, false, None);
         }
         Ok(out)
@@ -367,6 +399,7 @@ impl Storage {
         &self,
         p: PreparedTransactionInfo,
         messages: &mut HashMap<i64, CoreMessage>,
+        large: &mut HashSet<i64>,
     ) -> StoreResult<RecoveredTx> {
         let xid = decode_xid(&p.extra_data)?;
         let mut tx = RecoveredTx {
@@ -380,6 +413,10 @@ impl Storage {
             match r.user_record_type {
                 ids::ADD_MESSAGE_PROTOCOL => {
                     messages.insert(r.id, decode_message(&r.data)?);
+                }
+                ids::ADD_LARGE_MESSAGE => {
+                    messages.insert(r.id, decode_large_message(&r.data)?);
+                    large.insert(r.id);
                 }
                 ids::ADD_REF => tx.sends.push((ref_queue(&r.data)?, r.id)),
                 ids::ACKNOWLEDGE_REF => tx.acks.push((ref_queue(&r.data)?, r.id)),
@@ -408,16 +445,17 @@ impl Storage {
 
     // Message journal ------------------------------------------------------
 
+    /// `getMaxRecordSize` of the message journal.
+    pub fn max_record_size(&self) -> usize {
+        self.cfg.messages.max_record_size()
+    }
+
     /// `storeMessage`: the message record, never synced (the reference that
     /// follows is).
-    pub fn store_message(&self, message: &CoreMessage, encoded: &[u8]) -> StoreResult<()> {
-        self.messages.append_add(
-            message.message_id,
-            ids::ADD_MESSAGE_PROTOCOL,
-            encode_message(message, encoded),
-            false,
-            None,
-        )
+    pub fn store_message(&self, message: &ServerMessage) -> StoreResult<()> {
+        let (record_type, body) = message_record(message);
+        self.messages
+            .append_add(message.message_id(), record_type, body, false, None)
     }
 
     /// `storeReference`: synced when it is the last reference of a send.
@@ -547,18 +585,10 @@ impl Storage {
     }
 
     /// `storeMessageTransactional`.
-    pub fn store_message_tx(
-        &self,
-        tx: i64,
-        message: &CoreMessage,
-        encoded: &[u8],
-    ) -> StoreResult<()> {
-        self.messages.append_add_tx(
-            tx,
-            message.message_id,
-            ids::ADD_MESSAGE_PROTOCOL,
-            encode_message(message, encoded),
-        )
+    pub fn store_message_tx(&self, tx: i64, message: &ServerMessage) -> StoreResult<()> {
+        let (record_type, body) = message_record(message);
+        self.messages
+            .append_add_tx(tx, message.message_id(), record_type, body)
     }
 
     /// `storeReferenceTransactional`.
@@ -659,6 +689,8 @@ mod tests {
             sync_transactional: true,
             sync_non_transactional: true,
             max_redelivery_records: 10,
+            large_messages: dir.join("largemessages"),
+            large_message_sync: false,
         }
     }
 
@@ -715,10 +747,7 @@ mod tests {
             ..Default::default()
         };
         for id in [10, 11, 12] {
-            let m = msg(id);
-            let mut w = Writer::new();
-            m.encode(&mut w);
-            s.store_message(&m, w.as_slice()).unwrap();
+            s.store_message(&ServerMessage::new(msg(id))).unwrap();
             s.store_reference(1, id, false).unwrap();
             s.store_reference(2, id, true).unwrap();
         }
@@ -757,10 +786,8 @@ mod tests {
             durable: true,
             ..Default::default()
         };
-        let mut w = Writer::new();
-        m.encode(&mut w);
         let tx = s.generate_id();
-        s.store_message_tx(tx, &m, w.as_slice()).unwrap();
+        s.store_message_tx(tx, &ServerMessage::new(m)).unwrap();
         s.store_reference_tx(tx, 3, 7).unwrap();
         let xid = Xid {
             format_id: 5,

@@ -82,7 +82,8 @@ impl JournalConfig {
         }
     }
 
-    fn max_record_size(&self) -> usize {
+    /// `getMaxRecordSize`: the largest record the journal takes.
+    pub fn max_record_size(&self) -> usize {
         if self.buffer_size == 0 {
             self.file_size
         } else {

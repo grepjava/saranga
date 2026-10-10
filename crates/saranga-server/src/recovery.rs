@@ -10,6 +10,7 @@ use saranga_buffer::SimpleString;
 use saranga_storage::RecordCodec;
 use saranga_storage::codec::{PersistentAddressBindingEncoding, PersistentQueueBindingEncoding};
 
+use crate::large::LargeMessageStore;
 use crate::message::{self, MessageRef, ServerMessage};
 use crate::postoffice::{AddressInfo, PostOffice, RoutingTypes};
 use crate::queue::{Queue, QueueConfig};
@@ -181,9 +182,15 @@ pub async fn load_messages(
     storage: &Storage,
     post_office: &PostOffice,
     resource_manager: &ResourceManager,
+    large_store: &Arc<LargeMessageStore>,
 ) -> Result<()> {
+    // recoverLargeMessagesOnFolder: the files there before loading.
+    let mut stored = large_store
+        .start()
+        .map_err(|e| BrokerError::internal(format!("large-messages directory: {e}")))?;
     let RecoveredMessages {
         messages,
+        large,
         queues,
         prepared,
         duplicates,
@@ -197,8 +204,27 @@ pub async fn load_messages(
         .collect();
     let messages: HashMap<i64, Arc<ServerMessage>> = messages
         .into_iter()
-        .map(|(id, m)| (id, ServerMessage::new(m)))
+        .map(|(id, m)| {
+            if !large.contains(&id) {
+                return (id, ServerMessage::new(m));
+            }
+            stored.remove(&m.message_id);
+            let body = large_store.existing(m.message_id);
+            // parseLargeMessage: a copy written by an older broker may
+            // still share its original's file.
+            let body = match (body.path(), message::orig_message_id(&m)) {
+                (Some(p), Some(orig)) if !p.exists() => {
+                    let original = large_store.existing(orig);
+                    original.set_keep(true);
+                    original.copy(m.message_id, true).unwrap_or(body)
+                }
+                _ => body,
+            };
+            (id, ServerMessage::new_large(m, body))
+        })
         .collect();
+    // Files no large message refers to (the leftovers of a crash).
+    large_store.delete_files(stored);
     // The duplicate-ID caches, per address in journal order.
     let mut by_address: Vec<(String, DuplicateIds)> = Vec::new();
     for d in duplicates {

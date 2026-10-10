@@ -104,6 +104,9 @@ impl ConnShared {
 pub(crate) struct CoreDeliverySink {
     conn: Arc<ConnShared>,
     channel_id: i64,
+    /// The session's `minLargeMessageSize`: the size of large-message
+    /// chunks.
+    chunk_size: usize,
 }
 
 impl DeliverySink for CoreDeliverySink {
@@ -129,6 +132,42 @@ impl DeliverySink for CoreDeliverySink {
         let size = frame.len() as i64;
         self.conn.send_raw(frame);
         size
+    }
+
+    fn deliver_large(
+        &self,
+        consumer_id: i64,
+        message: &ServerMessage,
+        body_size: i64,
+        delivery_count: i32,
+    ) -> i64 {
+        // SessionReceiveLargeMessage: the headers and properties are the
+        // message's encoded form.
+        let frame = encode_frame(types::SESS_RECEIVE_LARGE_MSG, self.channel_id, |w| {
+            w.i64(consumer_id)
+                .i32(delivery_count)
+                .i64(body_size)
+                .bytes(message.encoded());
+        });
+        let size = frame.len() as i64;
+        self.conn.send_raw(frame);
+        size
+    }
+
+    fn deliver_continuation(&self, consumer_id: i64, chunk: Vec<u8>, continues: bool) -> i64 {
+        let packet = saranga_core_protocol::packets::large::SessionReceiveContinuationMessage {
+            body: chunk,
+            continues,
+            consumer_id,
+        };
+        let frame = Packet::from(packet).encode_frame(self.channel_id, &self.conn.context());
+        let size = frame.len() as i64;
+        self.conn.send_raw(frame);
+        size
+    }
+
+    fn chunk_size(&self) -> usize {
+        self.chunk_size
     }
 }
 

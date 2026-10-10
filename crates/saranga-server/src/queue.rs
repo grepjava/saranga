@@ -18,6 +18,7 @@ use saranga_buffer::PropertyValue;
 use saranga_message::CoreMessage;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::large::{LargeBody, LargeReader};
 use crate::message::{self, MessageRef, ServerMessage, now_millis};
 use crate::postoffice::{PostOffice, QueueSpec};
 use crate::settings::AddressSettings;
@@ -44,7 +45,28 @@ pub trait DeliverySink: Send + Sync {
     /// Sends one delivery and returns its size in flow-control credits
     /// (for Core, the size of the whole `SESS_RECEIVE_MSG` packet).
     fn deliver(&self, consumer_id: i64, message: &ServerMessage, delivery_count: i32) -> i64;
+
+    /// Starts a large message's delivery: its headers and body size
+    /// (`sendLargeMessage`). Returns the credits used.
+    fn deliver_large(
+        &self,
+        consumer_id: i64,
+        message: &ServerMessage,
+        body_size: i64,
+        delivery_count: i32,
+    ) -> i64;
+
+    /// Sends the next chunk of a large message's body
+    /// (`sendLargeMessageContinuation`). Returns the credits used.
+    fn deliver_continuation(&self, consumer_id: i64, chunk: Vec<u8>, continues: bool) -> i64;
+
+    /// The largest body chunk (the session's `minLargeMessageSize`).
+    fn chunk_size(&self) -> usize;
 }
+
+/// The most of a large message's body sent in one pass of the queue, so
+/// that a consumer without flow control does not hold the queue up.
+const LARGE_BYTES_PER_PASS: usize = 1024 * 1024;
 
 /// Everything about a queue that is fixed when it is created
 /// (`QueueConfiguration` with every default applied).
@@ -147,6 +169,8 @@ enum Cmd {
     },
     /// The expiry reaper's pass (`expireReferences`).
     ExpireScan,
+    /// Sends more of the large messages being delivered.
+    ResumeLarge,
     Shutdown,
 }
 
@@ -492,9 +516,119 @@ struct Consumer {
     delivering: VecDeque<MessageRef>,
     /// Messages already sent to a browser.
     browsed: HashSet<i64>,
+    /// The large message being sent (`largeMessageDeliverer`): nothing
+    /// else is delivered until it is done.
+    large: Option<LargeTransfer>,
+    /// Forced-delivery markers waiting for the large message.
+    forced: Vec<CoreMessage>,
+}
+
+/// A large message part-way to a consumer (`CoreLargeMessageDeliverer`).
+/// It holds the body, so the file stays until the transfer ends.
+struct LargeTransfer {
+    body: Arc<LargeBody>,
+    reader: Option<LargeReader>,
+    position: u64,
 }
 
 impl Consumer {
+    fn new(reg: ConsumerRegistration) -> Self {
+        Self {
+            credits: Some(0),
+            started: reg.started || reg.browse_only,
+            delivering: VecDeque::new(),
+            browsed: HashSet::new(),
+            large: None,
+            forced: Vec::new(),
+            reg,
+        }
+    }
+
+    fn has_credits(&self) -> bool {
+        self.credits.is_none_or(|c| c > 0)
+    }
+
+    fn take_credits(&mut self, size: i64) {
+        if let Some(credits) = &mut self.credits {
+            *credits -= size;
+        }
+    }
+
+    /// Hands a message to the sink; a large one starts a transfer.
+    fn send(&mut self, message: &ServerMessage, delivery_count: i32) {
+        let id = self.reg.client_id;
+        let size = match message.large() {
+            None => self.reg.sink.deliver(id, message, delivery_count),
+            Some(body) => {
+                let size = body.size() as i64;
+                let reader = body
+                    .reader()
+                    .inspect_err(|e| {
+                        tracing::warn!(
+                            "AMQ222110: Error on resetting large message deliver - {}: {e}",
+                            message.message_id()
+                        );
+                    })
+                    .ok();
+                self.large = Some(LargeTransfer {
+                    body: body.clone(),
+                    reader,
+                    position: 0,
+                });
+                self.reg
+                    .sink
+                    .deliver_large(id, message, size, delivery_count)
+            }
+        };
+        self.take_credits(size);
+    }
+
+    /// Sends the next chunks of the large message while the consumer has
+    /// credits (`CoreLargeMessageDeliverer.deliver`). Returns true when
+    /// more could be sent at once.
+    fn continue_large(&mut self) -> bool {
+        let mut budget = LARGE_BYTES_PER_PASS;
+        while self.started && self.has_credits() {
+            let Some(t) = &mut self.large else {
+                return false;
+            };
+            if budget == 0 {
+                return true;
+            }
+            let size = t.body.size();
+            let len = (size - t.position).min(self.reg.sink.chunk_size().max(1) as u64) as usize;
+            let chunk = match t.reader.as_mut().map(|r| r.read_chunk(len)) {
+                Some(Ok(chunk)) => chunk,
+                Some(Err(e)) => {
+                    tracing::warn!(
+                        "AMQ222110: Error on resetting large message deliver - {}: {e}",
+                        t.body.id()
+                    );
+                    t.reader = None;
+                    vec![0; len]
+                }
+                None => vec![0; len],
+            };
+            t.position += len as u64;
+            let continues = t.position < size;
+            budget = budget.saturating_sub(len.max(1));
+            let used = self
+                .reg
+                .sink
+                .deliver_continuation(self.reg.client_id, chunk, continues);
+            self.take_credits(used);
+            if !continues {
+                self.large = None;
+                for marker in std::mem::take(&mut self.forced) {
+                    self.reg
+                        .sink
+                        .deliver(self.reg.client_id, &ServerMessage::new(marker), 0);
+                }
+            }
+        }
+        false
+    }
+
     fn accepts(&self, r: &MessageRef) -> bool {
         self.reg
             .filter
@@ -503,7 +637,7 @@ impl Consumer {
     }
 
     fn can_take(&self) -> bool {
-        self.started && self.credits.is_none_or(|c| c > 0)
+        self.started && self.has_credits() && self.large.is_none()
     }
 }
 
@@ -942,7 +1076,7 @@ impl Actor {
             now,
         );
         message::apply_expiry_delay(&mut copy, &po.settings(address), now);
-        let mut copy = MessageRef::new(ServerMessage::new(copy));
+        let mut copy = MessageRef::new(r.message.copy(copy));
         copy.scheduled_time = message::scheduled_delivery_time(copy.message.core());
         let routed = po.route_internal(&copy, address);
         let queue = self.queue();
@@ -953,7 +1087,7 @@ impl Actor {
                 for (m, targets) in &routed {
                     for q in targets.iter().filter(|q| q.is_durable_ref(m)) {
                         if m.message.durable_up() == 1 {
-                            s.store_message_tx(tx, m.message.core(), m.message.encoded())?;
+                            s.store_message_tx(tx, &m.message)?;
                         }
                         s.store_reference_tx(tx, q.id(), m.message_id())?;
                         persistent = true;
@@ -987,13 +1121,7 @@ impl Actor {
             Cmd::Add(r) => self.add_tail(r),
             Cmd::Reinsert(refs) => self.return_refs(refs),
             Cmd::AddConsumer(reg) => {
-                let consumer = Consumer {
-                    credits: Some(0),
-                    started: reg.started || reg.browse_only,
-                    delivering: VecDeque::new(),
-                    browsed: HashSet::new(),
-                    reg: *reg,
-                };
+                let consumer = Consumer::new(*reg);
                 if consumer.reg.browse_only {
                     self.browsers.push(consumer);
                 } else {
@@ -1074,6 +1202,7 @@ impl Actor {
                 let refs = match self.consumer_mut(id) {
                     Some(c) if !c.reg.browse_only => {
                         c.started = false;
+                        c.large = None;
                         cancel(std::mem::take(&mut c.delivering), last_as_delivered, failed)
                     }
                     _ => Vec::new(),
@@ -1084,6 +1213,7 @@ impl Actor {
                 self.deliver();
                 self.force_delivery(id, sequence);
             }
+            Cmd::ResumeLarge => {}
             Cmd::Remove { message_id, reply } => {
                 let mut r = self
                     .messages
@@ -1195,6 +1325,14 @@ impl Actor {
     /// another. Each message goes to the next consumer, round robin, in the
     /// highest priority group that has one able to take it.
     fn deliver(&mut self) {
+        // Large messages part-way out go first.
+        let mut more = false;
+        for c in self.consumers.iter_mut().chain(self.browsers.iter_mut()) {
+            more |= c.continue_large();
+        }
+        if more {
+            self.queue().send(Cmd::ResumeLarge);
+        }
         if !self.can_dispatch() {
             self.deliver_to_browsers();
             return;
@@ -1315,20 +1453,17 @@ impl Actor {
                 let mut core = r.message.core().clone();
                 core.properties
                     .insert(key.as_str().into(), PropertyValue::Bool(true));
-                Some(ServerMessage::new(core))
+                Some(r.message.with_core(core))
             }
             _ => None,
         };
         let c = &mut self.consumers[index];
         r.delivery_count += 1;
-        let size = c.reg.sink.deliver(
-            c.reg.client_id,
-            flagged.as_deref().unwrap_or(&r.message),
-            r.delivery_count,
-        );
-        if let Some(credits) = &mut c.credits {
-            *credits -= size;
+        c.send(flagged.as_deref().unwrap_or(&r.message), r.delivery_count);
+        if c.large.is_some() && c.continue_large() {
+            self.shared.tx.send(Cmd::ResumeLarge).ok();
         }
+        let c = &mut self.consumers[index];
         if non_destructive {
             c.browsed.insert(r.message_id());
             if !c.reg.pre_acknowledge {
@@ -1395,12 +1530,10 @@ impl Actor {
                     break;
                 };
                 b.browsed.insert(r.message_id());
-                let size = b
-                    .reg
-                    .sink
-                    .deliver(b.reg.client_id, &r.message, r.delivery_count);
-                if let Some(credits) = &mut b.credits {
-                    *credits -= size;
+                let (message, count) = (r.message.clone(), r.delivery_count);
+                b.send(&message, count);
+                if b.large.is_some() && b.continue_large() {
+                    self.shared.tx.send(Cmd::ResumeLarge).ok();
                 }
             }
         }
@@ -1424,6 +1557,11 @@ impl Actor {
             FORCED_DELIVERY_MESSAGE.into(),
             PropertyValue::Long(sequence),
         );
+        // After the large message being sent, if any.
+        if c.large.is_some() {
+            c.forced.push(core);
+            return;
+        }
         c.reg
             .sink
             .deliver(c.reg.client_id, &ServerMessage::new(core), 0);
