@@ -7,7 +7,7 @@ Saranga is built in twelve phases. Each one ends with something runnable, and it
 | 0 | Foundation | Done |
 | 1 | Encoding primitives | Done |
 | 2 | Single-node in-memory broker (Core) | Done |
-| 3 | Persistence, on-disk compatible (first usable release) | Not started |
+| 3 | Persistence, on-disk compatible (first usable release) | Done |
 | 4 | Queue semantics parity | Not started |
 | 5 | Paging and large messages | Not started |
 | 6 | Config and security | Not started |
@@ -81,6 +81,15 @@ Phase 3 is the first release anyone could adopt. Every phase after it can ship a
 **Exit check**
 - The Java broker recovers a data directory Saranga wrote, and Saranga recovers one the Java broker wrote, for every scenario in the corpus.
 - Crash tests that kill the broker with `kill -9` lose no committed messages.
+
+**Exit check (met)** — `scripts/cross-store.sh` runs all of it:
+- Saranga recovers every golden data directory Artemis 2.57.0 wrote (7 scenarios, including a killed broker and a journal Artemis compacted) and a client sees what it saw on Artemis (`recovered.txt`). Three scenarios differ only through features of later phases: large messages (Phase 5), scheduled delivery and message groups (Phase 4).
+- [tests/interop/jms/Persist.java](tests/interop/jms/Persist.java) passes in every direction through `scripts/persistence.sh`: Saranga to Saranga, Artemis to Saranga and Saranga to Artemis, each after a clean stop and after a kill. It covers persistent and non-persistent messages, acknowledgements, durable subscriptions with selectors, local transactions, persisted delivery counts, prepared XA branches, queue attributes and 4,000 messages over several journal files.
+- `scripts/journal-interop.sh`: Artemis's `JournalImpl` loads a journal Saranga wrote (with compaction and every record type) to the same records, and the reverse.
+- Every record of every golden journal re-encodes byte for byte, at the journal level (`saranga-journal`) and at the record-body level (`saranga-storage`). `saranga data print` prints what `artemis data print` prints for all 7 scenarios.
+- XA in Core sessions: [tests/interop/jms/Phase3.java](tests/interop/jms/Phase3.java) (9 tests) and the `core-xa` scenario pass against Saranga and Artemis.
+
+**Deferred to later phases on purpose:** scheduled-delivery and duplicate-ID records are kept in the journal but not acted on (Phase 4); large messages and paging records are read but not recovered (Phase 5); heuristic completions and `xaForget` (Phase 8); transaction timeouts (Phase 4). Compaction blocks appends while it runs (see COMPAT.md).
 
 ## Phase 4: Queue semantics parity
 

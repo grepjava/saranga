@@ -23,7 +23,8 @@ jobs:
         shell: bash
         run: |
           cargo build -p saranga-cli
-          target/debug/saranga run --config tests/golden/etc/broker.xml --bind 127.0.0.1:61616 &
+          mkdir -p "$RUNNER_TEMP/instance/etc" && cp tests/golden/etc/broker.xml "$RUNNER_TEMP/instance/etc/"
+          target/debug/saranga run --config "$RUNNER_TEMP/instance/etc/broker.xml" --bind 127.0.0.1:61616 &
           for _ in $(seq 1 50); do (echo > /dev/tcp/127.0.0.1/61616) 2>/dev/null && break; sleep 0.2; done
           SARANGA_TEST_BROKER=127.0.0.1:61616 cargo test -p saranga-client --test broker
 

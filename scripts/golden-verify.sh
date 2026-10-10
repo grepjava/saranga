@@ -59,12 +59,12 @@ case "$TARGET" in
     docker logs "$NAME" 2>&1 | grep -q "AMQ221007" || { docker logs "$NAME" >&2; exit 1; }
     ;;
   saranga)
-    # TODO(phase 3): Saranga cannot open a data dir yet. Once `saranga run` takes
-    # one, pass "$WORK/data" here (e.g. --data "$(native "$WORK/data")").
+    # A broker instance around the extracted data: etc/broker.xml and data/.
+    mkdir -p "$WORK/etc" && cp "$CONFIG" "$WORK/etc/broker.xml"
     cargo build -q -p saranga-cli --manifest-path "$(native "$ROOT/Cargo.toml")"
-    "$ROOT/target/debug/saranga" run --config "$(native "$CONFIG")" --bind "127.0.0.1:$PORT" >&2 &
+    "$ROOT/target/debug/saranga" run --config "$(native "$WORK/etc/broker.xml")" --bind "127.0.0.1:$PORT" >&2 &
     BROKER_PID=$!
-    for _ in $(seq 1 50); do (echo > "/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break; sleep 0.1; done
+    for _ in $(seq 1 100); do (echo > "/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break; sleep 0.1; done
     ;;
   *) echo "usage: golden-verify.sh <scenario> [artemis|saranga]" >&2; exit 2 ;;
 esac

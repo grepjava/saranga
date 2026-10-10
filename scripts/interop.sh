@@ -19,6 +19,7 @@ native() { command -v cygpath >/dev/null && cygpath -m "$1" || echo "$1"; }
 BROKER_PID=""
 cleanup() {
   [[ -n "$BROKER_PID" ]] && kill "$BROKER_PID" 2>/dev/null || true
+  [[ -n "${INSTANCE:-}" ]] && rm -rf "$INSTANCE"
   docker rm -f saranga-interop >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -26,7 +27,10 @@ trap cleanup EXIT
 case "$TARGET" in
   saranga)
     cargo build -q --release -p saranga-cli --manifest-path "$(native "$ROOT/Cargo.toml")"
-    "$ROOT/target/release/saranga" run --config "$(native "$ROOT/tests/golden/etc/broker.xml")" --bind "127.0.0.1:$PORT" &
+    # A throwaway broker instance: the journal goes to its data/.
+    INSTANCE="$(mktemp -d)"
+    mkdir -p "$INSTANCE/etc" && cp "$ROOT/tests/golden/etc/broker.xml" "$INSTANCE/etc/"
+    "$ROOT/target/release/saranga" run --config "$(native "$INSTANCE/etc/broker.xml")" --bind "127.0.0.1:$PORT" &
     BROKER_PID=$!
     for _ in $(seq 1 50); do (echo > "/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break; sleep 0.1; done
     ;;

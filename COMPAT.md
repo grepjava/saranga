@@ -31,3 +31,10 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **`${...}` in `broker.xml`** resolves from environment variables. Java resolves from system properties (`-Dname=value`) first; Saranga has no system properties, so set an environment variable of the same name.
 - **Namespaces.** Elements are matched by local name, so prefixed elements that Java would miss are accepted.
 - **`xi:include`** is not expanded yet; it produces a warning.
+
+## Persistence differences
+- Saranga writes journal files the way Artemis's `NIO` journal does: records follow each other without block alignment, whatever `journal-type` says. Artemis reads such files with any journal type, and Saranga reads `ASYNCIO` files (aligned flushes padded with zeros).
+- Appends wait while the journal compacts; Artemis keeps appending and replays the appends afterwards. The compacted files are the same.
+- Group commit comes from a flusher thread that syncs whatever accumulated while the previous sync ran, rather than `TimedBuffer`'s timer, so `journal-buffer-timeout` has no effect.
+- `server.lock` holds the node ID and state as in Artemis; the primary lock is a lock on `serverlock.1`. The node ID of a new instance is a random UUID rather than a time-based one.
+- The XA error messages print `XidImpl (<n> ...` with a hash of the Xid where Java prints an identity hash.
