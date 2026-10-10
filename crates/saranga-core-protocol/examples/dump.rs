@@ -23,7 +23,12 @@ fn main() {
                 _ => {}
             }
             let text = format!("{packet:?}");
-            let text = if text.len() > 300 {
+            let text = if text.len()
+                > std::env::var("DUMP_WIDTH")
+                    .ok()
+                    .and_then(|w| w.parse().ok())
+                    .unwrap_or(300)
+            {
                 format!("{}…", &text[..text.floor_char_boundary(300)])
             } else {
                 text
