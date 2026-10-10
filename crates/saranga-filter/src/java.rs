@@ -167,10 +167,8 @@ fn read_java_float(s: &str) -> Option<JavaFloat> {
         }
     }
     // An optional type suffix, and nothing after it.
-    if i < b.len() {
-        if i != b.len() - 1 || !matches!(b[i], b'f' | b'F' | b'd' | b'D') {
-            return None;
-        }
+    if i < b.len() && (i != b.len() - 1 || !matches!(b[i], b'f' | b'F' | b'd' | b'D')) {
+        return None;
     }
     let int_digits = if int_digits.is_empty() {
         "0"
