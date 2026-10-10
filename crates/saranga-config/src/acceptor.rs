@@ -91,6 +91,58 @@ impl AcceptorConfig {
         Ok(config)
     }
 
+    /// An acceptor given as a name and parameters, as broker properties
+    /// give `acceptorConfigurations`: always TCP, with `host` and `port`
+    /// taken from the parameters.
+    pub fn from_params(name: &str, params: Vec<(String, Option<String>)>) -> Self {
+        let mut config = Self {
+            name: Some(name.to_owned()),
+            uri: String::new(),
+            scheme: "tcp".to_owned(),
+            host: None,
+            port: None,
+            params: Vec::new(),
+            lock_coordinator: None,
+        };
+        for (k, v) in params {
+            config.set_param(&k, v.as_deref());
+        }
+        config
+    }
+
+    /// Sets (or with `None` removes) a parameter, keeping `host` and `port`
+    /// and the URI text in step.
+    pub fn set_param(&mut self, key: &str, value: Option<&str>) {
+        match value {
+            Some(v) => match self.params.iter_mut().find(|(k, _)| k == key) {
+                Some((_, slot)) => *slot = Some(v.to_owned()),
+                None => self.params.push((key.to_owned(), Some(v.to_owned()))),
+            },
+            None => self.params.retain(|(k, _)| k != key),
+        }
+        match key {
+            "host" => self.host = value.map(str::to_owned),
+            "port" => self.port = value.and_then(|v| v.trim().parse().ok()),
+            _ => {}
+        }
+        let query: Vec<String> = self
+            .params
+            .iter()
+            .filter(|(k, _)| k != "host" && k != "port")
+            .map(|(k, v)| match v {
+                Some(v) => format!("{k}={v}"),
+                None => k.clone(),
+            })
+            .collect();
+        self.uri = format!(
+            "tcp://{}:{}{}{}",
+            self.host.as_deref().unwrap_or("localhost"),
+            self.port.unwrap_or(61616),
+            if query.is_empty() { "" } else { "?" },
+            query.join(";")
+        );
+    }
+
     fn param_entry(&self, key: &str) -> Option<Option<&str>> {
         self.params
             .iter()

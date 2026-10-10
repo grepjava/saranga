@@ -401,9 +401,29 @@ fn parse_core(
         });
     }
 
+    parse_scalars(core, config, warnings)?;
+    parse_acceptors(core, config, warnings)?;
+    parse_security_settings(core, config, warnings)?;
+    parse_address_settings(core, config, warnings)?;
+    parse_addresses(core, config, warnings)?;
+    parse_diverts(core, config, warnings)?;
+    parse_wildcards(core, config, warnings)?;
+    Ok(())
+}
+
+/// The single-valued settings of `<core>`. Only the elements present are
+/// applied, so broker properties can run it over one element at a time.
+fn parse_scalars(
+    core: Node<'_, '_>,
+    config: &mut BrokerConfig,
+    warnings: &mut Vec<Warning>,
+) -> Result<()> {
     let s = Settings { core };
     if let Some(name) = s.string("name") {
         config.name = name;
+    }
+    if let Some(prefix) = s.string("system-property-prefix") {
+        config.system_property_prefix = prefix;
     }
     if let Some(v) = s.bool("persistence-enabled") {
         config.persistence_enabled = v;
@@ -457,7 +477,7 @@ fn parse_core(
     if let Some(v) = s.non_empty_string("paging-directory")? {
         config.paging_directory = v;
     }
-    config.journal = parse_journal(&s)?;
+    parse_journal(&s, &mut config.journal)?;
 
     // Artemis only honours <wild-card-routing-enabled> when <core> also
     // carries an attribute of that name.
@@ -483,47 +503,179 @@ fn parse_core(
         }
         config.literal_match_markers = Some((chars[0], chars[1]));
     }
-
-    parse_acceptors(core, config, warnings)?;
-    parse_security_settings(core, config, warnings)?;
-    parse_address_settings(core, config, warnings)?;
-    parse_addresses(core, config, warnings)?;
-    parse_diverts(core, config, warnings)?;
-    parse_wildcards(core, config, warnings)?;
     Ok(())
 }
 
-fn parse_journal(s: &Settings<'_, '_>) -> Result<JournalConfig> {
-    let mut j = JournalConfig::default();
+/// Sets the journal settings present in `<core>`, leaving the rest.
+fn parse_journal(s: &Settings<'_, '_>, j: &mut JournalConfig) -> Result<()> {
     if let Some(t) = first(s.core, "journal-type") {
         j.journal_type = node_enum(t)?;
     }
-    j.datasync = s.bool("journal-datasync");
-    j.sync_transactional = s.bool("journal-sync-transactional");
-    j.sync_non_transactional = s.bool("journal-sync-non-transactional");
-    j.file_size = s
-        .text_bytes("journal-file-size", Check::PositiveInt)?
-        .map(|v| v as i32);
-    j.max_attic_files = s.i32("journal-max-attic-files", Check::Any)?;
-    j.buffer_timeout = s.i32("journal-buffer-timeout", Check::GeZero)?;
-    j.buffer_size = s
-        .text_bytes("journal-buffer-size", Check::PositiveInt)?
-        .map(|v| v as i32);
-    j.max_io = s.i32("journal-max-io", Check::GtZero)?;
-    j.device_block_size = s.i32("journal-device-block-size", Check::MinusOneOrGeZero)?;
-    j.file_open_timeout = s.i32("journal-file-open-timeout", Check::GtZero)?;
-    j.min_files = s.i32("journal-min-files", Check::GtZero)?;
-    j.pool_files = s.i32("journal-pool-files", Check::MinusOneOrGtZero)?;
-    j.compact_min_files = s.i32("journal-compact-min-files", Check::GeZero)?;
-    j.compact_percentage = s.i32("journal-compact-percentage", Check::Percentage)?;
-    j.create_journal_dir = s.bool("create-journal-dir");
-    j.create_bindings_dir = s.bool("create-bindings-dir");
-    j.max_redelivery_records = s.i32("max-redelivery-records", Check::MinusOneOrGeZero)?;
-    j.page_sync_timeout = s.i32("page-sync-timeout", Check::GeZero)?;
-    j.purge_page_folders = s.bool("purge-page-folders");
-    j.max_disk_usage = s.i32("max-disk-usage", Check::PercentageOrMinusOne)?;
-    j.disk_scan_period = s.i32("disk-scan-period", Check::MinusOneOrGtZero)?;
-    Ok(j)
+    set(&mut j.datasync, s.bool("journal-datasync"));
+    set(
+        &mut j.sync_transactional,
+        s.bool("journal-sync-transactional"),
+    );
+    set(
+        &mut j.sync_non_transactional,
+        s.bool("journal-sync-non-transactional"),
+    );
+    set(
+        &mut j.file_size,
+        s.text_bytes("journal-file-size", Check::PositiveInt)?
+            .map(|v| v as i32),
+    );
+    set(
+        &mut j.max_attic_files,
+        s.i32("journal-max-attic-files", Check::Any)?,
+    );
+    set(
+        &mut j.buffer_timeout,
+        s.i32("journal-buffer-timeout", Check::GeZero)?,
+    );
+    set(
+        &mut j.buffer_size,
+        s.text_bytes("journal-buffer-size", Check::PositiveInt)?
+            .map(|v| v as i32),
+    );
+    set(&mut j.max_io, s.i32("journal-max-io", Check::GtZero)?);
+    set(
+        &mut j.device_block_size,
+        s.i32("journal-device-block-size", Check::MinusOneOrGeZero)?,
+    );
+    set(
+        &mut j.file_open_timeout,
+        s.i32("journal-file-open-timeout", Check::GtZero)?,
+    );
+    set(&mut j.min_files, s.i32("journal-min-files", Check::GtZero)?);
+    set(
+        &mut j.pool_files,
+        s.i32("journal-pool-files", Check::MinusOneOrGtZero)?,
+    );
+    set(
+        &mut j.compact_min_files,
+        s.i32("journal-compact-min-files", Check::GeZero)?,
+    );
+    set(
+        &mut j.compact_percentage,
+        s.i32("journal-compact-percentage", Check::Percentage)?,
+    );
+    set(&mut j.create_journal_dir, s.bool("create-journal-dir"));
+    set(&mut j.create_bindings_dir, s.bool("create-bindings-dir"));
+    set(
+        &mut j.max_redelivery_records,
+        s.i32("max-redelivery-records", Check::MinusOneOrGeZero)?,
+    );
+    set(
+        &mut j.page_sync_timeout,
+        s.i32("page-sync-timeout", Check::GeZero)?,
+    );
+    set(&mut j.purge_page_folders, s.bool("purge-page-folders"));
+    set(
+        &mut j.max_disk_usage,
+        s.i32("max-disk-usage", Check::PercentageOrMinusOne)?,
+    );
+    set(
+        &mut j.disk_scan_period,
+        s.i32("disk-scan-period", Check::MinusOneOrGtZero)?,
+    );
+    Ok(())
+}
+
+/// The `<core>` elements [`parse_scalars`] reads, which broker properties
+/// can set by their camel-case names.
+const SCALAR_ELEMENTS: &[&str] = &[
+    "address-queue-scan-period",
+    "authentication-cache-size",
+    "authorization-cache-size",
+    "bindings-directory",
+    "cluster-password",
+    "cluster-user",
+    "configuration-file-refresh-period",
+    "create-bindings-dir",
+    "create-journal-dir",
+    "disk-scan-period",
+    "global-max-messages",
+    "global-max-size",
+    "id-cache-size",
+    "journal-buffer-size",
+    "journal-buffer-timeout",
+    "journal-compact-min-files",
+    "journal-compact-percentage",
+    "journal-datasync",
+    "journal-device-block-size",
+    "journal-directory",
+    "journal-file-open-timeout",
+    "journal-file-size",
+    "journal-max-attic-files",
+    "journal-max-io",
+    "journal-min-files",
+    "journal-pool-files",
+    "journal-sync-non-transactional",
+    "journal-sync-transactional",
+    "journal-type",
+    "large-message-sync",
+    "large-messages-directory",
+    "literal-match-markers",
+    "mask-password",
+    "max-disk-usage",
+    "max-redelivery-records",
+    "message-expiry-scan-period",
+    "name",
+    "page-sync-timeout",
+    "paging-directory",
+    "password-codec",
+    "persist-id-cache",
+    "persistence-enabled",
+    "populate-validated-user",
+    "purge-page-folders",
+    "reject-empty-validated-user",
+    "security-enabled",
+    "security-invalidation-interval",
+    "system-property-prefix",
+    "transaction-timeout",
+    "transaction-timeout-scan-period",
+];
+
+fn xml_escape(v: &str) -> String {
+    v.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Applies one top-level setting given by its element name, as broker
+/// properties do. `Ok(false)` if `<core>` has no such element; one it has
+/// but Saranga does not act on is accepted and ignored, as in `broker.xml`.
+pub(crate) fn apply_scalar(config: &mut BrokerConfig, element: &str, value: &str) -> Result<bool> {
+    if !SCALAR_ELEMENTS.contains(&element) {
+        return Ok(CORE_ELEMENTS.contains(&element));
+    }
+    let text = format!("<core><{element}>{}</{element}></core>", xml_escape(value));
+    let doc = Document::parse(&text)?;
+    parse_scalars(doc.root_element(), config, &mut Vec::new())?;
+    Ok(true)
+}
+
+/// An address setting holding only `element`, or `None` if
+/// `<address-setting>` has no such element.
+pub(crate) fn address_setting_fragment(
+    element: &str,
+    value: &str,
+) -> Result<Option<AddressSettings>> {
+    let text = format!(
+        "<address-setting><{element}>{}</{element}></address-setting>",
+        xml_escape(value)
+    );
+    let doc = Document::parse(&text)?;
+    let mut warnings = Vec::new();
+    let settings = parse_address_setting(doc.root_element(), &mut warnings)?;
+    Ok(warnings.is_empty().then_some(settings))
+}
+
+fn set<T>(slot: &mut Option<T>, value: Option<T>) {
+    if value.is_some() {
+        *slot = value;
+    }
 }
 
 fn parse_acceptors(
@@ -569,7 +721,9 @@ fn parse_security_options(s: &Settings<'_, '_>, config: &mut BrokerConfig) -> Re
     if let Some(v) = s.i64("authorization-cache-size", Check::GeZero)? {
         config.authorization_cache_size = v;
     }
-    config.mask_password = s.bool("mask-password");
+    if let Some(v) = s.bool("mask-password") {
+        config.mask_password = Some(v);
+    }
     if let Some(v) = s.non_empty_string("password-codec")? {
         config.password_codec = v;
     }

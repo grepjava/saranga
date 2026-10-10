@@ -26,7 +26,8 @@ pub enum ControlFlag {
 }
 
 impl ControlFlag {
-    fn parse(s: &str) -> Option<Self> {
+    /// A flag name, ignoring case.
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_uppercase().as_str() {
             "REQUIRED" => Some(Self::Required),
             "REQUISITE" => Some(Self::Requisite),

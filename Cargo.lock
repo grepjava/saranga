@@ -1587,6 +1587,7 @@ dependencies = [
  "blowfish",
  "pbkdf2 0.12.2",
  "rand 0.9.5",
+ "regex",
  "roxmltree",
  "sha1 0.10.7",
  "thiserror",

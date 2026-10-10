@@ -46,6 +46,17 @@ enum Command {
         /// Listen here instead of on the configured acceptors.
         #[arg(long)]
         bind: Option<SocketAddr>,
+        /// Broker properties applied over broker.xml, as `artemis run
+        /// --properties`: comma-separated files, or directories ending in
+        /// `/`. The default is `broker.properties` next to broker.xml, if
+        /// there is one.
+        #[arg(long)]
+        properties: Option<String>,
+        /// A system property, as `java -D`: `${name}` in the configuration
+        /// files resolves to it, and `brokerconfig.`-prefixed ones are
+        /// broker properties. Repeatable.
+        #[arg(short = 'D', value_name = "NAME=VALUE", value_parser = parse_system_property)]
+        system_properties: Vec<(String, String)>,
     },
     /// Tools on a broker's data directory.
     #[command(subcommand)]
@@ -65,10 +76,20 @@ async fn main() -> anyhow::Result<()> {
         logs.init();
     }
     match cli.command {
-        Command::Run { config, etc, bind } => {
+        Command::Run {
+            config,
+            etc,
+            bind,
+            properties,
+            system_properties,
+        } => {
+            let options = instance::Options {
+                system: system_properties,
+                broker_properties: properties,
+            };
             let instance = match (config, etc) {
-                (Some(c), _) => Some(instance::Instance::from_broker_xml(&c)?),
-                (None, Some(e)) => Some(instance::Instance::from_etc(&e)?),
+                (Some(c), _) => Some(instance::Instance::from_broker_xml(&c, options)?),
+                (None, Some(e)) => Some(instance::Instance::from_etc(&e, options)?),
                 (None, None) => None,
             };
             run(instance, bind).await
@@ -169,6 +190,15 @@ async fn watch_stop_files(dir: PathBuf) -> Stop {
             return Stop::Clean;
         }
     }
+}
+
+/// `-D name=value`; a bare `-D name` is the empty string, as in Java.
+fn parse_system_property(s: &str) -> Result<(String, String), String> {
+    let (k, v) = s.split_once('=').unwrap_or((s, ""));
+    if k.is_empty() {
+        return Err("expected NAME=VALUE".to_owned());
+    }
+    Ok((k.to_owned(), v.to_owned()))
 }
 
 async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> anyhow::Result<()> {

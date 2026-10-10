@@ -15,10 +15,12 @@ mod acceptor;
 mod address_settings;
 mod bootstrap;
 mod broker;
+pub mod broker_properties;
 mod bytes;
 pub mod mask;
 mod matcher;
 mod parser;
+pub mod properties;
 mod repository;
 mod security;
 mod substitute;
@@ -31,8 +33,8 @@ pub use address_settings::{
 };
 pub use bootstrap::{BootstrapConfig, BootstrapSecurity, file_uri_path};
 pub use broker::{
-    AddressConfig, BrokerConfig, DivertConfig, DivertRoutingType, JournalConfig, JournalType,
-    QueueConfig, TransformerConfig, Warning,
+    AddressConfig, BrokerConfig, DivertConfig, DivertRoutingType, JaasModuleConfig, JournalConfig,
+    JournalType, QueueConfig, TransformerConfig, Warning,
 };
 pub use bytes::convert_text_bytes;
 pub use matcher::Match;

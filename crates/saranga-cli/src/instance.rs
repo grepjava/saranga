@@ -1,17 +1,28 @@
 //! A broker instance's `etc/` directory, read the way `artemis run` reads
 //! it: `bootstrap.xml` names the security manager and `broker.xml`;
 //! `login.config` holds the JAAS domains; `${...}` placeholders resolve
-//! against the system properties the `artemis` script defines, then the
-//! environment.
+//! against the system properties given with `-D`, then those the `artemis`
+//! script defines, then the environment. Broker properties (`--properties`,
+//! else `etc/broker.properties`, then `-D brokerconfig.*`) apply over
+//! `broker.xml`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use saranga_config::{BootstrapConfig, BootstrapSecurity, BrokerConfig};
-use saranga_security::jaas::ModuleFactory;
+use saranga_config::{BootstrapConfig, BootstrapSecurity, BrokerConfig, broker_properties};
+use saranga_security::jaas::{ControlFlag, ModuleEntry, ModuleFactory};
 use saranga_security::{JaasSecurityManager, LoginConfig, SecurityStore, SecurityStoreConfig};
+
+/// What `saranga run` adds to the instance's files.
+#[derive(Debug, Default)]
+pub struct Options {
+    /// `-D name=value`: system properties, in order.
+    pub system: Vec<(String, String)>,
+    /// `--properties`: broker properties sources.
+    pub broker_properties: Option<String>,
+}
 
 pub struct Instance {
     /// The instance directory: relative data directories are under it.
@@ -20,14 +31,18 @@ pub struct Instance {
     pub broker_xml: PathBuf,
     pub bootstrap: Option<BootstrapConfig>,
     properties: HashMap<&'static str, String>,
+    /// System properties given on the command line, in order.
+    system: Vec<(String, String)>,
+    /// `--properties`: broker properties sources.
+    broker_properties: Option<String>,
 }
 
 impl Instance {
     /// An instance from its `etc/` directory: `bootstrap.xml` if there is
     /// one, else `broker.xml` next to it.
-    pub fn from_etc(etc: &Path) -> anyhow::Result<Self> {
+    pub fn from_etc(etc: &Path, options: Options) -> anyhow::Result<Self> {
         let etc = absolute(etc);
-        let mut instance = Self::new(etc.clone(), etc.join("broker.xml"));
+        let mut instance = Self::new(etc.clone(), etc.join("broker.xml"), options);
         let bootstrap_path = etc.join("bootstrap.xml");
         if bootstrap_path.exists() {
             let bootstrap = instance.read_bootstrap(&bootstrap_path)?;
@@ -52,10 +67,10 @@ impl Instance {
 
     /// An instance around a `broker.xml`: its directory is `etc/`, whose
     /// `bootstrap.xml` (if any) still chooses the security manager.
-    pub fn from_broker_xml(path: &Path) -> anyhow::Result<Self> {
+    pub fn from_broker_xml(path: &Path, options: Options) -> anyhow::Result<Self> {
         let path = absolute(path);
         let etc = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        let mut instance = Self::new(etc.clone(), path);
+        let mut instance = Self::new(etc.clone(), path, options);
         let bootstrap_path = etc.join("bootstrap.xml");
         if bootstrap_path.exists() {
             instance.bootstrap = Some(instance.read_bootstrap(&bootstrap_path)?);
@@ -63,7 +78,7 @@ impl Instance {
         Ok(instance)
     }
 
-    fn new(etc: PathBuf, broker_xml: PathBuf) -> Self {
+    fn new(etc: PathBuf, broker_xml: PathBuf, options: Options) -> Self {
         // `<instance>/etc` -> `<instance>`.
         let dir = etc
             .parent()
@@ -89,15 +104,24 @@ impl Instance {
             broker_xml,
             bootstrap: None,
             properties,
+            system: options.system,
+            broker_properties: options.broker_properties,
         }
+    }
+
+    fn system_property(&self, name: &str) -> Option<String> {
+        self.system
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
     }
 
     /// A system property as `artemis run` defines it, then an environment
     /// variable (`XMLUtil.replaceSystemPropsInString`).
     pub fn lookup(&self, name: &str) -> Option<String> {
-        self.properties
-            .get(name)
-            .cloned()
+        self.system_property(name)
+            .or_else(|| self.properties.get(name).cloned())
             .or_else(|| std::env::var(name).ok())
     }
 
@@ -116,12 +140,43 @@ impl Instance {
         let path = &self.broker_xml;
         let xml =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let config = BrokerConfig::parse_with(&xml, |n| self.lookup(n))
+        let mut config = BrokerConfig::parse_with(&xml, |n| self.lookup(n))
             .with_context(|| format!("reading {}", path.display()))?;
         for w in &config.warnings {
             tracing::warn!("{}: {w}", path.display());
         }
+        let lookup = |n: &str| self.lookup(n);
+        let mut warnings = Vec::new();
+        if let Some(sources) = self.broker_properties_sources() {
+            warnings.extend(
+                broker_properties::apply_sources(&mut config, &sources, &lookup)
+                    .with_context(|| format!("reading broker properties {sources}"))?,
+            );
+        }
+        warnings.extend(broker_properties::apply_system(
+            &mut config,
+            &self.system,
+            &lookup,
+        ));
+        for w in &warnings {
+            tracing::warn!("{w}");
+        }
+        config.warnings.extend(warnings);
         Ok(config)
+    }
+
+    /// `Configuration.resolvePropertiesSources`: the `broker.properties`
+    /// system property, else `--properties`, else `etc/broker.properties`
+    /// if it exists (`Run.execute`).
+    fn broker_properties_sources(&self) -> Option<String> {
+        self.system_property("broker.properties")
+            .or_else(|| self.broker_properties.clone())
+            .or_else(|| {
+                let default = self.etc.join("broker.properties");
+                default
+                    .exists()
+                    .then(|| default.display().to_string().replace('\\', "/"))
+            })
     }
 
     /// The security store for this instance, `None` with security off.
@@ -141,18 +196,38 @@ impl Instance {
                 }
             };
         let path = self.etc.join("login.config");
-        let login = if path.exists() {
+        let mut login = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             LoginConfig::parse(&text, |n| self.lookup(n))
                 .with_context(|| format!("reading {}", path.display()))?
         } else {
-            tracing::warn!(
-                "security is enabled but {} does not exist: every login will fail",
-                path.display()
-            );
+            if config.jaas_configs.is_empty() {
+                tracing::warn!(
+                    "security is enabled but {} does not exist: every login will fail",
+                    path.display()
+                );
+            }
             LoginConfig::default()
         };
+        // `ConfigurationImpl.getAppConfigurationEntry`: a realm from broker
+        // properties replaces the one in login.config.
+        for (realm, modules) in &config.jaas_configs {
+            let entries = modules
+                .iter()
+                .map(|m| ModuleEntry {
+                    class_name: m.login_module_class.clone(),
+                    flag: if m.control_flag.is_empty() {
+                        ControlFlag::Required
+                    } else {
+                        ControlFlag::parse(&m.control_flag).unwrap_or(ControlFlag::Required)
+                    },
+                    options: m.params.clone(),
+                })
+                .collect();
+            login.entries.retain(|(n, _)| n != realm);
+            login.entries.push((realm.clone(), entries));
+        }
         for (name, modules) in &login.entries {
             for m in modules {
                 if !ModuleFactory::supports(&m.class_name) {
@@ -165,7 +240,7 @@ impl Instance {
             }
         }
         for d in std::iter::once(&domain).chain(certificate_domain.as_ref()) {
-            if path.exists() && login.entry(d).is_none() {
+            if (path.exists() || !config.jaas_configs.is_empty()) && login.entry(d).is_none() {
                 tracing::warn!(
                     "{}: no entry for the security domain {d}: logins through it fail",
                     path.display()

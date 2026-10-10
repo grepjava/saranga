@@ -201,6 +201,13 @@ pub enum Warning {
     Unsupported { name: String, reason: &'static str },
     /// A `<permission type>` that names no permission; its roles get none.
     UnknownPermission { r#type: String },
+    /// A broker property that could not be applied. Artemis records these
+    /// in its configuration status instead of failing.
+    BrokerProperty {
+        source: String,
+        key: String,
+        reason: String,
+    },
 }
 
 impl fmt::Display for Warning {
@@ -226,8 +233,25 @@ impl fmt::Display for Warning {
             Self::UnknownPermission { r#type } => {
                 write!(f, "unknown permission type {type:?} in a security-setting")
             }
+            Self::BrokerProperty {
+                source,
+                key,
+                reason,
+            } => write!(f, "{source}: {key} was not applied: {reason}"),
         }
     }
+}
+
+/// One login module of a `jaasConfigs` realm (`JaasAppConfiguration`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JaasModuleConfig {
+    /// The key it was given in the properties; modules run in the order
+    /// they were first named.
+    pub name: String,
+    pub login_module_class: String,
+    /// `required`, `requisite`, `sufficient` or `optional`.
+    pub control_flag: String,
+    pub params: Vec<(String, String)>,
 }
 
 /// `ComponentConfigurationRoutingType`: what a divert does to the routing
@@ -348,6 +372,12 @@ pub struct BrokerConfig {
     /// replaces the earlier one.
     pub security_settings: Vec<(String, SecuritySetting)>,
     pub security_setting_plugins: Vec<SecuritySettingPluginConfig>,
+    /// `jaasConfigs` from broker properties: login configurations by realm,
+    /// which take the place of the same realm in `login.config`.
+    pub jaas_configs: Vec<(String, Vec<JaasModuleConfig>)>,
+    /// `system-property-prefix`: system properties under it are broker
+    /// properties.
+    pub system_property_prefix: String,
     pub warnings: Vec<Warning>,
 }
 
@@ -464,6 +494,9 @@ impl Default for BrokerConfig {
             reject_empty_validated_user: false,
             security_settings: Vec::new(),
             security_setting_plugins: Vec::new(),
+            jaas_configs: Vec::new(),
+            system_property_prefix: crate::broker_properties::DEFAULT_SYSTEM_PROPERTY_PREFIX
+                .to_owned(),
             warnings: Vec::new(),
         }
     }

@@ -15,7 +15,7 @@ pub mod dn;
 pub mod jaas;
 pub mod keystore;
 pub mod manager;
-pub mod properties;
+pub use saranga_config::properties;
 pub mod store;
 
 pub use jaas::{LoginConfig, PeerCertificate, Principal, Subject};
