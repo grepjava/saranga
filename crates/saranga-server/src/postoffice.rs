@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
 use crate::error::{BrokerError, Result};
-use crate::message::MessageRef;
+use crate::message::{MessageRef, ServerMessage, routing_type};
 use crate::queue::{FilterRef, Queue, QueueConfig};
 use crate::settings::{AddressSettings, SettingsRepository};
 use crate::wildcard::WildcardConfig;
@@ -314,6 +314,18 @@ struct AddressEntry {
     /// Round-robin position over the anycast queues (they share one routing
     /// name, the address, in `LocalQueueBinding`).
     anycast_next: AtomicUsize,
+    diverts: Vec<Arc<Divert>>,
+}
+
+impl AddressEntry {
+    fn new(info: AddressInfo) -> Self {
+        Self {
+            info,
+            queues: Vec::new(),
+            anycast_next: AtomicUsize::new(0),
+            diverts: Vec::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -388,11 +400,7 @@ impl PostOffice {
         self.write()
             .addresses
             .entry(info.name.clone())
-            .or_insert_with(|| AddressEntry {
-                info,
-                queues: Vec::new(),
-                anycast_next: AtomicUsize::new(0),
-            });
+            .or_insert_with(|| AddressEntry::new(info));
     }
 
     /// A queue recovered from the bindings journal, under its persisted ID
@@ -415,16 +423,14 @@ impl PostOffice {
         let entry = state
             .addresses
             .entry(config.address.clone())
-            .or_insert_with(|| AddressEntry {
-                info: AddressInfo {
+            .or_insert_with(|| {
+                AddressEntry::new(AddressInfo {
                     id: self.ids.next(),
                     name: config.address.clone(),
                     routing_types: RoutingTypes::of(config.routing_type),
                     auto_created: true,
                     temporary: false,
-                },
-                queues: Vec::new(),
-                anycast_next: AtomicUsize::new(0),
+                })
             });
         entry.info.routing_types.add(config.routing_type);
         let queue = Queue::spawn(id, config, filter, self.ids.clone(), self.me.clone());
@@ -501,14 +507,9 @@ impl PostOffice {
         if !temporary && let Some(s) = self.ids.storage() {
             crate::recovery::store_address(s, &info).map_err(Self::io)?;
         }
-        state.addresses.insert(
-            info.name.clone(),
-            AddressEntry {
-                info: info.clone(),
-                queues: Vec::new(),
-                anycast_next: AtomicUsize::new(0),
-            },
-        );
+        state
+            .addresses
+            .insert(info.name.clone(), AddressEntry::new(info.clone()));
         Ok(info)
     }
 
@@ -532,7 +533,7 @@ impl PostOffice {
     pub fn remove_address(&self, name: &str) -> bool {
         let mut state = self.write();
         match state.addresses.get(name) {
-            Some(entry) if entry.queues.is_empty() => {
+            Some(entry) if entry.queues.is_empty() && entry.diverts.is_empty() => {
                 if !entry.info.temporary
                     && let Some(s) = self.ids.storage()
                     && let Err(e) = s.delete_binding(entry.info.id)
@@ -891,31 +892,92 @@ impl PostOffice {
             .cloned()
     }
 
-    /// `PostOfficeImpl.route` without delivery: the queues a message sent to
-    /// `address` goes to, auto-creating what the settings allow. An empty
-    /// result means no bindings (the message is dropped).
+    /// `PostOfficeImpl.route` without delivery: where a message sent to
+    /// `address` goes, auto-creating what the settings allow. Each entry is
+    /// a message and its queues: the message itself, then any copies
+    /// diverts made. An empty result means no bindings (the message is
+    /// dropped).
     pub fn route(
         &self,
         message: &MessageRef,
         address: &str,
         routing_type: Option<RoutingType>,
-    ) -> Result<Vec<Queue>> {
+    ) -> Result<Routed> {
+        let mut out = Vec::new();
+        self.route_into(message, address, routing_type, true, 0, &mut out)?;
+        Ok(out)
+    }
+
+    /// `PostOfficeImpl.route` for a message the broker itself sends (a
+    /// dead-letter or expiry copy): no auto-creation, and no bindings means
+    /// no queues.
+    pub fn route_internal(&self, message: &MessageRef, address: &str) -> Routed {
+        let mut out = Vec::new();
+        let routing_type = routing_type(message.message.core());
+        if let Err(e) = self.route_into(message, address, routing_type, false, 0, &mut out) {
+            tracing::debug!("routing to {address}: {e}");
+        }
+        out
+    }
+
+    fn route_into(
+        &self,
+        message: &MessageRef,
+        address: &str,
+        routing_type: Option<RoutingType>,
+        auto_create: bool,
+        depth: usize,
+        out: &mut Routed,
+    ) -> Result<()> {
         let (real, _) = split_fqqn(address);
         // checkAddress
-        if self.address_info(real).is_none()
+        if auto_create
+            && self.address_info(real).is_none()
             && self.check_auto_create(address, routing_type)? == AutoCreate::NotFound
         {
             return Err(BrokerError::address_does_not_exist(real));
         }
         // simpleRoute
-        let mut targets = self.bindings_route(message, address);
-        if targets.is_none() {
+        let mut bindings = self.bindings_route(message, address);
+        if bindings.is_none() && auto_create {
             if self.check_auto_create(address, routing_type)? == AutoCreate::NotFound {
                 return Err(BrokerError::address_does_not_exist(real));
             }
-            targets = self.bindings_route(message, address);
+            bindings = self.bindings_route(message, address);
         }
-        Ok(targets.unwrap_or_default())
+        let Some((queues, diverts)) = bindings else {
+            return Ok(());
+        };
+        if !queues.is_empty() {
+            out.push((message.clone(), queues));
+        }
+        if depth >= MAX_DIVERT_DEPTH {
+            if !diverts.is_empty() {
+                tracing::warn!(
+                    "diverts from {real} nest deeper than {MAX_DIVERT_DEPTH}; not followed"
+                );
+            }
+            return Ok(());
+        }
+        // DivertImpl.route
+        for d in diverts {
+            for forward in &d.forwarding {
+                let copy = if forward == real {
+                    message.clone()
+                } else {
+                    let now = crate::message::now_millis();
+                    let mut core = d.copy(message.message.core(), self.ids.next(), forward);
+                    let s = self.settings(forward);
+                    crate::message::apply_expiry_delay(&mut core, &s, now);
+                    let mut r = MessageRef::new(ServerMessage::new(core));
+                    r.scheduled_time = crate::message::scheduled_delivery_time(r.message.core());
+                    r
+                };
+                let rt = routing_type_of(copy.message.core());
+                self.route_into(&copy, forward, rt, auto_create, depth + 1, out)?;
+            }
+        }
+        Ok(())
     }
 
     /// Whether anything is bound to `address`
@@ -924,20 +986,54 @@ impl PostOffice {
         self.read()
             .addresses
             .get(address)
-            .is_some_and(|e| !e.queues.is_empty())
+            .is_some_and(|e| !e.queues.is_empty() || !e.diverts.is_empty())
     }
 
-    /// `PostOfficeImpl.route` for a message the broker itself sends (a
-    /// dead-letter or expiry copy): no auto-creation, and no bindings means
-    /// no queues.
-    pub fn route_internal(&self, message: &MessageRef, address: &str) -> Vec<Queue> {
-        self.bindings_route(message, address).unwrap_or_default()
+    /// `deployDivert`: binds a divert to its address, which must exist.
+    pub fn deploy_divert(&self, d: &DivertDeployment) -> Result<()> {
+        let divert = Divert {
+            name: d.name.as_str().into(),
+            routing_name: d
+                .routing_name
+                .clone()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+                .into(),
+            address: d.address.as_str().into(),
+            forwarding: d
+                .forwarding_address
+                .split(',')
+                .map(|a| a.trim().to_owned())
+                .filter(|a| !a.is_empty())
+                .collect(),
+            exclusive: d.exclusive,
+            filter: self.filters.create(d.filter.as_deref())?,
+            routing_type: d.routing_type,
+        };
+        let mut state = self.write();
+        if state
+            .addresses
+            .values()
+            .any(|e| e.diverts.iter().any(|d| d.name == divert.name))
+        {
+            tracing::warn!("AMQ222017: Divert {} already exists", divert.name);
+            return Ok(());
+        }
+        let Some(entry) = state.addresses.get_mut(&*divert.address) else {
+            return Err(BrokerError::address_does_not_exist(&divert.address));
+        };
+        entry.diverts.push(Arc::new(divert));
+        Ok(())
     }
 
     /// Routes through the bindings of `address` and of every wildcard
-    /// address that matches it (`BindingsImpl.route`). `None` when there are
-    /// no local bindings at all.
-    fn bindings_route(&self, message: &MessageRef, address: &str) -> Option<Vec<Queue>> {
+    /// address that matches it (`BindingsImpl.route`): the queues, and the
+    /// diverts to follow. `None` when there are no local bindings at all.
+    fn bindings_route(
+        &self,
+        message: &MessageRef,
+        address: &str,
+    ) -> Option<(Vec<Queue>, Vec<Arc<Divert>>)> {
         let (real, fqqn_queue) = split_fqqn(address);
         let state = self.read();
         let mut entries: Vec<&AddressEntry> = state.addresses.get(real).into_iter().collect();
@@ -946,10 +1042,26 @@ impl PostOffice {
                 self.wildcard.is_wild(&e.info.name) && self.wildcard.matches(real, &e.info.name)
             }));
         }
-        if entries.iter().all(|e| e.queues.is_empty()) {
+        if entries
+            .iter()
+            .all(|e| e.queues.is_empty() && e.diverts.is_empty())
+        {
             return None;
         }
         let core = message.message.core();
+        let divert_matches = |d: &Divert| d.filter.as_ref().is_none_or(|f| f.matches(core));
+        // Exclusive diverts take the message from everything else.
+        if fqqn_queue.is_none() {
+            let exclusive: Vec<Arc<Divert>> = entries
+                .iter()
+                .flat_map(|e| e.diverts.iter())
+                .filter(|d| d.exclusive && divert_matches(d))
+                .cloned()
+                .collect();
+            if !exclusive.is_empty() {
+                return Some((Vec::new(), exclusive));
+            }
+        }
         let matches = |q: &Queue| {
             fqqn_queue.is_none_or(|n| &**q.name() == n)
                 && q.filter().is_none_or(|f| f.matches(core))
@@ -959,6 +1071,7 @@ impl PostOffice {
             c.enabled && !(c.purge_on_no_consumers && q.consumer_count() == 0)
         };
         let mut targets = Vec::new();
+        let mut diverts = Vec::new();
         for entry in entries {
             // Every multicast queue is its own routing group.
             for q in &entry.queues {
@@ -987,8 +1100,116 @@ impl PostOffice {
                     }
                 }
             }
+            // Non-exclusive diverts route a copy as well.
+            if fqqn_queue.is_none() {
+                diverts.extend(
+                    entry
+                        .diverts
+                        .iter()
+                        .filter(|d| !d.exclusive && divert_matches(d))
+                        .cloned(),
+                );
+            }
         }
-        Some(targets)
+        Some((targets, diverts))
+    }
+}
+
+/// How deep diverts may forward into further diverts.
+const MAX_DIVERT_DEPTH: usize = 16;
+
+/// Where a send went: each message with its queues.
+pub type Routed = Vec<(MessageRef, Vec<Queue>)>;
+
+fn routing_type_of(message: &saranga_message::CoreMessage) -> Option<RoutingType> {
+    routing_type(message)
+}
+
+/// A divert (`DivertImpl`): a binding on `address` that sends a copy of
+/// each matching message on to the forwarding addresses.
+pub struct Divert {
+    pub name: Name,
+    pub routing_name: Name,
+    pub address: Name,
+    pub forwarding: Vec<String>,
+    pub exclusive: bool,
+    pub filter: Option<FilterRef>,
+    pub routing_type: DivertRoutingType,
+}
+
+/// A divert to deploy (`DivertConfiguration`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DivertDeployment {
+    pub name: String,
+    pub routing_name: Option<String>,
+    pub address: String,
+    /// One address, or several separated by commas.
+    pub forwarding_address: String,
+    pub exclusive: bool,
+    pub filter: Option<String>,
+    pub routing_type: DivertRoutingType,
+}
+
+/// `ComponentConfigurationRoutingType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DivertRoutingType {
+    Multicast,
+    Anycast,
+    Strip,
+    Pass,
+}
+
+impl Divert {
+    /// The copy `DivertImpl.route` sends on: a new ID, the original's
+    /// address, queue (the divert) and ID recorded, its expiration kept, and
+    /// its routing type set by the divert.
+    fn copy(
+        &self,
+        original: &saranga_message::CoreMessage,
+        new_id: i64,
+        forward: &str,
+    ) -> saranga_message::CoreMessage {
+        use crate::message as m;
+        use saranga_buffer::{PropertyValue, SimpleString};
+        let mut copy = original.clone();
+        copy.message_id = new_id;
+        let p = &mut copy.properties;
+        p.insert(
+            m::HDR_ORIGINAL_QUEUE.into(),
+            PropertyValue::String(SimpleString::from(&*self.name)),
+        );
+        p.insert(
+            m::HDR_ORIGINAL_ADDRESS.into(),
+            PropertyValue::String(original.address.clone().unwrap_or_default()),
+        );
+        p.insert(
+            m::HDR_ORIG_MESSAGE_ID.into(),
+            PropertyValue::Long(original.message_id),
+        );
+        if let Some(t) = routing_type(original) {
+            p.insert(
+                m::HDR_ORIG_ROUTING_TYPE.into(),
+                PropertyValue::Byte(t.to_byte()),
+            );
+        }
+        copy.address = Some(SimpleString::from(forward));
+        copy.expiration = original.expiration;
+        let key = SimpleString::from(m::HDR_ROUTING_TYPE);
+        match self.routing_type {
+            DivertRoutingType::Anycast => {
+                copy.properties
+                    .insert(key, PropertyValue::Byte(RoutingType::Anycast.to_byte()));
+            }
+            DivertRoutingType::Multicast => {
+                copy.properties
+                    .insert(key, PropertyValue::Byte(RoutingType::Multicast.to_byte()));
+            }
+            DivertRoutingType::Strip => {
+                copy.properties.remove(&key);
+            }
+            DivertRoutingType::Pass => {}
+        }
+        copy
     }
 }
 

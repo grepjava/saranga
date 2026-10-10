@@ -224,6 +224,51 @@ impl fmt::Display for Warning {
     }
 }
 
+/// `ComponentConfigurationRoutingType`: what a divert does to the routing
+/// type of the copies it makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DivertRoutingType {
+    Multicast,
+    Anycast,
+    /// The copy has no routing type (the default).
+    #[default]
+    Strip,
+    /// The copy keeps the original's.
+    Pass,
+}
+
+impl std::str::FromStr for DivertRoutingType {
+    type Err = crate::ConfigError;
+
+    fn from_str(s: &str) -> crate::Result<Self> {
+        match s {
+            "MULTICAST" => Ok(Self::Multicast),
+            "ANYCAST" => Ok(Self::Anycast),
+            "STRIP" => Ok(Self::Strip),
+            "PASS" => Ok(Self::Pass),
+            _ => Err(crate::ConfigError::invalid(
+                "routing-type",
+                s,
+                "expected one of: MULTICAST ANYCAST STRIP PASS",
+            )),
+        }
+    }
+}
+
+/// One `<divert>` (`DivertConfiguration`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DivertConfig {
+    pub name: String,
+    /// `None` gets a random one when deployed.
+    pub routing_name: Option<String>,
+    pub address: String,
+    /// One address, or several separated by commas.
+    pub forwarding_address: String,
+    pub exclusive: bool,
+    pub filter: Option<String>,
+    pub routing_type: DivertRoutingType,
+}
+
 /// The broker configuration read from `broker.xml`. Every field the file
 /// leaves out holds the Artemis default.
 #[derive(Debug, Clone, PartialEq)]
@@ -247,6 +292,7 @@ pub struct BrokerConfig {
     /// Match string and settings, in document order.
     pub address_settings: Vec<(String, AddressSettings)>,
     pub addresses: Vec<AddressConfig>,
+    pub diverts: Vec<DivertConfig>,
     /// `message-expiry-scan-period` in milliseconds; `-1` turns the expiry
     /// reaper off.
     pub message_expiry_scan_period: i64,
@@ -327,6 +373,7 @@ impl Default for BrokerConfig {
             acceptors: Vec::new(),
             address_settings: Vec::new(),
             addresses: Vec::new(),
+            diverts: Vec::new(),
             message_expiry_scan_period: Self::DEFAULT_MESSAGE_EXPIRY_SCAN_PERIOD,
             id_cache_size: Self::DEFAULT_ID_CACHE_SIZE,
             persist_id_cache: Self::DEFAULT_PERSIST_ID_CACHE,

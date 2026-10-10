@@ -11,7 +11,10 @@ use roxmltree::{Document, Node, ParsingOptions};
 
 use crate::acceptor::AcceptorConfig;
 use crate::address_settings::AddressSettings;
-use crate::broker::{AddressConfig, BrokerConfig, JournalConfig, QueueConfig, Warning};
+use crate::broker::{
+    AddressConfig, BrokerConfig, DivertConfig, DivertRoutingType, JournalConfig, QueueConfig,
+    Warning,
+};
 use crate::bytes::convert_text_bytes;
 use crate::{ConfigError, Result, RoutingType, java_len, java_parse_bool, java_trim};
 
@@ -466,6 +469,7 @@ fn parse_core(
     parse_acceptors(core, config, warnings)?;
     parse_address_settings(core, config, warnings)?;
     parse_addresses(core, config, warnings)?;
+    parse_diverts(core, config, warnings)?;
     parse_wildcards(core, config, warnings)?;
     Ok(())
 }
@@ -746,6 +750,67 @@ fn parse_addresses(
         config.addresses.push(parse_address(node, warnings)?);
     }
     Ok(())
+}
+
+fn parse_diverts(
+    core: Node<'_, '_>,
+    config: &mut BrokerConfig,
+    warnings: &mut Vec<Warning>,
+) -> Result<()> {
+    let Some(list) = first(core, "diverts") else {
+        return Ok(());
+    };
+    warn_unknown_children(warnings, list, &["divert"]);
+    for node in all(list, "divert") {
+        config.diverts.push(parse_divert(node, warnings)?);
+    }
+    Ok(())
+}
+
+/// `parseDivertConfiguration`.
+fn parse_divert(node: Node<'_, '_>, warnings: &mut Vec<Warning>) -> Result<DivertConfig> {
+    warn_unknown_children(
+        warnings,
+        node,
+        &[
+            "routing-name",
+            "address",
+            "forwarding-address",
+            "exclusive",
+            "transformer-class-name",
+            "routing-type",
+            "filter",
+            "transformer",
+        ],
+    );
+    let required = |name: &str| -> Result<String> {
+        match first(node, name).map(trimmed_text) {
+            Some(v) if !v.is_empty() => Ok(v),
+            v => Err(ConfigError::invalid(
+                name,
+                v.unwrap_or_default(),
+                "must not be null or empty",
+            )),
+        }
+    };
+    if first(node, "transformer").is_some() || first(node, "transformer-class-name").is_some() {
+        warnings.push(Warning::Unsupported {
+            name: "transformer".to_owned(),
+            reason: "Java transformers cannot run in Saranga; the divert forwards untransformed",
+        });
+    }
+    Ok(DivertConfig {
+        name: node.attribute("name").unwrap_or_default().to_owned(),
+        routing_name: first(node, "routing-name").map(trimmed_text),
+        address: required("address")?,
+        forwarding_address: required("forwarding-address")?,
+        exclusive: first(node, "exclusive").is_some_and(node_bool),
+        filter: first(node, "filter").and_then(|f| f.attribute("string").map(str::to_owned)),
+        routing_type: match first(node, "routing-type") {
+            Some(t) => node_enum(t)?,
+            None => DivertRoutingType::default(),
+        },
+    })
 }
 
 /// `parseAddressConfiguration`.

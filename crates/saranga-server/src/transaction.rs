@@ -88,6 +88,9 @@ impl TxState {
     }
 }
 
+/// A commit or prepare that failed: why, and the rollback it became.
+pub type Failed = Box<(BrokerError, Outcome)>;
+
 /// `TransactionImpl`.
 #[derive(Debug)]
 pub struct Transaction {
@@ -257,14 +260,14 @@ impl Transaction {
 
     /// `TransactionImpl.commit(onePhase)`. A rollback-only transaction rolls
     /// back and fails with the reason it was marked.
-    pub fn commit(&mut self, one_phase: bool) -> Result<Outcome, (BrokerError, Outcome)> {
+    pub fn commit(&mut self, one_phase: bool) -> Result<Outcome, Failed> {
         if self.state == TxState::Committed {
             return Ok(Outcome::default());
         }
         if self.state == TxState::RollbackOnly {
             let outcome = self.internal_rollback();
             return match self.exception.clone() {
-                Some(e) => Err((e, outcome)),
+                Some(e) => Err(Box::new((e, outcome))),
                 None => Ok(outcome),
             };
         }
@@ -278,7 +281,7 @@ impl Transaction {
             self.state == TxState::Active
         };
         if !valid {
-            return Err((invalid_state(self.state), Outcome::default()));
+            return Err(Box::new((invalid_state(self.state), Outcome::default())));
         }
         // doCommit: a commit record for persistent work, or to end a
         // prepared branch.
@@ -323,25 +326,25 @@ impl Transaction {
 
     /// `TransactionImpl.prepare`. A rollback-only transaction rolls back
     /// instead, failing with its reason.
-    pub fn prepare(&mut self) -> Result<(), (BrokerError, Outcome)> {
+    pub fn prepare(&mut self) -> Result<(), Failed> {
         if self.is_effective() {
             return Ok(());
         }
         if self.state == TxState::RollbackOnly {
             let outcome = self.internal_rollback();
             return match self.exception.clone() {
-                Some(e) => Err((e, outcome)),
-                None => Err((invalid_state(TxState::RolledBack), outcome)),
+                Some(e) => Err(Box::new((e, outcome))),
+                None => Err(Box::new((invalid_state(TxState::RolledBack), outcome))),
             };
         }
         if self.state != TxState::Active {
-            return Err((invalid_state(self.state), Outcome::default()));
+            return Err(Box::new((invalid_state(self.state), Outcome::default())));
         }
         if self.xid.is_none() {
-            return Err((
+            return Err(Box::new((
                 BrokerError::illegal_state("Cannot prepare non XA transaction"),
                 Outcome::default(),
-            ));
+            )));
         }
         self.state = TxState::Prepared;
         Ok(())
@@ -480,7 +483,7 @@ mod tests {
     #[test]
     fn xa_two_phase_needs_prepare() {
         let mut t = Transaction::new(1, Some(xid(1)));
-        let (e, _) = t.commit(false).unwrap_err();
+        let (e, _) = *t.commit(false).unwrap_err();
         assert_eq!(e.message, "Transaction is in invalid state ACTIVE");
         t.prepare().unwrap();
         assert!(t.commit(true).is_err());
@@ -506,7 +509,7 @@ mod tests {
         let mut t = Transaction::new(1, None);
         t.mark_rollback_only(&BrokerError::illegal_state("first"));
         t.mark_rollback_only(&BrokerError::illegal_state("second"));
-        let (e, _) = t.commit(false).unwrap_err();
+        let (e, _) = *t.commit(false).unwrap_err();
         assert_eq!(e.message, "first");
         assert_eq!(t.state, TxState::RolledBack);
     }

@@ -789,8 +789,8 @@ impl CoreSession {
                 }
             }
         }
-        let queues = match self.broker.post_office().route(&r, &address, routing_type) {
-            Ok(queues) => queues,
+        let routed = match self.broker.post_office().route(&r, &address, routing_type) {
+            Ok(routed) => routed,
             Err(e) => {
                 if let Some(tx) = &tx {
                     transaction::lock(tx).mark_rollback_only(&e);
@@ -801,52 +801,53 @@ impl CoreSession {
                 return Err(e);
             }
         };
-        // processRouteToDurableQueues: the message record with its first
-        // durable reference, then one reference per durable queue.
-        let durable: Vec<Queue> = queues
-            .iter()
-            .filter(|q| q.is_durable_ref(&r))
-            .cloned()
-            .collect();
-        let message = &r.message;
+        // processRouteToDurableQueues, for the message and each divert
+        // copy: the message record with its first durable reference, then
+        // one reference per durable queue.
         match tx {
             None => {
                 if let Some(s) = &storage {
-                    let last = durable.len().saturating_sub(1);
-                    for (i, q) in durable.iter().enumerate() {
-                        let mid = message.message_id();
-                        if let Some((jtx, persistent)) = &mut own_tx {
+                    for (r, queues) in &routed {
+                        let message = &r.message;
+                        let scheduled_time = r.scheduled_time;
+                        let durable: Vec<&Queue> =
+                            queues.iter().filter(|q| q.is_durable_ref(r)).collect();
+                        let last = durable.len().saturating_sub(1);
+                        for (i, q) in durable.into_iter().enumerate() {
+                            let mid = message.message_id();
+                            if let Some((jtx, persistent)) = &mut own_tx {
+                                if message.durable_up() == 1 {
+                                    s.store_message_tx(*jtx, message.core(), message.encoded())
+                                        .map_err(io_error)?;
+                                }
+                                s.store_reference_tx(*jtx, q.id(), mid).map_err(io_error)?;
+                                if scheduled_time > 0 {
+                                    s.update_scheduled_delivery_time_tx(
+                                        *jtx,
+                                        q.id(),
+                                        mid,
+                                        scheduled_time,
+                                    )
+                                    .map_err(io_error)?;
+                                }
+                                *persistent = true;
+                                continue;
+                            }
                             if message.durable_up() == 1 {
-                                s.store_message_tx(*jtx, message.core(), message.encoded())
+                                s.store_message(message.core(), message.encoded())
                                     .map_err(io_error)?;
                             }
-                            s.store_reference_tx(*jtx, q.id(), mid).map_err(io_error)?;
-                            if scheduled_time > 0 {
-                                s.update_scheduled_delivery_time_tx(
-                                    *jtx,
-                                    q.id(),
-                                    mid,
-                                    scheduled_time,
-                                )
-                                .map_err(io_error)?;
+                            self.ops.push(
+                                s.store_reference(q.id(), mid, i == last)
+                                    .map_err(io_error)?,
+                            );
+                            if scheduled_time > 0
+                                && let Some(p) = s
+                                    .update_scheduled_delivery_time(q.id(), mid, scheduled_time, 0)
+                                    .map_err(io_error)?
+                            {
+                                self.ops.push(p);
                             }
-                            *persistent = true;
-                            continue;
-                        }
-                        if message.durable_up() == 1 {
-                            s.store_message(message.core(), message.encoded())
-                                .map_err(io_error)?;
-                        }
-                        self.ops.push(
-                            s.store_reference(q.id(), mid, i == last)
-                                .map_err(io_error)?,
-                        );
-                        if scheduled_time > 0
-                            && let Some(p) = s
-                                .update_scheduled_delivery_time(q.id(), mid, scheduled_time, 0)
-                                .map_err(io_error)?
-                        {
-                            self.ops.push(p);
                         }
                     }
                     if let Some((jtx, true)) = own_tx {
@@ -854,41 +855,45 @@ impl CoreSession {
                     }
                     // The references join their queues once journaled.
                     self.actions.push(Box::new(move || {
-                        for q in queues {
-                            q.add(r.clone());
+                        for (r, queues) in routed {
+                            for q in queues {
+                                q.add(r.clone());
+                            }
                         }
                     }));
                 } else {
-                    for q in queues {
-                        q.add(r.clone());
+                    for (r, queues) in routed {
+                        for q in queues {
+                            q.add(r.clone());
+                        }
                     }
                 }
             }
             Some(tx) => {
                 let mut t = transaction::lock(&tx);
-                for q in &durable {
-                    if message.durable_up() == 1
-                        && let Some(s) = &storage
-                    {
-                        s.store_message_tx(t.id, message.core(), message.encoded())
-                            .map_err(io_error)?;
-                    }
-                    if let Some(s) = &storage {
+                for (r, queues) in routed {
+                    let message = &r.message;
+                    for q in queues.iter().filter(|q| q.is_durable_ref(&r)) {
+                        let Some(s) = &storage else { break };
+                        if message.durable_up() == 1 {
+                            s.store_message_tx(t.id, message.core(), message.encoded())
+                                .map_err(io_error)?;
+                        }
                         s.store_reference_tx(t.id, q.id(), message.message_id())
                             .map_err(io_error)?;
-                        if scheduled_time > 0 {
+                        if r.scheduled_time > 0 {
                             s.update_scheduled_delivery_time_tx(
                                 t.id,
                                 q.id(),
                                 message.message_id(),
-                                scheduled_time,
+                                r.scheduled_time,
                             )
                             .map_err(io_error)?;
                         }
                         t.persistent = true;
                     }
+                    t.sends.extend(queues.into_iter().map(|q| (q, r.clone())));
                 }
-                t.sends.extend(queues.into_iter().map(|q| (q, r.clone())));
             }
         }
         Ok(None)
@@ -1146,7 +1151,8 @@ impl CoreSession {
                     }
                     Ok(())
                 }
-                Err((e, outcome)) => {
+                Err(failed) => {
+                    let (e, outcome) = *failed;
                     drop(t);
                     self.finish(outcome, false)?;
                     Err(e.into())
@@ -1199,7 +1205,8 @@ impl CoreSession {
                 self.finish(outcome, true)?;
                 Ok(())
             }
-            Err((e, outcome)) => {
+            Err(failed) => {
+                let (e, outcome) = *failed;
                 self.finish(outcome, false)?;
                 Err(e.into())
             }
@@ -1463,7 +1470,8 @@ impl CoreSession {
         let result = transaction::lock(&tx).commit(true);
         match result {
             Ok(outcome) => self.finish(outcome, true),
-            Err((e, outcome)) => {
+            Err(failed) => {
+                let (e, outcome) = *failed;
                 self.finish(outcome, false)?;
                 Err(e)
             }

@@ -213,6 +213,11 @@ impl Queue {
             scheduled: BTreeMap::new(),
             scheduled_seq: 0,
             expiry_warned: false,
+            groups: HashMap::new(),
+            exclusive_consumer: None,
+            last_values: HashMap::new(),
+            dispatching: false,
+            dispatch_start: None,
         };
         tokio::spawn(actor.run(rx));
         queue
@@ -418,6 +423,15 @@ impl MessageList {
         self.levels[r.message.priority_level()].push_back(r);
     }
 
+    fn get(&self, (level, index): (usize, usize)) -> &MessageRef {
+        &self.levels[level][index]
+    }
+
+    /// `poll`: the head, from the highest priority.
+    fn take_first(&mut self) -> Option<MessageRef> {
+        self.levels.iter_mut().rev().find_map(VecDeque::pop_front)
+    }
+
     fn push_front(&mut self, r: MessageRef) {
         self.levels[r.message.priority_level()].push_front(r);
     }
@@ -509,12 +523,39 @@ struct Actor {
     scheduled_seq: u64,
     /// AMQ222147 is logged once per queue.
     expiry_warned: bool,
+    /// Message groups and the consumer each is pinned to (`groups`).
+    groups: HashMap<GroupKey, ConsumerId>,
+    /// The consumer an exclusive queue delivers to (`exclusiveConsumer`).
+    exclusive_consumer: Option<ConsumerId>,
+    /// Last-value queue: the current message ID for each key.
+    last_values: HashMap<String, i64>,
+    /// `dispatching`: false while consumers-before-dispatch,
+    /// delay-before-dispatch or a group rebalance hold delivery.
+    dispatching: bool,
+    /// `dispatchStartTime`: when a delay-before-dispatch ends.
+    dispatch_start: Option<i64>,
+}
+
+/// A message group as `MessageGroups` keys it: by group ID, or by bucket
+/// when `group-buckets` is set.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum GroupKey {
+    Id(Vec<u8>),
+    Bucket(u32),
 }
 
 impl Actor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Cmd>) {
         loop {
-            let cmd = match self.scheduled.keys().next().map(|k| k.0) {
+            let wake = self
+                .scheduled
+                .keys()
+                .next()
+                .map(|k| k.0)
+                .into_iter()
+                .chain(self.dispatch_start.filter(|_| !self.dispatching))
+                .min();
+            let cmd = match wake {
                 None => rx.recv().await,
                 Some(at) => {
                     let wait = Duration::from_millis((at - now_millis()).max(0) as u64);
@@ -580,29 +621,133 @@ impl Actor {
         }
     }
 
-    /// `addTail`: scheduled references wait for their time.
+    /// `addTail`: scheduled references wait for their time. On a
+    /// last-value queue the reference replaces the queued one with its key
+    /// (`LastValueQueue.addTail`, pruned at once); a ring queue drops its
+    /// oldest reference once over its size (`enforceRing`).
     fn add_tail(&mut self, r: MessageRef) {
         if r.scheduled_time > 0 {
             self.schedule(r, true);
-        } else {
-            self.messages.push_back(r);
+            return;
+        }
+        self.track_last_value(&r, true);
+        self.messages.push_back(r);
+        let ring = self.shared.config.ring_size;
+        if ring != -1 && self.messages.len() as i64 > ring {
+            let oldest = self.messages.take_first();
+            if let Some(old) = oldest {
+                self.kill(old);
+            }
         }
     }
 
     /// `addSorted`: a returned reference goes back in message ID order, or
-    /// waits out its redelivery delay.
+    /// waits out its redelivery delay. A last-value queue keeps a newer
+    /// value over it; a full ring queue drops it.
     fn add_sorted(&mut self, r: MessageRef) {
         if r.scheduled_time > 0 {
             self.schedule(r, false);
-        } else {
-            self.messages.insert_sorted(r);
+            return;
         }
+        if !self.track_last_value(&r, false) {
+            self.kill(r);
+            return;
+        }
+        let ring = self.shared.config.ring_size;
+        if ring != -1 && self.messages.len() as i64 + 1 > ring {
+            self.kill(r);
+            return;
+        }
+        self.messages.insert_sorted(r);
+    }
+
+    /// `MessageReference.getLastValueProperty`: the queue's last-value key,
+    /// falling back to `_AMQ_LVQ_NAME`.
+    /// A last-value key alone makes a last-value queue
+    /// (`QueueFactoryImpl.lastValueKey`).
+    fn last_value_of(&self, r: &MessageRef) -> Option<String> {
+        let c = &self.shared.config;
+        let key = c.last_value_key.as_deref().filter(|k| !k.is_empty());
+        if !c.last_value && key.is_none() {
+            return None;
+        }
+        let core = r.message.core();
+        key.and_then(|k| message::string_property(core, k))
+            .or_else(|| message::string_property(core, message::HDR_LAST_VALUE_NAME))
+    }
+
+    /// Records `r` as its key's current value. With `replace` an older
+    /// queued value is dropped (`trackLastValue` then `pruneLastValues`);
+    /// without, `r` only becomes current if its key has none
+    /// (`trackLastValueIfAbsent`). Returns whether `r` is current.
+    fn track_last_value(&mut self, r: &MessageRef, replace: bool) -> bool {
+        let Some(key) = self.last_value_of(r) else {
+            return true;
+        };
+        let id = r.message_id();
+        match self.last_values.get(&key).copied() {
+            Some(current) if current != id => {
+                if !replace {
+                    let queued = self.messages.find(|m| m.message_id() == current).is_some();
+                    if queued {
+                        return false;
+                    }
+                }
+                self.last_values.insert(key, id);
+                if let Some(at) = self.messages.find(|m| m.message_id() == current) {
+                    let old = self.messages.remove(at);
+                    self.kill(old);
+                }
+            }
+            _ => {
+                self.last_values.insert(key, id);
+            }
+        }
+        true
+    }
+
+    /// `removeIfCurrent`.
+    fn forget_last_value(&mut self, r: &MessageRef) {
+        if let Some(key) = self.last_value_of(r)
+            && self.last_values.get(&key) == Some(&r.message_id())
+        {
+            self.last_values.remove(&key);
+        }
+    }
+
+    /// `canDispatch`.
+    fn can_dispatch(&mut self) -> bool {
+        if self.dispatching {
+            return true;
+        }
+        if self.consumers.iter().any(|c| !c.delivering.is_empty()) {
+            return false;
+        }
+        if self.consumers.len() as i64 >= i64::from(self.shared.config.consumers_before_dispatch) {
+            self.dispatching = true;
+            return true;
+        }
+        if self.dispatch_start.is_some_and(|t| t < now_millis()) {
+            self.dispatching = true;
+            return true;
+        }
+        false
+    }
+
+    /// `stopDispatch`.
+    fn stop_dispatch(&mut self) {
+        self.dispatching = false;
+        self.dispatch_start = None;
     }
 
     /// References coming back from consumers or a rolled-back transaction
     /// (`RefsOperation.afterRollback`): each is checked for redelivery
     /// (`checkRedelivery`), then the survivors return (`postRollback`).
     fn return_refs(&mut self, refs: Vec<MessageRef>) {
+        // A non-destructive queue never took them off its list.
+        if self.shared.config.non_destructive {
+            return;
+        }
         let now = now_millis();
         let back: Vec<MessageRef> = refs
             .into_iter()
@@ -646,6 +791,7 @@ impl Actor {
     /// `acknowledge` outside any transaction, for a reference the broker
     /// drops (`AckReason.KILLED` / `EXPIRED`).
     fn kill(&mut self, r: MessageRef) {
+        self.forget_last_value(&r);
         let queue = self.queue();
         if queue.is_durable_ref(&r)
             && let Some(s) = self.shared.ids.storage()
@@ -798,18 +944,20 @@ impl Actor {
         message::apply_expiry_delay(&mut copy, &po.settings(address), now);
         let mut copy = MessageRef::new(ServerMessage::new(copy));
         copy.scheduled_time = message::scheduled_delivery_time(copy.message.core());
-        let targets = po.route_internal(&copy, address);
+        let routed = po.route_internal(&copy, address);
         let queue = self.queue();
         if let Some(s) = self.shared.ids.storage() {
             let tx = self.shared.ids.next();
             let mut persistent = false;
             let mut written = || -> crate::storage::StoreResult<()> {
-                for q in targets.iter().filter(|q| q.is_durable_ref(&copy)) {
-                    if copy.message.durable_up() == 1 {
-                        s.store_message_tx(tx, copy.message.core(), copy.message.encoded())?;
+                for (m, targets) in &routed {
+                    for q in targets.iter().filter(|q| q.is_durable_ref(m)) {
+                        if m.message.durable_up() == 1 {
+                            s.store_message_tx(tx, m.message.core(), m.message.encoded())?;
+                        }
+                        s.store_reference_tx(tx, q.id(), m.message_id())?;
+                        persistent = true;
                     }
-                    s.store_reference_tx(tx, q.id(), copy.message_id())?;
-                    persistent = true;
                 }
                 if queue.is_durable_ref(&r) {
                     s.store_acknowledge_tx(tx, self.shared.id, r.message_id())?;
@@ -824,8 +972,10 @@ impl Actor {
                 tracing::warn!("moving message {} to {address}: {e}", r.message_id());
             }
         }
-        for q in &targets {
-            q.add(copy.clone());
+        for (m, targets) in routed {
+            for q in targets {
+                q.add(m.clone());
+            }
         }
         queue.post_acknowledge(&r);
         self.count_removed(1);
@@ -847,6 +997,17 @@ impl Actor {
                 if consumer.reg.browse_only {
                     self.browsers.push(consumer);
                 } else {
+                    let c = self.shared.clone();
+                    let c = &c.config;
+                    if c.group_rebalance {
+                        if c.group_rebalance_pause_dispatch {
+                            self.stop_dispatch();
+                        }
+                        self.groups.clear();
+                    }
+                    if c.delay_before_dispatch >= 0 && self.dispatch_start.is_none() {
+                        self.dispatch_start = Some(now_millis() + c.delay_before_dispatch);
+                    }
                     let at = self
                         .consumers
                         .iter()
@@ -857,7 +1018,17 @@ impl Actor {
             }
             Cmd::RemoveConsumer { id, failed, done } => {
                 if let Some(c) = self.take_consumer(id) {
+                    let browser = c.reg.browse_only;
                     self.return_refs(cancel(c.delivering, false, failed));
+                    if !browser {
+                        if self.consumers.is_empty() {
+                            self.stop_dispatch();
+                        }
+                        if self.exclusive_consumer == Some(id) {
+                            self.exclusive_consumer = None;
+                        }
+                        self.groups.retain(|_, c| *c != id);
+                    }
                 }
                 if self.shared.config.purge_on_no_consumers && self.consumers.is_empty() {
                     let refs = self.messages.take_where(|_| true);
@@ -1010,6 +1181,10 @@ impl Actor {
                 }
             }
         }
+        // Acknowledging on a non-destructive queue leaves the message there.
+        if self.shared.config.non_destructive {
+            return Ok(Vec::new());
+        }
         if !transactional {
             self.count_removed(refs.len());
         }
@@ -1020,7 +1195,21 @@ impl Actor {
     /// another. Each message goes to the next consumer, round robin, in the
     /// highest priority group that has one able to take it.
     fn deliver(&mut self) {
+        if !self.can_dispatch() {
+            self.deliver_to_browsers();
+            return;
+        }
         while self.messages.len() > 0 {
+            // An exclusive queue delivers only to its chosen consumer.
+            if self.shared.config.exclusive
+                && let Some(id) = self.exclusive_consumer
+            {
+                match self.consumers.iter().position(|c| c.reg.id == id) {
+                    Some(i) if self.try_deliver(i) => continue,
+                    Some(_) => break,
+                    None => self.exclusive_consumer = None,
+                }
+            }
             let mut handled = false;
             let mut start = 0;
             while start < self.consumers.len() && !handled {
@@ -1046,28 +1235,106 @@ impl Actor {
         self.deliver_to_browsers();
     }
 
+    /// The group a reference belongs to (`extractGroupID`), keyed by bucket
+    /// when `group-buckets` is set.
+    fn group_of(&self, r: &MessageRef) -> Option<GroupKey> {
+        let c = &self.shared.config;
+        if c.exclusive || c.group_buckets == 0 {
+            return None;
+        }
+        let id = message::group_id(r.message.core())?;
+        Some(if c.group_buckets > 0 {
+            GroupKey::Bucket((java_hash(&id) & i32::MAX) as u32 % c.group_buckets as u32)
+        } else {
+            GroupKey::Id(id)
+        })
+    }
+
     fn try_deliver(&mut self, index: usize) -> bool {
         let c = &self.consumers[index];
         if !c.can_take() {
             return false;
         }
-        let Some(at) = self.messages.find(|r| c.accepts(r)) else {
+        let non_destructive = self.shared.config.non_destructive;
+        let id = c.reg.id;
+        let groups = &self.groups;
+        let shared = &self.shared;
+        let group_ok = |r: &MessageRef| {
+            let c = &shared.config;
+            if c.exclusive || c.group_buckets == 0 {
+                return true;
+            }
+            let Some(g) = message::group_id(r.message.core()) else {
+                return true;
+            };
+            let key = if c.group_buckets > 0 {
+                GroupKey::Bucket((java_hash(&g) & i32::MAX) as u32 % c.group_buckets as u32)
+            } else {
+                GroupKey::Id(g)
+            };
+            groups.get(&key).is_none_or(|owner| *owner == id)
+        };
+        let Some(at) = self.messages.find(|r| {
+            c.accepts(r)
+                && (!non_destructive || !c.browsed.contains(&r.message_id()))
+                && group_ok(r)
+        }) else {
             return false;
         };
-        let mut r = self.messages.remove(at);
+        let mut r = if non_destructive {
+            self.messages.get(at).clone()
+        } else {
+            self.messages.remove(at)
+        };
         // An expired message is never delivered (`checkExpired`).
         if r.message.is_expired(now_millis()) {
+            if non_destructive {
+                r = self.messages.remove(at);
+            }
             self.expire(r);
             return true;
         }
+        // handleMessageGroup: a new group is pinned to this consumer and its
+        // first message flagged; sequence -1 closes the group.
+        let mut first = false;
+        if self.shared.config.exclusive {
+            if self.exclusive_consumer.is_none() {
+                self.exclusive_consumer = Some(id);
+                first = true;
+            }
+        } else if let Some(g) = self.group_of(&r) {
+            if message::group_sequence(r.message.core()) == -1 {
+                self.groups.remove(&g);
+            } else if let std::collections::hash_map::Entry::Vacant(e) = self.groups.entry(g) {
+                e.insert(id);
+                first = true;
+            }
+        }
+        let flagged = match (&self.shared.config.group_first_key, first) {
+            (Some(key), true) => {
+                let mut core = r.message.core().clone();
+                core.properties
+                    .insert(key.as_str().into(), PropertyValue::Bool(true));
+                Some(ServerMessage::new(core))
+            }
+            _ => None,
+        };
         let c = &mut self.consumers[index];
         r.delivery_count += 1;
-        let size = c
-            .reg
-            .sink
-            .deliver(c.reg.client_id, &r.message, r.delivery_count);
+        let size = c.reg.sink.deliver(
+            c.reg.client_id,
+            flagged.as_deref().unwrap_or(&r.message),
+            r.delivery_count,
+        );
         if let Some(credits) = &mut c.credits {
             *credits -= size;
+        }
+        if non_destructive {
+            c.browsed.insert(r.message_id());
+            if !c.reg.pre_acknowledge {
+                c.delivering.push_back(r);
+            }
+            return true;
         }
         if c.reg.pre_acknowledge {
             self.count_removed(1);
@@ -1161,6 +1428,13 @@ impl Actor {
             .sink
             .deliver(c.reg.client_id, &ServerMessage::new(core), 0);
     }
+}
+
+/// `SimpleString.hashCode` over the string's bytes.
+fn java_hash(bytes: &[u8]) -> i32 {
+    bytes.iter().fold(0i32, |h, &b| {
+        h.wrapping_mul(31).wrapping_add(i32::from(b as i8))
+    })
 }
 
 /// `calculateRedeliveryDelay`: the delay grows by the multiplier with each

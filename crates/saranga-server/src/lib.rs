@@ -122,6 +122,7 @@ pub struct BrokerConfig {
     /// `connection-ttl-override`; -1 lets clients choose.
     pub connection_ttl_override: i64,
     pub addresses: Vec<AddressDeployment>,
+    pub diverts: Vec<postoffice::DivertDeployment>,
     /// The journals; `None` keeps everything in memory
     /// (`persistence-enabled` false).
     pub storage: Option<storage::StorageConfig>,
@@ -142,6 +143,7 @@ impl BrokerConfig {
             wildcard: WildcardConfig::default(),
             connection_ttl_override: -1,
             addresses: Vec::new(),
+            diverts: Vec::new(),
             storage: None,
             message_expiry_scan_period: 30000,
             id_cache_size: 20000,
@@ -227,6 +229,11 @@ impl Broker {
             )?;
             for queue in &address.queues {
                 post_office.create_queue(queue.clone(), true)?;
+            }
+        }
+        for d in &config.diverts {
+            if let Err(e) = post_office.deploy_divert(d) {
+                tracing::warn!("divert {}: {e}", d.name);
             }
         }
         let resource_manager = transaction::ResourceManager::default();

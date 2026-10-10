@@ -17,6 +17,9 @@ use crate::storage::{RecoveredMessages, Storage, StoreResult, ids};
 use crate::transaction::{ResourceManager, Transaction, TxState};
 use crate::{BrokerError, Result, RoutingType};
 
+/// Duplicate IDs with their journal records.
+type DuplicateIds = Vec<(Vec<u8>, i64)>;
+
 fn ss(s: &str) -> SimpleString {
     SimpleString::from(s)
 }
@@ -197,7 +200,7 @@ pub async fn load_messages(
         .map(|(id, m)| (id, ServerMessage::new(m)))
         .collect();
     // The duplicate-ID caches, per address in journal order.
-    let mut by_address: Vec<(String, Vec<(Vec<u8>, i64)>)> = Vec::new();
+    let mut by_address: Vec<(String, DuplicateIds)> = Vec::new();
     for d in duplicates {
         match by_address.iter_mut().find(|(a, _)| *a == d.address) {
             Some((_, ids)) => ids.push((d.id, d.record)),

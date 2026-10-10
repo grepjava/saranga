@@ -59,6 +59,38 @@ fn long_property(message: &CoreMessage, name: &str) -> Option<i64> {
     }
 }
 
+/// `getSimpleStringProperty`: any value as text.
+pub fn string_property(message: &CoreMessage, name: &str) -> Option<String> {
+    Some(match property(message, name)? {
+        PropertyValue::Null => return None,
+        PropertyValue::String(s) => s.to_string_lossy(),
+        PropertyValue::Bool(v) => v.to_string(),
+        PropertyValue::Byte(v) => v.to_string(),
+        PropertyValue::Short(v) => v.to_string(),
+        PropertyValue::Int(v) => v.to_string(),
+        PropertyValue::Long(v) => v.to_string(),
+        PropertyValue::Float(v) => v.to_string(),
+        PropertyValue::Double(v) => v.to_string(),
+        PropertyValue::Char(v) => String::from_utf16_lossy(&[*v]),
+        PropertyValue::Bytes(b) => SimpleString::from_bytes(b.clone()).to_string_lossy(),
+    })
+}
+
+/// `Message.getGroupID`: `_AMQ_GROUP_ID` as `SimpleString` bytes.
+pub fn group_id(message: &CoreMessage) -> Option<Vec<u8>> {
+    match property(message, HDR_GROUP_ID)? {
+        PropertyValue::String(s) => Some(s.as_bytes().to_vec()),
+        PropertyValue::Null => None,
+        _ => string_property(message, HDR_GROUP_ID)
+            .map(|s| SimpleString::from(s.as_str()).as_bytes().to_vec()),
+    }
+}
+
+/// `Message.getGroupSequence`: 0 when unset.
+pub fn group_sequence(message: &CoreMessage) -> i64 {
+    long_property(message, HDR_GROUP_SEQUENCE).unwrap_or(0)
+}
+
 /// `CoreMessage.getScheduledDeliveryTime`: 0 when unset.
 pub fn scheduled_delivery_time(message: &CoreMessage) -> i64 {
     long_property(message, HDR_SCHEDULED_DELIVERY_TIME).unwrap_or(0)

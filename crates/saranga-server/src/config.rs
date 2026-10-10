@@ -8,7 +8,9 @@ use saranga_journal::JournalConfig;
 
 use saranga_config as cfg;
 
-use crate::postoffice::{FilterFactory, QueueSpec, RoutingTypes};
+use crate::postoffice::{
+    DivertDeployment, DivertRoutingType, FilterFactory, QueueSpec, RoutingTypes,
+};
 use crate::settings::{AddressSettings, SettingsRepository};
 use crate::storage::StorageConfig;
 use crate::wildcard::WildcardConfig;
@@ -144,6 +146,23 @@ fn deployment(a: &cfg::AddressConfig) -> AddressDeployment {
     }
 }
 
+fn divert(d: &cfg::DivertConfig) -> DivertDeployment {
+    DivertDeployment {
+        name: d.name.clone(),
+        routing_name: d.routing_name.clone(),
+        address: d.address.clone(),
+        forwarding_address: d.forwarding_address.clone(),
+        exclusive: d.exclusive,
+        filter: d.filter.clone(),
+        routing_type: match d.routing_type {
+            cfg::DivertRoutingType::Multicast => DivertRoutingType::Multicast,
+            cfg::DivertRoutingType::Anycast => DivertRoutingType::Anycast,
+            cfg::DivertRoutingType::Strip => DivertRoutingType::Strip,
+            cfg::DivertRoutingType::Pass => DivertRoutingType::Pass,
+        },
+    }
+}
+
 /// The journals' settings. Relative directories are resolved against the
 /// broker instance (`artemis.instance`), as Artemis does.
 pub fn storage_config(config: &cfg::BrokerConfig, instance: &Path) -> StorageConfig {
@@ -225,6 +244,7 @@ impl BrokerConfig {
             },
             connection_ttl_override: -1,
             addresses: config.addresses.iter().map(deployment).collect(),
+            diverts: config.diverts.iter().map(divert).collect(),
             storage: config
                 .persistence_enabled
                 .then(|| storage_config(config, instance)),

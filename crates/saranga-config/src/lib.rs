@@ -26,7 +26,10 @@ pub use address_settings::{
     AddressFullMessagePolicy, AddressSettings, DeletionPolicy, DiskFullMessagePolicy,
     PageFullMessagePolicy, SlowConsumerPolicy, SlowConsumerThresholdMeasurementUnit,
 };
-pub use broker::{AddressConfig, BrokerConfig, JournalConfig, JournalType, QueueConfig, Warning};
+pub use broker::{
+    AddressConfig, BrokerConfig, DivertConfig, DivertRoutingType, JournalConfig, JournalType,
+    QueueConfig, Warning,
+};
 pub use bytes::convert_text_bytes;
 pub use matcher::Match;
 pub use repository::{HierarchicalRepository, Mergeable, extract_address_name};
