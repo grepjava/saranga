@@ -736,6 +736,85 @@ impl PostOffice {
         Ok(queue)
     }
 
+    /// `PostOfficeImpl.updateQueue` with `forceUpdate`, as configuration
+    /// reload calls it: the queue named in `spec` takes the settings `spec`
+    /// resolves to. Name, address, durability and the kind of queue stay.
+    /// `Ok(None)` if there is no such queue.
+    pub fn update_queue(&self, spec: QueueSpec) -> Result<Option<Queue>> {
+        let Some(queue) = self.queue(&spec.name) else {
+            return Ok(None);
+        };
+        let old = queue.config();
+        let wanted = spec.resolve(&self.settings(&old.address));
+        if wanted.max_consumers != -1 && queue.consumer_count() > wanted.max_consumers {
+            return Err(BrokerError::invalid_max_consumers_update(
+                &old.name,
+                wanted.max_consumers,
+                queue.consumer_count(),
+            ));
+        }
+        let info = self.address_info(&old.address);
+        if let Some(info) = &info
+            && !info.routing_types.contains(wanted.routing_type)
+        {
+            return Err(BrokerError::invalid_routing_type_update(
+                &old.name,
+                wanted.routing_type.name(),
+                &old.address,
+                &info.routing_types.describe(),
+            ));
+        }
+        let mut new = (*old).clone();
+        new.max_consumers = wanted.max_consumers;
+        new.routing_type = wanted.routing_type;
+        new.purge_on_no_consumers = wanted.purge_on_no_consumers;
+        new.enabled = wanted.enabled;
+        new.exclusive = wanted.exclusive;
+        new.group_rebalance = wanted.group_rebalance;
+        new.group_rebalance_pause_dispatch = wanted.group_rebalance_pause_dispatch;
+        new.group_buckets = wanted.group_buckets;
+        new.group_first_key = wanted.group_first_key;
+        new.non_destructive = wanted.non_destructive;
+        new.consumers_before_dispatch = wanted.consumers_before_dispatch;
+        new.delay_before_dispatch = wanted.delay_before_dispatch;
+        new.configuration_managed = wanted.configuration_managed;
+        new.user = wanted.user;
+        new.ring_size = wanted.ring_size;
+        // An empty filter is no filter (`FilterImpl.createFilter("")`). The
+        // new one routes, but the queue's configuration keeps the old text
+        // (`QueueImpl.setFilter`).
+        let filter_string = wanted.filter_string.filter(|f| !f.trim().is_empty());
+        let filter = if filter_string == queue.filter_string() {
+            None
+        } else {
+            let compiled = self.filters.create(filter_string.as_deref())?;
+            Some((filter_string, compiled))
+        };
+        if new == *old && filter.is_none() {
+            return Ok(Some(queue));
+        }
+        if new.durable
+            && !new.temporary
+            && let Some(s) = self.ids.storage()
+        {
+            // `createQueueBindingEncoding` takes the filter the queue routes
+            // with.
+            let mut journalled = new.clone();
+            journalled.filter_string = match &filter {
+                Some((text, _)) => text.clone(),
+                None => queue.filter_string(),
+            };
+            s.update_binding(
+                queue.id(),
+                crate::storage::ids::QUEUE_BINDING_RECORD,
+                crate::recovery::queue_binding(&journalled),
+            )
+            .map_err(Self::io)?;
+        }
+        queue.update(new, filter);
+        Ok(Some(queue))
+    }
+
     /// `ActiveMQServerImpl.destroyQueue`. With `check_consumers` a queue that
     /// still has consumers is refused. An auto-created address left without
     /// queues is removed when `auto_delete_address`.
@@ -1249,6 +1328,47 @@ impl PostOffice {
             .addresses
             .get(address)
             .is_some_and(|e| !e.queues.is_empty() || !e.diverts.is_empty())
+    }
+
+    /// The diverts bound to addresses.
+    pub fn diverts(&self) -> Vec<Arc<Divert>> {
+        self.read()
+            .addresses
+            .values()
+            .flat_map(|e| e.diverts.iter().cloned())
+            .collect()
+    }
+
+    pub fn divert(&self, name: &str) -> Option<Arc<Divert>> {
+        self.diverts().into_iter().find(|d| *d.name == *name)
+    }
+
+    /// `destroyDivert`: unbinds a divert. False if there is none.
+    pub fn destroy_divert(&self, name: &str) -> bool {
+        let mut state = self.write();
+        for entry in state.addresses.values_mut() {
+            if let Some(i) = entry.diverts.iter().position(|d| *d.name == *name) {
+                entry.diverts.remove(i);
+                entry.binding_removed_at = crate::message::now_millis();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Swaps the address settings' match rules and gives every page store
+    /// its new settings (`HierarchicalRepository.swap` and the paging
+    /// manager's change listener).
+    pub fn swap_settings(
+        &self,
+        rules: saranga_config::HierarchicalRepository<saranga_config::AddressSettings>,
+    ) {
+        if !self.settings.swap(rules) {
+            return;
+        }
+        for store in self.paging.stores() {
+            store.apply_settings(self.settings(store.address()));
+        }
     }
 
     /// `deployDivert`: binds a divert to its address, which must exist. A

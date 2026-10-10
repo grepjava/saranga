@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
 use saranga_buffer::PropertyValue;
@@ -76,8 +76,10 @@ const LARGE_BYTES_PER_PASS: usize = 1024 * 1024;
 /// `max-read-page-messages` nor `max-read-page-bytes` limits it.
 const MAX_DEPAGE_NUM: i64 = 1000;
 
-/// Everything about a queue that is fixed when it is created
-/// (`QueueConfiguration` with every default applied).
+/// A queue's settings (`QueueConfiguration` with every default applied).
+/// Name, address, durability and the kind of queue (last-value,
+/// temporary) are fixed when it is created; `updateQueue` may change the
+/// rest.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueueConfig {
     pub name: Name,
@@ -181,13 +183,23 @@ enum Cmd {
     ResumeLarge,
     /// The queue's pages have something new: read it in.
     Depage,
+    /// `updateQueue` replaced the configuration; a new `group-buckets`
+    /// starts the groups afresh (`setGroupBuckets`).
+    Reconfigure {
+        reset_groups: bool,
+    },
     Shutdown,
 }
 
 struct Shared {
     id: i64,
-    config: QueueConfig,
-    filter: Option<FilterRef>,
+    name: Name,
+    /// Replaced by `updateQueue`.
+    config: RwLock<Arc<QueueConfig>>,
+    /// The filter routing applies, with its text. `updateQueue` replaces
+    /// it without touching `config.filter_string`, which queue queries
+    /// report: Artemis's `setFilter` leaves the queue configuration alone.
+    filter: RwLock<(Option<String>, Option<FilterRef>)>,
     ids: Arc<IdGenerator>,
     /// For address settings and for moving messages to the dead-letter and
     /// expiry addresses.
@@ -211,13 +223,22 @@ struct Shared {
     swept: AtomicBool,
 }
 
+impl Shared {
+    fn config(&self) -> Arc<QueueConfig> {
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
 /// A handle to a queue actor.
 #[derive(Clone)]
 pub struct Queue(Arc<Shared>);
 
 impl fmt::Debug for Queue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Queue({})", self.0.config.name)
+        write!(f, "Queue({})", self.0.name)
     }
 }
 
@@ -246,10 +267,12 @@ impl Queue {
                 let _ = tx.send(Cmd::Depage);
             }));
         }
+        let filter_string = config.filter_string.clone();
         let queue = Self(Arc::new(Shared {
             id,
-            config,
-            filter,
+            name: config.name.clone(),
+            config: RwLock::new(Arc::new(config)),
+            filter: RwLock::new((filter_string, filter)),
             ids,
             post_office,
             tx,
@@ -286,16 +309,46 @@ impl Queue {
         self.0.id
     }
 
-    pub fn config(&self) -> &QueueConfig {
-        &self.0.config
+    /// The queue's configuration as it is now: `updateQueue` may replace
+    /// it.
+    pub fn config(&self) -> Arc<QueueConfig> {
+        self.0.config()
     }
 
     pub fn name(&self) -> &Name {
-        &self.0.config.name
+        &self.0.name
     }
 
-    pub fn filter(&self) -> Option<&FilterRef> {
-        self.0.filter.as_ref()
+    /// `updateQueue`'s setters: the queue goes on with `config` and, if
+    /// given, the filter (text and compiled). Its name and address stay.
+    pub fn update(&self, config: QueueConfig, filter: Option<(Option<String>, Option<FilterRef>)>) {
+        let reset_groups = self.config().group_buckets != config.group_buckets;
+        *self.0.config.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(config);
+        if let Some(filter) = filter {
+            *self.0.filter.write().unwrap_or_else(|e| e.into_inner()) = filter;
+        }
+        let _ = self.0.tx.send(Cmd::Reconfigure { reset_groups });
+    }
+
+    /// The filter routing applies (`getFilter`).
+    pub fn filter(&self) -> Option<FilterRef> {
+        self.0
+            .filter
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .clone()
+    }
+
+    /// The text of [`Queue::filter`]: what the queue's binding is journalled
+    /// with.
+    pub fn filter_string(&self) -> Option<String> {
+        self.0
+            .filter
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+            .clone()
     }
 
     /// `getMessageCount`: with the paged messages not yet acknowledged.
@@ -341,7 +394,7 @@ impl Queue {
 
     /// `QueueImpl.isDurable`: its persistent messages are journaled.
     pub fn is_durable(&self) -> bool {
-        self.0.config.durable && !self.0.config.temporary
+        self.0.config().durable && !self.0.config().temporary
     }
 
     /// Whether this reference is journaled: a persistent message on a
@@ -362,7 +415,7 @@ impl Queue {
     /// The queue's address settings (`cachedAddressSettings`).
     pub fn settings(&self) -> Arc<AddressSettings> {
         match self.0.post_office.upgrade() {
-            Some(po) => po.settings(&self.0.config.address),
+            Some(po) => po.settings(&self.0.config().address),
             None => Arc::default(),
         }
     }
@@ -949,7 +1002,7 @@ impl Actor {
         }
         self.track_last_value(&r, true);
         self.messages.push_back(r);
-        let ring = self.shared.config.ring_size;
+        let ring = self.shared.config().ring_size;
         if ring != -1 && self.messages.len() as i64 > ring {
             let oldest = self.messages.take_first();
             if let Some(old) = oldest {
@@ -970,7 +1023,7 @@ impl Actor {
             self.kill(r);
             return;
         }
-        let ring = self.shared.config.ring_size;
+        let ring = self.shared.config().ring_size;
         if ring != -1 && self.messages.len() as i64 + 1 > ring {
             self.kill(r);
             return;
@@ -983,7 +1036,7 @@ impl Actor {
     /// A last-value key alone makes a last-value queue
     /// (`QueueFactoryImpl.lastValueKey`).
     fn last_value_of(&self, r: &MessageRef) -> Option<String> {
-        let c = &self.shared.config;
+        let c = self.shared.config();
         let key = c.last_value_key.as_deref().filter(|k| !k.is_empty());
         if !c.last_value && key.is_none() {
             return None;
@@ -1040,7 +1093,8 @@ impl Actor {
         if self.consumers.iter().any(|c| !c.delivering.is_empty()) {
             return false;
         }
-        if self.consumers.len() as i64 >= i64::from(self.shared.config.consumers_before_dispatch) {
+        if self.consumers.len() as i64 >= i64::from(self.shared.config().consumers_before_dispatch)
+        {
             self.dispatching = true;
             return true;
         }
@@ -1062,7 +1116,7 @@ impl Actor {
     /// (`checkRedelivery`), then the survivors return (`postRollback`).
     fn return_refs(&mut self, refs: Vec<MessageRef>) {
         // A non-destructive queue never took them off its list.
-        if self.shared.config.non_destructive {
+        if self.shared.config().non_destructive {
             return;
         }
         let now = now_millis();
@@ -1070,7 +1124,7 @@ impl Actor {
             .into_iter()
             .filter_map(|r| self.check_redelivery(r, now))
             .collect();
-        if self.shared.config.purge_on_no_consumers && self.consumers.is_empty() {
+        if self.shared.config().purge_on_no_consumers && self.consumers.is_empty() {
             back.into_iter().for_each(|r| self.kill(r));
         } else {
             back.into_iter().for_each(|r| self.add_sorted(r));
@@ -1121,7 +1175,7 @@ impl Actor {
 
     /// `sendToDeadLetterAddress`.
     fn send_to_dead_letter_address(&mut self, r: MessageRef, s: &AddressSettings) {
-        let name = &self.shared.config.name;
+        let name = &self.shared.name;
         let Some(dla) = s.dead_letter_address.clone() else {
             tracing::warn!(
                 "AMQ222150: Sending message {} to Dead Letter Address, but there is no Dead Letter Address configured for queue {name} so dropping it",
@@ -1130,7 +1184,7 @@ impl Actor {
             self.kill(r);
             return;
         };
-        let address = self.shared.config.address.clone();
+        let address = self.shared.config().address.clone();
         self.create_resources(
             &address,
             s.auto_create_dead_letter_resources,
@@ -1163,8 +1217,8 @@ impl Actor {
             .address
             .as_ref()
             .map(|a| a.to_string_lossy())
-            .unwrap_or_else(|| self.shared.config.address.to_string());
-        let s = if *message_address == *self.shared.config.address {
+            .unwrap_or_else(|| self.shared.config().address.to_string());
+        let s = if *message_address == *self.shared.config().address {
             queue.settings()
         } else {
             match self.shared.post_office.upgrade() {
@@ -1198,7 +1252,7 @@ impl Actor {
                     self.expiry_warned = true;
                     tracing::warn!(
                         "AMQ222147: Messages are being expired on queue {}, but there is no Expiry Address configured so messages will be dropped.",
-                        self.shared.config.name
+                        self.shared.name
                     );
                 }
                 self.kill(r);
@@ -1250,7 +1304,7 @@ impl Actor {
             r.message.core(),
             self.shared.ids.next(),
             address,
-            &self.shared.config.name,
+            &self.shared.name,
             expiry,
             now,
         );
@@ -1312,8 +1366,7 @@ impl Actor {
                 if consumer.reg.browse_only {
                     self.browsers.push(consumer);
                 } else {
-                    let c = self.shared.clone();
-                    let c = &c.config;
+                    let c = self.shared.config();
                     if c.group_rebalance {
                         if c.group_rebalance_pause_dispatch {
                             self.stop_dispatch();
@@ -1345,7 +1398,7 @@ impl Actor {
                         self.groups.retain(|_, c| *c != id);
                     }
                 }
-                if self.shared.config.purge_on_no_consumers && self.consumers.is_empty() {
+                if self.shared.config().purge_on_no_consumers && self.consumers.is_empty() {
                     let refs = self.messages.take_where(|_| true);
                     refs.into_iter().for_each(|r| self.kill(r));
                 }
@@ -1401,6 +1454,11 @@ impl Actor {
                 self.force_delivery(id, sequence);
             }
             Cmd::ResumeLarge | Cmd::Depage => {}
+            Cmd::Reconfigure { reset_groups } => {
+                if reset_groups {
+                    self.groups.clear();
+                }
+            }
             Cmd::Remove { message_id, reply } => {
                 let mut r = self
                     .messages
@@ -1493,7 +1551,7 @@ impl Actor {
             }
         }
         // Acknowledging on a non-destructive queue leaves the message there.
-        if self.shared.config.non_destructive {
+        if self.shared.config().non_destructive {
             return Ok(Vec::new());
         }
         let _ = transactional;
@@ -1519,7 +1577,7 @@ impl Actor {
         }
         while self.messages.len() > 0 {
             // An exclusive queue delivers only to its chosen consumer.
-            if self.shared.config.exclusive
+            if self.shared.config().exclusive
                 && let Some(id) = self.exclusive_consumer
             {
                 match self.consumers.iter().position(|c| c.reg.id == id) {
@@ -1556,7 +1614,7 @@ impl Actor {
     /// The group a reference belongs to (`extractGroupID`), keyed by bucket
     /// when `group-buckets` is set.
     fn group_of(&self, r: &MessageRef) -> Option<GroupKey> {
-        let c = &self.shared.config;
+        let c = self.shared.config();
         if c.exclusive || c.group_buckets == 0 {
             return None;
         }
@@ -1573,12 +1631,12 @@ impl Actor {
         if !c.can_take() {
             return false;
         }
-        let non_destructive = self.shared.config.non_destructive;
+        let non_destructive = self.shared.config().non_destructive;
         let id = c.reg.id;
         let groups = &self.groups;
         let shared = &self.shared;
         let group_ok = |r: &MessageRef| {
-            let c = &shared.config;
+            let c = shared.config();
             if c.exclusive || c.group_buckets == 0 {
                 return true;
             }
@@ -1615,7 +1673,7 @@ impl Actor {
         // handleMessageGroup: a new group is pinned to this consumer and its
         // first message flagged; sequence -1 closes the group.
         let mut first = false;
-        if self.shared.config.exclusive {
+        if self.shared.config().exclusive {
             if self.exclusive_consumer.is_none() {
                 self.exclusive_consumer = Some(id);
                 first = true;
@@ -1628,7 +1686,7 @@ impl Actor {
                 first = true;
             }
         }
-        let flagged = match (&self.shared.config.group_first_key, first) {
+        let flagged = match (&self.shared.config().group_first_key, first) {
             (Some(key), true) => {
                 let mut core = r.message.core().clone();
                 core.properties
@@ -1756,7 +1814,7 @@ impl Actor {
     /// a marker message carrying the sequence so the client knows the queue
     /// had nothing more for it.
     fn force_delivery(&mut self, id: ConsumerId, sequence: i64) {
-        let address = self.shared.config.name.clone();
+        let address = self.shared.name.clone();
         let message_id = self.shared.ids.next();
         let Some(c) = self.consumer_mut(id) else {
             return;

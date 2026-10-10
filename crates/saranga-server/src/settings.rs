@@ -20,6 +20,11 @@ pub struct AddressSettings {
     pub auto_delete_addresses: bool,
     pub auto_delete_addresses_delay: i64,
     pub auto_delete_addresses_skip_usage_check: bool,
+    /// `config-delete-queues` is `FORCE`: configured queues that leave the
+    /// configuration are deleted on reload.
+    pub config_delete_queues: bool,
+    /// `config-delete-addresses` is `FORCE`.
+    pub config_delete_addresses: bool,
     pub default_purge_on_no_consumers: bool,
     pub default_max_consumers: i32,
     pub default_exclusive_queue: bool,
@@ -120,6 +125,8 @@ impl Default for AddressSettings {
             auto_delete_addresses: true,
             auto_delete_addresses_delay: 0,
             auto_delete_addresses_skip_usage_check: false,
+            config_delete_queues: false,
+            config_delete_addresses: false,
             default_purge_on_no_consumers: false,
             default_max_consumers: -1,
             default_exclusive_queue: false,
@@ -173,6 +180,15 @@ impl Default for AddressSettings {
 /// Resolves the settings for an address (`HierarchicalRepository`).
 pub trait SettingsRepository: Send + Sync {
     fn get_match(&self, address: &str) -> Arc<AddressSettings>;
+
+    /// Replaces the match rules (`HierarchicalRepository.swap`), as
+    /// configuration reload does. False if these settings cannot change.
+    fn swap(
+        &self,
+        _rules: saranga_config::HierarchicalRepository<saranga_config::AddressSettings>,
+    ) -> bool {
+        false
+    }
 }
 
 /// One set of settings for every address.

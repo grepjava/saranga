@@ -17,6 +17,7 @@ pub mod paging;
 pub mod postoffice;
 pub mod queue;
 pub mod recovery;
+pub mod reload;
 pub mod settings;
 pub mod storage;
 pub mod transaction;
@@ -300,6 +301,8 @@ pub struct Broker {
     large_messages: Arc<large::LargeMessageStore>,
     node_lock: Mutex<Option<node::NodeLock>>,
     security: Option<Arc<saranga_security::SecurityStore>>,
+    /// For the diverts a reload deploys.
+    transformers: HashMap<String, postoffice::TransformerFactory>,
     populate_validated_user: bool,
     reject_empty_validated_user: bool,
 }
@@ -363,17 +366,7 @@ impl Broker {
         if let Some(s) = &storage {
             recovery::load_bindings(s, &post_office)?;
         }
-        for address in &config.addresses {
-            post_office.add_or_update_address(
-                &address.name,
-                address.routing_types,
-                false,
-                false,
-            )?;
-            for queue in &address.queues {
-                post_office.create_queue(queue.clone(), true)?;
-            }
-        }
+        reload::deploy_addresses(&post_office, &config.addresses);
         for d in &config.diverts {
             if let Err(e) = post_office.deploy_divert(d, &config.transformers) {
                 tracing::warn!("divert {}: {e}", d.name);
@@ -397,6 +390,7 @@ impl Broker {
         } else {
             paging.set_loaded();
         }
+        reload::undeploy_not_configured(&post_office, &config.addresses);
         if config.message_expiry_scan_period > 0 {
             spawn_expiry_reaper(&post_office, config.message_expiry_scan_period);
         }
@@ -420,6 +414,7 @@ impl Broker {
             large_messages,
             node_lock: Mutex::new(node_lock),
             security: config.security.clone(),
+            transformers: config.transformers,
             populate_validated_user: config.populate_validated_user,
             reject_empty_validated_user: config.reject_empty_validated_user,
         });

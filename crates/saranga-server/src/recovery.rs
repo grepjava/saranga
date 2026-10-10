@@ -161,7 +161,13 @@ pub fn load_bindings(storage: &Storage, post_office: &PostOffice) -> Result<()> 
             ids::QUEUE_BINDING_RECORD => {
                 let b = PersistentQueueBindingEncoding::decode(&r.data)
                     .map_err(|e| corrupt("queue binding", e))?;
-                queues.push((r.id, queue_config(&b)));
+                // An update record (`updateQueueBinding`) replaces the
+                // binding it updates, as `mapBindings.put` does.
+                let config = queue_config(&b);
+                match queues.iter_mut().find(|(id, _)| *id == r.id) {
+                    Some(q) => q.1 = config,
+                    None => queues.push((r.id, config)),
+                }
             }
             other => tracing::debug!("bindings record type {other} is not used yet"),
         }

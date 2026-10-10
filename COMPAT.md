@@ -28,7 +28,9 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **1.x message layout.** Clients older than version 129 put an extra end-of-message offset into sends and receives. Artemis ignores it on decode. Saranga keeps it so the message re-encodes exactly.
 
 ## Configuration differences
-- **`${...}` in `broker.xml`** resolves from environment variables. Java resolves from system properties (`-Dname=value`) first; Saranga has no system properties, so set an environment variable of the same name.
+- **`${...}`** in `broker.xml`, `bootstrap.xml`, `login.config` and broker properties resolves from `saranga run -D name=value`, then from the properties `artemis run` defines (`artemis.instance`, `artemis.home`, `artemis.instance.etc`, `artemis.URI.instance`, `data.dir`, `java.security.auth.login.config`), then from environment variables. Saranga does not read `JAVA_ARGS` in `artemis.profile`, so pass its `-D` options to `saranga run`.
+- **Broker properties** are read from `.properties` files only. JSON and YAML files are reported and skipped. The collections Saranga applies are `addressSettings`, `securityRoles`, `addressConfigurations`, `acceptorConfigurations`, `divertConfigurations` and `jaasConfigs`, plus the top-level settings it supports. Every other key is reported as a warning. Artemis reports such keys in its status, which Saranga does not have until management arrives in Phase 8.
+- **Configuration reload** swaps the security settings and address settings, reconciles diverts, and deploys and undeploys addresses and queues, as Artemis does. Saranga does not reload acceptors, bridges, connection routers or `jaasConfigs`. It also does not reload the `login.config` file itself, which Artemis does not reload either.
 - **Namespaces.** Elements are matched by local name, so prefixed elements that Java would miss are accepted.
 - **`xi:include`** is not expanded yet; it produces a warning.
 
@@ -53,5 +55,10 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **Duplicate detection** checks the message a client sends. Copies a divert makes are not checked against the forwarding address's cache.
 - **A prepared XA branch's duplicate IDs** keep their own journal record IDs after recovery. Artemis files them under the transaction's ID.
 - **Large-message files** are deleted once nothing holds the message any more, which is when Artemis's reference count releases it. When the broker stops, the files of messages still in memory are kept, as Artemis keeps them.
-- **Core frame size.** With security enabled, Artemis rejects Core frames over 4 KiB before a connection authenticates and over 128 KiB afterwards (`coreInitialMaxFrameSize`, `coreMaxFrameSize`). Saranga has no limit until security arrives in Phase 6.
 - **Divert transformers** are Rust plugins, not Java classes. The embedding application registers a `Transformer` under the class name that `broker.xml` gives. A divert whose transformer is not registered is not deployed, and a warning is logged.
+
+## Security differences
+- **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule` and `LDAPLoginModule` are supported. `Krb5LoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.
+- **Security managers.** Only the JAAS security manager (`<jaas-security>` in `bootstrap.xml`) is supported. A `<security-manager>` element stops the broker from starting.
+- **A role named `*`** in a security setting grants nothing in Artemis 2.57, despite looking like a wildcard. Saranga matches this.
+- **Security setting plugins** (`<security-setting-plugin>`) are not supported and produce a warning.

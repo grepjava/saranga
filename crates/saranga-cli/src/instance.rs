@@ -165,6 +165,43 @@ impl Instance {
         Ok(config)
     }
 
+    /// What a change to reloads the configuration: `broker.xml` and the
+    /// broker properties sources (`ActiveMQServerImpl`'s reload callbacks).
+    fn watched(&self) -> Vec<PathBuf> {
+        let mut paths = vec![self.broker_xml.clone()];
+        if let Some(sources) = self.broker_properties_sources() {
+            for source in sources.split(',') {
+                let path = source.split_once('?').map_or(source, |(p, _)| p);
+                paths.push(PathBuf::from(path));
+            }
+        }
+        paths
+    }
+
+    /// The modification times of the watched files, and of the files in
+    /// watched directories: a reload is due when it changes.
+    pub fn config_fingerprint(&self) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+        let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let mut out = Vec::new();
+        for path in self.watched() {
+            if path.is_dir() {
+                let mut files: Vec<PathBuf> = std::fs::read_dir(&path)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| Some(e.ok()?.path()))
+                    .collect();
+                files.sort();
+                out.extend(files.into_iter().map(|f| {
+                    let t = mtime(&f);
+                    (f, t)
+                }));
+            }
+            let t = mtime(&path);
+            out.push((path, t));
+        }
+        out
+    }
+
     /// `Configuration.resolvePropertiesSources`: the `broker.properties`
     /// system property, else `--properties`, else `etc/broker.properties`
     /// if it exists (`Run.execute`).

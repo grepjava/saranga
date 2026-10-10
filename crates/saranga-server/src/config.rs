@@ -17,35 +17,49 @@ use crate::wildcard::WildcardConfig;
 use crate::{AddressDeployment, BrokerConfig, RoutingType};
 
 /// Address settings resolved through `<address-settings>` match rules,
-/// cached per address (the settings do not change while the broker runs).
+/// cached per address until the rules are swapped.
 pub struct ConfiguredSettings {
+    state: Mutex<Rules>,
+}
+
+struct Rules {
     repository: cfg::HierarchicalRepository<cfg::AddressSettings>,
-    cache: Mutex<HashMap<String, Arc<AddressSettings>>>,
+    cache: HashMap<String, Arc<AddressSettings>>,
 }
 
 impl ConfiguredSettings {
     pub fn new(repository: cfg::HierarchicalRepository<cfg::AddressSettings>) -> Self {
         Self {
-            repository,
-            cache: Mutex::default(),
+            state: Mutex::new(Rules {
+                repository,
+                cache: HashMap::new(),
+            }),
         }
     }
 }
 
 impl SettingsRepository for ConfiguredSettings {
     fn get_match(&self, address: &str) -> Arc<AddressSettings> {
-        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(s) = cache.get(address) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = state.cache.get(address) {
             return s.clone();
         }
         let s = Arc::new(
-            self.repository
+            state
+                .repository
                 .get_match(address)
                 .map(|s| resolve(&s))
                 .unwrap_or_default(),
         );
-        cache.insert(address.to_owned(), s.clone());
+        state.cache.insert(address.to_owned(), s.clone());
         s
+    }
+
+    fn swap(&self, rules: cfg::HierarchicalRepository<cfg::AddressSettings>) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.repository = rules;
+        state.cache.clear();
+        true
     }
 }
 
@@ -69,6 +83,8 @@ fn resolve(s: &cfg::AddressSettings) -> AddressSettings {
         auto_delete_addresses: s.auto_delete_addresses(),
         auto_delete_addresses_delay: s.auto_delete_addresses_delay(),
         auto_delete_addresses_skip_usage_check: s.auto_delete_addresses_skip_usage_check(),
+        config_delete_queues: s.config_delete_queues() == cfg::DeletionPolicy::Force,
+        config_delete_addresses: s.config_delete_addresses() == cfg::DeletionPolicy::Force,
         default_purge_on_no_consumers: s.default_purge_on_no_consumers(),
         default_max_consumers: s.default_max_consumers(),
         default_exclusive_queue: s.default_exclusive_queue(),
@@ -128,7 +144,7 @@ fn resolve(s: &cfg::AddressSettings) -> AddressSettings {
 
 /// `<addresses>`: queues declared in configuration are
 /// `configuration-managed`.
-fn deployment(a: &cfg::AddressConfig) -> AddressDeployment {
+pub(crate) fn deployment(a: &cfg::AddressConfig) -> AddressDeployment {
     let mut routing_types = RoutingTypes::default();
     a.routing_types
         .iter()
@@ -167,7 +183,7 @@ fn deployment(a: &cfg::AddressConfig) -> AddressDeployment {
     }
 }
 
-fn divert(d: &cfg::DivertConfig) -> DivertDeployment {
+pub(crate) fn divert(d: &cfg::DivertConfig) -> DivertDeployment {
     DivertDeployment {
         name: d.name.clone(),
         routing_name: d.routing_name.clone(),

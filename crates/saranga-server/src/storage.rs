@@ -873,6 +873,14 @@ impl Storage {
         self.bindings.append_commit(tx, true, None)
     }
 
+    /// Updates a binding record in place (`updateQueueBinding`) and
+    /// commits.
+    pub fn update_binding(&self, id: i64, user_type: u8, body: Vec<u8>) -> StoreResult<()> {
+        let tx = self.generate_id();
+        self.bindings.append_update_tx(tx, id, user_type, body)?;
+        self.bindings.append_commit(tx, true, None)
+    }
+
     /// Deletes a binding record (`deleteQueueBinding`,
     /// `deleteAddressBinding`) and commits.
     pub fn delete_binding(&self, id: i64) -> StoreResult<()> {

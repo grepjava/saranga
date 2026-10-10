@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<!-- Configuration reload: the broker starts with broker-before.xml, which
+     scripts/reload-interop.sh then replaces with broker-after.xml. -->
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+   <core xmlns="urn:activemq:core">
+      <name>reload</name>
+      <persistence-enabled>true</persistence-enabled>
+      <security-enabled>false</security-enabled>
+      <configuration-file-refresh-period>1000</configuration-file-refresh-period>
+      <journal-pool-files>2</journal-pool-files>
+      <acceptors>
+         <acceptor name="artemis">tcp://0.0.0.0:61616?protocols=CORE</acceptor>
+      </acceptors>
+      <address-settings>
+         <address-setting match="reload.forced.#">
+            <config-delete-addresses>FORCE</config-delete-addresses>
+            <config-delete-queues>FORCE</config-delete-queues>
+         </address-setting>
+      </address-settings>
+      <addresses>
+         <address name="reload.q"><anycast><queue name="reload.q"/></anycast></address>
+         <address name="reload.src"><anycast><queue name="reload.src"/></anycast></address>
+         <address name="reload.kept"><anycast><queue name="reload.kept"/></anycast></address>
+         <address name="reload.forced.gone"><anycast><queue name="reload.forced.gone"/></anycast></address>
+         <address name="reload.forced.keep"><multicast>
+            <queue name="reload.forced.keep.a"/>
+            <queue name="reload.forced.keep.b"/>
+         </multicast></address>
+      </addresses>
+      <diverts>
+         <divert name="reload.d1">
+            <address>reload.src</address>
+            <forwarding-address>reload.kept</forwarding-address>
+         </divert>
+      </diverts>
+   </core>
+</configuration>

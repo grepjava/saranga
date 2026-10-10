@@ -167,6 +167,33 @@ impl BrokerError {
         )
     }
 
+    /// A plain `IllegalStateException` in Java.
+    pub fn invalid_max_consumers_update(queue: &str, max_consumers: i32, consumers: i32) -> Self {
+        Self::bundle(
+            ErrorType::InternalError,
+            229210,
+            format!(
+                "Can't update queue {queue} with maxConsumers: {max_consumers}. Current consumers are {consumers}."
+            ),
+        )
+    }
+
+    /// A plain `IllegalStateException` in Java.
+    pub fn invalid_routing_type_update(
+        queue: &str,
+        routing_type: &str,
+        address: &str,
+        supported: &str,
+    ) -> Self {
+        Self::bundle(
+            ErrorType::InternalError,
+            229211,
+            format!(
+                "Can't update queue {queue} with routing type: {routing_type}, Supported routing types for address: {address} are {supported}"
+            ),
+        )
+    }
+
     pub fn invalid_queue_name(name: &str) -> Self {
         Self::bundle(
             ErrorType::IllegalState,

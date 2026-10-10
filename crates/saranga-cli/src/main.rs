@@ -192,6 +192,37 @@ async fn watch_stop_files(dir: PathBuf) -> Stop {
     }
 }
 
+/// `configuration-file-refresh-period`: every period, if `broker.xml` or
+/// the broker properties changed, they are read again and the broker
+/// reloads what can change while it runs (`ReloadManagerImpl`).
+fn spawn_config_reloader(
+    instance: Arc<instance::Instance>,
+    broker: Arc<Broker>,
+    period: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let mut last = instance.config_fingerprint();
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let now = instance.config_fingerprint();
+            if now == last {
+                continue;
+            }
+            last = now;
+            let reload = instance.broker_config().and_then(|c| {
+                saranga_server::reload::Reload::from_file_config(&c).map_err(anyhow::Error::from)
+            });
+            match reload {
+                Ok(reload) => broker.reload(reload),
+                Err(e) => tracing::warn!("configuration not reloaded: {e:#}"),
+            }
+        }
+    });
+}
+
 /// `-D name=value`; a bare `-D name` is the empty string, as in Java.
 fn parse_system_property(s: &str) -> Result<(String, String), String> {
     let (k, v) = s.split_once('=').unwrap_or((s, ""));
@@ -256,6 +287,10 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
         servers.spawn(broker.clone().serve_acceptor(listener, acceptor));
     }
     tracing::info!("AMQ221007: Server is now active");
+    let instance = instance.map(Arc::new);
+    if let Some(instance) = &instance {
+        spawn_config_reloader(instance.clone(), broker.clone(), reload_period);
+    }
     let stop_dir = instance
         .as_ref()
         .and_then(|i| i.broker_xml.parent().map(Path::to_path_buf));
