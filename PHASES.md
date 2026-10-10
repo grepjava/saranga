@@ -184,6 +184,20 @@ The behaviour differences are listed in COMPAT.md.
 
 **Exit check:** unmodified Artemis `etc/` directories from typical deployments start Saranga.
 
+**Exit check (met)**: `scripts/etc-check.sh` makes 13 instances with the reference image's own `artemis create` and runs each with `saranga run --etc` exactly as created.
+- 10 variants start, take a login and a send and receive round trip, and refuse a wrong password. The variants are: the default, anonymous, NIO with `--blocking` and pre-declared queues and addresses, mapped journal with paging and retention, no persistence, a custom role and user, web options, a replicated primary, a static cluster member and a shared-store primary.
+- 3 variants refuse to start with a reason: a shared-store backup, a replicated backup and the JDBC store.
+- Every warning they print names something Saranga does not do yet: protocols other than Core, clustering, HA and retention.
+
+What else Phase 6 delivered, each suite passing against both Artemis and Saranga:
+- **Security:** properties, guest, certificate and LDAP login modules, password hashes and masks, security settings with role mapping, and checks on every Core operation, including login at `CONNECT`, the pre-authentication topology and frame size limits. Covered by `Phase6.java` (23 tests) and `Ldap.java` (6 tests, against a real OpenLDAP).
+- **TLS:** JKS, PKCS12 and PEM stores, mutual TLS, CRLs, SNI, protocol and cipher choices, and reloading the stores. Covered by `Tls.java` (10 tests).
+- **`broker.properties`:** `-D` system properties and `brokerconfig.` overrides, including `jaasConfigs`. Covered by `Props.java` (5 tests).
+- **Configuration reload:** settings swap, diverts, address and queue deployment, `updateQueue` and the `config-delete-*` policies. Covered by `Reload.java` (7 tests).
+- **`saranga run --etc`** reads `bootstrap.xml`, `login.config` and `broker.properties` the way `artemis run` does.
+
+The differences from Artemis are listed in COMPAT.md.
+
 ## Phase 7: Protocols
 
 **Scope**

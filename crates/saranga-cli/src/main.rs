@@ -110,11 +110,32 @@ struct Bind {
 fn core_acceptors(file: &saranga_config::BrokerConfig) -> anyhow::Result<Vec<Bind>> {
     let mut out = Vec::new();
     for a in &file.acceptors {
-        let protocols = a.protocols();
-        if !(protocols.is_empty() || protocols.iter().any(|p| p.eq_ignore_ascii_case("CORE"))) {
+        let name = a.name.clone().unwrap_or_default();
+        // No list means every protocol the broker has.
+        let protocols = match a.protocols() {
+            p if p.is_empty() => ["CORE", "AMQP", "STOMP", "HORNETQ", "MQTT", "OPENWIRE"]
+                .map(str::to_owned)
+                .to_vec(),
+            p => p,
+        };
+        let others: Vec<&str> = protocols
+            .iter()
+            .map(String::as_str)
+            .filter(|p| *p != "CORE")
+            .collect();
+        if !protocols.iter().any(|p| p == "CORE") {
+            tracing::warn!(
+                "acceptor {name} was not opened: Saranga does not serve {} yet",
+                others.join(", ")
+            );
             continue;
         }
-        let name = a.name.clone().unwrap_or_default();
+        if !others.is_empty() {
+            tracing::warn!(
+                "acceptor {name} serves CORE only: Saranga does not serve {} yet",
+                others.join(", ")
+            );
+        }
         let host = a.host.as_deref().unwrap_or("localhost");
         let port = a.port.unwrap_or(61616);
         // `ConfigurationHelper.getPasswordProperty`: `mask-password` and
@@ -223,6 +244,21 @@ fn spawn_config_reloader(
     });
 }
 
+/// Binds the acceptor's host the way Netty does: to the one address
+/// `InetAddress.getByName` gives, which is the first IPv4 address when the
+/// name has one (`localhost` is 127.0.0.1, not `::1`).
+async fn bind_acceptor(address: &str) -> std::io::Result<TcpListener> {
+    let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host(address).await?.collect();
+    addrs.sort_by_key(|a| !a.is_ipv4());
+    match addrs.first() {
+        Some(a) => TcpListener::bind(a).await,
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{address} resolves to no address"),
+        )),
+    }
+}
+
 /// `-D name=value`; a bare `-D name` is the empty string, as in Java.
 fn parse_system_property(s: &str) -> Result<(String, String), String> {
     let (k, v) = s.split_once('=').unwrap_or((s, ""));
@@ -276,7 +312,7 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
         acceptor,
     } in binds
     {
-        let listener = TcpListener::bind(&address)
+        let listener = bind_acceptor(&address)
             .await
             .with_context(|| format!("acceptor {name} on {address}"))?;
         if let Some(tls) = &acceptor.tls {

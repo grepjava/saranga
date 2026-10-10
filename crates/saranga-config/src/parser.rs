@@ -401,6 +401,7 @@ fn parse_core(
         });
     }
 
+    check_unsupported(core, warnings)?;
     parse_scalars(core, config, warnings)?;
     parse_acceptors(core, config, warnings)?;
     parse_security_settings(core, config, warnings)?;
@@ -408,6 +409,78 @@ fn parse_core(
     parse_addresses(core, config, warnings)?;
     parse_diverts(core, config, warnings)?;
     parse_wildcards(core, config, warnings)?;
+    Ok(())
+}
+
+/// `<core>` children Saranga reads but does not act on yet, and why.
+const NOT_ACTED_ON: &[(&str, &str)] = &[
+    (
+        "cluster-connections",
+        "clustering is not supported; the broker runs on its own",
+    ),
+    ("broadcast-groups", "clustering is not supported"),
+    ("discovery-groups", "clustering is not supported"),
+    ("bridges", "core bridges are not supported"),
+    ("federations", "federation is not supported"),
+    (
+        "broker-connections",
+        "AMQP broker connections are not supported",
+    ),
+    ("connection-routers", "connection routers are not supported"),
+    (
+        "grouping-handler",
+        "clustered message grouping is not supported",
+    ),
+    ("broker-plugins", "broker plugins are not supported"),
+    ("metrics", "metrics are not supported yet"),
+    ("metrics-plugin", "metrics are not supported yet"),
+    (
+        "resource-limit-settings",
+        "resource limits are not enforced",
+    ),
+    (
+        "journal-retention-directory",
+        "journal retention is not supported; no history is kept",
+    ),
+];
+
+/// Refuses what would make the broker something Saranga cannot be (an HA
+/// backup, a JDBC store) and warns about features it does not act on.
+fn check_unsupported(core: Node<'_, '_>, warnings: &mut Vec<Warning>) -> Result<()> {
+    if let Some(store) = first(core, "store")
+        && first(store, "database-store").is_some()
+    {
+        return Err(ConfigError::Unsupported {
+            element: "database-store".to_owned(),
+            reason: "JDBC persistence is not supported; use the file journal",
+        });
+    }
+    if let Some(ha) = first(core, "ha-policy") {
+        let role = |names: &[&str]| {
+            ha.descendants()
+                .any(|n| n.is_element() && names.contains(&n.tag_name().name()))
+        };
+        if role(&["backup", "slave", "colocated"]) {
+            return Err(ConfigError::Unsupported {
+                element: "ha-policy".to_owned(),
+                reason: "a backup broker is not supported; Saranga can only run as a primary",
+            });
+        }
+        if role(&["primary", "master", "scale-down"]) {
+            warnings.push(Warning::Unsupported {
+                name: "ha-policy".to_owned(),
+                reason: "high availability is not supported; the broker runs on its own and no backup takes over from it",
+            });
+        }
+    }
+    for (name, reason) in NOT_ACTED_ON {
+        if elements(core).any(|c| c.tag_name().name() == *name) {
+            warnings.push(Warning::Unsupported {
+                name: (*name).to_owned(),
+                reason,
+            });
+        }
+    }
     Ok(())
 }
 

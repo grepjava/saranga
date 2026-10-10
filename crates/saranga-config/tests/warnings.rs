@@ -27,13 +27,47 @@ fn unknown_core_element() {
 }
 
 #[test]
-fn known_but_unimplemented_elements_are_silent() {
+fn features_not_acted_on_are_reported() {
     let c = parse(
         r##"<configuration><core>
               <security-settings><security-setting match="#"><permission type="send" roles="amq"/></security-setting></security-settings>
               <cluster-connections/>
               <critical-analyzer>true</critical-analyzer>
+              <ha-policy><replication><primary/></replication></ha-policy>
            </core></configuration>"##,
+    );
+    let names: Vec<String> = c
+        .warnings
+        .iter()
+        .map(|w| match w {
+            Warning::Unsupported { name, .. } => name.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    // The critical analyzer only watches the broker; nothing to report.
+    assert_eq!(names, ["ha-policy", "cluster-connections"]);
+}
+
+#[test]
+fn backups_and_jdbc_are_refused() {
+    for xml in [
+        "<ha-policy><replication><backup/></replication></ha-policy>",
+        "<ha-policy><shared-store><slave/></shared-store></ha-policy>",
+        "<ha-policy><shared-store><colocated/></shared-store></ha-policy>",
+        "<store><database-store><jdbc-connection-url>x</jdbc-connection-url></database-store></store>",
+    ] {
+        let e = BrokerConfig::parse_with(
+            &format!("<configuration><core>{xml}</core></configuration>"),
+            |_| None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(e, saranga_config::ConfigError::Unsupported { .. }),
+            "{xml}: {e}"
+        );
+    }
+    let c = parse(
+        "<configuration><core><ha-policy><live-only/></ha-policy><store><file-store/></store></core></configuration>",
     );
     assert!(c.warnings.is_empty(), "{:?}", c.warnings);
 }

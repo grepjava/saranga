@@ -69,6 +69,13 @@ pub enum ConfigError {
     InvalidMatch(String),
     #[error("invalid acceptor URI {uri:?}: {reason}")]
     InvalidUri { uri: String, reason: String },
+    /// A configuration that makes the broker something Saranga cannot be
+    /// yet; starting anyway would mislead.
+    #[error("<{element}>: {reason}")]
+    Unsupported {
+        element: String,
+        reason: &'static str,
+    },
 }
 
 impl ConfigError {
