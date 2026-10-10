@@ -19,6 +19,13 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Rust client against saranga run
+        shell: bash
+        run: |
+          cargo build -p saranga-cli
+          target/debug/saranga run --config tests/golden/etc/broker.xml --bind 127.0.0.1:61616 &
+          for _ in $(seq 1 50); do (echo > /dev/tcp/127.0.0.1/61616) 2>/dev/null && break; sleep 0.2; done
+          SARANGA_TEST_BROKER=127.0.0.1:61616 cargo test -p saranga-client --test broker
 
   deny:
     runs-on: ubuntu-latest
