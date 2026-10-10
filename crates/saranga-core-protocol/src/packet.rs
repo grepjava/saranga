@@ -1,7 +1,17 @@
 use saranga_buffer::{DecodeError, Reader, Result, Writer};
 
+#[allow(unused_imports)]
+use crate::packets::cluster::*;
 use crate::packets::connection::*;
+#[allow(unused_imports)]
+use crate::packets::large::*;
 use crate::packets::message::*;
+#[allow(unused_imports)]
+use crate::packets::replication::*;
+#[allow(unused_imports)]
+use crate::packets::session::*;
+#[allow(unused_imports)]
+use crate::packets::xa::*;
 use crate::{Context, Direction, PacketCodec, RawFrame, encode_frame, types};
 
 /// Declares the [`Packet`] enum: one variant per packet struct, plus
@@ -73,6 +83,16 @@ packet_enum! {
     SessionSendMessageV2,
     SessionSendMessageV3,
     SessionReceiveMessage,
+    // ---- session ----
+    // ---- end session ----
+    // ---- xa ----
+    // ---- end xa ----
+    // ---- large ----
+    // ---- end large ----
+    // ---- cluster ----
+    // ---- end cluster ----
+    // ---- replication ----
+    // ---- end replication ----
 }
 
 fn body<P: PacketCodec + Into<Packet>>(r: &mut Reader<'_>, ctx: &Context) -> Result<Packet> {
@@ -134,6 +154,16 @@ impl Packet {
             {
                 body::<SessionReceiveMessage>(r, ctx)
             }
+            // ---- session ----
+            // ---- end session ----
+            // ---- xa ----
+            // ---- end xa ----
+            // ---- large ----
+            // ---- end large ----
+            // ---- cluster ----
+            // ---- end cluster ----
+            // ---- replication ----
+            // ---- end replication ----
             _ => Ok(Self::unknown(ty, r)),
         }
     }
