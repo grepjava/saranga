@@ -26,3 +26,8 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **`FederationConnectionConfiguration` encode/decode mismatch.** Encode writes `retryInterval` into the slot that decode reads as `maxRetryInterval`. This is an Artemis bug. Saranga keeps the wire value as-is.
 - **`ReplicationSyncFileMessage`.** The primary sends the whole 32 KiB read buffer even when fewer bytes were read. Only `dataSize` bytes are meaningful, and the rest is kept as `trailing`.
 - **1.x message layout.** Clients older than version 129 put an extra end-of-message offset into sends and receives. Artemis ignores it on decode. Saranga keeps it so the message re-encodes exactly.
+
+## Configuration differences
+- **`${...}` in `broker.xml`** resolves from environment variables. Java resolves from system properties (`-Dname=value`) first; Saranga has no system properties, so set an environment variable of the same name.
+- **Namespaces.** Elements are matched by local name, so prefixed elements that Java would miss are accepted.
+- **`xi:include`** is not expanded yet; it produces a warning.

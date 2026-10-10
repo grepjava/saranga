@@ -54,13 +54,20 @@ Phase 3 is the first release anyone could adopt. Every phase after it can ship a
 - Addresses and queues: ANYCAST and MULTICAST routing, wildcards, fully qualified queue names (FQQN), auto-create and auto-delete. Everything in Phase 2 is kept in memory, durable or not.
 - Producers and consumers with credit-based flow control: producer credits and the consumer window.
 - Acknowledgements (individual and cumulative), local transactions (commit and rollback, with redelivery and delivery counts) and browse-only consumers.
-- Enough of `broker.xml` for acceptors and addresses.
+- Enough of `broker.xml` for acceptors, address-settings (with Artemis's match rules) and addresses.
+- The JMS selector engine (`saranga-filter`). It was planned for Phase 4, but durable subscriptions with selectors are part of the Phase 2 exit check, so it moved forward.
 - `saranga run`.
 - A minimal Rust Core client (`saranga-client`).
 
 **Exit check**
-- The Artemis JMS client passes send/receive, queue, topic, durable-subscription, transacted and client-ack tests against `saranga run`. The tests are the golden scenarios, run against Saranga instead of the Java broker.
+- The Artemis JMS client passes send/receive, queue, topic, durable-subscription, transacted and client-ack tests against `saranga run`. `scripts/interop.sh saranga` runs [tests/interop/jms/Phase2.java](tests/interop/jms/Phase2.java) (24 tests) and the `core-basic` golden scenario; `scripts/interop.sh artemis` runs the same suite against the reference broker, so a wrong test shows up there first.
 - The Rust client sends and receives through Saranga.
+
+**Progress**
+- Done: the broker core, `saranga run --config`, selectors. All 24 JMS interop tests and `core-basic` pass against Saranga, as they do against Artemis 2.57.0.
+- Remaining: the Rust client and its CI tests against Saranga.
+
+**Deferred to later phases on purpose:** XA (Phase 3), large messages (Phase 5), expiry and dead-letter addresses, redelivery delay and max delivery attempts (Phase 4), acceptor address prefixes and the 1.x client prefixes (Phase 6), security (Phase 6).
 
 ## Phase 3: Persistence, on-disk compatible (first usable release)
 
@@ -81,7 +88,7 @@ Phase 3 is the first release anyone could adopt. Every phase after it can ship a
 - The address-settings match hierarchy, dead-letter and expiry addresses, redelivery delay and backoff, and max delivery attempts.
 - Scheduled delivery, duplicate detection and priority.
 - Queue types: message groups (including rebalancing), exclusive, last-value, non-destructive, ring and temporary queues.
-- Consumer filters using the full selector grammar.
+- Consumer filters: the selector engine is already done (Phase 2); what remains is the delivery cost of filtered consumers (per-consumer cursors).
 - Diverts, exclusive and non-exclusive, with transformers written as Rust plugins.
 - Consumer-window tuning.
 
