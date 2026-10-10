@@ -1,0 +1,11 @@
+[package]
+name = "saranga-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "saranga"
+path = "src/main.rs"
+
+[dependencies]
