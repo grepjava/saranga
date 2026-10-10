@@ -1,0 +1,150 @@
+     _        _               _
+    / \  ____| |_  ___ __  __(_) _____
+   / _ \|  _ \ __|/ _ \  \/  | |/  __/
+  / ___ \ | \/ |_/  __/ |\/| | |\___ \
+ /_/   \_\|   \__\____|_|  |_|_|/___ /
+ Apache Artemis 2.57.0
+
+
+
+********************************************
+B I N D I N G S  J O U R N A L
+********************************************
+Journal path: java\bindings
+#JournalFileImpl: (activemq-bindings-1.bindings id = 1, recordID = 1) (size=1048576)
+operation@AddRecord;recordID=1;userRecordType=24;isUpdate=false;compactCount=0;IDCounterEncoding [id=1000]
+operation@AddRecord;recordID=101;userRecordType=20;isUpdate=false;compactCount=0;GroupingEncoding [id=101, groupId=group-1, clusterName=cluster]
+operation@AddRecord;recordID=102;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=102, name=q, address=addr, routingType=ANYCAST, filterString=color = 'red', durable=null, user=bob, maxConsumers=10, exclusive=true, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=true, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=null, temporary=null, autoCreateAddress=null, internal=null, transient=null, autoCreated=false, fqqn=true]]
+operation@AddRecord;recordID=103;userRecordType=22;isUpdate=false;compactCount=0;QueueStatusEncoding [id=103, queueID=102, status=PAUSED]
+operation@AddRecord;recordID=104;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=104, name=addr, routingTypes={MULTICAST,ANYCAST}, autoCreated=true, internal=false]
+operation@AddRecord;recordID=105;userRecordType=46;isUpdate=false;compactCount=0;AddressStatusEncoding{status=RUNNING, id=104}
+operation@AddRecord;recordID=106;userRecordType=26;isUpdate=false;compactCount=0;PersistedSecuritySetting [storeId=106, addressMatch=secure.#, sendRoles=a,b, consumeRoles=c, createDurableQueueRoles=null, deleteDurableQueueRoles=null, createNonDurableQueueRoles=null, deleteNonDurableQueueRoles=null, manageRoles=null, browseRoles=null, createAddressRoles=null, deleteAddressRoles=null, viewRoles=v, editRoles=null]
+operation@AddRecord;recordID=107;userRecordType=27;isUpdate=false;compactCount=0;PersistedDivertConfiguration{storeId=107, divertConfiguration=DivertConfiguration [name=divert-1, routingName=route, address=from, forwardingAddress=to, exclusive=true, filterString=null, routing-type=STRIP, transformerConfiguration=TransformerConfiguration [className=org.example.Transformer, properties={zeta=1, alpha=2, key-number-three=null}]]}
+operation@AddRecord;recordID=108;userRecordType=28;isUpdate=false;compactCount=0;PersistedBridgeConfiguration{storeId=108, bridgeConfiguration=org.apache.activemq.artemis.core.config.BridgeConfiguration@7c3e2eac}
+operation@AddRecord;recordID=109;userRecordType=47;isUpdate=false;compactCount=0;PersistedUser [storeId=109, username=alice, password=****]
+operation@AddRecord;recordID=110;userRecordType=48;isUpdate=false;compactCount=0;PersistedRole [storeId=110, username=alice, roles [admin, users]]
+operation@AddRecord;recordID=111;userRecordType=50;isUpdate=false;compactCount=0;** null **
+operation@AddRecord;recordID=112;userRecordType=51;isUpdate=false;compactCount=0;** null **
+operation@AddRecord;recordID=113;userRecordType=52;isUpdate=false;compactCount=0;PersistedAddressSettingJSON{jsonSetting={"max-delivery-attempts":3}, storeId=0, addressMatch=#, setting=AddressSettings{addressFullMessagePolicy=null, maxSizeBytes=null, maxReadPageBytes=null, maxReadPageMessages=null, prefetchPageBytes=null, prefetchPageMessages=null, pageLimitBytes=null, pageLimitMessages=null, pageFullMessagePolicy=null, diskFullMessagePolicy=null, maxSizeMessages=null, pageSizeBytes=null, pageMaxCache=null, maxDeliveryAttempts=null, messageCounterHistoryDayLimit=null, redeliveryDelay=null, redeliveryMultiplier=null, redeliveryCollisionAvoidanceFactor=null, maxRedeliveryDelay=null, deadLetterAddress=null, expiryAddress=null, expiryDelay=null, minExpiryDelay=null, maxExpiryDelay=null, noExpiry=null, defaultLastValueQueue=null, defaultLastValueKey=null, defaultNonDestructive=null, defaultExclusiveQueue=null, defaultGroupRebalance=null, defaultGroupRebalancePauseDispatch=null, defaultGroupBuckets=null, defaultGroupFirstKey=null, redistributionDelay=null, sendToDLAOnNoRoute=null, slowConsumerThreshold=null, slowConsumerThresholdMeasurementUnit=null, slowConsumerCheckPeriod=null, slowConsumerPolicy=null, autoCreateJmsQueues=null, autoDeleteJmsQueues=null, autoCreateJmsTopics=null, autoDeleteJmsTopics=null, autoCreateQueues=null, autoDeleteQueues=null, autoDeleteCreatedQueues=null, autoDeleteQueuesDelay=null, autoDeleteQueuesSkipUsageCheck=null, autoDeleteQueuesMessageCount=null, defaultRingSize=null, retroactiveMessageCount=null, configDeleteQueues=null, autoCreateAddresses=null, autoDeleteAddresses=null, autoDeleteAddressesDelay=null, autoDeleteAddressesSkipUsageCheck=null, configDeleteAddresses=null, configDeleteDiverts=null, managementBrowsePageSize=null, maxSizeBytesRejectThreshold=null, defaultMaxConsumers=null, defaultPurgeOnNoConsumers=null, defaultConsumersBeforeDispatch=null, defaultDelayBeforeDispatch=null, defaultQueueRoutingType=null, defaultAddressRoutingType=null, defaultConsumerWindowSize=null, autoCreateDeadLetterResources=null, deadLetterQueuePrefix=null, deadLetterQueueSuffix=null, autoCreateExpiryResources=null, expiryQueuePrefix=null, expiryQueueSuffix=null, enableMetrics=null, managementMessageAttributeSizeLimit=null, enableIngressTimestamp=null, idCacheSize=null, queuePrefetch=null, initialQueueBufferSize=null}}
+#JournalFileImpl: (activemq-bindings-2.bindings id = 2, recordID = 2) (size=1048576)
+
+### Surviving Records Summary ###
+recordID=1;userRecordType=24;isUpdate=false;compactCount=0;IDCounterEncoding [id=1000]
+recordID=101;userRecordType=20;isUpdate=false;compactCount=0;GroupingEncoding [id=101, groupId=group-1, clusterName=cluster]
+recordID=102;userRecordType=21;isUpdate=false;compactCount=0;PersistentQueueBindingEncoding [queueConfiguration=QueueConfiguration [id=102, name=q, address=addr, routingType=ANYCAST, filterString=color = 'red', durable=null, user=bob, maxConsumers=10, exclusive=true, groupRebalance=false, groupRebalancePauseDispatch=false, groupBuckets=-1, groupFirstKey=null, lastValue=false, lastValueKey=null, nonDestructive=false, purgeOnNoConsumers=true, enabled=true, consumersBeforeDispatch=0, delayBeforeDispatch=-1, consumerPriority=null, autoDelete=false, autoDeleteDelay=0, autoDeleteMessageCount=0, ringSize=-1, configurationManaged=null, temporary=null, autoCreateAddress=null, internal=null, transient=null, autoCreated=false, fqqn=true]]
+recordID=103;userRecordType=22;isUpdate=false;compactCount=0;QueueStatusEncoding [id=103, queueID=102, status=PAUSED]
+recordID=104;userRecordType=44;isUpdate=false;compactCount=0;PersistentAddressBindingEncoding [id=104, name=addr, routingTypes={MULTICAST,ANYCAST}, autoCreated=true, internal=false]
+recordID=105;userRecordType=46;isUpdate=false;compactCount=0;AddressStatusEncoding{status=RUNNING, id=104}
+recordID=106;userRecordType=26;isUpdate=false;compactCount=0;PersistedSecuritySetting [storeId=106, addressMatch=secure.#, sendRoles=a,b, consumeRoles=c, createDurableQueueRoles=null, deleteDurableQueueRoles=null, createNonDurableQueueRoles=null, deleteNonDurableQueueRoles=null, manageRoles=null, browseRoles=null, createAddressRoles=null, deleteAddressRoles=null, viewRoles=v, editRoles=null]
+recordID=107;userRecordType=27;isUpdate=false;compactCount=0;PersistedDivertConfiguration{storeId=107, divertConfiguration=DivertConfiguration [name=divert-1, routingName=route, address=from, forwardingAddress=to, exclusive=true, filterString=null, routing-type=STRIP, transformerConfiguration=TransformerConfiguration [className=org.example.Transformer, properties={zeta=1, alpha=2, key-number-three=null}]]}
+recordID=108;userRecordType=28;isUpdate=false;compactCount=0;PersistedBridgeConfiguration{storeId=108, bridgeConfiguration=org.apache.activemq.artemis.core.config.BridgeConfiguration@7c3e2eac}
+recordID=109;userRecordType=47;isUpdate=false;compactCount=0;PersistedUser [storeId=109, username=alice, password=****]
+recordID=110;userRecordType=48;isUpdate=false;compactCount=0;PersistedRole [storeId=110, username=alice, roles [admin, users]]
+recordID=111;userRecordType=50;isUpdate=false;compactCount=0;** null **
+recordID=112;userRecordType=51;isUpdate=false;compactCount=0;** null **
+recordID=113;userRecordType=52;isUpdate=false;compactCount=0;PersistedAddressSettingJSON{jsonSetting={"max-delivery-attempts":3}, storeId=0, addressMatch=#, setting=AddressSettings{addressFullMessagePolicy=null, maxSizeBytes=null, maxReadPageBytes=null, maxReadPageMessages=null, prefetchPageBytes=null, prefetchPageMessages=null, pageLimitBytes=null, pageLimitMessages=null, pageFullMessagePolicy=null, diskFullMessagePolicy=null, maxSizeMessages=null, pageSizeBytes=null, pageMaxCache=null, maxDeliveryAttempts=null, messageCounterHistoryDayLimit=null, redeliveryDelay=null, redeliveryMultiplier=null, redeliveryCollisionAvoidanceFactor=null, maxRedeliveryDelay=null, deadLetterAddress=null, expiryAddress=null, expiryDelay=null, minExpiryDelay=null, maxExpiryDelay=null, noExpiry=null, defaultLastValueQueue=null, defaultLastValueKey=null, defaultNonDestructive=null, defaultExclusiveQueue=null, defaultGroupRebalance=null, defaultGroupRebalancePauseDispatch=null, defaultGroupBuckets=null, defaultGroupFirstKey=null, redistributionDelay=null, sendToDLAOnNoRoute=null, slowConsumerThreshold=null, slowConsumerThresholdMeasurementUnit=null, slowConsumerCheckPeriod=null, slowConsumerPolicy=null, autoCreateJmsQueues=null, autoDeleteJmsQueues=null, autoCreateJmsTopics=null, autoDeleteJmsTopics=null, autoCreateQueues=null, autoDeleteQueues=null, autoDeleteCreatedQueues=null, autoDeleteQueuesDelay=null, autoDeleteQueuesSkipUsageCheck=null, autoDeleteQueuesMessageCount=null, defaultRingSize=null, retroactiveMessageCount=null, configDeleteQueues=null, autoCreateAddresses=null, autoDeleteAddresses=null, autoDeleteAddressesDelay=null, autoDeleteAddressesSkipUsageCheck=null, configDeleteAddresses=null, configDeleteDiverts=null, managementBrowsePageSize=null, maxSizeBytesRejectThreshold=null, defaultMaxConsumers=null, defaultPurgeOnNoConsumers=null, defaultConsumersBeforeDispatch=null, defaultDelayBeforeDispatch=null, defaultQueueRoutingType=null, defaultAddressRoutingType=null, defaultConsumerWindowSize=null, autoCreateDeadLetterResources=null, deadLetterQueuePrefix=null, deadLetterQueueSuffix=null, autoCreateExpiryResources=null, expiryQueuePrefix=null, expiryQueueSuffix=null, enableMetrics=null, managementMessageAttributeSizeLimit=null, enableIngressTimestamp=null, idCacheSize=null, queuePrefetch=null, initialQueueBufferSize=null}}
+
+### Prepared TX ###
+
+### Message Counts ###
+message count=0
+large message count=0
+message reference count
+prepared message count=0
+prepared large message count=0
+prepared message reference count
+
+********************************************
+M E S S A G E S   J O U R N A L
+********************************************
+Journal path: java\journal
+#JournalFileImpl: (activemq-data-1.amq id = 1, recordID = 1) (size=10485760)
+operation@AddRecord;recordID=114;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=114;userMessageID=07070707-0707-1707-8707-070707070707;msg=CoreMessage[messageID=114, durable=true, userID=07070707-0707-1707-8707-070707070707, priority=9, timestamp=Tue Nov 14 22:13:20 UTC 2023, expiration=Fri Jan 01 00:00:00 UTC 2100, durable=true, address=addr, size=201, properties=TypedProperties[pNull=NULL-value, pFloat=1.0E-5, pBytes=[0102 03], _AMQ_ROUTE_TO=[0000 0000 0000 0009 0000 0000 0000 0100], bytesAsLongs[9, 256], pChar=A]]@87060781
+operation@Update;recordID=114;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=102]
+operation@Update;recordID=114;userRecordType=34;isUpdate=true;compactCount=0;DeliveryCountUpdateEncoding [queueID=102, count=3]
+operation@Update;recordID=114;userRecordType=36;isUpdate=true;compactCount=0;ScheduledDeliveryEncoding [scheduledDeliveryTime=4102444800000, queueID=102]
+operation@AddRecord;recordID=115;userRecordType=30;isUpdate=false;compactCount=0;LargeMessage(messageID=115;msg=LargeServerMessage[messageID=115,durable=true,userID=null,priority=9, timestamp=Tue Nov 14 22:13:20 UTC 2023,expiration=Fri Jan 01 00:00:00 UTC 2100, durable=true, address=addr, properties=TypedProperties[pNull=NULL-value, pFloat=1.0E-5, pBytes=[0102 03], _AMQ_ROUTE_TO=[0000 0000 0000 0009 0000 0000 0000 0100], bytesAsLongs[9, 256], pChar=A]]@1232373427
+operation@AddRecord;recordID=116;userRecordType=29;isUpdate=false;compactCount=0;PendingLargeMessageEncoding::MessageID=115
+operation@AddRecord;recordID=117;userRecordType=37;isUpdate=false;compactCount=0;DuplicateIDEncoding [address=BRIDGE.addr, duplID=0909 0909 0909 0909 0909 0909 0909 0909 0000 0000 0000 004D / nodeUUID=09090909-0909-1909-8909-090909090909 messageID=77]
+operation@AddRecord;recordID=118;userRecordType=38;isUpdate=false;compactCount=0;HeuristicCompletionEncoding [xid=XidImpl (1648232591 bq:-1.1 formatID:-3 gtxid:2 base64:_wEC_f___w==, isCommit=false]
+operation@AddRecord;recordID=119;userRecordType=35;isUpdate=false;compactCount=0;PageTransactionInfoImpl(transactionID=55,id=119,numberOfMessages=4)
+operation@Update;recordID=119;userRecordType=35;isUpdate=true;compactCount=0;PageUpdateTXEncoding [pageTX=55, records=1]
+operation@AddRecord;recordID=120;userRecordType=39;isUpdate=false;compactCount=0;CursorAckRecordEncoding [queueID=102, position=PagePositionImpl [pageNr=3, messageNr=4, recordID=-1]]
+operation@AddRecord;recordID=121;userRecordType=42;isUpdate=false;compactCount=0;PGComplete [queueID=102, position=PagePositionImpl [pageNr=2, messageNr=-1, recordID=-1]]
+operation@AddRecord;recordID=122;userRecordType=40;isUpdate=false;compactCount=0;PageCountRecord [queueID=102, value=10, persistentSize=1000]
+operation@Update;recordID=122;userRecordType=40;isUpdate=true;compactCount=0;PageCountRecord [queueID=102, value=12, persistentSize=0]
+#Counter queue 102 value=12 persistentSize=0, result=12
+
+operation@AddRecord;recordID=123;userRecordType=41;isUpdate=false;compactCount=0;PageCountRecordInc [queueID=102, value=-20, persistentSize=5]
+operation@Update;recordID=123;userRecordType=41;isUpdate=true;compactCount=0;PageCountRecordInc [queueID=999, value=1, persistentSize=0]
+#Counter queue 999 value=0 persistentSize=0 increased by 1
+
+operation@AddRecord;recordID=124;userRecordType=43;isUpdate=false;compactCount=0;PageCountPendingImpl [queueID=102, pageID=6]
+operation@AddRecord;recordID=125;userRecordType=53;isUpdate=false;compactCount=0;MapRecord{collectionID=102, id=5, key=AckRetry{nodeID='node-a', messageID=114, reason=EXPIRED, pageAttempts=0, queueAttempts=0, viewCount=0}, value=AckRetry{nodeID='node-a', messageID=114, reason=EXPIRED, pageAttempts=0, queueAttempts=0, viewCount=0}}
+operation@AddRecord;recordID=126;userRecordType=54;isUpdate=false;compactCount=0;** null **
+operation@AddRecord;recordID=127;userRecordType=49;isUpdate=false;compactCount=0;** null **
+operation@AddRecord;recordID=128;userRecordType=31;isUpdate=false;compactCount=0;ADD-MESSAGE is not supported any longer, use export/import
+operation@AddRecordTX;txID=129,recordID=130;userRecordType=32;isUpdate=false;compactCount=0;AddRef;QueueEncoding [queueID=102]
+operation@UpdateTX;txID=131,recordID=114;userRecordType=33;isUpdate=true;compactCount=0;ACK;QueueEncoding [queueID=102]
+operation@DeleteRecordTX;txID=131,recordID=119;userRecordType=0;isUpdate=true;compactCount=0;** null **
+operation@Prepare,txID=131,numberOfRecords=2,extraData=AAAAAQAAAAFiAAAAAWc=, xid=XidImpl (207471778 bq:98 formatID:1 gtxid:103 base64:YmcBAAAA
+#JournalFileImpl: (activemq-data-2.amq id = 2, recordID = 2) (size=10485760)
+
+#Counters during initial load:
+Queue 102 value=12
+Queue 999 value=0
+### Surviving Records Summary ###
+recordID=114;userRecordType=45;isUpdate=false;compactCount=0;Message(messageID=114;userMessageID=07070707-0707-1707-8707-070707070707;msg=CoreMessage[messageID=114, durable=true, userID=07070707-0707-1707-8707-070707070707, priority=9, timestamp=Tue Nov 14 22:13:20 UTC 2023, expiration=Fri Jan 01 00:00:00 UTC 2100, durable=true, address=addr, size=201, properties=TypedProperties[pNull=NULL-value, pFloat=1.0E-5, pBytes=[0102 03], _AMQ_ROUTE_TO=[0000 0000 0000 0009 0000 0000 0000 0100], bytesAsLongs[9, 256], pChar=A]]@1111897955
+recordID=114;userRecordType=32;isUpdate=true;compactCount=0;AddRef;QueueEncoding [queueID=102]
+recordID=114;userRecordType=34;isUpdate=true;compactCount=0;DeliveryCountUpdateEncoding [queueID=102, count=3]
+recordID=114;userRecordType=36;isUpdate=true;compactCount=0;ScheduledDeliveryEncoding [scheduledDeliveryTime=4102444800000, queueID=102]
+recordID=115;userRecordType=30;isUpdate=false;compactCount=0;LargeMessage(messageID=115;msg=LargeServerMessage[messageID=115,durable=true,userID=null,priority=9, timestamp=Tue Nov 14 22:13:20 UTC 2023,expiration=Fri Jan 01 00:00:00 UTC 2100, durable=true, address=addr, properties=TypedProperties[pNull=NULL-value, pFloat=1.0E-5, pBytes=[0102 03], _AMQ_ROUTE_TO=[0000 0000 0000 0009 0000 0000 0000 0100], bytesAsLongs[9, 256], pChar=A]]@1509309988
+recordID=116;userRecordType=29;isUpdate=false;compactCount=0;PendingLargeMessageEncoding::MessageID=115
+recordID=117;userRecordType=37;isUpdate=false;compactCount=0;DuplicateIDEncoding [address=BRIDGE.addr, duplID=0909 0909 0909 0909 0909 0909 0909 0909 0000 0000 0000 004D / nodeUUID=09090909-0909-1909-8909-090909090909 messageID=77]
+recordID=118;userRecordType=38;isUpdate=false;compactCount=0;HeuristicCompletionEncoding [xid=XidImpl (1643141512 bq:-1.1 formatID:-3 gtxid:2 base64:_wEC_f___w==, isCommit=false]
+recordID=119;userRecordType=35;isUpdate=false;compactCount=0;PageTransactionInfoImpl(transactionID=55,id=119,numberOfMessages=4)
+recordID=119;userRecordType=35;isUpdate=true;compactCount=0;PageUpdateTXEncoding [pageTX=55, records=1]
+recordID=120;userRecordType=39;isUpdate=false;compactCount=0;CursorAckRecordEncoding [queueID=102, position=PagePositionImpl [pageNr=3, messageNr=4, recordID=-1]]
+recordID=121;userRecordType=42;isUpdate=false;compactCount=0;PGComplete [queueID=102, position=PagePositionImpl [pageNr=2, messageNr=-1, recordID=-1]]
+recordID=122;userRecordType=40;isUpdate=false;compactCount=0;PageCountRecord [queueID=102, value=10, persistentSize=1000]
+##SubsCounter for queue=102, value=10
+
+recordID=122;userRecordType=40;isUpdate=true;compactCount=0;PageCountRecord [queueID=102, value=12, persistentSize=0]
+##SubsCounter for queue=102, value=12
+
+recordID=123;userRecordType=41;isUpdate=false;compactCount=0;PageCountRecordInc [queueID=102, value=-20, persistentSize=5]
+##SubsCounter for queue=102, value=12
+
+recordID=123;userRecordType=41;isUpdate=true;compactCount=0;PageCountRecordInc [queueID=999, value=1, persistentSize=0]
+##SubsCounter for queue=999, value=0
+
+recordID=124;userRecordType=43;isUpdate=false;compactCount=0;PageCountPendingImpl [queueID=102, pageID=6]
+recordID=125;userRecordType=53;isUpdate=false;compactCount=0;MapRecord{collectionID=102, id=5, key=AckRetry{nodeID='node-a', messageID=114, reason=EXPIRED, pageAttempts=0, queueAttempts=0, viewCount=0}, value=AckRetry{nodeID='node-a', messageID=114, reason=EXPIRED, pageAttempts=0, queueAttempts=0, viewCount=0}}
+recordID=126;userRecordType=54;isUpdate=false;compactCount=0;** null **
+recordID=127;userRecordType=49;isUpdate=false;compactCount=0;** null **
+recordID=128;userRecordType=31;isUpdate=false;compactCount=0;ADD-MESSAGE is not supported any longer, use export/import
+### Page Counters
+Queue 102 value=12
+Queue 999 value=0
+
+### Prepared TX ###
+131
+- recordID=114;userRecordType=33;isUpdate=true;compactCount=0;ACK;QueueEncoding [queueID=102]
+- recordID=119;userRecordType=0;isUpdate=true;compactCount=0;** null ** <marked to delete>
+
+### Failed Transactions (Missing commit/prepare/rollback record) ###
+Transaction 129 failed with these records:
+- recordID=130;userRecordType=32;isUpdate=false;compactCount=0;AddRef;QueueEncoding [queueID=102]
+
+### Message Counts ###
+message count=2
+large message count=1
+message reference count
+queue id 102,count=1
+prepared message count=0
+prepared large message count=0
+prepared message reference count
+
+********************************************
+P A G I N G
+********************************************

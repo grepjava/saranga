@@ -565,6 +565,7 @@ dependencies = [
  "clap",
  "saranga-config",
  "saranga-server",
+ "saranga-storage",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -199,8 +199,14 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-/// Artemis `UUID.toString()`: lower-case hex, `8-4-4-4-12`.
+/// `new UUID(UUID.TYPE_TIME_BASED, bytes).toString()` (Artemis's `UUID`):
+/// lower-case hex, `8-4-4-4-12`. The constructor overwrites the version
+/// nibble with 1 and the variant bits with `10`, so bytes that are not a
+/// time-based UUID print differently from what is stored.
 pub fn uuid(bytes: &[u8; 16]) -> String {
+    let mut bytes = *bytes;
+    bytes[6] = (bytes[6] & 0x0f) | 0x10;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let mut s = String::with_capacity(36);
     for (i, b) in bytes.iter().enumerate() {
         if matches!(i, 4 | 6 | 8 | 10) {
@@ -347,6 +353,8 @@ mod tests {
             ]),
             "1092e77d-c495-11f1-9dd2-00155d1c7a2e"
         );
+        // Version and variant bits are forced, as `new UUID(TYPE_TIME_BASED, ..)` does.
+        assert_eq!(uuid(&[7; 16]), "07070707-0707-1707-8707-070707070707");
         assert_eq!(bytes_to_hex(&[0x67, 0, 0x6f, 0], 2), "6700 6F00");
         assert_eq!(bytes_to_hex(&[], 2), "[]");
         assert_eq!(base64_url(b"branch-1"), "YnJhbmNoLTE=");

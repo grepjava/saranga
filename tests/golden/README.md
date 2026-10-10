@@ -48,6 +48,12 @@ dir, mounted at `/golden/data`, with explicit `--journal`, `--bindings`, `--pagi
 - The tool prints a warning about running outside a broker instance on stderr. It is not
   part of the file.
 
+`crates/saranga-storage/tests/data_print.rs` compares `saranga data print` with every
+`data-print.txt`. It ignores the banner (everything before the first `****` line), the
+`Journal path:` lines and the identity hash codes; everything else must match exactly.
+To run Java's tool on the host instead of Docker with the same output, set
+`JAVA_ARGS_APPEND="-Duser.timezone=UTC -Dstdout.encoding=UTF-8"`.
+
 `golden-verify.sh` starts a broker on a fresh copy of `data.tar.gz` and runs
 `tests/golden-gen/tools/DumpQueues.java` with the queues in `QUEUES`. The golden files are
 never touched. `artemis` mode copies the data into the reference image. `saranga` mode

@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
+mod data;
+
 use clap::{Parser, Subcommand};
 use saranga_server::postoffice::SelectorFilters;
 use saranga_server::{Broker, BrokerConfig};
@@ -37,17 +39,26 @@ enum Command {
         #[arg(long)]
         bind: Option<SocketAddr>,
     },
+    /// Tools on a broker's data directory.
+    #[command(subcommand)]
+    Data(data::DataCommand),
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let logs = tracing_subscriber::fmt().with_env_filter(
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    );
+    if matches!(cli.command, Command::Data(_)) {
+        // The data tools print their report on stdout.
+        logs.with_writer(std::io::stderr).init();
+    } else {
+        logs.init();
+    }
+    match cli.command {
         Command::Run { config, bind } => run(config, bind).await,
+        Command::Data(cmd) => data::run(cmd),
     }
 }
 
