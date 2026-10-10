@@ -8,6 +8,7 @@ pub mod config;
 pub mod core_protocol;
 pub mod error;
 pub mod message;
+pub mod node;
 pub mod postoffice;
 pub mod queue;
 pub mod settings;
