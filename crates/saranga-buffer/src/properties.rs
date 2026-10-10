@@ -60,7 +60,7 @@ impl PropertyValue {
     fn encode(&self, w: &mut Writer) {
         match self {
             Self::Null => w.u8(c::NULL),
-            Self::Bool(v) => w.u8(c::BOOLEAN).bool(*v),
+            Self::Bool(v) => w.u8(c::BOOLEAN).byte_buf_bool(*v),
             Self::Byte(v) => w.u8(c::BYTE).i8(*v),
             Self::Bytes(v) => w.u8(c::BYTES).byte_array(v),
             Self::Short(v) => w.u8(c::SHORT).i16(*v),

@@ -56,7 +56,16 @@ impl Writer {
         self.u8(v as u8)
     }
 
+    /// `ActiveMQBuffer.writeBoolean`: true is written as `0xFF` (-1).
+    /// Used by packets and journal records.
     pub fn bool(&mut self, v: bool) -> &mut Self {
+        self.u8(if v { 0xff } else { 0 })
+    }
+
+    /// Netty `ByteBuf.writeBoolean`: true is written as `0x01`. Used where
+    /// Artemis writes to the raw `ByteBuf` (`TypedProperties`, `CoreMessage`
+    /// headers).
+    pub fn byte_buf_bool(&mut self, v: bool) -> &mut Self {
         self.u8(v as u8)
     }
 

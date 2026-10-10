@@ -1,7 +1,14 @@
 [package]
 name = "saranga-core-protocol"
+description = "Artemis Core protocol packet codec"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+saranga-buffer = { path = "../saranga-buffer" }
+saranga-message = { path = "../saranga-message" }
+thiserror = "2"
+
+[dev-dependencies]
+flate2 = "1"

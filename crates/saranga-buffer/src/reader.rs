@@ -61,7 +61,7 @@ impl<'a> Reader<'a> {
         Ok(self.u8()? as i8)
     }
 
-    /// Netty `readBoolean`: any non-zero byte is true.
+    /// Any non-zero byte is true (both `ActiveMQBuffer` and Netty).
     pub fn bool(&mut self) -> Result<bool> {
         Ok(self.u8()? != 0)
     }

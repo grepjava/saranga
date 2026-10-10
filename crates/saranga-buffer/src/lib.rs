@@ -4,12 +4,14 @@
 //!
 //! All multi-byte integers are big-endian, as in Netty's `ByteBuf`.
 
+mod codec;
 mod jstring;
 mod properties;
 mod reader;
 mod simple_string;
 mod writer;
 
+pub use codec::Codec;
 pub use jstring::JString;
 pub use properties::{PropertyValue, TypedProperties};
 pub use reader::Reader;
