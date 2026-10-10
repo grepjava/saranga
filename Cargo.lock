@@ -350,6 +350,11 @@ dependencies = [
 [[package]]
 name = "saranga-filter"
 version = "0.0.1"
+dependencies = [
+ "saranga-buffer",
+ "saranga-message",
+ "thiserror",
+]
 
 [[package]]
 name = "saranga-ha"
