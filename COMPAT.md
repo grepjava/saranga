@@ -38,3 +38,11 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - Group commit comes from a flusher thread that syncs whatever accumulated while the previous sync ran, rather than `TimedBuffer`'s timer, so `journal-buffer-timeout` has no effect.
 - `server.lock` holds the node ID and state as in Artemis; the primary lock is a lock on `serverlock.1`. The node ID of a new instance is a random UUID rather than a time-based one.
 - The XA error messages print `XidImpl (<n> ...` with a hash of the Xid where Java prints an identity hash.
+
+## Queue semantics differences
+- **delay-before-dispatch** ends on a timer. Artemis has no timer: it starts dispatching at the next delivery attempt after the delay, such as a new message, a consumer's credits or a forced receive.
+- **Last-value queues** drop a replaced value as soon as its replacement arrives. Artemis prunes on its next delivery pass. The queue holds the same messages afterwards.
+- **Message groups.** While a group's consumer has no credit, only that group's messages wait. Artemis ends the whole delivery pass at that point.
+- **Duplicate detection** checks the message a client sends. Copies a divert makes are not checked against the forwarding address's cache.
+- **A prepared XA branch's duplicate IDs** keep their own journal record IDs after recovery. Artemis files them under the transaction's ID.
+- **Divert transformers** are Rust plugins, not Java classes. The embedding application registers a `Transformer` under the class name that `broker.xml` gives. A divert whose transformer is not registered is not deployed, and a warning is logged.

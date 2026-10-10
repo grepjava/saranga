@@ -22,7 +22,12 @@ import org.apache.activemq.artemis.api.core.client.ActiveMQClient;
 import org.apache.activemq.artemis.api.core.client.ClientSession;
 import org.apache.activemq.artemis.api.core.client.ClientSessionFactory;
 import org.apache.activemq.artemis.api.core.client.ServerLocator;
+import org.apache.activemq.artemis.core.transaction.impl.XidImpl;
 import org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory;
+import org.apache.activemq.artemis.jms.client.ActiveMQXAConnectionFactory;
+import javax.transaction.xa.XAException;
+import javax.transaction.xa.XAResource;
+import javax.transaction.xa.Xid;
 
 public class Phase4 {
     static String url;
@@ -87,6 +92,8 @@ public class Phase4 {
         tests.put("divertFilter", Phase4::divertFilter);
         tests.put("divertRoutingType", Phase4::divertRoutingType);
         tests.put("consumerWindowSize", Phase4::consumerWindowSize);
+        tests.put("sendToDlaOnNoRoute", Phase4::sendToDlaOnNoRoute);
+        tests.put("xaTransactionTimeout", Phase4::xaTransactionTimeout);
 
         int failed = 0;
         for (Map.Entry<String, Test> t : tests.entrySet()) {
@@ -102,6 +109,57 @@ public class Phase4 {
         }
         System.out.println(failed == 0 ? "ALL PASSED" : failed + " FAILED");
         System.exit(failed == 0 ? 0 : 1);
+    }
+
+    static void sendToDlaOnNoRoute() throws Exception {
+        // p4.noroute.#: send-to-dla-on-no-route, dead-letter-address p4.DLA
+        String t = name("noroute.t");
+        with(c -> {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                Topic topic = s.createTopic(t);
+                MessageProducer p = s.createProducer(topic);
+                p.send(tagged(s, "nobody", t));
+                // With a subscriber the message routes normally.
+                MessageConsumer sub = s.createConsumer(topic);
+                p.send(tagged(s, "somebody", t));
+                eq("somebody", text(sub.receive(2000)), "subscriber gets the routed message");
+            }
+            List<Message> dead = take(c, "p4.DLA", byId(t), 2000);
+            eq(List.of("nobody"), texts(dead), "unrouted message on the dead-letter address");
+            eq(t, dead.get(0).getStringProperty("_AMQ_ORIG_ADDRESS"), "_AMQ_ORIG_ADDRESS");
+        });
+    }
+
+    static void xaTransactionTimeout() throws Exception {
+        // A branch past its timeout is rolled back by the broker; its send never arrives.
+        String q = name("plain.xatimeout");
+        try (XAConnection xc = new ActiveMQXAConnectionFactory(url).createXAConnection();
+             Connection plain = cf(null).createConnection()) {
+            xc.start();
+            plain.start();
+            XASession xs = xc.createXASession();
+            XAResource xa = xs.getXAResource();
+            check(xa.setTransactionTimeout(1), "timeout set");
+            Xid xid = new XidImpl("b".getBytes(), 7, ("p4-" + RUN).getBytes());
+            xa.start(xid, XAResource.TMNOFLAGS);
+            xs.createProducer(xs.createQueue(q)).send(xs.createTextMessage("late"));
+            Thread.sleep(3500);
+            List<String> codes = new ArrayList<>();
+            try {
+                xa.end(xid, XAResource.TMSUCCESS);
+                codes.add("end ok");
+            } catch (XAException e) {
+                codes.add("end " + e.errorCode);
+            }
+            try {
+                xa.commit(xid, true);
+                codes.add("commit ok");
+            } catch (XAException e) {
+                codes.add("commit " + e.errorCode);
+            }
+            eq(List.of("end -6", "commit -4"), codes, "end and commit after the timeout");
+            check(take(plain, q, null, 500).isEmpty(), "the timed-out send never arrives");
+        }
     }
 
     // ----------------------------------------------------------------- helpers

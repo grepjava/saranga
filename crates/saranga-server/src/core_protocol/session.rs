@@ -266,7 +266,7 @@ impl CoreSession {
             producers: HashMap::new(),
             tx,
             pending_tx: None,
-            timeout_seconds: transaction::ResourceManager::TIMEOUT_SECONDS,
+            timeout_seconds: -1,
             ops: Vec::new(),
             actions: Vec::new(),
             completer: completer_tx,
@@ -681,14 +681,18 @@ impl CoreSession {
                 true,
                 Ok(Some(
                     SessionXAGetTimeoutResponseMessage {
-                        timeout_seconds: transaction::ResourceManager::TIMEOUT_SECONDS,
+                        timeout_seconds: self.broker.resource_manager().timeout_seconds(),
                     }
                     .into(),
                 )),
                 false,
             ),
             Packet::SessionXASetTimeoutMessage(p) => {
+                // xaSetTimeout
                 self.timeout_seconds = p.timeout_seconds;
+                if let Some(tx) = &self.tx {
+                    transaction::lock(tx).timeout_seconds = p.timeout_seconds;
+                }
                 (
                     true,
                     Ok(Some(SessionXASetTimeoutResponseMessage { ok: true }.into())),
@@ -1023,6 +1027,7 @@ impl CoreSession {
             }
         }
         let tx = self.new_tx(Some(xid.clone()));
+        transaction::lock(&tx).timeout_seconds = self.timeout_seconds;
         self.tx = Some(tx.clone());
         if !self.broker.resource_manager().put(xid.clone(), tx) {
             return Err(XaError::new(

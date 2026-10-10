@@ -15,12 +15,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 failed=0
 
 # Scenarios whose recovery differs from Artemis only through features of
-# later phases: large messages (Phase 5), scheduled delivery and message
-# groups (Phase 4).
+# later phases: large messages (Phase 5).
 declare -A LATER=(
   [core-large]="large messages, Phase 5"
-  [persist-durable]="scheduled delivery and message groups, Phase 4"
-  [persist-crash]="scheduled delivery, Phase 4"
 )
 
 echo "== Saranga recovers the golden data directories"

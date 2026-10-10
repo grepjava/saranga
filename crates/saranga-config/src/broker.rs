@@ -267,6 +267,17 @@ pub struct DivertConfig {
     pub exclusive: bool,
     pub filter: Option<String>,
     pub routing_type: DivertRoutingType,
+    pub transformer: Option<TransformerConfig>,
+}
+
+/// `TransformerConfiguration`: a transformer by class name, with its
+/// properties. Saranga looks the name up among the transformers the
+/// embedding application registered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransformerConfig {
+    pub class_name: String,
+    /// `<property key value>` pairs, in document order.
+    pub properties: Vec<(String, String)>,
 }
 
 /// The broker configuration read from `broker.xml`. Every field the file
@@ -296,6 +307,10 @@ pub struct BrokerConfig {
     /// `message-expiry-scan-period` in milliseconds; `-1` turns the expiry
     /// reaper off.
     pub message_expiry_scan_period: i64,
+    /// `transaction-timeout` in milliseconds.
+    pub transaction_timeout: i64,
+    /// `transaction-timeout-scan-period` in milliseconds.
+    pub transaction_timeout_scan_period: i64,
     /// `id-cache-size`: duplicate IDs remembered per address.
     pub id_cache_size: i32,
     /// `persist-id-cache`: duplicate IDs are journaled.
@@ -314,6 +329,8 @@ impl BrokerConfig {
     pub const DEFAULT_GLOBAL_MAX_MESSAGES: i64 = -1;
     pub const DEFAULT_MESSAGE_EXPIRY_SCAN_PERIOD: i64 = 30000;
     pub const DEFAULT_ID_CACHE_SIZE: i32 = 20000;
+    pub const DEFAULT_TRANSACTION_TIMEOUT: i64 = 300000;
+    pub const DEFAULT_TRANSACTION_TIMEOUT_SCAN_PERIOD: i64 = 1000;
     pub const DEFAULT_PERSIST_ID_CACHE: bool = true;
 
     /// Parses `broker.xml` text, resolving `${...}` from environment
@@ -375,6 +392,8 @@ impl Default for BrokerConfig {
             addresses: Vec::new(),
             diverts: Vec::new(),
             message_expiry_scan_period: Self::DEFAULT_MESSAGE_EXPIRY_SCAN_PERIOD,
+            transaction_timeout: Self::DEFAULT_TRANSACTION_TIMEOUT,
+            transaction_timeout_scan_period: Self::DEFAULT_TRANSACTION_TIMEOUT_SCAN_PERIOD,
             id_cache_size: Self::DEFAULT_ID_CACHE_SIZE,
             persist_id_cache: Self::DEFAULT_PERSIST_ID_CACHE,
             warnings: Vec::new(),

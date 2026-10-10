@@ -123,11 +123,17 @@ pub struct BrokerConfig {
     pub connection_ttl_override: i64,
     pub addresses: Vec<AddressDeployment>,
     pub diverts: Vec<postoffice::DivertDeployment>,
+    /// Divert transformers by the class name `broker.xml` refers to them by.
+    pub transformers: HashMap<String, postoffice::TransformerFactory>,
     /// The journals; `None` keeps everything in memory
     /// (`persistence-enabled` false).
     pub storage: Option<storage::StorageConfig>,
     /// `message-expiry-scan-period` in milliseconds; `-1` for none.
     pub message_expiry_scan_period: i64,
+    /// `transaction-timeout` in milliseconds.
+    pub transaction_timeout: i64,
+    /// `transaction-timeout-scan-period` in milliseconds.
+    pub transaction_timeout_scan_period: i64,
     /// `id-cache-size`.
     pub id_cache_size: i32,
     /// `persist-id-cache`.
@@ -144,8 +150,11 @@ impl BrokerConfig {
             connection_ttl_override: -1,
             addresses: Vec::new(),
             diverts: Vec::new(),
+            transformers: HashMap::new(),
             storage: None,
             message_expiry_scan_period: 30000,
+            transaction_timeout: 300000,
+            transaction_timeout_scan_period: 1000,
             id_cache_size: 20000,
             persist_id_cache: true,
         }
@@ -165,6 +174,31 @@ fn spawn_expiry_reaper(post_office: &Arc<PostOffice>, period_ms: i64) {
             };
             for q in po.queues() {
                 q.expire_scan();
+            }
+        }
+    });
+}
+
+/// `ResourceManagerImpl.TxTimeoutHandler`: every period, XA branches past
+/// their timeout are rolled back. It stops with the broker.
+fn spawn_transaction_reaper(broker: &Arc<Broker>, period_ms: i64) {
+    let broker = Arc::downgrade(broker);
+    let period = std::time::Duration::from_millis(period_ms.max(1) as u64);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(period).await;
+            let Some(b) = broker.upgrade() else { break };
+            for tx in b.resource_manager.take_timed_out(message::now_millis()) {
+                let outcome = transaction::lock(&tx).rollback();
+                match outcome {
+                    Ok(mut outcome) => {
+                        if let Err(e) = outcome.write(b.storage.as_deref()) {
+                            tracing::error!("AMQ224053: failed to timeout transaction: {e}");
+                        }
+                        outcome.apply();
+                    }
+                    Err(e) => tracing::error!("AMQ224053: failed to timeout transaction: {e}"),
+                }
             }
         }
     });
@@ -232,11 +266,12 @@ impl Broker {
             }
         }
         for d in &config.diverts {
-            if let Err(e) = post_office.deploy_divert(d) {
+            if let Err(e) = post_office.deploy_divert(d, &config.transformers) {
                 tracing::warn!("divert {}: {e}", d.name);
             }
         }
-        let resource_manager = transaction::ResourceManager::default();
+        let resource_manager =
+            transaction::ResourceManager::new((config.transaction_timeout / 1000) as i32);
         if let Some(s) = &storage {
             recovery::load_messages(s, &post_office, &resource_manager).await?;
         }
@@ -247,7 +282,7 @@ impl Broker {
             Some(l) => l.node_id().to_owned(),
             None => uuid::Uuid::new_v4().to_string(),
         };
-        Ok(Arc::new(Self {
+        let broker = Arc::new(Self {
             node_id,
             post_office,
             connection_ttl_override: config.connection_ttl_override,
@@ -256,7 +291,9 @@ impl Broker {
             resource_manager,
             storage,
             node_lock: Mutex::new(node_lock),
-        }))
+        });
+        spawn_transaction_reaper(&broker, config.transaction_timeout_scan_period);
+        Ok(broker)
     }
 
     /// A clean stop: the ID generator's checkpoint and the journals are

@@ -13,7 +13,7 @@ use crate::acceptor::AcceptorConfig;
 use crate::address_settings::AddressSettings;
 use crate::broker::{
     AddressConfig, BrokerConfig, DivertConfig, DivertRoutingType, JournalConfig, QueueConfig,
-    Warning,
+    TransformerConfig, Warning,
 };
 use crate::bytes::convert_text_bytes;
 use crate::{ConfigError, Result, RoutingType, java_len, java_parse_bool, java_trim};
@@ -420,6 +420,12 @@ fn parse_core(
     if let Some(v) = s.i64("message-expiry-scan-period", Check::MinusOneOrGtZero)? {
         config.message_expiry_scan_period = v;
     }
+    if let Some(v) = s.i64("transaction-timeout", Check::GtZero)? {
+        config.transaction_timeout = v;
+    }
+    if let Some(v) = s.i64("transaction-timeout-scan-period", Check::GtZero)? {
+        config.transaction_timeout_scan_period = v;
+    }
     if let Some(v) = s.i32("id-cache-size", Check::GeZero)? {
         config.id_cache_size = v;
     }
@@ -793,12 +799,23 @@ fn parse_divert(node: Node<'_, '_>, warnings: &mut Vec<Warning>) -> Result<Diver
             )),
         }
     };
-    if first(node, "transformer").is_some() || first(node, "transformer-class-name").is_some() {
-        warnings.push(Warning::Unsupported {
-            name: "transformer".to_owned(),
-            reason: "Java transformers cannot run in Saranga; the divert forwards untransformed",
-        });
-    }
+    let transformer = match first(node, "transformer") {
+        Some(t) => first(t, "class-name").map(|c| TransformerConfig {
+            class_name: trimmed_text(c),
+            properties: all(t, "property")
+                .map(|p| {
+                    (
+                        p.attribute("key").unwrap_or_default().to_owned(),
+                        p.attribute("value").unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect(),
+        }),
+        None => first(node, "transformer-class-name").map(|c| TransformerConfig {
+            class_name: trimmed_text(c),
+            properties: Vec::new(),
+        }),
+    };
     Ok(DivertConfig {
         name: node.attribute("name").unwrap_or_default().to_owned(),
         routing_name: first(node, "routing-name").map(trimmed_text),
@@ -810,6 +827,7 @@ fn parse_divert(node: Node<'_, '_>, warnings: &mut Vec<Warning>) -> Result<Diver
             Some(t) => node_enum(t)?,
             None => DivertRoutingType::default(),
         },
+        transformer,
     })
 }
 

@@ -227,6 +227,10 @@ under the License.
          <!-- Phase 4 interop suite (tests/interop/jms/Phase4.java). Artemis merges every
               matching entry, the most specific match winning per setting; anything not set
               here comes from the "#" catch-all below. -->
+         <address-setting match="p4.noroute.#">
+            <dead-letter-address>p4.DLA</dead-letter-address>
+            <send-to-dla-on-no-route>true</send-to-dla-on-no-route>
+         </address-setting>
          <address-setting match="p4.dla.#">
             <dead-letter-address>p4.DLA</dead-letter-address>
             <max-delivery-attempts>2</max-delivery-attempts>

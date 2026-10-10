@@ -8,7 +8,7 @@ Saranga is built in twelve phases. Each one ends with something runnable, and it
 | 1 | Encoding primitives | Done |
 | 2 | Single-node in-memory broker (Core) | Done |
 | 3 | Persistence, on-disk compatible (first usable release) | Done |
-| 4 | Queue semantics parity | Not started |
+| 4 | Queue semantics parity | Done |
 | 5 | Paging and large messages | Not started |
 | 6 | Config and security | Not started |
 | 7 | Protocols (AMQP, MQTT, STOMP, OpenWire, WebSockets) | Not started |
@@ -102,6 +102,29 @@ Phase 3 is the first release anyone could adopt. Every phase after it can ship a
 - Consumer-window tuning.
 
 **Exit check:** the ported Artemis integration tests for each feature pass.
+
+**Exit check (met)**
+- [tests/interop/jms/Phase4.java](tests/interop/jms/Phase4.java) has 48 tests ported from the Artemis integration tests. They cover:
+  - the address-settings hierarchy;
+  - dead-letter and expiry addresses, including auto-created resources and send-to-DLA-on-no-route;
+  - redelivery delay and backoff;
+  - expiry, both from the reaper and reported by the client;
+  - scheduled delivery and duplicate detection;
+  - priority, message groups (buckets, rebalance, first key), and exclusive, last-value, non-destructive, ring and temporary queues;
+  - consumers-before-dispatch and delay-before-dispatch;
+  - selectors, diverts, consumer windows and XA transaction timeouts.
+
+  Run with [tests/interop/jms/phase4.broker.xml](tests/interop/jms/phase4.broker.xml), they pass against Artemis 2.57.0 and against Saranga: `CONFIG=tests/interop/jms/phase4.broker.xml SUITE=Phase4 scripts/interop.sh saranga`.
+- The Phase 2 and Phase 3 suites still pass.
+- `scripts/cross-store.sh` still passes. Saranga now recovers the `persist-durable` and `persist-crash` golden scenarios (scheduled messages and message groups) exactly as Artemis does. Only `core-large` waits for Phase 5.
+- Divert transformers are Rust plugins: a `Transformer` registered in `BrokerConfig::transformers` under the class name that `broker.xml` gives.
+
+**Deferred on purpose:**
+- Per-consumer cursors for filtered consumers, a delivery-cost optimisation, to Phase 11.
+- Diverts and queues created through management, and the slow-consumer policy, to Phase 8.
+- Redistribution delay, to Phase 10.
+
+The behaviour differences are listed in COMPAT.md.
 
 ## Phase 5: Paging and large messages
 

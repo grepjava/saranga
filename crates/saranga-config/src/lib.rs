@@ -28,7 +28,7 @@ pub use address_settings::{
 };
 pub use broker::{
     AddressConfig, BrokerConfig, DivertConfig, DivertRoutingType, JournalConfig, JournalType,
-    QueueConfig, Warning,
+    QueueConfig, TransformerConfig, Warning,
 };
 pub use bytes::convert_text_bytes;
 pub use matcher::Match;

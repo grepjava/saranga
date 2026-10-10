@@ -108,6 +108,10 @@ pub struct Transaction {
     pub exception: Option<BrokerError>,
     /// Duplicate IDs that join their caches on commit.
     pub duplicates: Vec<crate::duplicate::PendingId>,
+    /// `createTime`, in epoch milliseconds.
+    pub created: i64,
+    /// The XA timeout the client set; -1 for the resource manager's.
+    pub timeout_seconds: i32,
 }
 
 pub type TxRef = Arc<Mutex<Transaction>>;
@@ -221,6 +225,8 @@ impl Transaction {
             acks: Vec::new(),
             exception: None,
             duplicates: Vec::new(),
+            created: crate::message::now_millis(),
+            timeout_seconds: -1,
         }
     }
 
@@ -414,14 +420,69 @@ fn base64_url(data: &[u8]) -> String {
 }
 
 /// `ResourceManagerImpl`: XA transactions by Xid, shared by all sessions.
-#[derive(Default)]
 pub struct ResourceManager {
     txs: Mutex<HashMap<Xid, TxRef>>,
+    /// `transaction-timeout` in seconds.
+    timeout_seconds: i32,
+}
+
+impl Default for ResourceManager {
+    fn default() -> Self {
+        Self::new(Self::TIMEOUT_SECONDS)
+    }
 }
 
 impl ResourceManager {
     /// `ActiveMQDefaultConfiguration.DEFAULT_TRANSACTION_TIMEOUT` (300 s).
     pub const TIMEOUT_SECONDS: i32 = 300;
+
+    pub fn new(timeout_seconds: i32) -> Self {
+        Self {
+            txs: Mutex::default(),
+            timeout_seconds,
+        }
+    }
+
+    /// `getTimeoutSeconds`.
+    pub fn timeout_seconds(&self) -> i32 {
+        self.timeout_seconds
+    }
+
+    /// `TxTimeoutHandler`: takes out every unprepared branch older than its
+    /// timeout, marked rollback-only; the caller rolls them back.
+    pub fn take_timed_out(&self, now: i64) -> Vec<TxRef> {
+        let mut map = self.map();
+        let timed_out: Vec<Xid> = map
+            .iter()
+            .filter(|(_, tx)| {
+                let mut t = lock(tx);
+                let secs = if t.timeout_seconds == -1 {
+                    self.timeout_seconds
+                } else {
+                    t.timeout_seconds
+                };
+                let out = t.state != TxState::Prepared && now > t.created + i64::from(secs) * 1000;
+                if out {
+                    t.mark_rollback_only(&BrokerError::new(
+                        saranga_core_protocol::ErrorType::TransactionTimeout,
+                        "",
+                    ));
+                }
+                out
+            })
+            .map(|(x, _)| x.clone())
+            .collect();
+        timed_out
+            .into_iter()
+            .filter_map(|x| {
+                tracing::warn!(
+                    "AMQ222103: transaction with xid {} timed out",
+                    xid_string(&x)
+                );
+                map.remove(&x)
+            })
+            .collect()
+    }
 
     fn map(&self) -> MutexGuard<'_, HashMap<Xid, TxRef>> {
         self.txs.lock().unwrap_or_else(|e| e.into_inner())

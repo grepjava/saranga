@@ -904,7 +904,7 @@ impl PostOffice {
         routing_type: Option<RoutingType>,
     ) -> Result<Routed> {
         let mut out = Vec::new();
-        self.route_into(message, address, routing_type, true, 0, &mut out)?;
+        self.route_into(message, address, routing_type, Hop::client(), &mut out)?;
         Ok(out)
     }
 
@@ -914,7 +914,7 @@ impl PostOffice {
     pub fn route_internal(&self, message: &MessageRef, address: &str) -> Routed {
         let mut out = Vec::new();
         let routing_type = routing_type(message.message.core());
-        if let Err(e) = self.route_into(message, address, routing_type, false, 0, &mut out) {
+        if let Err(e) = self.route_into(message, address, routing_type, Hop::internal(), &mut out) {
             tracing::debug!("routing to {address}: {e}");
         }
         out
@@ -925,10 +925,14 @@ impl PostOffice {
         message: &MessageRef,
         address: &str,
         routing_type: Option<RoutingType>,
-        auto_create: bool,
-        depth: usize,
+        hop: Hop,
         out: &mut Routed,
     ) -> Result<()> {
+        let Hop {
+            auto_create,
+            depth,
+            to_dla,
+        } = hop;
         let (real, _) = split_fqqn(address);
         // checkAddress
         if auto_create
@@ -946,7 +950,7 @@ impl PostOffice {
             bindings = self.bindings_route(message, address);
         }
         let Some((queues, diverts)) = bindings else {
-            return Ok(());
+            return self.maybe_send_to_dla(message, real, to_dla, out);
         };
         if !queues.is_empty() {
             out.push((message.clone(), queues));
@@ -974,10 +978,79 @@ impl PostOffice {
                     r
                 };
                 let rt = routing_type_of(copy.message.core());
-                self.route_into(&copy, forward, rt, auto_create, depth + 1, out)?;
+                self.route_into(
+                    &copy,
+                    forward,
+                    rt,
+                    Hop {
+                        depth: depth + 1,
+                        to_dla: false,
+                        ..hop
+                    },
+                    out,
+                )?;
             }
         }
         Ok(())
+    }
+
+    /// `maybeSendToDLA`: with `send-to-dla-on-no-route`, a message nothing
+    /// is bound to goes to the address's dead-letter address instead (once).
+    fn maybe_send_to_dla(
+        &self,
+        message: &MessageRef,
+        address: &str,
+        to_dla: bool,
+        out: &mut Routed,
+    ) -> Result<()> {
+        let s = self.settings(address);
+        if to_dla || !s.send_to_dla_on_no_route {
+            return Ok(());
+        }
+        let Some(dla) = s.dead_letter_address.clone() else {
+            tracing::warn!(
+                "AMQ222056: Did not route to any bindings for address {address} and sendToDLAOnNoRoute is true but there is no DLA configured for the address, the message will be ignored."
+            );
+            return Ok(());
+        };
+        use crate::message as m;
+        use saranga_buffer::{PropertyValue, SimpleString};
+        let original = message.message.core();
+        let mut core = original.clone();
+        let p = &mut core.properties;
+        // referenceOriginalMessage(message, null)
+        p.insert(m::HDR_ORIGINAL_QUEUE.into(), PropertyValue::Null);
+        p.insert(
+            m::HDR_ORIGINAL_ADDRESS.into(),
+            PropertyValue::String(original.address.clone().unwrap_or_default()),
+        );
+        p.insert(
+            m::HDR_ORIG_MESSAGE_ID.into(),
+            PropertyValue::Long(original.message_id),
+        );
+        if let Some(t) = routing_type(original) {
+            p.insert(
+                m::HDR_ORIG_ROUTING_TYPE.into(),
+                PropertyValue::Byte(t.to_byte()),
+            );
+        }
+        p.remove(&SimpleString::from(m::HDR_ROUTING_TYPE));
+        core.expiration = 0;
+        core.address = Some(SimpleString::from(dla.as_str()));
+        let now = m::now_millis();
+        m::apply_expiry_delay(&mut core, &self.settings(&dla), now);
+        let mut r = MessageRef::new(ServerMessage::new(core));
+        r.scheduled_time = message.scheduled_time;
+        self.route_into(
+            &r,
+            &dla,
+            None,
+            Hop {
+                to_dla: true,
+                ..Hop::internal()
+            },
+            out,
+        )
     }
 
     /// Whether anything is bound to `address`
@@ -989,8 +1062,24 @@ impl PostOffice {
             .is_some_and(|e| !e.queues.is_empty() || !e.diverts.is_empty())
     }
 
-    /// `deployDivert`: binds a divert to its address, which must exist.
-    pub fn deploy_divert(&self, d: &DivertDeployment) -> Result<()> {
+    /// `deployDivert`: binds a divert to its address, which must exist. A
+    /// transformer must be among `transformers`.
+    pub fn deploy_divert(
+        &self,
+        d: &DivertDeployment,
+        transformers: &HashMap<String, TransformerFactory>,
+    ) -> Result<()> {
+        let transformer = match &d.transformer {
+            None => None,
+            Some((class, properties)) => match transformers.get(class) {
+                Some(make) => Some(make(properties)),
+                None => {
+                    return Err(BrokerError::internal(format!(
+                        "no transformer is registered as {class}"
+                    )));
+                }
+            },
+        };
         let divert = Divert {
             name: d.name.as_str().into(),
             routing_name: d
@@ -1009,6 +1098,7 @@ impl PostOffice {
             exclusive: d.exclusive,
             filter: self.filters.create(d.filter.as_deref())?,
             routing_type: d.routing_type,
+            transformer,
         };
         let mut state = self.write();
         if state
@@ -1115,6 +1205,33 @@ impl PostOffice {
     }
 }
 
+/// One step of a route: whether addresses and queues may be auto-created
+/// (a client's send may, a broker-made copy may not), how many diverts
+/// deep it is, and whether it already goes to a dead-letter address.
+#[derive(Debug, Clone, Copy)]
+struct Hop {
+    auto_create: bool,
+    depth: usize,
+    to_dla: bool,
+}
+
+impl Hop {
+    fn client() -> Self {
+        Self {
+            auto_create: true,
+            depth: 0,
+            to_dla: false,
+        }
+    }
+
+    fn internal() -> Self {
+        Self {
+            auto_create: false,
+            ..Self::client()
+        }
+    }
+}
+
 /// How deep diverts may forward into further diverts.
 const MAX_DIVERT_DEPTH: usize = 16;
 
@@ -1135,7 +1252,19 @@ pub struct Divert {
     pub exclusive: bool,
     pub filter: Option<FilterRef>,
     pub routing_type: DivertRoutingType,
+    pub transformer: Option<Arc<dyn Transformer>>,
 }
+
+/// `Transformer`: rewrites the copies a divert makes. Transformers are Rust
+/// plugins: the embedding application registers a factory under the class
+/// name `broker.xml` gives (`BrokerConfig::transformers`).
+pub trait Transformer: Send + Sync {
+    fn transform(&self, message: saranga_message::CoreMessage) -> saranga_message::CoreMessage;
+}
+
+/// Makes a transformer from its configured properties (`Transformer.init`).
+pub type TransformerFactory =
+    Arc<dyn Fn(&HashMap<String, String>) -> Arc<dyn Transformer> + Send + Sync>;
 
 /// A divert to deploy (`DivertConfiguration`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1148,6 +1277,8 @@ pub struct DivertDeployment {
     pub exclusive: bool,
     pub filter: Option<String>,
     pub routing_type: DivertRoutingType,
+    /// The transformer's class name and properties.
+    pub transformer: Option<(String, HashMap<String, String>)>,
 }
 
 /// `ComponentConfigurationRoutingType`.
@@ -1209,7 +1340,10 @@ impl Divert {
             }
             DivertRoutingType::Pass => {}
         }
-        copy
+        match &self.transformer {
+            Some(t) => t.transform(copy),
+            None => copy,
+        }
     }
 }
 

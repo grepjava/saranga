@@ -154,6 +154,10 @@ fn divert(d: &cfg::DivertConfig) -> DivertDeployment {
         forwarding_address: d.forwarding_address.clone(),
         exclusive: d.exclusive,
         filter: d.filter.clone(),
+        transformer: d
+            .transformer
+            .as_ref()
+            .map(|t| (t.class_name.clone(), t.properties.iter().cloned().collect())),
         routing_type: match d.routing_type {
             cfg::DivertRoutingType::Multicast => DivertRoutingType::Multicast,
             cfg::DivertRoutingType::Anycast => DivertRoutingType::Anycast,
@@ -245,10 +249,13 @@ impl BrokerConfig {
             connection_ttl_override: -1,
             addresses: config.addresses.iter().map(deployment).collect(),
             diverts: config.diverts.iter().map(divert).collect(),
+            transformers: HashMap::new(),
             storage: config
                 .persistence_enabled
                 .then(|| storage_config(config, instance)),
             message_expiry_scan_period: config.message_expiry_scan_period,
+            transaction_timeout: config.transaction_timeout,
+            transaction_timeout_scan_period: config.transaction_timeout_scan_period,
             id_cache_size: config.id_cache_size,
             persist_id_cache: config.persist_id_cache,
         })
