@@ -136,6 +136,10 @@ pub struct Acceptor {
     pub core_initial_max_frame_size: usize,
     /// `coreMaxFrameSize`: the largest frame after login.
     pub core_max_frame_size: usize,
+    /// `anycastPrefix` and `multicastPrefix`: a name a client gives with
+    /// one of these prefixes means the name without it, with that routing
+    /// type (`CoreProtocolManager.getPrefixes`).
+    pub prefixes: Vec<(String, RoutingType)>,
 }
 
 impl Acceptor {
@@ -155,6 +159,7 @@ impl Default for Acceptor {
             core_connection_security: true,
             core_initial_max_frame_size: Self::CORE_INITIAL_MAX_FRAME_SIZE,
             core_max_frame_size: Self::CORE_MAX_FRAME_SIZE,
+            prefixes: Vec::new(),
         }
     }
 }
@@ -513,6 +518,10 @@ impl Broker {
             .or_default()
             .insert(key.to_owned(), data.to_owned());
         true
+    }
+
+    pub fn session_metadata(&self, session: &str, key: &str) -> Option<String> {
+        self.metadata().get(session)?.get(key).cloned()
     }
 
     pub fn remove_session_metadata(&self, session: &str) {

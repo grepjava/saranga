@@ -195,6 +195,8 @@ What else Phase 6 delivered, each suite passing against both Artemis and Saranga
 - **`broker.properties`:** `-D` system properties and `brokerconfig.` overrides, including `jaasConfigs`. Covered by `Props.java` (5 tests).
 - **Configuration reload:** settings swap, diverts, address and queue deployment, `updateQueue` and the `config-delete-*` policies. Covered by `Reload.java` (7 tests).
 - **`saranga run --etc`** reads `bootstrap.xml`, `login.config` and `broker.properties` the way `artemis run` does.
+- **Acceptor address prefixes** (`anycastPrefix`, `multicastPrefix`) on every Core operation: `Prefix.java` (6 tests).
+- **1.x clients:** the old `jms.queue.`/`jms.topic.` prefixes are put back on query results and delivered messages. Checked with a real Artemis 1.5.6 JMS client by `scripts/legacy-interop.sh` (`Legacy.java`, 4 tests).
 
 The differences from Artemis are listed in COMPAT.md.
 

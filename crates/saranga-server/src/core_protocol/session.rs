@@ -459,7 +459,7 @@ impl CoreSession {
                 let store = self
                     .broker
                     .post_office()
-                    .paging_store(&p.address.to_string_lossy());
+                    .paging_store(self.remove_prefix(&p.address.to_string_lossy()));
                 let (conn, channel) = (self.conn.clone(), self.channel_id);
                 let (credits, address) = (p.credits, p.address.clone());
                 let grant = Box::new(move || {
@@ -482,10 +482,11 @@ impl CoreSession {
                 (false, Ok(None), false)
             }
             Packet::SessionCreateConsumerMessage(p) => {
+                let queue_name = p.queue_name.to_string_lossy();
                 let result = self
                     .create_consumer(
                         p.id,
-                        &p.queue_name.to_string_lossy(),
+                        self.remove_prefix(&queue_name).to_owned().as_str(),
                         p.filter_string.map(|f| f.to_string_lossy()),
                         p.priority,
                         p.browse_only,
@@ -503,7 +504,13 @@ impl CoreSession {
                     .iter()
                     .filter_map(|&b| RoutingType::from_byte(b))
                     .for_each(|t| types.add(t));
+                // `getAddressAndRoutingType`: a prefix names the routing type.
                 let address = p.address.to_string_lossy();
+                let (address, prefixed) = self.strip_prefix(&address);
+                let address = address.to_owned();
+                if let Some(t) = prefixed {
+                    types = RoutingTypes::of(t);
+                }
                 let result = self
                     .security_check(&address, None, CheckType::CreateAddress)
                     .and_then(|()| {
@@ -524,6 +531,7 @@ impl CoreSession {
                 spec.filter_string = p.filter_string.map(|f| f.to_string_lossy());
                 spec.durable = p.durable;
                 spec.temporary = p.temporary;
+                self.unprefix_queue(&mut spec);
                 (
                     p.requires_response,
                     self.create_queue(spec).map(|()| None),
@@ -555,6 +563,7 @@ impl CoreSession {
                 spec.ring_size = p.ring_size.0;
                 spec.enabled = p.enabled.0;
                 spec.group_rebalance_pause_dispatch = p.group_rebalance_pause_dispatch.0;
+                self.unprefix_queue(&mut spec);
                 (
                     p.requires_response,
                     self.create_queue(spec).map(|()| None),
@@ -609,7 +618,8 @@ impl CoreSession {
                 false,
             ),
             Packet::SessionQueueQueryMessage(p) => {
-                let response = self.queue_query_response(&p.queue_name.to_string_lossy());
+                let response =
+                    self.queue_query_response_legacy(&p.queue_name.to_string_lossy(), true);
                 (true, Ok(Some(response)), false)
             }
             Packet::SessionBindingQueryMessage(p) => {
@@ -936,8 +946,18 @@ impl CoreSession {
                 a
             }
         };
-        // doSend: the user must be allowed to send to the address (and to
-        // the queue a fully qualified name picks).
+        // doSend: an address with one of the acceptor's prefixes loses it
+        // and is routed with the prefix's routing type.
+        let (address, prefixed): (Name, Option<RoutingType>) = match self.strip_prefix(&address) {
+            (bare, Some(t)) => {
+                let bare: Name = bare.into();
+                message.address = Some(SimpleString::from(&*bare));
+                (bare, Some(t))
+            }
+            (_, None) => (address, None),
+        };
+        // The user must be allowed to send to the address (and to the queue
+        // a fully qualified name picks).
         let (bare_address, fqqn_queue) = crate::postoffice::split_fqqn(&address);
         if let Err(e) = self.security_check(bare_address, fqqn_queue, CheckType::Send) {
             if !self.auto_commit_sends
@@ -963,7 +983,7 @@ impl CoreSession {
         {
             return Err(BrokerError::reject_empty_validated_user());
         }
-        let routing_type = routing_type(&message);
+        let routing_type = prefixed.or_else(|| routing_type(&message));
         // PostOfficeImpl.route: the address's expiry settings apply first.
         let settings = self
             .broker
@@ -1641,6 +1661,13 @@ impl CoreSession {
                 conn: self.conn.clone(),
                 channel_id: self.channel_id,
                 chunk_size: self.min_large_message_size.max(1) as usize,
+                legacy_prefix: self.legacy_jms().then_some(
+                    if queue.config().routing_type == RoutingType::Anycast {
+                        OLD_QUEUE_PREFIX
+                    } else {
+                        OLD_TOPIC_PREFIX
+                    },
+                ),
             }),
             filter,
             priority,
@@ -1665,6 +1692,34 @@ impl CoreSession {
             return;
         };
         c.queue.remove_consumer(c.id, failed).await;
+    }
+
+    /// `PrefixUtil.getAddressAndRoutingTypes` over the acceptor's prefixes:
+    /// the name without the first prefix it starts with, and that prefix's
+    /// routing type.
+    fn strip_prefix<'a>(&self, name: &'a str) -> (&'a str, Option<RoutingType>) {
+        for (prefix, t) in &self.conn.prefixes {
+            if let Some(rest) = name.strip_prefix(prefix.as_str()) {
+                return (rest, Some(*t));
+            }
+        }
+        (name, None)
+    }
+
+    /// `ServerSessionImpl.removePrefix`.
+    fn remove_prefix<'a>(&self, name: &'a str) -> &'a str {
+        self.strip_prefix(name).0
+    }
+
+    /// `createQueue`'s prefix handling: the address's prefix picks the
+    /// routing type; address and name lose their prefixes.
+    fn unprefix_queue(&self, spec: &mut QueueSpec) {
+        let (address, t) = self.strip_prefix(&spec.address);
+        if let Some(t) = t {
+            spec.routing_type = Some(t);
+        }
+        spec.address = address.into();
+        spec.name = self.remove_prefix(&spec.name).into();
     }
 
     /// `ServerSessionImpl.createQueue`.
@@ -1694,8 +1749,9 @@ impl CoreSession {
     }
 
     /// `CREATE_SHARED_QUEUE`: creates the queue unless one with the same
-    /// address and filter exists.
+    /// address and filter exists. Only the address loses its prefix.
     fn create_shared_queue(&mut self, mut spec: QueueSpec) -> Result<()> {
+        spec.address = self.remove_prefix(&spec.address).into();
         self.security_check(&spec.address, Some(&spec.name), create_check(spec.durable))?;
         spec.user = self.validated_user.clone();
         let existing = self.broker.post_office().queue_query(&spec.name);
@@ -1713,7 +1769,7 @@ impl CoreSession {
 
     fn delete_queue(&mut self, name: &str) -> Result<()> {
         let post_office = self.broker.post_office();
-        let name = queue_name_of(name);
+        let name = queue_name_of(self.remove_prefix(name));
         let queue = post_office
             .queue(name)
             .ok_or_else(|| BrokerError::no_such_queue(name))?;
@@ -1865,8 +1921,31 @@ impl CoreSession {
         self.broker.remove_session_metadata(&self.name);
     }
 
+    /// A 1.x JMS client (`JMS_SESSION_IDENTIFIER_PROPERTY` set by a client
+    /// older than `ADDRESSING_CHANGE_VERSION`): it names queues and topics
+    /// with the old prefixes.
+    fn legacy_jms(&self) -> bool {
+        self.conn.context().is_version_before_address_change()
+            && self
+                .broker
+                .session_metadata(&self.name, JMS_SESSION_IDENTIFIER)
+                .is_some()
+    }
+
     fn queue_query_response(&self, name: &str) -> Packet {
-        let r = self.broker.post_office().queue_query(name);
+        self.queue_query_response_legacy(name, false)
+    }
+
+    /// With `legacy` (`SESS_QUEUEQUERY`), an old client gets the address
+    /// with the old prefix of the queue's routing type.
+    fn queue_query_response_legacy(&self, name: &str, legacy: bool) -> Packet {
+        let mut r = self
+            .broker
+            .post_office()
+            .queue_query(self.remove_prefix(name));
+        if legacy && r.exists && self.conn.context().is_version_before_address_change() {
+            r.address = old_prefixed_address(&r.address, r.routing_type).into();
+        }
         let v = self.conn.version();
         if v >= version::ADDRESSING_CHANGE {
             queue_query_v3(r).into()
@@ -1903,12 +1982,24 @@ impl CoreSession {
         let r = self
             .broker
             .post_office()
-            .binding_query(address, ctx.is_version_new_fqqn());
+            .binding_query(self.remove_prefix(address), ctx.is_version_new_fqqn());
         let v = ctx.version;
+        // An old JMS client asking about jms.queue.X or jms.topic.X gets the
+        // queue names with that prefix (`convertQueueNames`).
+        let legacy_prefix = (r.exists && self.legacy_jms())
+            .then(|| {
+                [OLD_QUEUE_PREFIX, OLD_TOPIC_PREFIX]
+                    .into_iter()
+                    .find(|p| address.starts_with(p))
+            })
+            .flatten();
         let names: Vec<SimpleString> = r
             .queue_names
             .iter()
-            .map(|n| SimpleString::from(&**n))
+            .map(|n| match legacy_prefix {
+                Some(p) if !n.starts_with(p) => SimpleString::from(format!("{p}{n}").as_str()),
+                _ => SimpleString::from(&**n),
+            })
             .collect();
         if v >= version::ARTEMIS_2_29_0 {
             SessionBindingQueryResponseMessageV5 {
@@ -1969,6 +2060,25 @@ fn create_check(durable: bool) -> CheckType {
 
 fn io_error(e: saranga_journal::JournalError) -> BrokerError {
     BrokerError::new(ErrorType::IoError, e.to_string())
+}
+
+/// `ClientSession.JMS_SESSION_IDENTIFIER_PROPERTY`.
+const JMS_SESSION_IDENTIFIER: &str = "jms-session";
+/// `PacketImpl.OLD_QUEUE_PREFIX` and `OLD_TOPIC_PREFIX`.
+const OLD_QUEUE_PREFIX: &str = "jms.queue.";
+const OLD_TOPIC_PREFIX: &str = "jms.topic.";
+
+/// `QueueAbstractPacket.getOldPrefixedAddress`.
+fn old_prefixed_address(address: &str, routing_type: RoutingType) -> String {
+    let prefix = match routing_type {
+        RoutingType::Multicast => OLD_TOPIC_PREFIX,
+        RoutingType::Anycast => OLD_QUEUE_PREFIX,
+    };
+    if address.starts_with(prefix) {
+        address.to_owned()
+    } else {
+        format!("{prefix}{address}")
+    }
 }
 
 /// `ServerSessionPacketHandler.getRoutingTypeFromAddress`, for the

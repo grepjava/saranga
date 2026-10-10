@@ -65,6 +65,8 @@ pub(crate) struct ConnShared {
     remote_address: String,
     /// What the security store knows of this connection.
     security_info: Arc<ConnectionInfo>,
+    /// The acceptor's address prefixes.
+    pub(crate) prefixes: Vec<(String, crate::RoutingType)>,
 }
 
 impl ConnShared {
@@ -114,13 +116,34 @@ pub(crate) struct CoreDeliverySink {
     /// The session's `minLargeMessageSize`: the size of large-message
     /// chunks.
     chunk_size: usize,
+    /// For a 1.x JMS client, the old prefix its messages are addressed with
+    /// (`ServerConsumerImpl.applyPrefixForLegacyConsumer`).
+    legacy_prefix: Option<&'static str>,
+}
+
+impl CoreDeliverySink {
+    /// The message with the legacy prefix on its address, if it needs one.
+    fn legacy(&self, message: &ServerMessage) -> Option<saranga_message::CoreMessage> {
+        let prefix = self.legacy_prefix?;
+        let address = message.core().address.as_ref()?.to_string_lossy();
+        if address.starts_with(prefix) {
+            return None;
+        }
+        let mut core = message.core().clone();
+        core.address = Some(saranga_buffer::SimpleString::from(
+            format!("{prefix}{address}").as_str(),
+        ));
+        Some(core)
+    }
 }
 
 impl DeliverySink for CoreDeliverySink {
     fn deliver(&self, consumer_id: i64, message: &ServerMessage, delivery_count: i32) -> i64 {
         let ctx = self.conn.context();
         let frame = if ctx.is_version_before_address_change() {
-            let core = message.core().clone();
+            let core = self
+                .legacy(message)
+                .unwrap_or_else(|| message.core().clone());
             let packet = SessionReceiveMessage1X {
                 end_of_message_position: legacy_end_of_message_position(&core),
                 message: core,
@@ -150,11 +173,17 @@ impl DeliverySink for CoreDeliverySink {
     ) -> i64 {
         // SessionReceiveLargeMessage: the headers and properties are the
         // message's encoded form.
+        let legacy = self.legacy(message).map(|core| {
+            let mut w = saranga_buffer::Writer::new();
+            core.encode_headers_and_properties(&mut w);
+            w.into_vec()
+        });
+        let headers = legacy.as_deref().unwrap_or(message.encoded());
         let frame = encode_frame(types::SESS_RECEIVE_LARGE_MSG, self.channel_id, |w| {
             w.i64(consumer_id)
                 .i32(delivery_count)
                 .i64(body_size)
-                .bytes(message.encoded());
+                .bytes(headers);
         });
         let size = frame.len() as i64;
         self.conn.send_raw(frame);
@@ -213,6 +242,7 @@ pub async fn serve_stream<S>(
         temp_queues: Mutex::default(),
         remote_address,
         security_info,
+        prefixes: acceptor.prefixes.clone(),
     });
     // `CoreFrameWithSizeLimitDecoder`: with connection security, frames are
     // limited from the start.

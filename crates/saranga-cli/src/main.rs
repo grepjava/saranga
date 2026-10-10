@@ -171,6 +171,7 @@ fn core_acceptors(file: &saranga_config::BrokerConfig) -> anyhow::Result<Vec<Bin
                     .unwrap_or(Acceptor::CORE_INITIAL_MAX_FRAME_SIZE),
                 core_max_frame_size: size_param(a, "coreMaxFrameSize")?
                     .unwrap_or(Acceptor::CORE_MAX_FRAME_SIZE),
+                prefixes: prefixes(a),
             },
         });
     }
@@ -242,6 +243,21 @@ fn spawn_config_reloader(
             }
         }
     });
+}
+
+/// `anycastPrefix` and `multicastPrefix`, each a comma-separated list
+/// (`CoreProtocolManager.setAnycastPrefix`).
+fn prefixes(a: &saranga_config::AcceptorConfig) -> Vec<(String, saranga_server::RoutingType)> {
+    let mut out = Vec::new();
+    for (key, t) in [
+        ("anycastPrefix", saranga_server::RoutingType::Anycast),
+        ("multicastPrefix", saranga_server::RoutingType::Multicast),
+    ] {
+        if let Some(list) = a.param(key) {
+            out.extend(list.split(',').map(|p| (p.to_owned(), t)));
+        }
+    }
+    out
 }
 
 /// Binds the acceptor's host the way Netty does: to the one address

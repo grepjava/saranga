@@ -64,6 +64,11 @@ esac
 CP="$(native "$DIST/lib")/*"
 URL="tcp://127.0.0.1:$PORT"
 SUITE="${SUITE:-Phase2}"
+if [[ -n "${SUITE_FILE:-}" ]]; then
+  # Another suite on another client classpath (scripts/legacy-interop.sh).
+  java ${SUITE_JAVA_OPTS:-} -cp "$SUITE_CP" "$(native "$SUITE_FILE")" "$URL" "$@"
+  exit
+fi
 java -cp "$CP" "$(native "$ROOT/tests/interop/jms/$SUITE.java")" "$URL" "$@"
 # The golden scenarios log in as the anonymous guest.
 if [[ $# -eq 0 && -z "${ETC:-}" ]]; then
