@@ -46,7 +46,21 @@ pub struct PrintDataOptions {
     pub skip_journal: bool,
     /// `--max-pages`: `None` is unlimited (-1); `Some(0)` skips paging.
     pub max_pages: Option<u32>,
+    /// Prints the page files (`saranga_paging::print::print_pages`); without
+    /// it each store folder is only listed.
+    pub print_pages: Option<PagePrinter>,
 }
+
+/// `PrintData.printPages`: (out, paging directory, messages journal,
+/// bindings journal, safe, max pages).
+pub type PagePrinter = fn(
+    &mut dyn Write,
+    &Path,
+    &JournalDescription,
+    Option<&JournalDescription>,
+    bool,
+    Option<u32>,
+) -> io::Result<()>;
 
 /// What `DescribeJournal` returns: the surviving records of a journal.
 #[derive(Debug, Clone, Default)]
@@ -144,7 +158,17 @@ pub fn print_data(
         writeln!(out, ".... skipping")?;
         writeln!(out)?;
     } else {
-        print_pages(out, paging, &messages, bindings_describe.as_ref())?;
+        match opts.print_pages {
+            Some(print) => print(
+                out,
+                paging,
+                &messages,
+                bindings_describe.as_ref(),
+                opts.safe,
+                opts.max_pages,
+            )?,
+            None => print_pages(out, paging, &messages, bindings_describe.as_ref())?,
+        }
     }
     Ok(())
 }
@@ -164,8 +188,7 @@ fn print_banner(out: &mut dyn Write, text: &str) -> io::Result<()> {
     writeln!(out, "********************************************")
 }
 
-/// `PrintData.printPages`. Page files are not read yet (Phase 5): each
-/// store folder is listed with a placeholder.
+/// Without a page printer: each store folder is listed with a placeholder.
 fn print_pages(
     out: &mut dyn Write,
     paging: &Path,
@@ -1333,7 +1356,7 @@ fn describe_message(m: &PersistedMessage, data: &[u8]) -> Described {
 }
 
 /// `CoreMessage.toString()`.
-fn core_message_to_string(m: &CoreMessage, size: usize, data: &[u8]) -> String {
+pub fn core_message_to_string(m: &CoreMessage, size: usize, data: &[u8]) -> String {
     format!(
         "CoreMessage[messageID={}, durable={}, userID={}, priority={}, timestamp={}, expiration={}, durable={}, address={}, size={size}, properties={}]@{}",
         m.message_id,

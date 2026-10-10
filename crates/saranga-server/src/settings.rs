@@ -54,6 +54,49 @@ pub struct AddressSettings {
     pub expiry_queue_suffix: String,
     /// `id-cache-size` for this address; the broker's when unset.
     pub id_cache_size: Option<i32>,
+    /// `address-full-policy`.
+    pub address_full_policy: AddressFullPolicy,
+    /// `max-size-bytes`; -1 for no limit of the address's own.
+    pub max_size_bytes: i64,
+    /// `max-size-messages`; -1 for no limit.
+    pub max_size_messages: i64,
+    /// `page-size-bytes`.
+    pub page_size_bytes: i64,
+    /// `max-read-page-bytes`: paged bytes a queue holds in memory.
+    pub max_read_page_bytes: i64,
+    /// `max-read-page-messages`.
+    pub max_read_page_messages: i64,
+    /// `prefetch-page-bytes`.
+    pub prefetch_page_bytes: i64,
+    /// `prefetch-page-messages`.
+    pub prefetch_page_messages: i64,
+    /// `page-limit-bytes`: the pages an address may hold, in bytes.
+    pub page_limit_bytes: Option<i64>,
+    /// `page-limit-messages`: the paged messages a queue may have.
+    pub page_limit_messages: Option<i64>,
+    /// `page-full-policy`: what a paging address does past its limits.
+    pub page_full_policy: Option<PageFullPolicy>,
+}
+
+/// `PageFullMessagePolicy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageFullPolicy {
+    Drop,
+    Fail,
+}
+
+/// `AddressFullMessagePolicy`: what an address does at its size limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AddressFullPolicy {
+    /// New messages go to page files.
+    #[default]
+    Page,
+    /// Producers get no more credits until memory is freed.
+    Block,
+    /// Sends fail.
+    Fail,
+    /// New messages are dropped.
+    Drop,
 }
 
 impl AddressSettings {
@@ -108,6 +151,17 @@ impl Default for AddressSettings {
             expiry_queue_prefix: "EXP.".into(),
             expiry_queue_suffix: String::new(),
             id_cache_size: None,
+            address_full_policy: AddressFullPolicy::Page,
+            max_size_bytes: -1,
+            max_size_messages: -1,
+            page_size_bytes: 10 * 1024 * 1024,
+            max_read_page_bytes: 20 * 1024 * 1024,
+            max_read_page_messages: -1,
+            prefetch_page_bytes: 20 * 1024 * 1024,
+            prefetch_page_messages: -1,
+            page_limit_bytes: None,
+            page_limit_messages: None,
+            page_full_policy: None,
         }
     }
 }

@@ -178,22 +178,27 @@ pub fn load_bindings(storage: &Storage, post_office: &PostOffice) -> Result<()> 
 /// transactions: references go back to their queues in journal order with
 /// their delivery counts; prepared XA branches go to the resource manager
 /// holding their sends and acknowledgements.
+///
+/// `stored` holds the large-message files found before loading
+/// (`recoverLargeMessagesOnFolder`); the IDs of large messages in the
+/// journal leave it, and what remains is for the caller to delete once the
+/// pages have been looked at.
 pub async fn load_messages(
     storage: &Storage,
     post_office: &PostOffice,
     resource_manager: &ResourceManager,
     large_store: &Arc<LargeMessageStore>,
+    stored: &mut std::collections::HashSet<i64>,
 ) -> Result<()> {
-    // recoverLargeMessagesOnFolder: the files there before loading.
-    let mut stored = large_store
-        .start()
-        .map_err(|e| BrokerError::internal(format!("large-messages directory: {e}")))?;
     let RecoveredMessages {
         messages,
         large,
         queues,
         prepared,
         duplicates,
+        cursor_acks,
+        page_completes,
+        page_txs,
     } = storage
         .load_messages()
         .map_err(|e| corrupt("loading the message journal", e))?;
@@ -223,8 +228,8 @@ pub async fn load_messages(
             (id, ServerMessage::new_large(m, body))
         })
         .collect();
-    // Files no large message refers to (the leftovers of a crash).
-    large_store.delete_files(stored);
+    let paging = post_office.paging();
+    paging.load_records(cursor_acks, page_completes, page_txs);
     // The duplicate-ID caches, per address in journal order.
     let mut by_address: Vec<(String, DuplicateIds)> = Vec::new();
     for d in duplicates {
@@ -268,6 +273,7 @@ pub async fn load_messages(
                 delivery_count: r.delivery_count,
                 persisted_count: r.delivery_count,
                 scheduled_time,
+                paged: None,
             });
         }
     }
@@ -305,6 +311,33 @@ pub async fn load_messages(
                 record: d.record,
             });
         }
+        // Paged messages the transaction sent wait for it; those it
+        // acknowledged are not delivered meanwhile.
+        for pt in &p.page_txs {
+            tx.paging.page_txs.push(paging.reload_prepared(pt));
+        }
+        for a in &p.cursor_acks {
+            let (Some(q), Some(sub)) = (by_id.get(&a.queue_id), paging.subscription(a.queue_id))
+            else {
+                tracing::warn!(
+                    "AMQ222035: Cannot find queue {} for an acknowledgement in a prepared transaction",
+                    a.queue_id
+                );
+                continue;
+            };
+            sub.reload_prepared_ack(a.page, a.message_nr);
+            if let Some(pr) = sub.paged_ref(a.page, a.message_nr) {
+                sub.read_in(pr.position.size);
+                let mut r = MessageRef::new(pr.message);
+                r.paged = Some(crate::message::PagePosition {
+                    ack_record: a.record,
+                    ..pr.position
+                });
+                tx.acks.push((q.clone(), r));
+            }
+        }
+        tx.paging.updates = p.page_tx_updates.clone();
+        tx.paging.recovered(paging.clone());
         tx.state = TxState::Prepared;
         resource_manager.put(p.xid, Arc::new(std::sync::Mutex::new(tx)));
     }

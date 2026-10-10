@@ -21,7 +21,9 @@ IMAGE="saranga/artemis-ref:$VERSION"
 NAME="saranga-persistence"
 PORT="${PERSIST_PORT:-61623}"
 DIST="$ROOT/reference/activemq-artemis/artemis-distribution/target/apache-artemis-$VERSION-bin/apache-artemis-$VERSION"
-CONFIG="$ROOT/tests/golden/etc/broker.xml"
+# The golden broker.xml with golden.paging.# paging above 100 KiB, for the
+# paging tests.
+CONFIG="$ROOT/tests/golden/etc/persist-paging.broker.xml"
 RUN_ID="$(date +%s)"
 export MSYS_NO_PATHCONV=1
 
@@ -47,6 +49,8 @@ start_artemis() {   # $1: copy Saranga's data in first
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   docker create --name "$NAME" --user root -e ANONYMOUS_LOGIN=true \
     -p "127.0.0.1:$PORT:61616" "$IMAGE" >/dev/null
+  # The image creates its instance with etc-override/broker.xml.
+  docker cp "$(native "$INSTANCE/etc")" "$NAME:/var/lib/artemis-instance/etc-override" >/dev/null
   if [[ "${1:-}" == "with-data" ]]; then
     docker cp "$(native "$INSTANCE/data")" "$NAME:/var/lib/artemis-instance/data" >/dev/null
   fi

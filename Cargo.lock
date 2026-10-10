@@ -564,6 +564,7 @@ dependencies = [
  "anyhow",
  "clap",
  "saranga-config",
+ "saranga-paging",
  "saranga-server",
  "saranga-storage",
  "tokio",
@@ -643,6 +644,13 @@ dependencies = [
 [[package]]
 name = "saranga-paging"
 version = "0.0.1"
+dependencies = [
+ "flate2",
+ "saranga-buffer",
+ "saranga-message",
+ "saranga-storage",
+ "tar",
+]
 
 [[package]]
 name = "saranga-protocol-amqp"
@@ -674,6 +682,7 @@ dependencies = [
  "saranga-filter",
  "saranga-journal",
  "saranga-message",
+ "saranga-paging",
  "saranga-storage",
  "tempfile",
  "thiserror",
@@ -690,6 +699,7 @@ dependencies = [
  "saranga-buffer",
  "saranga-journal",
  "saranga-message",
+ "saranga-paging",
  "tar",
  "tempfile",
  "thiserror",

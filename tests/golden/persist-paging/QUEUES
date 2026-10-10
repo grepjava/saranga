@@ -1,0 +1,7 @@
+golden.paging.queue
+golden.paging.topic::paging-client.sub-a
+golden.paging.topic::paging-client.sub-b
+golden.paging.tx
+golden.paging.large
+golden.paging.np
+golden.paging.xa

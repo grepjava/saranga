@@ -9,7 +9,7 @@ Saranga is built in twelve phases. Each one ends with something runnable, and it
 | 2 | Single-node in-memory broker (Core) | Done |
 | 3 | Persistence, on-disk compatible (first usable release) | Done |
 | 4 | Queue semantics parity | Done |
-| 5 | Paging and large messages | In progress |
+| 5 | Paging and large messages | Done |
 | 6 | Config and security | Not started |
 | 7 | Protocols (AMQP, MQTT, STOMP, OpenWire, WebSockets) | Not started |
 | 8 | Management and operations | Not started |
@@ -137,6 +137,40 @@ The behaviour differences are listed in COMPAT.md.
 **Exit check**
 - Backlogs of several gigabytes page correctly.
 - Paging and large-message directories interoperate with Java in both directions.
+
+**Exit check (met)**
+- `scripts/paging-soak.sh` fills a paging queue with 3 GiB (314,572 messages of 10 KiB), stops the broker, starts one on the same data directory and drains the queue. Every message arrives once, in order and intact. It passes in every direction:
+
+  | Sent on | Drained on | Pages | Saranga peak memory |
+  |---|---|---|---|
+  | Saranga | Saranga | 10 MiB | about 340 MiB |
+  | Saranga | Saranga | 20 KiB (one message per page file, 314,572 files) | 64 MiB |
+  | Artemis | Saranga | 10 MiB | 337 MiB |
+  | Saranga | Artemis | 10 MiB | 358 MiB |
+
+  Saranga's memory does not grow with the backlog: a 1 GiB run peaks at the same level as a 3 GiB one. With 10 MiB pages, the peak is the 50 MiB the address may hold in memory, plus the page being written and the decoded pages cached for the cursors.
+- [tests/interop/jms/Phase5.java](tests/interop/jms/Phase5.java) has 40 tests.
+  - Large messages (22): bytes and text bodies, compressed bodies, streamed bodies, non-persistent, transacted, redelivered and pre-acknowledged messages, dead-letter and expiry moves, browsing, topic fan-out, selectors, small consumer windows, conversion of oversized regular messages, divert copies, scheduled delivery, duplicate detection, the Core streaming API (`setBodyInputStream`, `setOutputStream`), and consumers closed mid-transfer.
+  - Paging (18): paging and depaging, message counts, non-persistent messages, topics and durable subscriptions, transactions, consumer rollback, selectors, dead-letter and expiry moves into paging addresses, paged large messages, browsing, `max-size-messages`, the BLOCK, FAIL and DROP policies, and `page-limit-messages` with `page-full-policy`.
+
+  Run with [tests/interop/jms/phase5.broker.xml](tests/interop/jms/phase5.broker.xml), they pass against Artemis 2.57.0 and against Saranga: `CONFIG=tests/interop/jms/phase5.broker.xml SUITE=Phase5 scripts/interop.sh saranga`.
+- [tests/interop/jms/Persist.java](tests/interop/jms/Persist.java) gains three tests:
+  - large messages;
+  - a prepared XA branch with a large message;
+  - paging: a queue consumed part-way across pages, durable subscriptions consumed unevenly, committed and rolled-back transactions, a prepared XA branch and a paged large message.
+
+  All three pass through `scripts/persistence.sh` in every direction (Saranga to Saranga, Artemis to Saranga, Saranga to Artemis, and Artemis to Artemis), after a clean stop and after a kill.
+- `scripts/cross-store.sh` passes with nothing left for later phases. Saranga recovers `core-large` and the new `persist-paging` golden scenario exactly as Artemis does.
+- Every golden page file re-encodes byte for byte. `saranga data print` prints the paging section that `artemis data print` prints.
+- The Phase 2, 3 and 4 suites still pass.
+
+**Deferred on purpose:**
+- Large-message conversion between protocols, to Phase 7, which brings the other protocols.
+- Core frame size limits before and after authentication, to Phase 6, which brings security.
+- Large messages in the Rust client; the broker side is complete.
+- Paging without persistence, browsers that read through page files, and reading page files incrementally rather than whole, to Phase 11.
+
+The behaviour differences are listed in COMPAT.md.
 
 ## Phase 6: Config and security
 

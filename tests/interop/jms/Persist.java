@@ -44,6 +44,7 @@ public class Persist {
         tests.put("manyMessages", new Test(Persist::manyBefore, Persist::manyAfter));
         tests.put("largeMessages", new Test(Persist::largeBefore, Persist::largeAfter));
         tests.put("largeXaPrepared", new Test(Persist::largeXaBefore, Persist::largeXaAfter));
+        tests.put("paging", new Test(Persist::pagingBefore, Persist::pagingAfter));
 
         int failed = 0;
         for (Map.Entry<String, Test> t : tests.entrySet()) {
@@ -459,6 +460,132 @@ public class Persist {
             xa.commit(xid(11), false);
             try (Session s = plain.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
                 receiveLarge(s, s.createQueue(name("large.xa")), 7);
+            }
+        }
+    }
+
+    /** Names on golden.paging.#, which pages above 100 KiB (persist-paging.broker.xml). */
+    static String paged(String base) {
+        return "golden.paging." + base + "." + run;
+    }
+
+    static final String PAGE_PAD = "q".repeat(1000);
+
+    static void sendPaged(Session s, Destination d, String prefix, int n) throws Exception {
+        MessageProducer p = s.createProducer(d);
+        p.setDeliveryMode(DeliveryMode.PERSISTENT);
+        for (int i = 0; i < n; i++) {
+            TextMessage m = s.createTextMessage(prefix + "-" + i + "-" + PAGE_PAD);
+            m.setIntProperty("i", i);
+            p.send(m);
+        }
+        p.close();
+    }
+
+    static void expectPaged(MessageConsumer c, String prefix, int from, int to) throws Exception {
+        for (int i = from; i < to; i++) {
+            Message m = c.receive(5000);
+            check(m != null, prefix + " message " + i);
+            check((prefix + "-" + i + "-" + PAGE_PAD).equals(((TextMessage) m).getText()), prefix + " message " + i + " in order");
+        }
+    }
+
+    /**
+     * Paged messages: a queue partly consumed across pages, durable subscriptions consumed
+     * unevenly, a committed transaction next to a rolled-back one, a prepared XA branch and a
+     * large message, all on paging addresses.
+     */
+    static void pagingBefore() throws Exception {
+        session(s -> {
+            Queue q = s.createQueue(paged("q"));
+            sendPaged(s, q, "q", 600);
+            try (MessageConsumer c = s.createConsumer(q)) {
+                expectPaged(c, "q", 0, 250);
+            }
+            Topic t = s.createTopic(paged("topic"));
+            s.createDurableSubscriber(t, "pa").close();
+            s.createDurableSubscriber(t, "pb").close();
+            sendPaged(s, t, "t", 300);
+            try (TopicSubscriber a = s.createDurableSubscriber(t, "pa")) {
+                expectPaged(a, "t", 0, 100);
+            }
+        });
+        session(true, Session.SESSION_TRANSACTED, s -> {
+            Queue q = s.createQueue(paged("tx"));
+            sendPaged(s, q, "fill", 150);
+            s.commit();
+            sendPaged(s, q, "committed", 80);
+            s.commit();
+            sendPaged(s, q, "rolledback", 60);
+            s.rollback();
+            MessageProducer p = s.createProducer(q);
+            BytesMessage m = s.createBytesMessage();
+            m.writeBytes(pattern(300_000 + 8, 8));
+            m.setIntProperty("n", 8);
+            p.send(m);
+            s.commit();
+        });
+        try (XAConnection xc = new ActiveMQXAConnectionFactory(url).createXAConnection()) {
+            xc.start();
+            XASession xs = xc.createXASession();
+            Queue q = xs.createQueue(paged("xa"));
+            sendPaged(xs, q, "xfill", 150);
+            XAResource xa = xs.getXAResource();
+            Xid x = xid(21);
+            xa.start(x, XAResource.TMNOFLAGS);
+            sendPaged(xs, q, "prepared", 40);
+            xa.end(x, XAResource.TMSUCCESS);
+            xa.prepare(x);
+        }
+    }
+
+    static void pagingAfter() throws Exception {
+        session(s -> {
+            try (MessageConsumer c = s.createConsumer(s.createQueue(paged("q")))) {
+                expectPaged(c, "q", 250, 600);
+                check(c.receive(500) == null, "nothing more on the queue");
+            }
+            Topic t = s.createTopic(paged("topic"));
+            try (TopicSubscriber a = s.createDurableSubscriber(t, "pa")) {
+                expectPaged(a, "t", 100, 300);
+                check(a.receive(500) == null, "nothing more for pa");
+            }
+            try (TopicSubscriber b = s.createDurableSubscriber(t, "pb")) {
+                expectPaged(b, "t", 0, 300);
+                check(b.receive(500) == null, "nothing more for pb");
+            }
+            s.unsubscribe("pa");
+            s.unsubscribe("pb");
+            try (MessageConsumer c = s.createConsumer(s.createQueue(paged("tx")))) {
+                expectPaged(c, "fill", 0, 150);
+                expectPaged(c, "committed", 0, 80);
+                BytesMessage m = (BytesMessage) c.receive(5000);
+                check(m != null && m.getIntProperty("n") == 8, "the paged large message");
+                byte[] got = new byte[(int) m.getBodyLength()];
+                m.readBytes(got);
+                check(Arrays.equals(pattern(300_000 + 8, 8), got), "the large body");
+                check(c.receive(500) == null, "rolled-back messages never arrive");
+            }
+        });
+        try (Connection plain = new ActiveMQConnectionFactory(url).createConnection();
+             XAConnection xc = new ActiveMQXAConnectionFactory(url).createXAConnection()) {
+            plain.start();
+            xc.start();
+            XAResource xa = xc.createXASession().getXAResource();
+            List<Xid> inDoubt = Arrays.asList(xa.recover(XAResource.TMSTARTRSCAN | XAResource.TMENDRSCAN));
+            check(inDoubt.contains(xid(21)), "paged branch in doubt: " + inDoubt);
+            try (Session s = plain.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                try (MessageConsumer c = s.createConsumer(s.createQueue(paged("xa")))) {
+                    expectPaged(c, "xfill", 0, 150);
+                    check(c.receive(500) == null, "prepared paged messages wait");
+                }
+                xa.commit(xid(21), false);
+                // Artemis delivers them to the next consumer: nothing prompts the queue
+                // when the recovered branch commits.
+                try (MessageConsumer c = s.createConsumer(s.createQueue(paged("xa")))) {
+                    expectPaged(c, "prepared", 0, 40);
+                    check(c.receive(500) == null, "nothing more on xa");
+                }
             }
         }
     }

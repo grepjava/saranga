@@ -13,6 +13,7 @@ saranga-filter = { path = "../saranga-filter" }
 saranga-journal = { path = "../saranga-journal" }
 saranga-storage = { path = "../saranga-storage" }
 saranga-message = { path = "../saranga-message" }
+saranga-paging = { path = "../saranga-paging" }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tracing = "0.1"

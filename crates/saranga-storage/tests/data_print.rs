@@ -23,11 +23,16 @@ fn golden_root() -> PathBuf {
 }
 
 fn normalize(text: &str) -> Vec<String> {
-    text.lines()
+    let lines: Vec<String> = text
+        .lines()
         .skip_while(|l| !l.starts_with("****"))
         .map(|l| {
             if l.starts_with("Journal path: ") {
                 return "Journal path: <path>".to_owned();
+            }
+            if let Some(i) = l.find(" folder = ") {
+                let folder = l[i + 10..].rsplit(['/', '\\']).next().unwrap_or("");
+                return format!("{} folder = {folder}", &l[..i]);
             }
             let mut l = mask_after(&mask_after(l, "]@"), "XidImpl (");
             if l.contains("PersistedAddressSetting")
@@ -38,7 +43,32 @@ fn normalize(text: &str) -> Vec<String> {
             }
             l
         })
-        .collect()
+        .collect();
+    sort_stores(lines)
+}
+
+/// The paging section lists stores in Java hash-map order, which for stores
+/// sharing a bucket depends on the order Java listed the directories: the
+/// stores are compared as a set.
+fn sort_stores(lines: Vec<String>) -> Vec<String> {
+    const STORE: &str = "####################################################################################################";
+    let Some(start) = lines.iter().position(|l| l == STORE) else {
+        return lines;
+    };
+    let mut out = lines[..start].to_vec();
+    let mut stores: Vec<Vec<String>> = Vec::new();
+    for l in &lines[start..] {
+        if l == STORE {
+            stores.push(Vec::new());
+        }
+        stores
+            .last_mut()
+            .expect("starts with a store")
+            .push(l.clone());
+    }
+    stores.sort();
+    out.extend(stores.into_iter().flatten());
+    out
 }
 
 /// Replaces the digits following each `marker` with `<hash>`.
@@ -69,7 +99,10 @@ fn compare(name: &str, data: &Path, expected: &str) {
         &data.join("bindings"),
         &data.join("journal"),
         &data.join("paging"),
-        &PrintDataOptions::default(),
+        &PrintDataOptions {
+            print_pages: Some(saranga_paging::print::print_pages),
+            ..PrintDataOptions::default()
+        },
     )
     .unwrap();
     let actual = normalize(&String::from_utf8(out).unwrap());

@@ -20,8 +20,12 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::large::{LargeBody, LargeReader};
 use crate::message::{self, MessageRef, ServerMessage, now_millis};
+use crate::paging::{
+    PageIterator, PageSubscription, REF_MEMORY_ESTIMATE, TxPaging, memory_estimate,
+};
 use crate::postoffice::{PostOffice, QueueSpec};
 use crate::settings::AddressSettings;
+use crate::storage::{Pending, StoreResult};
 use crate::{IdGenerator, Name, RoutingType};
 
 /// `ClientConsumerImpl.FORCED_DELIVERY_MESSAGE`.
@@ -67,6 +71,10 @@ pub trait DeliverySink: Send + Sync {
 /// The most of a large message's body sent in one pass of the queue, so
 /// that a consumer without flow control does not hold the queue up.
 const LARGE_BYTES_PER_PASS: usize = 1024 * 1024;
+
+/// `MAX_DEPAGE_NUM`: paged messages a queue reads in when neither
+/// `max-read-page-messages` nor `max-read-page-bytes` limits it.
+const MAX_DEPAGE_NUM: i64 = 1000;
 
 /// Everything about a queue that is fixed when it is created
 /// (`QueueConfiguration` with every default applied).
@@ -171,6 +179,8 @@ enum Cmd {
     ExpireScan,
     /// Sends more of the large messages being delivered.
     ResumeLarge,
+    /// The queue's pages have something new: read it in.
+    Depage,
     Shutdown,
 }
 
@@ -183,8 +193,11 @@ struct Shared {
     /// expiry addresses.
     post_office: Weak<PostOffice>,
     tx: mpsc::UnboundedSender<Cmd>,
-    /// `getMessageCount`: queued, delivering and acked-in-transaction.
+    /// `getMessageCount`: queued, delivering and acked-in-transaction,
+    /// paged messages aside.
     message_count: AtomicI64,
+    /// The queue's cursor on its address's pages (`pageSubscription`).
+    paging: Option<Arc<PageSubscription>>,
     consumer_count: AtomicI32,
     deleted: AtomicBool,
 }
@@ -215,8 +228,15 @@ impl Queue {
         filter: Option<FilterRef>,
         ids: Arc<IdGenerator>,
         post_office: Weak<PostOffice>,
+        paging: Option<Arc<PageSubscription>>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        if let Some(sub) = &paging {
+            let tx = tx.clone();
+            sub.set_waker(Box::new(move || {
+                let _ = tx.send(Cmd::Depage);
+            }));
+        }
         let queue = Self(Arc::new(Shared {
             id,
             config,
@@ -225,6 +245,7 @@ impl Queue {
             post_office,
             tx,
             message_count: AtomicI64::new(0),
+            paging,
             consumer_count: AtomicI32::new(0),
             deleted: AtomicBool::new(false),
         }));
@@ -242,6 +263,7 @@ impl Queue {
             last_values: HashMap::new(),
             dispatching: false,
             dispatch_start: None,
+            page_iter: PageIterator::default(),
         };
         tokio::spawn(actor.run(rx));
         queue
@@ -263,8 +285,15 @@ impl Queue {
         self.0.filter.as_ref()
     }
 
+    /// `getMessageCount`: with the paged messages not yet acknowledged.
     pub fn message_count(&self) -> i64 {
         self.0.message_count.load(Ordering::SeqCst)
+            + self.0.paging.as_ref().map_or(0, |s| s.message_count())
+    }
+
+    /// The queue's page subscription.
+    pub fn page_subscription(&self) -> Option<&Arc<PageSubscription>> {
+        self.0.paging.as_ref()
     }
 
     pub fn consumer_count(&self) -> i32 {
@@ -281,9 +310,14 @@ impl Queue {
     }
 
     /// Whether this reference is journaled: a persistent message on a
-    /// durable queue.
+    /// durable queue, not read from a page.
     pub fn is_durable_ref(&self, r: &MessageRef) -> bool {
-        r.message.is_durable() && self.is_durable()
+        r.paged.is_none() && self.is_durable_ref_of(&r.message)
+    }
+
+    /// Whether a message routed here is journaled.
+    pub fn is_durable_ref_of(&self, m: &ServerMessage) -> bool {
+        m.is_durable() && self.is_durable()
     }
 
     pub fn ids(&self) -> &Arc<IdGenerator> {
@@ -298,9 +332,21 @@ impl Queue {
         }
     }
 
-    /// `postAcknowledge`: once no durable queue refers to the message, its
-    /// record is deleted (not synced; recovery deletes what a crash missed).
+    /// `postAcknowledge`: the reference leaves the queue for good. Once no
+    /// durable queue refers to the message, its record is deleted (not
+    /// synced; recovery deletes what a crash missed). A paged message is
+    /// acknowledged on its page instead.
     pub fn post_acknowledge(&self, r: &MessageRef) {
+        if let Some(position) = &r.paged {
+            if let Some(sub) = &self.0.paging
+                && let Some(store) = sub.store()
+            {
+                store.acknowledged(sub, position);
+            }
+            return;
+        }
+        self.0.message_count.fetch_sub(1, Ordering::SeqCst);
+        self.ref_down(r);
         if self.is_durable_ref(r)
             && r.message.durable_down() == 0
             && let Some(s) = self.0.ids.storage()
@@ -310,6 +356,107 @@ impl Queue {
                 "AMQ222178: Cannot find message {} on the journal: {e}",
                 r.message_id()
             );
+        }
+    }
+
+    /// `refUp`: the message's memory counts against its address while
+    /// referenced, and each reference against the queue's address.
+    fn ref_up(&self, r: &MessageRef) {
+        let po = self.0.post_office.upgrade();
+        let owner = r.message.owner(|| {
+            let address = r.message.core().address.as_ref()?.to_string_lossy();
+            po.as_ref().map(|po| po.paging_store(&address))
+        });
+        if r.message.ref_up() == 1
+            && let Some(owner) = owner
+        {
+            owner.add_size(memory_estimate(&r.message), 1);
+        }
+        if let Some(store) = self.0.paging.as_ref().and_then(|s| s.store()) {
+            store.add_size(REF_MEMORY_ESTIMATE, 0);
+        }
+    }
+
+    /// `refDown`.
+    fn ref_down(&self, r: &MessageRef) {
+        if r.message.ref_down() == 0
+            && let Some(owner) = r.message.owner(|| None)
+        {
+            owner.add_size(-memory_estimate(&r.message), -1);
+        }
+        if let Some(store) = self.0.paging.as_ref().and_then(|s| s.store()) {
+            store.add_size(-REF_MEMORY_ESTIMATE, 0);
+        }
+    }
+
+    /// Journals an acknowledgement outside a transaction: `ACKNOWLEDGE_REF`
+    /// for a journaled reference; for a paged one `ACKNOWLEDGE_CURSOR` in a
+    /// journal transaction of its own (`PageSubscription.ack`). Returns the
+    /// write to wait for.
+    pub fn store_ack(&self, r: &mut MessageRef) -> StoreResult<Option<Pending>> {
+        if let Some(position) = &mut r.paged {
+            let (Some(sub), Some(s)) = (&self.0.paging, self.0.ids.storage()) else {
+                return Ok(None);
+            };
+            let Some(store) = sub.store() else {
+                return Ok(None);
+            };
+            let tx = s.generate_id();
+            let mut paging = TxPaging::default();
+            paging.manager = store.manager();
+            position.ack_record = store.store_ack_tx(sub, tx, position, &mut paging.updates)?;
+            if position.ack_record < 0 && paging.updates.is_empty() {
+                return Ok(None);
+            }
+            paging.before_commit(s, tx)?;
+            return s.commit(tx).map(Some);
+        }
+        if self.is_durable_ref(r)
+            && let Some(s) = self.0.ids.storage()
+        {
+            return s.store_acknowledge(self.0.id, r.message_id()).map(Some);
+        }
+        Ok(None)
+    }
+
+    /// Journals an acknowledgement in the journal transaction `tx`
+    /// (`storeAcknowledgeTransactional`, or `ackTx` for a paged message,
+    /// whose page transaction update `paging` writes before the commit).
+    /// True when it wrote to the journal.
+    pub fn store_ack_tx(
+        &self,
+        tx: i64,
+        r: &mut MessageRef,
+        paging: &mut TxPaging,
+    ) -> StoreResult<bool> {
+        if let Some(position) = &mut r.paged {
+            let Some(sub) = &self.0.paging else {
+                return Ok(false);
+            };
+            let Some(store) = sub.store() else {
+                return Ok(false);
+            };
+            if paging.manager.is_none() {
+                paging.manager = store.manager();
+            }
+            position.ack_record = store.store_ack_tx(sub, tx, position, &mut paging.updates)?;
+            return Ok(position.ack_record >= 0 || position.tx_id > 0);
+        }
+        if self.is_durable_ref(r)
+            && let Some(s) = self.0.ids.storage()
+        {
+            s.store_acknowledge_tx(tx, self.0.id, r.message_id())?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// The queue is being deleted: its cursor goes from its address's pages.
+    pub fn unsubscribe(&self) {
+        if let Some(sub) = &self.0.paging
+            && let Some(store) = sub.store()
+        {
+            store.unsubscribe(sub);
         }
     }
 
@@ -329,6 +476,7 @@ impl Queue {
     /// Adds a routed message to the tail (`addTail`).
     pub fn add(&self, r: MessageRef) {
         self.0.message_count.fetch_add(1, Ordering::SeqCst);
+        self.ref_up(&r);
         self.send(Cmd::Add(r));
     }
 
@@ -338,12 +486,6 @@ impl Queue {
         if !refs.is_empty() {
             self.send(Cmd::Reinsert(refs));
         }
-    }
-
-    /// Records that `n` references acknowledged in a transaction were
-    /// committed.
-    pub fn acked(&self, n: usize) {
-        self.0.message_count.fetch_sub(n as i64, Ordering::SeqCst);
     }
 
     pub fn add_consumer(&self, reg: ConsumerRegistration) {
@@ -663,6 +805,8 @@ struct Actor {
     exclusive_consumer: Option<ConsumerId>,
     /// Last-value queue: the current message ID for each key.
     last_values: HashMap<String, i64>,
+    /// Where the queue is in its address's pages.
+    page_iter: PageIterator,
     /// `dispatching`: false while consumers-before-dispatch,
     /// delay-before-dispatch or a group rebalance hold delivery.
     dispatching: bool,
@@ -924,20 +1068,16 @@ impl Actor {
 
     /// `acknowledge` outside any transaction, for a reference the broker
     /// drops (`AckReason.KILLED` / `EXPIRED`).
-    fn kill(&mut self, r: MessageRef) {
+    fn kill(&mut self, mut r: MessageRef) {
         self.forget_last_value(&r);
         let queue = self.queue();
-        if queue.is_durable_ref(&r)
-            && let Some(s) = self.shared.ids.storage()
-            && let Err(e) = s.store_acknowledge(self.shared.id, r.message_id())
-        {
+        if let Err(e) = queue.store_ack(&mut r) {
             tracing::warn!(
                 "AMQ222178: Cannot find message {} on the journal: {e}",
                 r.message_id()
             );
         }
         queue.post_acknowledge(&r);
-        self.count_removed(1);
     }
 
     /// `sendToDeadLetterAddress`.
@@ -1061,7 +1201,7 @@ impl Actor {
 
     /// `move`: a copy of the message goes to `address` and the reference is
     /// acknowledged, in one transaction.
-    fn move_to(&mut self, address: &str, r: MessageRef, expiry: bool) {
+    fn move_to(&mut self, address: &str, mut r: MessageRef, expiry: bool) {
         let Some(po) = self.shared.post_office.upgrade() else {
             self.kill(r);
             return;
@@ -1079,6 +1219,14 @@ impl Actor {
         let mut copy = MessageRef::new(r.message.copy(copy));
         copy.scheduled_time = message::scheduled_delivery_time(copy.message.core());
         let routed = po.route_internal(&copy, address);
+        // A paging dead-letter or expiry address takes the copy in its pages.
+        let routed = match po.page_routed(routed.clone(), None) {
+            Ok((routed, _)) => routed,
+            Err(e) => {
+                tracing::warn!("moving message {} to {address}: {e}", r.message_id());
+                routed
+            }
+        };
         let queue = self.queue();
         if let Some(s) = self.shared.ids.storage() {
             let tx = self.shared.ids.next();
@@ -1093,11 +1241,12 @@ impl Actor {
                         persistent = true;
                     }
                 }
-                if queue.is_durable_ref(&r) {
-                    s.store_acknowledge_tx(tx, self.shared.id, r.message_id())?;
+                let mut paging = TxPaging::default();
+                if queue.store_ack_tx(tx, &mut r, &mut paging)? {
                     persistent = true;
                 }
                 if persistent {
+                    paging.before_commit(s, tx)?;
                     s.commit(tx)?;
                 }
                 Ok(())
@@ -1112,7 +1261,6 @@ impl Actor {
             }
         }
         queue.post_acknowledge(&r);
-        self.count_removed(1);
     }
 
     /// Handles one command; returns false to stop the actor.
@@ -1213,7 +1361,7 @@ impl Actor {
                 self.deliver();
                 self.force_delivery(id, sequence);
             }
-            Cmd::ResumeLarge => {}
+            Cmd::ResumeLarge | Cmd::Depage => {}
             Cmd::Remove { message_id, reply } => {
                 let mut r = self
                     .messages
@@ -1270,12 +1418,6 @@ impl Actor {
         Some(self.browsers.remove(i))
     }
 
-    fn count_removed(&self, n: usize) {
-        self.shared
-            .message_count
-            .fetch_sub(n as i64, Ordering::SeqCst);
-    }
-
     fn ack(
         &mut self,
         id: ConsumerId,
@@ -1315,9 +1457,7 @@ impl Actor {
         if self.shared.config.non_destructive {
             return Ok(Vec::new());
         }
-        if !transactional {
-            self.count_removed(refs.len());
-        }
+        let _ = transactional;
         Ok(refs)
     }
 
@@ -1325,6 +1465,7 @@ impl Actor {
     /// another. Each message goes to the next consumer, round robin, in the
     /// highest priority group that has one able to take it.
     fn deliver(&mut self) {
+        self.depage();
         // Large messages part-way out go first.
         let mut more = false;
         for c in self.consumers.iter_mut().chain(self.browsers.iter_mut()) {
@@ -1472,8 +1613,7 @@ impl Actor {
             return true;
         }
         if c.reg.pre_acknowledge {
-            self.count_removed(1);
-            self.pre_acknowledge(&r);
+            self.pre_acknowledge(r);
         } else {
             c.delivering.push_back(r);
         }
@@ -1482,18 +1622,52 @@ impl Actor {
 
     /// A pre-acknowledged delivery is acknowledged at once (`acknowledge`
     /// from `ServerConsumerImpl.proceedDeliver`).
-    fn pre_acknowledge(&self, r: &MessageRef) {
+    fn pre_acknowledge(&self, mut r: MessageRef) {
         let queue = Queue(self.shared.clone());
-        if queue.is_durable_ref(r)
-            && let Some(s) = self.shared.ids.storage()
-            && let Err(e) = s.store_acknowledge(self.shared.id, r.message_id())
-        {
+        if let Err(e) = queue.store_ack(&mut r) {
             tracing::warn!(
                 "AMQ222178: Cannot find message {} on the journal: {e}",
                 r.message_id()
             );
         }
-        queue.post_acknowledge(r);
+        queue.post_acknowledge(&r);
+    }
+
+    /// `QueueImpl.depage`: reads paged messages into memory while the
+    /// queue holds fewer than `max-read-page-messages` and
+    /// `max-read-page-bytes` of them (`needsDepage`).
+    fn depage(&mut self) {
+        let Some(sub) = self.shared.paging.clone() else {
+            return;
+        };
+        let Some(store) = sub.store() else {
+            return;
+        };
+        let s = self.queue().settings();
+        let now = now_millis();
+        loop {
+            let (n, bytes) = sub.in_memory();
+            let full = if s.max_read_page_messages <= 0 && s.max_read_page_bytes <= 0 {
+                n >= MAX_DEPAGE_NUM
+            } else {
+                (s.max_read_page_messages > 0 && n >= s.max_read_page_messages)
+                    || (s.max_read_page_bytes > 0 && bytes >= s.max_read_page_bytes)
+            };
+            if full {
+                break;
+            }
+            let Some(p) = store.next(&sub, &mut self.page_iter) else {
+                break;
+            };
+            sub.read_in(p.position.size);
+            let mut r = MessageRef::new(p.message);
+            r.paged = Some(p.position);
+            let t = message::scheduled_delivery_time(r.message.core());
+            if t > now {
+                r.scheduled_time = t;
+            }
+            self.add_tail(r);
+        }
     }
 
     /// `deleteAllReferences`: the deleted queue's durable messages are
@@ -1508,13 +1682,13 @@ impl Actor {
         for c in self.consumers.iter_mut() {
             refs.extend(c.delivering.drain(..));
         }
-        for r in &refs {
-            if queue.is_durable_ref(r)
-                && let Some(s) = &storage
-            {
-                let _ = s.store_acknowledge(self.shared.id, r.message_id());
+        let _ = storage;
+        for mut r in refs {
+            // A paged message's cursor goes with the queue's subscription.
+            if r.paged.is_none() {
+                let _ = queue.store_ack(&mut r);
             }
-            queue.post_acknowledge(r);
+            queue.post_acknowledge(&r);
         }
     }
 

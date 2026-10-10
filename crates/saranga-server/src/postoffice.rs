@@ -344,6 +344,7 @@ pub struct PostOffice {
     ids: Arc<IdGenerator>,
     wildcard: WildcardConfig,
     duplicates: crate::duplicate::DuplicateIdCaches,
+    paging: Arc<crate::paging::PagingManager>,
 }
 
 impl PostOffice {
@@ -353,6 +354,7 @@ impl PostOffice {
         ids: Arc<IdGenerator>,
         wildcard: WildcardConfig,
         duplicates: crate::duplicate::DuplicateIdCaches,
+        paging: Arc<crate::paging::PagingManager>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
@@ -362,7 +364,58 @@ impl PostOffice {
             ids,
             wildcard,
             duplicates,
+            paging,
         })
+    }
+
+    pub fn paging(&self) -> &Arc<crate::paging::PagingManager> {
+        &self.paging
+    }
+
+    /// The paging store of an address (`PagingManager.getPageStore`).
+    pub fn paging_store(&self, address: &str) -> Arc<crate::paging::PagingStore> {
+        self.paging.store(address, || self.settings(address))
+    }
+
+    /// `processRoute` with `PagingStore.page`: the queues of an address that
+    /// pages get the message in its pages instead of a reference; a full
+    /// address under DROP drops it, under FAIL refuses it. Returns what is
+    /// left to route, and the page syncs to wait for.
+    pub fn page_routed(
+        &self,
+        routed: Routed,
+        tx: Option<&crate::transaction::TxRef>,
+    ) -> Result<(Routed, Vec<crate::storage::Pending>)> {
+        let mut out = Vec::with_capacity(routed.len());
+        let mut pending = Vec::new();
+        for (r, queues) in routed {
+            let mut by_address: Vec<(Name, Vec<Queue>)> = Vec::new();
+            for q in queues {
+                let a = q.config().address.clone();
+                match by_address.iter_mut().find(|(b, _)| *b == a) {
+                    Some((_, g)) => g.push(q),
+                    None => by_address.push((a, vec![q])),
+                }
+            }
+            let mut keep = Vec::new();
+            for (address, group) in by_address {
+                match self.paging_store(&address).page(&r.message, tx, &group)? {
+                    crate::paging::Paged::No => keep.extend(group),
+                    crate::paging::Paged::Yes(p) => pending.extend(p),
+                    crate::paging::Paged::Dropped => {}
+                }
+            }
+            if !keep.is_empty() {
+                out.push((r, keep));
+            }
+        }
+        Ok((out, pending))
+    }
+
+    /// A new queue's cursor on its address's pages.
+    fn subscribe(&self, id: i64, config: &QueueConfig) -> Arc<crate::paging::PageSubscription> {
+        self.paging_store(&config.address)
+            .subscribe(id, config.durable && !config.temporary)
     }
 
     /// The duplicate-ID cache of `address` (`getDuplicateIDCache`).
@@ -433,7 +486,15 @@ impl PostOffice {
                 })
             });
         entry.info.routing_types.add(config.routing_type);
-        let queue = Queue::spawn(id, config, filter, self.ids.clone(), self.me.clone());
+        let sub = self.subscribe(id, &config);
+        let queue = Queue::spawn(
+            id,
+            config,
+            filter,
+            self.ids.clone(),
+            self.me.clone(),
+            Some(sub),
+        );
         entry.queues.push(queue.clone());
         state.queues.insert(queue.name().clone(), queue.clone());
         Ok(queue)
@@ -622,7 +683,15 @@ impl PostOffice {
             )
             .map_err(Self::io)?;
         }
-        let queue = Queue::spawn(id, config, filter, self.ids.clone(), self.me.clone());
+        let sub = self.subscribe(id, &config);
+        let queue = Queue::spawn(
+            id,
+            config,
+            filter,
+            self.ids.clone(),
+            self.me.clone(),
+            Some(sub),
+        );
         entry.queues.push(queue.clone());
         state.queues.insert(queue.name().clone(), queue.clone());
         Ok(queue)
@@ -660,6 +729,7 @@ impl PostOffice {
         {
             tracing::warn!("deleting queue {name}: {e}");
         }
+        queue.unsubscribe();
         queue.shutdown();
         if auto_delete_address && self.address_info(&address).is_some_and(|i| i.auto_created) {
             self.remove_address(&address);

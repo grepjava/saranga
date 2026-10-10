@@ -1,7 +1,15 @@
 [package]
 name = "saranga-paging"
+description = "Artemis page files: page records, paged messages and the paging directory layout"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+saranga-buffer = { path = "../saranga-buffer" }
+saranga-message = { path = "../saranga-message" }
+saranga-storage = { path = "../saranga-storage" }
+
+[dev-dependencies]
+flate2 = "1"
+tar = "0.4"

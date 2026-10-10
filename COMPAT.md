@@ -39,6 +39,13 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - `server.lock` holds the node ID and state as in Artemis; the primary lock is a lock on `serverlock.1`. The node ID of a new instance is a random UUID rather than a time-based one.
 - The XA error messages print `XidImpl (<n> ...` with a hash of the Xid where Java prints an identity hash.
 
+## Paging differences
+- **Paging needs persistence.** Without `persistence-enabled`, Artemis still writes page files (its null storage manager keeps no journal but the page store works); Saranga keeps every message in memory, and only BLOCK, FAIL and DROP limit an address.
+- **`global-max-size`** defaults to 1 GiB. Artemis defaults to half the JVM's maximum heap, which Saranga does not have.
+- **Messages sent in a transaction** count against the address size when the transaction commits. Artemis counts them as they are routed, before the commit. Under transactional producers a Saranga address therefore fills a little later.
+- **Queue browsers** see the messages a queue holds in memory, including those read in from its pages up to `max-read-page-messages` and `max-read-page-bytes` (1,000 messages when neither is set), but not the rest of a longer backlog. Artemis browsers read through the page files as well (`QueueBrowserIterator`).
+- **Page counters** are rebuilt from the page files at every start, and the counter records Artemis writes are deleted when Saranga loads them. Artemis rebuilds its counters the same way when the records are missing, so the data directory still moves back.
+
 ## Queue semantics differences
 - **delay-before-dispatch** ends on a timer. Artemis has no timer: it starts dispatching at the next delivery attempt after the delay, such as a new message, a consumer's credits or a forced receive.
 - **Last-value queues** drop a replaced value as soon as its replacement arrives. Artemis prunes on its next delivery pass. The queue holds the same messages afterwards.

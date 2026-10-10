@@ -112,6 +112,8 @@ pub struct Transaction {
     pub created: i64,
     /// The XA timeout the client set; -1 for the resource manager's.
     pub timeout_seconds: i32,
+    /// What it did with pages.
+    pub paging: crate::paging::TxPaging,
 }
 
 pub type TxRef = Arc<Mutex<Transaction>>;
@@ -136,6 +138,9 @@ pub struct Outcome {
     pub cancel: Vec<(Queue, MessageRef)>,
     /// Commit: duplicate IDs for their caches.
     pub duplicates: Vec<crate::duplicate::PendingId>,
+    /// The transaction's paging, committed or rolled back with it.
+    pub paging: crate::paging::TxPaging,
+    pub committed: bool,
 }
 
 impl Outcome {
@@ -145,8 +150,14 @@ impl Outcome {
         let (Some(storage), Some(record)) = (storage, self.record.take()) else {
             return Ok(None);
         };
+        let io = |e: saranga_journal::JournalError| {
+            BrokerError::new(saranga_core_protocol::ErrorType::IoError, e.to_string())
+        };
         let r = match record {
-            TxRecord::Commit(id) => storage.commit(id),
+            TxRecord::Commit(id) => {
+                self.paging.before_commit(storage, id).map_err(io)?;
+                storage.commit(id)
+            }
             TxRecord::Rollback(id) => storage.rollback(id),
         };
         r.map(Some)
@@ -164,16 +175,13 @@ impl Outcome {
         for (q, r) in self.add {
             q.add(r);
         }
-        let mut acked: Vec<(Queue, usize)> = Vec::new();
+        if self.committed {
+            self.paging.after_commit();
+        } else {
+            self.paging.after_rollback();
+        }
         for (q, r) in self.acked {
             q.post_acknowledge(&r);
-            match acked.iter_mut().find(|(a, _)| *a == q) {
-                Some((_, n)) => *n += 1,
-                None => acked.push((q, 1)),
-            }
-        }
-        for (q, n) in acked {
-            q.acked(n);
         }
         return_refs(self.cancel);
     }
@@ -227,6 +235,7 @@ impl Transaction {
             duplicates: Vec::new(),
             created: crate::message::now_millis(),
             timeout_seconds: -1,
+            paging: crate::paging::TxPaging::default(),
         }
     }
 
@@ -260,6 +269,7 @@ impl Transaction {
         Outcome {
             record: journaled.then_some(TxRecord::Rollback(self.id)),
             cancel: std::mem::take(&mut self.acks),
+            paging: std::mem::take(&mut self.paging),
             ..Outcome::default()
         }
     }
@@ -289,9 +299,11 @@ impl Transaction {
         if !valid {
             return Err(Box::new((invalid_state(self.state), Outcome::default())));
         }
-        // doCommit: a commit record for persistent work, or to end a
-        // prepared branch.
-        let journaled = self.persistent || (self.xid.is_some() && self.state == TxState::Prepared);
+        // doCommit: a commit record for persistent work (paged messages'
+        // page transaction among it), or to end a prepared branch.
+        let journaled = self.persistent
+            || !self.paging.page_txs.is_empty()
+            || (self.xid.is_some() && self.state == TxState::Prepared);
         self.state = TxState::Committed;
         Ok(Outcome {
             record: journaled.then_some(TxRecord::Commit(self.id)),
@@ -299,6 +311,8 @@ impl Transaction {
             acked: std::mem::take(&mut self.acks),
             cancel: Vec::new(),
             duplicates: std::mem::take(&mut self.duplicates),
+            paging: std::mem::take(&mut self.paging),
+            committed: true,
         })
     }
 

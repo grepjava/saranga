@@ -1,8 +1,8 @@
 //! Messages as the broker holds them: routed once, shared by every queue
 //! and consumer through `Arc`, with the encoded form cached.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use saranga_buffer::{PropertyValue, SimpleString, Writer};
 use saranga_message::CoreMessage;
@@ -196,6 +196,11 @@ pub struct ServerMessage {
     /// A large message's body (`LargeServerMessageImpl`); `core.body` is
     /// then empty.
     large: Option<Arc<LargeBody>>,
+    /// References in queues (`RefCountMessage.refUp/refDown`).
+    refs: AtomicI32,
+    /// The paging store of the message's address, which counts the memory
+    /// it takes while referenced (`owner`).
+    owner: OnceLock<Arc<crate::paging::PagingStore>>,
 }
 
 impl ServerMessage {
@@ -207,6 +212,8 @@ impl ServerMessage {
             encoded: w.into_vec(),
             durable_refs: AtomicI32::new(0),
             large: None,
+            refs: AtomicI32::new(0),
+            owner: OnceLock::new(),
         })
     }
 
@@ -220,6 +227,8 @@ impl ServerMessage {
             encoded: w.into_vec(),
             durable_refs: AtomicI32::new(0),
             large: Some(body),
+            refs: AtomicI32::new(0),
+            owner: OnceLock::new(),
         })
     }
 
@@ -299,6 +308,43 @@ impl ServerMessage {
     pub fn encode_size(&self) -> usize {
         self.encoded.len()
     }
+
+    /// `refUp`: returns the new count.
+    pub fn ref_up(&self) -> i32 {
+        self.refs.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// `refDown`: returns the new count.
+    pub fn ref_down(&self) -> i32 {
+        self.refs.fetch_sub(1, Ordering::SeqCst) - 1
+    }
+
+    /// The store accounting the message's memory, set with its first
+    /// reference.
+    pub fn owner(
+        &self,
+        store: impl FnOnce() -> Option<Arc<crate::paging::PagingStore>>,
+    ) -> Option<&Arc<crate::paging::PagingStore>> {
+        if self.owner.get().is_none()
+            && let Some(s) = store()
+        {
+            let _ = self.owner.set(s);
+        }
+        self.owner.get()
+    }
+}
+
+/// Where a paged message is (`PagePosition` of a `PagedReference`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagePosition {
+    pub page: i64,
+    pub message_nr: i32,
+    /// The transaction that paged it; -1 outside one.
+    pub tx_id: i64,
+    /// What it counts as in its queue's page counter.
+    pub size: i64,
+    /// Its `ACKNOWLEDGE_CURSOR` record once journaled; -1 before.
+    pub ack_record: i64,
 }
 
 /// `Message.getRoutingType`: the `_AMQ_ROUTING_TYPE` byte property.
@@ -322,6 +368,8 @@ pub struct MessageRef {
     /// When the reference may be delivered, in epoch milliseconds; 0 for
     /// now (`scheduledDeliveryTime`).
     pub scheduled_time: i64,
+    /// Set for a message read from a page: it is not in the journal.
+    pub paged: Option<PagePosition>,
 }
 
 impl MessageRef {
@@ -331,6 +379,7 @@ impl MessageRef {
             delivery_count: 0,
             persisted_count: 0,
             scheduled_time: 0,
+            paged: None,
         }
     }
 

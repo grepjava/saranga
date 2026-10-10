@@ -13,6 +13,7 @@ pub mod error;
 pub mod large;
 pub mod message;
 pub mod node;
+pub mod paging;
 pub mod postoffice;
 pub mod queue;
 pub mod recovery;
@@ -139,6 +140,11 @@ pub struct BrokerConfig {
     pub id_cache_size: i32,
     /// `persist-id-cache`.
     pub persist_id_cache: bool,
+    /// `global-max-size`: the memory all addresses' messages may take
+    /// before addresses page (or block, fail, drop); -1 for no limit.
+    pub global_max_size: i64,
+    /// `global-max-messages`; -1 for no limit.
+    pub global_max_messages: i64,
 }
 
 impl BrokerConfig {
@@ -158,6 +164,8 @@ impl BrokerConfig {
             transaction_timeout_scan_period: 1000,
             id_cache_size: 20000,
             persist_id_cache: true,
+            global_max_size: -1,
+            global_max_messages: -1,
         }
     }
 }
@@ -244,6 +252,27 @@ impl Broker {
             }
             None => (Arc::new(IdGenerator::new(1)), None, None),
         };
+        let large_messages = match &config.storage {
+            Some(sc) => {
+                large::LargeMessageStore::new(sc.large_messages.clone(), sc.large_message_sync)
+            }
+            None => large::LargeMessageStore::in_memory(),
+        };
+        // recoverLargeMessagesOnFolder: the files there before loading.
+        let mut stored_large = large_messages
+            .start()
+            .map_err(|e| internal("large-messages directory", &e))?;
+        let paging = paging::PagingManager::new(
+            config.storage.as_ref().map(|sc| sc.paging.clone()),
+            storage.clone(),
+            large_messages.clone(),
+            config.global_max_size,
+            config.global_max_messages,
+        );
+        // The page stores are found before the queues subscribe to them.
+        paging
+            .reload_stores(|a| config.settings.get_match(a))
+            .map_err(|e| internal("paging directory", &e))?;
         let post_office = PostOffice::new(
             config.settings,
             config.filters,
@@ -253,6 +282,7 @@ impl Broker {
                 config.id_cache_size,
                 storage.clone().filter(|_| config.persist_id_cache),
             ),
+            paging.clone(),
         );
         if let Some(s) = &storage {
             recovery::load_bindings(s, &post_office)?;
@@ -275,14 +305,21 @@ impl Broker {
         }
         let resource_manager =
             transaction::ResourceManager::new((config.transaction_timeout / 1000) as i32);
-        let large_messages = match &config.storage {
-            Some(sc) => {
-                large::LargeMessageStore::new(sc.large_messages.clone(), sc.large_message_sync)
-            }
-            None => large::LargeMessageStore::in_memory(),
-        };
         if let Some(s) = &storage {
-            recovery::load_messages(s, &post_office, &resource_manager, &large_messages).await?;
+            recovery::load_messages(
+                s,
+                &post_office,
+                &resource_manager,
+                &large_messages,
+                &mut stored_large,
+            )
+            .await?;
+            // Large messages in pages keep their files; the rest are the
+            // leftovers of a crash (`rebuildCounters`).
+            paging.after_load(&mut stored_large);
+            large_messages.delete_files(stored_large);
+        } else {
+            paging.set_loaded();
         }
         if config.message_expiry_scan_period > 0 {
             spawn_expiry_reaper(&post_office, config.message_expiry_scan_period);
@@ -310,6 +347,7 @@ impl Broker {
     /// written out, and `server.lock` marked paused.
     pub fn stop(&self) -> Result<()> {
         self.large_messages.stop();
+        self.post_office.paging().stop();
         if let Some(s) = &self.storage {
             s.stop()
                 .map_err(|e| BrokerError::internal(format!("stopping the journals: {e}")))?;

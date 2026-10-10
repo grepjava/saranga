@@ -54,6 +54,7 @@ pub fn run(cmd: DataCommand) -> anyhow::Result<()> {
                 skip_bindings: a.skip_bindings,
                 skip_journal: a.skip_journal,
                 max_pages: u32::try_from(a.max_pages).ok(),
+                print_pages: Some(saranga_paging::print::print_pages),
             };
             let paging = a
                 .paging

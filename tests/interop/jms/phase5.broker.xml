@@ -260,6 +260,13 @@ under the License.
             <max-size-bytes>200K</max-size-bytes>
             <address-full-policy>DROP</address-full-policy>
          </address-setting>
+         <address-setting match="p5.pagelimit.#">
+            <max-size-bytes>200K</max-size-bytes>
+            <page-size-bytes>64K</page-size-bytes>
+            <address-full-policy>PAGE</address-full-policy>
+            <page-limit-messages>100</page-limit-messages>
+            <page-full-policy>FAIL</page-full-policy>
+         </address-setting>
          <address-setting match="p5.pagemsgs.#">
             <max-size-messages>20</max-size-messages>
             <page-size-bytes>64K</page-size-bytes>

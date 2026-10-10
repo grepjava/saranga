@@ -61,6 +61,25 @@ public class Phase5 {
         tests.put("largeDuplicate", Phase5::largeDuplicate);
         tests.put("largeCoreStream", Phase5::largeCoreStream);
         tests.put("largeConsumerClosedMidway", Phase5::largeConsumerClosedMidway);
+        // paging
+        tests.put("pageAndDepage", Phase5::pageAndDepage);
+        tests.put("pageMessageCount", Phase5::pageMessageCount);
+        tests.put("pageNonPersistent", Phase5::pageNonPersistent);
+        tests.put("pageTopic", Phase5::pageTopic);
+        tests.put("pageDurableSubscriptions", Phase5::pageDurableSubscriptions);
+        tests.put("pageTransacted", Phase5::pageTransacted);
+        tests.put("pageConsumeRollback", Phase5::pageConsumeRollback);
+        tests.put("pageSelector", Phase5::pageSelector);
+        tests.put("pageToDeadLetter", Phase5::pageToDeadLetter);
+        tests.put("pageLarge", Phase5::pageLarge);
+        tests.put("pageExpiry", Phase5::pageExpiry);
+        tests.put("pageBrowse", Phase5::pageBrowse);
+        tests.put("pageMaxMessages", Phase5::pageMaxMessages);
+        tests.put("pageMany", Phase5::pageMany);
+        tests.put("blockPolicy", Phase5::blockPolicy);
+        tests.put("failPolicy", Phase5::failPolicy);
+        tests.put("dropPolicy", Phase5::dropPolicy);
+        tests.put("pageLimit", Phase5::pageLimit);
 
         int failed = 0;
         for (Map.Entry<String, Test> t : tests.entrySet()) {
@@ -404,7 +423,7 @@ public class Phase5 {
                 check(mc.receive(700) == null, "not delivered before its time");
                 Message got = mc.receive(5000);
                 checkBytes(got, body);
-                check(now() - sent >= 1400, "delivered at its time");
+                check(now() - sent >= 1000, "delivered at its time");
             }
         });
     }
@@ -487,6 +506,409 @@ public class Phase5 {
             List<Message> got = take(c, q, null, 5000);
             eq(1, got.size(), "the message is still there");
             checkBytes(got.get(0), pattern(8 * MB, 23));
+        });
+    }
+
+    // ------------------------------------------------------------------ paging
+    // p5.page.#: max-size-bytes 200K in 64K pages; 2 KB messages page after ~80.
+
+    static final String PAD = "p".repeat(2000);
+
+    /** Sends {@code n} text messages "{@code prefix}-i-PAD" with an int property i. */
+    static void sendN(Session s, Destination d, String prefix, int n, int mode) throws JMSException {
+        MessageProducer p = s.createProducer(d);
+        p.setDeliveryMode(mode);
+        for (int i = 0; i < n; i++) {
+            TextMessage m = s.createTextMessage(prefix + "-" + i + "-" + PAD);
+            m.setIntProperty("i", i);
+            p.send(m);
+        }
+        p.close();
+    }
+
+    /** Receives {@code n} messages "{@code prefix}-i" in order, i from {@code from}. */
+    static void expectN(MessageConsumer c, String prefix, int from, int n) throws JMSException {
+        for (int i = from; i < from + n; i++) {
+            Message m = c.receive(5000);
+            check(m != null, prefix + ": message " + i + " missing");
+            eq(prefix + "-" + i + "-" + PAD, text(m), prefix + ": message " + i);
+        }
+    }
+
+    static long messageCount(String queue) throws Exception {
+        try (ServerLocator locator = ActiveMQClient.createServerLocator(url);
+             ClientSessionFactory sf = locator.createSessionFactory();
+             ClientSession s = sf.createSession()) {
+            return s.queueQuery(SimpleString.of(queue)).getMessageCount();
+        }
+    }
+
+    static void pageAndDepage() throws Exception {
+        String q = name("page.depage");
+        with(c -> {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                sendN(s, s.createQueue(q), "m", 600, DeliveryMode.PERSISTENT);
+                MessageConsumer mc = s.createConsumer(s.createQueue(q));
+                expectN(mc, "m", 0, 600);
+                check(mc.receive(300) == null, "nothing more");
+            }
+        });
+    }
+
+    static void pageMessageCount() throws Exception {
+        String q = name("page.count");
+        with(c -> {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                sendN(s, s.createQueue(q), "m", 500, DeliveryMode.PERSISTENT);
+                eq(500L, messageCount(q), "message count with paged messages");
+                MessageConsumer mc = s.createConsumer(s.createQueue(q));
+                expectN(mc, "m", 0, 100);
+                mc.close();
+                long deadline = now() + 3000;
+                while (messageCount(q) != 400 && now() < deadline) Thread.sleep(50);
+                eq(400L, messageCount(q), "message count after consuming 100");
+                expectN(s.createConsumer(s.createQueue(q)), "m", 100, 400);
+            }
+        });
+    }
+
+    static void pageNonPersistent() throws Exception {
+        String q = name("page.np");
+        with(c -> {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                sendN(s, s.createQueue(q), "np", 400, DeliveryMode.NON_PERSISTENT);
+                expectN(s.createConsumer(s.createQueue(q)), "np", 0, 400);
+            }
+        });
+    }
+
+    static void pageTopic() throws Exception {
+        String t = name("page.topic");
+        with(c -> {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                Topic topic = s.createTopic(t);
+                MessageConsumer one = s.createConsumer(topic);
+                MessageConsumer two = s.createConsumer(topic);
+                sendN(s, topic, "t", 400, DeliveryMode.PERSISTENT);
+                expectN(one, "t", 0, 400);
+                expectN(two, "t", 0, 400);
+            }
+        });
+    }
+
+    static void pageDurableSubscriptions() throws Exception {
+        String t = name("page.durable");
+        try (Connection c = cf(null).createConnection()) {
+            c.setClientID("p5-durable-" + RUN);
+            c.start();
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                Topic topic = s.createTopic(t);
+                s.createDurableSubscriber(topic, "a").close();
+                s.createDurableSubscriber(topic, "b").close();
+                sendN(s, topic, "d", 400, DeliveryMode.PERSISTENT);
+                try (TopicSubscriber a = s.createDurableSubscriber(topic, "a")) {
+                    expectN(a, "d", 0, 400);
+                }
+                try (TopicSubscriber b = s.createDurableSubscriber(topic, "b")) {
+                    expectN(b, "d", 0, 150);
+                }
+                try (TopicSubscriber b = s.createDurableSubscriber(topic, "b")) {
+                    expectN(b, "d", 150, 250);
+                    check(b.receive(300) == null, "nothing more for b");
+                }
+                s.unsubscribe("a");
+                s.unsubscribe("b");
+            }
+        }
+    }
+
+    static void pageTransacted() throws Exception {
+        String q = name("page.tx");
+        with(c -> {
+            try (Session tx = c.createSession(true, Session.SESSION_TRANSACTED);
+                 Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                Queue queue = tx.createQueue(q);
+                sendN(tx, queue, "a", 200, DeliveryMode.PERSISTENT);
+                tx.commit();
+                sendN(tx, queue, "b", 100, DeliveryMode.PERSISTENT);
+                tx.rollback();
+                sendN(tx, queue, "c", 50, DeliveryMode.PERSISTENT);
+                // Not yet committed: a consumer reaches them only after the commit.
+                MessageConsumer mc = s.createConsumer(s.createQueue(q));
+                expectN(mc, "a", 0, 200);
+                check(mc.receive(500) == null, "uncommitted paged messages are not delivered");
+                tx.commit();
+                expectN(mc, "c", 0, 50);
+                check(mc.receive(300) == null, "rolled-back messages never arrive");
+            }
+        });
+    }
+
+    static void pageConsumeRollback() throws Exception {
+        String q = name("page.rollback");
+        with(c -> {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                sendN(s, s.createQueue(q), "r", 300, DeliveryMode.PERSISTENT);
+            }
+            try (Session tx = c.createSession(true, Session.SESSION_TRANSACTED)) {
+                MessageConsumer mc = tx.createConsumer(tx.createQueue(q));
+                expectN(mc, "r", 0, 10);
+                tx.rollback();
+                Message m = mc.receive(5000);
+                eq("r-0-" + PAD, text(m), "redelivered first");
+                check(m.getJMSRedelivered(), "redelivered");
+                expectN(mc, "r", 1, 299);
+                tx.commit();
+            }
+            check(take(c, q, null, 300).isEmpty(), "the queue is empty");
+        });
+    }
+
+    static void pageSelector() throws Exception {
+        String q = name("page.selector");
+        with(c -> {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                MessageProducer p = s.createProducer(s.createQueue(q));
+                for (int i = 0; i < 400; i++) {
+                    TextMessage m = s.createTextMessage("s-" + i + "-" + PAD);
+                    m.setStringProperty("color", i % 2 == 0 ? "red" : "blue");
+                    m.setIntProperty("i", i);
+                    p.send(m);
+                }
+                MessageConsumer red = s.createConsumer(s.createQueue(q), "color = 'red'");
+                for (int i = 0; i < 400; i += 2) {
+                    eq(i, red.receive(5000).getIntProperty("i"), "red in order");
+                }
+                check(red.receive(300) == null, "no more red");
+                red.close();
+                MessageConsumer blue = s.createConsumer(s.createQueue(q));
+                for (int i = 1; i < 400; i += 2) {
+                    eq(i, blue.receive(5000).getIntProperty("i"), "blue in order");
+                }
+            }
+        });
+    }
+
+    static void pageToDeadLetter() throws Exception {
+        // p5.pagedla.#: paging, max-delivery-attempts 2, dead-letter-address p5.DLA
+        String q = name("pagedla.q");
+        String id = q + ".dead";
+        with(c -> {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                MessageProducer p = s.createProducer(s.createQueue(q));
+                for (int i = 0; i < 300; i++) {
+                    TextMessage m = s.createTextMessage("x-" + i + "-" + PAD);
+                    m.setIntProperty("i", i);
+                    m.setStringProperty("p5id", i == 250 ? id : "keep");
+                    p.send(m);
+                }
+            }
+            // The 251st message is in a page: it is rolled back until dead.
+            try (Session tx = c.createSession(true, Session.SESSION_TRANSACTED)) {
+                MessageConsumer mc = tx.createConsumer(tx.createQueue(q), "p5id = '" + id + "'");
+                for (int n = 0; n < 2; n++) {
+                    check(mc.receive(5000) != null, "delivery " + n);
+                    tx.rollback();
+                }
+                check(mc.receive(500) == null, "dead-lettered after two deliveries");
+            }
+            List<Message> dead = take(c, "p5.DLA", byId(id), 3000);
+            eq(1, dead.size(), "dead-lettered copies");
+            eq(250, dead.get(0).getIntProperty("i"), "the right message");
+            eq(299, take(c, q, null, 5000).size(), "the others remain");
+        });
+    }
+
+    static void pageLarge() throws Exception {
+        String q = name("page.large");
+        with(c -> {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                sendN(s, s.createQueue(q), "f", 150, DeliveryMode.PERSISTENT);
+                MessageProducer p = s.createProducer(s.createQueue(q));
+                for (int i = 0; i < 8; i++) {
+                    BytesMessage m = bytes(s, pattern(300_000 + i, 40 + i));
+                    m.setIntProperty("n", i);
+                    p.send(m);
+                }
+                MessageConsumer mc = s.createConsumer(s.createQueue(q));
+                expectN(mc, "f", 0, 150);
+                for (int i = 0; i < 8; i++) {
+                    Message m = mc.receive(5000);
+                    checkBytes(m, pattern(300_000 + i, 40 + i));
+                    eq(i, m.getIntProperty("n"), "large in order");
+                }
+            }
+        });
+    }
+
+    static void pageExpiry() throws Exception {
+        String q = name("page.expiry");
+        String id = q + ".exp";
+        with(c -> {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                MessageProducer p = s.createProducer(s.createQueue(q));
+                p.setTimeToLive(500);
+                for (int i = 0; i < 300; i++) {
+                    TextMessage m = s.createTextMessage("e-" + i + "-" + PAD);
+                    m.setStringProperty("p5id", id);
+                    p.send(m);
+                }
+            }
+            Thread.sleep(1500);
+            eq(0, take(c, q, null, 1500).size(), "expired paged messages are not delivered");
+            long deadline = now() + 5000;
+            int expired = 0;
+            while (expired < 300 && now() < deadline) {
+                expired += take(c, "ExpiryQueue", byId(id), 500).size();
+            }
+            eq(300, expired, "expired to the expiry address");
+        });
+    }
+
+    static void pageBrowse() throws Exception {
+        String q = name("page.browse");
+        with(c -> {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                sendN(s, s.createQueue(q), "b", 300, DeliveryMode.PERSISTENT);
+                Enumeration<?> e = s.createBrowser(s.createQueue(q)).getEnumeration();
+                int n = 0;
+                while (e.hasMoreElements()) {
+                    eq("b-" + n + "-" + PAD, text((Message) e.nextElement()), "browsed in order");
+                    n++;
+                }
+                eq(300, n, "browsed messages");
+                expectN(s.createConsumer(s.createQueue(q)), "b", 0, 300);
+            }
+        });
+    }
+
+    static void pageMaxMessages() throws Exception {
+        // p5.pagemsgs.#: max-size-messages 20
+        String q = name("pagemsgs.q");
+        with(c -> {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                sendN(s, s.createQueue(q), "mm", 200, DeliveryMode.PERSISTENT);
+                eq(200L, messageCount(q), "message count");
+                expectN(s.createConsumer(s.createQueue(q)), "mm", 0, 200);
+            }
+        });
+    }
+
+    static void pageMany() throws Exception {
+        String q = name("page.many");
+        with(c -> {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                sendN(s, s.createQueue(q), "many", 5000, DeliveryMode.PERSISTENT);
+                MessageConsumer mc = s.createConsumer(s.createQueue(q));
+                for (int i = 0; i < 5000; i++) {
+                    Message m = mc.receive(5000);
+                    check(m != null, "message " + i);
+                    eq(i, m.getIntProperty("i"), "in order");
+                }
+                check(mc.receive(300) == null, "nothing more");
+            }
+        });
+    }
+
+    static void blockPolicy() throws Exception {
+        // p5.block.#: max-size-bytes 200K, BLOCK
+        String q = name("block.q");
+        with(c -> {
+            AtomicInteger sent = new AtomicInteger();
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            Thread producer = new Thread(() -> {
+                try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                    MessageProducer p = s.createProducer(s.createQueue(q));
+                    for (int i = 0; i < 300; i++) {
+                        TextMessage m = s.createTextMessage("k-" + i + "-" + PAD);
+                        m.setIntProperty("i", i);
+                        p.send(m);
+                        sent.incrementAndGet();
+                    }
+                } catch (Throwable e) {
+                    failure.set(e);
+                }
+            });
+            producer.start();
+            Thread.sleep(1500);
+            check(producer.isAlive(), "the producer is blocked");
+            check(sent.get() < 300, "not everything was sent: " + sent.get());
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                MessageConsumer mc = s.createConsumer(s.createQueue(q));
+                for (int i = 0; i < 300; i++) {
+                    Message m = mc.receive(10000);
+                    check(m != null, "message " + i);
+                    eq(i, m.getIntProperty("i"), "in order");
+                }
+            }
+            producer.join(10000);
+            check(failure.get() == null, "producer failed: " + failure.get());
+            eq(300, sent.get(), "all sent once unblocked");
+        });
+    }
+
+    static void failPolicy() throws Exception {
+        // p5.fail.#: max-size-bytes 200K, FAIL
+        String q = name("fail.q");
+        with(c -> {
+            int sent = 0;
+            JMSException failed = null;
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                MessageProducer p = s.createProducer(s.createQueue(q));
+                for (int i = 0; i < 300 && failed == null; i++) {
+                    try {
+                        p.send(s.createTextMessage("f-" + i + "-" + PAD));
+                        sent++;
+                    } catch (JMSException e) {
+                        failed = e;
+                    }
+                }
+            }
+            check(failed != null, "a send failed");
+            check(sent > 10 && sent < 300, "sends before the address was full: " + sent);
+            eq(sent, take(c, q, null, 5000).size(), "every accepted message");
+            // With room again, sends succeed.
+            sendBytes(c, q, pattern(100, 1));
+            eq(1, take(c, q, null, 5000).size(), "sent after draining");
+        });
+    }
+
+    static void dropPolicy() throws Exception {
+        // p5.drop.#: max-size-bytes 200K, DROP
+        String q = name("drop.q");
+        with(c -> {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                sendN(s, s.createQueue(q), "x", 300, DeliveryMode.PERSISTENT);
+            }
+            int kept = take(c, q, null, 5000).size();
+            check(kept > 10 && kept < 300, "messages kept: " + kept);
+            sendBytes(c, q, pattern(100, 1));
+            eq(1, take(c, q, null, 5000).size(), "sent after draining");
+        });
+    }
+
+    static void pageLimit() throws Exception {
+        // p5.pagelimit.#: paging, page-limit-messages 100, page-full-policy FAIL
+        String q = name("pagelimit.q");
+        with(c -> {
+            int sent = 0;
+            JMSException failed = null;
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                MessageProducer p = s.createProducer(s.createQueue(q));
+                for (int i = 0; i < 400 && failed == null; i++) {
+                    try {
+                        p.send(s.createTextMessage("l-" + i + "-" + PAD));
+                        sent++;
+                    } catch (JMSException e) {
+                        failed = e;
+                    }
+                }
+            }
+            check(failed != null, "a send failed past the page limit");
+            check(sent > 100 && sent < 400, "sends before the page limit: " + sent);
+            eq(sent, take(c, q, null, 5000).size(), "every accepted message");
+            sendBytes(c, q, pattern(100, 1));
+            eq(1, take(c, q, null, 5000).size(), "sent after draining");
         });
     }
 

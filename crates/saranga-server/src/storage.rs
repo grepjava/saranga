@@ -10,8 +10,8 @@ use saranga_journal::{Completion, Journal, JournalConfig, JournalError, Prepared
 use saranga_message::CoreMessage;
 use saranga_storage::RecordCodec;
 use saranga_storage::codec::{
-    DeliveryCountUpdateEncoding, DuplicateIdEncoding, IdCounterEncoding, RefEncoding,
-    ScheduledDeliveryEncoding,
+    CursorAckRecordEncoding, DeliveryCountUpdateEncoding, DuplicateIdEncoding, IdCounterEncoding,
+    PageTransactionEncoding, RefEncoding, ScheduledDeliveryEncoding,
 };
 use saranga_storage::message::{LargeMessageRecord, PersistedMessage};
 use saranga_storage::{BatchingIdGenerator, CHECKPOINT_BATCH_SIZE, IdCounterStore};
@@ -64,6 +64,8 @@ pub struct StorageConfig {
     pub max_redelivery_records: i32,
     /// `large-messages-directory`.
     pub large_messages: std::path::PathBuf,
+    /// `paging-directory`.
+    pub paging: std::path::PathBuf,
     /// `large-message-sync`.
     pub large_message_sync: bool,
 }
@@ -182,6 +184,12 @@ pub struct RecoveredTx {
     /// (queue ID, message ID) acknowledged by the transaction.
     pub acks: Vec<(i64, i64)>,
     pub duplicates: Vec<RecoveredDuplicate>,
+    /// The page transaction of messages the transaction paged.
+    pub page_txs: Vec<RecoveredPageTx>,
+    /// Paged messages the transaction acknowledged.
+    pub cursor_acks: Vec<RecoveredCursorRecord>,
+    /// (page transaction, messages) consumed by the transaction.
+    pub page_tx_updates: Vec<(i64, i32)>,
 }
 
 /// A `DUPLICATE_ID` record.
@@ -203,6 +211,38 @@ impl RecoveredDuplicate {
     }
 }
 
+/// A page cursor record: `ACKNOWLEDGE_CURSOR` (a paged message one queue
+/// acknowledged) or `PAGE_CURSOR_COMPLETE` (a page one queue finished; the
+/// message number is the page's number of messages).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveredCursorRecord {
+    pub record: i64,
+    pub queue_id: i64,
+    pub page: i64,
+    pub message_nr: i32,
+}
+
+impl RecoveredCursorRecord {
+    fn decode(record: i64, data: &[u8]) -> StoreResult<Self> {
+        let e = CursorAckRecordEncoding::decode(data).map_err(corrupt("page cursor record"))?;
+        Ok(Self {
+            record,
+            queue_id: e.queue_id,
+            page: e.page_nr,
+            message_nr: e.message_nr,
+        })
+    }
+}
+
+/// A `PAGE_TRANSACTION` record (`PageTransactionInfoImpl`): a transaction
+/// that paged messages, and how many of them are still to be consumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveredPageTx {
+    pub record: i64,
+    pub tx_id: i64,
+    pub messages: i32,
+}
+
 /// What the message journal holds (`loadMessageJournal`).
 #[derive(Debug, Default)]
 pub struct RecoveredMessages {
@@ -214,6 +254,12 @@ pub struct RecoveredMessages {
     pub prepared: Vec<RecoveredTx>,
     /// Committed duplicate IDs, in journal order.
     pub duplicates: Vec<RecoveredDuplicate>,
+    /// `ACKNOWLEDGE_CURSOR` records.
+    pub cursor_acks: Vec<RecoveredCursorRecord>,
+    /// `PAGE_CURSOR_COMPLETE` records.
+    pub page_completes: Vec<RecoveredCursorRecord>,
+    /// Page transactions with messages left to consume.
+    pub page_txs: Vec<RecoveredPageTx>,
 }
 
 /// The broker's journals.
@@ -281,6 +327,11 @@ impl Storage {
         let mut order: HashMap<i64, Vec<i64>> = HashMap::new();
         // Per queue: message ID to (delivery count, scheduled time).
         let mut refs: HashMap<i64, HashMap<i64, (i32, i64)>> = HashMap::new();
+        // Page transactions by transaction ID, in journal order.
+        let mut page_txs: Vec<RecoveredPageTx> = Vec::new();
+        // Page counter records: Saranga rebuilds the counters from the
+        // pages, as Artemis does on every start, so they are deleted.
+        let mut counters = Vec::new();
         for r in loaded.committed {
             match r.user_record_type {
                 ids::ADD_MESSAGE_PROTOCOL => {
@@ -345,8 +396,52 @@ impl Storage {
                 ids::DUPLICATE_ID => out
                     .duplicates
                     .push(RecoveredDuplicate::decode(r.id, &r.data)?),
+                ids::ACKNOWLEDGE_CURSOR => out
+                    .cursor_acks
+                    .push(RecoveredCursorRecord::decode(r.id, &r.data)?),
+                ids::PAGE_CURSOR_COMPLETE => out
+                    .page_completes
+                    .push(RecoveredCursorRecord::decode(r.id, &r.data)?),
+                ids::PAGE_TRANSACTION => {
+                    let e = PageTransactionEncoding::decode(&r.data)
+                        .map_err(corrupt("page transaction"))?;
+                    if r.is_update {
+                        // PageUpdateTXEncoding: messages consumed since.
+                        match page_txs.iter_mut().find(|p| p.tx_id == e.transaction_id) {
+                            Some(p) => p.messages -= e.records,
+                            None => tracing::warn!(
+                                "AMQ222041: Cannot find page transaction {}",
+                                e.transaction_id
+                            ),
+                        }
+                    } else {
+                        page_txs.push(RecoveredPageTx {
+                            record: r.id,
+                            tx_id: e.transaction_id,
+                            messages: e.records,
+                        });
+                    }
+                }
+                ids::PAGE_CURSOR_COUNTER_VALUE
+                | ids::PAGE_CURSOR_COUNTER_INC
+                | ids::PAGE_CURSOR_PENDING_COUNTER => counters.push(r.id),
                 other => tracing::debug!("Extra record type {other}"),
             }
+        }
+        // A page transaction whose messages were all consumed goes.
+        for p in page_txs {
+            if p.messages > 0 {
+                out.page_txs.push(p);
+            } else {
+                let _ = self.messages.append_delete(p.record, false, None);
+            }
+        }
+        if !counters.is_empty() {
+            let tx = self.generate_id();
+            for id in counters {
+                self.messages.append_delete_tx(tx, id, Vec::new())?;
+            }
+            self.messages.append_commit(tx, false, None)?;
         }
         for (queue, ids) in order {
             let Some(live) = refs.get(&queue) else {
@@ -408,6 +503,9 @@ impl Storage {
             sends: Vec::new(),
             acks: Vec::new(),
             duplicates: Vec::new(),
+            page_txs: Vec::new(),
+            cursor_acks: Vec::new(),
+            page_tx_updates: Vec::new(),
         };
         for r in p.records {
             match r.user_record_type {
@@ -423,6 +521,22 @@ impl Storage {
                 ids::DUPLICATE_ID => tx
                     .duplicates
                     .push(RecoveredDuplicate::decode(r.id, &r.data)?),
+                ids::ACKNOWLEDGE_CURSOR => tx
+                    .cursor_acks
+                    .push(RecoveredCursorRecord::decode(r.id, &r.data)?),
+                ids::PAGE_TRANSACTION => {
+                    let e = PageTransactionEncoding::decode(&r.data)
+                        .map_err(corrupt("page transaction"))?;
+                    if r.is_update {
+                        tx.page_tx_updates.push((e.transaction_id, e.records));
+                    } else {
+                        tx.page_txs.push(RecoveredPageTx {
+                            record: r.id,
+                            tx_id: e.transaction_id,
+                            messages: e.records,
+                        });
+                    }
+                }
                 other => tracing::debug!("prepared transaction {} record type {other}", p.id),
             }
         }
@@ -591,6 +705,104 @@ impl Storage {
             .append_add_tx(tx, message.message_id(), record_type, body)
     }
 
+    /// `storeCursorAcknowledgeTransactional`: returns the record's ID.
+    pub fn store_cursor_ack_tx(
+        &self,
+        tx: i64,
+        queue_id: i64,
+        page: i64,
+        message_nr: i32,
+    ) -> StoreResult<i64> {
+        let id = self.generate_id();
+        let body = CursorAckRecordEncoding {
+            queue_id,
+            page_nr: page,
+            message_nr,
+        }
+        .encode();
+        self.messages
+            .append_add_tx(tx, id, ids::ACKNOWLEDGE_CURSOR, body)?;
+        Ok(id)
+    }
+
+    /// `storePageCompleteTransactional`: a page a queue has finished, with
+    /// its number of messages. Returns the record's ID.
+    pub fn store_page_complete_tx(
+        &self,
+        tx: i64,
+        queue_id: i64,
+        page: i64,
+        messages: i32,
+    ) -> StoreResult<i64> {
+        let id = self.generate_id();
+        let body = CursorAckRecordEncoding {
+            queue_id,
+            page_nr: page,
+            message_nr: messages,
+        }
+        .encode();
+        self.messages
+            .append_add_tx(tx, id, ids::PAGE_CURSOR_COMPLETE, body)?;
+        Ok(id)
+    }
+
+    /// `storePageTransaction`: the messages a transaction paged. Returns the
+    /// record's ID.
+    pub fn store_page_transaction_tx(
+        &self,
+        tx: i64,
+        page_tx: i64,
+        messages: i32,
+    ) -> StoreResult<i64> {
+        let id = self.generate_id();
+        let body = PageTransactionEncoding {
+            transaction_id: page_tx,
+            records: messages,
+        }
+        .encode();
+        self.messages
+            .append_add_tx(tx, id, ids::PAGE_TRANSACTION, body)?;
+        Ok(id)
+    }
+
+    /// `updatePageTransaction`: messages of a page transaction consumed.
+    pub fn update_page_transaction_tx(
+        &self,
+        tx: i64,
+        record: i64,
+        page_tx: i64,
+        consumed: i32,
+    ) -> StoreResult<()> {
+        let body = PageTransactionEncoding {
+            transaction_id: page_tx,
+            records: consumed,
+        }
+        .encode();
+        self.messages
+            .append_update_tx(tx, record, ids::PAGE_TRANSACTION, body)
+    }
+
+    /// `appendDeleteRecordTransactional` for a paging record.
+    pub fn delete_record_tx(&self, tx: i64, id: i64) -> StoreResult<()> {
+        self.messages.append_delete_tx(tx, id, Vec::new())
+    }
+
+    /// `tryAppendDeleteRecord`, not synced: `deletePageComplete`,
+    /// `deleteCursorAcknowledge`, `deletePageTransactional`.
+    pub fn delete_record(&self, id: i64) -> StoreResult<()> {
+        self.messages.append_delete(id, false, None).map(|_| ())
+    }
+
+    /// `journal-sync-transactional`.
+    pub fn sync_transactional(&self) -> bool {
+        self.cfg.sync_transactional
+    }
+
+    /// `journal-sync-non-transactional`.
+    pub fn sync_non_transactional(&self) -> bool {
+        self.cfg.sync_non_transactional
+    }
+
     /// `storeReferenceTransactional`.
     pub fn store_reference_tx(&self, tx: i64, queue_id: i64, message_id: i64) -> StoreResult<()> {
         self.messages
@@ -690,6 +902,7 @@ mod tests {
             sync_non_transactional: true,
             max_redelivery_records: 10,
             large_messages: dir.join("largemessages"),
+            paging: dir.join("paging"),
             large_message_sync: false,
         }
     }

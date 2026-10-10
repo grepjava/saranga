@@ -12,6 +12,7 @@ saranga-message = { path = "../saranga-message" }
 thiserror = "2"
 
 [dev-dependencies]
+saranga-paging = { path = "../saranga-paging" }
 tempfile = "3"
 flate2 = "1"
 tar = "0.4"

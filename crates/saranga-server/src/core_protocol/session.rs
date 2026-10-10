@@ -424,11 +424,25 @@ impl CoreSession {
                 (false, result, false)
             }
             Packet::SessionRequestProducerCreditsMessage(p) => {
-                // No paging yet, so credits are always granted.
-                self.send(SessionProducerCreditsMessage {
-                    credits: p.credits,
-                    address: p.address,
+                // requestProducerCredits: a full address under BLOCK grants
+                // them once memory is freed, under FAIL refuses them.
+                let store = self
+                    .broker
+                    .post_office()
+                    .paging_store(&p.address.to_string_lossy());
+                let (conn, channel) = (self.conn.clone(), self.channel_id);
+                let (credits, address) = (p.credits, p.address.clone());
+                let grant = Box::new(move || {
+                    conn.send(channel, SessionProducerCreditsMessage { credits, address });
                 });
+                if let crate::paging::Credits::Failed = store.request_credits(grant) {
+                    self.send(
+                        saranga_core_protocol::packets::session::SessionProducerCreditsFailMessage {
+                            credits: p.credits,
+                            address: p.address,
+                        },
+                    );
+                }
                 (false, Ok(None), false)
             }
             Packet::SessionConsumerFlowCreditMessage(p) => {
@@ -737,6 +751,20 @@ impl CoreSession {
         self.respond(request, response, flush);
     }
 
+    /// `PostOfficeImpl.processRoute` with `PagingStore.page`: the queues of
+    /// an address that pages get the message in its pages instead of a
+    /// reference; a full address under DROP drops it, under FAIL refuses
+    /// the send.
+    fn page_routed(
+        &mut self,
+        routed: crate::postoffice::Routed,
+        tx: Option<&TxRef>,
+    ) -> Result<crate::postoffice::Routed> {
+        let (routed, pending) = self.broker.post_office().page_routed(routed, tx)?;
+        self.ops.extend(pending);
+        Ok(routed)
+    }
+
     /// `sendLarge`: a large message's headers. Its body follows in
     /// continuations.
     fn send_large(&mut self, mut message: CoreMessage) -> Result<Option<Packet>> {
@@ -941,7 +969,12 @@ impl CoreSession {
                 }
             }
         }
-        let routed = match self.broker.post_office().route(&r, &address, routing_type) {
+        let routed = match self
+            .broker
+            .post_office()
+            .route(&r, &address, routing_type)
+            .and_then(|routed| self.page_routed(routed, tx.as_ref()))
+        {
             Ok(routed) => routed,
             Err(e) => {
                 if let Some(tx) = &tx {
@@ -1071,29 +1104,23 @@ impl CoreSession {
             Ok(refs) => {
                 // QueueImpl.acknowledge
                 let storage = self.storage();
+                let _ = storage;
+                let mut refs = refs;
                 match tx {
                     Some(tx) => {
                         let mut t = transaction::lock(&tx);
-                        for r in &refs {
-                            if queue.is_durable_ref(r)
-                                && let Some(s) = &storage
-                            {
-                                s.store_acknowledge_tx(t.id, queue.id(), r.message_id())
-                                    .map_err(io_error)?;
+                        let id = t.id;
+                        for r in &mut refs {
+                            if queue.store_ack_tx(id, r, &mut t.paging).map_err(io_error)? {
                                 t.persistent = true;
                             }
                         }
                         t.acks.extend(refs.into_iter().map(|r| (queue.clone(), r)));
                     }
                     None => {
-                        for r in &refs {
-                            if queue.is_durable_ref(r)
-                                && let Some(s) = &storage
-                            {
-                                self.ops.push(
-                                    s.store_acknowledge(queue.id(), r.message_id())
-                                        .map_err(io_error)?,
-                                );
+                        for r in &mut refs {
+                            if let Some(p) = queue.store_ack(r).map_err(io_error)? {
+                                self.ops.push(p);
                             }
                             queue.post_acknowledge(r);
                         }
@@ -1295,8 +1322,9 @@ impl CoreSession {
             _ => match t.prepare() {
                 Ok(()) => {
                     let (id, xid) = (t.id, t.xid.clone().expect("XA transaction"));
-                    drop(t);
                     if let Some(s) = self.storage() {
+                        t.paging.before_commit(&s, id).map_err(io_error)?;
+                        drop(t);
                         self.ops.push(s.prepare(id, &xid).map_err(io_error)?);
                     }
                     Ok(())

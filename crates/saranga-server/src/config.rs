@@ -11,7 +11,7 @@ use saranga_config as cfg;
 use crate::postoffice::{
     DivertDeployment, DivertRoutingType, FilterFactory, QueueSpec, RoutingTypes,
 };
-use crate::settings::{AddressSettings, SettingsRepository};
+use crate::settings::{AddressFullPolicy, AddressSettings, PageFullPolicy, SettingsRepository};
 use crate::storage::StorageConfig;
 use crate::wildcard::WildcardConfig;
 use crate::{AddressDeployment, BrokerConfig, RoutingType};
@@ -102,6 +102,25 @@ fn resolve(s: &cfg::AddressSettings) -> AddressSettings {
         expiry_queue_prefix: s.expiry_queue_prefix().to_owned(),
         expiry_queue_suffix: s.expiry_queue_suffix().to_owned(),
         id_cache_size: s.id_cache_size,
+        address_full_policy: match s.address_full_message_policy() {
+            cfg::AddressFullMessagePolicy::Page => AddressFullPolicy::Page,
+            cfg::AddressFullMessagePolicy::Block => AddressFullPolicy::Block,
+            cfg::AddressFullMessagePolicy::Fail => AddressFullPolicy::Fail,
+            cfg::AddressFullMessagePolicy::Drop => AddressFullPolicy::Drop,
+        },
+        max_size_bytes: s.max_size_bytes(),
+        max_size_messages: s.max_size_messages(),
+        page_size_bytes: i64::from(s.page_size_bytes()),
+        max_read_page_bytes: i64::from(s.max_read_page_bytes()),
+        max_read_page_messages: i64::from(s.max_read_page_messages()),
+        prefetch_page_bytes: i64::from(s.prefetch_page_bytes()),
+        prefetch_page_messages: i64::from(s.prefetch_page_messages()),
+        page_limit_bytes: s.page_limit_bytes,
+        page_limit_messages: s.page_limit_messages,
+        page_full_policy: s.page_full_message_policy.map(|p| match p {
+            cfg::PageFullMessagePolicy::Drop => PageFullPolicy::Drop,
+            cfg::PageFullMessagePolicy::Fail => PageFullPolicy::Fail,
+        }),
     }
 }
 
@@ -224,6 +243,7 @@ pub fn storage_config(config: &cfg::BrokerConfig, instance: &Path) -> StorageCon
             .max_redelivery_records
             .unwrap_or(J::DEFAULT_MAX_REDELIVERY_RECORDS),
         large_messages: dir(&config.large_messages_directory),
+        paging: dir(&config.paging_directory),
         large_message_sync: config.large_message_sync,
     }
 }
@@ -260,6 +280,10 @@ impl BrokerConfig {
             transaction_timeout_scan_period: config.transaction_timeout_scan_period,
             id_cache_size: config.id_cache_size,
             persist_id_cache: config.persist_id_cache,
+            // Artemis takes half the JVM heap when unset: 1 GiB with the
+            // 2 GiB heap of an instance `artemis create` makes.
+            global_max_size: config.global_max_size.unwrap_or(1 << 30),
+            global_max_messages: config.global_max_messages,
         })
     }
 }
