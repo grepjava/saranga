@@ -90,13 +90,9 @@ fn golden_frames_roundtrip() {
             }
         }
     }
-    if !unknown.is_empty() {
-        eprintln!("packet types not ported yet (direction, type) => count:");
-        for ((dir, ty), n) in &unknown {
-            eprintln!("  {dir:?} {ty} => {n}");
-        }
-    }
-    if std::env::var_os("SARANGA_REQUIRE_ALL_PACKETS").is_some() {
-        assert!(unknown.is_empty(), "unported packet types in golden data");
-    }
+    // Every packet in real traffic must decode to a typed struct, not `Unknown`.
+    assert!(
+        unknown.is_empty(),
+        "packets decoded as Unknown, (direction, type) => count: {unknown:?}"
+    );
 }
