@@ -1,0 +1,16 @@
+persist.queue
+persist.acked
+persist.redeliver
+persist.tx
+persist.both.any
+persist.both.multi
+persist.exclusive
+persist.lvq
+persist.filtered
+persist.nondestructive
+persist.ring
+persist.groups
+persist.misc
+persist.topic::persist-client.sub-all
+persist.topic::persist-client.sub-red
+persist.topic.volatile

@@ -1,0 +1,7 @@
+scenario: persist-xa
+wire: captured
+shutdown: docker stop (clean)
+config: image default (tests/golden/etc/broker.xml)
+artemis-version: 2.57.0
+artemis-commit: 20cab945f0944d669a0aac383a7578e2a6fd7346
+generated: 2026-10-10T12:42:03Z
