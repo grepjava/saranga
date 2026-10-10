@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+# Golden corpus: raw broker captures and data dirs must never be touched.
+tests/golden/** -text -diff
