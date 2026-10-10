@@ -41,6 +41,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - Appends wait while the journal compacts; Artemis keeps appending and replays the appends afterwards. The compacted files are the same.
 - Group commit comes from a flusher thread that syncs whatever accumulated while the previous sync ran, rather than `TimedBuffer`'s timer, so `journal-buffer-timeout` has no effect.
 - `server.lock` holds the node ID and state as in Artemis; the primary lock is a lock on `serverlock.1`. The node ID of a new instance is a random UUID rather than a time-based one.
+- When an update changes a queue's filter (configuration reload, or management from Phase 8), the queue binding record Saranga writes holds the new filter. Artemis 2.57.0 writes the old one, because `QueueImpl.setFilter` does not update the queue's `QueueConfiguration`, which is what gets journalled (drafted upstream in [docs/upstream/artemis-issues.md](docs/upstream/artemis-issues.md), issue 2). The record has the same layout, and either broker reads the other's. A queue whose filter was changed by a Java broker and not by broker.xml therefore comes back on Saranga with the old filter, as it would on Artemis. Queue queries, as on Artemis, keep reporting the old filter until restart.
 - The XA error messages print `XidImpl (<n> ...` with a hash of the Xid where Java prints an identity hash.
 
 ## Paging differences

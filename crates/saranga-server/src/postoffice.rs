@@ -797,8 +797,8 @@ impl PostOffice {
             && !new.temporary
             && let Some(s) = self.ids.storage()
         {
-            // `createQueueBindingEncoding` takes the filter the queue routes
-            // with.
+            // The filter the queue routes with. Artemis journals the stale
+            // one from its QueueConfiguration; see COMPAT.md.
             let mut journalled = new.clone();
             journalled.filter_string = match &filter {
                 Some((text, _)) => text.clone(),
