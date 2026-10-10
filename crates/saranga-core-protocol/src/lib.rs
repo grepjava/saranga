@@ -10,6 +10,7 @@
 mod macros;
 
 mod context;
+mod error_type;
 mod frame;
 mod packet;
 pub mod packets;
@@ -17,6 +18,7 @@ pub mod transport;
 pub mod types;
 
 pub use context::{Context, Direction, version};
+pub use error_type::ErrorType;
 pub use frame::{FRAME_HEADER_SIZE, HANDSHAKE, RawFrame, encode_frame, read_frame};
 pub use packet::Packet;
 pub use saranga_buffer::{DecodeError, Result};
