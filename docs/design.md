@@ -72,106 +72,7 @@ Artemis is very large (about 1M+ lines of Java including tests), so this is a mu
 ---
 
 ## Phases
-Each phase has an exit criterion that is checked with real clients and data.
-
-**Phase 0: Foundation.**
-- Set up the workspace, CI (Linux and Windows), lint/fmt/deny, Apache-2.0 + NOTICE, and `COMPAT.md`.
-- Clone the reference source and pin the Artemis version.
-- Build the Docker interop harness and golden-corpus generator scripts.
-- Write ADRs: runtime model, I/O backends, error model.
-
-*Exit:* CI is green, and the harness can start a Java broker and collect golden data.
-
-**Phase 1: Encoding primitives.**
-- Implement `saranga-buffer`, the `CoreMessage` codec in `saranga-message`, and the full `saranga-core-protocol` packet set across protocol versions.
-- Add property-based round-trip tests.
-
-*Exit:* Every captured Core frame and message in the corpus decodes and re-encodes byte for byte.
-
-**Phase 2: Single-node in-memory broker (Core).**
-- Transport: a TCP acceptor.
-- Connection, session, producer and consumer handling.
-- Credit-based flow control (consumer window, producer credits).
-- Addresses, queues, ANYCAST/MULTICAST routing, wildcards, FQQN, auto-create/delete, and non-durable delivery.
-- Local transactions, acks and the minimal `broker.xml` subset.
-- `saranga run`.
-
-*Exit:* The Artemis JMS client passes send/receive, topic/queue, transacted and client-ack tests. The Rust client works.
-
-**Phase 3: Persistence (on-disk compatible). This is the first usable milestone.**
-- Journal file format: headers, all record types, transactional records, reclaim, compaction and its rename protocol.
-- Bindings journal and the full set of `StorageManager` record IDs.
-- Recovery on restart, XA (prepare/commit/rollback/recover) and the group-commit writer.
-- Durable messages.
-- `saranga data print`.
-
-*Exit:*
-- A Saranga-written data dir is recovered by the Java broker, and a Java-written one by Saranga, across the whole corpus.
-- Kill -9 crash tests lose no committed messages.
-
-**Phase 4: Queue semantics parity.**
-- Address-settings match hierarchy, DLA/expiry, redelivery delay/backoff, max-delivery-attempts.
-- Scheduled delivery, duplicate detection, priority, message groups (including rebalance), exclusive, last-value, non-destructive, ring and temporary queues.
-- Consumer filters (full selector grammar), diverts (exclusive/non-exclusive, transformers as Rust plugins) and consumer-windows tuning.
-
-*Exit:* The ported Artemis integration tests for each feature pass.
-
-**Phase 5: Paging and large messages.**
-- Page store, page cursors, page transactions, page counters, and the PAGE/BLOCK/FAIL/DROP policies.
-- Large messages: streaming chunks, compression, and the `.msg` file format.
-- Conversion of large messages between protocols.
-
-*Exit:* Multi-GB backlogs page correctly. Paging and large-message directories interoperate with Java in both directions.
-
-**Phase 6: Config and security.**
-- Full `broker.xml` schema (unknown elements warn, they do not fail), `broker.properties`, env overrides and hot reload.
-- TLS (rustls, PEM/PKCS12/JKS keystores), SNI and mTLS.
-- Login modules: properties-file, LDAP and certificate. Authorization via security-settings with the match hierarchy, plus password masking.
-
-*Exit:* Unmodified Artemis `etc/` directories from typical deployments start Saranga.
-
-**Phase 7: Protocols.**
-- AMQP 1.0, including transactions, links, durable subscriptions and message conversion.
-- MQTT 3.1.1/5, including sessions, retained messages, will, shared subscriptions and QoS 0/1/2.
-- STOMP 1.0–1.2.
-- OpenWire, including advisories, virtual topics and the prefetch model.
-- WebSocket transport for all of them, and protocol detection on a single port.
-
-*Exit:* The client matrix passes for every protocol. Messages convert correctly across protocols, for example MQTT in and JMS out.
-
-**Phase 8: Management and operations.**
-- REST API covering the operations of the `ActiveMQServerControl`, `AddressControl` and `QueueControl` equivalents.
-- Prometheus metrics with the same metric names Artemis exposes.
-- Management via messages to `activemq.management`.
-- Full CLI, plugin hooks (the `ActiveMQServerPlugin` equivalent as a Rust trait) and critical analyzer.
-- Logging and audit log via `tracing`.
-
-*Exit:* Ops runbooks written for Artemis work with the Saranga equivalents.
-
-**Phase 9: High availability.**
-- Shared-store primary/backup using file locks on the journal dir and the NFS lock semantics.
-- Replication: initial sync and live journal replication over the Core replication packets, wire-compatible with a Java peer.
-- Failback, client failover and reconnection, and the pluggable quorum (ZooKeeper).
-
-*Exit:*
-- Failover tests pass with zero loss of committed messages.
-- A Java primary works with a Saranga backup, and the reverse.
-
-**Phase 10: Clustering and federation.**
-- Discovery: UDP broadcast and static. JGroups only for UDP compatibility; full JGroups is not planned.
-- Cluster connections, topology broadcast to clients and server-side load balancing (OFF/STRICT/ON_DEMAND/OFF_WITH_REDISTRIBUTION).
-- Redistribution, grouping handlers, core bridges, federation (address and queue, upstream and downstream), and AMQP broker connections including mirroring.
-
-*Exit:* Mixed Java+Saranga clusters work. Federation and mirroring are verified in both directions.
-
-**Phase 11: Hardening and 1.0.**
-- Soak and chaos testing: network partitions, disk-full, fsync failure injection.
-- Jepsen-style linearizability checks on HA.
-- Fuzzing every codec with cargo-fuzz.
-- Benchmarks against Artemis (throughput, p99 latency, memory, startup time).
-- Docs and migration guide, container images and release.
-
-*Exit:* Saranga 1.0.
+The twelve phases (0 to 11), with their scope, exit checks and current status, are in [PHASES.md](../PHASES.md).
 
 ---
 
@@ -192,5 +93,5 @@ Each phase has an exit criterion that is checked with real clients and data.
 Phase 0:
 1. `git init` and create the workspace skeleton with empty crates.
 2. Shallow-clone Artemis at the pinned tag into `reference/`.
-3. Write `docs/design.md` (this document), `docs/phases.md`, `COMPAT.md` and the first ADRs.
+3. Write `docs/design.md` (this document), `PHASES.md`, `COMPAT.md` and the first ADRs.
 4. Build the Docker harness that starts the Java broker and captures the first golden data.
