@@ -891,10 +891,13 @@ fn describe_object(
                 java::simple_string(&g.cluster_name)
             ))
         }
+        // Artemis quirk: AbstractPersistedAddressSetting declares its own
+        // `storeId` field, shadowing the one `setStoreId` sets, so both
+        // address-setting records always print storeId=0.
         ids::ADDRESS_SETTING_RECORD => {
             let s = PersistedAddressSetting::decode(data)?;
             plain(format!(
-                "PersistedAddressSetting [storeId={id}, addressMatch={}, setting=<{} bytes of AddressSettings, not printed by saranga>]",
+                "PersistedAddressSetting [storeId=0, addressMatch={}, setting=<{} bytes of AddressSettings, not printed by saranga>]",
                 java::simple_string(&s.address_match),
                 s.settings.len()
             ))
@@ -902,7 +905,7 @@ fn describe_object(
         ids::ADDRESS_SETTING_RECORD_JSON => {
             let s = PersistedAddressSettingJson::decode(data)?;
             plain(format!(
-                "PersistedAddressSettingJSON{{jsonSetting={}, storeId={id}, addressMatch={}, setting=<AddressSettings not printed by saranga>}}",
+                "PersistedAddressSettingJSON{{jsonSetting={}, storeId=0, addressMatch={}, setting=<AddressSettings not printed by saranga>}}",
                 java::simple_string(&s.json),
                 java::simple_string(&s.address_match)
             ))
@@ -1127,7 +1130,7 @@ fn queue_configuration(id: i64, b: &PersistentQueueBindingEncoding) -> String {
         b.auto_delete_message_count.unwrap_or(0),
         b.ring_size.unwrap_or(-1),
         opt(b.configuration_managed),
-        b.internal.unwrap_or(false),
+        opt(b.internal),
         b.auto_created,
     )
 }
