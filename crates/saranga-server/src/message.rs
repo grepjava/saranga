@@ -2,6 +2,7 @@
 //! and consumer through `Arc`, with the encoded form cached.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use saranga_buffer::{PropertyValue, SimpleString, Writer};
 use saranga_message::CoreMessage;
@@ -18,6 +19,9 @@ pub struct ServerMessage {
     /// `core` encoded as `CoreMessage.encode` writes it, the form carried by
     /// `SESS_RECEIVE_MSG`.
     encoded: Vec<u8>,
+    /// References on durable queues not yet acknowledged
+    /// (`RefCountMessage.durableUp/Down`); the record is deleted at zero.
+    durable_refs: AtomicI32,
 }
 
 impl ServerMessage {
@@ -27,6 +31,7 @@ impl ServerMessage {
         Arc::new(Self {
             core,
             encoded: w.into_vec(),
+            durable_refs: AtomicI32::new(0),
         })
     }
 
@@ -46,6 +51,21 @@ impl ServerMessage {
     /// `PriorityLinkedListImpl` does.
     pub fn priority_level(&self) -> usize {
         usize::from(self.core.priority.min(9))
+    }
+
+    /// `isDurable`: persistent messages are journaled on durable queues.
+    pub fn is_durable(&self) -> bool {
+        self.core.durable
+    }
+
+    /// `durableUp`: returns the new count.
+    pub fn durable_up(&self) -> i32 {
+        self.durable_refs.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// `durableDown`: returns the new count.
+    pub fn durable_down(&self) -> i32 {
+        self.durable_refs.fetch_sub(1, Ordering::SeqCst) - 1
     }
 
     /// `Message.getEncodeSize`, the size counted for memory accounting.
@@ -70,6 +90,8 @@ pub fn routing_type(message: &CoreMessage) -> Option<RoutingType> {
 pub struct MessageRef {
     pub message: Arc<ServerMessage>,
     pub delivery_count: i32,
+    /// The delivery count last written to the journal (`persistedCount`).
+    pub persisted_count: i32,
 }
 
 impl MessageRef {
@@ -77,6 +99,7 @@ impl MessageRef {
         Self {
             message,
             delivery_count: 0,
+            persisted_count: 0,
         }
     }
 

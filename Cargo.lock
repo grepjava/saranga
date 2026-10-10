@@ -673,6 +673,7 @@ dependencies = [
  "saranga-filter",
  "saranga-journal",
  "saranga-message",
+ "saranga-storage",
  "tempfile",
  "thiserror",
  "tokio",

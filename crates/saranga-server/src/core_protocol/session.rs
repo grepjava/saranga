@@ -32,7 +32,7 @@ use crate::postoffice::{
     BindingQueryResult, QueueQueryResult, QueueSpec, RoutingTypes, queue_name_of,
 };
 use crate::queue::{ConsumerId, ConsumerRegistration, Queue};
-use crate::storage::Pending;
+use crate::storage::{Pending, Storage};
 use crate::transaction::{self, Outcome, Transaction, TxError, TxRef, TxState, XaError, xa_code};
 use crate::{Broker, BrokerError, Name, Result, RoutingType};
 
@@ -78,6 +78,9 @@ struct Confirmations {
 /// `doConfirmAndResponse`).
 struct Done {
     waits: Vec<Pending>,
+    /// Queue updates that must follow the journal writes
+    /// (`afterCompleteOperations`): routed references, committed outcomes.
+    actions: Vec<Box<dyn FnOnce() + Send>>,
     request: Request,
     response: Option<Packet>,
     flush: bool,
@@ -97,6 +100,11 @@ async fn completer(
         for w in done.waits {
             if let Err(e) = w.wait().await {
                 failure.get_or_insert(e);
+            }
+        }
+        if failure.is_none() {
+            for action in done.actions {
+                action();
             }
         }
         let response = match failure {
@@ -186,6 +194,8 @@ pub(crate) struct CoreSession {
     timeout_seconds: i32,
     /// Journal writes lined up by the request being handled.
     ops: Vec<Pending>,
+    /// Queue updates to make once those writes are done.
+    actions: Vec<Box<dyn FnOnce() + Send>>,
     completer: mpsc::UnboundedSender<Done>,
 }
 
@@ -225,6 +235,8 @@ impl Request {
 
 impl CoreSession {
     pub(crate) fn new(broker: Arc<Broker>, conn: Arc<ConnShared>, request: CreateSession) -> Self {
+        let tx =
+            (!request.xa).then(|| Transaction::new_ref(broker.post_office().ids().next(), None));
         let (completer_tx, completer_rx) = mpsc::unbounded_channel();
         tokio::spawn(completer(
             conn.clone(),
@@ -252,10 +264,11 @@ impl CoreSession {
             closed: false,
             consumers: BTreeMap::new(),
             producers: HashMap::new(),
-            tx: (!request.xa).then(|| Transaction::new_ref(None)),
+            tx,
             pending_tx: None,
             timeout_seconds: transaction::ResourceManager::TIMEOUT_SECONDS,
             ops: Vec::new(),
+            actions: Vec::new(),
             completer: completer_tx,
         }
     }
@@ -299,6 +312,31 @@ impl CoreSession {
         }
     }
 
+    fn storage(&self) -> Option<Arc<Storage>> {
+        self.broker.post_office().ids().storage().cloned()
+    }
+
+    /// `newTransaction`, with its journal ID.
+    fn new_tx(&self, xid: Option<Xid>) -> TxRef {
+        Transaction::new_ref(self.broker.post_office().ids().next(), xid)
+    }
+
+    /// Journals a finished transaction's record, then applies it to the
+    /// queues: once the record is written when `defer` (commits), at once
+    /// otherwise (rollbacks).
+    fn finish(&mut self, mut outcome: Outcome, defer: bool) -> Result<()> {
+        let storage = self.storage();
+        if let Some(p) = outcome.write(storage.as_deref())? {
+            self.ops.push(p);
+        }
+        if defer && storage.is_some() {
+            self.actions.push(Box::new(move || outcome.apply()));
+        } else {
+            outcome.apply();
+        }
+        Ok(())
+    }
+
     fn exception(&self, request: Request, e: &BrokerError) -> Packet {
         exception_packet(request, e)
     }
@@ -308,6 +346,7 @@ impl CoreSession {
     fn respond(&mut self, request: Request, response: Option<Packet>, flush: bool) {
         let _ = self.completer.send(Done {
             waits: std::mem::take(&mut self.ops),
+            actions: std::mem::take(&mut self.actions),
             request,
             response,
             flush,
@@ -704,15 +743,58 @@ impl CoreSession {
                 return Err(e);
             }
         };
+        // processRouteToDurableQueues: the message record with its first
+        // durable reference, then one reference per durable queue.
+        let storage = self.storage();
+        let durable: Vec<Queue> = queues
+            .iter()
+            .filter(|q| q.is_durable_ref(&r))
+            .cloned()
+            .collect();
+        let message = &r.message;
         match tx {
             None => {
-                for q in queues {
-                    q.add(r.clone());
+                if let Some(s) = &storage {
+                    let last = durable.len().saturating_sub(1);
+                    for (i, q) in durable.iter().enumerate() {
+                        if message.durable_up() == 1 {
+                            s.store_message(message.core(), message.encoded())
+                                .map_err(io_error)?;
+                        }
+                        self.ops.push(
+                            s.store_reference(q.id(), message.message_id(), i == last)
+                                .map_err(io_error)?,
+                        );
+                    }
+                    // The references join their queues once journaled.
+                    self.actions.push(Box::new(move || {
+                        for q in queues {
+                            q.add(r.clone());
+                        }
+                    }));
+                } else {
+                    for q in queues {
+                        q.add(r.clone());
+                    }
                 }
             }
-            Some(tx) => transaction::lock(&tx)
-                .sends
-                .extend(queues.into_iter().map(|q| (q, r.clone()))),
+            Some(tx) => {
+                let mut t = transaction::lock(&tx);
+                for q in &durable {
+                    if message.durable_up() == 1
+                        && let Some(s) = &storage
+                    {
+                        s.store_message_tx(t.id, message.core(), message.encoded())
+                            .map_err(io_error)?;
+                    }
+                    if let Some(s) = &storage {
+                        s.store_reference_tx(t.id, q.id(), message.message_id())
+                            .map_err(io_error)?;
+                        t.persistent = true;
+                    }
+                }
+                t.sends.extend(queues.into_iter().map(|q| (q, r.clone())));
+            }
         }
         Ok(None)
     }
@@ -738,10 +820,35 @@ impl CoreSession {
         let queue = c.queue.clone();
         match queue.ack(c.id, message_id, individual, tx.is_some()).await {
             Ok(refs) => {
-                if let Some(tx) = tx {
-                    transaction::lock(&tx)
-                        .acks
-                        .extend(refs.into_iter().map(|r| (queue.clone(), r)));
+                // QueueImpl.acknowledge
+                let storage = self.storage();
+                match tx {
+                    Some(tx) => {
+                        let mut t = transaction::lock(&tx);
+                        for r in &refs {
+                            if queue.is_durable_ref(r)
+                                && let Some(s) = &storage
+                            {
+                                s.store_acknowledge_tx(t.id, queue.id(), r.message_id())
+                                    .map_err(io_error)?;
+                                t.persistent = true;
+                            }
+                        }
+                        t.acks.extend(refs.into_iter().map(|r| (queue.clone(), r)));
+                    }
+                    None => {
+                        for r in &refs {
+                            if queue.is_durable_ref(r)
+                                && let Some(s) = &storage
+                            {
+                                self.ops.push(
+                                    s.store_acknowledge(queue.id(), r.message_id())
+                                        .map_err(io_error)?,
+                                );
+                            }
+                            queue.post_acknowledge(r);
+                        }
+                    }
                 }
                 Ok(None)
             }
@@ -811,11 +918,11 @@ impl CoreSession {
                 }
                 if let Ok(outcome) = t.rollback() {
                     drop(t);
-                    outcome.apply();
+                    self.finish(outcome, false)?;
                 }
             }
         }
-        let tx = Transaction::new_ref(Some(xid.clone()));
+        let tx = self.new_tx(Some(xid.clone()));
         self.tx = Some(tx.clone());
         if !self.broker.resource_manager().put(xid.clone(), tx) {
             return Err(XaError::new(
@@ -936,10 +1043,17 @@ impl CoreSession {
                 Ok(())
             }
             _ => match t.prepare() {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    let (id, xid) = (t.id, t.xid.clone().expect("XA transaction"));
+                    drop(t);
+                    if let Some(s) = self.storage() {
+                        self.ops.push(s.prepare(id, &xid).map_err(io_error)?);
+                    }
+                    Ok(())
+                }
                 Err((e, outcome)) => {
                     drop(t);
-                    outcome.apply();
+                    self.finish(outcome, false)?;
                     Err(e.into())
                 }
             },
@@ -987,11 +1101,11 @@ impl CoreSession {
         drop(t);
         match result {
             Ok(outcome) => {
-                outcome.apply();
+                self.finish(outcome, true)?;
                 Ok(())
             }
             Err((e, outcome)) => {
-                outcome.apply();
+                self.finish(outcome, false)?;
                 Err(e.into())
             }
         }
@@ -1127,7 +1241,8 @@ impl CoreSession {
     fn xa_failed(&mut self, xid: Xid) {
         let rm = self.broker.resource_manager();
         let tx = rm.get(&xid).unwrap_or_else(|| {
-            let tx = Transaction::new_ref(Some(xid.clone()));
+            let tx =
+                Transaction::new_ref(self.broker.post_office().ids().next(), Some(xid.clone()));
             rm.put(xid, tx.clone());
             tx
         });
@@ -1245,19 +1360,16 @@ impl CoreSession {
     fn commit(&mut self) -> Result<()> {
         let tx = self.tx.take();
         if !self.xa {
-            self.tx = Some(Transaction::new_ref(None));
+            self.tx = Some(self.new_tx(None));
         }
         let Some(tx) = tx else {
             return Ok(());
         };
         let result = transaction::lock(&tx).commit(true);
         match result {
-            Ok(outcome) => {
-                outcome.apply();
-                Ok(())
-            }
+            Ok(outcome) => self.finish(outcome, true),
             Err((e, outcome)) => {
-                outcome.apply();
+                self.finish(outcome, false)?;
                 Err(e)
             }
         }
@@ -1265,12 +1377,15 @@ impl CoreSession {
 
     /// `ServerSessionImpl.rollback`.
     async fn rollback(&mut self, last_as_delivered: bool, failed: bool) {
-        let tx = self.tx.take().unwrap_or_else(|| Transaction::new_ref(None));
+        let tx = match self.tx.take() {
+            Some(tx) => tx,
+            None => self.new_tx(None),
+        };
         if let Err(e) = self.do_rollback(failed, last_as_delivered, &tx).await {
             tracing::warn!(session = %self.name, "rollback: {e}");
         }
         if !self.xa {
-            self.tx = Some(Transaction::new_ref(None));
+            self.tx = Some(self.new_tx(None));
         }
     }
 
@@ -1310,13 +1425,13 @@ impl CoreSession {
             Err(e) => (Outcome::default(), Err(e)),
         };
         outcome.cancel.extend(cancelled);
-        outcome.apply();
+        let finished = self.finish(outcome, false);
         if was_started && !failed {
             for c in self.consumers.values() {
                 c.queue.set_started(c.id, true).await;
             }
         }
-        result
+        result.and(finished)
     }
 
     async fn set_started(&mut self, started: bool) {
@@ -1345,7 +1460,9 @@ impl CoreSession {
                     (t.xid.clone(), t.try_rollback())
                 };
                 if let Some(outcome) = outcome {
-                    outcome.apply();
+                    if let Err(e) = self.finish(outcome, false) {
+                        tracing::warn!(session = %self.name, "AMQ222207: Unable to rollback on close: {e}");
+                    }
                     if let Some(xid) = xid {
                         self.broker.resource_manager().remove(&xid);
                     }
@@ -1456,6 +1573,11 @@ impl CoreSession {
             .into()
         }
     }
+}
+
+/// A journal failure as the client sees it (`ActiveMQIOErrorException`).
+fn io_error(e: saranga_journal::JournalError) -> BrokerError {
+    BrokerError::new(ErrorType::IoError, e.to_string())
 }
 
 /// `ServerSessionPacketHandler.getRoutingTypeFromAddress`, for the

@@ -3,37 +3,23 @@
 //! `JournalStorageManager`, `BatchingIDGenerator` and `OperationContextImpl`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::Arc;
 
-use saranga_buffer::{Reader, SimpleString, Writer};
+use saranga_buffer::{Reader, Writer};
 use saranga_journal::{Completion, Journal, JournalConfig, JournalError, PreparedTransactionInfo};
 use saranga_message::CoreMessage;
+use saranga_storage::RecordCodec;
+use saranga_storage::codec::{DeliveryCountUpdateEncoding, IdCounterEncoding, RefEncoding};
+use saranga_storage::message::PersistedMessage;
+use saranga_storage::{BatchingIdGenerator, CHECKPOINT_BATCH_SIZE, IdCounterStore};
 use tokio::sync::oneshot;
 
 use crate::transaction::Xid;
 
-/// `JournalRecordIds` used by the broker.
-pub mod ids {
-    pub const QUEUE_BINDING_RECORD: u8 = 21;
-    pub const QUEUE_STATUS_RECORD: u8 = 22;
-    pub const ID_COUNTER_RECORD: u8 = 24;
-    pub const ADD_LARGE_MESSAGE: u8 = 30;
-    pub const ADD_MESSAGE: u8 = 31;
-    pub const ADD_REF: u8 = 32;
-    pub const ACKNOWLEDGE_REF: u8 = 33;
-    pub const UPDATE_DELIVERY_COUNT: u8 = 34;
-    pub const SET_SCHEDULED_DELIVERY_TIME: u8 = 36;
-    pub const DUPLICATE_ID: u8 = 37;
-    pub const ADDRESS_BINDING_RECORD: u8 = 44;
-    pub const ADD_MESSAGE_PROTOCOL: u8 = 45;
-    pub const ADDRESS_STATUS_RECORD: u8 = 46;
-}
+pub use saranga_storage::ids;
 
 /// `CoreMessagePersister.ID`.
 const CORE_PERSISTER_ID: u8 = 1;
-
-/// `AbstractJournalStorageManager.CHECKPOINT_BATCH_SIZE`.
-const CHECKPOINT_BATCH_SIZE: i64 = i32::MAX as i64;
 
 pub type StoreResult<T> = std::result::Result<T, JournalError>;
 
@@ -74,16 +60,31 @@ pub struct StorageConfig {
     pub max_redelivery_records: i32,
 }
 
-/// `BatchingIDGenerator`: IDs for messages, queues, addresses and
-/// transactions, with a checkpoint in the bindings journal so a restart
-/// never reuses one.
-struct IdGenerator {
-    counter: i64,
-    next_id: i64,
-    cleanup: Vec<i64>,
+/// Where `BatchingIDGenerator` keeps its counter: `ID_COUNTER_RECORD`s in
+/// the bindings journal (`storeID`, synced; `deleteID`, not).
+struct BindingsIdStore(Arc<Journal>);
+
+impl IdCounterStore for BindingsIdStore {
+    fn store_id(&self, journal_id: i64, id: i64) {
+        if let Err(e) = self.0.append_add(
+            journal_id,
+            ids::ID_COUNTER_RECORD,
+            IdCounterEncoding { id }.encode(),
+            true,
+            None,
+        ) {
+            tracing::warn!("AMQ222217: Exception during batching ID: {e}");
+        }
+    }
+
+    fn delete_id(&self, journal_id: i64) {
+        let _ = self.0.append_delete(journal_id, false, None);
+    }
 }
 
-/// A durable message's record bodies (`ADD_MESSAGE_PROTOCOL`).
+/// A durable message's record body (`ADD_MESSAGE_PROTOCOL`), from the
+/// encoding the broker already holds. Same bytes as
+/// `PersistedMessage::Core(CoreMessageRecord::new(message))`.
 fn encode_message(message: &CoreMessage, encoded: &[u8]) -> Vec<u8> {
     // CoreMessagePersister.encode
     let mut w = Writer::with_capacity(encoded.len() + 64);
@@ -95,34 +96,30 @@ fn encode_message(message: &CoreMessage, encoded: &[u8]) -> Vec<u8> {
     w.into_vec()
 }
 
-/// Decodes an `ADD_MESSAGE_PROTOCOL` body written by the Core persister.
+/// Decodes an `ADD_MESSAGE_PROTOCOL` body (`MessagePersister.decode`).
 pub fn decode_message(data: &[u8]) -> StoreResult<CoreMessage> {
-    let bad = |e: saranga_buffer::DecodeError| JournalError::Corrupt(format!("message record: {e}"));
-    let mut r = Reader::new(data);
-    let persister = r.u8().map_err(bad)?;
-    if persister != CORE_PERSISTER_ID {
-        return Err(JournalError::Corrupt(format!(
-            "message persister {persister} is not supported yet"
-        )));
+    match PersistedMessage::decode(data) {
+        Ok(PersistedMessage::Core(rec)) => Ok(rec.to_message()),
+        Ok(other) => Err(JournalError::Corrupt(format!(
+            "message persister {} is not supported yet",
+            other.persister_id()
+        ))),
+        Err(e) => Err(JournalError::Corrupt(format!("message record: {e}"))),
     }
-    let id = r.i64().map_err(bad)?;
-    let address = r.nullable_simple_string().map_err(bad)?;
-    let size = r.i32().map_err(bad)?;
-    let body = r.bytes(size.max(0) as usize).map_err(bad)?;
-    let mut message = CoreMessage::decode(&mut Reader::new(body)).map_err(bad)?;
-    message.message_id = id;
-    message.address = address;
-    Ok(message)
 }
 
-fn long(v: i64) -> Vec<u8> {
-    v.to_be_bytes().to_vec()
+fn corrupt(what: &str) -> impl Fn(saranga_storage::DecodeError) -> JournalError + '_ {
+    move |e| JournalError::Corrupt(format!("{what}: {e}"))
 }
 
-fn read_long(data: &[u8]) -> StoreResult<i64> {
-    data.get(..8)
-        .map(|b| i64::from_be_bytes(b.try_into().expect("8 bytes")))
-        .ok_or_else(|| JournalError::Corrupt("record shorter than a long".into()))
+fn ref_body(queue_id: i64) -> Vec<u8> {
+    RefEncoding { queue_id }.encode()
+}
+
+fn ref_queue(data: &[u8]) -> StoreResult<i64> {
+    Ok(RefEncoding::decode(data)
+        .map_err(corrupt("reference"))?
+        .queue_id)
 }
 
 /// `XidEncoding` (`XidCodecSupport.encodeXid`).
@@ -169,8 +166,8 @@ pub struct RecoveredMessages {
 pub struct Storage {
     cfg: StorageConfig,
     pub(crate) messages: Journal,
-    pub(crate) bindings: Journal,
-    ids: Mutex<IdGenerator>,
+    pub(crate) bindings: Arc<Journal>,
+    ids: BatchingIdGenerator<BindingsIdStore>,
 }
 
 impl Storage {
@@ -180,47 +177,25 @@ impl Storage {
         let messages = Journal::open(cfg.messages.clone())?;
         messages.replaceable_record(ids::UPDATE_DELIVERY_COUNT);
         messages.replaceable_record(ids::SET_SCHEDULED_DELIVERY_TIME);
-        let bindings = Journal::open(cfg.bindings.clone())?;
+        let bindings = Arc::new(Journal::open(cfg.bindings.clone())?);
         Ok(Self {
             cfg,
             messages,
+            ids: BatchingIdGenerator::new(
+                0,
+                CHECKPOINT_BATCH_SIZE,
+                BindingsIdStore(bindings.clone()),
+            ),
             bindings,
-            ids: Mutex::new(IdGenerator {
-                counter: 0,
-                next_id: 0,
-                cleanup: Vec::new(),
-            }),
         })
-    }
-
-    fn ids(&self) -> std::sync::MutexGuard<'_, IdGenerator> {
-        self.ids.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn store_id(&self, journal_id: i64, id: i64) {
-        if let Err(e) = self
-            .bindings
-            .append_add(journal_id, ids::ID_COUNTER_RECORD, long(id), true, None)
-        {
-            tracing::warn!("AMQ222217: Exception during batching ID: {e}");
-        }
     }
 
     /// `generateID`.
     pub fn generate_id(&self) -> i64 {
-        let mut g = self.ids();
-        let id = g.counter;
-        g.counter += 1;
-        if id >= g.next_id {
-            // saveCheckPoint
-            g.next_id += CHECKPOINT_BATCH_SIZE;
-            let journal_id = g.counter;
-            g.counter += 1;
-            let next = g.next_id;
-            drop(g);
-            self.store_id(journal_id, next);
-        }
-        id
+        // The generator only stops with the storage.
+        self.ids
+            .generate_id()
+            .unwrap_or_else(|_| self.ids.current_id())
     }
 
     /// Loads the bindings journal: the ID generator's state, and the binding
@@ -229,26 +204,16 @@ impl Storage {
     pub fn load_bindings(&self) -> StoreResult<Vec<saranga_journal::RecordInfo>> {
         let loaded = self.bindings.load_all()?;
         let mut rest = Vec::new();
-        {
-            let mut g = self.ids();
-            for r in loaded.committed {
-                if r.user_record_type == ids::ID_COUNTER_RECORD {
-                    // loadState
-                    g.cleanup.push(r.id);
-                    g.next_id = read_long(&r.data)? + 1;
-                    g.counter = g.next_id;
-                } else {
-                    rest.push(r);
-                }
+        for r in loaded.committed {
+            if r.user_record_type == ids::ID_COUNTER_RECORD {
+                self.ids
+                    .load_state(r.id, &r.data)
+                    .map_err(corrupt("ID counter"))?;
+            } else {
+                rest.push(r);
             }
         }
-        // cleanup: every counter record but the last.
-        let cleanup = std::mem::take(&mut self.ids().cleanup);
-        if let Some((_, older)) = cleanup.split_last() {
-            for &id in older {
-                let _ = self.bindings.append_delete(id, false, None);
-            }
-        }
+        self.ids.cleanup();
         Ok(rest)
     }
 
@@ -272,7 +237,7 @@ impl Storage {
                     ));
                 }
                 ids::ADD_REF => {
-                    let queue = read_long(&r.data)?;
+                    let queue = ref_queue(&r.data)?;
                     if !out.messages.contains_key(&r.id) {
                         tracing::warn!("AMQ222031: Cannot find message {}", r.id);
                         continue;
@@ -283,7 +248,7 @@ impl Storage {
                     }
                 }
                 ids::ACKNOWLEDGE_REF => {
-                    let queue = read_long(&r.data)?;
+                    let queue = ref_queue(&r.data)?;
                     match refs.get_mut(&queue) {
                         None => tracing::warn!(
                             "AMQ222030: Cannot find queue {queue} while reloading ACKNOWLEDGE_REF for message {}",
@@ -297,14 +262,10 @@ impl Storage {
                     }
                 }
                 ids::UPDATE_DELIVERY_COUNT => {
-                    let queue = read_long(&r.data)?;
-                    let count = r
-                        .data
-                        .get(8..12)
-                        .map(|b| i32::from_be_bytes(b.try_into().expect("4 bytes")))
-                        .ok_or_else(|| JournalError::Corrupt("delivery count record".into()))?;
-                    if let Some(c) = refs.get_mut(&queue).and_then(|q| q.get_mut(&r.id)) {
-                        *c = count;
+                    let u = DeliveryCountUpdateEncoding::decode(&r.data)
+                        .map_err(corrupt("delivery count"))?;
+                    if let Some(c) = refs.get_mut(&u.queue_id).and_then(|q| q.get_mut(&r.id)) {
+                        *c = u.count;
                     }
                 }
                 // Scheduled delivery and duplicate detection come with the
@@ -328,7 +289,8 @@ impl Storage {
             out.queues.insert(queue, list);
         }
         for p in loaded.prepared {
-            out.prepared.push(self.recover_prepared(p, &mut out.messages)?);
+            out.prepared
+                .push(self.recover_prepared(p, &mut out.messages)?);
         }
         // Messages with no reference left, and none held by a prepared
         // transaction, are deleted.
@@ -373,8 +335,8 @@ impl Storage {
                 ids::ADD_MESSAGE_PROTOCOL => {
                     messages.insert(r.id, decode_message(&r.data)?);
                 }
-                ids::ADD_REF => tx.sends.push((read_long(&r.data)?, r.id)),
-                ids::ACKNOWLEDGE_REF => tx.acks.push((read_long(&r.data)?, r.id)),
+                ids::ADD_REF => tx.sends.push((ref_queue(&r.data)?, r.id)),
+                ids::ACKNOWLEDGE_REF => tx.acks.push((ref_queue(&r.data)?, r.id)),
                 other => tracing::debug!("prepared transaction {} record type {other}", p.id),
             }
         }
@@ -384,12 +346,7 @@ impl Storage {
     /// Writes the ID generator's state (`persistIdGenerator`) and closes
     /// both journals.
     pub fn stop(&self) -> StoreResult<()> {
-        let (journal_id, id) = {
-            let mut g = self.ids();
-            g.counter += 1;
-            (g.counter, g.counter)
-        };
-        self.store_id(journal_id, id);
+        self.ids.stop();
         self.messages.stop()?;
         self.bindings.stop()
     }
@@ -415,11 +372,22 @@ impl Storage {
     }
 
     /// `storeReference`: synced when it is the last reference of a send.
-    pub fn store_reference(&self, queue_id: i64, message_id: i64, last: bool) -> StoreResult<Pending> {
+    pub fn store_reference(
+        &self,
+        queue_id: i64,
+        message_id: i64,
+        last: bool,
+    ) -> StoreResult<Pending> {
         let sync = last && self.cfg.sync_non_transactional;
         let (c, p) = self.completion(sync);
-        self.messages
-            .append_update(message_id, ids::ADD_REF, long(queue_id), sync, false, c)?;
+        self.messages.append_update(
+            message_id,
+            ids::ADD_REF,
+            ref_body(queue_id),
+            sync,
+            false,
+            c,
+        )?;
         Ok(p.expect("pending"))
     }
 
@@ -430,7 +398,7 @@ impl Storage {
         let found = self.messages.append_update(
             message_id,
             ids::ACKNOWLEDGE_REF,
-            long(queue_id),
+            ref_body(queue_id),
             sync,
             false,
             c,
@@ -443,7 +411,9 @@ impl Storage {
 
     /// `deleteMessage`: never synced; a missing delete is repaired on load.
     pub fn delete_message(&self, message_id: i64) -> StoreResult<()> {
-        self.messages.append_delete(message_id, false, None).map(|_| ())
+        self.messages
+            .append_delete(message_id, false, None)
+            .map(|_| ())
     }
 
     /// `updateDeliveryCount`: `false` when nothing was written (the count is
@@ -462,8 +432,7 @@ impl Storage {
         if max >= 0 && count > max {
             return Ok(false);
         }
-        let mut body = long(queue_id);
-        body.extend_from_slice(&count.to_be_bytes());
+        let body = DeliveryCountUpdateEncoding { queue_id, count }.encode();
         self.messages.append_update(
             message_id,
             ids::UPDATE_DELIVERY_COUNT,
@@ -476,7 +445,12 @@ impl Storage {
     }
 
     /// `storeMessageTransactional`.
-    pub fn store_message_tx(&self, tx: i64, message: &CoreMessage, encoded: &[u8]) -> StoreResult<()> {
+    pub fn store_message_tx(
+        &self,
+        tx: i64,
+        message: &CoreMessage,
+        encoded: &[u8],
+    ) -> StoreResult<()> {
         self.messages.append_add_tx(
             tx,
             message.message_id,
@@ -488,13 +462,13 @@ impl Storage {
     /// `storeReferenceTransactional`.
     pub fn store_reference_tx(&self, tx: i64, queue_id: i64, message_id: i64) -> StoreResult<()> {
         self.messages
-            .append_update_tx(tx, message_id, ids::ADD_REF, long(queue_id))
+            .append_update_tx(tx, message_id, ids::ADD_REF, ref_body(queue_id))
     }
 
     /// `storeAcknowledgeTransactional`.
     pub fn store_acknowledge_tx(&self, tx: i64, queue_id: i64, message_id: i64) -> StoreResult<()> {
         self.messages
-            .append_update_tx(tx, message_id, ids::ACKNOWLEDGE_REF, long(queue_id))
+            .append_update_tx(tx, message_id, ids::ACKNOWLEDGE_REF, ref_body(queue_id))
     }
 
     /// `prepare`: the Xid is the prepare record's extra data.
@@ -532,28 +506,42 @@ impl Storage {
     // Bindings journal -------------------------------------------------------
 
     /// Adds a binding record (`addQueueBinding`, `addAddressBinding`) in its
-    /// own committed transaction, synced (`commitBindings`).
-    pub fn add_binding(&self, id: i64, user_type: u8, body: Vec<u8>) -> StoreResult<Pending> {
+    /// own transaction, committed and synced before returning
+    /// (`commitBindings`).
+    pub fn add_binding(&self, id: i64, user_type: u8, body: Vec<u8>) -> StoreResult<()> {
         let tx = self.generate_id();
         self.bindings.append_add_tx(tx, id, user_type, body)?;
-        let (c, p) = Pending::new();
-        self.bindings.append_commit(tx, true, Some(c))?;
-        Ok(p)
+        self.bindings.append_commit(tx, true, None)
     }
 
-    /// `deleteQueueBinding` / `deleteAddressBinding` and `commitBindings`.
-    pub fn delete_binding(&self, id: i64) -> StoreResult<Pending> {
+    /// Replaces a binding record under a new ID (`updateAddressInfo`:
+    /// `deleteAddressBinding` then `addAddressBinding`).
+    pub fn replace_binding(
+        &self,
+        old_id: i64,
+        new_id: i64,
+        user_type: u8,
+        body: Vec<u8>,
+    ) -> StoreResult<()> {
+        let tx = self.generate_id();
+        self.bindings.append_delete_tx(tx, old_id, Vec::new())?;
+        self.bindings.append_add_tx(tx, new_id, user_type, body)?;
+        self.bindings.append_commit(tx, true, None)
+    }
+
+    /// Deletes a binding record (`deleteQueueBinding`,
+    /// `deleteAddressBinding`) and commits.
+    pub fn delete_binding(&self, id: i64) -> StoreResult<()> {
         let tx = self.generate_id();
         self.bindings.append_delete_tx(tx, id, Vec::new())?;
-        let (c, p) = Pending::new();
-        self.bindings.append_commit(tx, true, Some(c))?;
-        Ok(p)
+        self.bindings.append_commit(tx, true, None)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use saranga_buffer::SimpleString;
 
     fn config(dir: &std::path::Path) -> StorageConfig {
         StorageConfig {
@@ -570,6 +558,24 @@ mod tests {
             sync_non_transactional: true,
             max_redelivery_records: 10,
         }
+    }
+
+    #[test]
+    fn message_encoding_matches_the_core_persister() {
+        use saranga_storage::message::CoreMessageRecord;
+        let m = CoreMessage {
+            message_id: 99,
+            address: Some(SimpleString::from("addr")),
+            durable: true,
+            body: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let mut w = Writer::new();
+        m.encode(&mut w);
+        let ours = encode_message(&m, w.as_slice());
+        let theirs = PersistedMessage::Core(CoreMessageRecord::new(m.clone())).encode();
+        assert_eq!(ours, theirs);
+        assert_eq!(decode_message(&ours).unwrap(), m);
     }
 
     #[test]

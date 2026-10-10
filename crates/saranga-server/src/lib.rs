@@ -1,8 +1,10 @@
 //! The Saranga broker: addresses, queues and routing, and the Core
 //! protocol server that drives them.
 //!
-//! Phase 2 keeps everything in memory. The structure follows ADR 0001:
-//! one task per connection and per session, one actor per queue.
+//! With persistence enabled, durable state goes to the Artemis journals
+//! ([`storage`]) and is recovered on start ([`recovery`]). The structure
+//! follows ADR 0001: one task per connection and per session, one actor
+//! per queue.
 
 pub mod config;
 pub mod core_protocol;
@@ -11,6 +13,7 @@ pub mod message;
 pub mod node;
 pub mod postoffice;
 pub mod queue;
+pub mod recovery;
 pub mod settings;
 pub mod storage;
 pub mod transaction;
@@ -58,17 +61,48 @@ impl RoutingType {
     }
 }
 
-/// Message, queue and address IDs (`StorageManager.generateID`).
-#[derive(Debug)]
-pub struct IdGenerator(AtomicI64);
+/// Message, queue, address and transaction IDs
+/// (`StorageManager.generateID`), from the journal's batching generator when
+/// the broker persists, from a counter otherwise. It also carries the
+/// storage to everything that holds it.
+pub struct IdGenerator {
+    counter: AtomicI64,
+    storage: Option<Arc<storage::Storage>>,
+}
+
+impl std::fmt::Debug for IdGenerator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdGenerator")
+            .field("persistent", &self.storage.is_some())
+            .finish()
+    }
+}
 
 impl IdGenerator {
     pub fn new(first: i64) -> Self {
-        Self(AtomicI64::new(first))
+        Self {
+            counter: AtomicI64::new(first),
+            storage: None,
+        }
+    }
+
+    pub fn persistent(storage: Arc<storage::Storage>) -> Self {
+        Self {
+            counter: AtomicI64::new(0),
+            storage: Some(storage),
+        }
     }
 
     pub fn next(&self) -> i64 {
-        self.0.fetch_add(1, Ordering::Relaxed)
+        match &self.storage {
+            Some(s) => s.generate_id(),
+            None => self.counter.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// The journals, when the broker persists (`persistence-enabled`).
+    pub fn storage(&self) -> Option<&Arc<storage::Storage>> {
+        self.storage.as_ref()
     }
 }
 
@@ -87,6 +121,9 @@ pub struct BrokerConfig {
     /// `connection-ttl-override`; -1 lets clients choose.
     pub connection_ttl_override: i64,
     pub addresses: Vec<AddressDeployment>,
+    /// The journals; `None` keeps everything in memory
+    /// (`persistence-enabled` false).
+    pub storage: Option<storage::StorageConfig>,
 }
 
 impl BrokerConfig {
@@ -98,6 +135,7 @@ impl BrokerConfig {
             wildcard: WildcardConfig::default(),
             connection_ttl_override: -1,
             addresses: Vec::new(),
+            storage: None,
         }
     }
 }
@@ -111,17 +149,43 @@ pub struct Broker {
     /// (`ActiveMQServerImpl.lookupSession`).
     session_metadata: Mutex<HashMap<String, HashMap<String, String>>>,
     resource_manager: transaction::ResourceManager,
+    storage: Option<Arc<storage::Storage>>,
+    node_lock: Mutex<Option<node::NodeLock>>,
 }
 
 impl Broker {
-    pub fn new(config: BrokerConfig) -> Result<Arc<Self>> {
-        let ids = Arc::new(IdGenerator::new(1));
+    /// Starts the broker: with persistence, takes the journal directory's
+    /// lock, recovers addresses and queues from the bindings journal, deploys
+    /// the configured ones, then recovers messages and prepared transactions
+    /// (`ActiveMQServerImpl.initialisePart2` / `loadJournals`).
+    pub async fn start(config: BrokerConfig) -> Result<Arc<Self>> {
+        let internal =
+            |what: &str, e: &dyn std::fmt::Display| BrokerError::internal(format!("{what}: {e}"));
+        let (ids, storage, node_lock) = match &config.storage {
+            Some(sc) => {
+                let lock = node::NodeLock::acquire(&sc.messages.directory)
+                    .map_err(|e| internal("journal directory lock", &e))?;
+                let storage = Arc::new(
+                    storage::Storage::open(sc.clone())
+                        .map_err(|e| internal("opening the journals", &e))?,
+                );
+                (
+                    Arc::new(IdGenerator::persistent(storage.clone())),
+                    Some(storage),
+                    Some(lock),
+                )
+            }
+            None => (Arc::new(IdGenerator::new(1)), None, None),
+        };
         let post_office = Arc::new(PostOffice::new(
             config.settings,
             config.filters,
             ids,
             config.wildcard,
         ));
+        if let Some(s) = &storage {
+            recovery::load_bindings(s, &post_office)?;
+        }
         for address in &config.addresses {
             post_office.add_or_update_address(
                 &address.name,
@@ -133,14 +197,43 @@ impl Broker {
                 post_office.create_queue(queue.clone(), true)?;
             }
         }
+        let resource_manager = transaction::ResourceManager::default();
+        if let Some(s) = &storage {
+            recovery::load_messages(s, &post_office, &resource_manager).await?;
+        }
+        let node_id = match &node_lock {
+            Some(l) => l.node_id().to_owned(),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
         Ok(Arc::new(Self {
-            node_id: uuid::Uuid::new_v4().to_string(),
+            node_id,
             post_office,
             connection_ttl_override: config.connection_ttl_override,
             next_consumer_id: AtomicU64::new(1),
             session_metadata: Mutex::default(),
-            resource_manager: transaction::ResourceManager::default(),
+            resource_manager,
+            storage,
+            node_lock: Mutex::new(node_lock),
         }))
+    }
+
+    /// A clean stop: the ID generator's checkpoint and the journals are
+    /// written out, and `server.lock` marked paused.
+    pub fn stop(&self) -> Result<()> {
+        if let Some(s) = &self.storage {
+            s.stop()
+                .map_err(|e| BrokerError::internal(format!("stopping the journals: {e}")))?;
+        }
+        let lock = self
+            .node_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(l) = lock {
+            l.pause()
+                .map_err(|e| BrokerError::internal(format!("server.lock: {e}")))?;
+        }
+        Ok(())
     }
 
     pub fn node_id(&self) -> &str {

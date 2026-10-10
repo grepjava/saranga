@@ -366,6 +366,60 @@ impl PostOffice {
         self.state.write().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn io(e: saranga_journal::JournalError) -> BrokerError {
+        BrokerError::new(saranga_core_protocol::ErrorType::IoError, e.to_string())
+    }
+
+    /// An address recovered from the bindings journal.
+    pub fn reload_address(&self, info: AddressInfo) {
+        self.write()
+            .addresses
+            .entry(info.name.clone())
+            .or_insert_with(|| AddressEntry {
+                info,
+                queues: Vec::new(),
+                anycast_next: AtomicUsize::new(0),
+            });
+    }
+
+    /// A queue recovered from the bindings journal, under its persisted ID
+    /// (`initQueues`). A name taken already gets a `-N` suffix.
+    pub fn reload_queue(&self, id: i64, mut config: QueueConfig) -> Result<Queue> {
+        let filter = self.filters.create(config.filter_string.as_deref())?;
+        let mut state = self.write();
+        let mut n = 0;
+        let original = config.name.clone();
+        while state.queues.contains_key(&config.name) {
+            config.name = format!("{original}-{n}").into();
+            n += 1;
+        }
+        if config.name != original {
+            tracing::warn!(
+                "AMQ224076: Queue {original} is duplicated during reload. This queue will be renamed as {}",
+                config.name
+            );
+        }
+        let entry = state
+            .addresses
+            .entry(config.address.clone())
+            .or_insert_with(|| AddressEntry {
+                info: AddressInfo {
+                    id: self.ids.next(),
+                    name: config.address.clone(),
+                    routing_types: RoutingTypes::of(config.routing_type),
+                    auto_created: true,
+                    temporary: false,
+                },
+                queues: Vec::new(),
+                anycast_next: AtomicUsize::new(0),
+            });
+        entry.info.routing_types.add(config.routing_type);
+        let queue = Queue::spawn(id, config, filter, self.ids.clone());
+        entry.queues.push(queue.clone());
+        state.queues.insert(queue.name().clone(), queue.clone());
+        Ok(queue)
+    }
+
     pub fn address_info(&self, name: &str) -> Option<AddressInfo> {
         self.read().addresses.get(name).map(|e| e.info.clone())
     }
@@ -405,7 +459,22 @@ impl PostOffice {
                         return Err(BrokerError::invalid_routing_type_delete(t.name(), name));
                     }
                 }
-                entry.info.routing_types = routing_types;
+                let mut updated = entry.info.clone();
+                updated.routing_types = routing_types;
+                // updateAddressInfo: the binding is rewritten under a new ID.
+                if !updated.temporary
+                    && let Some(s) = self.ids.storage()
+                {
+                    updated.id = self.ids.next();
+                    s.replace_binding(
+                        entry.info.id,
+                        updated.id,
+                        crate::storage::ids::ADDRESS_BINDING_RECORD,
+                        crate::recovery::address_binding(&updated),
+                    )
+                    .map_err(Self::io)?;
+                }
+                entry.info = updated;
             }
             return Ok(entry.info.clone());
         }
@@ -416,6 +485,9 @@ impl PostOffice {
             auto_created,
             temporary,
         };
+        if !temporary && let Some(s) = self.ids.storage() {
+            crate::recovery::store_address(s, &info).map_err(Self::io)?;
+        }
         state.addresses.insert(
             info.name.clone(),
             AddressEntry {
@@ -448,6 +520,12 @@ impl PostOffice {
         let mut state = self.write();
         match state.addresses.get(name) {
             Some(entry) if entry.queues.is_empty() => {
+                if !entry.info.temporary
+                    && let Some(s) = self.ids.storage()
+                    && let Err(e) = s.delete_binding(entry.info.id)
+                {
+                    tracing::warn!("removing address {name}: {e}");
+                }
                 state.addresses.remove(name);
                 true
             }
@@ -518,7 +596,19 @@ impl PostOffice {
         let Some(entry) = state.addresses.get_mut(&config.address) else {
             return Err(BrokerError::address_does_not_exist(&config.address));
         };
-        let queue = Queue::spawn(self.ids.next(), config, filter, self.ids.clone());
+        let id = self.ids.next();
+        if config.durable
+            && !config.temporary
+            && let Some(s) = self.ids.storage()
+        {
+            s.add_binding(
+                id,
+                crate::storage::ids::QUEUE_BINDING_RECORD,
+                crate::recovery::queue_binding(&config),
+            )
+            .map_err(Self::io)?;
+        }
+        let queue = Queue::spawn(id, config, filter, self.ids.clone());
         entry.queues.push(queue.clone());
         state.queues.insert(queue.name().clone(), queue.clone());
         Ok(queue)
@@ -549,6 +639,12 @@ impl PostOffice {
             if let Some(entry) = state.addresses.get_mut(&address) {
                 entry.queues.retain(|q| q != &queue);
             }
+        }
+        if queue.is_durable()
+            && let Some(s) = self.ids.storage()
+            && let Err(e) = s.delete_binding(queue.id())
+        {
+            tracing::warn!("deleting queue {name}: {e}");
         }
         queue.shutdown();
         if auto_delete_address && self.address_info(&address).is_some_and(|i| i.auto_created) {

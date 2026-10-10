@@ -1,12 +1,16 @@
 //! Builds the broker's configuration from a parsed `broker.xml`.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+use saranga_journal::JournalConfig;
 
 use saranga_config as cfg;
 
 use crate::postoffice::{FilterFactory, QueueSpec, RoutingTypes};
 use crate::settings::{AddressSettings, SettingsRepository};
+use crate::storage::StorageConfig;
 use crate::wildcard::WildcardConfig;
 use crate::{AddressDeployment, BrokerConfig, RoutingType};
 
@@ -124,11 +128,72 @@ fn deployment(a: &cfg::AddressConfig) -> AddressDeployment {
     }
 }
 
+/// The journals' settings. Relative directories are resolved against the
+/// broker instance (`artemis.instance`), as Artemis does.
+pub fn storage_config(config: &cfg::BrokerConfig, instance: &Path) -> StorageConfig {
+    let j = &config.journal;
+    type J = cfg::JournalConfig;
+    let dir = |d: &str| {
+        let p = Path::new(d);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            instance.join(p)
+        }
+    };
+    let datasync = j.datasync.unwrap_or(J::DEFAULT_DATASYNC);
+    let pool_size = j.pool_files.unwrap_or(J::DEFAULT_POOL_FILES);
+    let compact_min_files = j
+        .compact_min_files
+        .unwrap_or(J::DEFAULT_COMPACT_MIN_FILES)
+        .max(0) as usize;
+    let compact_percentage = j
+        .compact_percentage
+        .unwrap_or(J::DEFAULT_COMPACT_PERCENTAGE)
+        .clamp(0, 100) as u32;
+    let max_attic_files = j
+        .max_attic_files
+        .unwrap_or(J::DEFAULT_MAX_ATTIC_FILES)
+        .max(0) as usize;
+    StorageConfig {
+        messages: JournalConfig {
+            file_size: j.file_size.unwrap_or(J::DEFAULT_FILE_SIZE).max(1024) as usize,
+            min_files: j.min_files.unwrap_or(J::DEFAULT_MIN_FILES).max(2) as usize,
+            pool_size,
+            compact_min_files,
+            compact_percentage,
+            datasync,
+            buffer_size: j.buffer_size.unwrap_or(J::DEFAULT_BUFFER_SIZE).max(0) as usize,
+            max_attic_files,
+            ..JournalConfig::messages(dir(&config.journal_directory))
+        },
+        bindings: JournalConfig {
+            pool_size,
+            compact_min_files,
+            compact_percentage,
+            datasync,
+            max_attic_files,
+            ..JournalConfig::bindings(dir(&config.bindings_directory))
+        },
+        sync_transactional: j
+            .sync_transactional
+            .unwrap_or(J::DEFAULT_SYNC_TRANSACTIONAL),
+        sync_non_transactional: j
+            .sync_non_transactional
+            .unwrap_or(J::DEFAULT_SYNC_NON_TRANSACTIONAL),
+        max_redelivery_records: j
+            .max_redelivery_records
+            .unwrap_or(J::DEFAULT_MAX_REDELIVERY_RECORDS),
+    }
+}
+
 impl BrokerConfig {
-    /// The broker configuration a `broker.xml` describes.
+    /// The broker configuration a `broker.xml` describes, with the broker
+    /// instance directory its relative data directories are under.
     pub fn from_file_config(
         config: &cfg::BrokerConfig,
         filters: Arc<dyn FilterFactory>,
+        instance: &Path,
     ) -> cfg::Result<Self> {
         let w = &config.wildcard_addresses;
         Ok(Self {
@@ -144,6 +209,9 @@ impl BrokerConfig {
             },
             connection_ttl_override: -1,
             addresses: config.addresses.iter().map(deployment).collect(),
+            storage: config
+                .persistence_enabled
+                .then(|| storage_config(config, instance)),
         })
     }
 }

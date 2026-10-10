@@ -1,7 +1,7 @@
 //! The `saranga` command (the counterpart of `artemis`).
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -27,7 +27,10 @@ struct Cli {
 enum Command {
     /// Runs the broker in the foreground.
     Run {
-        /// A broker.xml; its acceptors that speak CORE are opened.
+        /// A broker.xml; its acceptors that speak CORE are opened. Its
+        /// relative data directories are under the broker instance, the
+        /// directory above the file's (`<instance>/etc/broker.xml`). Without
+        /// one the broker keeps everything in memory.
         #[arg(long)]
         config: Option<PathBuf>,
         /// Listen here instead of on the configured acceptors.
@@ -45,6 +48,43 @@ async fn main() -> anyhow::Result<()> {
         .init();
     match Cli::parse().command {
         Command::Run { config, bind } => run(config, bind).await,
+    }
+}
+
+/// `<instance>/etc/broker.xml` -> `<instance>`.
+fn instance_dir(config: &Path) -> PathBuf {
+    let etc = config
+        .canonicalize()
+        .unwrap_or_else(|_| config.to_path_buf())
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    etc.parent().map(Path::to_path_buf).unwrap_or(etc)
+}
+
+/// How the broker was asked to stop.
+enum Stop {
+    Clean,
+    Halt,
+}
+
+/// `Run.addShutdownHook`: `STOP_ME` next to the configuration stops the
+/// broker, `KILL_ME` halts it at once (the files are removed on start).
+async fn watch_stop_files(dir: PathBuf) -> Stop {
+    let stop = dir.join("STOP_ME");
+    let kill = dir.join("KILL_ME");
+    let _ = std::fs::remove_file(&stop);
+    let _ = std::fs::remove_file(&kill);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if kill.exists() {
+            let _ = std::fs::remove_file(&kill);
+            return Stop::Halt;
+        }
+        if stop.exists() {
+            let _ = std::fs::remove_file(&stop);
+            return Stop::Clean;
+        }
     }
 }
 
@@ -70,7 +110,10 @@ async fn run(config: Option<PathBuf>, bind: Option<SocketAddr>) -> anyhow::Resul
                     (a.name.clone().unwrap_or_default(), format!("{host}:{port}"))
                 })
                 .collect();
-            (BrokerConfig::from_file_config(&file, filters)?, binds)
+            (
+                BrokerConfig::from_file_config(&file, filters, &instance_dir(path))?,
+                binds,
+            )
         }
         None => (BrokerConfig::new(filters), Vec::new()),
     };
@@ -79,7 +122,7 @@ async fn run(config: Option<PathBuf>, bind: Option<SocketAddr>) -> anyhow::Resul
     } else if binds.is_empty() {
         binds = vec![("artemis".to_owned(), "0.0.0.0:61616".to_owned())];
     }
-    let broker = Broker::new(broker_config)?;
+    let broker = Broker::start(broker_config).await?;
     let mut servers = tokio::task::JoinSet::new();
     for (name, address) in binds {
         let listener = TcpListener::bind(&address)
@@ -90,9 +133,34 @@ async fn run(config: Option<PathBuf>, bind: Option<SocketAddr>) -> anyhow::Resul
         servers.spawn(broker.clone().serve(listener));
     }
     tracing::info!("AMQ221007: Server is now active");
-    tokio::select! {
-        Some(result) = servers.join_next() => result??,
-        _ = tokio::signal::ctrl_c() => tracing::info!("AMQ221002: Saranga Message Broker is stopped"),
+    let stop_dir = config
+        .as_deref()
+        .and_then(|c| c.canonicalize().ok())
+        .and_then(|c| c.parent().map(Path::to_path_buf));
+    let stop_files = async {
+        match stop_dir {
+            Some(dir) => watch_stop_files(dir).await,
+            None => std::future::pending().await,
+        }
+    };
+    let stop = tokio::select! {
+        Some(result) = servers.join_next() => {
+            result??;
+            Stop::Clean
+        }
+        _ = tokio::signal::ctrl_c() => Stop::Clean,
+        s = stop_files => s,
+    };
+    match stop {
+        Stop::Halt => {
+            eprintln!("Halting by user request");
+            std::process::exit(0);
+        }
+        Stop::Clean => {
+            servers.abort_all();
+            broker.stop()?;
+            tracing::info!("AMQ221002: Saranga Message Broker is stopped");
+        }
     }
     Ok(())
 }

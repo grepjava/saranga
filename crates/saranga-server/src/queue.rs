@@ -129,6 +129,12 @@ enum Cmd {
         id: ConsumerId,
         sequence: i64,
     },
+    /// Takes a queued reference out for a recovered prepared transaction;
+    /// it stays counted.
+    Remove {
+        message_id: i64,
+        reply: oneshot::Sender<Option<MessageRef>>,
+    },
     Shutdown,
 }
 
@@ -220,6 +226,43 @@ impl Queue {
         self.0.deleted.load(Ordering::SeqCst)
     }
 
+    /// `QueueImpl.isDurable`: its persistent messages are journaled.
+    pub fn is_durable(&self) -> bool {
+        self.0.config.durable && !self.0.config.temporary
+    }
+
+    /// Whether this reference is journaled: a persistent message on a
+    /// durable queue.
+    pub fn is_durable_ref(&self, r: &MessageRef) -> bool {
+        r.message.is_durable() && self.is_durable()
+    }
+
+    pub fn ids(&self) -> &Arc<IdGenerator> {
+        &self.0.ids
+    }
+
+    /// `postAcknowledge`: once no durable queue refers to the message, its
+    /// record is deleted (not synced; recovery deletes what a crash missed).
+    pub fn post_acknowledge(&self, r: &MessageRef) {
+        if self.is_durable_ref(r)
+            && r.message.durable_down() == 0
+            && let Some(s) = self.0.ids.storage()
+            && let Err(e) = s.delete_message(r.message_id())
+        {
+            tracing::warn!(
+                "AMQ222178: Cannot find message {} on the journal: {e}",
+                r.message_id()
+            );
+        }
+    }
+
+    /// Takes a queued reference out by message ID (`removeReferenceWithID`).
+    pub async fn remove_reference(&self, message_id: i64) -> Option<MessageRef> {
+        let (reply, wait) = oneshot::channel();
+        self.send(Cmd::Remove { message_id, reply });
+        wait.await.ok().flatten()
+    }
+
     fn send(&self, cmd: Cmd) {
         // A send only fails once the actor has stopped, when the queue
         // is deleted; its messages go with it.
@@ -273,8 +316,9 @@ impl Queue {
     }
 
     /// Acknowledges up to and including `message_id` (cumulative), or just
-    /// that message (`individual`). Outside a transaction the references are
-    /// removed; inside one they are returned to be held by the transaction.
+    /// that message (`individual`), returning the references. Outside a
+    /// transaction they are gone from the queue; inside one the transaction
+    /// holds them and they stay counted until it completes.
     pub async fn ack(
         &self,
         id: ConsumerId,
@@ -517,7 +561,17 @@ impl Actor {
                 self.deliver();
                 self.force_delivery(id, sequence);
             }
-            Cmd::Shutdown => return false,
+            Cmd::Remove { message_id, reply } => {
+                let r = self
+                    .messages
+                    .find(|r| r.message_id() == message_id)
+                    .map(|at| self.messages.remove(at));
+                let _ = reply.send(r);
+            }
+            Cmd::Shutdown => {
+                self.delete_all_references();
+                return false;
+            }
         }
         true
     }
@@ -578,12 +632,10 @@ impl Actor {
                 }
             }
         }
-        if transactional {
-            Ok(refs)
-        } else {
+        if !transactional {
             self.count_removed(refs.len());
-            Ok(Vec::new())
         }
+        Ok(refs)
     }
 
     /// `QueueImpl.deliver`: hands messages to consumers until none can take
@@ -636,10 +688,49 @@ impl Actor {
         }
         if c.reg.pre_acknowledge {
             self.count_removed(1);
+            self.pre_acknowledge(&r);
         } else {
             c.delivering.push_back(r);
         }
         true
+    }
+
+    /// A pre-acknowledged delivery is acknowledged at once (`acknowledge`
+    /// from `ServerConsumerImpl.proceedDeliver`).
+    fn pre_acknowledge(&self, r: &MessageRef) {
+        let queue = Queue(self.shared.clone());
+        if queue.is_durable_ref(r)
+            && let Some(s) = self.shared.ids.storage()
+            && let Err(e) = s.store_acknowledge(self.shared.id, r.message_id())
+        {
+            tracing::warn!(
+                "AMQ222178: Cannot find message {} on the journal: {e}",
+                r.message_id()
+            );
+        }
+        queue.post_acknowledge(r);
+    }
+
+    /// `deleteAllReferences`: the deleted queue's durable messages are
+    /// acknowledged so their records go.
+    fn delete_all_references(&mut self) {
+        let queue = Queue(self.shared.clone());
+        let storage = self.shared.ids.storage().cloned();
+        let mut refs: Vec<MessageRef> = Vec::new();
+        for level in &mut self.messages.levels {
+            refs.extend(level.drain(..));
+        }
+        for c in self.consumers.iter_mut() {
+            refs.extend(c.delivering.drain(..));
+        }
+        for r in &refs {
+            if queue.is_durable_ref(r)
+                && let Some(s) = &storage
+            {
+                let _ = s.store_acknowledge(self.shared.id, r.message_id());
+            }
+            queue.post_acknowledge(r);
+        }
     }
 
     /// Browsers see every message without taking it (`BrowserDeliverer`).

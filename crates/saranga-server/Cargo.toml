@@ -11,6 +11,7 @@ saranga-config = { path = "../saranga-config" }
 saranga-core-protocol = { path = "../saranga-core-protocol" }
 saranga-filter = { path = "../saranga-filter" }
 saranga-journal = { path = "../saranga-journal" }
+saranga-storage = { path = "../saranga-storage" }
 saranga-message = { path = "../saranga-message" }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }

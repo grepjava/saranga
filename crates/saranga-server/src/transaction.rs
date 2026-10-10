@@ -14,6 +14,7 @@ pub use saranga_core_protocol::packets::xa::Xid;
 use crate::BrokerError;
 use crate::message::MessageRef;
 use crate::queue::Queue;
+use crate::storage::{Pending, Storage};
 
 /// `XAException` and `XAResource` codes used in XA responses.
 pub mod xa_code {
@@ -90,7 +91,11 @@ impl TxState {
 /// `TransactionImpl`.
 #[derive(Debug)]
 pub struct Transaction {
+    /// The journal transaction ID.
+    pub id: i64,
     pub xid: Option<Xid>,
+    /// `containsPersistent`: the transaction wrote to the journal.
+    pub persistent: bool,
     pub state: TxState,
     /// Routed sends, added to their queues on commit.
     pub sends: Vec<(Queue, MessageRef)>,
@@ -102,9 +107,18 @@ pub struct Transaction {
 
 pub type TxRef = Arc<Mutex<Transaction>>;
 
-/// What a finished transaction leaves to do on the queues.
+/// The record that completes a transaction in the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxRecord {
+    Commit(i64),
+    Rollback(i64),
+}
+
+/// What a finished transaction leaves to do: the record to journal, then
+/// the queue updates.
 #[derive(Debug, Default)]
 pub struct Outcome {
+    pub record: Option<TxRecord>,
     /// Commit: references to add to their queues.
     pub add: Vec<(Queue, MessageRef)>,
     /// Commit: references acknowledged for good, per queue.
@@ -114,13 +128,31 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    /// Applies the outcome to the queues (`afterCommit` / `afterRollback`).
+    /// Journals the commit or rollback record, if the transaction needs
+    /// one (`doCommit` / `doRollback`).
+    pub fn write(&mut self, storage: Option<&Storage>) -> Result<Option<Pending>, BrokerError> {
+        let (Some(storage), Some(record)) = (storage, self.record.take()) else {
+            return Ok(None);
+        };
+        let r = match record {
+            TxRecord::Commit(id) => storage.commit(id),
+            TxRecord::Rollback(id) => storage.rollback(id),
+        };
+        r.map(Some)
+            .map_err(|e| BrokerError::new(saranga_core_protocol::ErrorType::IoError, e.to_string()))
+    }
+
+    /// Applies the outcome to the queues (`afterCommit` / `afterRollback`):
+    /// committed sends join their queues, committed acknowledgements are
+    /// final, rolled-back references return with their delivery count
+    /// journaled (`checkRedelivery`).
     pub fn apply(self) {
         for (q, r) in self.add {
             q.add(r);
         }
         let mut acked: Vec<(Queue, usize)> = Vec::new();
-        for (q, _) in self.acked {
+        for (q, r) in self.acked {
+            q.post_acknowledge(&r);
             match acked.iter_mut().find(|(a, _)| *a == q) {
                 Some((_, n)) => *n += 1,
                 None => acked.push((q, 1)),
@@ -129,7 +161,32 @@ impl Outcome {
         for (q, n) in acked {
             q.acked(n);
         }
-        return_refs(self.cancel);
+        let cancel = self
+            .cancel
+            .into_iter()
+            .map(|(q, mut r)| {
+                persist_delivery_count(&q, &mut r);
+                (q, r)
+            })
+            .collect();
+        return_refs(cancel);
+    }
+}
+
+/// `StorageManager.updateDeliveryCount` for a reference going back to its
+/// queue after a rollback.
+pub fn persist_delivery_count(q: &Queue, r: &mut MessageRef) {
+    if !q.is_durable_ref(r) {
+        return;
+    }
+    let Some(s) = q.ids().storage() else { return };
+    match s.update_delivery_count(q.id(), r.message_id(), r.delivery_count, r.persisted_count) {
+        Ok(true) => r.persisted_count = r.delivery_count,
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            "AMQ222178: Cannot find message {} on the journal: {e}",
+            r.message_id()
+        ),
     }
 }
 
@@ -152,9 +209,11 @@ fn invalid_state(state: TxState) -> BrokerError {
 }
 
 impl Transaction {
-    pub fn new(xid: Option<Xid>) -> Self {
+    pub fn new(id: i64, xid: Option<Xid>) -> Self {
         Self {
+            id,
             xid,
+            persistent: false,
             state: TxState::Active,
             sends: Vec::new(),
             acks: Vec::new(),
@@ -162,8 +221,8 @@ impl Transaction {
         }
     }
 
-    pub fn new_ref(xid: Option<Xid>) -> TxRef {
-        Arc::new(Mutex::new(Self::new(xid)))
+    pub fn new_ref(id: i64, xid: Option<Xid>) -> TxRef {
+        Arc::new(Mutex::new(Self::new(id, xid)))
     }
 
     /// `markAsRollbackOnly`: the first reason sticks.
@@ -182,11 +241,14 @@ impl Transaction {
         matches!(self.state, TxState::Committed | TxState::RolledBack)
     }
 
-    /// `internalRollback`.
+    /// `internalRollback`. A rollback record is journaled for persistent
+    /// work, or to end a prepared branch.
     fn internal_rollback(&mut self) -> Outcome {
+        let journaled = self.persistent || (self.xid.is_some() && self.state == TxState::Prepared);
         self.state = TxState::RolledBack;
         self.sends.clear();
         Outcome {
+            record: journaled.then_some(TxRecord::Rollback(self.id)),
             cancel: std::mem::take(&mut self.acks),
             ..Outcome::default()
         }
@@ -217,8 +279,12 @@ impl Transaction {
         if !valid {
             return Err((invalid_state(self.state), Outcome::default()));
         }
+        // doCommit: a commit record for persistent work, or to end a
+        // prepared branch.
+        let journaled = self.persistent || (self.xid.is_some() && self.state == TxState::Prepared);
         self.state = TxState::Committed;
         Ok(Outcome {
+            record: journaled.then_some(TxRecord::Commit(self.id)),
             add: std::mem::take(&mut self.sends),
             acked: std::mem::take(&mut self.acks),
             cancel: Vec::new(),
@@ -401,28 +467,41 @@ mod tests {
 
     #[test]
     fn local_commit_rollback_states() {
-        let mut t = Transaction::new(None);
+        let mut t = Transaction::new(1, None);
         assert!(t.commit(false).is_ok());
         assert_eq!(t.state, TxState::Committed);
         assert!(t.rollback().is_err());
-        let mut t = Transaction::new(None);
+        let mut t = Transaction::new(1, None);
         assert!(t.prepare().is_err());
     }
 
     #[test]
     fn xa_two_phase_needs_prepare() {
-        let mut t = Transaction::new(Some(xid(1)));
+        let mut t = Transaction::new(1, Some(xid(1)));
         let (e, _) = t.commit(false).unwrap_err();
         assert_eq!(e.message, "Transaction is in invalid state ACTIVE");
         t.prepare().unwrap();
         assert!(t.commit(true).is_err());
         assert!(t.try_rollback().is_none());
-        t.commit(false).unwrap();
+        let o = t.commit(false).unwrap();
+        assert_eq!(o.record, Some(TxRecord::Commit(1)));
+    }
+
+    #[test]
+    fn only_persistent_or_prepared_work_is_journaled() {
+        let mut t = Transaction::new(3, None);
+        assert_eq!(t.commit(true).unwrap().record, None);
+        let mut t = Transaction::new(4, None);
+        t.persistent = true;
+        assert_eq!(t.rollback().unwrap().record, Some(TxRecord::Rollback(4)));
+        let mut t = Transaction::new(5, Some(xid(5)));
+        t.prepare().unwrap();
+        assert_eq!(t.rollback().unwrap().record, Some(TxRecord::Rollback(5)));
     }
 
     #[test]
     fn rollback_only_fails_commit_with_its_reason() {
-        let mut t = Transaction::new(None);
+        let mut t = Transaction::new(1, None);
         t.mark_rollback_only(&BrokerError::illegal_state("first"));
         t.mark_rollback_only(&BrokerError::illegal_state("second"));
         let (e, _) = t.commit(false).unwrap_err();
@@ -446,10 +525,10 @@ mod tests {
     #[test]
     fn resource_manager_in_doubt() {
         let rm = ResourceManager::default();
-        let a = Transaction::new_ref(Some(xid(1)));
+        let a = Transaction::new_ref(1, Some(xid(1)));
         assert!(rm.put(xid(1), a.clone()));
         assert!(!rm.put(xid(1), a.clone()));
-        rm.put(xid(2), Transaction::new_ref(Some(xid(2))));
+        rm.put(xid(2), Transaction::new_ref(2, Some(xid(2))));
         lock(&a).prepare().unwrap();
         assert_eq!(rm.in_doubt(), vec![xid(1)]);
     }
