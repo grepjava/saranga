@@ -25,6 +25,11 @@ impl BrokerError {
         Self::new(kind, format!("AMQ{id}: {text}"))
     }
 
+    /// `ActiveMQIllegalStateException` with a plain message.
+    pub fn illegal_state(text: impl Into<String>) -> Self {
+        Self::new(ErrorType::IllegalState, text)
+    }
+
     pub fn internal(text: impl Into<String>) -> Self {
         Self::new(ErrorType::InternalError, text)
     }

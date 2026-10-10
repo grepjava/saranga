@@ -12,6 +12,7 @@ pub mod postoffice;
 pub mod queue;
 pub mod settings;
 pub mod storage;
+pub mod transaction;
 pub mod wildcard;
 
 use std::collections::HashMap;
@@ -108,6 +109,7 @@ pub struct Broker {
     /// Session metadata by session name, for `addUniqueMetaData`
     /// (`ActiveMQServerImpl.lookupSession`).
     session_metadata: Mutex<HashMap<String, HashMap<String, String>>>,
+    resource_manager: transaction::ResourceManager,
 }
 
 impl Broker {
@@ -136,6 +138,7 @@ impl Broker {
             connection_ttl_override: config.connection_ttl_override,
             next_consumer_id: AtomicU64::new(1),
             session_metadata: Mutex::default(),
+            resource_manager: transaction::ResourceManager::default(),
         }))
     }
 
@@ -145,6 +148,11 @@ impl Broker {
 
     pub fn post_office(&self) -> &Arc<PostOffice> {
         &self.post_office
+    }
+
+    /// XA transactions by Xid.
+    pub fn resource_manager(&self) -> &transaction::ResourceManager {
+        &self.resource_manager
     }
 
     pub fn connection_ttl_override(&self) -> i64 {

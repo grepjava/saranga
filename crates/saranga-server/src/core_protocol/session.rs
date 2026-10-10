@@ -18,6 +18,10 @@ use saranga_core_protocol::packets::session::{
     SessionQueueQueryResponseMessage, SessionQueueQueryResponseMessageV2,
     SessionQueueQueryResponseMessageV3,
 };
+use saranga_core_protocol::packets::xa::{
+    SessionXAGetInDoubtXidsResponseMessage, SessionXAGetTimeoutResponseMessage,
+    SessionXAResponseMessage, SessionXASetTimeoutResponseMessage, Xid,
+};
 use saranga_core_protocol::{ErrorType, Flagged, Packet, version};
 use saranga_message::CoreMessage;
 use tokio::sync::mpsc;
@@ -29,6 +33,7 @@ use crate::postoffice::{
 };
 use crate::queue::{ConsumerId, ConsumerRegistration, Queue};
 use crate::storage::Pending;
+use crate::transaction::{self, Outcome, Transaction, TxError, TxRef, TxState, XaError, xa_code};
 use crate::{Broker, BrokerError, Name, Result, RoutingType};
 
 /// What the connection hands a session task.
@@ -58,22 +63,6 @@ struct ServerConsumer {
     id: ConsumerId,
     queue: Queue,
     browse_only: bool,
-}
-
-/// A local transaction (`TransactionImpl` with its `RefsOperation`):
-/// routed sends wait here until commit; acknowledged references are held
-/// until commit removes them or rollback returns them.
-#[derive(Default)]
-struct Transaction {
-    sends: Vec<(Queue, MessageRef)>,
-    acks: Vec<(Queue, MessageRef)>,
-    rollback_only: Option<BrokerError>,
-}
-
-impl Transaction {
-    fn mark_rollback_only(&mut self, e: &BrokerError) {
-        self.rollback_only.get_or_insert_with(|| e.clone());
-    }
 }
 
 /// `ChannelImpl.confirm` state, used when the client set a confirmation
@@ -178,7 +167,8 @@ pub(crate) struct CoreSession {
     /// Large messages arrive in Phase 5.
     #[allow(dead_code)]
     min_large_message_size: i32,
-    /// XA sessions start without a transaction (Phase 3).
+    /// XA sessions work in the transaction of the last `xaStart`, or in
+    /// none.
     xa: bool,
     auto_commit_sends: bool,
     auto_commit_acks: bool,
@@ -188,7 +178,12 @@ pub(crate) struct CoreSession {
     closed: bool,
     consumers: BTreeMap<i64, ServerConsumer>,
     producers: HashMap<i32, Option<String>>,
-    tx: Transaction,
+    /// The current transaction: always one for a local session.
+    tx: Option<TxRef>,
+    /// An XA branch ended but not yet prepared, committed or rolled back
+    /// (`pendingTX`), rolled back if the client fails.
+    pending_tx: Option<TxRef>,
+    timeout_seconds: i32,
     /// Journal writes lined up by the request being handled.
     ops: Vec<Pending>,
     completer: mpsc::UnboundedSender<Done>,
@@ -257,7 +252,9 @@ impl CoreSession {
             closed: false,
             consumers: BTreeMap::new(),
             producers: HashMap::new(),
-            tx: Transaction::default(),
+            tx: (!request.xa).then(|| Transaction::new_ref(None)),
+            pending_tx: None,
+            timeout_seconds: transaction::ResourceManager::TIMEOUT_SECONDS,
             ops: Vec::new(),
             completer: completer_tx,
         }
@@ -594,10 +591,70 @@ impl CoreSession {
                 self.producers.remove(&p.id);
                 (false, Ok(None), false)
             }
+            Packet::SessionXAStartMessage(p) => {
+                (true, Self::xa_response(self.xa_start(p.xid)), false)
+            }
+            Packet::SessionXAEndMessage(p) => (true, Self::xa_response(self.xa_end(p.xid)), false),
+            Packet::SessionXAPrepareMessage(p) => {
+                (true, Self::xa_response(self.xa_prepare(p.xid)), false)
+            }
+            Packet::SessionXACommitMessage(p) => (
+                true,
+                Self::xa_response(self.xa_commit(p.xid, p.one_phase)),
+                false,
+            ),
+            Packet::SessionXARollbackMessage(p) => {
+                let result = self.xa_rollback(p.xid).await;
+                (true, Self::xa_response(result), false)
+            }
+            Packet::SessionXAJoinMessage(p) => {
+                (true, Self::xa_response(self.xa_join(p.xid)), false)
+            }
+            Packet::SessionXAResumeMessage(p) => {
+                (true, Self::xa_response(self.xa_resume(p.xid)), false)
+            }
+            Packet::SessionXASuspend(_) => (true, Self::xa_response(self.xa_suspend()), false),
+            Packet::SessionXAForgetMessage(_) => {
+                // Heuristic completions come with management (Phase 8):
+                // there is never one to forget.
+                let e = XaError {
+                    code: xa_code::XAER_NOTA,
+                    message: None,
+                };
+                (true, Self::xa_response(Err(e.into())), false)
+            }
+            Packet::SessionXAAfterFailedMessage(p) => {
+                self.xa_failed(p.xid);
+                // No response for this one.
+                (false, Ok(None), false)
+            }
+            Packet::SessionXAInDoubtXids(_) => {
+                let xids = self.broker.resource_manager().in_doubt();
+                (
+                    true,
+                    Ok(Some(SessionXAGetInDoubtXidsResponseMessage { xids }.into())),
+                    false,
+                )
+            }
+            Packet::SessionXAGetTimeout(_) => (
+                true,
+                Ok(Some(
+                    SessionXAGetTimeoutResponseMessage {
+                        timeout_seconds: transaction::ResourceManager::TIMEOUT_SECONDS,
+                    }
+                    .into(),
+                )),
+                false,
+            ),
+            Packet::SessionXASetTimeoutMessage(p) => {
+                self.timeout_seconds = p.timeout_seconds;
+                (
+                    true,
+                    Ok(Some(SessionXASetTimeoutResponseMessage { ok: true }.into())),
+                    false,
+                )
+            }
             other => {
-                if self.xa {
-                    tracing::warn!(session = %self.name, "XA arrives in Phase 3");
-                }
                 tracing::warn!(session = %self.name, "unsupported packet {}", other.name());
                 let e = BrokerError::new(
                     ErrorType::UnsupportedPacket,
@@ -631,23 +688,31 @@ impl CoreSession {
         };
         let routing_type = routing_type(&message);
         let r = MessageRef::new(ServerMessage::new(message));
+        // doSend: outside a transaction when auto-committing or when an XA
+        // session has none.
+        let tx = if self.auto_commit_sends {
+            None
+        } else {
+            self.tx.clone()
+        };
         let queues = match self.broker.post_office().route(&r, &address, routing_type) {
             Ok(queues) => queues,
             Err(e) => {
-                if !self.auto_commit_sends {
-                    self.tx.mark_rollback_only(&e);
+                if let Some(tx) = &tx {
+                    transaction::lock(tx).mark_rollback_only(&e);
                 }
                 return Err(e);
             }
         };
-        if self.auto_commit_sends {
-            for q in queues {
-                q.add(r.clone());
+        match tx {
+            None => {
+                for q in queues {
+                    q.add(r.clone());
+                }
             }
-        } else {
-            self.tx
+            Some(tx) => transaction::lock(&tx)
                 .sends
-                .extend(queues.into_iter().map(|q| (q, r.clone())));
+                .extend(queues.into_iter().map(|q| (q, r.clone()))),
         }
         Ok(None)
     }
@@ -658,34 +723,423 @@ impl CoreSession {
         message_id: i64,
         individual: bool,
     ) -> Result<Option<Packet>> {
-        let transactional = !self.auto_commit_acks;
+        let tx = if self.auto_commit_acks {
+            None
+        } else {
+            self.tx.clone()
+        };
         let Some(c) = self.consumers.get(&consumer_id) else {
             let e = BrokerError::consumer_doesnt_exist(consumer_id);
-            if transactional {
-                self.tx.mark_rollback_only(&e);
+            if let Some(tx) = &self.tx {
+                transaction::lock(tx).mark_rollback_only(&e);
             }
             return Err(e);
         };
         let queue = c.queue.clone();
-        match queue.ack(c.id, message_id, individual, transactional).await {
+        match queue.ack(c.id, message_id, individual, tx.is_some()).await {
             Ok(refs) => {
-                self.tx
-                    .acks
-                    .extend(refs.into_iter().map(|r| (queue.clone(), r)));
+                if let Some(tx) = tx {
+                    transaction::lock(&tx)
+                        .acks
+                        .extend(refs.into_iter().map(|r| (queue.clone(), r)));
+                }
                 Ok(None)
             }
             Err(failed) => {
                 let e = BrokerError::consumer_no_reference(consumer_id, message_id, queue.name());
-                if transactional {
-                    self.tx
-                        .acks
-                        .extend(failed.refs.into_iter().map(|r| (queue.clone(), r)));
-                    self.tx.mark_rollback_only(&e);
-                } else {
-                    queue.reinsert(failed.refs);
+                match tx {
+                    Some(tx) => {
+                        let mut t = transaction::lock(&tx);
+                        t.acks
+                            .extend(failed.refs.into_iter().map(|r| (queue.clone(), r)));
+                        t.mark_rollback_only(&e);
+                    }
+                    None => queue.reinsert(failed.refs),
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// `createSessionXAResponseMessage` and
+    /// `onActiveMQXAExceptionWhileHandlePacket`: XA requests are never
+    /// response-async, so the answer is always the V1 message.
+    fn xa_response(result: Result<(), TxError>) -> Result<Option<Packet>> {
+        match result {
+            Ok(()) => Ok(Some(
+                SessionXAResponseMessage {
+                    error: false,
+                    response_code: xa_code::XA_OK,
+                    message: None,
+                }
+                .into(),
+            )),
+            Err(TxError::Xa(e)) => Ok(Some(
+                SessionXAResponseMessage {
+                    error: true,
+                    response_code: e.code,
+                    message: e.message.as_deref().map(JString::from),
+                }
+                .into(),
+            )),
+            Err(TxError::Broker(e)) => Err(e),
+        }
+    }
+
+    fn current_xid_is(&self, xid: &Xid) -> bool {
+        self.tx
+            .as_ref()
+            .is_some_and(|t| transaction::lock(t).xid.as_ref() == Some(xid))
+    }
+
+    /// `xaStart`: a transaction still open on the session is rolled back
+    /// (unless prepared) and replaced.
+    fn xa_start(&mut self, xid: Xid) -> Result<(), TxError> {
+        if let Some(old) = self.tx.take() {
+            let mut t = transaction::lock(&old);
+            tracing::warn!(
+                "AMQ222210: Session already had a transaction {} when xaStart {} was called",
+                t.xid
+                    .as_ref()
+                    .map(transaction::xid_string)
+                    .unwrap_or_default(),
+                transaction::xid_string(&xid)
+            );
+            if t.state != TxState::Prepared {
+                if let Some(x) = &t.xid {
+                    self.broker.resource_manager().remove(x);
+                }
+                if let Ok(outcome) = t.rollback() {
+                    drop(t);
+                    outcome.apply();
+                }
+            }
+        }
+        let tx = Transaction::new_ref(Some(xid.clone()));
+        self.tx = Some(tx.clone());
+        if !self.broker.resource_manager().put(xid.clone(), tx) {
+            return Err(XaError::new(
+                xa_code::XAER_DUPID,
+                format!(
+                    "Cannot start, there is already a xid {}",
+                    transaction::xid_string(&xid)
+                ),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// `xaEnd`.
+    fn xa_end(&mut self, xid: Xid) -> Result<(), TxError> {
+        if self.current_xid_is(&xid) {
+            let tx = self.tx.clone().expect("current transaction");
+            let state = transaction::lock(&tx).state;
+            match state {
+                TxState::Suspended => Err(XaError::new(
+                    xa_code::XAER_PROTO,
+                    "Cannot end, transaction is suspended",
+                )
+                .into()),
+                TxState::RolledBack => {
+                    self.tx = None;
+                    Err(XaError::new(
+                        xa_code::XAER_PROTO,
+                        "Cannot end, transaction is rolled back",
+                    )
+                    .into())
+                }
+                _ => {
+                    self.pending_tx = self.tx.take();
+                    Ok(())
+                }
+            }
+        } else {
+            // Ending a suspended branch (JTA 1.1, 3.4.4).
+            let Some(tx) = self.broker.resource_manager().get(&xid) else {
+                return Err(XaError::new(
+                    xa_code::XAER_NOTA,
+                    format!(
+                        "Cannot find suspended transaction to end {}",
+                        transaction::xid_string(&xid)
+                    ),
+                )
+                .into());
+            };
+            let mut t = transaction::lock(&tx);
+            match t.state {
+                TxState::Active => Ok(()),
+                TxState::Suspended => {
+                    t.state = TxState::Active;
+                    Ok(())
+                }
+                _ => Err(XaError::new(
+                    xa_code::XAER_PROTO,
+                    format!(
+                        "Transaction is not suspended {}",
+                        transaction::xid_string(&xid)
+                    ),
+                )
+                .into()),
+            }
+        }
+    }
+
+    fn not_found(xid: &Xid) -> TxError {
+        XaError::new(
+            xa_code::XAER_NOTA,
+            format!(
+                "Cannot find xid in resource manager: {}",
+                transaction::xid_string(xid)
+            ),
+        )
+        .into()
+    }
+
+    /// `xaPrepare`.
+    fn xa_prepare(&mut self, xid: Xid) -> Result<(), TxError> {
+        if self.current_xid_is(&xid) {
+            let current = self
+                .tx
+                .as_ref()
+                .and_then(|t| transaction::lock(t).xid.clone());
+            return Err(XaError::new(
+                xa_code::XAER_PROTO,
+                format!(
+                    "Cannot commit, session is currently doing work in a transaction {}",
+                    current
+                        .as_ref()
+                        .map(transaction::xid_string)
+                        .unwrap_or_default()
+                ),
+            )
+            .into());
+        }
+        let Some(tx) = self.broker.resource_manager().get(&xid) else {
+            return Err(Self::not_found(&xid));
+        };
+        let mut t = transaction::lock(&tx);
+        match t.state {
+            TxState::Suspended => Err(XaError::new(
+                xa_code::XAER_PROTO,
+                format!(
+                    "Cannot prepare transaction, it is suspended {}",
+                    transaction::xid_string(&xid)
+                ),
+            )
+            .into()),
+            TxState::Prepared => {
+                tracing::warn!(
+                    "AMQ222098: Ignoring prepare on xid as already called : {}",
+                    transaction::xid_string(&xid)
+                );
+                Ok(())
+            }
+            _ => match t.prepare() {
+                Ok(()) => Ok(()),
+                Err((e, outcome)) => {
+                    drop(t);
+                    outcome.apply();
+                    Err(e.into())
+                }
+            },
+        }
+    }
+
+    /// `xaCommit`.
+    fn xa_commit(&mut self, xid: Xid, one_phase: bool) -> Result<(), TxError> {
+        self.pending_tx = None;
+        if self.current_xid_is(&xid) {
+            let current = self
+                .tx
+                .as_ref()
+                .and_then(|t| transaction::lock(t).xid.clone());
+            return Err(XaError::new(
+                xa_code::XAER_PROTO,
+                format!(
+                    "Cannot commit, session is currently doing work in transaction {}",
+                    current
+                        .as_ref()
+                        .map(transaction::xid_string)
+                        .unwrap_or_default()
+                ),
+            )
+            .into());
+        }
+        let rm = self.broker.resource_manager();
+        let Some(tx) = rm.remove(&xid) else {
+            return Err(Self::not_found(&xid));
+        };
+        let mut t = transaction::lock(&tx);
+        if t.state == TxState::Suspended {
+            drop(t);
+            rm.put(xid.clone(), tx);
+            return Err(XaError::new(
+                xa_code::XAER_PROTO,
+                format!(
+                    "Cannot commit transaction, it is suspended {}",
+                    transaction::xid_string(&xid)
+                ),
+            )
+            .into());
+        }
+        let result = t.commit(one_phase);
+        drop(t);
+        match result {
+            Ok(outcome) => {
+                outcome.apply();
+                Ok(())
+            }
+            Err((e, outcome)) => {
+                outcome.apply();
+                Err(e.into())
+            }
+        }
+    }
+
+    /// `xaRollback`: rolls back the branch, and like Artemis also takes
+    /// back what this session's consumers are delivering.
+    async fn xa_rollback(&mut self, xid: Xid) -> Result<(), TxError> {
+        self.pending_tx = None;
+        if self.current_xid_is(&xid) {
+            let current = self
+                .tx
+                .as_ref()
+                .and_then(|t| transaction::lock(t).xid.clone());
+            return Err(XaError::new(
+                xa_code::XAER_PROTO,
+                format!(
+                    "Cannot roll back, session is currently doing work in a transaction {}",
+                    current
+                        .as_ref()
+                        .map(transaction::xid_string)
+                        .unwrap_or_default()
+                ),
+            )
+            .into());
+        }
+        let rm = self.broker.resource_manager();
+        let Some(tx) = rm.remove(&xid) else {
+            return Err(Self::not_found(&xid));
+        };
+        if transaction::lock(&tx).state == TxState::Suspended {
+            rm.put(xid.clone(), tx);
+            return Err(XaError::new(
+                xa_code::XAER_PROTO,
+                format!(
+                    "Cannot rollback transaction, it is suspended {}",
+                    transaction::xid_string(&xid)
+                ),
+            )
+            .into());
+        }
+        self.do_rollback(false, false, &tx).await?;
+        Ok(())
+    }
+
+    /// `xaJoin`.
+    fn xa_join(&mut self, xid: Xid) -> Result<(), TxError> {
+        let Some(tx) = self.broker.resource_manager().get(&xid) else {
+            return Err(Self::not_found(&xid));
+        };
+        if transaction::lock(&tx).state == TxState::Suspended {
+            return Err(XaError::new(
+                xa_code::XAER_PROTO,
+                format!(
+                    "Cannot join tx, it is suspended {}",
+                    transaction::xid_string(&xid)
+                ),
+            )
+            .into());
+        }
+        self.tx = Some(tx);
+        Ok(())
+    }
+
+    /// `xaResume`.
+    fn xa_resume(&mut self, xid: Xid) -> Result<(), TxError> {
+        if let Some(current) = &self.tx {
+            let x = transaction::lock(current).xid.clone();
+            return Err(XaError::new(
+                xa_code::XAER_PROTO,
+                format!(
+                    "Cannot resume, session is currently doing work in a transaction {}",
+                    x.as_ref().map(transaction::xid_string).unwrap_or_default()
+                ),
+            )
+            .into());
+        }
+        let Some(tx) = self.broker.resource_manager().get(&xid) else {
+            return Err(Self::not_found(&xid));
+        };
+        {
+            let mut t = transaction::lock(&tx);
+            if t.state != TxState::Suspended {
+                return Err(XaError::new(
+                    xa_code::XAER_PROTO,
+                    format!(
+                        "Cannot resume transaction, it is not suspended {}",
+                        transaction::xid_string(&xid)
+                    ),
+                )
+                .into());
+            }
+            t.state = TxState::Active;
+        }
+        self.tx = Some(tx);
+        Ok(())
+    }
+
+    /// `xaSuspend`.
+    fn xa_suspend(&mut self) -> Result<(), TxError> {
+        let Some(tx) = &self.tx else {
+            return Err(XaError::new(
+                xa_code::XAER_PROTO,
+                "Cannot suspend, session is not doing work in a transaction ",
+            )
+            .into());
+        };
+        let mut t = transaction::lock(tx);
+        match t.state {
+            TxState::Suspended => {
+                let x = t
+                    .xid
+                    .as_ref()
+                    .map(transaction::xid_string)
+                    .unwrap_or_default();
+                Err(XaError::new(
+                    xa_code::XAER_PROTO,
+                    format!("Cannot suspend, transaction is already suspended {x}"),
+                )
+                .into())
+            }
+            TxState::Active => {
+                t.state = TxState::Suspended;
+                drop(t);
+                self.tx = None;
+                Ok(())
+            }
+            _ => Err(BrokerError::internal("Can only suspend active transaction").into()),
+        }
+    }
+
+    /// `xaFailed`: after a failover the branch can only roll back.
+    fn xa_failed(&mut self, xid: Xid) {
+        let rm = self.broker.resource_manager();
+        let tx = rm.get(&xid).unwrap_or_else(|| {
+            let tx = Transaction::new_ref(Some(xid.clone()));
+            rm.put(xid, tx.clone());
+            tx
+        });
+        let effective = transaction::lock(&tx).is_effective();
+        if effective {
+            self.tx = None;
+        } else {
+            transaction::lock(&tx).mark_rollback_only(&BrokerError::new(
+                ErrorType::GenericException,
+                "Can't commit as a Failover happened during the operation",
+            ));
+            self.tx = Some(tx);
         }
     }
 
@@ -786,52 +1240,83 @@ impl CoreSession {
         Ok(())
     }
 
-    /// `TransactionImpl.commit`: a transaction marked rollback-only rolls
-    /// back and fails instead.
+    /// `ServerSessionImpl.commit`: commits the current transaction (a
+    /// rollback-only one rolls back and fails instead) and starts the next.
     fn commit(&mut self) -> Result<()> {
-        let tx = std::mem::take(&mut self.tx);
-        if let Some(e) = tx.rollback_only {
-            return_refs(tx.acks);
-            return Err(e);
+        let tx = self.tx.take();
+        if !self.xa {
+            self.tx = Some(Transaction::new_ref(None));
         }
-        for (q, r) in tx.sends {
-            q.add(r);
-        }
-        let mut acked: Vec<(Queue, usize)> = Vec::new();
-        for (q, _) in tx.acks {
-            match acked.iter_mut().find(|(a, _)| *a == q) {
-                Some((_, n)) => *n += 1,
-                None => acked.push((q, 1)),
+        let Some(tx) = tx else {
+            return Ok(());
+        };
+        let result = transaction::lock(&tx).commit(true);
+        match result {
+            Ok(outcome) => {
+                outcome.apply();
+                Ok(())
+            }
+            Err((e, outcome)) => {
+                outcome.apply();
+                Err(e)
             }
         }
-        for (q, n) in acked {
-            q.acked(n);
-        }
-        Ok(())
     }
 
-    /// `ServerSessionImpl.rollback`: drops the transaction's sends and
-    /// returns its acknowledged and in-flight messages to their queues.
+    /// `ServerSessionImpl.rollback`.
     async fn rollback(&mut self, last_as_delivered: bool, failed: bool) {
+        let tx = self.tx.take().unwrap_or_else(|| Transaction::new_ref(None));
+        if let Err(e) = self.do_rollback(failed, last_as_delivered, &tx).await {
+            tracing::warn!(session = %self.name, "rollback: {e}");
+        }
+        if !self.xa {
+            self.tx = Some(Transaction::new_ref(None));
+        }
+    }
+
+    /// `doRollback`: takes back what this session's consumers are
+    /// delivering and rolls the transaction back, returning both to the
+    /// queues.
+    async fn do_rollback(
+        &mut self,
+        failed: bool,
+        last_as_delivered: bool,
+        tx: &TxRef,
+    ) -> Result<(), BrokerError> {
         let was_started = self.started;
-        let tx = std::mem::take(&mut self.tx);
-        let mut refs = tx.acks;
+        let mut cancelled = Vec::new();
         for c in self.consumers.values() {
             if c.browse_only {
                 continue;
             }
-            let cancelled = c
+            let refs = c
                 .queue
                 .cancel_delivering(c.id, last_as_delivered, failed)
                 .await;
-            refs.extend(cancelled.into_iter().map(|r| (c.queue.clone(), r)));
+            cancelled.extend(refs.into_iter().map(|r| (c.queue.clone(), r)));
         }
-        return_refs(refs);
+        let result = {
+            let mut t = transaction::lock(tx);
+            // What was delivered after a transaction already rolled back
+            // (timed out) goes back on its own.
+            if t.state == TxState::RolledBack {
+                Ok(Outcome::default())
+            } else {
+                t.rollback()
+            }
+        };
+        let (mut outcome, result) = match result {
+            Ok(o) => (o, Ok(())),
+            Err(e) => (Outcome::default(), Err(e)),
+        };
+        outcome.cancel.extend(cancelled);
+        outcome.apply();
         if was_started && !failed {
             for c in self.consumers.values() {
                 c.queue.set_started(c.id, true).await;
             }
         }
+        result
     }
 
     async fn set_started(&mut self, started: bool) {
@@ -841,14 +1326,38 @@ impl CoreSession {
         }
     }
 
-    /// `ServerSessionImpl.doClose`: rolls back the local transaction, then
-    /// closes the consumers.
+    /// `ServerSessionImpl.doClose`. A failed client's transactions roll back
+    /// unless prepared; a clean close rolls back only a local transaction,
+    /// leaving XA branches to the transaction manager. Then the consumers
+    /// close.
     async fn close(&mut self, failed: bool) {
         if self.closed {
             return;
         }
         self.closed = true;
-        self.rollback(false, failed).await;
+        if failed {
+            for tx in [self.tx.take(), self.pending_tx.take()]
+                .into_iter()
+                .flatten()
+            {
+                let (xid, outcome) = {
+                    let mut t = transaction::lock(&tx);
+                    (t.xid.clone(), t.try_rollback())
+                };
+                if let Some(outcome) = outcome {
+                    outcome.apply();
+                    if let Some(xid) = xid {
+                        self.broker.resource_manager().remove(&xid);
+                    }
+                }
+            }
+        } else if self
+            .tx
+            .as_ref()
+            .is_some_and(|t| transaction::lock(t).xid.is_none())
+        {
+            self.rollback(false, false).await;
+        }
         let ids: Vec<i64> = self.consumers.keys().copied().collect();
         for id in ids {
             self.close_consumer(id, failed).await;
@@ -946,20 +1455,6 @@ impl CoreSession {
             }
             .into()
         }
-    }
-}
-
-/// Returns references to their queues, each queue's in one batch.
-fn return_refs(refs: Vec<(Queue, MessageRef)>) {
-    let mut by_queue: Vec<(Queue, Vec<MessageRef>)> = Vec::new();
-    for (q, r) in refs {
-        match by_queue.iter_mut().find(|(b, _)| *b == q) {
-            Some((_, list)) => list.push(r),
-            None => by_queue.push((q, vec![r])),
-        }
-    }
-    for (q, list) in by_queue {
-        q.reinsert(list);
     }
 }
 

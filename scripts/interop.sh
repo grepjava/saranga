@@ -40,7 +40,10 @@ esac
 
 CP="$(native "$DIST/lib")/*"
 URL="tcp://127.0.0.1:$PORT"
-java -cp "$CP" "$(native "$ROOT/tests/interop/jms/Phase2.java")" "$URL" "$@"
+SUITE="${SUITE:-Phase2}"
+java -cp "$CP" "$(native "$ROOT/tests/interop/jms/$SUITE.java")" "$URL" "$@"
 if [[ $# -eq 0 ]]; then
-  java -cp "$CP" "$(native "$ROOT/tests/golden-gen/scenarios/CoreBasic.java")" "$URL"
+  for scenario in CoreBasic CoreXa; do
+    java -cp "$CP" "$(native "$ROOT/tests/golden-gen/scenarios/$scenario.java")" "$URL"
+  done
 fi
