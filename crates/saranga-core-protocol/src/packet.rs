@@ -84,6 +84,47 @@ packet_enum! {
     SessionSendMessageV3,
     SessionReceiveMessage,
     // ---- session ----
+    CreateAddressMessage,
+    CreateProducerMessage,
+    RemoveProducerMessage,
+    CreateQueueMessage,
+    CreateQueueMessageV2,
+    CreateSharedQueueMessage,
+    CreateSharedQueueMessageV2,
+    SessionDeleteQueueMessage,
+    SessionQueueQueryMessage,
+    SessionQueueQueryResponseMessage,
+    SessionQueueQueryResponseMessageV2,
+    SessionQueueQueryResponseMessageV3,
+    SessionBindingQueryMessage,
+    SessionBindingQueryResponseMessage,
+    SessionBindingQueryResponseMessageV2,
+    SessionBindingQueryResponseMessageV3,
+    SessionBindingQueryResponseMessageV4,
+    SessionBindingQueryResponseMessageV5,
+    SessionCreateConsumerMessage,
+    SessionConsumerCloseMessage,
+    SessionConsumerFlowCreditMessage,
+    SessionForceConsumerDelivery,
+    DisconnectConsumerMessage,
+    DisconnectConsumerWithKillMessage,
+    SessionAcknowledgeMessage,
+    SessionIndividualAcknowledgeMessage,
+    SessionExpireMessage,
+    SessionCommitMessage,
+    SessionCommitMessageV2,
+    RollbackMessage,
+    SessionCloseMessage,
+    ReattachSessionMessage,
+    ReattachSessionResponseMessage,
+    SessionAddMetaDataMessage,
+    SessionAddMetaDataMessageV2,
+    SessionUniqueAddMetaDataMessage,
+    SessionRequestProducerCreditsMessage,
+    SessionProducerCreditsMessage,
+    SessionProducerCreditsFailMessage,
+    SessionSendMessage1X,
+    SessionReceiveMessage1X,
     // ---- end session ----
     // ---- xa ----
     SessionXAAfterFailedMessage,
@@ -196,7 +237,7 @@ impl Packet {
             types::SESS_XA_GET_TIMEOUT => body::<SessionXAGetTimeout>(r, ctx),
             types::SESS_SEND if ctx.direction == Direction::ToServer => {
                 if ctx.is_version_before_address_change() {
-                    Ok(Self::unknown(ty, r)) // SessionSendMessage_1X: not ported yet
+                    body::<SessionSendMessage1X>(r, ctx)
                 } else if async_v1 {
                     body::<SessionSendMessage>(r, ctx)
                 } else if ctx.is_before_producer_metrics_changed() {
@@ -205,13 +246,71 @@ impl Packet {
                     body::<SessionSendMessageV3>(r, ctx)
                 }
             }
-            types::SESS_RECEIVE_MSG
-                if ctx.direction == Direction::ToClient
-                    && !ctx.is_version_before_address_change() =>
-            {
-                body::<SessionReceiveMessage>(r, ctx)
+            types::SESS_RECEIVE_MSG if ctx.direction == Direction::ToClient => {
+                if ctx.is_version_before_address_change() {
+                    body::<SessionReceiveMessage1X>(r, ctx)
+                } else {
+                    body::<SessionReceiveMessage>(r, ctx)
+                }
             }
             // ---- session ----
+            types::CREATE_ADDRESS => body::<CreateAddressMessage>(r, ctx),
+            types::CREATE_PRODUCER if ctx.direction == Direction::ToServer => {
+                body::<CreateProducerMessage>(r, ctx)
+            }
+            types::REMOVE_PRODUCER if ctx.direction == Direction::ToServer => {
+                body::<RemoveProducerMessage>(r, ctx)
+            }
+            types::CREATE_QUEUE => body::<CreateQueueMessage>(r, ctx),
+            types::CREATE_QUEUE_V2 => body::<CreateQueueMessageV2>(r, ctx),
+            types::CREATE_SHARED_QUEUE => body::<CreateSharedQueueMessage>(r, ctx),
+            types::CREATE_SHARED_QUEUE_V2 => body::<CreateSharedQueueMessageV2>(r, ctx),
+            types::DELETE_QUEUE => body::<SessionDeleteQueueMessage>(r, ctx),
+            types::SESS_QUEUEQUERY => body::<SessionQueueQueryMessage>(r, ctx),
+            types::SESS_QUEUEQUERY_RESP => body::<SessionQueueQueryResponseMessage>(r, ctx),
+            types::SESS_QUEUEQUERY_RESP_V2 => body::<SessionQueueQueryResponseMessageV2>(r, ctx),
+            types::SESS_QUEUEQUERY_RESP_V3 => body::<SessionQueueQueryResponseMessageV3>(r, ctx),
+            types::SESS_BINDINGQUERY => body::<SessionBindingQueryMessage>(r, ctx),
+            types::SESS_BINDINGQUERY_RESP => body::<SessionBindingQueryResponseMessage>(r, ctx),
+            types::SESS_BINDINGQUERY_RESP_V2 => {
+                body::<SessionBindingQueryResponseMessageV2>(r, ctx)
+            }
+            types::SESS_BINDINGQUERY_RESP_V3 => {
+                body::<SessionBindingQueryResponseMessageV3>(r, ctx)
+            }
+            types::SESS_BINDINGQUERY_RESP_V4 => {
+                body::<SessionBindingQueryResponseMessageV4>(r, ctx)
+            }
+            types::SESS_BINDINGQUERY_RESP_V5 => {
+                body::<SessionBindingQueryResponseMessageV5>(r, ctx)
+            }
+            types::SESS_CREATECONSUMER => body::<SessionCreateConsumerMessage>(r, ctx),
+            types::SESS_CONSUMER_CLOSE => body::<SessionConsumerCloseMessage>(r, ctx),
+            types::SESS_FLOWTOKEN => body::<SessionConsumerFlowCreditMessage>(r, ctx),
+            types::SESS_FORCE_CONSUMER_DELIVERY => body::<SessionForceConsumerDelivery>(r, ctx),
+            types::DISCONNECT_CONSUMER => body::<DisconnectConsumerMessage>(r, ctx),
+            types::DISCONNECT_CONSUMER_KILL => body::<DisconnectConsumerWithKillMessage>(r, ctx),
+            types::SESS_ACKNOWLEDGE => body::<SessionAcknowledgeMessage>(r, ctx),
+            types::SESS_INDIVIDUAL_ACKNOWLEDGE => {
+                body::<SessionIndividualAcknowledgeMessage>(r, ctx)
+            }
+            types::SESS_EXPIRED => body::<SessionExpireMessage>(r, ctx),
+            types::SESS_COMMIT if !ctx.is_version_support_commit_v2() => {
+                body::<SessionCommitMessage>(r, ctx)
+            }
+            types::SESS_COMMIT => body::<SessionCommitMessageV2>(r, ctx),
+            types::SESS_ROLLBACK => body::<RollbackMessage>(r, ctx),
+            types::SESS_CLOSE => body::<SessionCloseMessage>(r, ctx),
+            types::REATTACH_SESSION => body::<ReattachSessionMessage>(r, ctx),
+            types::REATTACH_SESSION_RESP => body::<ReattachSessionResponseMessage>(r, ctx),
+            types::SESS_ADD_METADATA => body::<SessionAddMetaDataMessage>(r, ctx),
+            types::SESS_ADD_METADATA2 => body::<SessionAddMetaDataMessageV2>(r, ctx),
+            types::SESS_UNIQUE_ADD_METADATA => body::<SessionUniqueAddMetaDataMessage>(r, ctx),
+            types::SESS_PRODUCER_REQUEST_CREDITS => {
+                body::<SessionRequestProducerCreditsMessage>(r, ctx)
+            }
+            types::SESS_PRODUCER_CREDITS => body::<SessionProducerCreditsMessage>(r, ctx),
+            types::SESS_PRODUCER_FAIL_CREDITS => body::<SessionProducerCreditsFailMessage>(r, ctx),
             // ---- end session ----
             // ---- xa ----
             types::SESS_XA_START => body::<SessionXAStartMessage>(r, ctx),
