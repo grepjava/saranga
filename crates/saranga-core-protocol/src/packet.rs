@@ -90,6 +90,25 @@ packet_enum! {
     // ---- large ----
     // ---- end large ----
     // ---- cluster ----
+    SubscribeClusterTopologyUpdatesMessage,
+    SubscribeClusterTopologyUpdatesMessageV2,
+    ClusterTopologyChangeMessage,
+    ClusterTopologyChangeMessageV2,
+    ClusterTopologyChangeMessageV3,
+    ClusterTopologyChangeMessageV4,
+    NodeAnnounceMessage,
+    ClusterConnectMessage,
+    ClusterConnectReplyMessage,
+    BackupRegistrationMessage,
+    BackupReplicationStartFailedMessage,
+    BackupRequestMessage,
+    BackupResponseMessage,
+    QuorumVoteMessage,
+    QuorumVoteReplyMessage,
+    ScaleDownAnnounceMessage,
+    ConnectMessage,
+    ConnectResponseMessage,
+    FederationDownstreamConnectMessage,
     // ---- end cluster ----
     // ---- replication ----
     // ---- end replication ----
@@ -161,6 +180,37 @@ impl Packet {
             // ---- large ----
             // ---- end large ----
             // ---- cluster ----
+            // PacketDecoder (both sides):
+            types::CLUSTER_TOPOLOGY => body::<ClusterTopologyChangeMessage>(r, ctx),
+            types::CLUSTER_TOPOLOGY_V2 => body::<ClusterTopologyChangeMessageV2>(r, ctx),
+            types::CLUSTER_TOPOLOGY_V3 => body::<ClusterTopologyChangeMessageV3>(r, ctx),
+            types::CLUSTER_TOPOLOGY_V4 => body::<ClusterTopologyChangeMessageV4>(r, ctx),
+            types::SUBSCRIBE_TOPOLOGY => body::<SubscribeClusterTopologyUpdatesMessage>(r, ctx),
+            types::SUBSCRIBE_TOPOLOGY_V2 => {
+                body::<SubscribeClusterTopologyUpdatesMessageV2>(r, ctx)
+            }
+            types::CONNECT => body::<ConnectMessage>(r, ctx),
+            types::CONNECT_RESPONSE => body::<ConnectResponseMessage>(r, ctx),
+            types::FEDERATION_DOWNSTREAM_CONNECT => {
+                body::<FederationDownstreamConnectMessage>(r, ctx)
+            }
+            // ServerPacketDecoder only. Not guarded on direction: the
+            // connecting side of cluster, backup and quorum connections is
+            // itself a broker that decodes with ServerPacketDecoder
+            // (ActiveMQServerSideProtocolManagerFactory), and no client
+            // decoder maps these type bytes to anything else.
+            types::BACKUP_REGISTRATION => body::<BackupRegistrationMessage>(r, ctx),
+            types::BACKUP_REGISTRATION_FAILED => {
+                body::<BackupReplicationStartFailedMessage>(r, ctx)
+            }
+            types::CLUSTER_CONNECT => body::<ClusterConnectMessage>(r, ctx),
+            types::CLUSTER_CONNECT_REPLY => body::<ClusterConnectReplyMessage>(r, ctx),
+            types::NODE_ANNOUNCE => body::<NodeAnnounceMessage>(r, ctx),
+            types::BACKUP_REQUEST => body::<BackupRequestMessage>(r, ctx),
+            types::BACKUP_REQUEST_RESPONSE => body::<BackupResponseMessage>(r, ctx),
+            types::QUORUM_VOTE => body::<QuorumVoteMessage>(r, ctx),
+            types::QUORUM_VOTE_REPLY => body::<QuorumVoteReplyMessage>(r, ctx),
+            types::SCALEDOWN_ANNOUNCEMENT => body::<ScaleDownAnnounceMessage>(r, ctx),
             // ---- end cluster ----
             // ---- replication ----
             // ---- end replication ----

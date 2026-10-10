@@ -1,6 +1,7 @@
 //! Packet structs, grouped as in the Java `wireformat` package.
 
 pub mod cluster;
+pub mod cluster_types;
 pub mod connection;
 pub mod large;
 pub mod message;
