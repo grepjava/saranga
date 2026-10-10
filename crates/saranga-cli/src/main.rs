@@ -61,6 +61,25 @@ enum Command {
     /// Tools on a broker's data directory.
     #[command(subcommand)]
     Data(data::DataCommand),
+    /// Masks a password for the configuration files, as `artemis mask`:
+    /// write the result as ENC(<result>).
+    Mask {
+        /// The password to be masked.
+        password: String,
+        /// A one-way hash (for users files) instead of reversible masking.
+        #[arg(long)]
+        hash: bool,
+        /// The Blowfish key to mask with, instead of the default (or
+        /// ARTEMIS_DEFAULT_SENSITIVE_STRING_CODEC_KEY).
+        #[arg(long)]
+        key: Option<String>,
+        /// Use the <password-codec> of the broker.xml given with --config.
+        #[arg(long, requires = "config")]
+        password_codec: bool,
+        /// The broker.xml whose password codec --password-codec uses.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -95,6 +114,18 @@ async fn main() -> anyhow::Result<()> {
             run(instance, bind).await
         }
         Command::Data(cmd) => data::run(cmd),
+        Command::Mask {
+            password,
+            hash,
+            key,
+            password_codec,
+            config,
+        } => mask(
+            &password,
+            hash,
+            key,
+            password_codec.then_some(config).flatten(),
+        ),
     }
 }
 
@@ -273,6 +304,39 @@ async fn bind_acceptor(address: &str) -> std::io::Result<TcpListener> {
             format!("{address} resolves to no address"),
         )),
     }
+}
+
+/// `artemis mask` (`Mask.execute`).
+fn mask(
+    password: &str,
+    hash: bool,
+    key: Option<String>,
+    config: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    use saranga_config::mask::Codec;
+    let codec = match config {
+        Some(path) => {
+            let instance = instance::Instance::from_broker_xml(&path, Default::default())?;
+            let file = instance.broker_config()?;
+            Codec::from_desc(Some(&file.password_codec))?
+        }
+        None => {
+            let mut params = Vec::new();
+            if hash {
+                params.push(("algorithm".to_owned(), "one-way".to_owned()));
+            }
+            if let Some(key) = key {
+                if hash {
+                    println!("Option --key ignored in case of hashing");
+                } else {
+                    params.push(("key".to_owned(), key));
+                }
+            }
+            Codec::init(&params, |n| std::env::var(n).ok())?
+        }
+    };
+    println!("result: {}", codec.encode(password)?);
+    Ok(())
 }
 
 /// `-D name=value`; a bare `-D name` is the empty string, as in Java.

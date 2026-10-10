@@ -196,6 +196,7 @@ What else Phase 6 delivered, each suite passing against both Artemis and Saranga
 - **Configuration reload:** settings swap, diverts, address and queue deployment, `updateQueue` and the `config-delete-*` policies. Covered by `Reload.java` (7 tests).
 - **`saranga run --etc`** reads `bootstrap.xml`, `login.config` and `broker.properties` the way `artemis run` does.
 - **`ActiveMQBasicSecurityManager`** with bootstrap users, whose user and role records move between the brokers in both directions: `scripts/basic-security.sh`.
+- **`saranga mask`**: the same results as `artemis mask` for the default and keyed two-way codecs, and one-way hashes (`--hash`) for users files.
 - **Acceptor address prefixes** (`anycastPrefix`, `multicastPrefix`) on every Core operation: `Prefix.java` (6 tests).
 - **1.x clients:** the old `jms.queue.`/`jms.topic.` prefixes are put back on query results and delivered messages. Checked with a real Artemis 1.5.6 JMS client by `scripts/legacy-interop.sh` (`Legacy.java`, 4 tests).
 
