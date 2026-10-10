@@ -1,7 +1,17 @@
 [package]
 name = "saranga-storage"
+description = "Artemis storage manager records: bindings and message journal payloads, ID generator, data print"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+saranga-buffer = { path = "../saranga-buffer" }
+saranga-journal = { path = "../saranga-journal" }
+saranga-message = { path = "../saranga-message" }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+flate2 = "1"
+tar = "0.4"
