@@ -92,6 +92,13 @@ pub struct AddressSettings {
     /// `management-message-attribute-size-limit`: how much of a property
     /// the listing operations show.
     pub management_message_attribute_size_limit: i32,
+    /// `slow-consumer-threshold`; -1 checks no consumer.
+    pub slow_consumer_threshold: i64,
+    pub slow_consumer_threshold_measurement_unit:
+        saranga_config::SlowConsumerThresholdMeasurementUnit,
+    /// `slow-consumer-check-period`, in seconds.
+    pub slow_consumer_check_period: i64,
+    pub slow_consumer_policy: saranga_config::SlowConsumerPolicy,
 }
 
 /// `PageFullMessagePolicy`.
@@ -184,6 +191,13 @@ impl Default for AddressSettings {
             page_limit_messages: None,
             page_full_policy: None,
             management_browse_page_size: 200,
+            slow_consumer_threshold:
+                saranga_config::AddressSettings::DEFAULT_SLOW_CONSUMER_THRESHOLD,
+            slow_consumer_threshold_measurement_unit:
+                saranga_config::AddressSettings::DEFAULT_SLOW_CONSUMER_THRESHOLD_MEASUREMENT_UNIT,
+            slow_consumer_check_period:
+                saranga_config::AddressSettings::DEFAULT_SLOW_CONSUMER_CHECK_PERIOD,
+            slow_consumer_policy: saranga_config::AddressSettings::DEFAULT_SLOW_CONSUMER_POLICY,
             management_message_attribute_size_limit: 256,
         }
     }

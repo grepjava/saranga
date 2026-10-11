@@ -1278,4 +1278,52 @@ public class Management {
         Thread.sleep(1500);
         eq(0L, counter(q).getJsonNumber("count").longValue(), "not sampled while disabled");
     }
+
+    // ------------------------------------------------------------ slow consumers
+
+    /** A queue under address settings that check its consumers every second. */
+    static String slowQueue(String what, String policy) throws Exception {
+        String m = name(what);
+        op("broker", "addAddressSettings", m + ".#",
+            "{\"slowConsumerThreshold\":10,\"slowConsumerCheckPeriod\":1,\"slowConsumerPolicy\":\"" + policy + "\"}");
+        String q = m + ".q";
+        session.createQueue(QueueConfiguration.of(q).setRoutingType(RoutingType.ANYCAST));
+        send(q, 50);
+        return q;
+    }
+
+    static void t_slow_consumer_notified() throws Exception {
+        String q = slowQueue("slow", "NOTIFY");
+        try (ClientSession s = factory.createSession();
+             ClientConsumer n = notifications(s, "_AMQ_NotifType = 'CONSUMER_SLOW' AND _AMQ_Address = '" + q + "'");
+             ClientSession slow = factory.createSession();
+             ClientConsumer c = slow.createConsumer(q)) {
+            s.start();
+            String sessionName = ((org.apache.activemq.artemis.core.client.impl.ClientSessionInternal) slow).getName();
+            ClientMessage m = next(n, "CONSUMER_SLOW");
+            eq(1, m.getIntProperty("_AMQ_ConsumerCount"), "consumer count");
+            eq(q, m.getStringProperty("_AMQ_Address"), "address");
+            eq(sessionName, m.getStringProperty("_AMQ_SessionName"), "session name");
+            check(m.getStringProperty("_AMQ_RemoteAddress") != null, "remote address");
+            check(m.getStringProperty("_AMQ_ConnectionName") != null, "connection name");
+            check(m.getObjectProperty("_AMQ_ConsumerName") instanceof Long, "consumer name");
+        } finally {
+            op("broker", "removeAddressSettings", q.substring(0, q.length() - 2) + ".#");
+        }
+    }
+
+    static void t_slow_consumer_killed() throws Exception {
+        String q = slowQueue("slowkill", "KILL");
+        String cid = name("cid");
+        java.util.concurrent.CountDownLatch failed = new java.util.concurrent.CountDownLatch(1);
+        try (Connection c = failing(cid, null, failed)) {
+            Session s = c.createSession(false, Session.CLIENT_ACKNOWLEDGE);
+            s.createConsumer(s.createQueue(q));
+            check(failed.await(10, java.util.concurrent.TimeUnit.SECONDS), "the client saw no failure");
+            waitFor(() -> view("listConnections", "clientID", cid).getInt("count") == 0, "connection gone");
+            eq(50L, count(q), "messages back on the queue");
+        } finally {
+            op("broker", "removeAddressSettings", q.substring(0, q.length() - 2) + ".#");
+        }
+    }
 }

@@ -100,6 +100,8 @@ pub struct ClientConnection {
     /// Management closed the connection (`fail`).
     failed: AtomicBool,
     fail_notify: tokio::sync::Notify,
+    /// The slow-consumer policy killed the connection.
+    killed: AtomicBool,
 }
 
 impl ClientConnection {
@@ -122,6 +124,7 @@ impl ClientConnection {
             prefixes,
             sessions: Mutex::default(),
             failed: AtomicBool::new(false),
+            killed: AtomicBool::new(false),
             fail_notify: tokio::sync::Notify::new(),
         }
     }
@@ -174,6 +177,17 @@ impl ClientConnection {
     pub fn fail(&self) {
         self.failed.store(true, Ordering::SeqCst);
         self.fail_notify.notify_waiters();
+    }
+
+    /// The slow-consumer policy's `KILL`: the client is told, where its
+    /// protocol can tell it (`killMessage`), and the connection fails.
+    pub fn kill(&self) {
+        self.killed.store(true, Ordering::SeqCst);
+        self.fail();
+    }
+
+    pub fn is_killed(&self) -> bool {
+        self.killed.load(Ordering::SeqCst)
     }
 
     pub fn is_failed(&self) -> bool {

@@ -25,6 +25,7 @@ pub mod registry;
 pub mod reload;
 pub mod session;
 pub mod settings;
+mod slow_consumers;
 pub mod storage;
 pub mod transaction;
 pub mod users;
@@ -535,6 +536,7 @@ impl Broker {
             broker.security_records().insert(address_match, *id);
         }
         spawn_transaction_reaper(&broker, config.transaction_timeout_scan_period);
+        slow_consumers::spawn(&broker);
         if broker.management.counters().enabled() {
             broker.management.counters().start(&broker);
         }

@@ -257,6 +257,18 @@ pub async fn serve_stream<S>(
         post_auth_topology_sent: false,
     };
     if let Err(e) = conn.read_loop(&mut rd).await {
+        // RemotingConnectionImpl.killMessage.
+        if matches!(e, ConnError::Failed)
+            && conn.shared.client.is_killed()
+            && conn.shared.version() >= DISCONNECT_CONSUMER_KILL_VERSION
+        {
+            conn.shared.send(
+                1,
+                saranga_core_protocol::packets::session::DisconnectConsumerWithKillMessage {
+                    node_id: Some(conn.broker.node_id().into()),
+                },
+            );
+        }
         tracing::debug!(
             remote = conn.shared.client.remote_address(),
             "connection ended: {e}"
@@ -784,6 +796,9 @@ impl Connection {
         let _ = self.shared.out.send(Outgoing::Close);
     }
 }
+
+/// `DisconnectConsumerWithKillMessage.VERSION_INTRODUCED`.
+const DISCONNECT_CONSUMER_KILL_VERSION: i32 = 128;
 
 /// `Topology.PRE_AUTH_NODE_ID`.
 const PRE_AUTH_NODE_ID: &str = "00000000-0000-0000-0000-000000000000";
