@@ -394,6 +394,8 @@ struct Session {
     links: HashMap<u32, Link>,
     out: BTreeMap<u32, OutDelivery>,
     tags: Tags,
+    /// Transfer frames waiting for the client's incoming window.
+    blocked: std::collections::VecDeque<Vec<u8>>,
 }
 
 /// A declared transaction (`ProtonTransactionImpl`).
@@ -914,6 +916,7 @@ impl Conn {
                 links: HashMap::new(),
                 out: BTreeMap::new(),
                 tags: Tags::default(),
+                blocked: std::collections::VecDeque::new(),
             },
         );
         self.send(
@@ -1355,6 +1358,10 @@ impl Conn {
                 .wrapping_sub(s.next_outgoing_id),
             None => flow.incoming_window,
         };
+        if !s.blocked.is_empty() {
+            self.last_write = Instant::now();
+            send_transfers(s, Vec::new(), &self.out);
+        }
         let mut reply = None;
         let session_flow = |s: &Session| Flow {
             next_incoming_id: Some(s.next_incoming_id),
@@ -1787,10 +1794,8 @@ impl Conn {
             ..Default::default()
         };
         let frames = transfer_frames(channel, first, &payload, max_frame);
-        s.next_outgoing_id = s.next_outgoing_id.wrapping_add(frames.1);
-        s.remote_incoming_window = s.remote_incoming_window.saturating_sub(frames.1);
         self.last_write = Instant::now();
-        self.out.now(frames.0);
+        send_transfers(s, frames, &self.out);
         let s = self.sessions.get_mut(&channel).expect("checked");
         if presettled {
             // Settled when written: acknowledged now.
@@ -2135,8 +2140,9 @@ fn transfer_frames(
     first: Transfer,
     payload: &[u8],
     max_frame: usize,
-) -> (Vec<u8>, u32) {
-    let mut out = Vec::with_capacity(payload.len() + 64);
+) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    let mut out = Vec::with_capacity(payload.len().min(max_frame) + 64);
     let header_len = |t: &Transfer| {
         let mut v = Vec::new();
         Composite::encode(t, &mut v);
@@ -2147,9 +2153,8 @@ fn transfer_frames(
     let room = max_frame.saturating_sub(header_len(&probe)).max(1);
     if payload.len() <= room {
         frame::encode_amqp(&mut out, channel, &Performative::Transfer(first), payload);
-        return (out, 1);
+        return vec![out];
     }
-    let mut count = 0;
     let mut rest = payload;
     let mut t = probe;
     loop {
@@ -2162,7 +2167,7 @@ fn transfer_frames(
             &Performative::Transfer(t.clone()),
             &rest[..n],
         );
-        count += 1;
+        frames.push(std::mem::take(&mut out));
         rest = &rest[n..];
         if rest.is_empty() {
             break;
@@ -2173,7 +2178,25 @@ fn transfer_frames(
             ..Default::default()
         };
     }
-    (out, count)
+    frames
+}
+
+/// Writes transfer frames while the client's incoming window allows,
+/// keeping the rest for its next flow.
+fn send_transfers(s: &mut Session, frames: Vec<Vec<u8>>, out: &Outbound) {
+    s.blocked.extend(frames);
+    let mut bytes = Vec::new();
+    while s.remote_incoming_window > 0 {
+        let Some(f) = s.blocked.pop_front() else {
+            break;
+        };
+        bytes.extend(f);
+        s.next_outgoing_id = s.next_outgoing_id.wrapping_add(1);
+        s.remote_incoming_window -= 1;
+    }
+    if !bytes.is_empty() {
+        out.now(bytes);
+    }
 }
 
 /// `RoutingType.getType`: 0 multicast, 1 anycast.

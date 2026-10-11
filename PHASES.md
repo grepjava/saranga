@@ -250,6 +250,19 @@ The differences from Artemis are listed in COMPAT.md.
   - messages crossing between MQTT and JMS.
 
   `tests/mqtt.rs` in `saranga-protocol-mqtt` checks that a session and its in-flight packet IDs survive a restart. Session state is kept in `$sys.mqtt.sessions`, packet-ID correlations as journal records of type 54, and QoS 2 packet IDs in the `mqtt.qos.*` duplicate-ID caches, all as Artemis keeps them.
+- Stage 4 (AMQP 1.0) is done. Its parts:
+  - **The codec** picks the same encodings as Proton-J 0.35.0, which Artemis uses, including its fast-path list forms. 158 values that Proton-J encodes (`tests/golden-gen/amqp/CodecFixtures.java`) and every frame of a Qpid JMS session with Artemis decode and re-encode to the same bytes.
+  - **Messages** stay in their AMQP encoding in queues, the journal and pages, as `AMQPStandardMessage` and `AMQPLargeMessage` keep them. The broker works on a view of each message and carries its changes back, re-encoding only where Artemis does. `tests/golden-gen/amqp/MessageFixtures.java` checks these against Artemis's own classes, byte for byte: records, moves to a dead-letter address, diverts, added properties, redelivery, and conversion from Core. Conversion to Core is checked by its content, since Artemis keeps Core properties in a hash map.
+  - **On disk.** `tests/golden/amqp-durable` is a journal Artemis wrote through Qpid JMS, with a large message and a message moved to the dead-letter address. `saranga data print` prints it line for line as `artemis data print` does, and Saranga recovers it to what Artemis shows. `Persist.java`'s AMQP cases pass from Artemis to Saranga, from Saranga to Artemis and from Saranga to Saranga, after a clean stop and after a kill.
+  - **The protocol head** follows `AMQPConnectionContext`, the link contexts, `AMQPSessionCallback` and `ProtonTransactionHandler`:
+    - SASL PLAIN, ANONYMOUS and EXTERNAL;
+    - container-ID uniqueness, idle timeouts and heartbeats;
+    - producer credit, consumer credit and drain;
+    - anonymous relay, dynamic sources and targets, and FQQN sources;
+    - durable, shared and volatile subscriptions, named as Artemis names them;
+    - selectors and no-local, browsing, and every outcome a client settles with;
+    - transactions, including the unsettled acknowledgements that a rolled-back transaction keeps with their consumer.
+  - **Interop.** [tests/interop/amqp/Amqp.java](tests/interop/amqp/Amqp.java) has 34 Qpid JMS tests. They pass against Artemis 2.57.0 and against Saranga: `CONFIG=tests/interop/amqp/broker.xml SUITE_FILE=tests/interop/amqp/Amqp.java scripts/interop.sh saranga`. They cover message types, properties and headers, queues and topics, durable and shared subscriptions, selectors, no-local, transactions, acknowledgement modes, dead letters, expiry, temporary destinations, browsing, anonymous producers, FQQN, priority, delivery delay, groups, receiveNoWait, a large message, messages crossing between AMQP and Core JMS, and the SASL and Open exchanges on a raw socket.
 
 ## Phase 8: Management and operations
 

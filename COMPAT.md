@@ -79,6 +79,29 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **Interceptors** (Java classes) and connection routers (redirects) are not supported. The cluster-wide `SESSION_CREATED` notification that disconnects a client connected to another node waits for clustering (Phase 10).
 - **A large message** (over the journal's record size) published as a retained message stays a regular message in the retained-message queue. Artemis converts it to a large message there.
 
+## AMQP differences
+- **The Open's `product` and `version`** properties are `saranga` and its version. Artemis sends `apache-activemq-artemis` and its own.
+- **Artemis bugs not copied:**
+  - **Link failures:** some link failures close the whole connection in Artemis with `amqp:internal-error` "Unrecoverable error: ...". Examples are a receiver attach with no target, and an exception from the core broker while attaching a consumer (a missing queue, an FQQN filter mismatch). Saranga refuses only that link, with the same error.
+  - **Unknown transactions:** a transfer that names an unknown transaction closes the connection in both brokers. Artemis still routes the message, outside any transaction; Saranga does not.
+  - **Failed SASL outcomes:** Artemis leaves the socket open after a failed outcome, and PLAIN with no initial response is an internal error there. Saranga closes the socket after the outcome and answers PLAIN with no response with outcome `auth`.
+  - **Outcomes inside transactional states:** Released, Rejected and Modified wrapped in a transactional state do nothing in Artemis, so the message stays delivered to the consumer. Saranga applies them as it would outside a transaction.
+  - **Delivery tags** go back to the session's pool only when a delivery is settled. Artemis returns them on every disposition, so two unsettled deliveries can share a tag.
+  - **Conversion to Core:**
+    - An `amqp-value` body of a type other than null, string, binary, list or map becomes a BytesMessage holding the encoded section. Artemis copies the wrong bytes there (docs/upstream/artemis-issues.md, issue 7).
+    - An application property or stream item that Core has no type for is left out. Artemis fails the whole conversion.
+- **Not supported yet:**
+  - **SASL mechanisms:** SCRAM-SHA-256/512, GSSAPI, OAUTHBEARER and XOAUTH2. An acceptor's `saslMechanisms` that lists them gets outcome `sys` for them.
+  - **Core-message tunnelling** (`AMQ_CORE_MESSAGE_TUNNELING`): Core messages always go out converted to AMQP.
+  - **Broker connections, federation and mirroring links** (Phase 10). Their link names and capabilities are treated as ordinary links.
+  - **Connection routers and interceptors.**
+  - **Credit under an address-full policy:** credit is not withheld from producers to a full address under BLOCK. There is no reject threshold, no drain on transient errors, and no link quiesce timeout.
+  - `maxTransfersPerDelivery`.
+  - The `failover-server-list` connection property.
+- **Large messages:**
+  - An AMQP large message is held whole in memory while the broker holds it. It is also written to its large-message file, with Artemis's record, so either broker reads the other's.
+  - A copy to a dead-letter or expiry address copies the file as it is. Artemis rewrites the copy's header and properties without the expiry.
+
 ## Security differences
 - **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule` and `LDAPLoginModule` are supported. `Krb5LoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.
 - **Security managers.** The JAAS security manager (`<jaas-security>`) and `ActiveMQBasicSecurityManager` are supported. The basic manager keeps its users in the bindings journal, so its users move with the data directory in both directions. Any other `<security-manager>` class stops the broker from starting. As in Artemis, the basic manager has no users without persistence. Users can be added only through the bootstrap credentials until management arrives in Phase 8.
