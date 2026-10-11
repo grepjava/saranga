@@ -16,7 +16,9 @@ use saranga_security::{Authenticated, SecurityError};
 use saranga_server::postoffice::{AutoCreate, QueueSpec, split_fqqn};
 use saranga_server::protocol::Connection as Accepted;
 use saranga_server::queue::{DeliverySink, Queue};
-use saranga_server::session::{ClientConnection, Completion, ServerSession, SessionOptions};
+use saranga_server::session::{
+    ClientConnection, Completion, ServerSession, SessionOptions, Transport,
+};
 use saranga_server::{Broker, BrokerError, RoutingType};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -190,6 +192,9 @@ enum Event {
     AutoAck { consumer: i64, message: i64 },
     /// A reply that closes the connection was written.
     Close,
+    /// The broker closed a subscription's consumer
+    /// (`StompSession.disconnect`).
+    Disconnected { consumer: i64 },
 }
 
 /// A reply, sent once the journal writes before it are done
@@ -348,6 +353,19 @@ struct StompSink {
     to_ack: ToAck,
 }
 
+impl StompSession {
+    /// `sendInternal`: the producer is made at the first send, and the
+    /// send is counted against it.
+    fn start_sending(&mut self) {
+        let name = self.sender.get_or_insert_with(|| {
+            let name = uuid::Uuid::new_v4().to_string();
+            self.session.add_producer(&name, "STOMP", None);
+            name
+        });
+        self.session.set_sender(Some(name.clone()));
+    }
+}
+
 impl DeliverySink for StompSink {
     fn deliver(
         &self,
@@ -415,11 +433,30 @@ impl DeliverySink for StompSink {
     fn supports_large(&self) -> bool {
         false
     }
+
+    /// `StompSession.disconnect`: the client gets an ERROR frame and the
+    /// subscription goes.
+    fn disconnect(&self, consumer_id: i64, _reason: &str) {
+        if self.subscription.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut frame = Frame::new(names::ERROR, self.kind);
+        frame.add_header(names::CONTENT_TYPE, "text/plain");
+        frame.set_body(format!(
+            "consumer with ID {consumer_id} disconnected by server"
+        ));
+        self.out.send(&frame);
+        let _ = self.events.send(Event::Disconnected {
+            consumer: consumer_id,
+        });
+    }
 }
 
 /// `StompSession`: a server session and the subscriptions on it.
 struct StompSession {
     session: ServerSession,
+    /// The session's one producer, made at its first send (`senderName`).
+    sender: Option<String>,
     /// By consumer ID.
     subscriptions: BTreeMap<i64, Arc<Subscription>>,
     to_ack: ToAck,
@@ -465,10 +502,12 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
     let settings = Settings::from(&c.acceptor, &broker);
     let remote = c.info.remote_address.clone();
     let client = Arc::new(ClientConnection::new(
-        c.peer.map(|a| a.to_string()).unwrap_or_default(),
+        Transport::socket("STOMP", "StompConnection", c.peer, c.local),
         Arc::new(c.info),
         c.acceptor.prefixes.clone(),
     ));
+    let _registered = broker.registry().add(&client);
+    let failed = client.clone();
     let (mut rd, wr) = tokio::io::split(c.stream);
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     let writer = tokio::spawn(write_loop(wr, out_rx));
@@ -504,8 +543,10 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
     loop {
         let ttl = Duration::from_millis(conn.ttl.max(1) as u64);
         tokio::select! {
+            () = failed.failed() => break,
             event = events_rx.recv() => match event {
                 Some(Event::AutoAck { consumer, message }) => conn.auto_ack(consumer, message).await,
+                Some(Event::Disconnected { consumer }) => conn.disconnected(consumer).await,
                 Some(Event::Close) | None => break,
             },
             read = tokio::time::timeout(ttl, rd.read_buf(&mut buf)), if !conn.closing => match read {
@@ -800,6 +841,7 @@ impl Connection {
             );
             Ok(StompSession {
                 session,
+                sender: None,
                 subscriptions: BTreeMap::new(),
                 to_ack: ToAck::default(),
                 no_local: 0,
@@ -1104,17 +1146,15 @@ impl Connection {
             );
             message.body = Vec::new();
             message.message_id = id;
-            session
-                .session
-                .send(message, Some(body))
-                .await
-                .map_err(|e| send_error(e.message))?;
+            session.start_sending();
+            let sent = session.session.send(message, Some(body)).await;
+            session.session.set_sender(None);
+            sent.map_err(|e| send_error(e.message))?;
         } else {
-            session
-                .session
-                .send(message, None)
-                .await
-                .map_err(|e| send_error(e.message))?;
+            session.start_sending();
+            let sent = session.session.send(message, None).await;
+            session.session.set_sender(None);
+            sent.map_err(|e| send_error(e.message))?;
         }
         Ok(None)
     }
@@ -1284,6 +1324,18 @@ impl Connection {
     }
 
     /// An auto-acknowledged delivery went out: acknowledge and commit it.
+    /// A subscription's consumer was disconnected by the broker: it goes.
+    async fn disconnected(&mut self, consumer: i64) {
+        for session in self.main.iter_mut().chain(self.transacted.values_mut()) {
+            if let Some(sub) = session.subscriptions.remove(&consumer) {
+                if sub.no_local {
+                    session.no_local -= 1;
+                }
+                session.session.close_consumer(consumer, false).await;
+            }
+        }
+    }
+
     async fn auto_ack(&mut self, consumer: i64, message: i64) {
         let Some(session) = self.main.as_mut() else {
             return;

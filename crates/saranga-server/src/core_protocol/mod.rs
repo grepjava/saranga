@@ -37,7 +37,7 @@ use tokio::task::JoinHandle;
 
 use crate::message::ServerMessage;
 use crate::queue::DeliverySink;
-use crate::session::ClientConnection;
+use crate::session::{ClientConnection, Transport};
 use crate::{Broker, BrokerError};
 use session::{CoreSession, SessionInput};
 
@@ -182,18 +182,34 @@ impl DeliverySink for CoreDeliverySink {
     fn chunk_size(&self) -> usize {
         self.chunk_size
     }
+
+    /// `CoreSessionCallback.disconnect`: a client that knows the packet is
+    /// told its consumer is gone.
+    fn disconnect(&self, consumer_id: i64, reason: &str) {
+        if self.conn.version() >= 124 {
+            self.conn.send(
+                self.channel_id,
+                saranga_core_protocol::packets::session::DisconnectConsumerMessage { consumer_id },
+            );
+        } else {
+            tracing::warn!(
+                "AMQ222210: Server is unable to disconnect the consumer of an old client: {reason}"
+            );
+        }
+    }
 }
 
 /// Serves one plain TCP Core connection until it closes or fails.
 pub async fn serve_connection(broker: Arc<Broker>, stream: TcpStream) {
     let peer = stream.peer_addr().ok();
+    let local = stream.local_addr().ok();
     let _ = stream.set_nodelay(true);
     let info = ConnectionInfo {
         remote_address: peer.map(java_socket_address).unwrap_or_default(),
         certificates: None,
         security_domain: None,
     };
-    serve_stream(broker, stream, peer, info, Arc::default()).await;
+    serve_stream(broker, stream, peer, local, info, Arc::default()).await;
 }
 
 /// Serves one Core connection over any byte stream (TCP or TLS) until it
@@ -202,12 +218,12 @@ pub async fn serve_stream<S>(
     broker: Arc<Broker>,
     stream: S,
     peer: Option<std::net::SocketAddr>,
+    local: Option<std::net::SocketAddr>,
     info: ConnectionInfo,
     acceptor: Arc<crate::Acceptor>,
 ) where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    let remote_address = peer.map(|a| a.to_string()).unwrap_or_default();
     let (mut rd, wr) = tokio::io::split(stream);
     let (out, rx) = mpsc::unbounded_channel();
     let writer = tokio::spawn(write_loop(wr, rx));
@@ -215,11 +231,12 @@ pub async fn serve_stream<S>(
         out,
         version: AtomicI32::new(0),
         client: Arc::new(ClientConnection::new(
-            remote_address,
+            Transport::socket("CORE", "RemotingConnectionImpl", peer, local),
             Arc::new(info),
             acceptor.prefixes.clone(),
         )),
     });
+    let _registered = broker.registry().add(&shared.client);
     // `CoreFrameWithSizeLimitDecoder`: with connection security, frames are
     // limited from the start.
     let connection_security = broker.security().is_some() && acceptor.core_connection_security;
@@ -306,6 +323,8 @@ enum ConnError {
     Decode(#[from] saranga_core_protocol::DecodeError),
     #[error("no data within the connection TTL")]
     TimedOut,
+    #[error("closed by management")]
+    Failed,
     #[error("{0}")]
     Protocol(String),
 }
@@ -373,12 +392,19 @@ impl Connection {
         rd: &mut R,
         buf: &mut Vec<u8>,
     ) -> Result<usize, ConnError> {
-        let read = rd.read_buf(buf);
+        let client = &self.shared.client;
+        // Management may fail the connection meanwhile.
+        let read = async {
+            tokio::select! {
+                n = rd.read_buf(buf) => Ok(n?),
+                () = client.failed() => Err(ConnError::Failed),
+            }
+        };
         if self.ttl < 0 {
-            return Ok(read.await?);
+            return read.await;
         }
         match tokio::time::timeout(Duration::from_millis(self.ttl as u64), read).await {
-            Ok(n) => Ok(n?),
+            Ok(n) => n,
             Err(_) => Err(ConnError::TimedOut),
         }
     }
@@ -713,6 +739,10 @@ impl Connection {
             request,
             authenticated,
         );
+        let closer = tx.clone();
+        session.entry().set_closer(Box::new(move |force| {
+            let _ = closer.send(SessionInput::Close(force));
+        }));
         self.session_tasks.push(tokio::spawn(session.run(rx)));
         self.sessions.insert(channel_id, tx);
         self.shared.send(

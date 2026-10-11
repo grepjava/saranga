@@ -311,8 +311,9 @@ impl Queue {
             })
             .await
             .unwrap_or_default();
+        let reason = format!("Queue deleted: {}", self.name());
         for (sink, id) in sinks {
-            sink.disconnect(id);
+            sink.disconnect(id, &reason);
         }
     }
 

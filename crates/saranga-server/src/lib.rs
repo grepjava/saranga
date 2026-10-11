@@ -20,6 +20,7 @@ pub mod postoffice;
 pub mod protocol;
 pub mod queue;
 pub mod recovery;
+pub mod registry;
 pub mod reload;
 pub mod session;
 pub mod settings;
@@ -350,6 +351,8 @@ pub struct Broker {
     management: management::Management,
     /// Reads the configuration again, for `reloadConfigurationFile`.
     config_loader: Mutex<Option<ConfigLoader>>,
+    /// The connections, sessions, consumers and producers.
+    registry: Arc<registry::Registry>,
 }
 
 /// Reads the configuration files again (`ReloadManager`).
@@ -510,6 +513,7 @@ impl Broker {
             extra_records: Mutex::new(extra_records),
             management: management::Management::new(config.management),
             config_loader: Mutex::new(None),
+            registry: Arc::default(),
         });
         spawn_transaction_reaper(&broker, config.transaction_timeout_scan_period);
         // loadProtocolServices: each protocol sets itself up once the
@@ -548,6 +552,11 @@ impl Broker {
     /// The management service.
     pub fn management(&self) -> &management::Management {
         &self.management
+    }
+
+    /// The connections and their sessions, consumers and producers.
+    pub fn registry(&self) -> &Arc<registry::Registry> {
+        &self.registry
     }
 
     /// Divert transformers by class name.
@@ -652,6 +661,13 @@ impl Broker {
         self.metadata().get(session)?.get(key).cloned()
     }
 
+    /// Every key and value of a session's metadata, by key.
+    pub fn session_metadata_all(&self, session: &str) -> Option<Vec<(String, String)>> {
+        let mut all: Vec<_> = self.metadata().get(session)?.clone().into_iter().collect();
+        all.sort();
+        Some(all)
+    }
+
     pub fn remove_session_metadata(&self, session: &str) {
         self.metadata().remove(session);
     }
@@ -716,6 +732,7 @@ impl Broker {
             let (stream, peer) = listener.accept().await?;
             tracing::debug!(%peer, "connection accepted");
             let _ = stream.set_nodelay(true);
+            let local = stream.local_addr().ok();
             let mut info = saranga_security::ConnectionInfo {
                 remote_address: core_protocol::java_socket_address(peer),
                 certificates: None,
@@ -741,7 +758,7 @@ impl Broker {
                         Box::new(stream)
                     }
                 };
-                protocol::detect_and_serve(broker, stream, Some(peer), info, acceptor).await;
+                protocol::detect_and_serve(broker, stream, Some(peer), local, info, acceptor).await;
             });
         }
     }

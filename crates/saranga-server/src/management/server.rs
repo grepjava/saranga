@@ -78,6 +78,9 @@ pub(super) async fn attribute(
     };
     let uptime = crate::message::now_millis() - m.started_at();
     let queues = po.queues();
+    if let Some(v) = super::connections::attribute(broker, name) {
+        return Ok(Some(v));
+    }
     Ok(Some(match name {
         "Name" => Json::from(m.config.name.clone()),
         "Version" => Json::from(VERSION),
@@ -121,9 +124,6 @@ pub(super) async fn attribute(
                 .sum::<i64>(),
         ),
         "TotalConsumerCount" => Json::from(queues.iter().map(|q| q.consumer_count()).sum::<i32>()),
-        "ConnectionCount" | "TotalConnectionCount" | "SessionCount" | "TotalSessionCount" => {
-            Json::from(0i32)
-        }
         "ManagementAddress" => Json::from(m.config.address.clone()),
         "ManagementNotificationAddress" => Json::from(m.config.notification_address.clone()),
         "PersistenceEnabled" => Json::from(broker.storage().is_some()),
@@ -535,6 +535,9 @@ pub(super) async fn invoke(
     call: &Call<'_>,
 ) -> Option<Outcome> {
     let po = broker.post_office();
+    if let Some(outcome) = super::connections::invoke(broker, call).await {
+        return Some(outcome);
+    }
 
     // Addresses.
     if let Some(a) = call.is("createAddress", &[S, S]) {

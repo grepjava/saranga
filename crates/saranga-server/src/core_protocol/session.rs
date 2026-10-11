@@ -39,6 +39,8 @@ pub(crate) enum SessionInput {
     /// A packet and its size on the wire, for confirmations.
     Packet(Box<Packet>, usize),
     ConnectionFailed,
+    /// Management closes the session (`closeSessionWithID`).
+    Close(bool),
 }
 
 /// The fields of `CreateSessionMessage` / `_V2` the session keeps.
@@ -150,7 +152,8 @@ pub(crate) struct CoreSession {
     channel_id: i64,
     /// The size of the chunks large messages are sent to consumers in.
     min_large_message_size: i32,
-    producers: HashMap<i32, Option<String>>,
+    /// The client's producer IDs and the names the session knows them by.
+    producers: HashMap<i32, String>,
     /// The large message being received (`currentLargeMessage`): its
     /// headers, and its body so far.
     large: Option<(CoreMessage, LargeWriter)>,
@@ -226,6 +229,9 @@ impl CoreSession {
             },
             authenticated,
         );
+        if request.version < version::ARTEMIS_2_28_0 {
+            session.entry().set_legacy_producers();
+        }
         Self {
             session,
             broker,
@@ -238,6 +244,11 @@ impl CoreSession {
         }
     }
 
+    /// What management sees of the session.
+    pub(crate) fn entry(&self) -> &Arc<crate::registry::SessionEntry> {
+        self.session.entry()
+    }
+
     pub(crate) async fn run(mut self, mut rx: mpsc::UnboundedReceiver<SessionInput>) {
         while let Some(input) = rx.recv().await {
             match input {
@@ -248,6 +259,11 @@ impl CoreSession {
                     }
                 }
                 SessionInput::ConnectionFailed => {
+                    self.close(true).await;
+                    break;
+                }
+                SessionInput::Close(_force) => {
+                    // ServerSessionImpl.close(failed = true, force).
                     self.close(true).await;
                     break;
                 }
@@ -352,11 +368,13 @@ impl CoreSession {
                 self.send_message(p.message, None).await,
                 false,
             ),
-            Packet::SessionSendMessageV3(p) => (
-                p.requires_response,
-                self.send_message(p.message, None).await,
-                false,
-            ),
+            Packet::SessionSendMessageV3(p) => {
+                self.session
+                    .set_sender(self.producers.get(&p.sender_id).cloned());
+                let result = self.send_message(p.message, None).await;
+                self.session.set_sender(None);
+                (p.requires_response, result, false)
+            }
             Packet::SessionSendMessage1X(p) => (
                 p.requires_response,
                 self.send_message(p.message, None).await,
@@ -597,13 +615,30 @@ impl CoreSession {
                 (true, result, false)
             }
             Packet::CreateProducerMessage(p) => {
-                self.producers
-                    .entry(p.id)
-                    .or_insert_with(|| p.address.map(|a| a.to_string_lossy()));
+                if self.producers.contains_key(&p.id) {
+                    tracing::warn!(
+                        "AMQ222316: Unable to create producer with ID {}: one already exists in session {}",
+                        p.id,
+                        self.session.name()
+                    );
+                } else {
+                    // PRODUCER_ID_PREFIX and a new UUID.
+                    let name = format!("artemis:sender:ID:{}", uuid::Uuid::new_v4());
+                    let address = p.address.map(|a| a.to_string_lossy());
+                    self.session.add_producer(&name, "CORE", address.as_deref());
+                    self.producers.insert(p.id, name);
+                }
                 (false, Ok(None), false)
             }
             Packet::RemoveProducerMessage(p) => {
-                self.producers.remove(&p.id);
+                match self.producers.remove(&p.id) {
+                    Some(name) => self.session.remove_producer(&name),
+                    None => tracing::warn!(
+                        "AMQ222317: Unable to remove producer with ID {}: it does not exist in session {}",
+                        p.id,
+                        self.session.name()
+                    ),
+                }
                 (false, Ok(None), false)
             }
             Packet::SessionXAStartMessage(p) => {
@@ -690,12 +725,15 @@ impl CoreSession {
                     .await,
                 false,
             ),
-            Packet::SessionSendContinuationMessageV3(p) => (
-                p.requires_response,
-                self.send_continuation(p.body, p.continues, p.message_body_size)
-                    .await,
-                false,
-            ),
+            Packet::SessionSendContinuationMessageV3(p) => {
+                self.session
+                    .set_sender(self.producers.get(&p.sender_id).cloned());
+                let result = self
+                    .send_continuation(p.body, p.continues, p.message_body_size)
+                    .await;
+                self.session.set_sender(None);
+                (p.requires_response, result, false)
+            }
             other => {
                 tracing::warn!(session = %self.session.name(), "unsupported packet {}", other.name());
                 let e = BrokerError::new(

@@ -90,6 +90,7 @@ pub(crate) struct AmqConsumer {
     node_id: String,
     /// The session's unnegotiated wire format, for conversion.
     wf: Mutex<WireFormat>,
+    client: Arc<saranga_server::session::ClientConnection>,
 }
 
 pub(crate) struct NewConsumer {
@@ -103,6 +104,7 @@ pub(crate) struct NewConsumer {
     pub out: Arc<Outbound>,
     pub no_local: Arc<AtomicBool>,
     pub node_id: String,
+    pub client: Arc<saranga_server::session::ClientConnection>,
 }
 
 impl AmqConsumer {
@@ -135,6 +137,7 @@ impl AmqConsumer {
             no_local: n.no_local,
             node_id: n.node_id,
             wf: Mutex::new(WireFormat::new(crate::codec::DEFAULT_WIRE_VERSION)),
+            client: n.client,
         })
     }
 
@@ -450,6 +453,16 @@ impl DeliverySink for Sink {
 
     fn deliver_continuation(&self, _consumer_id: i64, _chunk: Vec<u8>, _continues: bool) -> i64 {
         0
+    }
+
+    /// `AMQSession.disconnect`: fatal for an OpenWire consumer, whose
+    /// binding would be in limbo; the client is told and the connection
+    /// fails, so it can fail over and subscribe again.
+    fn disconnect(&self, _consumer_id: i64, reason: &str) {
+        self.0
+            .out
+            .send(&crate::connection::io_connection_error(reason));
+        self.0.client.fail();
     }
 
     fn chunk_size(&self) -> usize {

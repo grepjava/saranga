@@ -130,7 +130,7 @@ pub(super) async fn send(
         None => Default::default(),
     };
     let conn = Arc::new(crate::session::ClientConnection::new(
-        "management".to_owned(),
+        crate::session::Transport::internal("management"),
         info,
         Vec::new(),
     ));

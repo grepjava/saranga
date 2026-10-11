@@ -88,7 +88,7 @@ pub trait DeliverySink: Send + Sync {
 
     /// `ServerConsumer.disconnect`: management removed the consumer's
     /// queue, and the client is told its consumer is gone.
-    fn disconnect(&self, _consumer_id: i64) {}
+    fn disconnect(&self, _consumer_id: i64, _reason: &str) {}
 }
 
 /// The most of a large message's body sent in one pass of the queue, so
@@ -146,6 +146,74 @@ pub struct ConsumerRegistration {
     pub browse_only: bool,
     pub pre_acknowledge: bool,
     pub started: bool,
+    /// What management reports of the consumer's deliveries and acks.
+    pub metrics: Arc<ConsumerMetrics>,
+}
+
+/// `ServerConsumerImpl.ServerConsumerMetrics`.
+#[derive(Debug, Default)]
+pub struct ConsumerMetrics {
+    in_transit_size: AtomicI64,
+    delivered: AtomicI64,
+    delivered_size: AtomicI64,
+    acknowledged: AtomicI64,
+    awaiting_commit: AtomicI32,
+    last_delivered: AtomicI64,
+    last_acknowledged: AtomicI64,
+}
+
+impl ConsumerMetrics {
+    /// `addMessage`: a delivery of `size` bytes.
+    pub fn add_message(&self, size: i64) {
+        self.in_transit_size.fetch_add(size, Ordering::Relaxed);
+        self.delivered_size.fetch_add(size, Ordering::Relaxed);
+        self.delivered.fetch_add(1, Ordering::Relaxed);
+        self.last_delivered.store(now_millis(), Ordering::Relaxed);
+    }
+
+    /// `addAcknowledge`: an ack of `size` bytes, in a transaction or not.
+    pub fn add_acknowledge(&self, size: i64, transactional: bool) {
+        self.in_transit_size.fetch_sub(size, Ordering::Relaxed);
+        self.acknowledged.fetch_add(1, Ordering::Relaxed);
+        self.last_acknowledged
+            .store(now_millis(), Ordering::Relaxed);
+        if transactional {
+            self.awaiting_commit.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `afterCommit` / `afterRollback` of the transaction holding the acks.
+    pub fn transaction_ended(&self) {
+        self.awaiting_commit.store(0, Ordering::Relaxed);
+    }
+
+    pub fn in_transit_size(&self) -> i64 {
+        self.in_transit_size.load(Ordering::Relaxed)
+    }
+
+    pub fn delivered(&self) -> i64 {
+        self.delivered.load(Ordering::Relaxed)
+    }
+
+    pub fn delivered_size(&self) -> i64 {
+        self.delivered_size.load(Ordering::Relaxed)
+    }
+
+    pub fn acknowledged(&self) -> i64 {
+        self.acknowledged.load(Ordering::Relaxed)
+    }
+
+    pub fn awaiting_commit(&self) -> i32 {
+        self.awaiting_commit.load(Ordering::Relaxed)
+    }
+
+    pub fn last_delivered(&self) -> i64 {
+        self.last_delivered.load(Ordering::Relaxed)
+    }
+
+    pub fn last_acknowledged(&self) -> i64 {
+        self.last_acknowledged.load(Ordering::Relaxed)
+    }
 }
 
 /// An acknowledgement that named a message the consumer was not
@@ -1005,6 +1073,7 @@ impl Consumer {
                     .deliver_large(id, message, size, delivery_count)
             }
         };
+        self.reg.metrics.add_message(message.encode_size() as i64);
         self.take_credits(size);
     }
 
@@ -1824,11 +1893,15 @@ impl Actor {
                 }
             }
         }
+        for r in &refs {
+            c.reg
+                .metrics
+                .add_acknowledge(r.message.encode_size() as i64, transactional);
+        }
         // Acknowledging on a non-destructive queue leaves the message there.
         if self.shared.config().non_destructive {
             return Ok(Vec::new());
         }
-        let _ = transactional;
         Ok(refs)
     }
 

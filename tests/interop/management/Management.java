@@ -676,4 +676,291 @@ public class Management {
             eq("[3]", ((TextMessage) reply).getText(), "result");
         }
     }
+
+    // ------------------------------------------------------------ connections, sessions, consumers, producers
+
+    interface Cond { boolean ok() throws Exception; }
+
+    static void waitFor(Cond c, String what) throws Exception {
+        for (int i = 0; i < 100; i++) {
+            if (c.ok()) return;
+            Thread.sleep(50);
+        }
+        throw new AssertionError("timed out waiting for " + what);
+    }
+
+    /** A paged view, filtered on one field: {"data": [...], "count": n}. */
+    static JsonObject view(String operation, String field, String value) throws Exception {
+        String options = "{\"field\":\"" + field + "\",\"operation\":\"EQUALS\",\"value\":\"" + value + "\"}";
+        return JsonUtil.readJsonObject((String) op("broker", operation, options, 1, 100));
+    }
+
+    static JsonObject only(JsonObject view, String what) {
+        eq(1, view.getInt("count"), what + " count in " + view);
+        return view.getJsonArray("data").getJsonObject(0);
+    }
+
+    static ConnectionFactory coreJms() {
+        return new org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory(url);
+    }
+
+    /** The ID of the connection with this client ID. */
+    static String connectionId(String clientId) throws Exception {
+        return only(view("listConnections", "clientID", clientId), "connection").getString("connectionID");
+    }
+
+    static void t_connection_counts() throws Exception {
+        long connections = longAttr("broker", "ConnectionCount");
+        long total = longAttr("broker", "TotalConnectionCount");
+        long sessions = longAttr("broker", "SessionCount");
+        check(connections >= 1, "ConnectionCount " + connections);
+        try (Connection c = coreJms().createConnection()) {
+            c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            eq(connections + 1, longAttr("broker", "ConnectionCount"), "ConnectionCount with one more");
+            check(longAttr("broker", "TotalConnectionCount") >= total + 1, "TotalConnectionCount");
+            check(longAttr("broker", "SessionCount") >= sessions + 1, "SessionCount");
+            check(longAttr("broker", "TotalSessionCount") >= longAttr("broker", "SessionCount"), "TotalSessionCount");
+        }
+        waitFor(() -> longAttr("broker", "ConnectionCount") == connections, "ConnectionCount back to " + connections);
+    }
+
+    static void t_list_connections() throws Exception {
+        String cid = name("cid");
+        try (Connection c = coreJms().createConnection("u-" + RUN, "p")) {
+            c.setClientID(cid);
+            c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            JsonObject conn = only(view("listConnections", "clientID", cid), "connection");
+            eq("CORE", conn.getString("protocol"), "protocol");
+            eq("RemotingConnectionImpl", conn.getString("implementation"), "implementation");
+            eq("u-" + RUN, conn.getString("users"), "users");
+            check(conn.getInt("sessionCount") >= 1, "sessionCount " + conn);
+            check(!conn.getString("remoteAddress").startsWith("/"), "remoteAddress " + conn);
+            check(conn.getString("localAddress").matches(".+:[0-9]+"), "localAddress " + conn);
+            String id = conn.getString("connectionID");
+            check(Arrays.asList((Object[]) op("broker", "listConnectionIDs")).contains(id), "listConnectionIDs");
+            String remote = conn.getString("remoteAddress");
+            check(Arrays.asList((Object[]) op("broker", "listRemoteAddresses")).contains(remote), "listRemoteAddresses");
+            check(Arrays.asList((Object[]) op("broker", "listRemoteAddresses", remote)).contains(remote), "listRemoteAddresses(ip)");
+            JsonArray all = JsonUtil.readJsonArray((String) op("broker", "listConnectionsAsJSON"));
+            boolean found = false;
+            for (int i = 0; i < all.size(); i++) {
+                JsonObject o = all.getJsonObject(i);
+                if (o.getString("connectionID").equals(id)) {
+                    found = true;
+                    eq(remote, o.getString("clientAddress"), "clientAddress");
+                    eq("RemotingConnectionImpl", o.getString("implementation"), "implementation");
+                }
+            }
+            check(found, "listConnectionsAsJSON " + all);
+            eq(0, view("listConnections", "users", "nobody-" + RUN).getInt("count"), "users filter");
+            eq(1, view("listConnections", "users", "u-" + RUN).getInt("count"), "users filter");
+            String e = opFails("broker", "listConnections", "{\"field\":\"nope\",\"operation\":\"EQUALS\",\"value\":\"x\"}", 1, 10);
+            check(e.contains("No enum constant org.apache.activemq.artemis.core.management.impl.view.ConnectionField.nope"), "error " + e);
+        }
+        waitFor(() -> view("listConnections", "clientID", cid).getInt("count") == 0, "connection gone");
+    }
+
+    static void t_list_sessions() throws Exception {
+        String cid = name("cid");
+        try (Connection c = coreJms().createConnection()) {
+            c.setClientID(cid);
+            Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            String q = newQueue("sessions");
+            MessageConsumer consumer = s.createConsumer(s.createQueue(q));
+            String id = connectionId(cid);
+            List<Object> names = Arrays.asList((Object[]) op("broker", "listSessions", id));
+            check(names.size() >= 2, "listSessions " + names);
+            JsonObject sessions = view("listSessions", "connectionID", id);
+            eq(names.size(), sessions.getInt("count"), "listSessions count");
+            int consumers = 0;
+            JsonArray data = sessions.getJsonArray("data");
+            for (int i = 0; i < data.size(); i++) {
+                JsonObject o = data.getJsonObject(i);
+                eq(id, o.getString("connectionID"), "connectionID");
+                eq(cid, o.getString("clientID"), "clientID");
+                check(names.contains(o.getString("id")), "session id " + o);
+                consumers += o.getInt("consumerCount");
+            }
+            eq(1, consumers, "consumerCount");
+            JsonArray json = JsonUtil.readJsonArray((String) op("broker", "listSessionsAsJSON", id));
+            eq(names.size(), json.size(), "listSessionsAsJSON");
+            boolean clientIdMetadata = false;
+            for (int i = 0; i < json.size(); i++) {
+                JsonObject o = json.getJsonObject(i);
+                check(names.contains(o.getString("sessionID")), "sessionID " + o);
+                JsonObject metadata = o.getJsonObject("metadata");
+                if (metadata != null && cid.equals(metadata.getString("jms-client-id", null))) clientIdMetadata = true;
+            }
+            check(clientIdMetadata, "jms-client-id metadata in " + json);
+            JsonArray all = JsonUtil.readJsonArray((String) op("broker", "listAllSessionsAsJSON"));
+            check(all.size() >= names.size(), "listAllSessionsAsJSON");
+            consumer.close();
+        }
+    }
+
+    static void t_list_consumers() throws Exception {
+        String q = newQueue("consumers");
+        String cid = name("cid");
+        try (Connection c = coreJms().createConnection()) {
+            c.setClientID(cid);
+            c.start();
+            Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            MessageConsumer consumer = s.createConsumer(s.createQueue(q), "i > 0");
+            send(q, 3);
+            check(consumer.receive(2000) != null, "first message");
+            check(consumer.receive(2000) != null, "second message");
+            waitFor(() -> "2".equals(only(view("listConsumers", "queue", q), "consumer").getString("messagesAcknowledged")), "two acks");
+            JsonObject o = only(view("listConsumers", "queue", q), "consumer");
+            eq(q, o.getString("address"), "address");
+            eq("anycast", o.getString("queueType"), "queueType");
+            eq("i > 0", o.getString("filter"), "filter");
+            eq("CORE", o.getString("protocol"), "protocol");
+            eq(cid, o.getString("clientID"), "clientID");
+            eq("2", o.getString("messagesDelivered"), "messagesDelivered");
+            eq("0", o.getString("messagesInTransit"), "messagesInTransit");
+            eq("0", o.getString("messagesAcknowledgedAwaitingCommit"), "awaiting commit");
+            eq("OK", o.getString("status"), "status");
+            check(o.getJsonNumber("lastAcknowledgedTime").longValue() > 0, "lastAcknowledgedTime");
+            check(Long.parseLong(o.getString("messagesDeliveredSize")) > 0, "messagesDeliveredSize");
+            String id = connectionId(cid);
+            JsonArray mine = JsonUtil.readJsonArray((String) op("broker", "listConsumersAsJSON", id));
+            eq(1, mine.size(), "listConsumersAsJSON " + mine);
+            JsonObject j = mine.getJsonObject(0);
+            eq(id, j.getString("connectionID"), "connectionID");
+            eq(q, j.getString("queueName"), "queueName");
+            eq(false, j.getBoolean("browseOnly"), "browseOnly");
+            eq("i > 0", j.getString("filter"), "filter");
+            eq(2L, j.getJsonNumber("messagesAcknowledged").longValue(), "messagesAcknowledged");
+            eq(Long.parseLong(o.getString("id")), j.getJsonNumber("sequentialId").longValue(), "sequentialId");
+            JsonArray all = JsonUtil.readJsonArray((String) op("broker", "listAllConsumersAsJSON"));
+            check(all.size() >= 1, "listAllConsumersAsJSON");
+            check(longAttr("broker", "TotalConsumerCount") >= 1, "TotalConsumerCount");
+            consumer.close();
+        }
+    }
+
+    static void t_list_producers() throws Exception {
+        String q = newQueue("producers");
+        String cid = name("cid");
+        try (Connection c = coreJms().createConnection()) {
+            c.setClientID(cid);
+            Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            MessageProducer p = s.createProducer(s.createQueue(q));
+            p.send(s.createTextMessage("one"));
+            p.send(s.createTextMessage("two"));
+            JsonObject o = only(view("listProducers", "address", q), "producer");
+            eq(2L, o.getJsonNumber("msgSent").longValue(), "msgSent");
+            check(o.getJsonNumber("msgSizeSent").longValue() > 0, "msgSizeSent");
+            eq("CORE", o.getString("protocol"), "protocol");
+            eq(cid, o.getString("clientID"), "clientID");
+            check(!o.getString("lastProducedMessageID").isEmpty(), "lastProducedMessageID");
+            JsonArray info = JsonUtil.readJsonArray((String) op("broker", "listProducersInfoAsJSON"));
+            boolean found = false;
+            for (int i = 0; i < info.size(); i++) {
+                JsonObject j = info.getJsonObject(i);
+                if (q.equals(j.getString("destination"))) {
+                    found = true;
+                    eq(o.getString("id"), j.getString("id"), "id");
+                    eq(o.getString("session"), j.getString("sessionID"), "sessionID");
+                    eq(connectionId(cid), j.getString("connectionID"), "connectionID");
+                    eq(2L, j.getJsonNumber("msgSent").longValue(), "msgSent");
+                }
+            }
+            check(found, "listProducersInfoAsJSON " + info);
+            p.close();
+            waitFor(() -> view("listProducers", "address", q).getInt("count") == 0, "producer gone");
+        }
+    }
+
+    static void t_amqp_connection_and_producer() throws Exception {
+        String q = newQueue("amqp-producer");
+        String cid = name("cid");
+        ConnectionFactory cf = new org.apache.qpid.jms.JmsConnectionFactory("amqp://" + host + ":" + port);
+        try (Connection c = cf.createConnection()) {
+            c.setClientID(cid);
+            Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            MessageProducer p = s.createProducer(s.createQueue(q));
+            p.send(s.createTextMessage("one"));
+            JsonObject conn = only(view("listConnections", "clientID", cid), "connection");
+            eq("AMQP", conn.getString("protocol"), "protocol");
+            eq("ActiveMQProtonRemotingConnection", conn.getString("implementation"), "implementation");
+            JsonObject o = only(view("listProducers", "address", q), "producer");
+            eq("AMQP", o.getString("protocol"), "producer protocol");
+            eq(1L, o.getJsonNumber("msgSent").longValue(), "msgSent");
+        }
+    }
+
+    static void t_close_consumer_with_id() throws Exception {
+        String q = newQueue("close-consumer");
+        try (ClientConsumer c = session.createConsumer(q)) {
+            JsonObject o = only(view("listConsumers", "queue", q), "consumer");
+            eq(true, op("broker", "closeConsumerWithID", o.getString("session"), o.getString("id")), "closed");
+            waitFor(c::isClosed, "the client consumer to close");
+            waitFor(() -> view("listConsumers", "queue", q).getInt("count") == 0, "consumer gone");
+        }
+        eq(false, op("broker", "closeConsumerWithID", "no-such-session", "1"), "unknown consumer");
+    }
+
+    static void t_close_session_with_id() throws Exception {
+        String cid = name("cid");
+        // The client's own close of the closed session waits for no reply.
+        ConnectionFactory cf = new org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory(url + "?callTimeout=1000");
+        try (Connection c = cf.createConnection()) {
+            c.setClientID(cid);
+            c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            String id = connectionId(cid);
+            List<Object> names = Arrays.asList((Object[]) op("broker", "listSessions", id));
+            String victim = (String) names.get(names.size() - 1);
+            eq(true, op("broker", "closeSessionWithID", id, victim), "closed");
+            waitFor(() -> !Arrays.asList((Object[]) op("broker", "listSessions", id)).contains(victim), "session gone");
+            eq(false, op("broker", "closeSessionWithID", id, "no-such-session"), "unknown session");
+        }
+    }
+
+    /** A JMS connection that reports its failure. */
+    static Connection failing(String clientId, String user, java.util.concurrent.CountDownLatch failed) throws Exception {
+        Connection c = user == null ? coreJms().createConnection() : coreJms().createConnection(user, "p");
+        c.setClientID(clientId);
+        c.setExceptionListener(e -> failed.countDown());
+        c.start();
+        return c;
+    }
+
+    static void t_close_connection_with_id() throws Exception {
+        String cid = name("cid");
+        java.util.concurrent.CountDownLatch failed = new java.util.concurrent.CountDownLatch(1);
+        try (Connection c = failing(cid, null, failed)) {
+            c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            eq(true, op("broker", "closeConnectionWithID", connectionId(cid)), "closed");
+            check(failed.await(10, java.util.concurrent.TimeUnit.SECONDS), "the client saw no failure");
+            waitFor(() -> view("listConnections", "clientID", cid).getInt("count") == 0, "connection gone");
+        }
+        eq(false, op("broker", "closeConnectionWithID", "no-such-connection"), "unknown connection");
+    }
+
+    static void t_close_connections_for_user() throws Exception {
+        String cid = name("cid");
+        String user = "closeme-" + RUN;
+        java.util.concurrent.CountDownLatch failed = new java.util.concurrent.CountDownLatch(1);
+        try (Connection c = failing(cid, user, failed)) {
+            c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            eq(true, op("broker", "closeConnectionsForUser", user), "closed");
+            check(failed.await(10, java.util.concurrent.TimeUnit.SECONDS), "the client saw no failure");
+        }
+        eq(false, op("broker", "closeConnectionsForUser", "nobody-" + RUN), "no such user");
+        eq(false, op("broker", "closeConnectionsForAddress", "192.0.2.123"), "no such address");
+    }
+
+    static void t_close_consumer_connections_for_address() throws Exception {
+        String q = newQueue("close-consumers");
+        String cid = name("cid");
+        java.util.concurrent.CountDownLatch failed = new java.util.concurrent.CountDownLatch(1);
+        try (Connection c = failing(cid, null, failed)) {
+            Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            s.createConsumer(s.createQueue(q));
+            eq(true, op("broker", "closeConsumerConnectionsForAddress", q), "closed");
+            check(failed.await(10, java.util.concurrent.TimeUnit.SECONDS), "the client saw no failure");
+        }
+        eq(false, op("broker", "closeConsumerConnectionsForAddress", "nothing." + RUN), "no consumers");
+    }
 }

@@ -1,13 +1,16 @@
 //! The paged, filtered and sorted listings (`ActiveMQAbstractView` with
-//! `QueueView` and `AddressView`): `{"data": [...], "count": n}`, each
-//! item an object of string fields.
+//! `QueueView`, `AddressView`, `ConnectionView`, `SessionView`,
+//! `ConsumerView` and `ProducerView`): `{"data": [...], "count": n}`.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use super::Outcome;
 use super::json::Json;
 use crate::Broker;
+use crate::registry::{ConsumerEntry, ProducerEntry, SessionEntry};
+use crate::session::ClientConnection;
 
 /// A field's value, as the view's `getField` gives it for filtering and
 /// sorting.
@@ -16,6 +19,8 @@ pub(super) enum Field {
     Long(i64),
     Bool(bool),
     Text(Option<String>),
+    /// Several values, any of which may match (`matchAny`); not sortable.
+    Any(Vec<String>),
 }
 
 impl Field {
@@ -25,6 +30,7 @@ impl Field {
             Field::Long(n) => n.to_string(),
             Field::Bool(b) => b.to_string(),
             Field::Text(t) => t.clone().unwrap_or_default(),
+            Field::Any(v) => v.join(","),
         }
     }
 
@@ -46,13 +52,31 @@ struct Part {
 }
 
 impl Part {
-    /// `matches` for text and booleans, `matchesLong` for numbers.
+    /// `matches` for text, `matchesLong` for numbers, `matchAny` for
+    /// sets.
     fn accepts(&self, f: Option<&Field>) -> bool {
         let Some(op) = self.operation.as_deref() else {
             return true;
         };
         let Some(f) = f else {
             return true;
+        };
+        let text_matches = |text: Option<&str>| {
+            let equals = || match text {
+                None => self.value.is_empty(),
+                Some(t) => t == self.value,
+            };
+            let contains = || match text {
+                None => self.value.is_empty(),
+                Some(t) => t.contains(self.value.as_str()),
+            };
+            match op {
+                "EQUALS" => equals(),
+                "NOT_EQUALS" => !equals(),
+                "CONTAINS" => contains(),
+                "NOT_CONTAINS" => !contains(),
+                _ => false,
+            }
         };
         match f {
             Field::Long(n) => {
@@ -69,27 +93,9 @@ impl Part {
                     _ => true,
                 }
             }
-            other => {
-                let text = match other {
-                    Field::Text(None) => None,
-                    other => Some(other.text()),
-                };
-                let equals = || match &text {
-                    None => self.value.is_empty(),
-                    Some(t) => *t == self.value,
-                };
-                let contains = || match &text {
-                    None => self.value.is_empty(),
-                    Some(t) => t.contains(self.value.as_str()),
-                };
-                match op {
-                    "EQUALS" => equals(),
-                    "NOT_EQUALS" => !equals(),
-                    "CONTAINS" => contains(),
-                    "NOT_CONTAINS" => !contains(),
-                    _ => false,
-                }
-            }
+            Field::Any(values) => values.iter().any(|v| text_matches(Some(v))),
+            Field::Text(None) => text_matches(None),
+            other => text_matches(Some(&other.text())),
         }
     }
 }
@@ -155,64 +161,99 @@ fn options(text: Option<&str>) -> Result<Options, String> {
     })
 }
 
-/// A field name as the options give it: the view's name (`messageCount`)
-/// or the enum constant's (`MESSAGE_COUNT`).
-fn canonical(field: &str, names: &[&str]) -> Option<String> {
-    if names.contains(&field) {
-        return Some(field.to_owned());
-    }
-    let wanted = field.replace('_', "").to_lowercase();
-    names
-        .iter()
-        .find(|n| n.to_lowercase() == wanted)
-        .map(|n| (*n).to_owned())
+/// A view's field enum: each constant and its name.
+struct View {
+    /// The enum's class (`QueueField`).
+    class: &'static str,
+    fields: &'static [(&'static str, &'static str)],
+    default_sort: &'static str,
 }
 
-/// Filters, sorts and pages `items` (each its fields in output order).
+impl View {
+    /// `valueOfName` (the name, any case) for sorting.
+    fn by_name(&self, field: &str) -> Option<&'static str> {
+        self.fields
+            .iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(field))
+            .map(|(_, n)| *n)
+    }
+
+    /// The field a filter names: `valueOfName`, then `valueOf` (the
+    /// constant, exactly).
+    fn filter_field(&self, field: &str) -> Result<&'static str, String> {
+        self.by_name(field)
+            .or_else(|| {
+                self.fields
+                    .iter()
+                    .find(|(c, _)| *c == field)
+                    .map(|(_, n)| *n)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "No enum constant org.apache.activemq.artemis.core.management.impl.view.{}.{field}",
+                    self.class
+                )
+            })
+    }
+}
+
+/// One element of a view: its fields for filtering and sorting, and its
+/// JSON (`toJson`).
+struct Item {
+    fields: Vec<(&'static str, Field)>,
+    json: Json,
+}
+
+impl Item {
+    fn field(&self, name: &str) -> Option<&Field> {
+        self.fields.iter().find(|(n, _)| *n == name).map(|(_, f)| f)
+    }
+
+    /// Fields that `toJson` writes as their `toString`.
+    fn strings(fields: Vec<(&'static str, Field)>) -> Self {
+        let json = Json::Object(
+            fields
+                .iter()
+                .map(|(n, f)| ((*n).to_owned(), Json::from(f.text())))
+                .collect(),
+        );
+        Self { fields, json }
+    }
+}
+
+/// Filters, sorts and pages `items` (`getResultsAsJson`).
 fn render(
-    items: Vec<Vec<(&'static str, Field)>>,
-    names: &[&str],
-    default_sort: &str,
+    items: Vec<Item>,
+    view: &View,
     opts: &Options,
     page: i32,
     page_size: i32,
 ) -> Result<Json, String> {
+    let mut parts = Vec::new();
     for p in &opts.parts {
-        if !p.field.is_empty() && canonical(&p.field, names).is_none() {
-            return Err(format!("Unsupported field, {}", p.field));
+        if !p.field.is_empty() {
+            parts.push((view.filter_field(&p.field)?, p));
         }
     }
-    let field = |item: &Vec<(&'static str, Field)>, name: &str| {
-        item.iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, f)| f.clone())
-    };
-    let mut kept: Vec<_> = items
+    let mut kept: Vec<Item> = items
         .into_iter()
-        .filter(|item| {
-            opts.parts.iter().all(|p| {
-                if p.field.is_empty() {
-                    return true;
-                }
-                let name = canonical(&p.field, names).unwrap_or_default();
-                p.accepts(field(item, &name).as_ref())
-            })
-        })
+        .filter(|item| parts.iter().all(|(name, p)| p.accepts(item.field(name))))
         .collect();
     let count = kept.len();
-    let sort = opts
-        .sort_field
-        .as_deref()
-        .and_then(|f| canonical(f, names))
-        .unwrap_or_else(|| default_sort.to_owned());
-    kept.sort_by(|a, b| {
-        let (x, y) = (field(a, &sort), field(b, &sort));
-        let o = match (x, y) {
-            (Some(x), Some(y)) => x.compare(&y),
-            _ => Ordering::Equal,
-        };
-        if opts.descending { o.reverse() } else { o }
-    });
+    // getField(sortField) takes only a field's name; another sorts nothing.
+    let sort = match &opts.sort_field {
+        Some(f) => view.by_name(f),
+        None => Some(view.default_sort),
+    };
+    if let Some(sort) = sort {
+        kept.sort_by(|a, b| {
+            let o = match (a.field(sort), b.field(sort)) {
+                (Some(x), Some(y)) => x.compare(y),
+                _ => Ordering::Equal,
+            };
+            if opts.descending { o.reverse() } else { o }
+        });
+    }
     let (start, end) = if page == -1 || page_size == -1 {
         (0, count)
     } else {
@@ -226,57 +267,70 @@ fn render(
         .into_iter()
         .enumerate()
         .filter(|(i, _)| *i >= start && *i < end)
-        .map(|(_, item)| {
-            Json::Object(
-                item.into_iter()
-                    .map(|(n, f)| (n.to_owned(), Json::from(f.text())))
-                    .collect(),
-            )
-        })
+        .map(|(_, item)| item.json)
         .collect();
     Ok(Json::object()
         .with("data", Json::Array(data))
         .with("count", count))
 }
 
-const QUEUE_FIELDS: &[&str] = &[
-    "id",
-    "name",
-    "address",
-    "filter",
-    "durable",
-    "paused",
-    "persistedPause",
-    "temporary",
-    "purgeOnNoConsumers",
-    "consumerCount",
-    "maxConsumers",
-    "autoCreated",
-    "user",
-    "routingType",
-    "messagesAdded",
-    "messageCount",
-    "messagesAcked",
-    "messagesExpired",
-    "deliveringCount",
-    "messagesKilled",
-    "directDeliver",
-    "exclusive",
-    "lastValue",
-    "lastValueKey",
-    "scheduledCount",
-    "groupRebalance",
-    "groupRebalancePauseDispatch",
-    "groupBuckets",
-    "groupFirstKey",
-    "enabled",
-    "ringSize",
-    "consumersBeforeDispatch",
-    "delayBeforeDispatch",
-    "autoDelete",
-    "internalQueue",
-    "consumerID",
-];
+async fn list(
+    items: Vec<Item>,
+    view: &View,
+    options_text: Option<&str>,
+    page: i32,
+    page_size: i32,
+) -> Outcome {
+    let opts = options(options_text)?;
+    let json = render(items, view, &opts, page, page_size)?;
+    Ok(Json::from(json.to_string()))
+}
+
+const QUEUE_VIEW: View = View {
+    class: "QueueField",
+    fields: &[
+        ("ID", "id"),
+        ("NAME", "name"),
+        ("CONSUMER_ID", "consumerID"),
+        ("ADDRESS", "address"),
+        ("MAX_CONSUMERS", "maxConsumers"),
+        ("FILTER", "filter"),
+        ("MESSAGE_COUNT", "messageCount"),
+        ("CONSUMER_COUNT", "consumerCount"),
+        ("DELIVERING_COUNT", "deliveringCount"),
+        ("MESSAGES_ADDED", "messagesAdded"),
+        ("MESSAGES_ACKED", "messagesAcked"),
+        ("MESSAGES_EXPIRED", "messagesExpired"),
+        ("ROUTING_TYPE", "routingType"),
+        ("USER", "user"),
+        ("AUTO_CREATED", "autoCreated"),
+        ("DURABLE", "durable"),
+        ("PAUSED", "paused"),
+        ("PERSISTEDPAUSE", "persistedPause"),
+        ("TEMPORARY", "temporary"),
+        ("PURGE_ON_NO_CONSUMERS", "purgeOnNoConsumers"),
+        ("MESSAGES_KILLED", "messagesKilled"),
+        ("DIRECT_DELIVER", "directDeliver"),
+        ("LAST_VALUE", "lastValue"),
+        ("EXCLUSIVE", "exclusive"),
+        ("SCHEDULED_COUNT", "scheduledCount"),
+        ("LAST_VALUE_KEY", "lastValueKey"),
+        ("GROUP_REBALANCE", "groupRebalance"),
+        (
+            "GROUP_REBALANCE_PAUSE_DISPATCH",
+            "groupRebalancePauseDispatch",
+        ),
+        ("GROUP_BUCKETS", "groupBuckets"),
+        ("GROUP_FIRST_KEY", "groupFirstKey"),
+        ("ENABLED", "enabled"),
+        ("RING_SIZE", "ringSize"),
+        ("CONSUMERS_BEFORE_DISPATCH", "consumersBeforeDispatch"),
+        ("DELAY_BEFORE_DISPATCH", "delayBeforeDispatch"),
+        ("AUTO_DELETE", "autoDelete"),
+        ("INTERNAL_QUEUE", "internalQueue"),
+    ],
+    default_sort: "name",
+};
 
 /// `listQueues(options, page, pageSize)`.
 pub(super) async fn list_queues(
@@ -285,14 +339,13 @@ pub(super) async fn list_queues(
     page: i32,
     page_size: i32,
 ) -> Outcome {
-    let opts = options(options_text)?;
     let mut items = Vec::new();
     for q in broker.post_office().queues() {
         let c = q.config();
         let stats = q.stats().await;
         use Field::*;
         let text = |s: Option<String>| Text(s);
-        items.push(vec![
+        items.push(Item::strings(vec![
             ("id", Long(q.id())),
             ("name", text(Some(c.name.to_string()))),
             ("address", text(Some(c.address.to_string()))),
@@ -337,36 +390,42 @@ pub(super) async fn list_queues(
             ("delayBeforeDispatch", Long(c.delay_before_dispatch)),
             ("autoDelete", Bool(c.auto_delete)),
             ("internalQueue", Bool(c.internal)),
-        ]);
+        ]));
     }
-    let json = render(items, QUEUE_FIELDS, "name", &opts, page, page_size)?;
-    Ok(Json::from(json.to_string()))
+    list(items, &QUEUE_VIEW, options_text, page, page_size).await
 }
 
-const ADDRESS_FIELDS: &[&str] = &[
-    "id",
-    "name",
-    "routingTypes",
-    "queueCount",
-    "internal",
-    "temporary",
-    "autoCreated",
-    "paused",
-    "currentDuplicateIdCacheSize",
-    "retroactiveResource",
-    "unroutedMessageCount",
-    "routedMessageCount",
-    "messageCount",
-    "addressLimitPercent",
-    "numberOfPages",
-    "addressSize",
-    "maxPageReadBytes",
-    "maxPageReadMessages",
-    "prefetchPageBytes",
-    "prefetchPageMessages",
-    "numberOfBytesPerPage",
-    "paging",
-];
+const ADDRESS_VIEW: View = View {
+    class: "AddressField",
+    fields: &[
+        ("ID", "id"),
+        ("NAME", "name"),
+        ("ROUTING_TYPES", "routingTypes"),
+        ("QUEUE_COUNT", "queueCount"),
+        ("INTERNAL", "internal"),
+        ("TEMPORARY", "temporary"),
+        ("AUTO_CREATED", "autoCreated"),
+        ("PAUSED", "paused"),
+        (
+            "CURRENT_DUPLICATE_ID_CACHE_SIZE",
+            "currentDuplicateIdCacheSize",
+        ),
+        ("RETROACTIVE_RESOURCE", "retroactiveResource"),
+        ("UNROUTED_MESSAGE_COUNT", "unroutedMessageCount"),
+        ("ROUTED_MESSAGE_COUNT", "routedMessageCount"),
+        ("MESSAGE_COUNT", "messageCount"),
+        ("NUMBER_OF_BYTES_PER_PAGE", "numberOfBytesPerPage"),
+        ("ADDRESS_LIMIT_PERCENT", "addressLimitPercent"),
+        ("PAGING", "paging"),
+        ("NUMBER_OF_PAGES", "numberOfPages"),
+        ("ADDRESS_SIZE", "addressSize"),
+        ("MAX_PAGE_READ_BYTES", "maxPageReadBytes"),
+        ("MAX_PAGE_READ_MESSAGES", "maxPageReadMessages"),
+        ("PREFETCH_PAGE_BYTES", "prefetchPageBytes"),
+        ("PREFETCH_PAGE_MESSAGES", "prefetchPageMessages"),
+    ],
+    default_sort: "id",
+};
 
 /// `listAddresses(options, page, pageSize)`.
 pub(super) async fn list_addresses(
@@ -375,7 +434,6 @@ pub(super) async fn list_addresses(
     page: i32,
     page_size: i32,
 ) -> Outcome {
-    let opts = options(options_text)?;
     let po = broker.post_office();
     let prefix = super::queue::internal_prefix(broker);
     let mut items = Vec::new();
@@ -392,7 +450,7 @@ pub(super) async fn list_addresses(
         };
         use Field::*;
         let types = Json::from(super::address::routing_type_names(info.routing_types)).to_string();
-        items.push(vec![
+        items.push(Item::strings(vec![
             ("id", Long(info.id)),
             ("name", Text(Some(info.name.to_string()))),
             ("routingTypes", Text(Some(types))),
@@ -455,8 +513,468 @@ pub(super) async fn list_addresses(
                 "paging",
                 Bool(store.as_ref().is_some_and(|s| s.is_paging())),
             ),
-        ]);
+        ]));
     }
-    let json = render(items, ADDRESS_FIELDS, "id", &opts, page, page_size)?;
-    Ok(Json::from(json.to_string()))
+    list(items, &ADDRESS_VIEW, options_text, page, page_size).await
+}
+
+/// `new Date(millis).toString()`, in UTC.
+pub(super) fn date(millis: i64) -> String {
+    saranga_storage::java::date(millis)
+}
+
+/// The users of a connection's sessions, sorted and without repeats, a
+/// session without one counting as empty.
+fn users(c: &ClientConnection) -> BTreeSet<String> {
+    c.sessions()
+        .iter()
+        .map(|s| s.username.clone().unwrap_or_default())
+        .collect()
+}
+
+const CONNECTION_VIEW: View = View {
+    class: "ConnectionField",
+    fields: &[
+        ("CONNECTION_ID", "connectionID"),
+        ("CLIENT_ID", "clientID"),
+        ("USERS", "users"),
+        ("PROTOCOL", "protocol"),
+        ("SESSION_COUNT", "sessionCount"),
+        ("REMOTE_ADDRESS", "remoteAddress"),
+        ("LOCAL_ADDRESS", "localAddress"),
+        ("SESSION_ID", "sessionID"),
+        ("CREATION_TIME", "creationTime"),
+        ("IMPLEMENTATION", "implementation"),
+        ("PROXY_ADDRESS", "proxyAddress"),
+        ("PROXY_PROTOCOL_VERSION", "proxyProtocolVersion"),
+    ],
+    default_sort: "connectionID",
+};
+
+/// `listConnections(options, page, pageSize)`.
+pub(super) async fn list_connections(
+    broker: &Arc<Broker>,
+    options_text: Option<&str>,
+    page: i32,
+    page_size: i32,
+) -> Outcome {
+    let items = broker
+        .registry()
+        .connections()
+        .iter()
+        .map(|c| {
+            let users: Vec<String> = users(c).into_iter().collect();
+            let sessions = c.sessions();
+            use Field::*;
+            Item {
+                fields: vec![
+                    ("connectionID", Text(Some(c.id().to_owned()))),
+                    ("clientID", Text(c.client_id())),
+                    ("users", Any(users.clone())),
+                    ("protocol", Text(Some(c.protocol().to_owned()))),
+                    ("sessionCount", Long(sessions.len() as i64)),
+                    ("remoteAddress", Text(Some(c.remote_address().to_owned()))),
+                    ("localAddress", Text(Some(c.local_address().to_owned()))),
+                    (
+                        "sessionID",
+                        Any(sessions.iter().map(|s| s.name.clone()).collect()),
+                    ),
+                    ("creationTime", Long(c.created())),
+                    ("implementation", Text(Some(c.implementation().to_owned()))),
+                    ("proxyAddress", Text(None)),
+                    ("proxyProtocolVersion", Text(None)),
+                ],
+                json: Json::object()
+                    .with("connectionID", c.id())
+                    .with("remoteAddress", c.remote_address())
+                    .with("users", users.join(","))
+                    .with("creationTime", date(c.created()))
+                    .with("implementation", c.implementation())
+                    .with("protocol", c.protocol())
+                    .with("clientID", c.client_id().unwrap_or_default())
+                    .with("localAddress", c.local_address())
+                    .with("sessionCount", sessions.len() as i32)
+                    .with("proxyAddress", "")
+                    .with("proxyProtocolVersion", ""),
+            }
+        })
+        .collect();
+    list(items, &CONNECTION_VIEW, options_text, page, page_size).await
+}
+
+const SESSION_VIEW: View = View {
+    class: "SessionField",
+    fields: &[
+        ("ID", "id"),
+        ("CONNECTION_ID", "connectionID"),
+        ("CONSUMER_COUNT", "consumerCount"),
+        ("PRODUCER_COUNT", "producerCount"),
+        ("USER", "user"),
+        ("VALIDATED_USER", "validatedUser"),
+        ("PROTOCOL", "protocol"),
+        ("CLIENT_ID", "clientID"),
+        ("LOCAL_ADDRESS", "localAddress"),
+        ("REMOTE_ADDRESS", "remoteAddress"),
+        ("CREATION_TIME", "creationTime"),
+    ],
+    default_sort: "id",
+};
+
+/// `listSessions(options, page, pageSize)`.
+pub(super) async fn list_sessions(
+    broker: &Arc<Broker>,
+    options_text: Option<&str>,
+    page: i32,
+    page_size: i32,
+) -> Outcome {
+    let mut items = Vec::new();
+    for c in broker.registry().connections() {
+        for s in c.sessions() {
+            let consumers = s.consumers().len() as i64;
+            let producers = s.producers().len() as i64;
+            use Field::*;
+            items.push(Item {
+                // SessionPredicateFilterPart has no case for the users or
+                // the creation time: they match anything.
+                fields: vec![
+                    ("id", Text(Some(s.name.clone()))),
+                    ("connectionID", Text(Some(c.id().to_owned()))),
+                    ("consumerCount", Long(consumers)),
+                    ("producerCount", Long(producers)),
+                    ("protocol", Text(Some(c.protocol().to_owned()))),
+                    ("clientID", Text(c.client_id())),
+                    ("localAddress", Text(Some(c.local_address().to_owned()))),
+                    ("remoteAddress", Text(Some(c.remote_address().to_owned()))),
+                ],
+                json: Json::object()
+                    .with("id", s.name.clone())
+                    .with("user", s.username.clone().unwrap_or_default())
+                    .with(
+                        "validatedUser",
+                        s.validated_user.clone().unwrap_or_default(),
+                    )
+                    .with("creationTime", date(s.created))
+                    .with("consumerCount", consumers as i32)
+                    .with("producerCount", producers as i32)
+                    .with("connectionID", c.id())
+                    .with("clientID", c.client_id().unwrap_or_default()),
+            });
+        }
+    }
+    list(items, &SESSION_VIEW, options_text, page, page_size).await
+}
+
+/// Every consumer, with its session and connection.
+pub(super) fn all_consumers(
+    broker: &Broker,
+) -> Vec<(Arc<ClientConnection>, Arc<SessionEntry>, Arc<ConsumerEntry>)> {
+    let mut all = Vec::new();
+    for c in broker.registry().connections() {
+        for s in c.sessions() {
+            for consumer in s.consumers() {
+                all.push((c.clone(), s.clone(), consumer));
+            }
+        }
+    }
+    all
+}
+
+/// `ConsumerView.checkConsumerStatus`.
+fn consumer_status(c: &ClientConnection) -> &'static str {
+    if c.is_failed() { "Orphaned" } else { "OK" }
+}
+
+/// What a consumer is delivering, by sequential ID (`getMessagesInTransit`).
+async fn in_transit(
+    consumers: &[(Arc<ClientConnection>, Arc<SessionEntry>, Arc<ConsumerEntry>)],
+) -> std::collections::HashMap<u64, usize> {
+    let mut queues: Vec<crate::queue::Queue> = Vec::new();
+    for (_, _, c) in consumers {
+        if !queues.iter().any(|q| q.id() == c.queue.id()) {
+            queues.push(c.queue.clone());
+        }
+    }
+    let mut counts = std::collections::HashMap::new();
+    for q in queues {
+        for info in q.consumers().await {
+            counts.insert(info.id, info.delivering);
+        }
+    }
+    counts
+}
+
+const CONSUMER_VIEW: View = View {
+    class: "ConsumerField",
+    fields: &[
+        ("ID", "id"),
+        ("SEQUENTIAL_ID", "sequentialId"),
+        ("SESSION", "session"),
+        ("CONNECTION", "connection"),
+        ("QUEUE", "queue"),
+        ("FILTER", "filter"),
+        ("ADDRESS", "address"),
+        ("USER", "user"),
+        ("VALIDATED_USER", "validatedUser"),
+        ("PROTOCOL", "protocol"),
+        ("CLIENT_ID", "clientID"),
+        ("LOCAL_ADDRESS", "localAddress"),
+        ("REMOTE_ADDRESS", "remoteAddress"),
+        ("QUEUE_TYPE", "queueType"),
+        ("BROWSE_ONLY", "browseOnly"),
+        ("CREATION_TIME", "creationTime"),
+        ("MESSAGES_IN_TRANSIT", "messagesInTransit"),
+        ("MESSAGES_IN_TRANSIT_SIZE", "messagesInTransitSize"),
+        ("MESSAGES_DELIVERED", "messagesDelivered"),
+        ("MESSAGES_DELIVERED_SIZE", "messagesDeliveredSize"),
+        ("MESSAGES_ACKNOWLEDGED", "messagesAcknowledged"),
+        (
+            "MESSAGES_ACKNOWLEDGED_AWAITING_COMMIT",
+            "messagesAcknowledgedAwaitingCommit",
+        ),
+        ("LAST_DELIVERED_TIME", "lastDeliveredTime"),
+        ("LAST_ACKNOWLEDGED_TIME", "lastAcknowledgedTime"),
+        ("STATUS", "status"),
+    ],
+    default_sort: "id",
+};
+
+/// `listConsumers(options, page, pageSize)`.
+pub(super) async fn list_consumers(
+    broker: &Arc<Broker>,
+    options_text: Option<&str>,
+    page: i32,
+    page_size: i32,
+) -> Outcome {
+    let all = all_consumers(broker);
+    let transit = in_transit(&all).await;
+    let items = all
+        .iter()
+        .map(|(conn, s, c)| {
+            let m = &c.metrics;
+            let qc = c.queue.config();
+            let delivering = transit.get(&c.sequential_id).copied().unwrap_or(0) as i64;
+            use Field::*;
+            let text = |v: &str| Text(Some(v.to_owned()));
+            Item {
+                fields: vec![
+                    ("id", Long(c.sequential_id as i64)),
+                    ("session", text(&s.name)),
+                    ("user", Text(s.username.clone())),
+                    ("validatedUser", Text(s.validated_user.clone())),
+                    ("address", text(&qc.address)),
+                    ("queue", text(&qc.name)),
+                    ("filter", Text(c.filter.clone())),
+                    ("protocol", text(conn.protocol())),
+                    ("clientID", Text(conn.client_id())),
+                    ("localAddress", text(conn.local_address())),
+                    ("remoteAddress", text(conn.remote_address())),
+                    ("messagesInTransit", Long(delivering)),
+                    ("messagesInTransitSize", Long(m.in_transit_size())),
+                    // ConsumerPredicateFilterPart compares it as text.
+                    ("messagesDelivered", Text(Some(m.delivered().to_string()))),
+                    ("messagesDeliveredSize", Long(m.delivered_size())),
+                    ("messagesAcknowledged", Long(m.acknowledged())),
+                    (
+                        "messagesAcknowledgedAwaitingCommit",
+                        Long(i64::from(m.awaiting_commit())),
+                    ),
+                    ("lastAcknowledgedTime", Long(m.last_acknowledged())),
+                    ("lastDeliveredTime", Long(m.last_delivered())),
+                    ("creationTime", Long(c.created)),
+                    ("status", text(consumer_status(conn))),
+                    ("queueType", text(&qc.routing_type.name().to_lowercase())),
+                    ("connection", text(conn.id())),
+                ],
+                json: Json::object()
+                    .with("id", c.sequential_id.to_string())
+                    .with("session", s.name.clone())
+                    .with("clientID", conn.client_id().unwrap_or_default())
+                    .with("user", s.username.clone().unwrap_or_default())
+                    .with(
+                        "validatedUser",
+                        s.validated_user.clone().unwrap_or_default(),
+                    )
+                    .with("protocol", conn.protocol())
+                    .with("queue", qc.name.to_string())
+                    .with("queueType", qc.routing_type.name().to_lowercase())
+                    .with("filter", c.filter.clone().unwrap_or_default())
+                    .with("address", qc.address.to_string())
+                    .with("localAddress", conn.local_address())
+                    .with("remoteAddress", conn.remote_address())
+                    .with("creationTime", date(c.created))
+                    .with("messagesInTransit", delivering.to_string())
+                    .with("messagesInTransitSize", m.in_transit_size().to_string())
+                    .with("messagesDelivered", m.delivered().to_string())
+                    .with("messagesDeliveredSize", m.delivered_size().to_string())
+                    .with("messagesAcknowledged", m.acknowledged().to_string())
+                    .with(
+                        "messagesAcknowledgedAwaitingCommit",
+                        m.awaiting_commit().to_string(),
+                    )
+                    .with("lastDeliveredTime", m.last_delivered())
+                    .with("lastAcknowledgedTime", m.last_acknowledged())
+                    .with("status", consumer_status(conn)),
+            }
+        })
+        .collect();
+    list(items, &CONSUMER_VIEW, options_text, page, page_size).await
+}
+
+/// `toJSONObject(ServerConsumer)` of `listConsumersAsJSON` and
+/// `listAllConsumersAsJSON`.
+pub(super) async fn consumers_json(
+    consumers: &[(Arc<ClientConnection>, Arc<SessionEntry>, Arc<ConsumerEntry>)],
+) -> Json {
+    let transit = in_transit(consumers).await;
+    Json::Array(
+        consumers
+            .iter()
+            .map(|(conn, s, c)| {
+                let m = &c.metrics;
+                let delivering = transit.get(&c.sequential_id).copied().unwrap_or(0) as i32;
+                let mut o = Json::object()
+                    .with("consumerID", c.id)
+                    .with("sequentialId", c.sequential_id as i64)
+                    .with("connectionID", conn.id())
+                    .with("sessionID", s.name.clone())
+                    .with("queueName", c.queue.name().to_string())
+                    .with("browseOnly", c.browse_only)
+                    .with("creationTime", c.created)
+                    .with("deliveringCount", delivering)
+                    .with("messagesInTransit", delivering)
+                    .with("messagesInTransitSize", m.in_transit_size())
+                    .with("messagesDelivered", m.delivered())
+                    .with("messagesDeliveredSize", m.delivered_size())
+                    .with("messagesAcknowledged", m.acknowledged())
+                    .with("messagesAcknowledgedAwaitingCommit", m.awaiting_commit())
+                    .with("lastDeliveredTime", m.last_delivered())
+                    .with("lastAcknowledgedTime", m.last_acknowledged())
+                    .with("status", consumer_status(conn));
+                if let Some(f) = &c.filter {
+                    o.put("filter", f.clone());
+                }
+                o
+            })
+            .collect(),
+    )
+}
+
+/// Every producer, with its session and connection.
+pub(super) fn all_producers(
+    broker: &Broker,
+) -> Vec<(Arc<ClientConnection>, Arc<SessionEntry>, Arc<ProducerEntry>)> {
+    let mut all = Vec::new();
+    for c in broker.registry().connections() {
+        for s in c.sessions() {
+            for p in s.producers() {
+                all.push((c.clone(), s.clone(), p));
+            }
+        }
+    }
+    all
+}
+
+const PRODUCER_VIEW: View = View {
+    class: "ProducerField",
+    fields: &[
+        ("ID", "id"),
+        ("NAME", "name"),
+        ("SESSION", "session"),
+        ("CONNECTION_ID", "connectionID"),
+        ("ADDRESS", "address"),
+        ("USER", "user"),
+        ("VALIDATED_USER", "validatedUser"),
+        ("PROTOCOL", "protocol"),
+        ("CLIENT_ID", "clientID"),
+        ("LOCAL_ADDRESS", "localAddress"),
+        ("REMOTE_ADDRESS", "remoteAddress"),
+        ("CREATION_TIME", "creationTime"),
+        ("MESSAGE_SENT", "msgSent"),
+        ("MESSAGE_SENT_SIZE", "msgSizeSent"),
+        ("LAST_PRODUCED_MESSAGE_ID", "lastProducedMessageID"),
+    ],
+    default_sort: "id",
+};
+
+/// `listProducers(options, page, pageSize)`.
+pub(super) async fn list_producers(
+    broker: &Arc<Broker>,
+    options_text: Option<&str>,
+    page: i32,
+    page_size: i32,
+) -> Outcome {
+    let items = all_producers(broker)
+        .iter()
+        .map(|(conn, s, p)| {
+            let address = p.address.clone();
+            use Field::*;
+            let text = |v: &str| Text(Some(v.to_owned()));
+            Item {
+                fields: vec![
+                    ("id", Long(p.id)),
+                    ("connectionID", text(conn.id())),
+                    ("session", text(&s.name)),
+                    ("user", Text(s.username.clone())),
+                    ("validatedUser", Text(s.validated_user.clone())),
+                    ("address", text(&address)),
+                    ("protocol", text(&p.protocol)),
+                    ("clientID", Text(conn.client_id())),
+                    ("localAddress", text(conn.local_address())),
+                    ("remoteAddress", text(conn.remote_address())),
+                    ("name", text(&p.name)),
+                    ("creationTime", Long(p.created)),
+                    ("msgSent", Long(p.sent())),
+                    ("msgSizeSent", Long(p.sent_size())),
+                    ("lastProducedMessageID", Text(p.last_message_id())),
+                ],
+                json: Json::object()
+                    .with("id", p.id.to_string())
+                    .with("name", p.name.clone())
+                    .with("session", s.name.clone())
+                    .with("clientID", conn.client_id().unwrap_or_default())
+                    .with("user", s.username.clone().unwrap_or_default())
+                    .with(
+                        "validatedUser",
+                        s.validated_user.clone().unwrap_or_default(),
+                    )
+                    .with("protocol", conn.protocol())
+                    .with("address", address)
+                    .with("localAddress", conn.local_address())
+                    .with("remoteAddress", conn.remote_address())
+                    .with("creationTime", p.created.to_string())
+                    .with("msgSent", p.sent())
+                    .with("msgSizeSent", p.sent_size())
+                    .with(
+                        "lastProducedMessageID",
+                        p.last_message_id().unwrap_or_default(),
+                    ),
+            }
+        })
+        .collect();
+    list(items, &PRODUCER_VIEW, options_text, page, page_size).await
+}
+
+/// `ServerSessionImpl.describeProducersInfo`, for every session
+/// (`listProducersInfoAsJSON`).
+pub(super) fn producers_info(broker: &Broker) -> Json {
+    Json::Array(
+        all_producers(broker)
+            .iter()
+            .map(|(conn, s, p)| {
+                Json::object()
+                    .with("id", p.id.to_string())
+                    .with("name", p.name.clone())
+                    .with("connectionID", conn.id())
+                    .with("sessionID", s.name.clone())
+                    .with("creationTime", p.created.to_string())
+                    .with("destination", p.address.clone())
+                    .with(
+                        "lastProducedMessageID",
+                        p.last_message_id().map_or(Json::Null, Json::from),
+                    )
+                    .with("msgSent", p.sent())
+                    .with("msgSizeSent", p.sent_size())
+            })
+            .collect(),
+    )
 }

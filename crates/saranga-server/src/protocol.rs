@@ -91,6 +91,8 @@ pub struct Connection {
     /// The stream, starting with the bytes the protocol was detected from.
     pub stream: Rewind,
     pub peer: Option<SocketAddr>,
+    /// The acceptor's end of the socket.
+    pub local: Option<SocketAddr>,
     /// What security sees of the connection.
     pub info: ConnectionInfo,
     pub acceptor: Arc<Acceptor>,
@@ -155,7 +157,7 @@ impl ProtocolManager for CoreProtocol {
 
     fn serve(&self, broker: Arc<Broker>, c: Connection) -> ServeFuture {
         Box::pin(crate::core_protocol::serve_stream(
-            broker, c.stream, c.peer, c.info, c.acceptor,
+            broker, c.stream, c.peer, c.local, c.info, c.acceptor,
         ))
     }
 }
@@ -167,6 +169,7 @@ pub async fn detect_and_serve(
     broker: Arc<Broker>,
     mut stream: Box<dyn Stream>,
     peer: Option<SocketAddr>,
+    local: Option<SocketAddr>,
     info: ConnectionInfo,
     acceptor: Arc<Acceptor>,
 ) {
@@ -208,6 +211,7 @@ pub async fn detect_and_serve(
     let connection = Connection {
         stream: Rewind::new(header, stream),
         peer,
+        local,
         info,
         acceptor,
     };

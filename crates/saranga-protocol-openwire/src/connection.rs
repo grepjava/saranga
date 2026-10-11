@@ -18,7 +18,9 @@ use saranga_message::CoreMessage;
 use saranga_security::{Authenticated, SecurityError};
 use saranga_server::postoffice::{AutoCreate, AutoCreateOptions, QueueSpec, split_fqqn};
 use saranga_server::protocol::Connection as Accepted;
-use saranga_server::session::{ClientConnection, Completion, ServerSession, SessionOptions};
+use saranga_server::session::{
+    ClientConnection, Completion, ServerSession, SessionOptions, Transport,
+};
 use saranga_server::transaction::{self, TxError, TxRef, TxState, xa_code};
 use saranga_server::{Broker, BrokerError, RoutingType};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -40,6 +42,15 @@ const TEMP_TOPIC_ADVISORY: &str = "ActiveMQ.Advisory.TempTopic";
 const DUPLICATE_ID_PROPERTY: &str = "_AMQ_DUPL_ID";
 
 // ---------------------------------------------------------------- errors
+
+/// `serviceException` of an `IOException`: the `ConnectionError` that tells
+/// the client its connection failed.
+pub(crate) fn io_connection_error(message: &str) -> DataStructure {
+    DataStructure::ConnectionError(ConnectionError {
+        exception: Some(Box::new(OwError::io(message).throwable())),
+        ..Default::default()
+    })
+}
 
 /// A Java exception for an `ExceptionResponse` or `ConnectionError`.
 #[derive(Debug, Clone)]
@@ -529,10 +540,12 @@ pub async fn serve(broker: Arc<Broker>, manager: Arc<Manager>, c: Accepted) {
     let remote = c.info.remote_address.trim_start_matches('/').to_owned();
     let local = local_address(&c);
     let client = Arc::new(ClientConnection::new(
-        c.peer.map(|a| a.to_string()).unwrap_or_default(),
+        Transport::socket("OPENWIRE", "OpenWireConnection", c.peer, c.local),
         Arc::new(c.info),
         c.acceptor.prefixes.clone(),
     ));
+    let _registered = broker.registry().add(&client);
+    let failed = client.clone();
     let (mut rd, wr) = tokio::io::split(c.stream);
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     let writer = tokio::spawn(write_loop(wr, out_rx));
@@ -587,6 +600,7 @@ pub async fn serve(broker: Arc<Broker>, manager: Arc<Manager>, c: Accepted) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            () = failed.failed() => break,
             event = events_rx.recv() => match event {
                 Some(Event::Stop) | None => break,
             },
@@ -1473,6 +1487,12 @@ impl Connection {
                 self.add_destination(&add).await?;
             }
         }
+        let name = convert::producer_id_string(&pid);
+        let address = info.destination.as_ref().map(|d| d.physical_name());
+        if let Some(s) = self.sessions.get(&sid) {
+            s.session
+                .add_producer(&name, "OPENWIRE", address.as_deref());
+        }
         self.producers.insert(pid, info);
         Ok(())
     }
@@ -1501,6 +1521,9 @@ impl Connection {
     /// `processRemoveProducer`.
     fn process_remove_producer(&mut self, id: &ProducerId) -> OwResult<()> {
         self.producers.remove(id);
+        if let Some(s) = self.sessions.get(&session_of_producer(id)) {
+            s.session.remove_producer(&convert::producer_id_string(id));
+        }
         if !self.sessions.contains_key(&session_of_producer(id)) {
             return Err(OwError::npe());
         }
@@ -1661,7 +1684,11 @@ impl Connection {
                 set_routing_type(&mut m, RoutingType::Multicast);
             }
             let session = self.sessions.get_mut(&sid).expect("checked");
+            session
+                .session
+                .set_sender(Some(convert::producer_id_string(&pid)));
             let result = session.session.send_in(m, None, tx.clone()).await;
+            session.session.set_sender(None);
             if let Err(e) = result {
                 if !should_block {
                     return Err(e.into());
@@ -2067,6 +2094,7 @@ impl Connection {
             out: self.out.clone(),
             no_local: self.no_local.clone(),
             node_id: self.broker.node_id().to_owned(),
+            client: self.client.clone(),
         });
         if info.browser {
             // A browser reads a snapshot of the queue.

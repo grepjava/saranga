@@ -18,7 +18,9 @@ use saranga_security::Authenticated;
 use saranga_server::message::{ServerMessage, now_millis};
 use saranga_server::protocol::Connection as Accepted;
 use saranga_server::queue::{DeliverySink, FORCED_DELIVERY_MESSAGE, Queue};
-use saranga_server::session::{ClientConnection, Completion, ServerSession, SessionOptions};
+use saranga_server::session::{
+    ClientConnection, Completion, ServerSession, SessionOptions, Transport,
+};
 use saranga_server::{Broker, BrokerError, RoutingType};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -210,6 +212,12 @@ enum Event {
     },
     /// A drain the client asked for is done: no more messages now.
     Drained { channel: u16, handle: u32 },
+    /// The broker closes the link (`AMQPSessionCallback.disconnect`).
+    Disconnect {
+        channel: u16,
+        handle: u32,
+        reason: String,
+    },
 }
 
 /// A sender link's credit as the queue sees it: what the client gave less
@@ -277,6 +285,14 @@ impl DeliverySink for Sink {
 
     fn supports_large(&self) -> bool {
         false
+    }
+
+    fn disconnect(&self, _consumer_id: i64, reason: &str) {
+        let _ = self.events.send(Event::Disconnect {
+            channel: self.channel,
+            handle: self.handle,
+            reason: reason.to_owned(),
+        });
     }
 
     /// `hasCredits`: credit left and the link open.
@@ -454,10 +470,11 @@ pub async fn serve(
     registry: Arc<ContainerIds>,
 ) {
     let client = Arc::new(ClientConnection::new(
-        c.peer.map(|a| a.to_string()).unwrap_or_default(),
+        Transport::socket("AMQP", "ActiveMQProtonRemotingConnection", c.peer, c.local),
         Arc::new(c.info),
         c.acceptor.prefixes.clone(),
     ));
+    let _registered = broker.registry().add(&client);
     let (rd, wr) = tokio::io::split(c.stream);
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     let writer = tokio::spawn(write_loop(wr, out_rx));
@@ -657,9 +674,13 @@ impl Conn {
         events: &mut mpsc::UnboundedReceiver<Event>,
     ) {
         let max = self.settings.max_frame_size.max(frame::MIN_MAX_FRAME_SIZE);
+        let client = self.client.clone();
         while !self.closed {
             let tick = self.next_tick();
             tokio::select! {
+                // Management failed the connection: it goes as if the
+                // client had.
+                () = client.failed() => break,
                 read = r.frame(max) => match read {
                     Ok(bytes) => {
                         self.last_read = Instant::now();
@@ -1125,6 +1146,8 @@ impl Conn {
         self.send(channel, Performative::Attach(reply));
         let credits = self.settings.credits.max(0) as u32;
         let s = self.sessions.get_mut(&channel).expect("checked");
+        s.server
+            .add_producer(&attach.name, "AMQP", resolved.address.as_deref());
         let delivery_count = attach.initial_delivery_count.unwrap_or(0);
         s.links.insert(
             attach.handle,
@@ -1302,7 +1325,7 @@ impl Conn {
                         self.temp_addresses.retain(|t| t != a);
                     }
                 }
-                let _ = rl.name;
+                s.server.remove_producer(&rl.name);
             }
             Link::Coordinator(_) => {}
         }
@@ -1496,6 +1519,7 @@ impl Conn {
         let target = rl.target.clone();
         let source = rl.source.clone();
         let large_at = self.settings.min_large_message_size;
+        s.server.set_sender(Some(rl.name.clone()));
         let result = server_send(
             &mut s.server,
             &target,
@@ -1507,6 +1531,7 @@ impl Conn {
             large_at,
         )
         .await;
+        s.server.set_sender(None);
         let wait = s.server.take_completion();
         rl_topup(
             s,
@@ -1738,6 +1763,29 @@ impl Conn {
                 let s = &self.sessions[&channel];
                 let flow = self.link_flow(s, handle, count, 0, true);
                 self.send(channel, Performative::Flow(flow));
+                Ok(())
+            }
+            Event::Disconnect {
+                channel,
+                handle,
+                reason,
+            } => {
+                // ProtonServerSenderContext.close(RESOURCE_DELETED).
+                let Some(mut s) = self.sessions.remove(&channel) else {
+                    return Ok(());
+                };
+                if let Some(l) = s.links.remove(&handle) {
+                    self.close_link(&mut s, l, false).await;
+                    self.send(
+                        channel,
+                        Performative::Detach(Detach {
+                            handle,
+                            closed: true,
+                            error: Some(Error::new(condition::RESOURCE_DELETED, Some(reason))),
+                        }),
+                    );
+                }
+                self.sessions.insert(channel, s);
                 Ok(())
             }
         }

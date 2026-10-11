@@ -4,6 +4,7 @@
 //! what goes back on the wire is the protocol's business.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use saranga_buffer::SimpleString;
@@ -18,36 +19,175 @@ use crate::message::{MessageRef, NativeMessage, ServerMessage, routing_type};
 use crate::postoffice::{
     BindingQueryResult, Creator, QueueQueryResult, QueueSpec, RoutingTypes, queue_name_of,
 };
-use crate::queue::{ConsumerId, ConsumerRegistration, DeliverySink, Queue};
+use crate::queue::{ConsumerId, ConsumerMetrics, ConsumerRegistration, DeliverySink, Queue};
+use crate::registry::{ConsumerEntry, SessionEntry};
 use crate::storage::{Pending, Storage};
 use crate::transaction::{self, Outcome, Transaction, TxError, TxRef, TxState, XaError, xa_code};
 use crate::{Broker, BrokerError, Name, Result, RoutingType};
 
+/// What a connection is carried over, as management shows it.
+pub struct Transport {
+    /// `getProtocolName`: `CORE`, `AMQP`, `STOMP`, `MQTT`, `OPENWIRE`.
+    pub protocol: &'static str,
+    /// The class Artemis implements the connection with
+    /// (`connection.getClass().getSimpleName()`).
+    pub implementation: &'static str,
+    /// `getRemoteAddress`: `127.0.0.1:51234`.
+    pub remote_address: String,
+    /// `getTransportLocalAddress`: `127.0.0.1:61616`, `[::1]:61616`.
+    pub local_address: String,
+}
+
+impl Transport {
+    /// A connection over a socket, its addresses as Netty's
+    /// `SocketAddressUtil` prints them.
+    pub fn socket(
+        protocol: &'static str,
+        implementation: &'static str,
+        peer: Option<std::net::SocketAddr>,
+        local: Option<std::net::SocketAddr>,
+    ) -> Self {
+        let text = |a: Option<std::net::SocketAddr>, enclose: bool| {
+            a.map(|a| {
+                let java = crate::core_protocol::java_socket_address(a);
+                let bare = java.trim_start_matches('/');
+                match a {
+                    // IPV6Util.encloseHost
+                    std::net::SocketAddr::V6(v6) if enclose => {
+                        let host = &bare[..bare.len() - v6.port().to_string().len() - 1];
+                        format!("[{host}]:{}", v6.port())
+                    }
+                    _ => bare.to_owned(),
+                }
+            })
+            .unwrap_or_default()
+        };
+        Self {
+            protocol,
+            implementation,
+            remote_address: text(peer, false),
+            local_address: text(local, true),
+        }
+    }
+
+    /// A connection inside the broker (management's own sends).
+    pub fn internal(name: &str) -> Self {
+        Self {
+            protocol: "CORE",
+            implementation: "RemotingConnectionImpl",
+            remote_address: name.to_owned(),
+            local_address: name.to_owned(),
+        }
+    }
+}
+
 /// What every protocol's connection shares with its sessions
 /// (`RemotingConnection` as the server session sees it).
 pub struct ClientConnection {
+    /// `getID`: eight hex digits, as Netty's `ChannelId.asShortText`.
+    id: String,
+    transport: Transport,
+    created: i64,
     client_id: Mutex<Option<String>>,
     /// Temporary queues, deleted when the connection goes away.
     temp_queues: Mutex<Vec<Name>>,
-    remote_address: String,
     /// What the security store knows of this connection.
     security_info: Arc<ConnectionInfo>,
     /// The acceptor's address prefixes.
     prefixes: Vec<(String, RoutingType)>,
+    sessions: Mutex<Vec<Arc<SessionEntry>>>,
+    /// Management closed the connection (`fail`).
+    failed: AtomicBool,
+    fail_notify: tokio::sync::Notify,
 }
 
 impl ClientConnection {
     pub fn new(
-        remote_address: String,
+        transport: Transport,
         security_info: Arc<ConnectionInfo>,
         prefixes: Vec<(String, RoutingType)>,
     ) -> Self {
+        let id = uuid::Uuid::new_v4().as_bytes()[..4]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         Self {
+            id,
+            transport,
+            created: crate::message::now_millis(),
             client_id: Mutex::default(),
             temp_queues: Mutex::default(),
-            remote_address,
             security_info,
             prefixes,
+            sessions: Mutex::default(),
+            failed: AtomicBool::new(false),
+            fail_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn protocol(&self) -> &'static str {
+        self.transport.protocol
+    }
+
+    pub fn implementation(&self) -> &'static str {
+        self.transport.implementation
+    }
+
+    pub fn local_address(&self) -> &str {
+        &self.transport.local_address
+    }
+
+    /// `getCreationTime`, in milliseconds since the epoch.
+    pub fn created(&self) -> i64 {
+        self.created
+    }
+
+    /// The sessions open on the connection (`getSessions(connectionID)`).
+    pub fn sessions(&self) -> Vec<Arc<SessionEntry>> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn add_session(&self, session: Arc<SessionEntry>) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(session);
+    }
+
+    fn remove_session(&self, session: &Arc<SessionEntry>) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|s| !Arc::ptr_eq(s, session));
+    }
+
+    /// `RemotingConnection.fail`, from management: the protocol closes the
+    /// connection as if the client had gone.
+    pub fn fail(&self) {
+        self.failed.store(true, Ordering::SeqCst);
+        self.fail_notify.notify_waiters();
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::SeqCst)
+    }
+
+    /// Completes once management has failed the connection; the protocol's
+    /// read loop waits on it with the socket.
+    pub async fn failed(&self) {
+        loop {
+            let notified = self.fail_notify.notified();
+            if self.is_failed() {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -77,7 +217,7 @@ impl ClientConnection {
     }
 
     pub fn remote_address(&self) -> &str {
-        &self.remote_address
+        &self.transport.remote_address
     }
 
     pub fn security_info(&self) -> Arc<ConnectionInfo> {
@@ -135,6 +275,7 @@ struct ServerConsumer {
     id: ConsumerId,
     queue: Queue,
     browse_only: bool,
+    metrics: Arc<ConsumerMetrics>,
 }
 
 /// The journal writes a request lined up, and the queue updates that must
@@ -214,6 +355,10 @@ pub struct ServerSession {
     actions: Vec<Box<dyn FnOnce() + Send>>,
     /// Permission checks are off (a send the broker makes).
     unchecked: bool,
+    /// What management sees of the session.
+    entry: Arc<SessionEntry>,
+    /// The producer the next sends are counted against.
+    sender: Option<String>,
 }
 
 /// What [`ServerSession::send_message`] sends besides the message.
@@ -240,9 +385,20 @@ impl ServerSession {
         let tx =
             (!options.xa).then(|| Transaction::new_ref(broker.post_office().ids().next(), None));
         let security_info = conn.security_info();
+        let entry = Arc::new(SessionEntry::new(
+            options.name.clone(),
+            options.username.clone(),
+            authenticated.validated_user.clone(),
+            &conn,
+            options.default_address.clone(),
+        ));
+        conn.add_session(entry.clone());
+        broker.registry().session_created();
         Self {
             broker,
             conn,
+            entry,
+            sender: None,
             name: options.name,
             auth: SecurityAuth {
                 username: options.username,
@@ -270,6 +426,29 @@ impl ServerSession {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// What management sees of the session.
+    pub fn entry(&self) -> &Arc<SessionEntry> {
+        &self.entry
+    }
+
+    /// `addProducer`: a producer the protocol names, to `address` or to
+    /// any.
+    pub fn add_producer(&self, name: &str, protocol: &str, address: Option<&str>) {
+        let id = self.broker.registry().next_producer_id();
+        self.entry.add_producer(id, name, protocol, address);
+    }
+
+    /// `removeProducer`.
+    pub fn remove_producer(&self, name: &str) {
+        self.entry.remove_producer(name);
+    }
+
+    /// The producer the following sends are counted against
+    /// (`send(..., senderName)`).
+    pub fn set_sender(&mut self, name: Option<String>) {
+        self.sender = name;
     }
 
     pub fn broker(&self) -> &Arc<Broker> {
@@ -392,6 +571,9 @@ impl ServerSession {
     /// queues: once the record is written when `defer` (commits), at once
     /// otherwise (rollbacks).
     fn finish(&mut self, mut outcome: Outcome, defer: bool) -> Result<()> {
+        for c in self.consumers.values() {
+            c.metrics.transaction_ended();
+        }
         let storage = self.storage();
         if let Some(p) = outcome.write(storage.as_deref())? {
             self.ops.push(p);
@@ -575,6 +757,9 @@ impl ServerSession {
         let address: Name = match &message.address {
             Some(a) => {
                 let a: Name = a.to_string_lossy().into();
+                if self.default_address.is_none() {
+                    self.entry.set_default_address(&a);
+                }
                 self.default_address.get_or_insert_with(|| a.clone());
                 a
             }
@@ -656,6 +841,25 @@ impl ServerSession {
             }
         });
         r.scheduled_time = scheduled_time;
+        // updateProducerMetrics, with the size before routing.
+        if !self.unchecked {
+            let size = match r.message.large() {
+                Some(body) => body.size() as i64,
+                None => r.message.encode_size() as i64,
+            };
+            let user_id = r
+                .message
+                .core()
+                .user_id
+                .map(|u| uuid::Uuid::from_bytes(u).to_string());
+            self.entry.producer_sent(
+                self.broker.registry(),
+                self.sender.as_deref(),
+                &address,
+                user_id,
+                size,
+            );
+        }
         let storage = self.storage();
         // checkDuplicateID: a send outside a transaction gets one of its own
         // so the ID is journaled with the message.
@@ -1460,28 +1664,45 @@ impl ServerSession {
                 _ => return Err(e),
             }
         }
+        let filter_string = filter.clone().filter(|f| !f.trim().is_empty());
         let filter = post_office.filters().create(filter.as_deref())?;
         let c = queue.config();
         if !browse_only && c.max_consumers != -1 && queue.consumer_count() >= c.max_consumers {
             return Err(BrokerError::max_consumer_limit_reached(&c.address, &c.name));
         }
         let id = self.broker.next_consumer_id();
+        let sink = sink(&queue);
+        let metrics = Arc::new(ConsumerMetrics::default());
         queue.add_consumer(ConsumerRegistration {
             id,
             client_id: consumer_id,
-            sink: sink(&queue),
+            sink: sink.clone(),
             filter,
             priority,
             browse_only,
             pre_acknowledge: self.pre_acknowledge,
             started: self.started,
+            metrics: metrics.clone(),
         });
+        self.entry.add_consumer(Arc::new(ConsumerEntry {
+            id: consumer_id,
+            sequential_id: id,
+            session: self.name.clone(),
+            queue: queue.clone(),
+            filter: filter_string,
+            browse_only,
+            created: crate::message::now_millis(),
+            metrics: metrics.clone(),
+            sink,
+        }));
+        self.broker.registry().consumer_created();
         self.consumers.insert(
             consumer_id,
             ServerConsumer {
                 id,
                 queue,
                 browse_only,
+                metrics,
             },
         );
         Ok(())
@@ -1494,6 +1715,7 @@ impl ServerSession {
             tracing::debug!(consumer_id, "closing an unknown consumer");
             return;
         };
+        self.entry.remove_consumer(consumer_id);
         c.queue.remove_consumer(c.id, failed).await;
     }
 
@@ -1883,6 +2105,8 @@ impl ServerSession {
             self.close_consumer(id, failed).await;
         }
         self.broker.remove_session_metadata(&self.name);
+        self.entry.clear_producers();
+        self.conn.remove_session(&self.entry);
     }
 }
 

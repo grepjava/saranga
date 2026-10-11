@@ -20,7 +20,9 @@ use saranga_server::message::{ServerMessage, now_millis};
 use saranga_server::postoffice::{QueueSpec, RoutingTypes};
 use saranga_server::protocol::Connection as Accepted;
 use saranga_server::queue::{DeliverySink, Queue};
-use saranga_server::session::{ClientConnection, Completion, ServerSession, SessionOptions};
+use saranga_server::session::{
+    ClientConnection, Completion, ServerSession, SessionOptions, Transport,
+};
 use saranga_server::wildcard::WildcardConfig;
 use saranga_server::{Broker, BrokerError, RoutingType};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -104,6 +106,9 @@ enum Event {
     /// A QoS 1 or 2 delivery too large for the client is acknowledged as
     /// if sent ([MQTT-3.1.2-25]).
     Discard { packet_id: i32 },
+    /// The broker disconnected a consumer (`MQTTSessionCallback.disconnect`):
+    /// it goes (`removeItself`).
+    Disconnect { consumer: i64 },
 }
 
 /// A packet handler's failure.
@@ -180,6 +185,12 @@ impl DeliverySink for MqttSink {
 
     fn supports_large(&self) -> bool {
         false
+    }
+
+    fn disconnect(&self, consumer_id: i64, _reason: &str) {
+        let _ = self.shared.events.send(Event::Disconnect {
+            consumer: consumer_id,
+        });
     }
 
     /// `hasCredits`: no more durable QoS 1 and 2 messages than the client's
@@ -520,6 +531,9 @@ pub struct Core {
     /// `MQTTSubscriptionManager.started`.
     subscriptions_started: bool,
     client_id: String,
+    /// The session's one producer, made at its first publish
+    /// (`MQTTPublishManager.senderName`).
+    sender: Option<String>,
 }
 
 impl Core {
@@ -611,7 +625,15 @@ impl Core {
                 set_routing_type(&mut message, t);
             }
             let retained = message.clone();
-            self.session.send_in(message, None, tx.clone()).await?;
+            let sender = self.sender.get_or_insert_with(|| {
+                let name = uuid::Uuid::new_v4().to_string();
+                self.session.add_producer(&name, "MQTT", None);
+                name
+            });
+            self.session.set_sender(Some(sender.clone()));
+            let sent = self.session.send_in(message, None, tx.clone()).await;
+            self.session.set_sender(None);
+            sent?;
             if qos == 2 && !internal {
                 let prefix = self.prefix();
                 let mut s = lock(&self.state);
@@ -1372,10 +1394,12 @@ pub async fn serve(
 ) {
     let remote = c.info.remote_address.clone();
     let client = Arc::new(ClientConnection::new(
-        c.peer.map(|a| a.to_string()).unwrap_or_default(),
+        Transport::socket("MQTT", "MQTTConnection", c.peer, c.local),
         Arc::new(c.info),
         c.acceptor.prefixes.clone(),
     ));
+    let _registered = broker.registry().add(&client);
+    let failed = client.clone();
     let (mut rd, wr) = tokio::io::split(c.stream);
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     let writer = tokio::spawn(write_loop(wr, out_rx));
@@ -1416,6 +1440,12 @@ pub async fn serve(
             t => Duration::from_millis(t as u64),
         };
         tokio::select! {
+            // Management failed the connection: a failure, as if the
+            // client had gone.
+            () = failed.failed() => {
+                conn.disconnect(true).await;
+                break;
+            }
             Some(event) = events_rx.recv() => conn.on_event(event).await,
             Some(control) = control_rx.recv() => match control {
                 Control::TakeOver { done } => {
@@ -1671,6 +1701,7 @@ impl Conn {
                 core.session.cancel_one(consumer, message, false)
             }
             Event::Discard { packet_id } => core.acknowledge_delivery(packet_id, false).await,
+            Event::Disconnect { consumer } => core.session.close_consumer(consumer, false).await,
         }
         core.flush();
     }
@@ -1892,6 +1923,7 @@ impl Conn {
             shared,
             subscriptions_started: false,
             client_id: client_id.clone(),
+            sender: None,
         };
         if clean_start {
             // [MQTT-3.1.2-6] the previous session goes.
