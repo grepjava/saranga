@@ -88,7 +88,31 @@ pub struct SecurityCounters {
     pub authorization_failure: AtomicU64,
 }
 
+/// A refused login or permission, as management notifications report it
+/// (`SECURITY_AUTHENTICATION_VIOLATION`, `SECURITY_PERMISSION_VIOLATION`).
+#[derive(Debug, Clone)]
+pub enum Violation {
+    Authentication {
+        user: Option<String>,
+        cert_subject_dn: String,
+        /// As `RemotingConnection.getRemoteAddress` prints it.
+        remote_address: String,
+    },
+    Permission {
+        /// Without a queue name.
+        address: String,
+        check: CheckType,
+        /// `getCaller`.
+        user: String,
+    },
+}
+
+/// Told of each [`Violation`].
+pub type ViolationListener = Arc<dyn Fn(Violation) + Send + Sync>;
+
 pub struct SecurityStore {
+    /// The broker's notifications (`notificationService`).
+    violations: RwLock<Option<ViolationListener>>,
     config: SecurityStoreConfig,
     repository: RwLock<HierarchicalRepository<SecuritySetting>>,
     manager: Arc<dyn SecurityManager>,
@@ -115,7 +139,33 @@ impl SecurityStore {
             repository: RwLock::new(repository),
             manager,
             counters: SecurityCounters::default(),
+            violations: RwLock::default(),
         }
+    }
+
+    /// Who hears of refused logins and permissions.
+    pub fn set_violation_listener(&self, listener: ViolationListener) {
+        *self.violations.write().unwrap_or_else(|e| e.into_inner()) = Some(listener);
+    }
+
+    fn violation(&self, v: Violation) {
+        let listener = self
+            .violations
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(l) = listener {
+            l(v);
+        }
+    }
+
+    /// `authenticationFailed`: the notification.
+    fn authentication_failed(&self, user: Option<&str>, connection: &ConnectionInfo) {
+        self.violation(Violation::Authentication {
+            user: user.map(str::to_owned),
+            cert_subject_dn: connection.cert_subject_dn().to_owned(),
+            remote_address: connection.remote_address.trim_start_matches('/').to_owned(),
+        });
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -240,6 +290,7 @@ impl SecurityStore {
                 self.counters
                     .authentication_failure
                     .fetch_add(1, Ordering::Relaxed);
+                self.authentication_failed(user, connection);
                 return Err(unable_to_validate(connection, user, None));
             }
             ClusterCheck::Ignore => {}
@@ -279,6 +330,7 @@ impl SecurityStore {
             self.counters
                 .authentication_failure
                 .fetch_add(1, Ordering::Relaxed);
+            self.authentication_failed(user, connection);
             let e = unable_to_validate(connection, user, Some(connection.cert_subject_dn()));
             tracing::warn!("AMQ222216: Security problem while authenticating: {e}");
             return Err(e);
@@ -412,6 +464,11 @@ impl SecurityStore {
             .fetch_add(1, Ordering::Relaxed);
         let bare_address = saranga_config::extract_address_name(address);
         let caller = self.caller(auth);
+        self.violation(Violation::Permission {
+            address: bare_address.to_owned(),
+            check,
+            user: caller.clone(),
+        });
         Err(SecurityError(match queue.map(extract_queue_name) {
             None => format!(
                 "AMQ229032: User: {caller} does not have permission='{check}' on address {bare_address}"

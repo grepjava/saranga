@@ -22,4 +22,7 @@ pub mod store;
 pub use basic::{BasicSecurityManager, UserDirectory};
 pub use jaas::{LoginConfig, PeerCertificate, Principal, Subject};
 pub use manager::{ConnectionInfo, JaasSecurityManager, SecurityManager};
-pub use store::{Authenticated, SecurityAuth, SecurityError, SecurityStore, SecurityStoreConfig};
+pub use store::{
+    Authenticated, SecurityAuth, SecurityError, SecurityStore, SecurityStoreConfig, Violation,
+    ViolationListener,
+};

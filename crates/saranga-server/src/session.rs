@@ -16,6 +16,7 @@ use saranga_security::{Authenticated, ConnectionInfo, SecurityAuth};
 
 use crate::large::LargeBody;
 use crate::message::{MessageRef, NativeMessage, ServerMessage, routing_type};
+use crate::notifications::{NotificationType, hdr, string};
 use crate::postoffice::{
     BindingQueryResult, Creator, QueueQueryResult, QueueSpec, RoutingTypes, queue_name_of,
 };
@@ -276,6 +277,7 @@ struct ServerConsumer {
     queue: Queue,
     browse_only: bool,
     metrics: Arc<ConsumerMetrics>,
+    filter: Option<String>,
 }
 
 /// The journal writes a request lined up, and the queue updates that must
@@ -394,6 +396,7 @@ impl ServerSession {
         ));
         conn.add_session(entry.clone());
         broker.registry().session_created();
+        session_notification(&broker, &conn, &entry, NotificationType::SessionCreated);
         Self {
             broker,
             conn,
@@ -1754,13 +1757,41 @@ impl ServerSession {
             sequential_id: id,
             session: self.name.clone(),
             queue: queue.clone(),
-            filter: filter_string,
+            filter: filter_string.clone(),
             browse_only,
             created: crate::message::now_millis(),
             metrics: metrics.clone(),
             sink,
         }));
         self.broker.registry().consumer_created();
+        if !browse_only {
+            // CONSUMER_CREATED: the address, or the FQQN the client named.
+            let c = queue.config();
+            let address = if queue_name.contains("::") {
+                queue_name.to_owned()
+            } else {
+                c.address.to_string()
+            };
+            let props = self.consumer_props(consumer_id, &queue, filter_string.as_deref());
+            let validated = self.entry.validated_user.clone();
+            let cert = self.conn.security_info().cert_subject_dn().to_owned();
+            self.broker
+                .post_office()
+                .notify(NotificationType::ConsumerCreated, move |n| {
+                    let mut p = vec![(hdr::ADDRESS, string(Some(&address)))];
+                    p.extend(props.head(n));
+                    p.push((hdr::USER, props.user.clone()));
+                    p.push((hdr::VALIDATED_USER, string(validated.as_deref())));
+                    p.push((hdr::CERT_SUBJECT_DN, string(Some(&cert))));
+                    p.push((hdr::REMOTE_ADDRESS, string(Some(&props.remote))));
+                    p.push((hdr::SESSION_NAME, string(Some(&props.session))));
+                    if let Some(f) = &props.filter {
+                        p.push((hdr::FILTERSTRING, string(Some(f))));
+                    }
+                    p.extend(props.tail());
+                    p
+                });
+        }
         self.consumers.insert(
             consumer_id,
             ServerConsumer {
@@ -1768,6 +1799,7 @@ impl ServerSession {
                 queue,
                 browse_only,
                 metrics,
+                filter: filter_string,
             },
         );
         Ok(())
@@ -1782,6 +1814,24 @@ impl ServerSession {
         };
         self.entry.remove_consumer(consumer_id);
         c.queue.remove_consumer(c.id, failed).await;
+        if !c.browse_only {
+            let address = c.queue.config().address.to_string();
+            let props = self.consumer_props(consumer_id, &c.queue, c.filter.as_deref());
+            self.broker
+                .post_office()
+                .notify(NotificationType::ConsumerClosed, move |n| {
+                    let head = props.head(n);
+                    let mut p = vec![(hdr::ADDRESS, string(Some(&address)))];
+                    p.extend(head.iter().take(2).cloned());
+                    p.push((hdr::FILTERSTRING, string(props.filter.as_deref())));
+                    p.extend(head.into_iter().skip(2));
+                    p.push((hdr::USER, props.user.clone()));
+                    p.push((hdr::REMOTE_ADDRESS, string(Some(&props.remote))));
+                    p.push((hdr::SESSION_NAME, string(Some(&props.session))));
+                    p.extend(props.tail());
+                    p
+                });
+        }
     }
 
     /// `PrefixUtil.getPrefix`: the acceptor prefix `name` starts with.
@@ -2172,8 +2222,109 @@ impl ServerSession {
         self.broker.remove_session_metadata(&self.name);
         self.entry.clear_producers();
         self.conn.remove_session(&self.entry);
+        session_notification(
+            &self.broker,
+            &self.conn,
+            &self.entry,
+            NotificationType::SessionClosed,
+        );
+    }
+
+    /// What `CONSUMER_CREATED` and `CONSUMER_CLOSED` say of a consumer.
+    fn consumer_props(
+        &self,
+        consumer_id: i64,
+        queue: &Queue,
+        filter: Option<&str>,
+    ) -> ConsumerProps {
+        ConsumerProps {
+            queue: queue.name().to_string(),
+            consumer_count: queue.consumer_count(),
+            user: string(self.username()),
+            remote: self.conn.remote_address().to_owned(),
+            session: self.name.clone(),
+            filter: filter.map(str::to_owned),
+            client_id: self.conn.client_id(),
+            consumer_id,
+        }
     }
 }
+
+/// The parts of a consumer notification.
+struct ConsumerProps {
+    queue: String,
+    consumer_count: i32,
+    user: saranga_buffer::PropertyValue,
+    remote: String,
+    session: String,
+    filter: Option<String>,
+    client_id: Option<String>,
+    consumer_id: i64,
+}
+
+impl ConsumerProps {
+    /// Cluster name, routing name, distance and consumer count.
+    fn head(
+        &self,
+        n: &crate::notifications::Notifier,
+    ) -> Vec<(&'static str, saranga_buffer::PropertyValue)> {
+        use saranga_buffer::PropertyValue as V;
+        vec![
+            (
+                hdr::CLUSTER_NAME,
+                string(Some(&n.cluster_name(&self.queue))),
+            ),
+            (hdr::ROUTING_NAME, string(Some(&self.queue))),
+            (hdr::DISTANCE, V::Int(0)),
+            (hdr::CONSUMER_COUNT, V::Int(self.consumer_count)),
+        ]
+    }
+
+    /// The client ID, if any, and the consumer's ID.
+    fn tail(&self) -> Vec<(&'static str, saranga_buffer::PropertyValue)> {
+        let mut p = Vec::new();
+        if let Some(c) = &self.client_id {
+            p.push((hdr::CLIENT_ID, string(Some(c))));
+        }
+        p.push((
+            hdr::CONSUMER_NAME,
+            saranga_buffer::PropertyValue::Long(self.consumer_id),
+        ));
+        p
+    }
+}
+
+/// `sendSessionNotification`, unless `suppress-session-notifications`.
+fn session_notification(
+    broker: &Broker,
+    conn: &ClientConnection,
+    entry: &SessionEntry,
+    kind: NotificationType,
+) {
+    if broker.management().config().suppress_session_notifications {
+        return;
+    }
+    let (connection, user, session, client_id, protocol) = (
+        conn.id().to_owned(),
+        entry.username.clone(),
+        entry.name.clone(),
+        conn.client_id(),
+        conn.protocol(),
+    );
+    broker.post_office().notify(kind, move |n| {
+        vec![
+            (hdr::CONNECTION_NAME, string(Some(&connection))),
+            (hdr::USER, string(user.as_deref())),
+            (hdr::SESSION_NAME, string(Some(&session))),
+            (hdr::CLIENT_ID, string(client_id.as_deref())),
+            (hdr::PROTOCOL_NAME, string(Some(protocol))),
+            (hdr::ADDRESS, string(Some(n.address()))),
+            (hdr::DISTANCE, saranga_buffer::PropertyValue::Int(0)),
+        ]
+    });
+}
+
+impl ServerSession {}
 
 /// The check that creating a queue of this durability needs.
 fn create_check(durable: bool) -> CheckType {

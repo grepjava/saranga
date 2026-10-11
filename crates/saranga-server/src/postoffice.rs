@@ -429,6 +429,8 @@ pub struct PostOffice {
     /// The bindings-journal records of persisted configurations, by key
     /// (`mapPersistedAddressSettings`, `mapPersistedDivertConfigurations`).
     persisted: Mutex<Persisted>,
+    /// Management notifications, once the broker is active.
+    notifier: RwLock<Option<crate::notifications::Notifier>>,
 }
 
 #[derive(Default)]
@@ -456,7 +458,74 @@ impl PostOffice {
             duplicates,
             paging,
             persisted: Mutex::default(),
+            notifier: RwLock::default(),
         })
+    }
+
+    /// Notifications are sent from now on (the broker is active).
+    pub fn set_notifier(&self, notifier: crate::notifications::Notifier) {
+        *self.notifier.write().unwrap_or_else(|e| e.into_inner()) = Some(notifier);
+    }
+
+    /// `ManagementService.sendNotification`; nothing before the broker is
+    /// active. `props` builds the properties from the notifier (for the
+    /// notification address and cluster names).
+    pub fn notify(
+        &self,
+        kind: crate::notifications::NotificationType,
+        props: impl FnOnce(
+            &crate::notifications::Notifier,
+        ) -> Vec<(&'static str, saranga_buffer::PropertyValue)>,
+    ) {
+        let guard = self.notifier.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = guard.as_ref() {
+            n.send(kind, props(n), self.ids.next());
+        }
+    }
+
+    /// `BINDING_ADDED`, `BINDING_REMOVED` and `BINDING_UPDATED` of a queue.
+    fn notify_queue_binding(&self, kind: crate::notifications::NotificationType, q: &Queue) {
+        use crate::notifications::{NotificationType as T, hdr, string};
+        use saranga_buffer::PropertyValue as V;
+        let c = q.config();
+        let filter = q.filter_string();
+        let (name, address, id) = (c.name.to_string(), c.address.to_string(), q.id());
+        self.notify(kind, move |n| {
+            let cluster = n.cluster_name(&name);
+            match kind {
+                T::BindingAdded => {
+                    let mut p = vec![
+                        (hdr::BINDING_TYPE, V::Int(0)),
+                        (hdr::ADDRESS, string(Some(&address))),
+                        (hdr::CLUSTER_NAME, string(Some(&cluster))),
+                        (hdr::ROUTING_NAME, string(Some(&name))),
+                        (hdr::BINDING_ID, V::Long(id)),
+                        (hdr::DISTANCE, V::Int(0)),
+                    ];
+                    if let Some(f) = &filter {
+                        p.push((hdr::FILTERSTRING, string(Some(f))));
+                    }
+                    p
+                }
+                T::BindingRemoved => vec![
+                    (hdr::ADDRESS, string(Some(&address))),
+                    (hdr::CLUSTER_NAME, string(Some(&cluster))),
+                    (hdr::ROUTING_NAME, string(Some(&name))),
+                    (hdr::DISTANCE, V::Int(0)),
+                    (hdr::BINDING_ID, V::Long(id)),
+                    (hdr::FILTERSTRING, string(filter.as_deref())),
+                ],
+                _ => {
+                    let mut p = vec![(hdr::CLUSTER_NAME, string(Some(&cluster)))];
+                    if let Some(f) = &filter {
+                        p.push((hdr::FILTERSTRING, string(Some(f))));
+                    }
+                    p.push((hdr::DISTANCE, V::Int(0)));
+                    p.push((hdr::ADDRESS, string(Some(&address))));
+                    p
+                }
+            }
+        });
     }
 
     fn persisted(&self) -> std::sync::MutexGuard<'_, Persisted> {
@@ -715,6 +784,8 @@ impl PostOffice {
         }
         entry.queues.push(queue.clone());
         state.queues.insert(queue.name().clone(), queue.clone());
+        drop(state);
+        self.notify_queue_binding(crate::notifications::NotificationType::BindingAdded, &queue);
         Ok(queue)
     }
 
@@ -945,6 +1016,8 @@ impl PostOffice {
         }
         entry.queues.push(queue.clone());
         state.queues.insert(queue.name().clone(), queue.clone());
+        drop(state);
+        self.notify_queue_binding(crate::notifications::NotificationType::BindingAdded, &queue);
         Ok(queue)
     }
 
@@ -1023,7 +1096,14 @@ impl PostOffice {
             )
             .map_err(Self::io)?;
         }
+        let filter_changed = filter.is_some();
         queue.update(new, filter);
+        if filter_changed {
+            self.notify_queue_binding(
+                crate::notifications::NotificationType::BindingUpdated,
+                &queue,
+            );
+        }
         Ok(Some(queue))
     }
 
@@ -1060,6 +1140,10 @@ impl PostOffice {
         {
             tracing::warn!("deleting queue {name}: {e}");
         }
+        self.notify_queue_binding(
+            crate::notifications::NotificationType::BindingRemoved,
+            &queue,
+        );
         queue.unsubscribe();
         queue.shutdown();
         if auto_delete_address && self.address_auto_deletable(&address) {
@@ -1790,7 +1874,36 @@ impl PostOffice {
         let Some(entry) = state.addresses.get_mut(&*divert.address) else {
             return Err(BrokerError::address_does_not_exist(&divert.address));
         };
+        let (name, routing_name, address) = (
+            divert.name.to_string(),
+            divert.routing_name.to_string(),
+            divert.address.to_string(),
+        );
+        let filter = d.filter.clone().filter(|f| !f.trim().is_empty());
         entry.diverts.push(Arc::new(divert));
+        drop(state);
+        // BINDING_ADDED of the DivertBinding: its cluster name is its
+        // unique name.
+        let id = self.ids.next();
+        self.notify(
+            crate::notifications::NotificationType::BindingAdded,
+            move |_| {
+                use crate::notifications::{hdr, string};
+                use saranga_buffer::PropertyValue as V;
+                let mut p = vec![
+                    (hdr::BINDING_TYPE, V::Int(2)),
+                    (hdr::ADDRESS, string(Some(&address))),
+                    (hdr::CLUSTER_NAME, string(Some(&name))),
+                    (hdr::ROUTING_NAME, string(Some(&routing_name))),
+                    (hdr::BINDING_ID, V::Long(id)),
+                    (hdr::DISTANCE, V::Int(0)),
+                ];
+                if let Some(f) = &filter {
+                    p.push((hdr::FILTERSTRING, string(Some(f))));
+                }
+                p
+            },
+        );
         Ok(true)
     }
 

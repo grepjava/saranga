@@ -54,6 +54,8 @@ pub struct ManagementConfig {
     pub address: String,
     /// `management-notification-address`.
     pub notification_address: String,
+    /// `suppress-session-notifications`.
+    pub suppress_session_notifications: bool,
     /// The broker's `name`.
     pub name: String,
     /// The parsed `broker.xml`, for the attributes that report it.
@@ -67,6 +69,7 @@ impl Default for ManagementConfig {
         Self {
             address: "activemq.management".to_owned(),
             notification_address: "activemq.notifications".to_owned(),
+            suppress_session_notifications: false,
             name: "localhost".to_owned(),
             file: None,
             file_path: None,

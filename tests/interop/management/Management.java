@@ -1129,4 +1129,73 @@ public class Management {
         check(longAttr("broker", "AuthenticationCacheSize") >= 0, "AuthenticationCacheSize");
         check(longAttr("broker", "AuthorizationCacheSize") >= 0, "AuthorizationCacheSize");
     }
+
+    // ------------------------------------------------------------ notifications
+
+    /** A temporary queue on the notification address, with a filter. */
+    static ClientConsumer notifications(ClientSession s, String filter) throws Exception {
+        String q = name("notif");
+        s.createQueue(QueueConfiguration.of(q).setAddress("activemq.notifications")
+            .setRoutingType(RoutingType.MULTICAST).setDurable(false).setTemporary(true).setFilterString(filter));
+        return s.createConsumer(q);
+    }
+
+    static ClientMessage next(ClientConsumer c, String type) throws Exception {
+        ClientMessage m = c.receive(5000);
+        check(m != null, "no " + type + " notification");
+        m.acknowledge();
+        eq(type, m.getStringProperty("_AMQ_NotifType"), "notification type");
+        check(m.getLongProperty("_AMQ_NotifTimestamp") > 0, "timestamp");
+        check(m.isDurable(), "durable");
+        return m;
+    }
+
+    static void t_binding_and_consumer_notifications() throws Exception {
+        String q = name("notified");
+        try (ClientSession s = factory.createSession(); ClientConsumer n = notifications(s, "_AMQ_RoutingName = '" + q + "'")) {
+            s.start();
+            session.createQueue(QueueConfiguration.of(q).setRoutingType(RoutingType.ANYCAST).setFilterString("i > 1"));
+            ClientMessage m = next(n, "BINDING_ADDED");
+            eq(q, m.getStringProperty("_AMQ_Address"), "address");
+            eq(0, m.getIntProperty("_AMQ_Binding_Type"), "binding type");
+            eq(0, m.getIntProperty("_AMQ_Distance"), "distance");
+            eq("i > 1", m.getStringProperty("_AMQ_FilterString"), "filter");
+            check(m.getStringProperty("_AMQ_ClusterName").startsWith(q) && m.getStringProperty("_AMQ_ClusterName").length() > q.length(), "cluster name");
+            check(m.getLongProperty("_AMQ_Binding_ID") > 0, "binding id");
+            try (ClientConsumer c = session.createConsumer(q, "j = 2")) {
+                m = next(n, "CONSUMER_CREATED");
+                eq(q, m.getStringProperty("_AMQ_Address"), "address");
+                eq(1, m.getIntProperty("_AMQ_ConsumerCount"), "consumer count");
+                eq("j = 2", m.getStringProperty("_AMQ_FilterString"), "filter");
+                eq("unavailable", m.getStringProperty("_AMQ_CertSubjectDN"), "cert");
+                check(m.getStringProperty("_AMQ_SessionName") != null, "session name");
+                check(m.getStringProperty("_AMQ_RemoteAddress") != null, "remote address");
+                check(m.containsProperty("_AMQ_ConsumerName"), "consumer name");
+            }
+            m = next(n, "CONSUMER_CLOSED");
+            eq(0, m.getIntProperty("_AMQ_ConsumerCount"), "consumer count");
+            eq("j = 2", m.getStringProperty("_AMQ_FilterString"), "filter");
+            op("broker", "destroyQueue", q);
+            m = next(n, "BINDING_REMOVED");
+            eq(q, m.getStringProperty("_AMQ_Address"), "address");
+            eq("i > 1", m.getStringProperty("_AMQ_FilterString"), "filter");
+            check(n.receive(200) == null, "nothing more");
+        }
+    }
+
+    static void t_session_notifications() throws Exception {
+        try (ClientSession s = factory.createSession(); ClientConsumer n = notifications(s, "_AMQ_NotifType LIKE 'SESSION%' AND _AMQ_User = 'notif-" + RUN + "'")) {
+            s.start();
+            ClientSession other = factory.createSession("notif-" + RUN, "p", false, true, true, false, 1);
+            String name = ((org.apache.activemq.artemis.core.client.impl.ClientSessionInternal) other).getName();
+            ClientMessage m = next(n, "SESSION_CREATED");
+            eq(name, m.getStringProperty("_AMQ_SessionName"), "session name");
+            eq("CORE", m.getStringProperty("_AMQ_Protocol_Name"), "protocol");
+            eq("activemq.notifications", m.getStringProperty("_AMQ_Address"), "address");
+            check(m.getStringProperty("_AMQ_ConnectionName") != null, "connection name");
+            other.close();
+            m = next(n, "SESSION_CLOSED");
+            eq(name, m.getStringProperty("_AMQ_SessionName"), "session name");
+        }
+    }
 }

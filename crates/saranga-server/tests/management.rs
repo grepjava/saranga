@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use saranga_config as cfg;
 use saranga_server::management::Json;
-use saranga_server::postoffice::SelectorFilters;
+use saranga_server::postoffice::{QueueSpec, SelectorFilters};
 use saranga_server::session::{ClientConnection, ServerSession, SessionOptions, Transport};
 use saranga_server::transaction::Xid;
 use saranga_server::{Broker, BrokerConfig};
@@ -350,4 +350,96 @@ async fn security_settings_survive_a_restart() {
     assert_eq!(by_name("admin").get("manage"), Some(&Json::from(true)));
     let gone = op(&broker, "broker", "getRolesAsJSON", vec![s("gone.x")]).await;
     assert_eq!(gone.as_str(), Some("[]"));
+}
+
+#[tokio::test]
+async fn security_violations_are_notified() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = cfg::BrokerConfig::parse(
+        r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+             <persistence-enabled>false</persistence-enabled>
+             <security-enabled>true</security-enabled>
+           </core></configuration>"#,
+    )
+    .unwrap();
+    let mut config =
+        BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path()).unwrap();
+    let manager = saranga_security::JaasSecurityManager::new(
+        saranga_security::LoginConfig::default(),
+        None,
+        "activemq",
+        None,
+    );
+    let store = Arc::new(saranga_security::SecurityStore::new(
+        saranga_security::SecurityStoreConfig::from_broker(&file),
+        file.security_repository().unwrap(),
+        Arc::new(manager),
+    ));
+    config.security = Some(store.clone());
+    let broker = Broker::start(config).await.unwrap();
+    op(
+        &broker,
+        "broker",
+        "createAddress",
+        vec![s("activemq.notifications"), s("MULTICAST")],
+    )
+    .await;
+    let mut queue = QueueSpec::new("notified", "activemq.notifications");
+    queue.routing_type = Some(saranga_server::RoutingType::Multicast);
+    queue.durable = false;
+    broker.post_office().create_queue(queue, false).unwrap();
+
+    let info = saranga_security::ConnectionInfo {
+        remote_address: "/10.0.0.1:1234".into(),
+        certificates: None,
+        security_domain: None,
+    };
+    assert!(store.authenticate(Some("bob"), Some("x"), &info).is_err());
+    let auth = saranga_security::SecurityAuth {
+        username: Some("carol".into()),
+        password: None,
+        connection: Arc::new(info),
+        subject: None,
+    };
+    assert!(
+        store
+            .check("orders::q", Some("q"), cfg::CheckType::Send, &auth)
+            .is_err()
+    );
+    let q = broker.post_office().queue("notified").unwrap();
+    for _ in 0..100 {
+        // The queue's own BINDING_ADDED, then the two violations.
+        if q.message_count() == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let listed = op(&broker, "queue.notified", "listMessages", vec![s("")]).await;
+    let Json::Array(messages) = listed else {
+        panic!("{listed}")
+    };
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0].get("_AMQ_NotifType"), Some(&s("BINDING_ADDED")));
+    let auth_failed = &messages[1];
+    assert_eq!(
+        auth_failed.get("_AMQ_NotifType"),
+        Some(&s("SECURITY_AUTHENTICATION_VIOLATION"))
+    );
+    assert_eq!(auth_failed.get("_AMQ_User"), Some(&s("bob")));
+    assert_eq!(
+        auth_failed.get("_AMQ_RemoteAddress"),
+        Some(&s("10.0.0.1:1234"))
+    );
+    assert_eq!(
+        auth_failed.get("_AMQ_CertSubjectDN"),
+        Some(&s("unavailable"))
+    );
+    let denied = &messages[2];
+    assert_eq!(
+        denied.get("_AMQ_NotifType"),
+        Some(&s("SECURITY_PERMISSION_VIOLATION"))
+    );
+    assert_eq!(denied.get("_AMQ_Address"), Some(&s("orders")));
+    assert_eq!(denied.get("_AMQ_CheckType"), Some(&s("SEND")));
+    assert_eq!(denied.get("_AMQ_User"), Some(&s("carol")));
 }

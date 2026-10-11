@@ -352,6 +352,7 @@ impl BrokerConfig {
             management: crate::management::ManagementConfig {
                 address: config.management_address.clone(),
                 notification_address: config.management_notification_address.clone(),
+                suppress_session_notifications: config.suppress_session_notifications,
                 name: config.name.clone(),
                 file: Some(Arc::new(config.clone())),
                 file_path: None,

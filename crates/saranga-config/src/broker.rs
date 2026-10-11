@@ -381,6 +381,9 @@ pub struct BrokerConfig {
     pub management_address: String,
     /// `management-notification-address`.
     pub management_notification_address: String,
+    /// `suppress-session-notifications`: no `SESSION_CREATED` and
+    /// `SESSION_CLOSED` notifications.
+    pub suppress_session_notifications: bool,
     /// `internal-naming-prefix`: the start of the names of the broker's own
     /// resources.
     pub internal_naming_prefix: String,
@@ -521,6 +524,7 @@ impl Default for BrokerConfig {
             reject_empty_validated_user: false,
             management_address: "activemq.management".to_owned(),
             management_notification_address: "activemq.notifications".to_owned(),
+            suppress_session_notifications: false,
             internal_naming_prefix: "$.artemis.internal.".to_owned(),
             mqtt_session_scan_interval: 5000,
             mqtt_session_state_persistence_timeout: 5000,

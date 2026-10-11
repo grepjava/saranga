@@ -536,6 +536,9 @@ fn parse_scalars(
     if let Some(v) = s.non_empty_string("management-notification-address")? {
         config.management_notification_address = v;
     }
+    if let Some(v) = s.bool("suppress-session-notifications") {
+        config.suppress_session_notifications = v;
+    }
     if let Some(v) = s.bool("large-message-sync") {
         config.large_message_sync = v;
     }

@@ -15,6 +15,7 @@ pub mod large;
 pub mod management;
 pub mod message;
 pub mod node;
+pub mod notifications;
 pub mod paging;
 pub mod postoffice;
 pub mod protocol;
@@ -534,6 +535,22 @@ impl Broker {
             broker.security_records().insert(address_match, *id);
         }
         spawn_transaction_reaper(&broker, config.transaction_timeout_scan_period);
+        // The broker is active: notifications go out from now on.
+        broker
+            .post_office
+            .set_notifier(notifications::Notifier::start(
+                &broker.post_office,
+                broker.management.config().notification_address.clone(),
+                broker.node_id.clone(),
+            ));
+        if let Some(store) = &broker.security {
+            let po = Arc::downgrade(&broker.post_office);
+            store.set_violation_listener(Arc::new(move |v| {
+                if let Some(po) = po.upgrade() {
+                    notifications::security_violation(&po, v);
+                }
+            }));
+        }
         // loadProtocolServices: each protocol sets itself up once the
         // journals are loaded.
         for p in broker.protocols.clone() {
@@ -762,6 +779,19 @@ impl Broker {
         acceptor: Acceptor,
     ) -> std::io::Result<()> {
         let acceptor = Arc::new(acceptor);
+        // NettyAcceptor.start: ACCEPTOR_STARTED with the port it listens on.
+        let port = listener
+            .local_addr()
+            .map_or(i32::from(acceptor.port), |a| i32::from(a.port()));
+        let host = acceptor.host.clone();
+        self.post_office.notify(notifications::NotificationType::AcceptorStarted, move |_| {
+            use saranga_buffer::PropertyValue as V;
+            vec![
+                ("factory", notifications::string(Some("org.apache.activemq.artemis.core.remoting.impl.netty.NettyAcceptorFactory"))),
+                ("host", notifications::string(Some(&host))),
+                ("port", V::Int(port)),
+            ]
+        });
         loop {
             let (stream, peer) = listener.accept().await?;
             tracing::debug!(%peer, "connection accepted");
