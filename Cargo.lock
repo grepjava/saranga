@@ -1691,6 +1691,10 @@ dependencies = [
 [[package]]
 name = "saranga-protocol-openwire"
 version = "0.0.1"
+dependencies = [
+ "flate2",
+ "thiserror",
+]
 
 [[package]]
 name = "saranga-protocol-stomp"
