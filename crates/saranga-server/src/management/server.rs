@@ -186,9 +186,9 @@ pub(super) async fn attribute(
         "SecurityInvalidationInterval" => {
             Json::from(file.map_or(10_000, |f| f.security_invalidation_interval))
         }
-        "MessageCounterEnabled" => Json::from(false),
-        "MessageCounterSamplePeriod" => Json::from(10_000i64),
-        "MessageCounterMaxDayCount" => Json::from(10i32),
+        "MessageCounterEnabled" => Json::from(m.counters().enabled()),
+        "MessageCounterSamplePeriod" => Json::from(m.counters().sample_period()),
+        "MessageCounterMaxDayCount" => Json::from(m.counters().max_day_count()),
         "AsyncConnectionExecutionEnabled" => Json::from(true),
         "IncomingInterceptorClassNames"
         | "OutgoingInterceptorClassNames"
@@ -541,6 +541,50 @@ pub(super) async fn invoke(
     }
     if let Some(outcome) = super::security::invoke(m, broker, call).await {
         return Some(outcome);
+    }
+
+    // Message counters.
+    let counters = m.counters();
+    if call.is("enableMessageCounters", &[]).is_some() {
+        counters.set_enabled(broker, true);
+        return Some(Ok(Json::Null));
+    }
+    if call.is("disableMessageCounters", &[]).is_some() {
+        counters.set_enabled(broker, false);
+        return Some(Ok(Json::Null));
+    }
+    if call.is("resetAllMessageCounters", &[]).is_some() {
+        counters.reset_all_counters(broker);
+        return Some(Ok(Json::Null));
+    }
+    if call.is("resetAllMessageCounterHistories", &[]).is_some() {
+        counters.reset_all_histories(broker);
+        return Some(Ok(Json::Null));
+    }
+    if let Some(a) = call.is("setMessageCounterSamplePeriod", &[L]) {
+        let period = a.l(0);
+        if period < super::counters::MIN_SAMPLE_PERIOD {
+            if period <= 0 {
+                return Some(Err(format!(
+                    "AMQ229047: invalid value: {period} sample period must be greater than 0"
+                )));
+            }
+            tracing::warn!("AMQ224072: Message Counter Sample Period too short: {period}");
+        }
+        if period != counters.sample_period() {
+            counters.reschedule(broker, period);
+        }
+        return Some(Ok(Json::Null));
+    }
+    if let Some(a) = call.is("setMessageCounterMaxDayCount", &[I]) {
+        let count = a.i(0);
+        if count <= 0 {
+            return Some(Err(format!(
+                "AMQ229046: invalid value: {count} count must be greater than 0"
+            )));
+        }
+        counters.set_max_day_count(count);
+        return Some(Ok(Json::Null));
     }
 
     // Addresses.

@@ -539,6 +539,15 @@ fn parse_scalars(
     if let Some(v) = s.bool("suppress-session-notifications") {
         config.suppress_session_notifications = v;
     }
+    if let Some(v) = s.bool("message-counter-enabled") {
+        config.message_counter_enabled = v;
+    }
+    if let Some(v) = s.i64("message-counter-sample-period", Check::GtZero)? {
+        config.message_counter_sample_period = v;
+    }
+    if let Some(v) = s.i32("message-counter-max-day-history", Check::GtZero)? {
+        config.message_counter_max_day_history = v;
+    }
     if let Some(v) = s.string("view-permission-method-match-pattern") {
         // Pattern.compile at startup.
         let name = "view-permission-method-match-pattern";

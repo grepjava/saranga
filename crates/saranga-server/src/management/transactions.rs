@@ -14,8 +14,29 @@ use crate::transaction::{self, TxRef, Xid, xid_base64, xid_string};
 /// `DateFormat.getDateTimeInstance(SHORT, MEDIUM)` in the `en_US` locale
 /// of JDK 20 and later, in UTC: `10/11/26, 11:33:10 AM` (a narrow no-break
 /// space before the marker).
-fn short_medium(millis: i64) -> String {
-    // Days since the epoch to a civil date (Howard Hinnant's algorithm).
+pub(super) fn short_medium(millis: i64) -> String {
+    let (y, m, d, tod) = civil(millis);
+    let h = tod / 3600;
+    let h12 = if h % 12 == 0 { 12 } else { h % 12 };
+    format!(
+        "{m}/{d}/{:02}, {h12}:{:02}:{:02}\u{202f}{}",
+        y.rem_euclid(100),
+        tod % 3600 / 60,
+        tod % 60,
+        if h < 12 { "AM" } else { "PM" }
+    )
+}
+
+/// `DateFormat.getDateInstance(SHORT)` in the `en_US` locale, in UTC:
+/// `10/11/26`.
+pub(super) fn short_date(millis: i64) -> String {
+    let (y, m, d, _) = civil(millis);
+    format!("{m}/{d}/{:02}", y.rem_euclid(100))
+}
+
+/// Year, month, day and second of the day of an epoch time in UTC
+/// (Howard Hinnant's algorithm).
+fn civil(millis: i64) -> (i64, i64, i64, i64) {
     let secs = millis.div_euclid(1000);
     let z = secs.div_euclid(86_400) + 719_468;
     let tod = secs.rem_euclid(86_400);
@@ -27,15 +48,7 @@ fn short_medium(millis: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
-    let h = tod / 3600;
-    let h12 = if h % 12 == 0 { 12 } else { h % 12 };
-    format!(
-        "{m}/{d}/{:02}, {h12}:{:02}:{:02}\u{202f}{}",
-        y.rem_euclid(100),
-        tod % 3600 / 60,
-        tod % 60,
-        if h < 12 { "AM" } else { "PM" }
-    )
+    (y, m, d, tod)
 }
 
 /// `new String(bytes)`: the platform charset, UTF-8.
@@ -226,7 +239,7 @@ pub(super) async fn invoke(broker: &Arc<Broker>, call: &Call<'_>) -> Option<Outc
 
 #[cfg(test)]
 mod tests {
-    use super::short_medium;
+    use super::{short_date, short_medium};
 
     #[test]
     fn short_medium_dates() {
@@ -236,5 +249,6 @@ mod tests {
             short_medium(1_791_723_909_000),
             "10/11/26, 1:05:09\u{202f}PM"
         );
+        assert_eq!(short_date(1_791_723_909_000), "10/11/26");
     }
 }

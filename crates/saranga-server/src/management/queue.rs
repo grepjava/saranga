@@ -170,6 +170,28 @@ pub(super) async fn invoke(broker: &Arc<Broker>, q: &Queue, call: &Call<'_>) -> 
         };
     }
     let count = |n: usize| Some(Ok(Json::from(n as i32)));
+    // Message counters.
+    let counters = broker.management().counters();
+    if call.is("listMessageCounter", &[]).is_some() {
+        return Some(Ok(Json::from(
+            counters.with(q, |c| c.take_json().to_string()),
+        )));
+    }
+    if call.is("resetMessageCounter", &[]).is_some() {
+        counters.with(q, |c| c.reset_counter());
+        return Some(Ok(Json::Null));
+    }
+    if call.is("listMessageCounterAsHTML", &[]).is_some() {
+        return Some(Ok(Json::from(counters.with(q, |c| c.take_html()))));
+    }
+    if call.is("listMessageCounterHistory", &[]).is_some() {
+        return Some(Ok(Json::from(
+            counters.with(q, |c| c.history_json().to_string()),
+        )));
+    }
+    if call.is("listMessageCounterHistoryAsHTML", &[]).is_some() {
+        return Some(Ok(Json::from(counters.with(q, |c| c.history_html()))));
+    }
     if call.is("removeMessage", &[L]).is_some() {
         let a = call.is("removeMessage", &[L])?;
         let n = q

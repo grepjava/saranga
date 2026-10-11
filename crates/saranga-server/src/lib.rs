@@ -535,6 +535,9 @@ impl Broker {
             broker.security_records().insert(address_match, *id);
         }
         spawn_transaction_reaper(&broker, config.transaction_timeout_scan_period);
+        if broker.management.counters().enabled() {
+            broker.management.counters().start(&broker);
+        }
         // The broker is active: notifications go out from now on.
         broker
             .post_office

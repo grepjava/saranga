@@ -384,6 +384,12 @@ pub struct BrokerConfig {
     /// `suppress-session-notifications`: no `SESSION_CREATED` and
     /// `SESSION_CLOSED` notifications.
     pub suppress_session_notifications: bool,
+    /// `message-counter-enabled`.
+    pub message_counter_enabled: bool,
+    /// `message-counter-sample-period`, in milliseconds.
+    pub message_counter_sample_period: i64,
+    /// `message-counter-max-day-history`.
+    pub message_counter_max_day_history: i32,
     /// `management-message-rbac`: management messages also need the view
     /// or edit permission on `<prefix>.<resource>.<method>`.
     pub management_message_rbac: bool,
@@ -533,6 +539,9 @@ impl Default for BrokerConfig {
             management_address: "activemq.management".to_owned(),
             management_notification_address: "activemq.notifications".to_owned(),
             suppress_session_notifications: false,
+            message_counter_enabled: false,
+            message_counter_sample_period: 10_000,
+            message_counter_max_day_history: 10,
             management_message_rbac: false,
             management_rbac_prefix: "mops".to_owned(),
             view_permission_method_match_pattern: "^(get|is|count|list|browse|query).*$".to_owned(),

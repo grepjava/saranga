@@ -11,6 +11,7 @@
 mod address;
 pub mod args;
 mod connections;
+mod counters;
 pub mod json;
 mod messages;
 mod queue;
@@ -57,6 +58,12 @@ pub struct ManagementConfig {
     pub notification_address: String,
     /// `suppress-session-notifications`.
     pub suppress_session_notifications: bool,
+    /// `message-counter-enabled`.
+    pub message_counter_enabled: bool,
+    /// `message-counter-sample-period`.
+    pub message_counter_sample_period: i64,
+    /// `message-counter-max-day-history`.
+    pub message_counter_max_day_history: i32,
     /// `management-rbac-prefix`, when `management-message-rbac` is on.
     pub rbac_prefix: Option<String>,
     /// `view-permission-method-match-pattern`, matched against the whole
@@ -76,6 +83,9 @@ impl Default for ManagementConfig {
             address: "activemq.management".to_owned(),
             notification_address: "activemq.notifications".to_owned(),
             suppress_session_notifications: false,
+            message_counter_enabled: false,
+            message_counter_sample_period: 10_000,
+            message_counter_max_day_history: 10,
             rbac_prefix: None,
             view_permission: view_permission("^(get|is|count|list|browse|query).*$"),
             name: "localhost".to_owned(),
@@ -103,6 +113,7 @@ pub type Caller<'a> = Option<(
 /// The broker's management service.
 pub struct Management {
     config: ManagementConfig,
+    counters: counters::MessageCounters,
     /// When the broker started, in epoch milliseconds.
     started_at: i64,
 }
@@ -118,6 +129,11 @@ enum Resource {
 impl Management {
     pub fn new(config: ManagementConfig) -> Self {
         Self {
+            counters: counters::MessageCounters::new(
+                config.message_counter_enabled,
+                config.message_counter_sample_period,
+                config.message_counter_max_day_history,
+            ),
             config,
             started_at: crate::message::now_millis(),
         }
@@ -134,6 +150,11 @@ impl Management {
 
     pub fn started_at(&self) -> i64 {
         self.started_at
+    }
+
+    /// The message counters (`getMessageCounterManager`).
+    pub fn counters(&self) -> &counters::MessageCounters {
+        &self.counters
     }
 
     /// `securityCheck` with `permissionForInvoke`: with

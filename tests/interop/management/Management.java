@@ -1198,4 +1198,84 @@ public class Management {
             eq(name, m.getStringProperty("_AMQ_SessionName"), "session name");
         }
     }
+
+    // ------------------------------------------------------------ message counters
+
+    static final String DATE_TIME = "\\d{1,2}/\\d{1,2}/\\d\\d, \\d{1,2}:\\d\\d:\\d\\d\u202f[AP]M";
+
+    static JsonObject counter(String q) throws Exception {
+        return JsonUtil.readJsonObject((String) op(queue(q), "listMessageCounter"));
+    }
+
+    static void t_message_counters() throws Exception {
+        String q = newQueue("counted");
+        eq(10000L, longAttr("broker", "MessageCounterSamplePeriod"), "sample period");
+        eq(10L, longAttr("broker", "MessageCounterMaxDayCount"), "max day count");
+        JsonObject c = counter(q);
+        eq(q, c.getString("destinationName"), "destinationName");
+        check(c.isNull("destinationSubscription"), "destinationSubscription");
+        eq(true, c.getBoolean("destinationDurable"), "destinationDurable");
+        eq(0L, c.getJsonNumber("count").longValue(), "count");
+        check(c.getString("updateTimestamp").matches(DATE_TIME), "updateTimestamp " + c);
+        op("broker", "setMessageCounterSamplePeriod", 1000L);
+        op("broker", "enableMessageCounters");
+        try {
+            eq(true, attr("broker", "MessageCounterEnabled"), "enabled");
+            eq(1000L, longAttr("broker", "MessageCounterSamplePeriod"), "sample period");
+            send(q, 3);
+            long deadline = System.currentTimeMillis() + 10_000;
+            long depthDelta = 0;
+            do {
+                Thread.sleep(200);
+                c = counter(q);
+                depthDelta += c.getJsonNumber("messageCountDelta").longValue();
+            } while (c.getJsonNumber("count").longValue() < 3 && System.currentTimeMillis() < deadline);
+            eq(3L, c.getJsonNumber("count").longValue(), "count " + c);
+            eq(3L, c.getJsonNumber("countDelta").longValue(), "countDelta");
+            eq(3L, c.getJsonNumber("messageCount").longValue(), "messageCount");
+            eq(3L, depthDelta, "messageCountDelta");
+            check(c.getString("lastAddTimestamp").matches(DATE_TIME), "lastAddTimestamp " + c);
+            c = counter(q);
+            eq(0L, c.getJsonNumber("countDelta").longValue(), "countDelta taken");
+            eq(0L, c.getJsonNumber("messageCountDelta").longValue(), "messageCountDelta taken");
+
+            JsonObject h = JsonUtil.readJsonObject((String) op(queue(q), "listMessageCounterHistory"));
+            JsonArray days = h.getJsonArray("dayCounters");
+            eq(1, days.size(), "days " + h);
+            check(days.getJsonObject(0).getString("date").matches("\\d{1,2}/\\d{1,2}/\\d\\d"), "date " + h);
+            JsonArray hours = days.getJsonObject(0).getJsonArray("counters");
+            eq(24, hours.size(), "hours");
+            long total = 0;
+            for (int i = 0; i < 24; i++) total += Math.max(0, hours.getJsonNumber(i).longValue());
+            eq(3L, total, "messages in the history " + h);
+
+            String html = (String) op(queue(q), "listMessageCounterAsHTML");
+            check(html.startsWith("<table class=\"activemq-message-counter\">\n<tr><th>Type</th>"), "html " + html);
+            check(html.contains("<tr bgcolor=\"#FFFFFF\"><td>Queue</td><td>" + q + "</td><td>-</td><td>-</td><td>3</td><td>-</td><td>3</td><td>-</td><td>"), "html " + html);
+            String hhtml = (String) op(queue(q), "listMessageCounterHistoryAsHTML");
+            check(hhtml.startsWith("<ul>\n<li>\n  <ul>\n    <li>Queue '" + q + "'</li>\n    <li><table class=\"activemq-message-counter-history\">\n<tr><th>Date</th><th>0</th>"), "history html " + hhtml);
+            check(hhtml.contains("<td>3</td></tr>\n</table></li>\n  </ul>\n</li>\n</ul>\n"), "history html " + hhtml);
+
+            op(queue(q), "resetMessageCounter");
+            c = counter(q);
+            eq(0L, c.getJsonNumber("count").longValue(), "reset count");
+            eq(3L, c.getJsonNumber("messageCount").longValue(), "messageCount after reset");
+            eq(3L, c.getJsonNumber("messageCountDelta").longValue(), "messageCountDelta after reset");
+
+            eq("AMQ229047: invalid value: 0 sample period must be greater than 0", opFails("broker", "setMessageCounterSamplePeriod", 0L), "period 0");
+            eq("AMQ229046: invalid value: 0 count must be greater than 0", opFails("broker", "setMessageCounterMaxDayCount", 0), "max day count 0");
+            op("broker", "setMessageCounterMaxDayCount", 5);
+            eq(5L, longAttr("broker", "MessageCounterMaxDayCount"), "max day count");
+            op("broker", "setMessageCounterMaxDayCount", 10);
+            op("broker", "resetAllMessageCounterHistories");
+            op("broker", "resetAllMessageCounters");
+        } finally {
+            op("broker", "disableMessageCounters");
+            op("broker", "setMessageCounterSamplePeriod", 10000L);
+        }
+        eq(false, attr("broker", "MessageCounterEnabled"), "disabled");
+        send(q, 1);
+        Thread.sleep(1500);
+        eq(0L, counter(q).getJsonNumber("count").longValue(), "not sampled while disabled");
+    }
 }

@@ -141,7 +141,8 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **`listUser`** lists users in name order, and each user's roles in name order. Artemis lists both in `HashMap` and `HashSet` order.
 - **Notifications** not sent yet: `CONSUMER_SLOW` (with the slow-consumer policy, stage 2 of Phase 8), those of `NotificationActiveMQServerPlugin` (`CONNECTION_CREATED`, `CONNECTION_DESTROYED`, `ADDRESS_ADDED`, `ADDRESS_REMOVED`, `MESSAGE_DELIVERED`, `MESSAGE_EXPIRED`; plugins come in stage 5), `ACCEPTOR_STOPPED`, and those of clustering, bridges, discovery and grouping (Phase 10). A divert's `BINDING_ADDED` carries a new ID in `_AMQ_Binding_ID`, as Saranga's diverts have none of their own.
 - **`management-message-rbac`** checks the permission before it looks for the operation. For an operation that does not exist, a caller without the permission gets the permission error; Artemis looks for the operation's method first and answers `AMQ229069: no operation`.
-- **Not yet (stage 2 of Phase 8):** message counters and the slow-consumer policy.
+- **Message counter dates** are in UTC, as the other dates are, and so are the hours of a counter's history.
+- **Not yet (stage 2 of Phase 8):** the slow-consumer policy.
 - **Records.** Paused queues and addresses, address settings and diverts are journaled as Artemis journals them (`QUEUE_STATUS_RECORD`, `ADDRESS_STATUS_RECORD`, `ADDRESS_SETTING_RECORD_JSON`, `DIVERT_RECORD`), so they move with the data directory in both directions. Like Artemis, Saranga journals every deployed divert, configured ones included.
 
 ## Security differences

@@ -353,6 +353,9 @@ impl BrokerConfig {
                 address: config.management_address.clone(),
                 notification_address: config.management_notification_address.clone(),
                 suppress_session_notifications: config.suppress_session_notifications,
+                message_counter_enabled: config.message_counter_enabled,
+                message_counter_sample_period: config.message_counter_sample_period,
+                message_counter_max_day_history: config.message_counter_max_day_history,
                 rbac_prefix: config
                     .management_message_rbac
                     .then(|| config.management_rbac_prefix.clone()),
