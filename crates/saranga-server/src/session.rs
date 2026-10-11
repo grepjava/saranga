@@ -388,8 +388,26 @@ impl ServerSession {
     /// then already set.
     pub async fn send(
         &mut self,
+        message: CoreMessage,
+        large: Option<Arc<LargeBody>>,
+    ) -> Result<()> {
+        // doSend: outside a transaction when auto-committing or when an XA
+        // session has none.
+        let tx = if self.auto_commit_sends {
+            None
+        } else {
+            self.tx.clone()
+        };
+        self.send_in(message, large, tx).await
+    }
+
+    /// `ServerSessionImpl.send(tx, message, ...)`: as [`ServerSession::send`]
+    /// in the given transaction, or none.
+    pub async fn send_in(
+        &mut self,
         mut message: CoreMessage,
         large: Option<Arc<LargeBody>>,
+        tx: Option<TxRef>,
     ) -> Result<()> {
         let large = match large {
             Some(body) => Some(body),
@@ -430,9 +448,7 @@ impl ServerSession {
         // a fully qualified name picks).
         let (bare_address, fqqn_queue) = crate::postoffice::split_fqqn(&address);
         if let Err(e) = self.security_check(bare_address, fqqn_queue, CheckType::Send) {
-            if !self.auto_commit_sends
-                && let Some(tx) = &self.tx
-            {
+            if let Some(tx) = &tx {
                 transaction::lock(tx).mark_rollback_only(&e);
             }
             return Err(e);
@@ -467,13 +483,6 @@ impl ServerSession {
             None => ServerMessage::new(message),
         });
         r.scheduled_time = scheduled_time;
-        // doSend: outside a transaction when auto-committing or when an XA
-        // session has none.
-        let tx = if self.auto_commit_sends {
-            None
-        } else {
-            self.tx.clone()
-        };
         let storage = self.storage();
         // checkDuplicateID: a send outside a transaction gets one of its own
         // so the ID is journaled with the message.
@@ -534,6 +543,40 @@ impl ServerSession {
                 return Err(e);
             }
         };
+        self.deliver_routed(routed, tx, own_tx)
+    }
+
+    /// `MQTTUtil.sendMessageDirectlyToQueue`: the message goes to this one
+    /// queue, whatever is bound to its address, in the transaction given
+    /// or none. Its ID must be set.
+    pub fn send_to_queue(
+        &mut self,
+        message: CoreMessage,
+        large: Option<Arc<LargeBody>>,
+        queue: &Queue,
+        tx: Option<TxRef>,
+    ) -> Result<()> {
+        let scheduled_time = crate::message::scheduled_delivery_time(&message);
+        let mut r = MessageRef::new(match large {
+            Some(body) => ServerMessage::new_large(message, body),
+            None => ServerMessage::new(message),
+        });
+        r.scheduled_time = scheduled_time;
+        let routed = self.page_routed(vec![(r, vec![queue.clone()])], tx.as_ref())?;
+        self.deliver_routed(routed, tx, None)
+    }
+
+    /// Journals routed messages and hands them to their queues: at once
+    /// (once journaled) outside a transaction, at commit inside one.
+    /// `own_tx` is the journal transaction a send outside a transaction
+    /// took for its duplicate ID.
+    fn deliver_routed(
+        &mut self,
+        routed: crate::postoffice::Routed,
+        tx: Option<TxRef>,
+        mut own_tx: Option<(i64, bool)>,
+    ) -> Result<()> {
+        let storage = self.storage();
         // processRouteToDurableQueues, for the message and each divert
         // copy: the message record with its first durable reference, then
         // one reference per durable queue.
@@ -643,9 +686,27 @@ impl ServerSession {
         } else {
             self.tx.clone()
         };
+        if !self.consumers.contains_key(&consumer_id)
+            && let Some(tx) = &self.tx
+        {
+            transaction::lock(tx)
+                .mark_rollback_only(&BrokerError::consumer_doesnt_exist(consumer_id));
+        }
+        self.acknowledge_in(consumer_id, message_id, individual, tx)
+            .await
+    }
+
+    /// As [`ServerSession::acknowledge`], in the given transaction or none.
+    pub async fn acknowledge_in(
+        &mut self,
+        consumer_id: i64,
+        message_id: i64,
+        individual: bool,
+        tx: Option<TxRef>,
+    ) -> Result<Vec<i64>> {
         let Some(c) = self.consumers.get(&consumer_id) else {
             let e = BrokerError::consumer_doesnt_exist(consumer_id);
-            if let Some(tx) = &self.tx {
+            if let Some(tx) = &tx {
                 transaction::lock(tx).mark_rollback_only(&e);
             }
             return Err(e);
@@ -1327,6 +1388,65 @@ impl ServerSession {
         self.broker
             .post_office()
             .binding_query(self.remove_prefix(address), new_fqqn)
+    }
+
+    /// `newTransaction`: a transaction of the caller's own, apart from the
+    /// session's.
+    pub fn new_transaction(&self) -> TxRef {
+        self.new_tx(None)
+    }
+
+    /// Commits a transaction of the caller's own; a rollback-only one rolls
+    /// back and fails instead.
+    pub fn commit_tx(&mut self, tx: &TxRef) -> Result<()> {
+        let result = transaction::lock(tx).commit(true);
+        match result {
+            Ok(outcome) => self.finish(outcome, true),
+            Err(failed) => {
+                let (e, outcome) = *failed;
+                self.finish(outcome, false)?;
+                Err(e)
+            }
+        }
+    }
+
+    /// Rolls back a transaction of the caller's own.
+    pub fn rollback_tx(&mut self, tx: &TxRef) -> Result<()> {
+        let outcome = transaction::lock(tx).rollback()?;
+        self.finish(outcome, false)
+    }
+
+    /// Deletes a journal record as part of `tx` (`deleteMapRecordTx`).
+    pub fn delete_record_in(&self, tx: &TxRef, record: i64) -> Result<()> {
+        let Some(s) = self.storage() else {
+            return Ok(());
+        };
+        let mut t = transaction::lock(tx);
+        s.delete_record_tx(t.id, record).map_err(io_error)?;
+        t.persistent = true;
+        Ok(())
+    }
+
+    /// Adds `id` to a duplicate-ID cache as part of `tx`
+    /// (`DuplicateIDCache.addToCache(id, tx)`).
+    pub fn add_duplicate_in(
+        &self,
+        tx: &TxRef,
+        cache: &crate::duplicate::CacheRef,
+        id: Vec<u8>,
+    ) -> Result<()> {
+        let record = self.broker.post_office().ids().next();
+        let mut t = transaction::lock(tx);
+        let c = crate::duplicate::lock(cache);
+        c.store_tx(t.id, &id, record).map_err(io_error)?;
+        t.persistent |= c.is_persistent();
+        drop(c);
+        t.duplicates.push(crate::duplicate::PendingId {
+            cache: cache.clone(),
+            id,
+            record,
+        });
+        Ok(())
     }
 
     /// `ServerSessionImpl.commit`: commits the current transaction (a

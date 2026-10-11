@@ -123,6 +123,52 @@ impl DuplicateIdCache {
         }
     }
 
+    /// `deleteFromCache`: removes an ID and deletes its record. False when
+    /// it was not there.
+    pub fn remove(&mut self, id: &[u8]) -> bool {
+        let Some(slot) = self.index.remove(id) else {
+            return false;
+        };
+        if let Some((_, record)) = self.slots[slot].take()
+            && let Some(s) = &self.storage
+            && let Err(e) = s.messages.append_delete(record, false, None)
+        {
+            tracing::warn!("AMQ222057: Error deleting duplicate cache: {e}");
+        }
+        true
+    }
+
+    /// `getMap`: the IDs held, oldest first, with their records.
+    pub fn entries(&self) -> Vec<(Vec<u8>, i64)> {
+        let n = self.slots.len();
+        (0..n)
+            .map(|i| (self.pos + i) % n.max(1))
+            .filter_map(|i| self.slots[i].clone())
+            .collect()
+    }
+
+    /// `clear`: every ID's record is deleted, in one transaction.
+    fn clear(&mut self, next_id: impl Fn() -> i64) {
+        let records: Vec<i64> = self.slots.iter().flatten().map(|(_, r)| *r).collect();
+        self.slots.clear();
+        self.index.clear();
+        self.pos = 0;
+        let Some(s) = &self.storage else {
+            return;
+        };
+        if records.is_empty() {
+            return;
+        }
+        let tx = next_id();
+        let written = records
+            .into_iter()
+            .try_for_each(|r| s.messages.append_delete_tx(tx, r, Vec::new()))
+            .and_then(|()| s.messages.append_commit(tx, false, None));
+        if let Err(e) = written {
+            tracing::warn!("AMQ222057: Error deleting duplicate cache: {e}");
+        }
+    }
+
     /// Journals a new ID inside transaction `tx` (`storeDuplicateIDTransactional`).
     pub fn store_tx(&self, tx: i64, id: &[u8], record: i64) -> StoreResult<()> {
         let Some(s) = &self.storage else {
@@ -180,6 +226,26 @@ impl DuplicateIdCaches {
             caches: Mutex::default(),
             default_size: default_size.max(0) as usize,
             storage,
+        }
+    }
+
+    /// `duplicateIDCacheExists`.
+    pub fn exists(&self, address: &str) -> bool {
+        self.caches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(address)
+    }
+
+    /// `deleteDuplicateCache`: the cache goes, and its records with it.
+    pub fn delete(&self, address: &str, next_id: impl Fn() -> i64) {
+        let removed = self
+            .caches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(address);
+        if let Some(c) = removed {
+            lock(&c).clear(next_id);
         }
     }
 

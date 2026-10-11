@@ -73,6 +73,13 @@ pub trait DeliverySink: Send + Sync {
     fn supports_large(&self) -> bool {
         true
     }
+
+    /// `SessionCallback.hasCredits(consumer, ref)`: whether this message
+    /// may go now. A consumer that says no gets nothing more until
+    /// [`Queue::prompt_delivery`].
+    fn has_credits(&self, _message: &ServerMessage) -> bool {
+        true
+    }
 }
 
 /// The most of a large message's body sent in one pass of the queue, so
@@ -115,6 +122,8 @@ pub struct QueueConfig {
     pub enabled: bool,
     pub configuration_managed: bool,
     pub user: Option<String>,
+    /// `internal`: a queue the broker keeps for itself (`$sys.mqtt.sessions`).
+    pub internal: bool,
 }
 
 /// A consumer as the queue sees it.
@@ -194,6 +203,24 @@ enum Cmd {
     /// starts the groups afresh (`setGroupBuckets`).
     Reconfigure {
         reset_groups: bool,
+    },
+    /// `promptDelivery`: try delivering again.
+    Prompt,
+    /// `deleteMatchingReferences`: queued messages the filter accepts (all
+    /// with none) are acknowledged.
+    DeleteMatching {
+        filter: Option<FilterRef>,
+        reply: oneshot::Sender<usize>,
+    },
+    /// The queued messages, for browsing (`iterator`).
+    Browse {
+        reply: oneshot::Sender<Vec<MessageRef>>,
+    },
+    /// `individualCancel`: one delivering message goes back.
+    CancelOne {
+        id: ConsumerId,
+        message_id: i64,
+        failed: bool,
     },
     Shutdown,
 }
@@ -656,6 +683,37 @@ impl Queue {
 
     pub fn force_delivery(&self, id: ConsumerId, sequence: i64) {
         self.send(Cmd::ForceDelivery { id, sequence });
+    }
+
+    /// `promptDelivery`: a consumer that refused a message may take it now.
+    pub fn prompt_delivery(&self) {
+        self.send(Cmd::Prompt);
+    }
+
+    /// `deleteMatchingReferences`: acknowledges the queued messages `filter`
+    /// accepts, or all of them, and returns how many.
+    pub async fn delete_matching(&self, filter: Option<FilterRef>) -> usize {
+        let (reply, wait) = oneshot::channel();
+        self.send(Cmd::DeleteMatching { filter, reply });
+        wait.await.unwrap_or(0)
+    }
+
+    /// The messages queued now, in delivery order (`browserIterator`).
+    pub async fn browse(&self) -> Vec<MessageRef> {
+        let (reply, wait) = oneshot::channel();
+        self.send(Cmd::Browse { reply });
+        wait.await.unwrap_or_default()
+    }
+
+    /// `individualCancel`: a message the consumer is delivering goes back
+    /// to the queue; unless the client failed, this delivery does not
+    /// count.
+    pub fn cancel_one(&self, id: ConsumerId, message_id: i64, failed: bool) {
+        self.send(Cmd::CancelOne {
+            id,
+            message_id,
+            failed,
+        });
     }
 
     /// `ServerSessionImpl.expire`: a delivered message the client found
@@ -1473,7 +1531,39 @@ impl Actor {
                 self.deliver();
                 self.force_delivery(id, sequence);
             }
-            Cmd::ResumeLarge | Cmd::Depage => {}
+            Cmd::ResumeLarge | Cmd::Depage | Cmd::Prompt => {}
+            Cmd::DeleteMatching { filter, reply } => {
+                let refs = self
+                    .messages
+                    .take_where(|r| filter.as_ref().is_none_or(|f| f.matches(r.message.core())));
+                let n = refs.len();
+                refs.into_iter().for_each(|r| self.kill(r));
+                let _ = reply.send(n);
+            }
+            Cmd::Browse { reply } => {
+                let mut refs: Vec<MessageRef> = self.messages.iter().cloned().collect();
+                refs.extend(self.scheduled.values().cloned());
+                let _ = reply.send(refs);
+            }
+            Cmd::CancelOne {
+                id,
+                message_id,
+                failed,
+            } => {
+                let r = self.consumer_mut(id).and_then(|c| {
+                    let i = c
+                        .delivering
+                        .iter()
+                        .position(|r| r.message_id() == message_id)?;
+                    c.delivering.remove(i)
+                });
+                if let Some(mut r) = r {
+                    if !failed {
+                        r.delivery_count -= 1;
+                    }
+                    self.return_refs(vec![r]);
+                }
+            }
             Cmd::Reconfigure { reset_groups } => {
                 if reset_groups {
                     self.groups.clear();
@@ -1677,6 +1767,10 @@ impl Actor {
         }) else {
             return false;
         };
+        // handle: a consumer whose protocol holds this message back is busy.
+        if !c.reg.sink.has_credits(&self.messages.get(at).message) {
+            return false;
+        }
         let mut r = if non_destructive {
             self.messages.get(at).clone()
         } else {

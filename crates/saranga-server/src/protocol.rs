@@ -117,6 +117,11 @@ pub trait ProtocolManager: Send + Sync + 'static {
 
     /// Serves the connection until it closes.
     fn serve(&self, broker: Arc<Broker>, connection: Connection) -> ServeFuture;
+
+    /// Called once the broker has loaded its journals
+    /// (`loadProtocolServices`): the protocol loads its state and starts
+    /// its periodic tasks.
+    fn start(&self, _broker: &Arc<Broker>) {}
 }
 
 /// The Core protocol (`CoreProtocolManager`).

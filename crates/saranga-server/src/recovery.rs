@@ -61,7 +61,7 @@ pub fn queue_binding(c: &QueueConfig) -> Vec<u8> {
         ring_size: Some(c.ring_size),
         enabled: Some(c.enabled),
         group_rebalance_pause_dispatch: Some(c.group_rebalance_pause_dispatch),
-        internal: Some(false),
+        internal: Some(c.internal),
     }
     .encode()
 }
@@ -103,6 +103,7 @@ pub fn queue_config(b: &PersistentQueueBindingEncoding) -> QueueConfig {
         enabled: b.enabled.unwrap_or(true),
         configuration_managed: b.configuration_managed.unwrap_or(false),
         user: b.user(),
+        internal: b.internal.unwrap_or(false),
     }
 }
 
@@ -119,7 +120,7 @@ pub fn address_binding(info: &AddressInfo) -> Vec<u8> {
         name: ss(&info.name),
         routing_types,
         auto_created: info.auto_created,
-        internal: Some(false),
+        internal: Some(info.internal),
     }
     .encode()
 }
@@ -137,6 +138,7 @@ fn address_info(id: i64, b: &PersistentAddressBindingEncoding) -> AddressInfo {
         routing_types,
         auto_created: b.auto_created,
         temporary: false,
+        internal: b.internal.unwrap_or(false),
     }
 }
 
@@ -206,7 +208,7 @@ pub async fn load_messages(
     resource_manager: &ResourceManager,
     large_store: &Arc<LargeMessageStore>,
     stored: &mut std::collections::HashSet<i64>,
-) -> Result<()> {
+) -> Result<Vec<crate::storage::ExtraRecord>> {
     let RecoveredMessages {
         messages,
         large,
@@ -216,6 +218,7 @@ pub async fn load_messages(
         cursor_acks,
         page_completes,
         page_txs,
+        extra,
     } = storage
         .load_messages()
         .map_err(|e| corrupt("loading the message journal", e))?;
@@ -358,7 +361,7 @@ pub async fn load_messages(
         tx.state = TxState::Prepared;
         resource_manager.put(p.xid, Arc::new(std::sync::Mutex::new(tx)));
     }
-    Ok(())
+    Ok(extra)
 }
 
 /// Persists a new address (`addAddressInfo` → `addAddressBinding`).

@@ -260,6 +260,18 @@ pub struct RecoveredMessages {
     pub page_completes: Vec<RecoveredCursorRecord>,
     /// Page transactions with messages left to consume.
     pub page_txs: Vec<RecoveredPageTx>,
+    /// Records of types the broker does not know, for the protocols that
+    /// wrote them (`journalRecordsListener`).
+    pub extra: Vec<ExtraRecord>,
+}
+
+/// A committed message-journal record of a type a protocol owns, such as
+/// MQTT's `MQTT_PACKET_ID_CORRELATION`.
+#[derive(Debug, Clone)]
+pub struct ExtraRecord {
+    pub id: i64,
+    pub record_type: u8,
+    pub data: Vec<u8>,
 }
 
 /// The broker's journals.
@@ -425,7 +437,14 @@ impl Storage {
                 ids::PAGE_CURSOR_COUNTER_VALUE
                 | ids::PAGE_CURSOR_COUNTER_INC
                 | ids::PAGE_CURSOR_PENDING_COUNTER => counters.push(r.id),
-                other => tracing::debug!("Extra record type {other}"),
+                other => {
+                    tracing::debug!("Extra record type {other}");
+                    out.extra.push(ExtraRecord {
+                        id: r.id,
+                        record_type: other,
+                        data: r.data,
+                    });
+                }
             }
         }
         // A page transaction whose messages were all consumed goes.
@@ -785,6 +804,33 @@ impl Storage {
     /// `appendDeleteRecordTransactional` for a paging record.
     pub fn delete_record_tx(&self, tx: i64, id: i64) -> StoreResult<()> {
         self.messages.append_delete_tx(tx, id, Vec::new())
+    }
+
+    /// Adds a record of a protocol's own type to the message journal
+    /// (`storeMapRecord`). Returns the write to wait for.
+    pub fn add_record(
+        &self,
+        id: i64,
+        record_type: u8,
+        body: Vec<u8>,
+        sync: bool,
+    ) -> StoreResult<Pending> {
+        let (c, p) = Pending::new();
+        self.messages
+            .append_add(id, record_type, body, sync, Some(c))?;
+        Ok(p)
+    }
+
+    /// Adds a record of a protocol's own type in the journal transaction
+    /// `tx`.
+    pub fn add_record_tx(
+        &self,
+        tx: i64,
+        id: i64,
+        record_type: u8,
+        body: Vec<u8>,
+    ) -> StoreResult<()> {
+        self.messages.append_add_tx(tx, id, record_type, body)
     }
 
     /// `tryAppendDeleteRecord`, not synced: `deletePageComplete`,

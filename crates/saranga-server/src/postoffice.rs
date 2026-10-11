@@ -128,6 +128,8 @@ pub struct AddressInfo {
     pub routing_types: RoutingTypes,
     pub auto_created: bool,
     pub temporary: bool,
+    /// An address the broker keeps for itself.
+    pub internal: bool,
 }
 
 /// A request to create a queue (`QueueConfiguration` before defaults).
@@ -161,6 +163,9 @@ pub struct QueueSpec {
     pub ring_size: Option<i64>,
     pub enabled: Option<bool>,
     pub user: Option<String>,
+    /// `setInternal`: a queue (and auto-created address) the broker keeps
+    /// for itself.
+    pub internal: bool,
 }
 
 impl QueueSpec {
@@ -195,6 +200,7 @@ impl QueueSpec {
             ring_size: None,
             enabled: None,
             user: None,
+            internal: false,
         }
     }
 
@@ -269,6 +275,7 @@ impl QueueSpec {
             enabled: self.enabled.unwrap_or(true),
             configuration_managed: self.configuration_managed,
             user: self.user,
+            internal: self.internal,
         }
     }
 }
@@ -457,6 +464,23 @@ impl PostOffice {
             .subscribe(id, config.durable && !config.temporary)
     }
 
+    /// A duplicate-ID cache by name, of the given size
+    /// (`getDuplicateIDCache(address, size)`).
+    pub fn named_duplicate_cache(&self, name: &str, size: i32) -> crate::duplicate::CacheRef {
+        self.duplicates.get(name, Some(size))
+    }
+
+    /// `duplicateIDCacheExists`.
+    pub fn duplicate_cache_exists(&self, name: &str) -> bool {
+        self.duplicates.exists(name)
+    }
+
+    /// `deleteDuplicateCache`.
+    pub fn delete_duplicate_cache(&self, name: &str) {
+        let ids = self.ids.clone();
+        self.duplicates.delete(name, move || ids.next());
+    }
+
     /// The duplicate-ID cache of `address` (`getDuplicateIDCache`).
     pub fn duplicate_cache(&self, address: &str) -> crate::duplicate::CacheRef {
         let size = self.settings(address).id_cache_size;
@@ -522,6 +546,7 @@ impl PostOffice {
                     routing_types: RoutingTypes::of(config.routing_type),
                     auto_created: true,
                     temporary: false,
+                    internal: config.internal,
                 })
             });
         entry.info.routing_types.add(config.routing_type);
@@ -603,8 +628,33 @@ impl PostOffice {
             routing_types,
             auto_created,
             temporary,
+            internal: false,
         };
         if !temporary && let Some(s) = self.ids.storage() {
+            crate::recovery::store_address(s, &info).map_err(Self::io)?;
+        }
+        state
+            .addresses
+            .insert(info.name.clone(), AddressEntry::new(info.clone()));
+        Ok(info)
+    }
+
+    /// The auto-created address of an internal queue
+    /// (`AddressInfo.setInternal`).
+    fn add_internal_address(&self, name: &str, routing_type: RoutingType) -> Result<AddressInfo> {
+        let mut state = self.write();
+        if let Some(entry) = state.addresses.get(name) {
+            return Ok(entry.info.clone());
+        }
+        let info = AddressInfo {
+            id: self.ids.next(),
+            name: name.into(),
+            routing_types: RoutingTypes::of(routing_type),
+            auto_created: true,
+            temporary: false,
+            internal: true,
+        };
+        if let Some(s) = self.ids.storage() {
             crate::recovery::store_address(s, &info).map_err(Self::io)?;
         }
         state
@@ -671,6 +721,9 @@ impl PostOffice {
         let config = spec.resolve(&settings);
 
         match self.address_info(&config.address) {
+            None if auto_create_address && config.internal => {
+                self.add_internal_address(&config.address, config.routing_type)?;
+            }
             None if auto_create_address => {
                 self.add_or_update_address(
                     &config.address,

@@ -338,6 +338,9 @@ pub struct Broker {
     reject_empty_validated_user: bool,
     /// Every protocol the broker serves, Core first.
     protocols: Vec<Arc<dyn protocol::ProtocolManager>>,
+    /// Message-journal records the broker does not know, until the
+    /// protocol that owns them takes them.
+    extra_records: Mutex<Vec<storage::ExtraRecord>>,
 }
 
 impl Broker {
@@ -407,8 +410,9 @@ impl Broker {
         }
         let resource_manager =
             transaction::ResourceManager::new((config.transaction_timeout / 1000) as i32);
+        let mut extra_records = Vec::new();
         if let Some(s) = &storage {
-            recovery::load_messages(
+            extra_records = recovery::load_messages(
                 s,
                 &post_office,
                 &resource_manager,
@@ -466,8 +470,14 @@ impl Broker {
             )
             .chain(config.protocols)
             .collect(),
+            extra_records: Mutex::new(extra_records),
         });
         spawn_transaction_reaper(&broker, config.transaction_timeout_scan_period);
+        // loadProtocolServices: each protocol sets itself up once the
+        // journals are loaded.
+        for p in broker.protocols.clone() {
+            p.start(&broker);
+        }
         Ok(broker)
     }
 
@@ -595,6 +605,24 @@ impl Broker {
         } else {
             listed
         }
+    }
+
+    /// Takes the recovered message-journal records of a protocol's own type
+    /// (`registerRecordsLoader`): ID and body, in journal order.
+    pub fn take_records(&self, record_type: u8) -> Vec<(i64, Vec<u8>)> {
+        let mut records = self.extra_records.lock().unwrap_or_else(|e| e.into_inner());
+        let (mine, rest) = std::mem::take(&mut *records)
+            .into_iter()
+            .partition(|r| r.record_type == record_type);
+        *records = rest;
+        mine.into_iter()
+            .map(|r: storage::ExtraRecord| (r.id, r.data))
+            .collect()
+    }
+
+    /// The broker's journals; `None` without persistence.
+    pub fn storage(&self) -> Option<&Arc<storage::Storage>> {
+        self.storage.as_ref()
     }
 
     /// The names of every protocol the broker serves.
