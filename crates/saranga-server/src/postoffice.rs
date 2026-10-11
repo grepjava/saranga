@@ -1150,7 +1150,12 @@ impl PostOffice {
         routing_type: Option<RoutingType>,
         creator: Creator<'_>,
     ) -> Result<AutoCreate> {
-        self.check_auto_create_with(address, routing_type, creator, &AutoCreateOptions::default())
+        self.check_auto_create_with(
+            address,
+            routing_type,
+            creator,
+            &AutoCreateOptions::default(),
+        )
     }
 
     /// `checkAutoCreate(QueueConfiguration)`: as [`PostOffice::check_auto_create`]

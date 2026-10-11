@@ -353,9 +353,12 @@ impl ServerSession {
         options: &crate::postoffice::AutoCreateOptions,
     ) -> Result<crate::postoffice::AutoCreate> {
         let address = self.remove_prefix(address);
-        self.broker
-            .post_office()
-            .check_auto_create_with(address, routing_type, self.creator(), options)
+        self.broker.post_office().check_auto_create_with(
+            address,
+            routing_type,
+            self.creator(),
+            options,
+        )
     }
 
     /// Starts an XA transaction apart from the session's own
@@ -953,6 +956,27 @@ impl ServerSession {
         {
             c.queue.reject(c.id, message_id);
         }
+    }
+
+    /// [`ServerSession::reject`], the dead-letter copy getting
+    /// `properties`.
+    pub fn reject_with(
+        &self,
+        consumer_id: i64,
+        message_id: i64,
+        properties: Vec<(String, saranga_buffer::PropertyValue)>,
+    ) {
+        if let Some(c) = self.consumers.get(&consumer_id)
+            && !c.browse_only
+        {
+            c.queue.reject_with(c.id, message_id, properties);
+        }
+    }
+
+    /// Whether consumers created from now on are acknowledged as their
+    /// messages go out (`ServerConsumer.setPreAcknowledge`).
+    pub fn set_pre_acknowledge(&mut self, pre_acknowledge: bool) {
+        self.pre_acknowledge = pre_acknowledge;
     }
 
     /// `ServerConsumerImpl.promptDelivery`.

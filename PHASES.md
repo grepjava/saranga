@@ -263,6 +263,20 @@ The differences from Artemis are listed in COMPAT.md.
     - selectors and no-local, browsing, and every outcome a client settles with;
     - transactions, including the unsettled acknowledgements that a rolled-back transaction keeps with their consumer.
   - **Interop.** [tests/interop/amqp/Amqp.java](tests/interop/amqp/Amqp.java) has 34 Qpid JMS tests. They pass against Artemis 2.57.0 and against Saranga: `CONFIG=tests/interop/amqp/broker.xml SUITE_FILE=tests/interop/amqp/Amqp.java scripts/interop.sh saranga`. They cover message types, properties and headers, queues and topics, durable and shared subscriptions, selectors, no-local, transactions, acknowledgement modes, dead letters, expiry, temporary destinations, browsing, anonymous producers, FQQN, priority, delivery delay, groups, receiveNoWait, a large message, messages crossing between AMQP and Core JMS, and the SASL and Open exchanges on a raw socket.
+- Stage 5 (OpenWire) is done. Its parts:
+  - **The codec** handles versions 1 to 12, tight and loose, with the marshal cache. Its command structs are generated from the ActiveMQ 5.19.10 marshallers that Artemis ships (`tests/golden-gen/openwire`). About 5,000 frames the Java marshallers wrote decode and re-encode to the same bytes.
+  - **Conversion** to and from Core ports `OpenWireMessageConverter`. `tests/golden-gen/openwire/MessageFixtures.java` checks it against Artemis's converter both ways: the Core messages match exactly, property order included, and dispatches match byte for byte except compressed bodies, which match once inflated.
+  - **The protocol head** follows `OpenWireConnection`, `AMQSession`, `AMQConsumer` and `OpenWireProtocolManager`:
+    - wire-format negotiation, `BrokerInfo`, keep-alive pings and the inactivity TTL;
+    - the pre-login gate, client ID uniqueness, and the connection's own session `-1`;
+    - sync and async sends, producer windows answered with `ProducerAck`, composite destinations and failover duplicate IDs;
+    - the prefetch window with its delivered-ack extension, prefetch 0 with `MessagePull`, forced-delivery markers and null dispatches;
+    - every ack type, matched by message ID range, with poison acks to the dead-letter address carrying the failure cause;
+    - local and XA transactions; a rollback leaves acknowledged messages with their consumers, as `returnReferences` does;
+    - durable and non-durable topic subscriptions, no-local, selectors, browsers, wildcards and virtual topic consumers mapped to FQQNs;
+    - temporary destinations, removed with their connection;
+    - the connection and destination advisories, and the replay of temporary destinations to advisory subscribers.
+  - **Interop.** [tests/interop/openwire/OpenWire.java](tests/interop/openwire/OpenWire.java) has 60 tests using the ActiveMQ 5.19.10 client, ported mostly from Artemis's `SimpleOpenWireTest` and its neighbours. They pass against Artemis 2.57.0 and against Saranga: `CONFIG=tests/interop/openwire/broker.xml SUITE_FILE=tests/interop/openwire/OpenWire.java scripts/interop.sh saranga`. They cover message types, compression and encodings, every acknowledgement mode, redelivery and the dead-letter queue, transactions and XA (two-phase commit, recovery, rollback), producer windows, async sends, queues and topics, durable subscriptions, no-local, selectors, browsing, prefetch 0 and 1, groups, composite destinations, wildcards, virtual topics, scheduled and expired messages, temporary destinations, missing destinations, auto-deletion, advisories, keep-alive, duplicate client IDs and messages crossing between OpenWire and Core JMS.
 
 ## Phase 8: Management and operations
 

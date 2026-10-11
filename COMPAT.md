@@ -66,7 +66,8 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **Byte-array properties** appear in MESSAGE headers as `[B@` followed by a hash of their contents. Artemis prints the array's identity hash. Neither means anything to a client.
 - **Frame interceptors** (Java classes) are not supported.
 - **The connection TTL** closes a silent connection when it runs out. Artemis notices at its next `connection-ttl-check-interval`, up to that much later.
-- **A `` that is the last byte read** waits for its `
+- **A `
+` that is the last byte read** waits for its `
 `. Artemis reports `There is a CR not followed by an LF` when the two arrive in different packets.
 
 ## MQTT differences
@@ -101,6 +102,21 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **Large messages:**
   - An AMQP large message is held whole in memory while the broker holds it. It is also written to its large-message file, with Artemis's record, so either broker reads the other's.
   - A copy to a dead-letter or expiry address copies the file as it is. Artemis rewrites the copy's header and properties without the expiry.
+
+## OpenWire differences
+- **`brokerName`** defaults to the host name from `HOSTNAME`, `COMPUTERNAME` or `/etc/hostname`, lowercased, then to the node ID. Artemis asks the JVM for the local host name.
+- **Browsers** get a snapshot of the queue when they are created, all of it at once, then the end-of-browse dispatch. Artemis walks the live queue within the browser's prefetch.
+- **A pull with no timeout** (prefetch 0, `receive()` or `receiveNoWait()`) gets its null dispatch when the forced-delivery marker reaches the consumer. Artemis blocks the connection's commands until then, for up to 10 seconds.
+- **A poison acknowledgement** inside a transaction moves the message to the dead-letter address at once. Artemis moves it when the transaction commits.
+- **Removal advisories** on connection close are sent for the temporary destinations the connection made. Artemis also sends them for the temporary subscription queues of its topic consumers, under `ActiveMQ.Advisory.TempQueue`.
+- **Dispatched properties** of messages that came from Core or the journal are marshalled in the order they were put, not in the order of a freshly decoded Java `HashMap`. Clients read them into a map.
+- **Not supported yet:**
+  - Address-full policies for OpenWire producers: BLOCK does not pause the connection's reads, and FAIL does not answer `ResourceAllocationException`.
+  - The `ConsumerControl` that tells a client about `queue-prefetch` 0.
+  - The slow-consumer advisory.
+  - Marking advisory addresses and subscriptions internal (`suppressInternalManagementObjects`), and the DROP policy on advisory subscriptions.
+  - `ConnectionControl` for cluster clients (`updateClusterClients`, `rebalanceClusterClients`), connection routers and interceptors.
+  - The `openwireMaxPacketChunkSize` and `actorThresholdBytes` back-pressure: frames are read and written whole.
 
 ## Security differences
 - **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule` and `LDAPLoginModule` are supported. `Krb5LoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.

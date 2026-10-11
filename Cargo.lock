@@ -1558,6 +1558,7 @@ dependencies = [
  "saranga-paging",
  "saranga-protocol-amqp",
  "saranga-protocol-mqtt",
+ "saranga-protocol-openwire",
  "saranga-protocol-stomp",
  "saranga-security",
  "saranga-server",
@@ -1695,9 +1696,17 @@ dependencies = [
  "flate2",
  "saranga-buffer",
  "saranga-client",
+ "saranga-config",
+ "saranga-core-protocol",
+ "saranga-filter",
  "saranga-message",
+ "saranga-security",
+ "saranga-server",
  "saranga-storage",
  "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

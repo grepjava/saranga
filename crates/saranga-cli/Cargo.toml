@@ -17,6 +17,7 @@ saranga-paging = { path = "../saranga-paging" }
 saranga-security = { path = "../saranga-security" }
 saranga-protocol-amqp = { path = "../saranga-protocol-amqp" }
 saranga-protocol-mqtt = { path = "../saranga-protocol-mqtt" }
+saranga-protocol-openwire = { path = "../saranga-protocol-openwire" }
 saranga-protocol-stomp = { path = "../saranga-protocol-stomp" }
 saranga-server = { path = "../saranga-server" }
 saranga-storage = { path = "../saranga-storage" }

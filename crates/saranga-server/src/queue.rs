@@ -229,6 +229,8 @@ enum Cmd {
     Reject {
         id: ConsumerId,
         message_id: i64,
+        /// Properties the dead-letter copy gets.
+        properties: Vec<(String, PropertyValue)>,
     },
     /// `backToDelivering`: a reference a rolled back transaction had
     /// acknowledged stays with the consumer as delivered.
@@ -745,7 +747,22 @@ impl Queue {
     /// `ServerConsumerImpl.reject`: a message the consumer is delivering
     /// goes to the dead-letter address now.
     pub fn reject(&self, id: ConsumerId, message_id: i64) {
-        self.send(Cmd::Reject { id, message_id });
+        self.reject_with(id, message_id, Vec::new());
+    }
+
+    /// As [`Queue::reject`], the message first getting `properties`
+    /// (OpenWire's poison acknowledgement names the failure's cause).
+    pub fn reject_with(
+        &self,
+        id: ConsumerId,
+        message_id: i64,
+        properties: Vec<(String, PropertyValue)>,
+    ) {
+        self.send(Cmd::Reject {
+            id,
+            message_id,
+            properties,
+        });
     }
 
     /// `ServerConsumerImpl.backToDelivering`: the reference goes back to
@@ -1614,7 +1631,11 @@ impl Actor {
                 Some(c) => c.delivering.push_back(r),
                 None => self.return_refs(vec![r]),
             },
-            Cmd::Reject { id, message_id } => {
+            Cmd::Reject {
+                id,
+                message_id,
+                properties,
+            } => {
                 let r = self.consumer_mut(id).and_then(|c| {
                     let i = c
                         .delivering
@@ -1622,7 +1643,14 @@ impl Actor {
                         .position(|r| r.message_id() == message_id)?;
                     c.delivering.remove(i)
                 });
-                if let Some(r) = r {
+                if let Some(mut r) = r {
+                    if !properties.is_empty() {
+                        let mut core = r.message.core().clone();
+                        for (k, v) in properties {
+                            core.properties.insert(k.as_str().into(), v);
+                        }
+                        r.message = r.message.with_core(core);
+                    }
                     let s = self.queue().settings();
                     self.send_to_dead_letter_address(r, &s);
                 }

@@ -130,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// The protocols besides Core that `saranga run` serves.
-const SERVED_PROTOCOLS: [&str; 4] = ["CORE", "STOMP", "MQTT", "AMQP"];
+const SERVED_PROTOCOLS: [&str; 5] = ["CORE", "STOMP", "MQTT", "AMQP", "OPENWIRE"];
 
 /// The protocols besides Core that `saranga run` serves, as configured.
 fn protocol_managers(
@@ -162,6 +162,7 @@ fn protocol_managers(
         Arc::new(saranga_protocol_stomp::StompProtocol),
         Arc::new(saranga_protocol_mqtt::MqttProtocol::new(mqtt)),
         Arc::new(saranga_protocol_amqp::AmqpProtocol::new(amqp)),
+        Arc::new(saranga_protocol_openwire::OpenWireProtocol::new()),
     ]
 }
 
