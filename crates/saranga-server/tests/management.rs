@@ -263,3 +263,91 @@ async fn heuristic_completion_survives_a_restart() {
     .await;
     assert!(heuristics(committed).is_empty());
 }
+
+/// A broker with a security store (security disabled, as the store exists
+/// either way).
+async fn start_with_security(dir: &Path) -> Arc<Broker> {
+    let file = cfg::BrokerConfig::parse(
+        r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+             <persistence-enabled>true</persistence-enabled>
+             <security-enabled>false</security-enabled>
+             <journal-pool-files>2</journal-pool-files>
+             <journal-file-size>65536</journal-file-size>
+           </core></configuration>"#,
+    )
+    .unwrap();
+    let mut config = BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir).unwrap();
+    let manager = saranga_security::JaasSecurityManager::new(
+        saranga_security::LoginConfig::default(),
+        None,
+        "activemq",
+        None,
+    );
+    config.security = Some(Arc::new(saranga_security::SecurityStore::new(
+        saranga_security::SecurityStoreConfig::from_broker(&file),
+        file.security_repository().unwrap(),
+        Arc::new(manager),
+    )));
+    Broker::start(config).await.unwrap()
+}
+
+#[tokio::test]
+async fn security_settings_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start_with_security(dir.path()).await;
+    let set = |json: &str| vec![s("secured.#"), s(json)];
+    op(
+        &broker,
+        "broker",
+        "addSecuritySettings",
+        set(r#"{"send":["x"]}"#),
+    )
+    .await;
+    // Replaced: only the second record remains.
+    op(
+        &broker,
+        "broker",
+        "addSecuritySettings",
+        set(r#"{"send":["a","b"],"consume":["a"],"manage":["admin"],"view":["a"]}"#),
+    )
+    .await;
+    op(
+        &broker,
+        "broker",
+        "addSecuritySettings",
+        vec![s("gone.#"), s(r#"{"send":["g"]}"#)],
+    )
+    .await;
+    op(
+        &broker,
+        "broker",
+        "removeSecuritySettings",
+        vec![s("gone.#")],
+    )
+    .await;
+    broker.stop().unwrap();
+    drop(broker);
+
+    let broker = start_with_security(dir.path()).await;
+    let roles = op(&broker, "broker", "getRolesAsJSON", vec![s("secured.x")]).await;
+    let roles = Json::parse(roles.as_str().unwrap()).unwrap();
+    let Json::Array(roles) = roles else { panic!() };
+    let by_name = |n: &str| {
+        roles
+            .iter()
+            .find(|r| r.get("name") == Some(&s(n)))
+            .unwrap_or_else(|| panic!("no role {n}"))
+            .clone()
+    };
+    assert_eq!(roles.len(), 3);
+    assert_eq!(by_name("a").get("send"), Some(&Json::from(true)));
+    assert_eq!(by_name("a").get("consume"), Some(&Json::from(true)));
+    // Artemis restores the view and edit roles as none, and grants manage to
+    // a role whose name appears in the manage list's text.
+    assert_eq!(by_name("a").get("view"), Some(&Json::from(false)));
+    assert_eq!(by_name("a").get("manage"), Some(&Json::from(true)));
+    assert_eq!(by_name("b").get("manage"), Some(&Json::from(false)));
+    assert_eq!(by_name("admin").get("manage"), Some(&Json::from(true)));
+    let gone = op(&broker, "broker", "getRolesAsJSON", vec![s("gone.x")]).await;
+    assert_eq!(gone.as_str(), Some("[]"));
+}

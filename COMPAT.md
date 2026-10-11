@@ -137,11 +137,13 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **`proxyAddress` and `proxyProtocolVersion`** are always empty: Saranga does not take the PROXY protocol.
 - **`closeSessionWithID`** closes Core sessions only. For a session of another protocol it returns false; Artemis closes the server side of any session.
 - **A STOMP consumer closed by management** is removed from its session after the `ERROR` frame. Artemis drops the subscription but leaves the server consumer in place.
-- **Not yet (stage 2 of Phase 8):** users, security settings and roles (`getRoles` is empty), notifications, message counters, `management-message-rbac` and the slow-consumer policy.
+- **`getRoles` and `getRolesAsJSON`** list roles in the order the setting gives them. Artemis lists them in `HashSet` order.
+- **`listUser`** lists users in name order, and each user's roles in name order. Artemis lists both in `HashMap` and `HashSet` order.
+- **Not yet (stage 2 of Phase 8):** notifications, message counters, `management-message-rbac` and the slow-consumer policy.
 - **Records.** Paused queues and addresses, address settings and diverts are journaled as Artemis journals them (`QUEUE_STATUS_RECORD`, `ADDRESS_STATUS_RECORD`, `ADDRESS_SETTING_RECORD_JSON`, `DIVERT_RECORD`), so they move with the data directory in both directions. Like Artemis, Saranga journals every deployed divert, configured ones included.
 
 ## Security differences
 - **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule` and `LDAPLoginModule` are supported. `Krb5LoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.
-- **Security managers.** The JAAS security manager (`<jaas-security>`) and `ActiveMQBasicSecurityManager` are supported. The basic manager keeps its users in the bindings journal, so its users move with the data directory in both directions. Any other `<security-manager>` class stops the broker from starting. As in Artemis, the basic manager has no users without persistence. Users can be added only through the bootstrap credentials until stage 2 of Phase 8.
+- **Security managers.** The JAAS security manager (`<jaas-security>`) and `ActiveMQBasicSecurityManager` are supported. The basic manager keeps its users in the bindings journal, so its users move with the data directory in both directions. Any other `<security-manager>` class stops the broker from starting. As in Artemis, the basic manager has no users without persistence. Users are added through the bootstrap credentials or through management (`addUser`).
 - **A role named `*`** in a security setting grants nothing in Artemis 2.57, despite looking like a wildcard. Saranga matches this.
 - **Security setting plugins** (`<security-setting-plugin>`) are not supported and produce a warning.

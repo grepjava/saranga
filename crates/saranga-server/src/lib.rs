@@ -353,6 +353,11 @@ pub struct Broker {
     config_loader: Mutex<Option<ConfigLoader>>,
     /// The connections, sessions, consumers and producers.
     registry: Arc<registry::Registry>,
+    /// The basic security manager's users.
+    users: Option<Arc<users::Users>>,
+    /// The records of the security settings management added, by match
+    /// (`mapPersistedSecuritySettings`).
+    security_records: Mutex<HashMap<String, i64>>,
 }
 
 /// Reads the configuration files again (`ReloadManager`).
@@ -514,7 +519,20 @@ impl Broker {
             management: management::Management::new(config.management),
             config_loader: Mutex::new(None),
             registry: Arc::default(),
+            users: config.users.clone(),
+            security_records: Mutex::default(),
         });
+        // recoverStoredSecuritySettings.
+        for (id, s) in &recovered.security_settings {
+            let address_match = s.address_match.to_string_lossy();
+            if let Some(store) = &broker.security
+                && let Err(e) =
+                    store.add_match(&address_match, management::recovered_security_setting(s))
+            {
+                tracing::warn!("security setting {address_match}: {e}");
+            }
+            broker.security_records().insert(address_match, *id);
+        }
         spawn_transaction_reaper(&broker, config.transaction_timeout_scan_period);
         // loadProtocolServices: each protocol sets itself up once the
         // journals are loaded.
@@ -587,6 +605,22 @@ impl Broker {
     /// closed and their clients told (`ServerConsumer.disconnect`).
     pub async fn disconnect_consumers(&self, queue: &queue::Queue) {
         queue.disconnect_consumers().await;
+    }
+
+    /// The security store, whether or not security is enabled.
+    pub fn security_store(&self) -> Option<&Arc<saranga_security::SecurityStore>> {
+        self.security.as_ref()
+    }
+
+    /// The basic security manager's users, when it is the one in use.
+    pub fn users(&self) -> Option<&Arc<users::Users>> {
+        self.users.as_ref()
+    }
+
+    pub(crate) fn security_records(&self) -> std::sync::MutexGuard<'_, HashMap<String, i64>> {
+        self.security_records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// The security store, when security is enabled.

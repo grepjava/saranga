@@ -103,6 +103,131 @@ impl Users {
     }
 }
 
+impl Users {
+    fn store_user(
+        state: &mut State,
+        storage: &Storage,
+        user: &str,
+        password: &str,
+    ) -> StoreResult<()> {
+        let id = storage.generate_id();
+        let record = PersistedUser {
+            username: user.into(),
+            password: password.into(),
+        };
+        storage.add_binding(id, ids::USER_RECORD, record.encode())?;
+        state
+            .users
+            .insert(user.to_owned(), (id, password.to_owned()));
+        Ok(())
+    }
+
+    fn store_roles(
+        state: &mut State,
+        storage: &Storage,
+        user: &str,
+        roles: &[String],
+    ) -> StoreResult<()> {
+        let id = storage.generate_id();
+        let record = PersistedRole {
+            username: user.into(),
+            roles: roles.iter().map(|r| r.as_str().into()).collect(),
+        };
+        storage.add_binding(id, ids::ROLE_RECORD, record.encode())?;
+        state.roles.insert(user.to_owned(), (id, roles.to_vec()));
+        Ok(())
+    }
+
+    /// `ActiveMQBasicSecurityManager.addNewUser`.
+    pub fn add_new(&self, user: &str, password: &str, roles: &[String]) -> Result<(), String> {
+        let mut state = self.lock();
+        let Some(storage) = state.storage.clone() else {
+            return Ok(());
+        };
+        if state.users.contains_key(user) {
+            return Err(format!("AMQ229223: User {user} already exists"));
+        }
+        Self::store_user(&mut state, &storage, user, password).map_err(|e| e.to_string())?;
+        Self::store_roles(&mut state, &storage, user, roles).map_err(|e| e.to_string())
+    }
+
+    /// `ActiveMQBasicSecurityManager.removeUser`.
+    pub fn remove(&self, user: &str) -> Result<(), String> {
+        let mut state = self.lock();
+        let storage = state.storage.clone();
+        let Some((id, _)) = state.users.remove(user) else {
+            return Err(format!("AMQ229224: User {user} does not exist"));
+        };
+        if let Some(s) = &storage {
+            s.delete_binding(id).map_err(|e| e.to_string())?;
+            if let Some((id, _)) = state.roles.remove(user) {
+                s.delete_binding(id).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `ActiveMQBasicSecurityManager.updateUser`: the password if given,
+    /// the roles if any are given.
+    pub fn update(
+        &self,
+        user: &str,
+        password: Option<&str>,
+        roles: Option<&[String]>,
+    ) -> Result<(), String> {
+        let mut state = self.lock();
+        let Some(storage) = state.storage.clone() else {
+            return Err(format!("AMQ229224: User {user} does not exist"));
+        };
+        if !state.users.contains_key(user) {
+            return Err(format!("AMQ229224: User {user} does not exist"));
+        }
+        let io = |e: saranga_journal::JournalError| e.to_string();
+        if let Some(password) = password {
+            if let Some((old, _)) = state.users.remove(user) {
+                storage.delete_binding(old).map_err(io)?;
+            }
+            Self::store_user(&mut state, &storage, user, password).map_err(io)?;
+        }
+        if let Some(roles) = roles.filter(|r| !r.is_empty()) {
+            if let Some((old, _)) = state.roles.remove(user) {
+                storage.delete_binding(old).map_err(io)?;
+            }
+            Self::store_roles(&mut state, &storage, user, roles).map_err(io)?;
+        }
+        Ok(())
+    }
+
+    /// `ActiveMQBasicSecurityManager.listUser`: one user and its roles, or
+    /// every user when none is named.
+    pub fn list(&self, user: Option<&str>) -> Result<Vec<(String, Vec<String>)>, String> {
+        let state = self.lock();
+        let roles = |u: &str| {
+            let mut r = state
+                .roles
+                .get(u)
+                .map(|(_, r)| r.clone())
+                .unwrap_or_default();
+            r.sort();
+            r.dedup();
+            r
+        };
+        match user.filter(|u| !u.is_empty()) {
+            Some(u) => {
+                if !state.users.contains_key(u) {
+                    return Err(format!("AMQ229224: User {u} does not exist"));
+                }
+                Ok(vec![(u.to_owned(), roles(u))])
+            }
+            None => {
+                let mut all: Vec<_> = state.users.keys().map(|u| (u.clone(), roles(u))).collect();
+                all.sort();
+                Ok(all)
+            }
+        }
+    }
+}
+
 impl saranga_security::UserDirectory for Users {
     fn user(&self, user: &str) -> Option<(String, Option<Vec<String>>)> {
         let state = self.lock();

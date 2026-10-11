@@ -234,11 +234,11 @@ impl Instance {
             })
     }
 
-    /// The security of this instance.
+    /// The security of this instance. As in Artemis, the security manager
+    /// exists with security disabled too: management adds users and
+    /// security settings through it, though no check is made.
     pub fn security(&self, config: &BrokerConfig) -> anyhow::Result<Security> {
-        if !config.security_enabled {
-            return Ok(Security::default());
-        }
+        let enabled = config.security_enabled;
         let (domain, certificate_domain) = match self
             .bootstrap
             .as_ref()
@@ -265,10 +265,19 @@ impl Instance {
         let mut login = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            LoginConfig::parse(&text, |n| self.lookup(n))
-                .with_context(|| format!("reading {}", path.display()))?
+            match LoginConfig::parse(&text, |n| self.lookup(n)) {
+                Ok(l) => l,
+                Err(e) if !enabled => {
+                    tracing::debug!("{}: {e}", path.display());
+                    LoginConfig::default()
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::from(e))
+                        .with_context(|| format!("reading {}", path.display()));
+                }
+            }
         } else {
-            if config.jaas_configs.is_empty() {
+            if enabled && config.jaas_configs.is_empty() {
                 tracing::warn!(
                     "security is enabled but {} does not exist: every login will fail",
                     path.display()
@@ -294,7 +303,7 @@ impl Instance {
             login.entries.retain(|(n, _)| n != realm);
             login.entries.push((realm.clone(), entries));
         }
-        for (name, modules) in &login.entries {
+        for (name, modules) in login.entries.iter().filter(|_| enabled) {
             for m in modules {
                 if !ModuleFactory::supports(&m.class_name) {
                     tracing::warn!(
@@ -306,7 +315,10 @@ impl Instance {
             }
         }
         for d in std::iter::once(&domain).chain(certificate_domain.as_ref()) {
-            if (path.exists() || !config.jaas_configs.is_empty()) && login.entry(d).is_none() {
+            if enabled
+                && (path.exists() || !config.jaas_configs.is_empty())
+                && login.entry(d).is_none()
+            {
                 tracing::warn!(
                     "{}: no entry for the security domain {d}: logins through it fail",
                     path.display()

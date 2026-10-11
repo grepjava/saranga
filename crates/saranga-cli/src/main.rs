@@ -431,6 +431,7 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
             config.security = security.store;
             config.users = security.users;
             config.bootstrap_users = security.bootstrap_users;
+            config.management.file_path = Some(instance.broker_xml.clone());
             let period = file.configuration_file_refresh_period.max(1) as u64;
             file_config = Some(file);
             (config, binds, std::time::Duration::from_millis(period))

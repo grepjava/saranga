@@ -81,6 +81,9 @@ pub(super) async fn attribute(
     if let Some(v) = super::connections::attribute(broker, name) {
         return Ok(Some(v));
     }
+    if let Some(v) = super::security::attribute(broker, name) {
+        return Ok(Some(v));
+    }
     Ok(Some(match name {
         "Name" => Json::from(m.config.name.clone()),
         "Version" => Json::from(VERSION),
@@ -214,12 +217,7 @@ pub(super) async fn attribute(
                 Json::Array(acceptors)
             }
         }
-        "AuthenticationCacheSize" | "AuthorizationCacheSize" => Json::from(0i64),
-        "AuthenticationSuccessCount"
-        | "AuthenticationFailureCount"
-        | "AuthorizationSuccessCount"
-        | "AuthorizationFailureCount"
-        | "PendingMirrorAcks" => Json::from(0i64),
+        "PendingMirrorAcks" => Json::from(0i64),
         "EmbeddedWebServerStarted" => Json::from(false),
         _ => return Ok(None),
     }))
@@ -539,6 +537,9 @@ pub(super) async fn invoke(
         return Some(outcome);
     }
     if let Some(outcome) = super::transactions::invoke(broker, call).await {
+        return Some(outcome);
+    }
+    if let Some(outcome) = super::security::invoke(m, broker, call).await {
         return Some(outcome);
     }
 

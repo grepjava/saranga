@@ -207,6 +207,11 @@ pub fn load_bindings(
                         .map_err(|e| corrupt("user record", e))?;
                 }
             }
+            ids::SECURITY_SETTING_RECORD => {
+                let s = saranga_storage::codec::PersistedSecuritySetting::decode(&r.data)
+                    .map_err(|e| corrupt("security setting", e))?;
+                out.security_settings.push((r.id, s));
+            }
             other => tracing::debug!("bindings record type {other} is not used yet"),
         }
     }
@@ -243,6 +248,9 @@ pub fn load_bindings(
 pub struct RecoveredBindings {
     /// Diverts journaled by `storeDivertConfiguration`.
     pub diverts: Vec<crate::postoffice::DivertDeployment>,
+    /// Security settings journaled by `storeSecuritySetting`, with their
+    /// records.
+    pub security_settings: Vec<(i64, saranga_storage::codec::PersistedSecuritySetting)>,
 }
 
 /// `loadMessageJournal` with `handleAddMessage` and the prepared

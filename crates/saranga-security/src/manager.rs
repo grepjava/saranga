@@ -55,6 +55,12 @@ pub trait SecurityManager: Send + Sync {
     fn user_from_subject(&self, subject: &Subject) -> Option<String> {
         subject.user().map(str::to_owned)
     }
+
+    /// The JAAS manager, for the management operations that edit the
+    /// files of its `PropertiesLoginModule`.
+    fn as_jaas(&self) -> Option<&JaasSecurityManager> {
+        None
+    }
 }
 
 /// `SecurityManagerUtil.authorize`: the subject has a role principal named
@@ -114,6 +120,10 @@ impl JaasSecurityManager {
 }
 
 impl SecurityManager for JaasSecurityManager {
+    fn as_jaas(&self) -> Option<&JaasSecurityManager> {
+        Some(self)
+    }
+
     fn authenticate(
         &self,
         user: Option<&str>,

@@ -1056,4 +1056,77 @@ public class Management {
         }
         eq(false, op("broker", "rollbackPreparedTransaction", "bm8="), "unknown xid");
     }
+
+    // ------------------------------------------------------------ users and security settings
+
+    static Map<String, Set<String>> users(String user) throws Exception {
+        JsonArray list = JsonUtil.readJsonArray((String) op("broker", "listUser", user));
+        Map<String, Set<String>> out = new HashMap<>();
+        for (int i = 0; i < list.size(); i++) {
+            JsonObject o = list.getJsonObject(i);
+            Set<String> roles = new TreeSet<>();
+            JsonArray r = o.getJsonArray("roles");
+            for (int j = 0; j < r.size(); j++) roles.add(r.getString(j));
+            out.put(o.getString("username"), roles);
+        }
+        return out;
+    }
+
+    static void t_users() throws Exception {
+        String user = "mgmt-user-" + RUN;
+        op("broker", "addUser", user, "secret", "r1,r2", true);
+        eq(Map.of(user, new TreeSet<>(List.of("r1", "r2"))), users(user), "listUser");
+        check(users("").containsKey(user), "listUser of everyone");
+        String e = opFails("broker", "addUser", user, "other", "r1", true);
+        check(e.contains("AMQ229223: User " + user + " already exists"), "error " + e);
+        op("broker", "resetUser", user, "changed", "r3");
+        eq(Map.of(user, new TreeSet<>(List.of("r3"))), users(user), "after resetUser");
+        op("broker", "resetUser", user, null, null, false);
+        eq(Map.of(user, new TreeSet<>(List.of("r3"))), users(user), "roles kept");
+        op("broker", "removeUser", user);
+        check(!users("").containsKey(user), "removed");
+        e = opFails("broker", "removeUser", user);
+        check(e.contains("AMQ229224: User " + user + " does not exist"), "error " + e);
+        String hashed = "mgmt-hashed-" + RUN;
+        op("broker", "addUser", hashed, "secret", "r1", false);
+        eq(Map.of(hashed, new TreeSet<>(List.of("r1"))), users(hashed), "hashed user");
+        op("broker", "removeUser", hashed);
+    }
+
+    static Map<String, List<Object>> roles(String match) throws Exception {
+        Map<String, List<Object>> out = new TreeMap<>();
+        for (Object row : (Object[]) op("broker", "getRoles", match)) {
+            Object[] r = (Object[]) row;
+            out.put((String) r[0], Arrays.asList(r).subList(1, r.length));
+        }
+        return out;
+    }
+
+    static void t_security_settings() throws Exception {
+        String match = "mgmt.sec." + RUN + ".#";
+        op("broker", "addSecuritySettings", match, "a, b", "a", "", "", "", "", "admin");
+        Map<String, List<Object>> r = roles(match);
+        eq(Set.of("a", "admin", "b"), r.keySet(), "roles");
+        eq(List.of(true, true, false, false, false, false, false, false, false, false, false, false), r.get("a"), "a");
+        eq(List.of(true, false, false, false, false, false, false, false, false, false, false, false), r.get("b"), "b");
+        eq(List.of(false, false, false, false, false, false, true, false, false, false, false, false), r.get("admin"), "admin");
+        eq(r.keySet(), roles("mgmt.sec." + RUN + ".x").keySet(), "roles for a matching address");
+        // The JSON form, with view and edit, replaces the setting.
+        op("broker", "addSecuritySettings", match, "{\"send\":[\"c\"],\"view\":[\"c\"],\"edit\":[\"d\"]}");
+        JsonArray json = JsonUtil.readJsonArray((String) op("broker", "getRolesAsJSON", match));
+        Map<String, JsonObject> byName = new TreeMap<>();
+        for (int i = 0; i < json.size(); i++) byName.put(json.getJsonObject(i).getString("name"), json.getJsonObject(i));
+        eq(Set.of("c", "d"), byName.keySet(), "roles as JSON");
+        eq(true, byName.get("c").getBoolean("send"), "c send");
+        eq(true, byName.get("c").getBoolean("view"), "c view");
+        eq(false, byName.get("c").getBoolean("edit"), "c edit");
+        eq(true, byName.get("d").getBoolean("edit"), "d edit");
+        eq(false, byName.get("d").getBoolean("consume"), "d consume");
+        op("broker", "removeSecuritySettings", match);
+        eq(0, roles(match).size(), "removed");
+        op("broker", "clearAuthenticationCache");
+        op("broker", "clearAuthorizationCache");
+        check(longAttr("broker", "AuthenticationCacheSize") >= 0, "AuthenticationCacheSize");
+        check(longAttr("broker", "AuthorizationCacheSize") >= 0, "AuthorizationCacheSize");
+    }
 }

@@ -14,6 +14,7 @@ mod connections;
 pub mod json;
 mod messages;
 mod queue;
+mod security;
 mod server;
 mod transactions;
 mod views;
@@ -25,6 +26,7 @@ use saranga_message::{CoreMessage, message_type};
 
 use crate::Broker;
 pub use json::Json;
+pub(crate) use security::recovered as recovered_security_setting;
 
 /// `ManagementHelper.HDR_RESOURCE_NAME`.
 pub const HDR_RESOURCE_NAME: &str = "_AMQ_ResourceName";

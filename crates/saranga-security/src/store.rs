@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use saranga_config::{CheckType, HierarchicalRepository, SecuritySetting};
+use saranga_config::{CheckType, HierarchicalRepository, Role, SecuritySetting};
 use sha2::{Digest, Sha256};
 
 use crate::jaas::Subject;
@@ -139,6 +139,47 @@ impl SecurityStore {
     pub fn set_repository(&self, repository: HierarchicalRepository<SecuritySetting>) {
         *self.repository.write().unwrap_or_else(|e| e.into_inner()) = repository;
         self.invalidate_authorization_cache();
+    }
+
+    /// `addMatch` on the security settings (management's
+    /// `addSecuritySettings`): granted permissions are forgotten.
+    pub fn add_match(&self, address_match: &str, setting: SecuritySetting) -> Result<(), String> {
+        self.repository
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .add_match(address_match, setting)
+            .map_err(|e| e.to_string())?;
+        self.invalidate_authorization_cache();
+        Ok(())
+    }
+
+    /// `removeMatch` on the security settings.
+    pub fn remove_match(&self, address_match: &str) {
+        self.repository
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove_match(address_match);
+        self.invalidate_authorization_cache();
+    }
+
+    /// `getMatch`: the roles of the most specific setting for `address`.
+    pub fn roles(&self, address: &str) -> Vec<Role> {
+        self.repository
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_most_specific(address)
+            .map(|s| s.roles.clone())
+            .unwrap_or_default()
+    }
+
+    /// `getAuthenticationCacheSize`.
+    pub fn authentication_cache_size(&self) -> usize {
+        self.authentication_cache.as_ref().map_or(0, TtlCache::len)
+    }
+
+    /// `getAuthorizationCacheSize`.
+    pub fn authorization_cache_size(&self) -> usize {
+        self.authorization_cache.as_ref().map_or(0, TtlCache::len)
     }
 
     pub fn invalidate_authorization_cache(&self) {
@@ -464,6 +505,12 @@ impl<K: Eq + Hash + Clone, V: Clone> TtlCache<K, V> {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<K, (Instant, V)>> {
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The entries held, expired ones not yet evicted included
+    /// (`estimatedSize`).
+    fn len(&self) -> usize {
+        self.lock().len()
     }
 
     fn get(&self, key: &K) -> Option<V> {
