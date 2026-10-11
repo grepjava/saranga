@@ -538,6 +538,9 @@ pub(super) async fn invoke(
     if let Some(outcome) = super::connections::invoke(broker, call).await {
         return Some(outcome);
     }
+    if let Some(outcome) = super::transactions::invoke(broker, call).await {
+        return Some(outcome);
+    }
 
     // Addresses.
     if let Some(a) = call.is("createAddress", &[S, S]) {

@@ -133,11 +133,11 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **`changeMessagesPriority`** changes the messages in memory. Artemis also changes paged messages it reads in through the queue's own cursor; Saranga leaves messages still in pages as they are.
 - **`listBindingsForAddress`** names a queue binding as `LocalQueueBinding [address=..., queue=...]`. Artemis prints its queue object there, with an identity hash.
 - **Connection IDs** are eight random hex digits, as Netty's short channel IDs look, but not Netty's.
-- **Dates** in the `list*` views (`creationTime`) are written as `Date.toString` writes them in UTC. Artemis uses the JVM's time zone.
+- **Dates** in the `list*` views (`creationTime`) are written as `Date.toString` writes them in UTC, and those of the prepared transactions as `DateFormat`'s short date and medium time in the `en_US` locale, in UTC. Artemis uses the JVM's time zone and locale.
 - **`proxyAddress` and `proxyProtocolVersion`** are always empty: Saranga does not take the PROXY protocol.
 - **`closeSessionWithID`** closes Core sessions only. For a session of another protocol it returns false; Artemis closes the server side of any session.
 - **A STOMP consumer closed by management** is removed from its session after the `ERROR` frame. Artemis drops the subscription but leaves the server consumer in place.
-- **Not yet (stage 2 of Phase 8):** transactions, users, security settings and roles (`getRoles` is empty), notifications, message counters, `management-message-rbac` and the slow-consumer policy.
+- **Not yet (stage 2 of Phase 8):** users, security settings and roles (`getRoles` is empty), notifications, message counters, `management-message-rbac` and the slow-consumer policy.
 - **Records.** Paused queues and addresses, address settings and diverts are journaled as Artemis journals them (`QUEUE_STATUS_RECORD`, `ADDRESS_STATUS_RECORD`, `ADDRESS_SETTING_RECORD_JSON`, `DIVERT_RECORD`), so they move with the data directory in both directions. Like Artemis, Saranga journals every deployed divert, configured ones included.
 
 ## Security differences

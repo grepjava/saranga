@@ -15,6 +15,7 @@ pub mod json;
 mod messages;
 mod queue;
 mod server;
+mod transactions;
 mod views;
 
 use std::sync::Arc;

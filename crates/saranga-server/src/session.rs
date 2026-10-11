@@ -1445,7 +1445,25 @@ impl ServerSession {
         }
         let rm = self.broker.resource_manager();
         let Some(tx) = rm.remove(&xid) else {
-            return Err(Self::not_found(&xid));
+            return Err(match rm.heuristic(&xid) {
+                Some(true) => XaError::new(
+                    xa_code::XA_HEURCOM,
+                    format!(
+                        "transaction has been heuristically committed: {}",
+                        transaction::xid_string(&xid)
+                    ),
+                )
+                .into(),
+                Some(false) => XaError::new(
+                    xa_code::XA_HEURRB,
+                    format!(
+                        "transaction has been heuristically rolled back: {}",
+                        transaction::xid_string(&xid)
+                    ),
+                )
+                .into(),
+                None => Self::not_found(&xid),
+            });
         };
         let mut t = transaction::lock(&tx);
         if t.state == TxState::Suspended {
@@ -1498,7 +1516,26 @@ impl ServerSession {
         }
         let rm = self.broker.resource_manager();
         let Some(tx) = rm.remove(&xid) else {
-            return Err(Self::not_found(&xid));
+            // Artemis spells it "ben" here.
+            return Err(match rm.heuristic(&xid) {
+                Some(true) => XaError::new(
+                    xa_code::XA_HEURCOM,
+                    format!(
+                        "transaction has ben heuristically committed: {}",
+                        transaction::xid_string(&xid)
+                    ),
+                )
+                .into(),
+                Some(false) => XaError::new(
+                    xa_code::XA_HEURRB,
+                    format!(
+                        "transaction has ben heuristically rolled back: {}",
+                        transaction::xid_string(&xid)
+                    ),
+                )
+                .into(),
+                None => Self::not_found(&xid),
+            });
         };
         if transaction::lock(&tx).state == TxState::Suspended {
             rm.put(xid.clone(), tx);
@@ -1512,6 +1549,34 @@ impl ServerSession {
             .into());
         }
         self.do_rollback(false, false, &tx).await?;
+        Ok(())
+    }
+
+    /// `xaForget`: a branch management completed is forgotten and its
+    /// record deleted.
+    pub fn xa_forget(&mut self, xid: Xid) -> Result<(), TxError> {
+        let Some(record) = self.broker.resource_manager().remove_heuristic(&xid) else {
+            return Err(XaError {
+                code: xa_code::XAER_NOTA,
+                message: None,
+            }
+            .into());
+        };
+        if let Some(s) = self.storage() {
+            match s.delete_heuristic_completion(record) {
+                Ok(p) => self.ops.push(p),
+                Err(e) => {
+                    tracing::warn!(
+                        "AMQ222182: Unable to delete heuristic completion from storage manager: {e}"
+                    );
+                    return Err(XaError {
+                        code: xa_code::XAER_RMFAIL,
+                        message: None,
+                    }
+                    .into());
+                }
+            }
+        }
         Ok(())
     }
 

@@ -9,6 +9,8 @@ use std::sync::Arc;
 use saranga_config as cfg;
 use saranga_server::management::Json;
 use saranga_server::postoffice::SelectorFilters;
+use saranga_server::session::{ClientConnection, ServerSession, SessionOptions, Transport};
+use saranga_server::transaction::Xid;
 use saranga_server::{Broker, BrokerConfig};
 
 async fn start(dir: &Path) -> Arc<Broker> {
@@ -168,4 +170,96 @@ async fn management_state_survives_a_restart() {
             .await
             .is_err()
     );
+}
+
+/// An XA session on a connection of its own.
+fn xa_session(broker: &Arc<Broker>) -> ServerSession {
+    let conn = Arc::new(ClientConnection::new(
+        Transport::internal("test"),
+        Arc::new(saranga_security::ConnectionInfo {
+            remote_address: "test".into(),
+            certificates: None,
+            security_domain: None,
+        }),
+        Vec::new(),
+    ));
+    ServerSession::new(
+        broker.clone(),
+        conn,
+        SessionOptions {
+            name: "xa".into(),
+            username: None,
+            password: None,
+            xa: true,
+            auto_commit_sends: false,
+            auto_commit_acks: false,
+            pre_acknowledge: false,
+            default_address: None,
+        },
+        Default::default(),
+    )
+}
+
+fn heuristics(j: Json) -> Vec<Json> {
+    match j {
+        Json::Array(v) => v,
+        other => panic!("not an array: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn heuristic_completion_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(dir.path()).await;
+    let xid = Xid {
+        format_id: 7,
+        branch_qualifier: b"bq".to_vec(),
+        global_transaction_id: b"gtx".to_vec(),
+    };
+    let b64 = saranga_server::transaction::xid_base64(&xid);
+    let mut session = xa_session(&broker);
+    session.xa_start(xid.clone()).unwrap();
+    session.xa_end(xid.clone()).unwrap();
+    session.xa_prepare(xid.clone()).unwrap();
+    session.take_completion().wait().await.unwrap();
+    assert_eq!(
+        op(
+            &broker,
+            "broker",
+            "commitPreparedTransaction",
+            vec![s(&b64)]
+        )
+        .await,
+        Json::from(true)
+    );
+    broker.stop().unwrap();
+    drop(session);
+    drop(broker);
+
+    let broker = start(dir.path()).await;
+    let committed = op(
+        &broker,
+        "broker",
+        "listHeuristicCommittedTransactions",
+        vec![],
+    )
+    .await;
+    assert_eq!(heuristics(committed), vec![s(&b64)]);
+    assert_eq!(broker.resource_manager().in_doubt(), vec![xid.clone()]);
+    let mut session = xa_session(&broker);
+    session.xa_forget(xid.clone()).unwrap();
+    session.take_completion().wait().await.unwrap();
+    broker.stop().unwrap();
+    drop(session);
+    drop(broker);
+
+    let broker = start(dir.path()).await;
+    let committed = op(
+        &broker,
+        "broker",
+        "listHeuristicCommittedTransactions",
+        vec![],
+    )
+    .await;
+    assert!(heuristics(committed).is_empty());
 }

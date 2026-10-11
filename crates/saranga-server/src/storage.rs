@@ -283,6 +283,9 @@ pub struct RecoveredMessages {
     /// Records of types the broker does not know, for the protocols that
     /// wrote them (`journalRecordsListener`).
     pub extra: Vec<ExtraRecord>,
+    /// `HEURISTIC_COMPLETION` records: the record, the Xid, and whether it
+    /// was committed.
+    pub heuristics: Vec<(i64, Xid, bool)>,
 }
 
 /// A committed message-journal record of a type a protocol owns, such as
@@ -463,6 +466,17 @@ impl Storage {
                 ids::PAGE_CURSOR_COUNTER_VALUE
                 | ids::PAGE_CURSOR_COUNTER_INC
                 | ids::PAGE_CURSOR_PENDING_COUNTER => counters.push(r.id),
+                ids::HEURISTIC_COMPLETION => {
+                    // HeuristicCompletionEncoding: the Xid, then isCommit.
+                    use saranga_buffer::Codec;
+                    let mut reader = Reader::new(&r.data);
+                    let xid = Xid::read(&mut reader)
+                        .map_err(|e| JournalError::Corrupt(format!("xid: {e}")))?;
+                    let commit = reader
+                        .bool()
+                        .map_err(|e| JournalError::Corrupt(format!("heuristic completion: {e}")))?;
+                    out.heuristics.push((r.id, xid, commit));
+                }
                 other => {
                     tracing::debug!("Extra record type {other}");
                     out.extra.push(ExtraRecord {
@@ -857,6 +871,25 @@ impl Storage {
         body: Vec<u8>,
     ) -> StoreResult<()> {
         self.messages.append_add_tx(tx, id, record_type, body)
+    }
+
+    /// `storeHeuristicCompletion`: a branch management completed, synced.
+    pub fn store_heuristic_completion(
+        &self,
+        id: i64,
+        xid: &Xid,
+        commit: bool,
+    ) -> StoreResult<Pending> {
+        let mut body = encode_xid(xid);
+        body.push(u8::from(commit));
+        self.add_record(id, ids::HEURISTIC_COMPLETION, body, true)
+    }
+
+    /// `deleteHeuristicCompletion`, synced.
+    pub fn delete_heuristic_completion(&self, id: i64) -> StoreResult<Pending> {
+        let (c, p) = Pending::new();
+        self.messages.append_delete(id, true, Some(c))?;
+        Ok(p)
     }
 
     /// `tryAppendDeleteRecord`, not synced: `deletePageComplete`,

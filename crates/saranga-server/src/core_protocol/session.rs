@@ -31,7 +31,7 @@ use super::{ConnShared, CoreDeliverySink};
 use crate::large::LargeWriter;
 use crate::postoffice::{BindingQueryResult, QueueQueryResult, QueueSpec, RoutingTypes};
 use crate::session::{Completion, ServerSession, SessionOptions};
-use crate::transaction::{TxError, XaError, xa_code};
+use crate::transaction::{TxError, xa_code};
 use crate::{Broker, BrokerError, Result, RoutingType};
 
 /// What the connection hands a session task.
@@ -672,15 +672,11 @@ impl CoreSession {
             Packet::SessionXASuspend(_) => {
                 (true, Self::xa_response(self.session.xa_suspend()), false)
             }
-            Packet::SessionXAForgetMessage(_) => {
-                // Heuristic completions come with management (Phase 8):
-                // there is never one to forget.
-                let e = XaError {
-                    code: xa_code::XAER_NOTA,
-                    message: None,
-                };
-                (true, Self::xa_response(Err(e.into())), false)
-            }
+            Packet::SessionXAForgetMessage(p) => (
+                true,
+                Self::xa_response(self.session.xa_forget(p.xid)),
+                false,
+            ),
             Packet::SessionXAAfterFailedMessage(p) => {
                 self.session.xa_failed(p.xid);
                 // No response for this one.

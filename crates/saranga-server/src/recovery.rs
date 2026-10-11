@@ -272,6 +272,7 @@ pub async fn load_messages(
         page_completes,
         page_txs,
         extra,
+        heuristics,
     } = storage
         .load_messages()
         .map_err(|e| corrupt("loading the message journal", e))?;
@@ -426,6 +427,9 @@ pub async fn load_messages(
         tx.paging.recovered(paging.clone());
         tx.state = TxState::Prepared;
         resource_manager.put(p.xid, Arc::new(std::sync::Mutex::new(tx)));
+    }
+    for (record, xid, commit) in heuristics {
+        resource_manager.put_heuristic(record, xid, commit);
     }
     Ok(extra)
 }

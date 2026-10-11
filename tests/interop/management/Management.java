@@ -710,18 +710,20 @@ public class Management {
     }
 
     static void t_connection_counts() throws Exception {
-        long connections = longAttr("broker", "ConnectionCount");
         long total = longAttr("broker", "TotalConnectionCount");
-        long sessions = longAttr("broker", "SessionCount");
-        check(connections >= 1, "ConnectionCount " + connections);
+        long sessions = longAttr("broker", "TotalSessionCount");
+        String cid = name("cid");
         try (Connection c = coreJms().createConnection()) {
+            c.setClientID(cid);
             c.createSession(false, Session.AUTO_ACKNOWLEDGE);
-            eq(connections + 1, longAttr("broker", "ConnectionCount"), "ConnectionCount with one more");
+            check(longAttr("broker", "ConnectionCount") >= 2, "ConnectionCount");
+            // Other connections may be closing meanwhile: the count and the list agree once they settle.
+            waitFor(() -> longAttr("broker", "ConnectionCount") == ((Object[]) op("broker", "listConnectionIDs")).length, "ConnectionCount and listConnectionIDs to agree");
             check(longAttr("broker", "TotalConnectionCount") >= total + 1, "TotalConnectionCount");
-            check(longAttr("broker", "SessionCount") >= sessions + 1, "SessionCount");
-            check(longAttr("broker", "TotalSessionCount") >= longAttr("broker", "SessionCount"), "TotalSessionCount");
+            check(longAttr("broker", "TotalSessionCount") >= sessions + 2, "TotalSessionCount");
+            check(longAttr("broker", "SessionCount") >= 3, "SessionCount");
         }
-        waitFor(() -> longAttr("broker", "ConnectionCount") == connections, "ConnectionCount back to " + connections);
+        waitFor(() -> view("listConnections", "clientID", cid).getInt("count") == 0, "connection gone");
     }
 
     static void t_list_connections() throws Exception {
@@ -962,5 +964,96 @@ public class Management {
             check(failed.await(10, java.util.concurrent.TimeUnit.SECONDS), "the client saw no failure");
         }
         eq(false, op("broker", "closeConsumerConnectionsForAddress", "nothing." + RUN), "no consumers");
+    }
+
+    // ------------------------------------------------------------ prepared and heuristic transactions
+
+    /** A prepared XA branch that sends one message to q. */
+    static javax.transaction.xa.Xid prepare(ClientSession xa, String q, String what) throws Exception {
+        javax.transaction.xa.Xid xid = new org.apache.activemq.artemis.core.transaction.impl.XidImpl(
+            ("bq-" + what + RUN).getBytes(), 7, ("gtx-" + what + RUN).getBytes());
+        xa.start(xid, javax.transaction.xa.XAResource.TMNOFLAGS);
+        try (ClientProducer p = xa.createProducer(q)) {
+            ClientMessage m = xa.createMessage(true);
+            m.putStringProperty("what", what);
+            p.send(m);
+        }
+        xa.end(xid, javax.transaction.xa.XAResource.TMSUCCESS);
+        xa.prepare(xid);
+        return xid;
+    }
+
+    static String b64(javax.transaction.xa.Xid xid) {
+        return org.apache.activemq.artemis.core.transaction.impl.XidImpl.toBase64String(xid);
+    }
+
+    interface XaCall { void run() throws javax.transaction.xa.XAException; }
+
+    static int xaCode(XaCall c) {
+        try {
+            c.run();
+        } catch (javax.transaction.xa.XAException x) {
+            return x.errorCode;
+        }
+        throw new AssertionError("no XAException");
+    }
+
+    static void t_prepared_transactions() throws Exception {
+        String q = newQueue("prepared");
+        try (ClientSession xa = factory.createSession(true, false, false)) {
+            javax.transaction.xa.Xid xid = prepare(xa, q, "listed");
+            String b = b64(xid);
+            List<Object> listed = Arrays.asList((Object[]) op("broker", "listPreparedTransactions"));
+            check(listed.stream().anyMatch(s -> ((String) s).contains(" base64: " + b + " XidImpl (")), "listPreparedTransactions " + listed);
+            JsonArray details = JsonUtil.readJsonArray((String) op("broker", "listPreparedTransactionDetailsAsJSON"));
+            JsonObject mine = null;
+            for (int i = 0; i < details.size(); i++) {
+                if (details.getJsonObject(i).getString("xid_as_base64").equals(b)) mine = details.getJsonObject(i);
+            }
+            check(mine != null, "details " + details);
+            eq(7, mine.getInt("xid_format_id"), "xid_format_id");
+            eq("gtx-listed" + RUN, mine.getString("xid_global_txid"), "xid_global_txid");
+            eq("bq-listed" + RUN, mine.getString("xid_branch_qual"), "xid_branch_qual");
+            JsonObject m = mine.getJsonArray("tx_related_messages").getJsonObject(0);
+            eq("(+) send", m.getString("message_operation_type"), "operation type");
+            eq("Default", m.getString("message_type"), "message type");
+            eq("listed", m.getJsonObject("message_properties").getString("what"), "property");
+            String html = (String) op("broker", "listPreparedTransactionDetailsAsHTML");
+            check(html.startsWith("<h3>*** Prepared Transaction Details ***</h3><table") && html.contains(b), "html " + html);
+            xa.rollback(xid);
+        }
+        eq(0L, count(q), "rolled back");
+    }
+
+    static void t_heuristic_commit() throws Exception {
+        String q = newQueue("heurcom");
+        try (ClientSession xa = factory.createSession(true, false, false)) {
+            javax.transaction.xa.Xid xid = prepare(xa, q, "commit");
+            eq(true, op("broker", "commitPreparedTransaction", b64(xid)), "committed");
+            eq(false, op("broker", "commitPreparedTransaction", b64(xid)), "no longer prepared");
+            eq(1L, count(q), "the message is in");
+            check(Arrays.asList((Object[]) op("broker", "listHeuristicCommittedTransactions")).contains(b64(xid)), "listed as committed");
+            check(!Arrays.asList((Object[]) op("broker", "listHeuristicRolledBackTransactions")).contains(b64(xid)), "not rolled back");
+            check(Arrays.asList(xa.recover(javax.transaction.xa.XAResource.TMSTARTRSCAN)).contains(xid), "recovered");
+            eq(javax.transaction.xa.XAException.XA_HEURCOM, xaCode(() -> xa.commit(xid, false)), "commit");
+            eq(javax.transaction.xa.XAException.XA_HEURCOM, xaCode(() -> xa.rollback(xid)), "rollback");
+            xa.forget(xid);
+            check(!Arrays.asList((Object[]) op("broker", "listHeuristicCommittedTransactions")).contains(b64(xid)), "forgotten");
+            eq(javax.transaction.xa.XAException.XAER_NOTA, xaCode(() -> xa.forget(xid)), "forget twice");
+        }
+    }
+
+    static void t_heuristic_rollback() throws Exception {
+        String q = newQueue("heurrb");
+        try (ClientSession xa = factory.createSession(true, false, false)) {
+            javax.transaction.xa.Xid xid = prepare(xa, q, "rollback");
+            eq(true, op("broker", "rollbackPreparedTransaction", b64(xid)), "rolled back");
+            eq(0L, count(q), "nothing in");
+            check(Arrays.asList((Object[]) op("broker", "listHeuristicRolledBackTransactions")).contains(b64(xid)), "listed as rolled back");
+            eq(javax.transaction.xa.XAException.XA_HEURRB, xaCode(() -> xa.commit(xid, false)), "commit");
+            xa.forget(xid);
+            check(!Arrays.asList((Object[]) op("broker", "listHeuristicRolledBackTransactions")).contains(b64(xid)), "forgotten");
+        }
+        eq(false, op("broker", "rollbackPreparedTransaction", "bm8="), "unknown xid");
     }
 }

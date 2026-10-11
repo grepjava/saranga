@@ -404,13 +404,18 @@ pub fn xid_string(xid: &Xid) -> String {
 
 /// `XidImpl.toByteArray`: branch qualifier, global ID, then the format ID's
 /// bytes as Java computes them (`% 0xFF`, not a mask).
-fn xid_bytes(xid: &Xid) -> Vec<u8> {
+pub fn xid_bytes(xid: &Xid) -> Vec<u8> {
     let mut b = xid.branch_qualifier.clone();
     b.extend_from_slice(&xid.global_transaction_id);
     for i in 0..4 {
         b.push(((xid.format_id >> (i * 8)) % 0xFF) as i8 as u8);
     }
     b
+}
+
+/// `XidImpl.toBase64String`.
+pub fn xid_base64(xid: &Xid) -> String {
+    base64_url(&xid_bytes(xid))
 }
 
 /// `java.util.Base64.getUrlEncoder()`: URL-safe alphabet with padding.
@@ -438,6 +443,18 @@ pub struct ResourceManager {
     txs: Mutex<HashMap<Xid, TxRef>>,
     /// `transaction-timeout` in seconds.
     timeout_seconds: i32,
+    /// Branches committed or rolled back by management, until the
+    /// transaction manager forgets them (`heuristicCompletions`).
+    heuristics: Mutex<Vec<Heuristic>>,
+}
+
+/// `HeuristicCompletionHolder`.
+#[derive(Debug, Clone)]
+pub struct Heuristic {
+    /// Its `HEURISTIC_COMPLETION` record.
+    pub record: i64,
+    pub xid: Xid,
+    pub commit: bool,
 }
 
 impl Default for ResourceManager {
@@ -454,7 +471,61 @@ impl ResourceManager {
         Self {
             txs: Mutex::default(),
             timeout_seconds,
+            heuristics: Mutex::default(),
         }
+    }
+
+    fn heuristic_list(&self) -> MutexGuard<'_, Vec<Heuristic>> {
+        self.heuristics.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `putHeuristicCompletion`.
+    pub fn put_heuristic(&self, record: i64, xid: Xid, commit: bool) {
+        self.heuristic_list().push(Heuristic {
+            record,
+            xid,
+            commit,
+        });
+    }
+
+    /// Whether `xid` was completed by management: committed (true) or
+    /// rolled back (false).
+    pub fn heuristic(&self, xid: &Xid) -> Option<bool> {
+        self.heuristic_list()
+            .iter()
+            .find(|h| &h.xid == xid)
+            .map(|h| h.commit)
+    }
+
+    /// `removeHeuristicCompletion`: the record to delete, if `xid` was
+    /// completed by management.
+    pub fn remove_heuristic(&self, xid: &Xid) -> Option<i64> {
+        let mut all = self.heuristic_list();
+        let i = all.iter().position(|h| &h.xid == xid)?;
+        Some(all.remove(i).record)
+    }
+
+    /// `getHeuristicCommittedTransactions` / `getHeuristicRolledbackTransactions`.
+    pub fn heuristics(&self, commit: bool) -> Vec<Xid> {
+        self.heuristic_list()
+            .iter()
+            .filter(|h| h.commit == commit)
+            .map(|h| h.xid.clone())
+            .collect()
+    }
+
+    /// `getPreparedTransactionsWithCreationTime`, oldest first.
+    pub fn prepared(&self) -> Vec<(Xid, TxRef)> {
+        let mut all: Vec<(Xid, TxRef, i64)> = self
+            .map()
+            .iter()
+            .filter_map(|(x, tx)| {
+                let t = lock(tx);
+                (t.state == TxState::Prepared).then(|| (x.clone(), tx.clone(), t.created))
+            })
+            .collect();
+        all.sort_by_key(|(_, _, created)| *created);
+        all.into_iter().map(|(x, tx, _)| (x, tx)).collect()
     }
 
     /// `getTimeoutSeconds`.
@@ -543,14 +614,18 @@ impl ResourceManager {
         self.map().remove(xid)
     }
 
-    /// `getInDoubtTransactions`: the prepared ones (heuristic completions
-    /// come with management, Phase 8).
+    /// `getInDoubtTransactions`: the prepared ones, then those management
+    /// committed, then those it rolled back.
     pub fn in_doubt(&self) -> Vec<Xid> {
-        self.map()
+        let mut xids: Vec<Xid> = self
+            .map()
             .iter()
             .filter(|(_, tx)| lock(tx).state == TxState::Prepared)
             .map(|(x, _)| x.clone())
-            .collect()
+            .collect();
+        xids.extend(self.heuristics(true));
+        xids.extend(self.heuristics(false));
+        xids
     }
 }
 
