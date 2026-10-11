@@ -334,6 +334,17 @@ pub struct BindingQueryResult {
     pub default_delay_before_dispatch: i64,
 }
 
+/// What a queue configuration given to `checkAutoCreate` adds to the
+/// address and routing type.
+#[derive(Debug, Clone, Default)]
+pub struct AutoCreateOptions {
+    /// Temporary: created whatever the address settings say.
+    pub temporary: bool,
+    /// The queue's durability; by default durable unless temporary.
+    pub durable: Option<bool>,
+    pub filter: Option<String>,
+}
+
 /// `checkAutoCreate`'s outcome (`AutoCreateResult`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoCreate {
@@ -1139,22 +1150,36 @@ impl PostOffice {
         routing_type: Option<RoutingType>,
         creator: Creator<'_>,
     ) -> Result<AutoCreate> {
+        self.check_auto_create_with(address, routing_type, creator, &AutoCreateOptions::default())
+    }
+
+    /// `checkAutoCreate(QueueConfiguration)`: as [`PostOffice::check_auto_create`]
+    /// for a queue configuration that may be temporary (always creatable)
+    /// or carry a durability and a filter.
+    pub fn check_auto_create_with(
+        &self,
+        address: &str,
+        routing_type: Option<RoutingType>,
+        creator: Creator<'_>,
+        options: &AutoCreateOptions,
+    ) -> Result<AutoCreate> {
         use saranga_config::CheckType;
         let Some(routing_type) = routing_type else {
             return Ok(AutoCreate::Existed);
         };
+        let temporary = options.temporary;
         let (real, fqqn_queue) = split_fqqn(address);
         let queue_name = fqqn_queue.unwrap_or(real);
         let s = self.settings(real);
         let mut result = match self.address_info(real) {
-            None if s.auto_create_addresses => {
+            None if s.auto_create_addresses || temporary => {
                 creator.check(real, None, CheckType::CreateAddress)?;
-                self.add_routing_type(real, routing_type, false)?;
+                self.add_routing_type(real, routing_type, temporary)?;
                 AutoCreate::Created
             }
             None => return Ok(AutoCreate::NotFound),
             Some(info) if info.routing_types.contains(routing_type) => AutoCreate::Existed,
-            Some(info) if s.auto_create_addresses => {
+            Some(info) if s.auto_create_addresses || temporary => {
                 creator.check(real, None, CheckType::CreateAddress)?;
                 self.add_routing_type(real, routing_type, info.temporary)?;
                 AutoCreate::Updated
@@ -1166,10 +1191,13 @@ impl PostOffice {
                 None => {
                     if fqqn_queue.is_none() && self.matching_queue(real, routing_type).is_some() {
                         result = AutoCreate::Existed;
-                    } else if s.auto_create_queues {
+                    } else if s.auto_create_queues || temporary {
                         let mut spec = QueueSpec::new(queue_name, real);
                         spec.routing_type = Some(routing_type);
                         spec.auto_created = true;
+                        spec.temporary = temporary;
+                        spec.durable = options.durable.unwrap_or(!temporary);
+                        spec.filter_string = options.filter.clone();
                         spec.user = creator.user.map(str::to_owned);
                         let check = if spec.durable {
                             CheckType::CreateDurableQueue

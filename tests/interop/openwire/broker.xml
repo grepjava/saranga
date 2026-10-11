@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<!-- OpenWire and Core on one acceptor (OpenWire.java), set up as Artemis's
+     OpenWireTestBase: auto-creation on, except for addresses under noauto.;
+     virtual topic consumers mapped to FQQNs as in
+     VirtualTopicToFQQNOpenWireTest; redelivered messages go to DLQ after
+     three deliveries for addresses under redeliver. -->
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+   <core xmlns="urn:activemq:core">
+      <name>openwire</name>
+      <persistence-enabled>true</persistence-enabled>
+      <security-enabled>false</security-enabled>
+      <address-queue-scan-period>100</address-queue-scan-period>
+      <acceptors>
+         <acceptor name="artemis">tcp://0.0.0.0:61616?protocols=CORE,OPENWIRE;virtualTopicConsumerWildcards=Consumer.*.%3E%3B2</acceptor>
+      </acceptors>
+      <address-settings>
+         <address-setting match="noauto.#">
+            <auto-create-queues>false</auto-create-queues>
+            <auto-create-addresses>false</auto-create-addresses>
+         </address-setting>
+         <address-setting match="redeliver.#">
+            <dead-letter-address>DLQ</dead-letter-address>
+            <max-delivery-attempts>3</max-delivery-attempts>
+         </address-setting>
+         <address-setting match="#">
+            <dead-letter-address>DLQ</dead-letter-address>
+            <expiry-address>ExpiryQueue</expiry-address>
+            <auto-create-queues>true</auto-create-queues>
+            <auto-create-addresses>true</auto-create-addresses>
+            <auto-delete-queues>true</auto-delete-queues>
+            <auto-delete-addresses>true</auto-delete-addresses>
+         </address-setting>
+      </address-settings>
+      <addresses>
+         <address name="DLQ"><anycast><queue name="DLQ"/></anycast></address>
+         <address name="ExpiryQueue"><anycast><queue name="ExpiryQueue"/></anycast></address>
+         <address name="exampleQueue"><anycast><queue name="exampleQueue"/></anycast></address>
+         <address name="noauto.existing"><anycast><queue name="noauto.existing"/></anycast></address>
+      </addresses>
+   </core>
+</configuration>

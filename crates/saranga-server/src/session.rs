@@ -212,6 +212,8 @@ pub struct ServerSession {
     ops: Vec<Pending>,
     /// Queue updates to make once those writes are done.
     actions: Vec<Box<dyn FnOnce() + Send>>,
+    /// Permission checks are off (a send the broker makes).
+    unchecked: bool,
 }
 
 /// What [`ServerSession::send_message`] sends besides the message.
@@ -262,6 +264,7 @@ impl ServerSession {
             timeout_seconds: -1,
             ops: Vec::new(),
             actions: Vec::new(),
+            unchecked: false,
         }
     }
 
@@ -326,7 +329,51 @@ impl ServerSession {
         queue: Option<&str>,
         check: CheckType,
     ) -> Result<()> {
+        if self.unchecked {
+            return Ok(());
+        }
         self.creator().check(address, queue, check)
+    }
+
+    /// A send the broker makes itself (an advisory), which no permission
+    /// stops.
+    pub async fn send_unchecked(&mut self, message: CoreMessage) -> Result<()> {
+        self.unchecked = true;
+        let r = self.send_in(message, None, None).await;
+        self.unchecked = false;
+        r
+    }
+
+    /// `checkAutoCreate(QueueConfiguration)` for `address` without its
+    /// acceptor prefix.
+    pub fn check_auto_create_with(
+        &self,
+        address: &str,
+        routing_type: Option<RoutingType>,
+        options: &crate::postoffice::AutoCreateOptions,
+    ) -> Result<crate::postoffice::AutoCreate> {
+        let address = self.remove_prefix(address);
+        self.broker
+            .post_office()
+            .check_auto_create_with(address, routing_type, self.creator(), options)
+    }
+
+    /// Starts an XA transaction apart from the session's own
+    /// (`ResourceManager.putTransaction` of a new `TransactionImpl`).
+    pub fn begin_xa(&self, xid: Xid) -> Result<TxRef, TxError> {
+        let tx = self.new_tx(Some(xid.clone()));
+        transaction::lock(&tx).timeout_seconds = self.timeout_seconds;
+        if !self.broker.resource_manager().put(xid.clone(), tx.clone()) {
+            return Err(XaError::new(
+                xa_code::XAER_DUPID,
+                format!(
+                    "Cannot start, there is already a xid {}",
+                    transaction::xid_string(&xid)
+                ),
+            )
+            .into());
+        }
+        Ok(tx)
     }
 
     fn storage(&self) -> Option<Arc<Storage>> {
