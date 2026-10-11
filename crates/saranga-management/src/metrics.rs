@@ -176,7 +176,7 @@ async fn add(
     for gauge in gauges {
         let Ok(value) = broker
             .management()
-            .attribute(broker, resource, gauge.attribute, None)
+            .attribute(broker, resource, gauge.attribute, Default::default())
             .await
         else {
             continue;

@@ -10,6 +10,7 @@
 //! Ported from `org.apache.activemq.artemis.core.security` and
 //! `org.apache.activemq.artemis.spi.core.security`.
 
+pub mod audit;
 pub mod basic;
 mod der;
 pub mod dn;

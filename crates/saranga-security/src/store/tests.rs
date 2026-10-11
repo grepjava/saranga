@@ -112,7 +112,7 @@ fn authenticate_and_cache() {
         .unwrap_err();
     assert_eq!(
         e.0,
-        "AMQ229031: Unable to validate user from /127.0.0.1:5000. Username: u1; SSL certificate subject DN: unavailable"
+        "AMQ229031: Unable to validate user from 127.0.0.1:5000. Username: u1; SSL certificate subject DN: unavailable"
     );
     // A subject without a user principal is refused.
     assert!(

@@ -374,6 +374,8 @@ struct Shared {
     address_paused: AtomicBool,
     /// The `QUEUE_STATUS_RECORD` of a persisted pause; -1 for none.
     pause_record: AtomicI64,
+    /// The actor at work, for the critical analyzer.
+    critical: crate::critical::Measure,
 }
 
 impl Shared {
@@ -445,6 +447,7 @@ impl Queue {
             paused: AtomicBool::new(false),
             address_paused: AtomicBool::new(false),
             pause_record: AtomicI64::new(-1),
+            critical: Default::default(),
         }));
         let actor = Actor {
             shared: queue.0.clone(),
@@ -464,6 +467,11 @@ impl Queue {
         };
         tokio::spawn(actor.run(rx));
         queue
+    }
+
+    /// The queue's critical path: its actor handling a command.
+    pub fn critical(&self) -> &crate::critical::Measure {
+        &self.0.critical
     }
 
     pub fn id(&self) -> i64 {
@@ -1194,6 +1202,8 @@ impl Actor {
                     tokio::select! {
                         cmd = rx.recv() => cmd,
                         _ = tokio::time::sleep(wait) => {
+                            let shared = self.shared.clone();
+                            let _critical = shared.critical.enter();
                             self.deliver_scheduled();
                             self.deliver();
                             continue;
@@ -1202,6 +1212,8 @@ impl Actor {
                 }
             };
             let Some(cmd) = cmd else { break };
+            let shared = self.shared.clone();
+            let _critical = shared.critical.enter();
             if !self.handle(cmd) {
                 break;
             }

@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use saranga_security::audit;
+
 use crate::message::now_millis;
 use crate::queue::{ConsumerId, ConsumerMetrics, DeliverySink, Queue};
 use crate::session::ClientConnection;
@@ -30,12 +32,25 @@ pub struct Registry {
 pub struct Registration {
     registry: Weak<Registry>,
     key: u64,
+    connection: Arc<ClientConnection>,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
         if let Some(r) = self.registry.upgrade() {
             lock(&r.connections).remove(&self.key);
+        }
+        if audit::resource_enabled() {
+            let c = &self.connection;
+            let subject = c.subject();
+            audit::resource(audit::fill(
+                "AMQ601768: {} connection {} for user {} destroyed",
+                &[
+                    c.protocol(),
+                    c.id(),
+                    &audit::caller(subject.as_deref(), Some(c.remote_address())),
+                ],
+            ));
         }
     }
 }
@@ -47,9 +62,20 @@ impl Registry {
         let key = self.next_key.fetch_add(1, Ordering::Relaxed) as u64;
         lock(&self.connections).insert(key, Arc::downgrade(connection));
         self.total_connections.fetch_add(1, Ordering::Relaxed);
+        if audit::resource_enabled() {
+            audit::resource(audit::fill(
+                "AMQ601767: {} connection {} from {} created",
+                &[
+                    connection.protocol(),
+                    connection.id(),
+                    connection.remote_address(),
+                ],
+            ));
+        }
         Registration {
             registry: Arc::downgrade(self),
             key,
+            connection: connection.clone(),
         }
     }
 
@@ -124,6 +150,8 @@ pub struct SessionEntry {
     /// by address (`ServerLegacyProducersImpl`).
     legacy_producers: AtomicBool,
     closer: Mutex<Option<SessionCloser>>,
+    /// A send or an acknowledgement under way, for the critical analyzer.
+    pub critical: crate::critical::Measure,
 }
 
 /// `ServerLegacyProducersImpl.MAX_PRODUCER_METRIC_SIZE`.
@@ -151,6 +179,7 @@ impl SessionEntry {
             producers: Mutex::default(),
             legacy_producers: AtomicBool::new(false),
             closer: Mutex::default(),
+            critical: Default::default(),
         }
     }
 

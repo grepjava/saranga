@@ -31,6 +31,7 @@ use axum::routing::get;
 use saranga_config::CheckType;
 use saranga_security::{ConnectionInfo, SecurityAuth};
 use saranga_server::Broker;
+use saranga_server::audit::Who;
 use saranga_server::management::Caller;
 use saranga_server::management::json::Json;
 
@@ -109,6 +110,7 @@ fn login(
         remote_address: format!("/{peer}"),
         certificates: None,
         security_domain: None,
+        connection_id: None,
     });
     let authenticated = store
         .authenticate(Some(&user), Some(&password), &connection)
@@ -130,13 +132,30 @@ fn login(
     Ok(Some(auth))
 }
 
-fn caller<'a>(broker: &'a Broker, auth: &'a Option<SecurityAuth>) -> Caller<'a> {
-    broker.security().map(|s| &**s).zip(auth.as_ref())
+/// Who a request is: its session for the permission checks, and for the
+/// audit log its subject and address.
+fn caller<'a>(broker: &'a Broker, auth: &'a Option<SecurityAuth>, remote: &'a str) -> Caller<'a> {
+    Caller {
+        security: broker.security().map(|s| &**s).zip(auth.as_ref()),
+        who: Some(Who {
+            subject: auth.as_ref().and_then(|a| a.subject.as_deref()),
+            remote: Some(remote),
+        }),
+    }
+}
+
+/// The caller of a call whose permissions are checked already.
+fn checked<'a>(broker: &'a Broker, auth: &'a Option<SecurityAuth>, remote: &'a str) -> Caller<'a> {
+    Caller {
+        security: None,
+        ..caller(broker, auth, remote)
+    }
 }
 
 async fn read(
     broker: &Arc<Broker>,
     auth: &Option<SecurityAuth>,
+    remote: &str,
     resource: &str,
     attribute: &str,
 ) -> Response {
@@ -144,7 +163,10 @@ async fn read(
     if !m.exists(broker, resource) {
         return not_found(format!("no resource {resource}"));
     }
-    let Ok(value) = m.attribute(broker, resource, attribute, None).await else {
+    let Ok(value) = m
+        .attribute(broker, resource, attribute, checked(broker, auth, remote))
+        .await
+    else {
         return not_found(format!("no attribute {attribute} on {resource}"));
     };
     let mut chars = attribute.chars();
@@ -157,7 +179,11 @@ async fn read(
     } else {
         "get"
     };
-    if let Err(e) = m.permits(caller(broker, auth), resource, &format!("{getter}{upper}")) {
+    if let Err(e) = m.permits(
+        caller(broker, auth, remote),
+        resource,
+        &format!("{getter}{upper}"),
+    ) {
         return error(StatusCode::FORBIDDEN, e);
     }
     reply(StatusCode::OK, value)
@@ -166,6 +192,7 @@ async fn read(
 async fn call(
     broker: &Arc<Broker>,
     auth: &Option<SecurityAuth>,
+    remote: &str,
     resource: &str,
     operation: &str,
     body: &[u8],
@@ -188,10 +215,19 @@ async fn call(
     if !m.exists(broker, resource) {
         return not_found(format!("no resource {resource}"));
     }
-    if let Err(e) = m.permits(caller(broker, auth), resource, operation) {
+    if let Err(e) = m.permits(caller(broker, auth, remote), resource, operation) {
         return error(StatusCode::FORBIDDEN, e);
     }
-    match m.invoke(broker, resource, operation, &params, None).await {
+    match m
+        .invoke(
+            broker,
+            resource,
+            operation,
+            &params,
+            checked(broker, auth, remote),
+        )
+        .await
+    {
         Ok(value) => reply(StatusCode::OK, value),
         Err(e) if e.starts_with("AMQ229069") => not_found(e),
         Err(e) => error(StatusCode::BAD_REQUEST, e),
@@ -201,6 +237,7 @@ async fn call(
 async fn browse(
     broker: &Arc<Broker>,
     auth: &Option<SecurityAuth>,
+    remote: &str,
     queue: &str,
     query: &HashMap<String, String>,
 ) -> Response {
@@ -224,11 +261,17 @@ async fn browse(
             );
         }
     };
-    if let Err(e) = m.permits(caller(broker, auth), &resource, "browse") {
+    if let Err(e) = m.permits(caller(broker, auth, remote), &resource, "browse") {
         return error(StatusCode::FORBIDDEN, e);
     }
     match m
-        .browse(broker, queue, page, query.get("filter").cloned())
+        .browse(
+            broker,
+            queue,
+            page,
+            query.get("filter").cloned(),
+            checked(broker, auth, remote),
+        )
         .await
     {
         Ok(value) => reply(StatusCode::OK, value),
@@ -247,9 +290,12 @@ async fn get3(
         Ok(a) => a,
         Err(r) => return *r,
     };
+    let remote = peer.to_string();
     match (kind.as_str(), a.as_str(), b.as_str()) {
-        ("broker", "attributes", attribute) => read(&broker, &auth, "broker", attribute).await,
-        ("queues", queue, "messages") => browse(&broker, &auth, queue, &query).await,
+        ("broker", "attributes", attribute) => {
+            read(&broker, &auth, &remote, "broker", attribute).await
+        }
+        ("queues", queue, "messages") => browse(&broker, &auth, &remote, queue, &query).await,
         _ => not_found("no such API"),
     }
 }
@@ -265,8 +311,9 @@ async fn post3(
         Ok(a) => a,
         Err(r) => return *r,
     };
+    let remote = peer.to_string();
     match (kind.as_str(), a.as_str()) {
-        ("broker", "operations") => call(&broker, &auth, "broker", &b, &body).await,
+        ("broker", "operations") => call(&broker, &auth, &remote, "broker", &b, &body).await,
         _ => not_found("no such API"),
     }
 }
@@ -281,8 +328,9 @@ async fn get4(
         Ok(a) => a,
         Err(r) => return *r,
     };
+    let remote = peer.to_string();
     match (resource(&kind, &name), part.as_str()) {
-        (Some(r), "attributes") => read(&broker, &auth, &r, &member).await,
+        (Some(r), "attributes") => read(&broker, &auth, &remote, &r, &member).await,
         _ => not_found("no such API"),
     }
 }
@@ -298,8 +346,9 @@ async fn post4(
         Ok(a) => a,
         Err(r) => return *r,
     };
+    let remote = peer.to_string();
     match (resource(&kind, &name), part.as_str()) {
-        (Some(r), "operations") => call(&broker, &auth, &r, &member, &body).await,
+        (Some(r), "operations") => call(&broker, &auth, &remote, &r, &member, &body).await,
         _ => not_found("no such API"),
     }
 }

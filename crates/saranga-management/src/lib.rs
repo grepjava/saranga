@@ -266,9 +266,14 @@ fn forbidden() -> Response {
     )
 }
 
-/// The roles of the user the `Authorization: Basic` header names, when the
-/// broker's security manager validates it.
-fn login(state: &AppState, headers: &HeaderMap, peer: SocketAddr) -> Option<Vec<String>> {
+/// The roles and subject of the user the `Authorization: Basic` header
+/// names, when the broker's security manager validates it. The login is
+/// audited as the console's `JaasAuthenticator` audits it.
+fn login(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Option<(Vec<String>, Arc<saranga_security::jaas::Subject>)> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let encoded = value
         .strip_prefix("Basic ")
@@ -280,17 +285,40 @@ fn login(state: &AppState, headers: &HeaderMap, peer: SocketAddr) -> Option<Vec<
         remote_address: format!("/{peer}"),
         certificates: None,
         security_domain: None,
+        connection_id: None,
     };
-    let subject = store
+    use saranga_security::audit;
+    let subject = match store
         .manager()
         .authenticate(Some(user), Some(password), &connection)
-        .ok()??;
+    {
+        Ok(Some(subject)) => Arc::new(subject),
+        failed => {
+            if audit::resource_enabled() {
+                let reason = match failed {
+                    Err(e) => e.0,
+                    _ => "no subject".to_owned(),
+                };
+                audit::resource(audit::fill(
+                    "AMQ601716: User {} failed authentication on connection {}, reason: {}",
+                    &[&audit::caller(None, None), "null", &reason],
+                ));
+            }
+            return None;
+        }
+    };
+    if audit::resource_enabled() {
+        audit::resource(audit::fill(
+            "AMQ601715: User {} successfully authenticated on connection {}",
+            &[&audit::caller(Some(&subject), None), "null"],
+        ));
+    }
     let roles: Vec<String> = subject.roles().map(str::to_owned).collect();
     let allowed = state
         .console_roles
         .iter()
         .any(|r| r == "*" || roles.iter().any(|u| u == r));
-    allowed.then_some(roles)
+    allowed.then_some((roles, subject))
 }
 
 async fn jolokia_handler(
@@ -343,10 +371,13 @@ async fn jolokia_handler(
         }
         return cors(r);
     }
-    let Some(roles) = login(&state, &headers, peer) else {
+    let Some((roles, subject)) = login(&state, &headers, peer) else {
         return forbidden();
     };
-    let caller = jolokia::Caller { roles };
+    let caller = jolokia::Caller {
+        roles,
+        subject: Some(subject),
+    };
     let scheme = if headers.get("x-forwarded-proto").is_some() {
         "https"
     } else {

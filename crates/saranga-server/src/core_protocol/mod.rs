@@ -208,6 +208,7 @@ pub async fn serve_connection(broker: Arc<Broker>, stream: TcpStream) {
         remote_address: peer.map(java_socket_address).unwrap_or_default(),
         certificates: None,
         security_domain: None,
+        connection_id: None,
     };
     serve_stream(broker, stream, peer, local, info, Arc::default()).await;
 }

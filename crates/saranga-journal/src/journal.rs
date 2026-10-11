@@ -603,6 +603,13 @@ impl Journal {
     }
 
     /// `appendAddRecord`.
+    /// How long the journal's write in progress has taken, and an ID of
+    /// that write; `None` while it writes nothing (the critical analyzer's
+    /// `TimedBuffer` path).
+    pub fn writing(&self) -> Option<(std::time::Duration, u64)> {
+        self.writer.busy()
+    }
+
     pub fn append_add(
         &self,
         id: i64,

@@ -340,6 +340,7 @@ pub(super) async fn send(
         remote_address: "management".to_owned(),
         certificates: None,
         security_domain: None,
+        connection_id: None,
     });
     let authenticated = match broker.security() {
         Some(s) => s

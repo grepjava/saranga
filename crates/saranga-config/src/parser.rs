@@ -12,8 +12,8 @@ use roxmltree::{Document, Node, ParsingOptions};
 use crate::acceptor::AcceptorConfig;
 use crate::address_settings::AddressSettings;
 use crate::broker::{
-    AddressConfig, BrokerConfig, DivertConfig, DivertRoutingType, JournalConfig, QueueConfig,
-    TransformerConfig, Warning,
+    AddressConfig, BrokerConfig, BrokerPluginConfig, CriticalAnalyzerPolicy, DivertConfig,
+    DivertRoutingType, JournalConfig, QueueConfig, TransformerConfig, Warning,
 };
 use crate::bytes::convert_text_bytes;
 use crate::mask::{self, MaskError};
@@ -405,6 +405,7 @@ fn parse_core(
     parse_scalars(core, config, warnings)?;
     parse_acceptors(core, config, warnings)?;
     parse_security_settings(core, config, warnings)?;
+    parse_broker_plugins(core, config)?;
     parse_address_settings(core, config, warnings)?;
     parse_addresses(core, config, warnings)?;
     parse_diverts(core, config, warnings)?;
@@ -431,7 +432,6 @@ const NOT_ACTED_ON: &[(&str, &str)] = &[
         "grouping-handler",
         "clustered message grouping is not supported",
     ),
-    ("broker-plugins", "broker plugins are not supported"),
     ("metrics", "metrics are not supported yet"),
     ("metrics-plugin", "metrics are not supported yet"),
     (
@@ -541,6 +541,25 @@ fn parse_scalars(
     }
     if let Some(v) = s.bool("suppress-session-notifications") {
         config.suppress_session_notifications = v;
+    }
+    if let Some(v) = s.bool("critical-analyzer") {
+        config.critical_analyzer = v;
+    }
+    if let Some(v) = s.i64("critical-analyzer-timeout", Check::GeZero)? {
+        config.critical_analyzer_timeout = v;
+    }
+    if let Some(v) = s.i64("critical-analyzer-check-period", Check::GeZero)? {
+        config.critical_analyzer_check_period = v;
+    }
+    if let Some(v) = s.string("critical-analyzer-policy") {
+        // CriticalAnalyzerPolicy.valueOf
+        config.critical_analyzer_policy = CriticalAnalyzerPolicy::parse(&v).ok_or_else(|| {
+            ConfigError::invalid(
+                "critical-analyzer-policy",
+                &v,
+                "must be one of HALT, SHUTDOWN or LOG".to_owned(),
+            )
+        })?;
     }
     if let Some(v) = s.bool("message-counter-enabled") {
         config.message_counter_enabled = v;
@@ -880,6 +899,33 @@ fn required_attribute(n: Node<'_, '_>, attribute: &str) -> Result<String> {
 
 /// `parseSecurity`: role mappings first, then each `<security-setting>`
 /// with its role names mapped, then the plugins.
+/// `parseBrokerPlugins`: each `<broker-plugin>`'s class and properties.
+fn parse_broker_plugins(core: Node<'_, '_>, config: &mut BrokerConfig) -> Result<()> {
+    let Some(list) = first(core, "broker-plugins") else {
+        return Ok(());
+    };
+    for node in list
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "broker-plugin")
+    {
+        let class_name = required_attribute(node, "class-name")?;
+        let properties = elements(node)
+            .filter(|c| c.tag_name().name() == "property")
+            .map(|p| {
+                (
+                    p.attribute("key").unwrap_or_default().to_owned(),
+                    p.attribute("value").unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        config.broker_plugins.push(BrokerPluginConfig {
+            class_name,
+            properties,
+        });
+    }
+    Ok(())
+}
+
 fn parse_security_settings(
     core: Node<'_, '_>,
     config: &mut BrokerConfig,

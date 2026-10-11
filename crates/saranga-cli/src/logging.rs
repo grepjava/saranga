@@ -1063,7 +1063,16 @@ impl Config {
                 refs: vec![(0, ALL)],
                 additive: false,
             },
-            loggers: HashMap::new(),
+            // The audit loggers are off, as Artemis's file has them.
+            loggers: HashMap::from([(
+                "org.apache.activemq.audit".to_owned(),
+                LoggerConfig {
+                    name: "org.apache.activemq.audit".to_owned(),
+                    level: OFF,
+                    refs: Vec::new(),
+                    additive: false,
+                },
+            )]),
             appenders: vec![Appender {
                 layout,
                 threshold: ALL,
@@ -1522,6 +1531,29 @@ struct ArtemisLayer {
 }
 
 impl ArtemisLayer {
+    /// Whether an event can be logged before its message is known: exactly
+    /// for an explicit logger (the audit loggers), else whether any logger
+    /// logs at its level; `None` when that is for `RUST_LOG` to say.
+    fn enabled_for(&self, meta: &Metadata<'_>) -> Option<bool> {
+        let config = self.config();
+        let level = level_value(*meta.level());
+        if meta.module_path() != Some(meta.target()) {
+            let logger = config.find(&meta.target().replace("::", ".")).level;
+            return if self.shared.levels {
+                Some(level <= logger)
+            } else if logger == OFF {
+                Some(false)
+            } else {
+                None
+            };
+        }
+        if self.shared.levels {
+            Some(config.may_log(level))
+        } else {
+            None
+        }
+    }
+
     fn config(&self) -> Arc<Config> {
         self.shared
             .config
@@ -1534,15 +1566,19 @@ impl ArtemisLayer {
 impl<S: Subscriber> Layer<S> for ArtemisLayer {
     fn register_callsite(&self, meta: &'static Metadata<'static>) -> Interest {
         if meta.is_span() {
-            Interest::never()
-        } else {
-            // The configuration can change.
-            Interest::sometimes()
+            return Interest::never();
+        }
+        // An explicit logger is known now: decided once, until the
+        // configuration changes (which rebuilds the interest cache).
+        match self.enabled_for(meta) {
+            Some(true) if self.shared.levels => Interest::always(),
+            Some(false) => Interest::never(),
+            _ => Interest::sometimes(),
         }
     }
 
     fn enabled(&self, meta: &Metadata<'_>, _: Context<'_, S>) -> bool {
-        !self.shared.levels || self.config().may_log(level_value(*meta.level()))
+        self.enabled_for(meta).unwrap_or(true)
     }
 
     fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {

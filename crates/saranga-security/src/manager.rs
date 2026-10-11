@@ -18,6 +18,8 @@ pub struct ConnectionInfo {
     pub certificates: Option<Arc<[PeerCertificate]>>,
     /// The acceptor's `securityDomain`, which overrides the broker's.
     pub security_domain: Option<String>,
+    /// The connection's ID, for the audit log; `None` for a web login.
+    pub connection_id: Option<String>,
 }
 
 impl ConnectionInfo {

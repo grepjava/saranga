@@ -103,13 +103,20 @@ pub fn view_permission(pattern: &str) -> Option<regex::Regex> {
     regex::Regex::new(&format!("^(?:{pattern})$")).ok()
 }
 
-/// Who sends a management message, for `management-message-rbac`: the
-/// security store and the sending session. `None` for the broker's own
-/// callers.
-pub type Caller<'a> = Option<(
-    &'a saranga_security::SecurityStore,
-    &'a saranga_security::SecurityAuth,
-)>;
+/// Who makes a management call.
+#[derive(Clone, Copy, Default)]
+pub struct Caller<'a> {
+    /// For `management-message-rbac`: the security store and the sending
+    /// session. `None` without security, for the broker's own calls, and
+    /// for callers that checked the permissions themselves.
+    pub security: Option<(
+        &'a saranga_security::SecurityStore,
+        &'a saranga_security::SecurityAuth,
+    )>,
+    /// For the audit log; `None` for the broker's own calls (metrics),
+    /// which are not audited.
+    pub who: Option<crate::audit::Who<'a>>,
+}
 
 /// The broker's management service.
 pub struct Management {
@@ -125,6 +132,19 @@ enum Resource {
     Address(String),
     Queue(crate::queue::Queue),
     Divert(Arc<crate::postoffice::Divert>),
+}
+
+impl Resource {
+    /// The control that audits calls on it, and its name.
+    fn audited(&self) -> (crate::audit::Control, String) {
+        use crate::audit::Control;
+        match self {
+            Resource::Broker => (Control::Broker, String::new()),
+            Resource::Address(a) => (Control::Address, a.clone()),
+            Resource::Queue(q) => (Control::Queue, q.name().to_string()),
+            Resource::Divert(d) => (Control::Divert, d.name.to_string()),
+        }
+    }
 }
 
 impl Management {
@@ -163,7 +183,8 @@ impl Management {
     /// pattern matches) or the edit permission on
     /// `<prefix>.<resource>.<method>`.
     fn security_check(&self, caller: Caller, resource: &str, method: &str) -> Result<(), String> {
-        let (Some(prefix), Some((store, auth))) = (&self.config.rbac_prefix, caller) else {
+        let (Some(prefix), Some((store, auth))) = (&self.config.rbac_prefix, caller.security)
+        else {
             return Ok(());
         };
         let view = self
@@ -243,7 +264,18 @@ impl Management {
                 };
                 let method = format!("{getter}{upper}");
                 match self.security_check(caller, resource, &method) {
-                    Ok(()) => Ok(v),
+                    Ok(()) => {
+                        let (control, name) = r.audited();
+                        crate::audit::management_call(
+                            broker,
+                            control,
+                            &name,
+                            &method,
+                            &[],
+                            caller.who,
+                        );
+                        Ok(v)
+                    }
                     Err(_) => Err(problem()),
                 }
             }
@@ -259,11 +291,32 @@ impl Management {
         queue: &str,
         page: Option<(i32, i32)>,
         filter: Option<String>,
+        caller: Caller<'_>,
     ) -> Outcome {
         let Some(q) = broker.post_office().queue(queue) else {
             return Err(format!("AMQ229017: Queue {queue} does not exist"));
         };
-        queue::browse(broker, &q, page, filter).await
+        let params: Vec<Json> = match (page, &filter) {
+            (None, None) => Vec::new(),
+            (None, Some(f)) => vec![Json::from(f.as_str())],
+            (Some((p, s)), None) => vec![Json::from(i64::from(p)), Json::from(i64::from(s))],
+            (Some((p, s)), Some(f)) => vec![
+                Json::from(i64::from(p)),
+                Json::from(i64::from(s)),
+                Json::from(f.as_str()),
+            ],
+        };
+        crate::audit::management_call(
+            broker,
+            crate::audit::Control::Queue,
+            queue,
+            "browse",
+            &params,
+            caller.who,
+        );
+        let result = queue::browse(broker, &q, page, filter).await;
+        crate::audit::browsed(queue, &result, caller.who);
+        result
     }
 
     /// `invokeOperation`.
@@ -281,11 +334,25 @@ impl Management {
             ));
         };
         self.security_check(caller, resource, operation)?;
+        let (control, name) = r.audited();
+        crate::audit::management_call(broker, control, &name, operation, params, caller.who);
+        let result = self.dispatch(broker, &r, operation, params).await;
+        crate::audit::management_result(control, &name, operation, params, &result, caller.who);
+        result
+    }
+
+    async fn dispatch(
+        &self,
+        broker: &Arc<Broker>,
+        r: &Resource,
+        operation: &str,
+        params: &[Json],
+    ) -> Outcome {
         let call = args::Call {
             op: operation,
             params,
         };
-        let found = match &r {
+        let found = match r {
             Resource::Broker => server::invoke(self, broker, &call).await,
             Resource::Address(a) => address::invoke(broker, a, &call).await,
             Resource::Queue(q) => queue::invoke(broker, q, &call).await,
@@ -300,7 +367,7 @@ impl Management {
                 if let Some(attr) = operation.strip_prefix(prefix)
                     && attr.starts_with(|c: char| c.is_ascii_uppercase())
                 {
-                    let value = match &r {
+                    let value = match r {
                         Resource::Broker => server::attribute(self, broker, attr).await,
                         Resource::Address(a) => address::attribute(broker, a, attr).await,
                         Resource::Queue(q) => queue::attribute(broker, q, attr).await,

@@ -354,6 +354,7 @@ impl BrokerConfig {
             // Protocol crates register themselves: whoever starts the
             // broker adds them.
             protocols: Vec::new(),
+            critical: crate::critical::CriticalConfig::from_file(config),
             management: crate::management::ManagementConfig {
                 address: config.management_address.clone(),
                 notification_address: config.management_notification_address.clone(),

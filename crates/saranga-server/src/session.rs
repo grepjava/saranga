@@ -94,6 +94,9 @@ pub struct ClientConnection {
     temp_queues: Mutex<Vec<Name>>,
     /// What the security store knows of this connection.
     security_info: Arc<ConnectionInfo>,
+    /// The subject its sessions authenticated as (`getSubject`), for the
+    /// audit log.
+    subject: Mutex<Option<Arc<saranga_security::jaas::Subject>>>,
     /// The acceptor's address prefixes.
     prefixes: Vec<(String, RoutingType)>,
     sessions: Mutex<Vec<Arc<SessionEntry>>>,
@@ -113,7 +116,12 @@ impl ClientConnection {
         let id = uuid::Uuid::new_v4().as_bytes()[..4]
             .iter()
             .map(|b| format!("{b:02x}"))
-            .collect();
+            .collect::<String>();
+        // The audit log names the connection a login was on.
+        let security_info = Arc::new(ConnectionInfo {
+            connection_id: Some(id.clone()),
+            ..(*security_info).clone()
+        });
         Self {
             id,
             transport,
@@ -121,6 +129,7 @@ impl ClientConnection {
             client_id: Mutex::default(),
             temp_queues: Mutex::default(),
             security_info,
+            subject: Mutex::default(),
             prefixes,
             sessions: Mutex::default(),
             failed: AtomicBool::new(false),
@@ -237,6 +246,20 @@ impl ClientConnection {
 
     pub fn security_info(&self) -> Arc<ConnectionInfo> {
         self.security_info.clone()
+    }
+
+    /// `setSubject`: the subject a session of this connection logged in as.
+    pub fn set_subject(&self, subject: Option<Arc<saranga_security::jaas::Subject>>) {
+        if subject.is_some() {
+            *self.subject.lock().unwrap_or_else(|e| e.into_inner()) = subject;
+        }
+    }
+
+    pub fn subject(&self) -> Option<Arc<saranga_security::jaas::Subject>> {
+        self.subject
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn prefixes(&self) -> &[(String, RoutingType)] {
@@ -398,6 +421,26 @@ impl ServerSession {
         options: SessionOptions,
         authenticated: Authenticated,
     ) -> Self {
+        // The connection is who its sessions authenticated as.
+        conn.set_subject(authenticated.subject.clone());
+        if crate::audit::base_enabled() {
+            let subject = conn.subject();
+            crate::audit::session_created(
+                &broker,
+                crate::audit::Who {
+                    subject: subject.as_deref(),
+                    remote: Some(conn.remote_address()),
+                },
+                &options.name,
+                options.username.as_deref(),
+                conn.id(),
+                options.auto_commit_sends,
+                options.auto_commit_acks,
+                options.pre_acknowledge,
+                options.xa,
+                options.default_address.as_deref(),
+            );
+        }
         let tx =
             (!options.xa).then(|| Transaction::new_ref(broker.post_office().ids().next(), None));
         let security_info = conn.security_info();
@@ -443,6 +486,24 @@ impl ServerSession {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Who this session is, for the audit log: its connection's subject
+    /// and address.
+    pub fn who(&self) -> crate::audit::Who<'_> {
+        crate::audit::Who {
+            subject: self.auth.subject.as_deref(),
+            remote: Some(self.conn.remote_address()),
+        }
+    }
+
+    fn audit(&self) -> crate::audit::SessionAudit<'_> {
+        crate::audit::SessionAudit {
+            who: self.who(),
+            session: &self.name,
+            connection_id: self.conn.id(),
+            consumers: self.consumers.len(),
+        }
     }
 
     /// What management sees of the session.
@@ -771,6 +832,8 @@ impl ServerSession {
         outgoing: Outgoing,
         tx: Option<TxRef>,
     ) -> Result<()> {
+        let entry = self.entry.clone();
+        let _critical = entry.critical.enter();
         let address: Name = match &message.address {
             Some(a) => {
                 let a: Name = a.to_string_lossy().into();
@@ -948,6 +1011,13 @@ impl ServerSession {
         request: CoreMessage,
         tx: Option<TxRef>,
     ) -> Result<()> {
+        if crate::audit::base_enabled() {
+            let tx = tx.as_ref().map(transaction::lock);
+            self.audit().management_message(
+                tx.as_deref(),
+                &crate::message::ServerMessage::new(request.clone()),
+            );
+        }
         let address = self.broker.management().address().to_owned();
         if let Err(e) = self.security_check(&address, None, CheckType::Manage) {
             if let Some(tx) = &tx {
@@ -956,11 +1026,28 @@ impl ServerSession {
             return Err(e);
         }
         let broker = self.broker.clone();
-        let caller = broker.security().map(|s| (&**s, &self.auth));
+        let caller = crate::management::Caller {
+            security: broker.security().map(|s| (&**s, &self.auth)),
+            who: Some(self.who()),
+        };
         let mut reply = broker
             .management()
             .handle_message(&broker, &request, caller)
             .await;
+        // The request is logged as sent, as any other message.
+        if crate::audit::message_enabled() {
+            let message = crate::message::ServerMessage::new(request.clone());
+            match &tx {
+                Some(tx) if !self.auto_commit_sends => {
+                    let tx = crate::audit::transaction_string(&transaction::lock(tx));
+                    crate::audit::send_in_transaction(self.who(), &message, &tx);
+                }
+                _ => {
+                    let context = crate::audit::routing_context("null", &[]);
+                    crate::audit::sent(self.who(), &message, &context, None);
+                }
+            }
+        }
         let Some(reply_to) = crate::message::string_property(&request, crate::management::REPLY_TO)
         else {
             return Ok(());
@@ -1007,6 +1094,29 @@ impl ServerSession {
         tx: Option<TxRef>,
         mut own_tx: Option<(i64, bool)>,
     ) -> Result<()> {
+        // The broker's own sends (a management reply, an advisory) are not
+        // the session's.
+        if crate::audit::message_enabled()
+            && !self.unchecked
+            && let Some((r, _)) = routed.first()
+        {
+            // The message as sent; its divert copies are not logged.
+            match &tx {
+                Some(tx) if !self.auto_commit_sends => {
+                    let tx = crate::audit::transaction_string(&transaction::lock(tx));
+                    crate::audit::send_in_transaction(self.who(), &r.message, &tx);
+                }
+                _ => {
+                    let address = r.message.core().address.as_ref().map(ToString::to_string);
+                    let queues: Vec<Queue> = routed.iter().flat_map(|(_, q)| q.clone()).collect();
+                    let context = crate::audit::routing_context(
+                        address.as_deref().unwrap_or("null"),
+                        &queues,
+                    );
+                    crate::audit::sent(self.who(), &r.message, &context, None);
+                }
+            }
+        }
         let storage = self.storage();
         // processRouteToDurableQueues, for the message and each divert
         // copy: the message record with its first durable reference, then
@@ -1135,6 +1245,8 @@ impl ServerSession {
         individual: bool,
         tx: Option<TxRef>,
     ) -> Result<Vec<i64>> {
+        let entry = self.entry.clone();
+        let _critical = entry.critical.enter();
         let Some(c) = self.consumers.get(&consumer_id) else {
             let e = BrokerError::consumer_doesnt_exist(consumer_id);
             if let Some(tx) = &tx {
@@ -1146,6 +1258,48 @@ impl ServerSession {
         match queue.ack(c.id, message_id, individual, tx.is_some()).await {
             Ok(mut refs) => {
                 let ids = refs.iter().map(MessageRef::message_id).collect();
+                if crate::audit::message_enabled() {
+                    let name = queue.name().to_string();
+                    match &tx {
+                        Some(tx) => {
+                            let tx = crate::audit::transaction_string(&transaction::lock(tx));
+                            for r in &refs {
+                                crate::audit::ack_in_transaction(
+                                    self.who(),
+                                    &name,
+                                    &r.message,
+                                    &tx,
+                                );
+                            }
+                        }
+                        None => {
+                            // ServerConsumerImpl.acknowledge: in a
+                            // transaction of its own, committed at once.
+                            let t =
+                                Transaction::new_ref(self.broker.post_office().ids().next(), None);
+                            let mut t = transaction::lock(&t);
+                            let active = crate::audit::transaction_string(&t);
+                            for r in &refs {
+                                crate::audit::ack_in_transaction(
+                                    self.who(),
+                                    &name,
+                                    &r.message,
+                                    &active,
+                                );
+                            }
+                            t.state = TxState::Committed;
+                            let committed = crate::audit::transaction_string(&t);
+                            for r in &refs {
+                                crate::audit::acknowledged(
+                                    self.who(),
+                                    &name,
+                                    &r.message,
+                                    Some(&committed),
+                                );
+                            }
+                        }
+                    }
+                }
                 // QueueImpl.acknowledge
                 match tx {
                     Some(tx) => {
@@ -1727,6 +1881,14 @@ impl ServerSession {
         browse_only: bool,
         sink: impl FnOnce(&Queue) -> Arc<dyn DeliverySink>,
     ) -> Result<()> {
+        self.audit().consumer(
+            consumer_id,
+            queue_name,
+            filter.as_deref(),
+            priority,
+            browse_only,
+            None,
+        );
         let post_office = self.broker.post_office();
         let name = queue_name_of(queue_name);
         let queue = post_office
@@ -1757,7 +1919,14 @@ impl ServerSession {
             return Err(BrokerError::max_consumer_limit_reached(&c.address, &c.name));
         }
         let id = self.broker.next_consumer_id();
-        let sink = sink(&queue);
+        // Its deliveries go through the audit log's message logger, which
+        // can be turned on while it consumes.
+        let sink: Arc<dyn DeliverySink> = Arc::new(crate::audit::AuditedSink {
+            inner: sink(&queue),
+            subject: self.auth.subject.clone(),
+            remote: self.conn.remote_address().to_owned(),
+            queue: queue.name().to_string(),
+        });
         let metrics = Arc::new(ConsumerMetrics::default());
         queue.add_consumer(ConsumerRegistration {
             id,
@@ -1912,6 +2081,16 @@ impl ServerSession {
         mut types: RoutingTypes,
         auto_created: bool,
     ) -> Result<()> {
+        if crate::audit::base_enabled() {
+            // EnumSet order.
+            let names: Vec<&str> = [RoutingType::Multicast, RoutingType::Anycast]
+                .into_iter()
+                .filter(|t| types.contains(*t))
+                .map(|t| t.name())
+                .collect();
+            self.audit()
+                .address(&self.broker, address, &names.join(","), auto_created);
+        }
         let (address, prefixed) = self.strip_prefix(address);
         if let Some(t) = prefixed {
             types = RoutingTypes::of(t);
@@ -1925,6 +2104,7 @@ impl ServerSession {
 
     /// `ServerSessionImpl.createQueue`.
     pub fn create_queue(&mut self, mut spec: QueueSpec) -> Result<Queue> {
+        self.audit().queue(&spec, false);
         // The user must be allowed to create the queue, and the address too
         // if the queue's creation would create or extend it.
         self.security_check(&spec.address, Some(&spec.name), create_check(spec.durable))?;
@@ -1952,6 +2132,7 @@ impl ServerSession {
     /// `createSharedQueue`: creates the queue unless one with the same
     /// address and filter exists. Only the address loses its prefix.
     pub fn create_shared_queue(&mut self, mut spec: QueueSpec) -> Result<()> {
+        self.audit().queue(&spec, true);
         spec.address = self.remove_prefix(&spec.address).into();
         self.security_check(&spec.address, Some(&spec.name), create_check(spec.durable))?;
         spec.user = self.validated_user.clone();
@@ -1976,6 +2157,7 @@ impl ServerSession {
     /// `deleteQueue(name, checkSecurity)`: without the check, the session's
     /// user need not be allowed to delete the queue or its address.
     pub fn delete_queue_with(&mut self, name: &str, check_security: bool) -> Result<()> {
+        self.audit().delete_queue(name);
         let post_office = self.broker.post_office();
         let name = queue_name_of(self.remove_prefix(name));
         let queue = post_office
@@ -2029,7 +2211,9 @@ impl ServerSession {
     /// Commits a transaction of the caller's own; a rollback-only one rolls
     /// back and fails instead.
     pub fn commit_tx(&mut self, tx: &TxRef) -> Result<()> {
+        let ending = crate::audit::ending(&transaction::lock(tx));
         let result = transaction::lock(tx).commit(true);
+        self.audit_ended(ending, tx, result.is_ok());
         match result {
             Ok(outcome) => self.finish(outcome, true),
             Err(failed) => {
@@ -2037,6 +2221,13 @@ impl ServerSession {
                 self.finish(outcome, false)?;
                 Err(e)
             }
+        }
+    }
+
+    /// The audit log's messages for a transaction that has ended.
+    fn audit_ended(&self, ending: Option<crate::audit::Ending>, tx: &TxRef, committed: bool) {
+        if let Some(ending) = ending {
+            crate::audit::ended(self.who(), ending, &transaction::lock(tx), committed);
         }
     }
 
@@ -2074,7 +2265,9 @@ impl ServerSession {
 
     /// Rolls back a transaction of the caller's own.
     pub fn rollback_tx(&mut self, tx: &TxRef) -> Result<()> {
+        let ending = crate::audit::ending(&transaction::lock(tx));
         let outcome = transaction::lock(tx).rollback()?;
+        self.audit_ended(ending, tx, false);
         self.finish(outcome, false)
     }
 
@@ -2121,7 +2314,9 @@ impl ServerSession {
         let Some(tx) = tx else {
             return Ok(());
         };
+        let ending = crate::audit::ending(&transaction::lock(&tx));
         let result = transaction::lock(&tx).commit(true);
+        self.audit_ended(ending, &tx, result.is_ok());
         match result {
             Ok(outcome) => self.finish(outcome, true),
             Err(failed) => {
@@ -2167,6 +2362,7 @@ impl ServerSession {
                 .await;
             cancelled.extend(refs.into_iter().map(|r| (c.queue.clone(), r)));
         }
+        let ending = crate::audit::ending(&transaction::lock(tx));
         let result = {
             let mut t = transaction::lock(tx);
             // What was delivered after a transaction already rolled back
@@ -2177,6 +2373,9 @@ impl ServerSession {
                 t.rollback()
             }
         };
+        if result.is_ok() {
+            self.audit_ended(ending, tx, false);
+        }
         let (mut outcome, result) = match result {
             Ok(o) => (o, Ok(())),
             Err(e) => (Outcome::default(), Err(e)),

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use saranga_config::{CheckType, HierarchicalRepository, Role, SecuritySetting};
 use sha2::{Digest, Sha256};
 
+use crate::audit;
 use crate::jaas::Subject;
 use crate::manager::{CERT_SUBJECT_DN_UNAVAILABLE, ConnectionInfo, SecurityManager};
 
@@ -291,7 +292,9 @@ impl SecurityStore {
                     .authentication_failure
                     .fetch_add(1, Ordering::Relaxed);
                 self.authentication_failed(user, connection);
-                return Err(unable_to_validate(connection, user, None));
+                let e = unable_to_validate(connection, user, None);
+                audit_failed_authentication(connection, &e);
+                return Err(e);
             }
             ClusterCheck::Ignore => {}
         }
@@ -333,8 +336,18 @@ impl SecurityStore {
             self.authentication_failed(user, connection);
             let e = unable_to_validate(connection, user, Some(connection.cert_subject_dn()));
             tracing::warn!("AMQ222216: Security problem while authenticating: {e}");
+            audit_failed_authentication(connection, &e);
             return Err(e);
         };
+        if audit::resource_enabled() {
+            audit::resource(audit::fill(
+                "AMQ601715: User {} successfully authenticated on connection {}",
+                &[
+                    &audit::caller(subject.as_deref(), Some(&connection.remote_address)),
+                    connection.connection_id.as_deref().unwrap_or("null"),
+                ],
+            ));
+        }
         self.counters
             .authentication_success
             .fetch_add(1, Ordering::Relaxed);
@@ -469,14 +482,27 @@ impl SecurityStore {
             check,
             user: caller.clone(),
         });
-        Err(SecurityError(match queue.map(extract_queue_name) {
+        let e = SecurityError(match queue.map(extract_queue_name) {
             None => format!(
                 "AMQ229032: User: {caller} does not have permission='{check}' on address {bare_address}"
             ),
             Some(q) => format!(
                 "AMQ229213: User: {caller} does not have permission='{check}' for queue {q} on address {bare_address}"
             ),
-        }))
+        });
+        if audit::base_enabled() {
+            audit::base(audit::fill(
+                "AMQ601264: User {} gets security check failure, reason = {}",
+                &[
+                    &audit::caller(
+                        auth.subject.as_deref(),
+                        Some(&auth.connection.remote_address),
+                    ),
+                    &e.0,
+                ],
+            ));
+        }
+        Err(e)
     }
 
     /// `getCaller`: the user name given, or the subject's user.
@@ -505,10 +531,12 @@ fn unable_to_validate(
     user: Option<&str>,
     cert_dn: Option<&str>,
 ) -> SecurityError {
+    // RemotingConnection.getRemoteAddress: SocketAddressUtil.toString,
+    // without InetSocketAddress's leading slash.
     let remote = if connection.remote_address.is_empty() {
         "null"
     } else {
-        &connection.remote_address
+        connection.remote_address.trim_start_matches('/')
     };
     SecurityError(format!(
         "AMQ229031: Unable to validate user from {remote}. Username: {}; SSL certificate subject DN: {}",
@@ -631,6 +659,21 @@ impl<K: Eq + Hash + Clone, V: Clone> TtlCache<K, V> {
 
     fn clear(&self) {
         self.lock().clear();
+    }
+}
+
+/// `userFailedAuthenticationInAudit`: the failure, for no subject, from the
+/// connection's address.
+fn audit_failed_authentication(connection: &ConnectionInfo, e: &SecurityError) {
+    if audit::resource_enabled() {
+        audit::resource(audit::fill(
+            "AMQ601716: User {} failed authentication on connection {}, reason: {}",
+            &[
+                &audit::caller(None, Some(&connection.remote_address)),
+                connection.connection_id.as_deref().unwrap_or("null"),
+                &e.0,
+            ],
+        ));
     }
 }
 

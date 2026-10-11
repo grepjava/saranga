@@ -29,7 +29,7 @@ async fn start(dir: &Path) -> Arc<Broker> {
 async fn op(broker: &Arc<Broker>, resource: &str, operation: &str, params: Vec<Json>) -> Json {
     broker
         .management()
-        .invoke(broker, resource, operation, &params, None)
+        .invoke(broker, resource, operation, &params, Default::default())
         .await
         .unwrap_or_else(|e| panic!("{operation}: {e}"))
 }
@@ -37,7 +37,7 @@ async fn op(broker: &Arc<Broker>, resource: &str, operation: &str, params: Vec<J
 async fn attr(broker: &Arc<Broker>, resource: &str, attribute: &str) -> Json {
     broker
         .management()
-        .attribute(broker, resource, attribute, None)
+        .attribute(broker, resource, attribute, Default::default())
         .await
         .unwrap_or_else(|e| panic!("{attribute}: {e}"))
 }
@@ -166,7 +166,7 @@ async fn management_state_survives_a_restart() {
     assert!(
         broker
             .management()
-            .attribute(&broker, "divert.d", "ForwardingAddress", None)
+            .attribute(&broker, "divert.d", "ForwardingAddress", Default::default())
             .await
             .is_err()
     );
@@ -180,6 +180,7 @@ fn xa_session(broker: &Arc<Broker>) -> ServerSession {
             remote_address: "test".into(),
             certificates: None,
             security_domain: None,
+            connection_id: None,
         }),
         Vec::new(),
     ));
@@ -393,6 +394,7 @@ async fn security_violations_are_notified() {
         remote_address: "/10.0.0.1:1234".into(),
         certificates: None,
         security_domain: None,
+        connection_id: None,
     };
     assert!(store.authenticate(Some("bob"), Some("x"), &info).is_err());
     let auth = saranga_security::SecurityAuth {

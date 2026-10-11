@@ -732,6 +732,8 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
         }
         _ = tokio::signal::ctrl_c() => Stop::Clean,
         _ = terminated() => Stop::Clean,
+        // The critical analyzer's SHUTDOWN policy.
+        _ = broker.shutdown_requested() => Stop::Clean,
         s = stop_files => s,
     };
     match stop {

@@ -20,9 +20,12 @@ command -v cygpath >/dev/null && HOST_SRC="$(cygpath -m "$SRC")"
 
 DIST="$SRC/artemis-distribution/target/apache-artemis-$VERSION-bin/apache-artemis-$VERSION"
 if [[ ! -d "$DIST" ]]; then
+  # JDK 24 or later, as the image runs on JDK 25: the jars' Java 24 classes
+  # (META-INF/versions/24, such as SecurityManagerShim on Subject.current())
+  # are only built then, and without them the audit log fails on JDK 25.
   docker run --rm \
     -v "$HOST_SRC:/src" -v saranga-m2:/root/.m2 -w /src \
-    maven:3.9-eclipse-temurin-21 \
+    maven:3.9-eclipse-temurin-25 \
     mvn -B -ntp install -pl artemis-distribution -am \
       -DskipTests -Dcheckstyle.skip -Drat.skip -Denforcer.skip -Dmaven.javadoc.skip
 fi

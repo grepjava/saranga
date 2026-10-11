@@ -6,8 +6,10 @@
 //! follows ADR 0001: one task per connection and per session, one actor
 //! per queue.
 
+pub mod audit;
 pub mod config;
 pub mod core_protocol;
+pub mod critical;
 mod disk;
 pub mod duplicate;
 pub mod error;
@@ -234,6 +236,8 @@ pub struct BrokerConfig {
     /// The management address, the broker's name and what management
     /// reports of the configuration.
     pub management: management::ManagementConfig,
+    /// The critical analyzer.
+    pub critical: critical::CriticalConfig,
 }
 
 impl BrokerConfig {
@@ -263,6 +267,7 @@ impl BrokerConfig {
             bootstrap_users: Vec::new(),
             protocols: Vec::new(),
             management: management::ManagementConfig::default(),
+            critical: critical::CriticalConfig::default(),
         }
     }
 }
@@ -360,6 +365,9 @@ pub struct Broker {
     /// The records of the security settings management added, by match
     /// (`mapPersistedSecuritySettings`).
     security_records: Mutex<HashMap<String, i64>>,
+    stopped: std::sync::atomic::AtomicBool,
+    /// The critical analyzer asked for the broker to stop.
+    shutdown: tokio::sync::Notify,
 }
 
 /// Reads the configuration files again (`ReloadManager`).
@@ -524,6 +532,8 @@ impl Broker {
             registry: Arc::default(),
             users: config.users.clone(),
             security_records: Mutex::default(),
+            stopped: Default::default(),
+            shutdown: tokio::sync::Notify::new(),
         });
         // recoverStoredSecuritySettings.
         for (id, s) in &recovered.security_settings {
@@ -568,12 +578,31 @@ impl Broker {
         for p in broker.protocols.clone() {
             p.start(&broker).await;
         }
+        critical::start(&broker, config.critical);
         Ok(broker)
+    }
+
+    /// Whether [`Broker::stop`] has run.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Asks whoever runs the broker to stop it (the critical analyzer's
+    /// `SHUTDOWN` policy).
+    pub fn request_shutdown(&self) {
+        self.shutdown.notify_one();
+    }
+
+    /// Waits for [`Broker::request_shutdown`].
+    pub async fn shutdown_requested(&self) {
+        self.shutdown.notified().await;
     }
 
     /// A clean stop: the ID generator's checkpoint and the journals are
     /// written out, and `server.lock` marked paused.
     pub fn stop(&self) -> Result<()> {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
         self.large_messages.stop();
         self.post_office.paging().stop();
         if let Some(s) = &self.storage {
@@ -813,6 +842,7 @@ impl Broker {
                 remote_address: core_protocol::java_socket_address(peer),
                 certificates: None,
                 security_domain: acceptor.security_domain.clone(),
+                connection_id: None,
             };
             let broker = self.clone();
             let acceptor = acceptor.clone();

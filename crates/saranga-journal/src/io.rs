@@ -98,6 +98,10 @@ struct Shared {
     work: Condvar,
     done: Condvar,
     datasync: bool,
+    /// When the flusher started its current write, in nanoseconds since
+    /// `epoch`; 0 while it waits for work. The critical analyzer reads it.
+    busy_since: std::sync::atomic::AtomicU64,
+    epoch: std::time::Instant,
 }
 
 /// The write queue and its flusher thread.
@@ -113,6 +117,8 @@ impl Writer {
             work: Condvar::new(),
             done: Condvar::new(),
             datasync,
+            busy_since: std::sync::atomic::AtomicU64::new(0),
+            epoch: std::time::Instant::now(),
         });
         let s = shared.clone();
         let thread = std::thread::Builder::new()
@@ -197,6 +203,22 @@ impl Writer {
     pub fn failure(&self) -> Option<JournalError> {
         self.lock().failed.clone()
     }
+
+    /// How long the write (and sync) in progress has taken, and when it
+    /// started; `None` while the flusher is idle.
+    pub fn busy(&self) -> Option<(std::time::Duration, u64)> {
+        let since = self
+            .shared
+            .busy_since
+            .load(std::sync::atomic::Ordering::Acquire);
+        (since != 0).then(|| {
+            let now = self.shared.epoch.elapsed().as_nanos() as u64 + 1;
+            (
+                std::time::Duration::from_nanos(now.saturating_sub(since)),
+                since,
+            )
+        })
+    }
 }
 
 impl Drop for Writer {
@@ -226,7 +248,11 @@ fn flusher(s: Arc<Shared>) {
                 p.enqueued,
             )
         };
+        let started = s.epoch.elapsed().as_nanos() as u64 + 1;
+        s.busy_since
+            .store(started, std::sync::atomic::Ordering::Release);
         let result = write_batches(&batches, sync && s.datasync);
+        s.busy_since.store(0, std::sync::atomic::Ordering::Release);
         drop(batches);
         let mut p = s.pending.lock().unwrap_or_else(|e| e.into_inner());
         p.completed = upto;

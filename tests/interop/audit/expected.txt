@@ -1,0 +1,130 @@
+== step 1
+AMQ601267: User artemis(amq)@ADDR is creating a core session on ActiveMQServerImpl::name=0.0.0.0
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601767: CORE connection ID from ADDR created
+AMQ601768: CORE connection ID for user artemis(amq)@ADDR destroyed
+== step 2
+AMQ601065: User anonymous@ADDR is creating a queue on ActiveMQServerImpl::name=0.0.0.0 with parameters: [aq, ANYCAST, aq, null, true, -1, false, false, false, -1, null, false, null, false, 0, -1, false, 0, 0, true, -1]
+AMQ601065: User artemis(amq)@ADDR is creating a queue on ServerSessionImpl
+AMQ601072: User artemis(amq)@ADDR is deleting a queue on ServerSessionImpl
+AMQ601263: User artemis(amq)@ADDR is handling a management message on UUID
+AMQ601265: User artemis(amq)@ADDR is creating a core consumer on ServerSessionImpl
+AMQ601267: User artemis(amq)@ADDR is creating a core session on ActiveMQServerImpl::name=0.0.0.0
+AMQ601500: User artemis(amq)@ADDR sent a message to activemq.management
+AMQ601501: User artemis(amq)@ADDR is consuming a message from activemq.management.UUID
+AMQ601707: User artemis(amq)@ADDR successfully created queue: aq on address: aq with routing type ANYCAST
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601767: CORE connection ID from ADDR created
+AMQ601768: CORE connection ID for user artemis(amq)@ADDR destroyed
+== step 3
+AMQ601267: User artemis(amq)@ADDR is creating a core session on ActiveMQServerImpl::name=0.0.0.0
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601767: CORE connection ID from ADDR created
+AMQ601768: CORE connection ID for user artemis(amq)@ADDR destroyed
+== step 4
+AMQ601267: User artemis(amq)@ADDR is creating a core session on ActiveMQServerImpl::name=0.0.0.0
+AMQ601267: User artemis(amq)@ADDR is creating a core session on ActiveMQServerImpl::name=0.0.0.0
+AMQ601500: User artemis(amq)@ADDR sent a message to aq
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601767: CORE connection ID from ADDR created
+AMQ601768: CORE connection ID for user artemis(amq)@ADDR destroyed
+== step 5
+AMQ601267: User artemis(amq)@ADDR is creating a core session on ActiveMQServerImpl::name=0.0.0.0
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601767: CORE connection ID from ADDR created
+AMQ601768: CORE connection ID for user artemis(amq)@ADDR destroyed
+== step 6
+AMQ601265: User artemis(amq)@ADDR is creating a core consumer on ServerSessionImpl
+AMQ601267: User artemis(amq)@ADDR is creating a core session on ActiveMQServerImpl::name=0.0.0.0
+AMQ601267: User artemis(amq)@ADDR is creating a core session on ActiveMQServerImpl::name=0.0.0.0
+AMQ601501: User artemis(amq)@ADDR is consuming a message from aq
+AMQ601502: User artemis(amq)@ADDR acknowledged message from aq
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601759: User artemis(amq)@ADDR added acknowledgement of a message from aq
+AMQ601767: CORE connection ID from ADDR created
+AMQ601768: CORE connection ID for user artemis(amq)@ADDR destroyed
+== step 7
+AMQ601267: User artemis(amq)@ADDR is creating a core session on ActiveMQServerImpl::name=0.0.0.0
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601767: CORE connection ID from ADDR created
+AMQ601768: CORE connection ID for user artemis(amq)@ADDR destroyed
+== step 8
+AMQ601065: User artemis(amq)@ADDR is creating a queue on ServerSessionImpl
+AMQ601065: User artemis(amq)@ADDR is creating a queue on ServerSessionImpl
+AMQ601072: User artemis(amq)@ADDR is deleting a queue on ServerSessionImpl
+AMQ601072: User artemis(amq)@ADDR is deleting a queue on ServerSessionImpl
+AMQ601135: User artemis(amq)@ADDR is listing network topology on ActiveMQServerImpl::name=0.0.0.0
+AMQ601143: User artemis(amq)@ADDR is getting node ID on ActiveMQServerImpl::name=0.0.0.0
+AMQ601263: User artemis(amq)@ADDR is handling a management message on UUID
+AMQ601263: User artemis(amq)@ADDR is handling a management message on UUID
+AMQ601265: User artemis(amq)@ADDR is creating a core consumer on ServerSessionImpl
+AMQ601265: User artemis(amq)@ADDR is creating a core consumer on ServerSessionImpl
+AMQ601267: User artemis(amq)@ADDR is creating a core session on ActiveMQServerImpl::name=0.0.0.0
+AMQ601500: User artemis(amq)@ADDR sent a message to activemq.management
+AMQ601500: User artemis(amq)@ADDR sent a message to activemq.management
+AMQ601501: User artemis(amq)@ADDR is consuming a message from activemq.management.UUID
+AMQ601501: User artemis(amq)@ADDR is consuming a message from activemq.management.UUID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601767: CORE connection ID from ADDR created
+AMQ601768: CORE connection ID for user artemis(amq)@ADDR destroyed
+== step 9
+AMQ601267: User artemis(amq)@ADDR is creating a core session on ActiveMQServerImpl::name=0.0.0.0
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601767: CORE connection ID from ADDR created
+AMQ601768: CORE connection ID for user artemis(amq)@ADDR destroyed
+== step 10
+AMQ601065: User artemis(amq)@ADDR is creating a queue on ServerSessionImpl
+AMQ601072: User artemis(amq)@ADDR is deleting a queue on ServerSessionImpl
+AMQ601110: User artemis(amq)@ADDR is listing queues on ActiveMQServerImpl::name=0.0.0.0 with parameters: [{"field":"NAME","value":"aq","operation":"CONTAINS"}, 1, 50]
+AMQ601263: User artemis(amq)@ADDR is handling a management message on UUID
+AMQ601265: User artemis(amq)@ADDR is creating a core consumer on ServerSessionImpl
+AMQ601267: User artemis(amq)@ADDR is creating a core session on ActiveMQServerImpl::name=0.0.0.0
+AMQ601500: User artemis(amq)@ADDR sent a message to activemq.management
+AMQ601501: User artemis(amq)@ADDR is consuming a message from activemq.management.UUID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601767: CORE connection ID from ADDR created
+AMQ601768: CORE connection ID for user artemis(amq)@ADDR destroyed
+== step 11
+AMQ601716: User anonymous@ADDR failed authentication on connection ID, reason: AMQ229031: Unable to validate user from ADDR. Username: bad; SSL certificate subject DN: unavailable
+AMQ601767: CORE connection ID from ADDR created
+AMQ601768: CORE connection ID for user anonymous@ADDR destroyed
+== step 12
+AMQ601716: User anonymous@ADDR failed authentication on connection ID, reason: AMQ229031: Unable to validate user from ADDR. Username: bad; SSL certificate subject DN: unavailable
+AMQ601767: CORE connection ID from ADDR created
+AMQ601768: CORE connection ID for user anonymous@ADDR destroyed
+== step 13
+AMQ601716: User anonymous@ADDR failed authentication on connection ID, reason: AMQ229031: Unable to validate user from ADDR. Username: bad; SSL certificate subject DN: unavailable
+AMQ601767: CORE connection ID from ADDR created
+AMQ601768: CORE connection ID for user anonymous@ADDR destroyed
+== step 14
+AMQ601267: User artemis(amq)@ADDR is creating a core session on ActiveMQServerImpl::name=0.0.0.0
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601767: CORE connection ID from ADDR created
+AMQ601768: CORE connection ID for user artemis(amq)@ADDR destroyed
+== step 15
+AMQ601065: User artemis(amq)@ADDR is creating a queue on ServerSessionImpl
+AMQ601072: User anonymous@ADDR is deleting a queue on ActiveMQServerImpl::name=0.0.0.0 with parameters: [aq, false, false]
+AMQ601072: User artemis(amq)@ADDR is deleting a queue on ServerSessionImpl
+AMQ601263: User artemis(amq)@ADDR is handling a management message on UUID
+AMQ601265: User artemis(amq)@ADDR is creating a core consumer on ServerSessionImpl
+AMQ601267: User artemis(amq)@ADDR is creating a core session on ActiveMQServerImpl::name=0.0.0.0
+AMQ601500: User artemis(amq)@ADDR sent a message to activemq.management
+AMQ601501: User artemis(amq)@ADDR is consuming a message from activemq.management.UUID
+AMQ601711: User artemis(amq)@ADDR successfully deleted queue: aq
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601715: User artemis(amq)@ADDR successfully authenticated on connection ID
+AMQ601767: CORE connection ID from ADDR created
+AMQ601768: CORE connection ID for user artemis(amq)@ADDR destroyed

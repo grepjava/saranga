@@ -319,6 +319,37 @@ pub struct TransformerConfig {
     pub properties: Vec<(String, String)>,
 }
 
+/// A `<broker-plugin>`: the Java class it names and its `<property>`
+/// values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerPluginConfig {
+    pub class_name: String,
+    pub properties: std::collections::HashMap<String, String>,
+}
+
+/// What the critical analyzer does when a component stops responding
+/// (`CriticalAnalyzerPolicy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CriticalAnalyzerPolicy {
+    /// Ends the process at once, with status 70.
+    Halt,
+    /// Stops the broker.
+    Shutdown,
+    /// Logs.
+    Log,
+}
+
+impl CriticalAnalyzerPolicy {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "HALT" => Self::Halt,
+            "SHUTDOWN" => Self::Shutdown,
+            "LOG" => Self::Log,
+            _ => return None,
+        })
+    }
+}
+
 /// The broker configuration read from `broker.xml`. Every field the file
 /// leaves out holds the Artemis default.
 #[derive(Debug, Clone, PartialEq)]
@@ -386,6 +417,15 @@ pub struct BrokerConfig {
     /// `suppress-session-notifications`: no `SESSION_CREATED` and
     /// `SESSION_CLOSED` notifications.
     pub suppress_session_notifications: bool,
+    /// `critical-analyzer`.
+    pub critical_analyzer: bool,
+    /// `critical-analyzer-timeout`, in milliseconds.
+    pub critical_analyzer_timeout: i64,
+    /// `critical-analyzer-check-period`, in milliseconds; 0 for half the
+    /// timeout.
+    pub critical_analyzer_check_period: i64,
+    /// `critical-analyzer-policy`.
+    pub critical_analyzer_policy: CriticalAnalyzerPolicy,
     /// `message-counter-enabled`.
     pub message_counter_enabled: bool,
     /// `message-counter-sample-period`, in milliseconds.
@@ -418,6 +458,8 @@ pub struct BrokerConfig {
     /// replaces the earlier one.
     pub security_settings: Vec<(String, SecuritySetting)>,
     pub security_setting_plugins: Vec<SecuritySettingPluginConfig>,
+    /// `<broker-plugins>`, in document order.
+    pub broker_plugins: Vec<BrokerPluginConfig>,
     /// `jaasConfigs` from broker properties: login configurations by realm,
     /// which take the place of the same realm in `login.config`.
     pub jaas_configs: Vec<(String, Vec<JaasModuleConfig>)>,
@@ -542,6 +584,10 @@ impl Default for BrokerConfig {
             jmx_domain: "org.apache.activemq.artemis".to_owned(),
             management_notification_address: "activemq.notifications".to_owned(),
             suppress_session_notifications: false,
+            critical_analyzer: true,
+            critical_analyzer_timeout: 120_000,
+            critical_analyzer_check_period: 0,
+            critical_analyzer_policy: CriticalAnalyzerPolicy::Log,
             message_counter_enabled: false,
             message_counter_sample_period: 10_000,
             message_counter_max_day_history: 10,
@@ -555,6 +601,7 @@ impl Default for BrokerConfig {
             amqp_use_core_subscription_naming: false,
             security_settings: Vec::new(),
             security_setting_plugins: Vec::new(),
+            broker_plugins: Vec::new(),
             jaas_configs: Vec::new(),
             system_property_prefix: crate::broker_properties::DEFAULT_SYSTEM_PROPERTY_PREFIX
                 .to_owned(),

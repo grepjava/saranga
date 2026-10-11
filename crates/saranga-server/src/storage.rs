@@ -308,6 +308,14 @@ pub struct Storage {
 impl Storage {
     /// Opens both journals (`JournalStorageManager.start`); nothing is loaded
     /// yet.
+    /// The longest write in progress on either journal, and its ID.
+    pub fn writing(&self) -> Option<(std::time::Duration, u64)> {
+        match (self.messages.writing(), self.bindings.writing()) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// The message journal's directory.
     pub fn journal_directory(&self) -> &std::path::Path {
         &self.cfg.messages.directory

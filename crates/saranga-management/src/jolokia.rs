@@ -19,6 +19,22 @@ use crate::mbean::{Bean, Control, ObjectName, Op, registered};
 /// Who is asking, and what they may do.
 pub struct Caller {
     pub roles: Vec<String>,
+    /// The subject the login gave, for the audit log.
+    pub subject: Option<Arc<saranga_security::jaas::Subject>>,
+}
+
+impl Caller {
+    /// For the audit log: the console's requests carry no remote address
+    /// (`@unknown`), as Artemis's console thread has none.
+    fn management(&self) -> saranga_server::management::Caller<'_> {
+        saranga_server::management::Caller {
+            security: None,
+            who: Some(saranga_server::audit::Who {
+                subject: self.subject.as_deref(),
+                remote: None,
+            }),
+        }
+    }
 }
 
 /// The agent: the broker's MBeans and the access list.
@@ -504,7 +520,7 @@ impl Agent {
         }
         self.broker
             .management()
-            .attribute(&self.broker, &bean.resource(), attr, None)
+            .attribute(&self.broker, &bean.resource(), attr, caller.management())
             .await
             .map_err(|e| Failure::new("java.lang.UnsupportedOperationException", e, 500))
     }
@@ -600,7 +616,13 @@ impl Agent {
         let value = convert(req.value.as_ref().unwrap_or(&Json::Null), info.type_name)?;
         self.broker
             .management()
-            .invoke(&self.broker, &bean.resource(), &setter, &[value], None)
+            .invoke(
+                &self.broker,
+                &bean.resource(),
+                &setter,
+                &[value],
+                caller.management(),
+            )
             .await
             .map_err(|e| Failure::new("java.lang.Exception", e, 500))?;
         Ok(old)
@@ -708,11 +730,19 @@ impl Agent {
                     [p, size] => (Some((i(p), i(size))), None),
                     [p, size, f, ..] => (Some((i(p), i(size))), s(f)),
                 };
-                management.browse(&self.broker, q, page, filter).await
+                management
+                    .browse(&self.broker, q, page, filter, caller.management())
+                    .await
             }
             _ => {
                 management
-                    .invoke(&self.broker, &bean.resource(), op.name, &params, None)
+                    .invoke(
+                        &self.broker,
+                        &bean.resource(),
+                        op.name,
+                        &params,
+                        caller.management(),
+                    )
                     .await
             }
         }
