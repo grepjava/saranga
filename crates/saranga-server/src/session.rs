@@ -14,7 +14,7 @@ use saranga_message::CoreMessage;
 use saranga_security::{Authenticated, ConnectionInfo, SecurityAuth};
 
 use crate::large::LargeBody;
-use crate::message::{MessageRef, ServerMessage, routing_type};
+use crate::message::{MessageRef, NativeMessage, ServerMessage, routing_type};
 use crate::postoffice::{
     BindingQueryResult, Creator, QueueQueryResult, QueueSpec, RoutingTypes, queue_name_of,
 };
@@ -212,6 +212,14 @@ pub struct ServerSession {
     ops: Vec<Pending>,
     /// Queue updates to make once those writes are done.
     actions: Vec<Box<dyn FnOnce() + Send>>,
+}
+
+/// What [`ServerSession::send_message`] sends besides the message.
+enum Outgoing {
+    /// A Core message, with the body of a large one.
+    Core(Option<Arc<LargeBody>>),
+    /// A native message and its view before the send changed it.
+    Native(Arc<dyn NativeMessage>, CoreMessage),
 }
 
 impl ServerSession {
@@ -424,6 +432,42 @@ impl ServerSession {
                 body
             }
         };
+        self.send_message(message, Outgoing::Core(large), tx).await
+    }
+
+    /// Sends a message kept in its own protocol's encoding, which has no ID
+    /// yet, in the session's transaction or none as for
+    /// [`ServerSession::send`].
+    pub async fn send_native(&mut self, native: Arc<dyn NativeMessage>) -> Result<()> {
+        let tx = if self.auto_commit_sends {
+            None
+        } else {
+            self.tx.clone()
+        };
+        self.send_native_in(native, tx).await
+    }
+
+    /// As [`ServerSession::send_native`] in the given transaction, or none.
+    pub async fn send_native_in(
+        &mut self,
+        native: Arc<dyn NativeMessage>,
+        tx: Option<TxRef>,
+    ) -> Result<()> {
+        let view = native.view();
+        let mut message = view.clone();
+        message.message_id = self.broker.post_office().ids().next();
+        self.send_message(message, Outgoing::Native(native, view), tx)
+            .await
+    }
+
+    /// The rest of `send`: `message` is the message, or the view of a
+    /// native one, with its ID.
+    async fn send_message(
+        &mut self,
+        mut message: CoreMessage,
+        outgoing: Outgoing,
+        tx: Option<TxRef>,
+    ) -> Result<()> {
         let address: Name = match &message.address {
             Some(a) => {
                 let a: Name = a.to_string_lossy().into();
@@ -483,9 +527,12 @@ impl ServerSession {
         crate::message::apply_expiry_delay(&mut message, &settings, crate::message::now_millis());
         let scheduled_time = crate::message::scheduled_delivery_time(&message);
         let duplicate_id = crate::duplicate::duplicate_id_bytes(&message);
-        let mut r = MessageRef::new(match large {
-            Some(body) => ServerMessage::new_large(message, body),
-            None => ServerMessage::new(message),
+        let mut r = MessageRef::new(match outgoing {
+            Outgoing::Core(Some(body)) => ServerMessage::new_large(message, body),
+            Outgoing::Core(None) => ServerMessage::new(message),
+            Outgoing::Native(native, before) => {
+                ServerMessage::new_native(native.updated(&before, &message))
+            }
         });
         r.scheduled_time = scheduled_time;
         let storage = self.storage();

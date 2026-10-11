@@ -8,9 +8,11 @@ license.workspace = true
 [dependencies]
 saranga-buffer = { path = "../saranga-buffer" }
 saranga-filter = { path = "../saranga-filter" }
+saranga-security = { path = "../saranga-security" }
 saranga-message = { path = "../saranga-message" }
 saranga-server = { path = "../saranga-server" }
 saranga-storage = { path = "../saranga-storage" }
 thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }

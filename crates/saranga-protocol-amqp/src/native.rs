@@ -277,7 +277,13 @@ impl NativeMessage for AmqpNative {
     /// change of address or routing type).
     fn updated(&self, before: &CoreMessage, after: &CoreMessage) -> Arc<dyn NativeMessage> {
         let now = now_millis();
-        let mut m = if after.message_id != before.message_id {
+        // A message without an ID is getting one (`setMessageID`); one
+        // whose ID changes is a copy (`copy(newID)`).
+        let mut m = if before.message_id == 0 {
+            let mut m = self.message.clone();
+            m.set_message_id(after.message_id);
+            m
+        } else if after.message_id != before.message_id {
             self.message.copy(after.message_id, now)
         } else {
             self.message.clone()
@@ -310,7 +316,7 @@ impl NativeMessage for AmqpNative {
         // or a move's), even one equal to what the original's annotations
         // give.
         let rt = SimpleString::from(HDR_ROUTING_TYPE);
-        let copied = after.message_id != before.message_id;
+        let copied = before.message_id != 0 && after.message_id != before.message_id;
         if changed(&rt) || (copied && get(after, &rt).is_some()) {
             m.set_routing_type(match get(after, &rt) {
                 Some(PropertyValue::Byte(b)) => Some(b),

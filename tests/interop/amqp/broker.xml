@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<!-- AMQP and Core on one acceptor (Amqp.java): two delivery attempts before
+     the dead-letter address for amqp.dlq.#, and a quick expiry scan. -->
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+   <core xmlns="urn:activemq:core">
+      <name>amqp</name>
+      <persistence-enabled>true</persistence-enabled>
+      <security-enabled>false</security-enabled>
+      <message-expiry-scan-period>100</message-expiry-scan-period>
+      <acceptors>
+         <acceptor name="artemis">tcp://0.0.0.0:61616?protocols=CORE,AMQP</acceptor>
+      </acceptors>
+      <address-settings>
+         <address-setting match="#">
+            <dead-letter-address>DLQ</dead-letter-address>
+            <expiry-address>ExpiryQueue</expiry-address>
+         </address-setting>
+         <address-setting match="amqp.dlq.#">
+            <dead-letter-address>DLQ</dead-letter-address>
+            <expiry-address>ExpiryQueue</expiry-address>
+            <max-delivery-attempts>2</max-delivery-attempts>
+         </address-setting>
+      </address-settings>
+      <addresses>
+         <address name="DLQ"><anycast><queue name="DLQ"/></anycast></address>
+         <address name="ExpiryQueue"><anycast><queue name="ExpiryQueue"/></anycast></address>
+      </addresses>
+   </core>
+</configuration>

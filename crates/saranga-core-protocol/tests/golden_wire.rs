@@ -16,7 +16,11 @@ fn connections() -> Vec<PathBuf> {
     for scenario in std::fs::read_dir(golden_root()).unwrap().flatten() {
         let wire = scenario.path().join("wire");
         if let Ok(conns) = std::fs::read_dir(&wire) {
-            out.extend(conns.flatten().map(|c| c.path()));
+            // Connections of other protocols (AMQP starts with its own
+            // header) have tests of their own.
+            out.extend(conns.flatten().map(|c| c.path()).filter(|c| {
+                std::fs::read(c.join("c2s.bin")).is_ok_and(|b| !b.starts_with(b"AMQP"))
+            }));
         }
     }
     out.sort();

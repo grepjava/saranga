@@ -12,6 +12,8 @@ saranga-message = { path = "../saranga-message" }
 thiserror = "2"
 
 [dev-dependencies]
+# Describes AMQP records in the data print test (a dev-only cycle).
+saranga-protocol-amqp = { path = "../saranga-protocol-amqp" }
 saranga-paging = { path = "../saranga-paging" }
 tempfile = "3"
 flate2 = "1"

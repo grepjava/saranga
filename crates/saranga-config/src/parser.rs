@@ -555,6 +555,9 @@ fn parse_scalars(
     if let Some(v) = s.bool("mqtt-subscription-persistence-enabled") {
         config.mqtt_subscription_persistence_enabled = v;
     }
+    if let Some(v) = s.bool("amqp-use-core-subscription-naming") {
+        config.amqp_use_core_subscription_naming = v;
+    }
     parse_security_options(&s, config)?;
     if let Some(v) = s.i64("configuration-file-refresh-period", Check::GtZero)? {
         config.configuration_file_refresh_period = v;

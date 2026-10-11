@@ -158,7 +158,12 @@ composite! {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeliveryState {
     Received(Received),
+    /// `Accepted.getInstance()`.
     Accepted,
+    /// `new Accepted()`: the same on the wire, but Proton-J writes a
+    /// disposition carrying it in the long form (Artemis does so for the
+    /// outcome of a discharge). Never decoded.
+    AcceptedNew,
     Rejected(Rejected),
     Released,
     Modified(Modified),
@@ -194,7 +199,7 @@ impl Field for DeliveryState {
     fn to_value(&self) -> Value {
         match self {
             Self::Received(s) => Composite::to_value(s),
-            Self::Accepted => Composite::to_value(&Accepted {}),
+            Self::Accepted | Self::AcceptedNew => Composite::to_value(&Accepted {}),
             Self::Rejected(s) => Composite::to_value(s),
             Self::Released => Composite::to_value(&Released {}),
             Self::Modified(s) => Composite::to_value(s),

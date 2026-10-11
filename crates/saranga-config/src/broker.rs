@@ -392,6 +392,9 @@ pub struct BrokerConfig {
     /// `mqtt-subscription-persistence-enabled`: MQTT sessions are kept in
     /// `$sys.mqtt.sessions`.
     pub mqtt_subscription_persistence_enabled: bool,
+    /// `amqp-use-core-subscription-naming`: AMQP subscription queues are
+    /// named as Core names them.
+    pub amqp_use_core_subscription_naming: bool,
     /// Match string and roles, in document order; a repeated match
     /// replaces the earlier one.
     pub security_settings: Vec<(String, SecuritySetting)>,
@@ -522,6 +525,7 @@ impl Default for BrokerConfig {
             mqtt_session_scan_interval: 5000,
             mqtt_session_state_persistence_timeout: 5000,
             mqtt_subscription_persistence_enabled: true,
+            amqp_use_core_subscription_naming: false,
             security_settings: Vec::new(),
             security_setting_plugins: Vec::new(),
             jaas_configs: Vec::new(),

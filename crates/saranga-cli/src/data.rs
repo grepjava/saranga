@@ -70,6 +70,7 @@ pub fn run(cmd: DataCommand) -> anyhow::Result<()> {
             }
             let stdout = std::io::stdout();
             let mut out = std::io::BufWriter::new(stdout.lock());
+            saranga_protocol_amqp::describe::register();
             print_data(&mut out, &a.bindings, &a.journal, &paging, &opts)?;
             out.flush()?;
             Ok(())

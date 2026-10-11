@@ -28,7 +28,7 @@ use saranga_message::CoreMessage;
 use crate::codec::*;
 use crate::ids;
 use crate::java;
-use crate::message::{LargeMessageRecord, PersistedMessage};
+use crate::message::{AmqpMessageRecord, LargeMessageRecord, PersistedMessage};
 
 const BINDINGS_BANNER: &str = "B I N D I N G S  J O U R N A L";
 const MESSAGES_BANNER: &str = "M E S S A G E S   J O U R N A L";
@@ -1315,6 +1315,19 @@ fn user_message_id(m: &CoreMessage) -> String {
         .unwrap_or_default()
 }
 
+/// Describes an AMQP message as `AMQPStandardMessage.toString` does,
+/// with its `getUserID` if it has one. The AMQP protocol, which knows the
+/// encoding, sets it ([`set_amqp_describer`]).
+pub type AmqpDescriber = fn(&AmqpMessageRecord) -> (Option<String>, String);
+
+static AMQP_DESCRIBER: std::sync::OnceLock<AmqpDescriber> = std::sync::OnceLock::new();
+
+/// Sets how AMQP messages are described; without it they print without
+/// their sections.
+pub fn set_amqp_describer(describe: AmqpDescriber) {
+    let _ = AMQP_DESCRIBER.set(describe);
+}
+
 /// `MessageDescribe` for an `ADD_MESSAGE_PROTOCOL` record.
 fn describe_message(m: &PersistedMessage, data: &[u8]) -> Described {
     match m {
@@ -1329,6 +1342,23 @@ fn describe_message(m: &PersistedMessage, data: &[u8]) -> Described {
                     core_message_to_string(&msg, size, data)
                 ),
                 safe_text: Some(format!("CoreMessage(safe data, size={size})")),
+            }
+        }
+        PersistedMessage::Amqp(a) if AMQP_DESCRIBER.get().is_some() => {
+            let describe = AMQP_DESCRIBER.get().expect("checked");
+            let (user_id, text) = describe(a);
+            Described {
+                text: format!(
+                    "Message(messageID={}{};msg={text}",
+                    a.message_id,
+                    user_id
+                        .map(|u| format!(";userMessageID={u}"))
+                        .unwrap_or_default()
+                ),
+                safe_text: Some(format!(
+                    "AMQPStandardMessage(safe data, size={})",
+                    a.data.len()
+                )),
             }
         }
         PersistedMessage::Amqp(a) => Described {

@@ -115,6 +115,7 @@ fn compare(name: &str, data: &Path, expected: &str) {
 
 #[test]
 fn data_print_matches_artemis_on_the_golden_corpus() {
+    saranga_protocol_amqp::describe::register();
     let mut compared = Vec::new();
     for e in std::fs::read_dir(golden_root()).unwrap().flatten() {
         let expected = e.path().join("data-print.txt");
