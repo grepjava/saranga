@@ -86,6 +86,224 @@ pub(super) fn to_map(r: &MessageRef, limit: i32) -> Json {
     o
 }
 
+/// `Float.toString`.
+fn java_float(f: f32) -> String {
+    let abs = f.abs();
+    if f.is_finite() && f != 0.0 && (1e-3..1e7).contains(&abs) {
+        let s = format!("{f}");
+        if s.contains('.') { s } else { format!("{s}.0") }
+    } else if f.is_finite() && f != 0.0 {
+        let s = format!("{f:e}");
+        let (mantissa, exp) = s.split_once('e').unwrap_or((&s, "0"));
+        let mantissa = if mantissa.contains('.') {
+            mantissa.to_owned()
+        } else {
+            format!("{mantissa}.0")
+        };
+        format!("{mantissa}E{exp}")
+    } else {
+        super::json::java_double(f64::from(f))
+    }
+}
+
+/// A property value's `toString`, as `"" + map` writes it.
+fn property_text(v: &PropertyValue, limit: i32) -> String {
+    match v {
+        PropertyValue::Null => String::new(),
+        PropertyValue::Bool(b) => b.to_string(),
+        PropertyValue::Byte(b) => b.to_string(),
+        PropertyValue::Short(s) => s.to_string(),
+        PropertyValue::Int(i) => i.to_string(),
+        PropertyValue::Long(l) => l.to_string(),
+        PropertyValue::Float(f) => java_float(*f),
+        PropertyValue::Double(d) => super::json::java_double(*d),
+        PropertyValue::Char(c) => String::from_utf16_lossy(&[*c]),
+        PropertyValue::String(s) => truncate(s.to_string_lossy(), limit),
+        // An array's identity hash: no two runs agree on it.
+        PropertyValue::Bytes(b) => format!("[B@{:x}", b.as_ptr() as usize & 0x7fff_ffff),
+    }
+}
+
+/// `Message.toCompositeData(valueSizeLimit, deliveryCount)` as Jolokia
+/// writes the composite: its items sorted by name, the typed property
+/// tables as maps (null when empty), and `text` for a text message or
+/// `BodyPreview` for any other.
+pub(super) fn to_composite(r: &MessageRef, limit: i32) -> Json {
+    let m = &r.message;
+    let core = full_core(m);
+    let names: Vec<String> = core
+        .properties
+        .entries()
+        .iter()
+        .map(|(k, _)| k.to_string_lossy())
+        .collect();
+    let order = super::security::java_hash_order(names, false);
+    let props: Vec<(String, &PropertyValue)> = order
+        .into_iter()
+        .filter_map(|n| {
+            core.properties
+                .entries()
+                .iter()
+                .find(|(k, _)| k.to_string_lossy() == n)
+                .map(|(_, v)| (n, v))
+        })
+        .collect();
+    let text = props
+        .iter()
+        .map(|(k, v)| format!("{k}={}", property_text(v, limit)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let typed = |pick: &dyn Fn(&PropertyValue) -> Option<Json>| {
+        let mut o = Json::object();
+        for (k, v) in &props {
+            if let Some(j) = pick(v) {
+                o.put(k, j);
+            }
+        }
+        match &o {
+            Json::Object(items) if items.is_empty() => Json::Null,
+            _ => o,
+        }
+    };
+    let mut items: Vec<(&str, Json)> = vec![
+        ("messageID", Json::from(core.message_id.to_string())),
+        (
+            "protocol",
+            Json::from(if m.native().is_some() { "AMQP" } else { "CORE" }),
+        ),
+        (
+            "userID",
+            Json::from(
+                core.user_id
+                    .map(|u| format!("ID:{}", uuid::Uuid::from_bytes(u)))
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "address",
+            Json::from(
+                core.address
+                    .as_ref()
+                    .map(|a| a.to_string_lossy())
+                    .unwrap_or_default(),
+            ),
+        ),
+        ("durable", Json::from(core.durable)),
+        ("expiration", Json::from(core.expiration)),
+        ("timestamp", Json::from(core.timestamp)),
+        ("priority", Json::from(i32::from(core.priority))),
+        ("redelivered", Json::from(r.delivery_count > 1)),
+        ("largeMessage", Json::from(m.is_large())),
+        ("persistentSize", Json::from(m.encode_size() as i64)),
+        (
+            "PropertiesText",
+            Json::from(truncate(format!("{{{text}}}"), limit)),
+        ),
+        (
+            "StringProperties",
+            typed(&|v| match v {
+                PropertyValue::String(s) => Some(Json::from(truncate(s.to_string_lossy(), limit))),
+                PropertyValue::Null => Some(Json::from("")),
+                _ => None,
+            }),
+        ),
+        (
+            "BooleanProperties",
+            typed(&|v| match v {
+                PropertyValue::Bool(b) => Some(Json::from(*b)),
+                _ => None,
+            }),
+        ),
+        (
+            "ByteProperties",
+            typed(&|v| match v {
+                PropertyValue::Byte(b) => Some(Json::from(i32::from(*b))),
+                _ => None,
+            }),
+        ),
+        (
+            "ShortProperties",
+            typed(&|v| match v {
+                PropertyValue::Short(s) => Some(Json::from(i32::from(*s))),
+                _ => None,
+            }),
+        ),
+        (
+            "IntProperties",
+            typed(&|v| match v {
+                PropertyValue::Int(i) => Some(Json::from(*i)),
+                _ => None,
+            }),
+        ),
+        (
+            "LongProperties",
+            typed(&|v| match v {
+                PropertyValue::Long(l) => Some(Json::from(*l)),
+                _ => None,
+            }),
+        ),
+        (
+            "FloatProperties",
+            typed(&|v| match v {
+                PropertyValue::Float(f) => {
+                    Some(Json::from(java_float(*f).parse::<f64>().unwrap_or(0.0)))
+                }
+                _ => None,
+            }),
+        ),
+        (
+            "DoubleProperties",
+            typed(&|v| match v {
+                PropertyValue::Double(d) => Some(Json::from(*d)),
+                _ => None,
+            }),
+        ),
+        ("type", Json::from(i32::from(core.message_type))),
+    ];
+    if core.message_type == message_type::TEXT {
+        let body = if m.is_large() {
+            "[large message]".to_owned()
+        } else if core
+            .properties
+            .entries()
+            .iter()
+            .any(|(k, _)| k.to_string_lossy() == "_AMQ_LARGE_COMPRESSED")
+        {
+            "[compressed]".to_owned()
+        } else {
+            let text = saranga_buffer::Reader::new(&core.body)
+                .nullable_simple_string()
+                .ok()
+                .flatten();
+            text.map(|t| truncate(t.to_string_lossy(), limit))
+                .unwrap_or_default()
+        };
+        items.push(("text", Json::from(body)));
+    } else {
+        let body: &[u8] = if m.is_large() { &[] } else { &core.body };
+        let n = if limit >= 0 {
+            body.len().min(limit as usize)
+        } else {
+            body.len()
+        };
+        items.push((
+            "BodyPreview",
+            Json::Array(
+                body[..n]
+                    .iter()
+                    .map(|x| Json::from(i32::from(*x as i8)))
+                    .collect(),
+            ),
+        ));
+    }
+    items.sort_by(|a, b| a.0.cmp(b.0));
+    let mut o = Json::object();
+    for (k, v) in items {
+        o.put(k, v);
+    }
+    o
+}
+
 /// `Objects.toString(getObjectPropertyForFilter(name), null)`.
 pub(super) fn filter_value_string(m: &ServerMessage, name: &str) -> Option<String> {
     use saranga_filter::{Filterable, Value};

@@ -180,6 +180,17 @@ impl Management {
             .map_err(|e| e.0)
     }
 
+    /// Whether a resource of this management name exists.
+    pub fn exists(&self, broker: &Broker, resource: &str) -> bool {
+        self.resource(broker, resource).is_some()
+    }
+
+    /// The `management-message-rbac` check of a method on a resource (a
+    /// getter for an attribute), as a management message gets it.
+    pub fn permits(&self, caller: Caller, resource: &str, method: &str) -> Result<(), String> {
+        self.security_check(caller, resource, method)
+    }
+
     fn resource(&self, broker: &Broker, name: &str) -> Option<Resource> {
         let po = broker.post_office();
         if name == "broker" {
@@ -237,6 +248,21 @@ impl Management {
             }
             Ok(None) | Err(_) => Err(problem()),
         }
+    }
+
+    /// `QueueControl.browse`, whose composite data only the web API can
+    /// carry: `page` is a page number and size.
+    pub async fn browse(
+        &self,
+        broker: &Arc<Broker>,
+        queue: &str,
+        page: Option<(i32, i32)>,
+        filter: Option<String>,
+    ) -> Outcome {
+        let Some(q) = broker.post_office().queue(queue) else {
+            return Err(format!("AMQ229017: Queue {queue} does not exist"));
+        };
+        queue::browse(broker, &q, page, filter).await
     }
 
     /// `invokeOperation`.

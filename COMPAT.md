@@ -129,7 +129,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 
 ## Management differences
 - **`getVersion`** reports 2.57.0, the Artemis release whose management interface Saranga answers, so tools that check the version keep working.
-- **`browse`** answers `no operation`, by design. Artemis answers it with JMX `CompositeData` objects, Java-serialized and base64-encoded inside the JSON, which only a Java client can read; Saranga does not produce Java serialization. `listMessages` and `listMessagesAsJSON` return the same messages as plain JSON, and the REST API's `browse` returns them as JSON too.
+- **`browse`** over management messages answers `no operation`, by design. Artemis answers it with JMX `CompositeData` objects, Java-serialized and base64-encoded inside the JSON, which only a Java client can read; Saranga does not produce Java serialization. `listMessages` and `listMessagesAsJSON` return the same messages as plain JSON, and the REST API (`GET /api/queues/{name}/messages`) and the Jolokia layer return `browse`'s messages as JSON.
 - **`changeMessagesPriority`** changes the messages in memory. Artemis also changes paged messages it reads in through the queue's own cursor; Saranga leaves messages still in pages as they are.
 - **`listBindingsForAddress`** names a queue binding as `LocalQueueBinding [address=..., queue=...]`. Artemis prints its queue object there, with an identity hash.
 - **Connection IDs** are eight random hex digits, as Netty's short channel IDs look, but not Netty's.
@@ -146,6 +146,19 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **The slow-consumer advisory** (`ActiveMQ.Advisory.SlowConsumer.*`) is not sent to OpenWire clients; the `CONSUMER_SLOW` notification and the `KILL` policy work for consumers of every protocol.
 - **Slow consumers** are checked by one task for all queues, within 200 ms of each queue's check period. Artemis schedules a task for each queue.
 - **Records.** Paused queues and addresses, address settings and diverts are journaled as Artemis journals them (`QUEUE_STATUS_RECORD`, `ADDRESS_STATUS_RECORD`, `ADDRESS_SETTING_RECORD_JSON`, `DIVERT_RECORD`), so they move with the data directory in both directions. Like Artemis, Saranga journals every deployed divert, configured ones included.
+
+## Web server differences
+Artemis serves its web console, with Jolokia, and the metrics plugin's app. Saranga serves:
+- **A REST API at `/api` on every binding**, which Artemis does not have. It is Saranga's documented management interface: the resources, operations and security of management messages, as plain JSON over HTTP (see `crates/saranga-management/src/rest.rs`). With broker security off it asks for no login, as the Core acceptors do.
+- **The metrics** where `bootstrap.xml` declares the metrics app. JVM, process and Netty metrics are not exported; the broker, address and queue metrics are.
+- **A Jolokia compatibility layer, not the web console.** Where `bootstrap.xml` declares the console's app, `/console/jolokia` answers the Jolokia 2.4.3 protocol from Rust: there is no JMX and no Java. The console's pages (hawtio) are not served, so the Artemis console must be run elsewhere and pointed at it. Without the console's app there is no Jolokia layer. Its approximations:
+  - Only Artemis's MBeans exist: no `java.lang`, `JMImplementation` or `jolokia` MBeans.
+  - An operation that fails answers `error_type` `java.lang.Exception` with status 500 and the failure's text. Artemis's controls throw several exception classes.
+  - `list` gives no `ctor` (constructors) entries.
+  - Acceptors' `start` and `stop` are refused: Saranga does not start and stop acceptors through management yet.
+  - The console roles come from `-Dhawtio.roles`, `HAWTIO_ROLES` in `artemis.profile` or `-Dhawtio.roles=` in `artemis.profile.cmd`, and are `amq` by default.
+  - The overloads of an operation are listed in an order fixed by the catalog. Java lists them in `Class.getMethods` order, which can differ from one JVM run to the next.
+- **`browse`'s messages** (in both APIs) are shown in the layout of Core messages' `toCompositeData`. An AMQP message is shown converted to Core, with `protocol` `AMQP`; Artemis shows it with the AMQP message's own items. A bytes property appears in `PropertiesText` as `[B@` and a number, as in Java, but not the same number.
 
 ## CLI differences
 The Artemis CLI's `queue`, `address`, `user`, `producer`, `consumer`, `browser`, `transfer`, `check` and `stop` work against Saranga unchanged. The `saranga` command has them too, with the same options and output; these are the differences:

@@ -1,4 +1,5 @@
-"""The web suite: Jolokia and metrics against Saranga, and against Artemis
+"""The web suite: the REST API, browsing, metrics and the Jolokia layer against
+Saranga, and the Jolokia layer against Artemis
 2.57.0 where Artemis can answer.
 
     python -I tests/interop/web/web.py <saranga web URL> <saranga core URL> [<artemis web URL>]
@@ -245,6 +246,63 @@ def t_metrics():
     assert 'artemis_authentication_count{broker="0.0.0.0",result="success"}' in text
 
 
+def t_browse():
+    msgs = value("/exec/" + q(QUEUE) + "/browse()")
+    assert len(msgs) == 1, msgs
+    m = msgs[0]
+    assert list(m) == sorted(m), list(m)
+    assert m["text"] == "hello" and m["type"] == 3 and m["protocol"] == "CORE", m
+    assert m["StringProperties"] == {"color": "red"} and m["IntProperties"] is None, m
+    assert m["PropertiesText"] == "{color=red}" and m["redelivered"] is False, m
+    # sendMessage addresses the queue by its FQQN and sets no user ID.
+    assert m["durable"] is True and m["address"] == "web.a::web.q" and m["userID"] == "", m
+    assert value("/exec/" + q(QUEUE) + "/browse(java.lang.String)/color='blue'") == []
+    assert len(value("/exec/" + q(QUEUE) + "/browse(int,int)/1/10")) == 1
+    assert value("/exec/" + q(QUEUE) + "/browse(int,int)/2/10") == []
+
+
+def rest(path, auth=SARANGA_AUTH, body=None):
+    """(status, headers, parsed JSON) of a REST API request."""
+    data = None if body is None else (body if isinstance(body, str) else json.dumps(body)).encode()
+    req = urllib.request.Request(SARANGA + "/api" + path, data=data, method="POST" if data is not None else "GET")
+    if auth:
+        token = base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
+        req.add_header("Authorization", "Basic " + token)
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, dict(r.headers), json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), json.loads(e.read().decode())
+
+
+def t_rest():
+    assert rest("/broker/attributes/Version")[::2] == (200, "2.57.0")
+    assert rest("/queues/web.q/attributes/MessageCount")[::2] == (200, 1)
+    assert rest("/addresses/web.a/attributes/QueueNames")[::2] == (200, ["web.q"])
+    assert rest("/queues/web.q/operations/countMessages", body=["color='red'"])[::2] == (200, 1)
+    status, _, msgs = rest("/queues/web.q/messages")
+    assert status == 200 and msgs == value("/exec/" + q(QUEUE) + "/browse()"), msgs
+    assert rest("/queues/web.q/messages?filter=" + q("color='blue'"))[::2] == (200, [])
+    assert rest("/queues/web.q/messages?page=1&pageSize=1")[2] == msgs
+    assert rest("/queues/web.q/messages?page=1")[0] == 400
+
+
+def t_rest_errors():
+    status, headers, body = rest("/broker/attributes/Version", auth=None)
+    assert status == 401 and {k.lower(): v for k, v in headers.items()}.get("www-authenticate") == 'Basic realm="saranga"', (status, headers)
+    assert rest("/broker/attributes/Version", auth=("admin", "wrong"))[0] == 401
+    # viewer has no manage permission on the management address.
+    status, _, body = rest("/queues/web.q/attributes/MessageCount", auth=("viewer", "viewer"))
+    assert status == 403 and "AMQ229032" in body["error"], body
+    assert rest("/queues/nosuch/attributes/MessageCount")[0] == 404
+    assert rest("/queues/web.q/attributes/NoSuch")[0] == 404
+    assert rest("/broker/operations/noSuchOperation", body=[])[0] == 404
+    status, _, body = rest("/broker/operations/deleteAddress", body=["nosuch"])
+    assert status == 400 and "AMQ229203" in body["error"], body
+    assert rest("/broker/operations/getVersion", body="{")[0] == 400
+    assert rest("/nosuch/x/attributes/y")[0] == 404
+
+
 def t_purge():
     value("/exec/" + q(QUEUE) + "/removeAllMessages()")
     assert value("/read/" + q(QUEUE) + "/MessageCount") == 0
@@ -254,7 +312,8 @@ def t_purge():
 for name, f in [("read", t_read), ("exec and search", t_exec_and_search), ("send and count", t_send_and_count),
                 ("pattern read", t_pattern_read), ("inner path", t_inner_path), ("write", t_write),
                 ("operation error", t_operation_error), ("viewer", t_viewer_reads_queues_only),
-                ("metrics", t_metrics), ("purge", t_purge)]:
+                ("metrics", t_metrics), ("browse", t_browse), ("rest", t_rest),
+                ("rest errors", t_rest_errors), ("purge", t_purge)]:
     run(name, f)
 
 if FAILED:

@@ -342,7 +342,7 @@ fn find_roles(roles: &Document, user: &str) -> Vec<String> {
 /// `copy` is a set made with `new HashSet<>(collection)`, whose table is
 /// sized for the collection up front; otherwise the table grows from 16 as
 /// items are added.
-fn java_hash_order(items: Vec<String>, copy: bool) -> Vec<String> {
+pub(super) fn java_hash_order(items: Vec<String>, copy: bool) -> Vec<String> {
     let mut unique: Vec<String> = Vec::new();
     for item in items {
         if !unique.contains(&item) {

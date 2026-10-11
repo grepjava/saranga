@@ -690,12 +690,33 @@ impl Agent {
                 500,
             ));
         }
-        let result = self
-            .broker
-            .management()
-            .invoke(&self.broker, &bean.resource(), op.name, &params, None)
-            .await
-            .map_err(|e| Failure::new("java.lang.Exception", e, 500))?;
+        let management = self.broker.management();
+        let result = match (&bean, op.name) {
+            // Composite data, which management messages cannot carry.
+            (Bean::Queue(q), "browse") => {
+                let s = |j: &Json| match j {
+                    Json::String(s) => Some(s.clone()),
+                    _ => None,
+                };
+                let i = |j: &Json| match j {
+                    Json::Long(n) => *n as i32,
+                    _ => 0,
+                };
+                let (page, filter) = match params.as_slice() {
+                    [] => (None, None),
+                    [f] => (None, s(f)),
+                    [p, size] => (Some((i(p), i(size))), None),
+                    [p, size, f, ..] => (Some((i(p), i(size))), s(f)),
+                };
+                management.browse(&self.broker, q, page, filter).await
+            }
+            _ => {
+                management
+                    .invoke(&self.broker, &bean.resource(), op.name, &params, None)
+                    .await
+            }
+        }
+        .map_err(|e| Failure::new("java.lang.Exception", e, 500))?;
         Ok(if op.ret == "void" { Json::Null } else { result })
     }
 

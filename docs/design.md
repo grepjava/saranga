@@ -5,7 +5,7 @@
 - **Wire-compatible and on-disk compatible.** Existing Artemis/JMS clients connect unchanged. Saranga reads and writes Artemis journal, bindings, paging and large-message files, so a Java broker's data directory can be moved over in place, and back again.
 - **Every protocol Artemis supports:** Core, AMQP 1.0, MQTT 3.1.1/5, STOMP, OpenWire, and all of them over WebSockets.
 - **Full HA and clustering parity:** shared-store, replication, pluggable quorum, cluster connections, redistribution, bridges, federation, and AMQP broker connections (including mirroring).
-- **Management:** REST API, Prometheus metrics and a CLI. No JMX or Jolokia.
+- **Management:** REST API, Prometheus metrics and a CLI. No JMX. The REST API is Saranga's own plain JSON API and the documented interface. A Jolokia compatibility layer, written in Rust and served only where `bootstrap.xml` declares the web console's app, answers the Jolokia protocol at `/console/jolokia` for the Artemis console and other tools that speak Jolokia. It is optional and not the primary interface.
 
 Artemis is very large (about 1M+ lines of Java including tests), so this is a multi-year effort. The phases are ordered so that every phase ends with something runnable and testable against real Artemis clients and real Artemis data files. The Java code is the specification; we port behaviour, not structure.
 
@@ -47,7 +47,7 @@ Artemis is very large (about 1M+ lines of Java including tests), so this is a mu
 | `saranga-protocol-openwire` | OpenWire marshallers (v1–v12) and the ActiveMQ 5 client semantics | `artemis-openwire-protocol` |
 | `saranga-ha` | Shared-store (file locks), replication (Core replication packets), pluggable quorum (ZooKeeper) | `server.impl.*Activation`, `replication.*`, `artemis-quorum-*` |
 | `saranga-cluster` | Discovery (UDP broadcast, static, JGroups-compatible where feasible), cluster connections, load balancing, redistribution, core bridges, federation, AMQP broker connections and mirroring | `cluster.*`, `federation.*`, `connect.*` |
-| `saranga-management` | REST API (axum), Prometheus exporter, management messages sent to `activemq.management` | `management.*`, `artemis-prometheus-metrics-plugin` |
+| `saranga-management` | The web server (axum): the REST API, the Prometheus exporter and the optional Jolokia compatibility layer. Management messages sent to `activemq.management` are handled in `saranga-server` | `management.*`, `artemis-prometheus-metrics-plugin`, Jolokia's HTTP protocol |
 | `saranga-client` | Rust Core-protocol client. Used for testing and also shippable on its own | `artemis-core-client` |
 | `saranga-cli` | Binary named `saranga`: `create`, `run`, `stop`, `queue`, `address`, `producer`/`consumer`, `perf`, `data print/exp/imp/compact`, `mask` | `artemis-cli` |
 

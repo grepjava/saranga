@@ -1,18 +1,23 @@
-//! The broker's embedded web server, from `bootstrap.xml`'s `<web>`: on each
-//! `<binding>`, the Jolokia-compatible management API where the web console
-//! is (`<app url="console" war="console.war"/>`, at `/console/jolokia`), and
-//! the Prometheus metrics where the metrics plugin's app is
-//! (`<app url="metrics" war="metrics.war"/>`).
+//! The broker's embedded web server, from `bootstrap.xml`'s `<web>`. On each
+//! `<binding>`:
 //!
-//! As in Artemis, the API needs a user of the broker's JAAS domain holding
-//! one of the console roles (`HAWTIO_ROLES`), and every attribute and
-//! operation is checked against `management.xml`'s `<authorisation>`.
+//! - the REST API at `/api` (see [`rest`]), always;
+//! - the Prometheus metrics where the metrics plugin's app is
+//!   (`<app url="metrics" war="metrics.war"/>`);
+//! - the Jolokia compatibility layer where the web console's app is
+//!   (`<app url="console" war="console.war"/>`, at `/console/jolokia`), for
+//!   the Artemis console and tools that speak Jolokia. As in Artemis, it
+//!   needs a user of the broker's JAAS domain holding one of the console
+//!   roles (`HAWTIO_ROLES`), and every attribute and operation is checked
+//!   against `management.xml`'s `<authorisation>`. Without that app it is
+//!   not served.
 
 mod access;
 mod catalog;
 mod jolokia;
 mod mbean;
 pub mod metrics;
+pub mod rest;
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -136,7 +141,8 @@ pub async fn start(
             })
             .clone();
         tracing::info!("AMQ241001: HTTP Server started at {}", b.uri);
-        let mut router = Router::new();
+        tracing::info!("Saranga REST API available at {}/api", b.uri);
+        let mut router = rest::router(broker.clone());
         if let Some(redirect) = &options.root_redirect {
             let location = format!("/{}", redirect.trim_start_matches('/'));
             router =

@@ -610,6 +610,43 @@ async fn list_messages(
     )
 }
 
+/// `browse`: the queued messages the filter accepts as composite data.
+/// Without a page, those among the first `management-browse-page-size`;
+/// with one, the `page`th `page_size` of the accepted messages.
+pub(super) async fn browse(
+    broker: &Broker,
+    q: &Queue,
+    page: Option<(i32, i32)>,
+    filter_text: Option<String>,
+) -> Outcome {
+    let f = filter(broker, filter_text)?;
+    let settings = q.settings();
+    let limit = settings.management_message_attribute_size_limit;
+    let refs = q.browse().await;
+    let accepts =
+        |r: &&crate::message::MessageRef| f.as_ref().is_none_or(|f| f.matches(&*r.message));
+    let picked: Vec<Json> = match page {
+        None => refs
+            .iter()
+            .take(settings.management_browse_page_size.max(0) as usize)
+            .filter(accepts)
+            .map(|r| messages::to_composite(r, limit))
+            .collect(),
+        Some((page, size)) => {
+            let start = (i64::from(page) - 1) * i64::from(size);
+            let end = (i64::from(page) * i64::from(size)).min(refs.len() as i64);
+            refs.iter()
+                .filter(accepts)
+                .enumerate()
+                .take_while(|(i, _)| (*i as i64) < end)
+                .filter(|(i, _)| *i as i64 >= start)
+                .map(|(_, r)| messages::to_composite(r, limit))
+                .collect()
+        }
+    };
+    Ok(Json::Array(picked))
+}
+
 async fn scheduled(q: &Queue, limit: i32) -> Json {
     Json::Array(
         q.scheduled_messages()

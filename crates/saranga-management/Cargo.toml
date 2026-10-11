@@ -1,6 +1,6 @@
 [package]
 name = "saranga-management"
-description = "The broker's web server: the Jolokia-compatible management API and Prometheus metrics"
+description = "The broker's web server: the REST management API, Prometheus metrics and a Jolokia compatibility layer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
