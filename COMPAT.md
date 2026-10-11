@@ -138,13 +138,25 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **`closeSessionWithID`** closes Core sessions only. For a session of another protocol it returns false; Artemis closes the server side of any session.
 - **A STOMP consumer closed by management** is removed from its session after the `ERROR` frame. Artemis drops the subscription but leaves the server consumer in place.
 - **`getRoles` and `getRolesAsJSON`** list roles in the order the setting gives them. Artemis lists them in `HashSet` order.
-- **`listUser`** lists users in name order, and each user's roles in name order. Artemis lists both in `HashMap` and `HashSet` order.
+- **`listUser`** lists users and each user's roles in the order Java's `HashMap` and `HashSet` iterate them, as Artemis does. For a basic security manager the users are first put in name order; Artemis puts them in the order of its own map of the journal's users, so a long list can come out in a different order.
+- **`listNetworkTopology`** returns `[]` until clustering (Phase 10): the topology of a broker without cluster connections.
 - **Notifications** not sent yet: those of `NotificationActiveMQServerPlugin` (`CONNECTION_CREATED`, `CONNECTION_DESTROYED`, `ADDRESS_ADDED`, `ADDRESS_REMOVED`, `MESSAGE_DELIVERED`, `MESSAGE_EXPIRED`; plugins come in stage 5), `ACCEPTOR_STOPPED`, and those of clustering, bridges, discovery and grouping (Phase 10). A divert's `BINDING_ADDED` carries a new ID in `_AMQ_Binding_ID`, as Saranga's diverts have none of their own.
 - **`management-message-rbac`** checks the permission before it looks for the operation. For an operation that does not exist, a caller without the permission gets the permission error; Artemis looks for the operation's method first and answers `AMQ229069: no operation`.
 - **Message counter dates** are in UTC, as the other dates are, and so are the hours of a counter's history.
 - **The slow-consumer advisory** (`ActiveMQ.Advisory.SlowConsumer.*`) is not sent to OpenWire clients; the `CONSUMER_SLOW` notification and the `KILL` policy work for consumers of every protocol.
 - **Slow consumers** are checked by one task for all queues, within 200 ms of each queue's check period. Artemis schedules a task for each queue.
 - **Records.** Paused queues and addresses, address settings and diverts are journaled as Artemis journals them (`QUEUE_STATUS_RECORD`, `ADDRESS_STATUS_RECORD`, `ADDRESS_SETTING_RECORD_JSON`, `DIVERT_RECORD`), so they move with the data directory in both directions. Like Artemis, Saranga journals every deployed divert, configured ones included.
+
+## CLI differences
+The Artemis CLI's `queue`, `address`, `user`, `producer`, `consumer`, `browser`, `transfer`, `check` and `stop` work against Saranga unchanged. The `saranga` command has them too, with the same options and output; these are the differences:
+- **Connections** are Core over plain TCP. A URL with `sslEnabled=true` is refused, `--protocol AMQP` (and `--source-protocol`/`--target-protocol amqp`) is not supported, and of a list of URLs (`(tcp://a:61616,tcp://b:61616)`) only the first is used.
+- **The default URL** comes from the instance's acceptor called `artemis` (or `--acceptor`), as in Artemis. Artemis also looks for a connector of that name; Saranga does not read connectors yet.
+- **Files of messages** (`producer --data`, `consumer --data`) and `--serializer` are not supported: the XML message format is not ported yet.
+- **A failed connection** is reported (`Connection failed::<reason>`) and the command stops with status 1. Artemis asks for the URL, user and password again unless `--silent` is given.
+- **`browser --verbose`** prints a message as `ActiveMQMessage[<id>]:PERSISTENT`. Artemis appends the Core message's own `toString`.
+- **`--verbose`** does not print the `Executing <class> <arguments>` and `Home::...` lines.
+- **`queue stat --loop`** prints the time of each iteration in UTC.
+- **`user` and `stop`** are always there; Artemis has them only in an instance's CLI. `stop` finds the instance through `ARTEMIS_INSTANCE` (or `ARTEMIS_INSTANCE_ETC`), as an instance's `bin/artemis` sets it, through a `xml:<bootstrap.xml>` argument, or through `--broker <broker.xml>`.
 
 ## Security differences
 - **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule` and `LDAPLoginModule` are supported. `Krb5LoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.

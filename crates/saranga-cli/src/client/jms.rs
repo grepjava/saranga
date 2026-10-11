@@ -1,0 +1,536 @@
+//! What the Artemis Core JMS client does on the wire for the CLI's JMS
+//! calls: `ActiveMQConnection` (the initial session, the client ID),
+//! `ActiveMQSession` (sessions per acknowledge mode, `checkDestination`,
+//! `createConsumer`, `createBrowser`), `AutoCreateUtil.autoCreateQueue` and
+//! `ActiveMQMessageProducer.doSendx`.
+
+use std::time::Duration;
+
+use anyhow::bail;
+use saranga_client::message::{CONNECTION_ID, DEFAULT_PRIORITY};
+use saranga_client::{
+    Connection, Consumer, ConsumerOptions, CoreMessage, Delivery, Error, ErrorType, MessageExt,
+    Producer, QueueConfiguration, RoutingType, Session, SessionOptions,
+};
+
+/// `ClientSession.JMS_SESSION_IDENTIFIER_PROPERTY`.
+const JMS_SESSION: &str = "jms-session";
+/// `ClientSession.JMS_SESSION_CLIENT_ID_PROPERTY`.
+const JMS_CLIENT_ID: &str = "jms-client-id";
+/// `ActiveMQClient.DEFAULT_ACK_BATCH_SIZE`: the batch of a transacted session.
+const TRANSACTION_BATCH_SIZE: i32 = 1024 * 1024;
+
+/// The text of a client error, as `getMessage` gives it.
+pub fn message(e: &Error) -> String {
+    match e {
+        Error::ActiveMq { message, .. } => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// A JMS queue or topic (`ActiveMQQueue`, `ActiveMQTopic`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Destination {
+    Queue(String),
+    Topic(String),
+}
+
+impl Destination {
+    /// `DestAbstract.getDestination`: `topic://` makes a topic, anything
+    /// else (`queue://`, no prefix) a queue.
+    pub fn parse(destination: &str) -> Self {
+        let name = match destination.find("://") {
+            Some(i) => destination[i + 3..].to_owned(),
+            None => destination.to_owned(),
+        };
+        if destination.starts_with("topic://") {
+            Self::Topic(name)
+        } else {
+            Self::Queue(name)
+        }
+    }
+
+    pub fn address(&self) -> &str {
+        match self {
+            Self::Queue(a) | Self::Topic(a) => a,
+        }
+    }
+
+    pub fn is_queue(&self) -> bool {
+        matches!(self, Self::Queue(_))
+    }
+
+    fn routing_type(&self) -> RoutingType {
+        if self.is_queue() {
+            RoutingType::Anycast
+        } else {
+            RoutingType::Multicast
+        }
+    }
+}
+
+impl std::fmt::Display for Destination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Queue(a) => write!(f, "ActiveMQQueue[{a}]"),
+            Self::Topic(a) => write!(f, "ActiveMQTopic[{a}]"),
+        }
+    }
+}
+
+/// An `ActiveMQConnection`: a Core connection and its initial session,
+/// which validated the user and holds the client ID.
+pub struct JmsConnection {
+    pub conn: Connection,
+    initial: Session,
+    /// `connID`: the client ID, else the connection's UID.
+    pub conn_id: String,
+    pub client_id: Option<String>,
+    user: Option<String>,
+    password: Option<String>,
+}
+
+impl JmsConnection {
+    /// `createConnection`: a connection and its initial session; with a
+    /// client ID, `jms-client-id` unique metadata.
+    pub async fn connect(
+        url: &str,
+        user: Option<String>,
+        password: Option<String>,
+        client_id: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let conn = super::open(url).await?;
+        let options = SessionOptions {
+            username: user.clone(),
+            password: password.clone(),
+            ..SessionOptions::default()
+        };
+        let initial = match conn.create_session(options).await {
+            Ok(s) => s,
+            Err(e) => {
+                conn.close().await;
+                bail!(ConnectFailed(message(&e)));
+            }
+        };
+        if let Some(id) = &client_id
+            && let Err(e) = initial.add_unique_metadata(JMS_CLIENT_ID, id).await
+        {
+            conn.close().await;
+            bail!(ConnectFailed(message(&e)));
+        }
+        let uid = saranga_client::uuid::to_string(&saranga_client::uuid::time_based());
+        Ok(Self {
+            conn,
+            initial,
+            conn_id: client_id.clone().unwrap_or(uid),
+            client_id,
+            user,
+            password,
+        })
+    }
+
+    /// `createSession(transacted, AUTO_ACKNOWLEDGE)`.
+    pub async fn session(&self, transacted: bool) -> anyhow::Result<JmsSession> {
+        let options = SessionOptions {
+            username: self.user.clone(),
+            password: self.password.clone(),
+            auto_commit_sends: !transacted,
+            auto_commit_acks: !transacted,
+            ack_batch_size: if transacted {
+                TRANSACTION_BATCH_SIZE
+            } else {
+                0
+            },
+            ..SessionOptions::default()
+        };
+        let session = self.conn.create_session(options).await?;
+        session.add_metadata(JMS_SESSION, "").await?;
+        if let Some(id) = &self.client_id {
+            session.add_metadata(JMS_CLIENT_ID, id).await?;
+        }
+        Ok(JmsSession {
+            session,
+            transacted,
+            conn_id: self.conn_id.clone(),
+        })
+    }
+
+    /// The user and password the connection was made with.
+    pub fn credentials(&self) -> (Option<String>, Option<String>) {
+        (self.user.clone(), self.password.clone())
+    }
+
+    pub async fn close(self) {
+        self.initial.close().await;
+        self.conn.close().await;
+    }
+}
+
+/// The connection could not be made: `Connection failed::<reason>`.
+#[derive(Debug)]
+pub struct ConnectFailed(pub String);
+
+impl std::fmt::Display for ConnectFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConnectFailed {}
+
+/// An `ActiveMQSession` in `AUTO_ACKNOWLEDGE` or `SESSION_TRANSACTED` mode.
+pub struct JmsSession {
+    pub session: Session,
+    pub transacted: bool,
+    conn_id: String,
+}
+
+/// `ActiveMQDestination.createQueueNameForSubscription` for a durable
+/// subscription: `<clientID>.<name>`, each with `\` and `.` escaped.
+pub fn subscription_queue(client_id: &str, name: &str) -> String {
+    let escape = |s: &str| s.replace('\\', "\\\\").replace('.', "\\.");
+    format!("{}.{}", escape(client_id), escape(name))
+}
+
+impl JmsSession {
+    /// `ActiveMQSession.checkDestination`: a producer's destination exists,
+    /// or is auto-created.
+    pub async fn check_destination(&self, dest: &Destination) -> anyhow::Result<()> {
+        let address = dest.address();
+        let s = &self.session;
+        let query = s.address_query(address).await?;
+        if !query.exists {
+            if dest.is_queue() {
+                if query.auto_create_addresses && query.auto_create_queues {
+                    s.create_address(address, &[RoutingType::Anycast], true)
+                        .await?;
+                } else {
+                    bail!(
+                        "Destination {address} does not exist, autoCreateAddresses={} , autoCreateQueues={}",
+                        query.auto_create_addresses,
+                        query.auto_create_queues
+                    );
+                }
+            } else if query.auto_create_addresses {
+                s.create_address(address, &[RoutingType::Multicast], true)
+                    .await?;
+            } else {
+                bail!(
+                    "Destination {address} does not exist, autoCreateAddresses={}",
+                    query.auto_create_addresses
+                );
+            }
+        } else if (!query.supports_multicast && !dest.is_queue())
+            || (!query.supports_anycast && dest.is_queue())
+        {
+            bail!(
+                "Destination {address} exists, but does not support {} routing",
+                if dest.is_queue() {
+                    "ANYCAST"
+                } else {
+                    "MULTICAST"
+                }
+            );
+        }
+        if dest.is_queue() && !s.queue_query(address).await?.exists {
+            if query.auto_create_queues {
+                let config = self
+                    .queue_config(address, address, RoutingType::Anycast, None, true, &query)
+                    .auto_created(true);
+                ignore_exists(s.create_queue(config).await)?;
+            } else {
+                bail!(
+                    "Destination {address} does not exist, address exists but autoCreateQueues={}",
+                    query.auto_create_queues
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// `AutoCreateUtil.setRequiredQueueConfigurationIfNotSet`.
+    fn queue_config(
+        &self,
+        name: &str,
+        address: &str,
+        routing_type: RoutingType,
+        filter: Option<&str>,
+        durable: bool,
+        query: &saranga_client::AddressQuery,
+    ) -> QueueConfiguration {
+        let mut config = QueueConfiguration::new(name)
+            .address(address)
+            .routing_type(routing_type)
+            .durable(durable);
+        if let Some(f) = filter {
+            config = config.filter(f);
+        }
+        config.max_consumers = Some(query.default_max_consumers);
+        config.purge_on_no_consumers = Some(query.default_purge_on_no_consumers);
+        config
+    }
+
+    pub async fn producer(&self, dest: &Destination) -> anyhow::Result<Producer> {
+        self.check_destination(dest).await?;
+        Ok(self.session.create_producer(Some(dest.address())).await?)
+    }
+
+    /// `ActiveMQMessageProducer.doSendx` with the producer's defaults.
+    pub async fn send(
+        &self,
+        producer: &Producer,
+        dest: &Destination,
+        mut message: CoreMessage,
+        persistent: bool,
+        ttl: i64,
+    ) -> anyhow::Result<CoreMessage> {
+        let now = now_millis();
+        message
+            .set_durable(persistent)
+            .set_priority(DEFAULT_PRIORITY)
+            .set_expiration(if ttl == 0 { 0 } else { now + ttl })
+            .set_timestamp(now)
+            .set_new_user_id()
+            .put_string_property(CONNECTION_ID, &self.conn_id)
+            .set_routing_type(dest.routing_type());
+        producer.send(message.clone()).await?;
+        Ok(message)
+    }
+
+    /// `ActiveMQSession.createConsumer` / `createDurableSubscriber`: a
+    /// queue consumer, a non-durable topic subscription on a temporary
+    /// queue, or a durable one (`subscription`, which needs a client ID).
+    pub async fn consumer(
+        &self,
+        dest: &Destination,
+        selector: Option<&str>,
+        subscription: Option<(&str, Option<&str>)>,
+    ) -> anyhow::Result<Consumer> {
+        let s = &self.session;
+        let filter = selector
+            .filter(|f| !f.is_empty())
+            .map(saranga_filter::translate::convert_to_activemq_filter_string);
+        let queue = match dest {
+            Destination::Queue(address) => {
+                self.auto_create_queue(address).await?;
+                address.clone()
+            }
+            Destination::Topic(address) => {
+                let query = s.address_query(address).await?;
+                if !query.exists {
+                    if query.auto_create_addresses {
+                        s.create_address(address, &[RoutingType::Multicast], true)
+                            .await?;
+                    } else {
+                        bail!("Topic {address} does not exist");
+                    }
+                }
+                match subscription {
+                    None => {
+                        let name =
+                            saranga_client::uuid::to_string(&saranga_client::uuid::time_based());
+                        let config = self
+                            .queue_config(
+                                &name,
+                                address,
+                                RoutingType::Multicast,
+                                filter.as_deref(),
+                                false,
+                                &query,
+                            )
+                            .temporary(true);
+                        s.create_queue(config).await?;
+                        name
+                    }
+                    Some((name, client_id)) => {
+                        let Some(client_id) = client_id else {
+                            bail!(
+                                "Cannot create durable subscription - client ID has not been set"
+                            );
+                        };
+                        let queue = subscription_queue(client_id, name);
+                        let sub = s.queue_query(&queue).await?;
+                        if !sub.exists {
+                            let config = self.queue_config(
+                                &queue,
+                                address,
+                                RoutingType::Multicast,
+                                filter.as_deref(),
+                                true,
+                                &query,
+                            );
+                            s.create_queue(config).await?;
+                        } else {
+                            if sub.consumer_count > 0 {
+                                bail!(
+                                    "Cannot create a subscriber on the durable subscription since it already has subscriber(s)"
+                                );
+                            }
+                            let changed = sub.filter_string.as_deref() != filter.as_deref()
+                                || sub.address.as_deref() != Some(address.as_str());
+                            if changed {
+                                // Changing a durable subscription is
+                                // unsubscribing and subscribing again.
+                                s.delete_queue(&queue).await?;
+                                let config = self.queue_config(
+                                    &queue,
+                                    address,
+                                    RoutingType::Multicast,
+                                    filter.as_deref(),
+                                    true,
+                                    &query,
+                                );
+                                s.create_queue(config).await?;
+                            }
+                        }
+                        queue
+                    }
+                }
+            }
+        };
+        Ok(s.create_consumer_with(
+            &queue,
+            ConsumerOptions {
+                filter: if dest.is_queue() || subscription.is_none() {
+                    filter
+                } else {
+                    None
+                },
+                ..ConsumerOptions::default()
+            },
+        )
+        .await?)
+    }
+
+    /// `AutoCreateUtil.autoCreateQueue` for a JMS queue.
+    async fn auto_create_queue(&self, address: &str) -> anyhow::Result<()> {
+        let s = &self.session;
+        let query = s.address_query(address).await?;
+        if !query.exists || !query.queue_names.iter().any(|q| q == address) {
+            if query.auto_create_queues {
+                let config = self
+                    .queue_config(address, address, RoutingType::Anycast, None, true, &query)
+                    .auto_created(true);
+                ignore_exists(s.create_queue(config).await)?;
+            } else {
+                bail!("Destination {address} does not exist");
+            }
+        } else {
+            let q = s.queue_query(address).await?;
+            if q.routing_type.is_some_and(|t| t != RoutingType::Anycast) {
+                bail!("Destination {address} does not support JMS queue semantics");
+            }
+        }
+        Ok(())
+    }
+
+    /// `ActiveMQSession.createBrowser`: a browse-only consumer, made when
+    /// the enumeration is.
+    pub async fn browser(&self, queue: &str, selector: Option<&str>) -> anyhow::Result<Consumer> {
+        let filter = selector
+            .filter(|f| !f.is_empty())
+            .map(saranga_filter::translate::convert_to_activemq_filter_string);
+        self.auto_create_queue(queue).await?;
+        Ok(self
+            .session
+            .create_consumer_with(
+                queue,
+                ConsumerOptions {
+                    filter,
+                    browse_only: true,
+                    ..ConsumerOptions::default()
+                },
+            )
+            .await?)
+    }
+
+    /// `MessageConsumer.receive(timeout)` (none: wait for ever; zero:
+    /// `receiveNoWait`), acknowledged as the session's mode says.
+    pub async fn receive(
+        &self,
+        consumer: &Consumer,
+        timeout: Option<Duration>,
+    ) -> anyhow::Result<Option<Delivery>> {
+        let delivery = match timeout {
+            Some(t) if t.is_zero() => consumer.receive_immediate().await?,
+            Some(t) => consumer.receive(t).await?,
+            None => loop {
+                if let Some(d) = consumer.receive(Duration::from_secs(3600)).await? {
+                    break Some(d);
+                }
+            },
+        };
+        if let Some(d) = &delivery {
+            consumer.acknowledge(d).await?;
+        }
+        Ok(delivery)
+    }
+
+    pub async fn commit(&self) -> anyhow::Result<()> {
+        Ok(self.session.commit().await?)
+    }
+
+    pub async fn rollback(&self) -> anyhow::Result<()> {
+        Ok(self.session.rollback(false).await?)
+    }
+
+    pub async fn start(&self) -> anyhow::Result<()> {
+        Ok(self.session.start().await?)
+    }
+
+    pub async fn close(&self) {
+        self.session.close().await;
+    }
+}
+
+/// A queue made by someone else between the query and the create is fine.
+fn ignore_exists(r: saranga_client::Result<()>) -> saranga_client::Result<()> {
+    match r {
+        Err(e) if e.kind() == Some(ErrorType::QueueExists) => Ok(()),
+        r => r,
+    }
+}
+
+pub fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+/// The text of a JMS message for the CLI's output: a TEXT body's text, else
+/// the JMS message ID.
+pub fn text_or_id(m: &CoreMessage) -> String {
+    if m.message_type == saranga_client::message_type::TEXT {
+        m.text().ok().flatten().unwrap_or_else(|| "null".to_owned())
+    } else {
+        m.jms_message_id().unwrap_or_else(|| "null".to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Destination, subscription_queue};
+
+    #[test]
+    fn destinations() {
+        assert_eq!(
+            Destination::parse("queue://a"),
+            Destination::Queue("a".into())
+        );
+        assert_eq!(
+            Destination::parse("topic://a.b"),
+            Destination::Topic("a.b".into())
+        );
+        assert_eq!(Destination::parse("a"), Destination::Queue("a".into()));
+        assert_eq!(
+            Destination::parse("fqqn://a::b"),
+            Destination::Queue("a::b".into())
+        );
+        assert_eq!(
+            Destination::Topic("t".into()).to_string(),
+            "ActiveMQTopic[t]"
+        );
+        assert_eq!(subscription_queue("c.i", "s\\1"), "c\\.i.s\\\\1");
+    }
+}

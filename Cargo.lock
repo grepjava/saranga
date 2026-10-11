@@ -1554,7 +1554,9 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "saranga-client",
  "saranga-config",
+ "saranga-filter",
  "saranga-paging",
  "saranga-protocol-amqp",
  "saranga-protocol-mqtt",

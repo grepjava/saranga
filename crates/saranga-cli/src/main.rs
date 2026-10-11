@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
+mod client;
 mod data;
 mod instance;
 
@@ -61,6 +62,37 @@ enum Command {
     /// Tools on a broker's data directory.
     #[command(subcommand)]
     Data(data::DataCommand),
+    /// Create a queue, or delete, update, purge or print stats of queues.
+    #[command(subcommand)]
+    Queue(client::queue::QueueCommand),
+    /// Create, delete, update or show addresses.
+    #[command(subcommand)]
+    Address(client::address::AddressCommand),
+    /// Add, list, reset or remove users of the broker's security manager.
+    #[command(subcommand)]
+    User(client::user::UserCommand),
+    /// Send message(s) to a broker.
+    Producer(client::messages::ProducerArgs),
+    /// Consume messages from a queue.
+    Consumer(client::messages::ConsumerArgs),
+    /// Browse messages on a queue.
+    Browser(client::messages::BrowseArgs),
+    /// Move messages from one JMS destination towards another JMS
+    /// destination.
+    Transfer(client::messages::TransferArgs),
+    /// Check a node or a queue.
+    #[command(subcommand)]
+    Check(client::check::CheckCommand),
+    /// Stop the broker of an instance, as `artemis stop`: STOP_ME next to
+    /// its broker.xml.
+    Stop {
+        /// Override the broker configuration from the bootstrap.xml.
+        #[arg(long)]
+        broker: Option<PathBuf>,
+        /// Broker Configuration URI. Default:
+        /// xml:${ARTEMIS_INSTANCE}/etc/bootstrap.xml.
+        configuration: Option<String>,
+    },
     /// Masks a password for the configuration files, as `artemis mask`:
     /// write the result as ENC(<result>).
     Mask {
@@ -83,18 +115,120 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    let logs = tracing_subscriber::fmt().with_env_filter(
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    let client = matches!(
+        cli.command,
+        Command::Queue(_)
+            | Command::Address(_)
+            | Command::User(_)
+            | Command::Producer(_)
+            | Command::Consumer(_)
+            | Command::Browser(_)
+            | Command::Transfer(_)
+            | Command::Check(_)
+            | Command::Stop { .. }
     );
-    if matches!(cli.command, Command::Data(_)) {
-        // The data tools print their report on stdout.
+    let logs = tracing_subscriber::fmt().with_env_filter(
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(if client { "warn" } else { "info" })),
+    );
+    if client || matches!(cli.command, Command::Data(_)) {
+        // These commands print their report on stdout.
         logs.with_writer(std::io::stderr).init();
     } else {
         logs.init();
     }
-    match cli.command {
+    if client {
+        return match run_client(cli.command).await {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                report_client_error(&e);
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    match run_command(cli.command).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// The commands against a running broker.
+async fn run_client(command: Command) -> anyhow::Result<()> {
+    match command {
+        Command::Queue(c) => client::queue::run(c).await,
+        Command::Address(c) => client::address::run(c).await,
+        Command::User(c) => client::user::run(c).await,
+        Command::Producer(a) => client::messages::producer(a).await,
+        Command::Consumer(a) => client::messages::consumer(a).await,
+        Command::Browser(a) => client::messages::browser(a).await,
+        Command::Transfer(a) => client::messages::transfer(a).await,
+        Command::Check(c) => client::check::run(c).await,
+        Command::Stop {
+            broker,
+            configuration,
+        } => stop(broker, configuration),
+        _ => unreachable!("not a client command"),
+    }
+}
+
+/// Reports a failed command as `Artemis.execute` does: a `CLIException`'s
+/// message, a `RuntimeException`'s with the usage hint, a failed
+/// connection as the CLI's retry prompt starts.
+fn report_client_error(e: &anyhow::Error) {
+    if let Some(u) = e.downcast_ref::<client::UsageError>() {
+        eprintln!("{u}");
+        println!();
+        println!("Usage: saranga help [<args>...]");
+        println!("use 'help <command>' for more information");
+        println!("      [<args>...]");
+    } else if let Some(c) = e.downcast_ref::<client::check::CheckFailed>() {
+        eprintln!("{c}");
+    } else if let Some(c) = e.downcast_ref::<client::jms::ConnectFailed>() {
+        eprintln!("Connection failed::{c}");
+    } else if let Some(c) = e.downcast_ref::<saranga_client::Error>() {
+        eprintln!("{}", client::jms::message(c));
+    } else {
+        eprintln!("{e:#}");
+    }
+}
+
+/// `artemis stop`: `STOP_ME` in the directory of the instance's
+/// broker.xml, which the running broker looks for.
+fn stop(broker: Option<PathBuf>, configuration: Option<String>) -> anyhow::Result<()> {
+    let broker_xml = match broker {
+        Some(b) => PathBuf::from(b.to_string_lossy().trim_start_matches("file:")),
+        None => {
+            let etc = match configuration {
+                Some(c) => {
+                    let bootstrap = PathBuf::from(c.trim_start_matches("xml:"));
+                    bootstrap.parent().map(Path::to_path_buf).unwrap_or_default()
+                }
+                None => client::instance_etc().context(
+                    "stop needs a broker instance: run it from the instance's bin/ (ARTEMIS_INSTANCE)",
+                )?,
+            };
+            instance::Instance::from_etc(&etc, instance::Options::default())?.broker_xml
+        }
+    };
+    let dir = broker_xml
+        .parent()
+        .context("the broker configuration has no directory")?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("STOP_ME"))
+        .with_context(|| format!("creating {}", dir.join("STOP_ME").display()))?;
+    Ok(())
+}
+
+async fn run_command(command: Command) -> anyhow::Result<()> {
+    match command {
         Command::Run {
             config,
             etc,
@@ -126,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
             key,
             password_codec.then_some(config).flatten(),
         ),
+        _ => unreachable!("a client command"),
     }
 }
 
@@ -533,4 +668,16 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use clap::CommandFactory;
+
+    /// Duplicate argument IDs (a command's `--user` against the
+    /// connection's) and the like.
+    #[test]
+    fn cli_is_well_formed() {
+        super::Cli::command().debug_assert();
+    }
 }

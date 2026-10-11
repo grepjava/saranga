@@ -25,3 +25,5 @@ saranga-transport = { path = "../saranga-transport" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+saranga-client = { path = "../saranga-client" }
+saranga-filter = { path = "../saranga-filter" }
