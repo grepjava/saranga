@@ -224,6 +224,20 @@ The differences from Artemis are listed in COMPAT.md.
 6. **WebSockets** for every protocol.
 7. **Exit check**: the client matrix and conversion between protocols.
 
+**Progress**
+- Stage 1 (groundwork) is done. Acceptors pick each connection's protocol from its first 8 bytes. `ServerSession` holds what Core and every other protocol share. `tests/protocols.rs` in `saranga-server` covers the detection.
+- Stage 2 (STOMP) is done. [tests/interop/stomp/Stomp.java](tests/interop/stomp/Stomp.java) has 76 tests ported from Artemis's `StompTest`, `StompV11Test` and `StompV12Test`. They pass against Artemis 2.57.0 and against Saranga: `CONFIG=tests/interop/stomp/broker.xml SUITE_FILE=tests/interop/stomp/Stomp.java scripts/interop.sh saranga`. They cover:
+  - version negotiation, `
+` line ends, and header escaping and repetition;
+  - receipts, and the ERROR frames with their texts;
+  - the `auto`, `client` and `client-individual` ack modes, NACK, and consumer windows;
+  - transactions;
+  - topics, durable and no-local subscriptions, and selectors;
+  - auto-creation, routing types and the `/queue/` and `/topic/` prefixes;
+  - scheduled and expired messages, heart-beats and the TTL;
+  - large messages in both directions;
+  - messages crossing between STOMP and JMS.
+
 ## Phase 8: Management and operations
 
 **Scope**

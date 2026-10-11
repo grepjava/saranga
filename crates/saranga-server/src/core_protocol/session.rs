@@ -336,7 +336,7 @@ impl CoreSession {
         self.session
             .acknowledge(consumer_id, message_id, individual)
             .await
-            .map(|()| None)
+            .map(|_| None)
     }
 
     async fn handle(&mut self, packet: Packet, size: usize) {

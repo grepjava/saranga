@@ -60,6 +60,15 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **Large-message files** are deleted once nothing holds the message any more, which is when Artemis's reference count releases it. When the broker stops, the files of messages still in memory are kept, as Artemis keeps them.
 - **Divert transformers** are Rust plugins, not Java classes. The embedding application registers a `Transformer` under the class name that `broker.xml` gives. A divert whose transformer is not registered is not deployed, and a warning is logged.
 
+## STOMP differences
+- **The `server` header** of CONNECTED is `Saranga/<version>`. Artemis sends `ActiveMQ-Artemis/2.57.0 ActiveMQ Artemis Messaging Engine`. `disableStompServerHeader` leaves it out on both.
+- **`AMQ339011 Error sending message`** names the message by its ID, durability and address. Artemis prints the whole `CoreMessage.toString()`.
+- **Byte-array properties** appear in MESSAGE headers as `[B@` followed by a hash of their contents. Artemis prints the array's identity hash. Neither means anything to a client.
+- **Frame interceptors** (Java classes) are not supported.
+- **The connection TTL** closes a silent connection when it runs out. Artemis notices at its next `connection-ttl-check-interval`, up to that much later.
+- **A `` that is the last byte read** waits for its `
+`. Artemis reports `There is a CR not followed by an LF` when the two arrive in different packets.
+
 ## Security differences
 - **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule` and `LDAPLoginModule` are supported. `Krb5LoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.
 - **Security managers.** The JAAS security manager (`<jaas-security>`) and `ActiveMQBasicSecurityManager` are supported. The basic manager keeps its users in the bindings journal, so its users move with the data directory in both directions. Any other `<security-manager>` class stops the broker from starting. As in Artemis, the basic manager has no users without persistence. Users can be added only through the bootstrap credentials until management arrives in Phase 8.

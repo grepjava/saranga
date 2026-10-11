@@ -1,7 +1,21 @@
 [package]
 name = "saranga-protocol-stomp"
+description = "STOMP 1.0, 1.1 and 1.2 for the Saranga broker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+saranga-buffer = { path = "../saranga-buffer" }
+saranga-core-protocol = { path = "../saranga-core-protocol" }
+saranga-filter = { path = "../saranga-filter" }
+saranga-message = { path = "../saranga-message" }
+saranga-security = { path = "../saranga-security" }
+saranga-server = { path = "../saranga-server" }
+saranga-storage = { path = "../saranga-storage" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

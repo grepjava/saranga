@@ -152,6 +152,12 @@ impl Completion {
         self.waits.is_empty() && self.actions.is_empty()
     }
 
+    /// Adds another request's writes and updates to these.
+    pub fn merge(&mut self, other: Completion) {
+        self.waits.extend(other.waits);
+        self.actions.extend(other.actions);
+    }
+
     /// Waits for the journal writes, then makes the queue updates; after a
     /// failed write, the error and no updates (`OperationContext.onError`).
     pub async fn wait(self) -> std::result::Result<(), saranga_journal::JournalError> {
@@ -625,13 +631,13 @@ impl ServerSession {
 
     /// `ServerSessionImpl.acknowledge` and `individualAcknowledge`: the
     /// consumer's message, and with `!individual` every message delivered
-    /// before it.
+    /// before it. Returns the IDs of the messages acknowledged.
     pub async fn acknowledge(
         &mut self,
         consumer_id: i64,
         message_id: i64,
         individual: bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<i64>> {
         let tx = if self.auto_commit_acks {
             None
         } else {
@@ -647,6 +653,7 @@ impl ServerSession {
         let queue = c.queue.clone();
         match queue.ack(c.id, message_id, individual, tx.is_some()).await {
             Ok(mut refs) => {
+                let ids = refs.iter().map(MessageRef::message_id).collect();
                 // QueueImpl.acknowledge
                 match tx {
                     Some(tx) => {
@@ -668,7 +675,7 @@ impl ServerSession {
                         }
                     }
                 }
-                Ok(())
+                Ok(ids)
             }
             Err(failed) => {
                 let e = BrokerError::consumer_no_reference(consumer_id, message_id, queue.name());
@@ -1162,6 +1169,37 @@ impl ServerSession {
             return;
         };
         c.queue.remove_consumer(c.id, failed).await;
+    }
+
+    /// `PrefixUtil.getPrefix`: the acceptor prefix `name` starts with.
+    pub fn prefix_of(&self, name: &str) -> Option<&str> {
+        self.conn
+            .prefixes()
+            .iter()
+            .find(|(p, _)| name.starts_with(p.as_str()))
+            .map(|(p, _)| p.as_str())
+    }
+
+    /// `checkAutoCreate` for `address` (which may be a fully qualified
+    /// queue name) without its acceptor prefix. `None` for the routing
+    /// type means the caller does not know it, which counts as existing.
+    pub fn check_auto_create(
+        &self,
+        address: &str,
+        routing_type: Option<RoutingType>,
+    ) -> Result<crate::postoffice::AutoCreate> {
+        let address = self.remove_prefix(address);
+        self.broker
+            .post_office()
+            .check_auto_create(address, routing_type, self.creator())
+    }
+
+    /// Grants a consumer credits later, from outside the session: `-1` for
+    /// no flow control.
+    pub fn credit_granter(&self, consumer_id: i64) -> Option<impl FnOnce(i32) + Send + use<>> {
+        let c = self.consumers.get(&consumer_id)?;
+        let (queue, id) = (c.queue.clone(), c.id);
+        Some(move |credits| queue.credits(id, credits))
     }
 
     /// See [`ClientConnection::strip_prefix`].

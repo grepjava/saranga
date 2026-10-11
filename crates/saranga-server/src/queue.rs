@@ -66,6 +66,13 @@ pub trait DeliverySink: Send + Sync {
 
     /// The largest body chunk (the session's `minLargeMessageSize`).
     fn chunk_size(&self) -> usize;
+
+    /// `supportLargeMessage`: whether large messages go out in chunks.
+    /// Without it (every protocol but Core) a large message is delivered
+    /// whole, its body read from its file.
+    fn supports_large(&self) -> bool {
+        true
+    }
 }
 
 /// The most of a large message's body sent in one pass of the queue, so
@@ -793,6 +800,19 @@ impl Consumer {
         let id = self.reg.client_id;
         let size = match message.large() {
             None => self.reg.sink.deliver(id, message, delivery_count),
+            Some(body) if !self.reg.sink.supports_large() => {
+                let mut core = message.core().clone();
+                core.body = body.read_all().unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "AMQ222110: Error on resetting large message deliver - {}: {e}",
+                        message.message_id()
+                    );
+                    Vec::new()
+                });
+                self.reg
+                    .sink
+                    .deliver(id, &ServerMessage::new(core), delivery_count)
+            }
             Some(body) => {
                 let size = body.size() as i64;
                 let reader = body

@@ -65,8 +65,9 @@ CP="$(native "$DIST/lib")/*"
 URL="tcp://127.0.0.1:$PORT"
 SUITE="${SUITE:-Phase2}"
 if [[ -n "${SUITE_FILE:-}" ]]; then
-  # Another suite on another client classpath (scripts/legacy-interop.sh).
-  java ${SUITE_JAVA_OPTS:-} -cp "$SUITE_CP" "$(native "$SUITE_FILE")" "$URL" "$@"
+  # Another suite, on the reference client classpath unless SUITE_CP
+  # names another (scripts/legacy-interop.sh).
+  java ${SUITE_JAVA_OPTS:-} -cp "${SUITE_CP:-$CP}" "$(native "$SUITE_FILE")" "$URL" "$@"
   exit
 fi
 java -cp "$CP" "$(native "$ROOT/tests/interop/jms/$SUITE.java")" "$URL" "$@"

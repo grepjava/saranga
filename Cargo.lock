@@ -1556,6 +1556,7 @@ dependencies = [
  "clap",
  "saranga-config",
  "saranga-paging",
+ "saranga-protocol-stomp",
  "saranga-security",
  "saranga-server",
  "saranga-storage",
@@ -1665,6 +1666,18 @@ version = "0.0.1"
 [[package]]
 name = "saranga-protocol-stomp"
 version = "0.0.1"
+dependencies = [
+ "saranga-buffer",
+ "saranga-core-protocol",
+ "saranga-filter",
+ "saranga-message",
+ "saranga-security",
+ "saranga-server",
+ "saranga-storage",
+ "tokio",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "saranga-security"

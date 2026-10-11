@@ -327,9 +327,9 @@ pub struct BindingQueryResult {
     pub default_delay_before_dispatch: i64,
 }
 
-/// `checkAutoCreate`'s outcome.
+/// `checkAutoCreate`'s outcome (`AutoCreateResult`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AutoCreate {
+pub enum AutoCreate {
     Existed,
     Created,
     Updated,
@@ -1070,7 +1070,10 @@ impl PostOffice {
 
     /// `ServerSessionImpl.checkAutoCreate`, for a send to `address` (which
     /// may be an FQQN) with the message's routing type.
-    fn check_auto_create(
+    /// `ServerSessionImpl.checkAutoCreate`: makes sure the address (and,
+    /// for anycast or a fully qualified name, the queue) exists, creating
+    /// what the settings allow.
+    pub fn check_auto_create(
         &self,
         address: &str,
         routing_type: Option<RoutingType>,

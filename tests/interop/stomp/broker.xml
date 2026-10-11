@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<!-- STOMP and Core on one acceptor (Stomp.java), set up as Artemis's
+     StompTestBase: queue testQueue, topic testtopic, no consumer window by
+     default; plus the /queue/ and /topic/ prefixes, and addresses under
+     noauto. that are never auto-created. -->
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+   <core xmlns="urn:activemq:core">
+      <name>stomp</name>
+      <persistence-enabled>true</persistence-enabled>
+      <security-enabled>false</security-enabled>
+      <connection-ttl-check-interval>500</connection-ttl-check-interval>
+      <acceptors>
+         <acceptor name="artemis">tcp://0.0.0.0:61616?protocols=CORE,STOMP;stompConsumerWindowSize=-1;anycastPrefix=/queue/;multicastPrefix=/topic/</acceptor>
+      </acceptors>
+      <address-settings>
+         <address-setting match="noauto.#">
+            <auto-create-queues>false</auto-create-queues>
+            <auto-create-addresses>false</auto-create-addresses>
+         </address-setting>
+         <address-setting match="#">
+            <dead-letter-address>DLQ</dead-letter-address>
+            <expiry-address>ExpiryQueue</expiry-address>
+         </address-setting>
+      </address-settings>
+      <addresses>
+         <address name="DLQ"><anycast><queue name="DLQ"/></anycast></address>
+         <address name="ExpiryQueue"><anycast><queue name="ExpiryQueue"/></anycast></address>
+         <address name="testQueue"><anycast><queue name="testQueue"/></anycast></address>
+         <address name="testtopic"><multicast/></address>
+      </addresses>
+   </core>
+</configuration>

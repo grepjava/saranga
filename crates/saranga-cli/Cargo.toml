@@ -15,6 +15,7 @@ clap = { version = "4", features = ["derive"] }
 saranga-config = { path = "../saranga-config" }
 saranga-paging = { path = "../saranga-paging" }
 saranga-security = { path = "../saranga-security" }
+saranga-protocol-stomp = { path = "../saranga-protocol-stomp" }
 saranga-server = { path = "../saranga-server" }
 saranga-storage = { path = "../saranga-storage" }
 saranga-transport = { path = "../saranga-transport" }

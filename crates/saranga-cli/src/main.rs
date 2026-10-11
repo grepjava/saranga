@@ -131,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// The protocols besides Core that `saranga run` serves.
 fn protocol_managers() -> Vec<Arc<dyn saranga_server::protocol::ProtocolManager>> {
-    Vec::new()
+    vec![Arc::new(saranga_protocol_stomp::StompProtocol)]
 }
 
 /// An acceptor to open.
