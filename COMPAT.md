@@ -156,6 +156,8 @@ The Artemis CLI's `queue`, `address`, `user`, `producer`, `consumer`, `browser`,
 - **`browser --verbose`** prints a message as `ActiveMQMessage[<id>]:PERSISTENT`. Artemis appends the Core message's own `toString`.
 - **`--verbose`** does not print the `Executing <class> <arguments>` and `Home::...` lines.
 - **`queue stat --loop`** prints the time of each iteration in UTC.
+- **`saranga create`** writes the instance `artemis create` writes, from the same templates: the `etc/` files are the same but for the password hash's salt and the paths. `bin/` holds `artemis` and `saranga` (`artemis.cmd` and `saranga.cmd` on Windows), which run the `saranga` that made the instance, for the instance, and on Unix `artemis-service`, unchanged; there is no Windows service wrapper (`artemis-service.exe`). Without `--aio`, `--nio` or `--mapped` the journal type is `NIO`, as Artemis chooses where libaio is missing. The auto-tuning measures the NIO writes only. Clustering and HA options (`--clustered`, `--replicated`, `--shared-store`, `--backup`, `--static-cluster` and the like) and `--jdbc` are refused. The messages printed name Saranga.
+- **`saranga run`** with neither `--config` nor `--etc` runs the instance named by `ARTEMIS_INSTANCE`, as an instance's `bin/artemis run` does, and stops cleanly on SIGTERM as well as on Ctrl-C, so `artemis-service stop` works.
 - **`user` and `stop`** are always there; Artemis has them only in an instance's CLI. `stop` finds the instance through `ARTEMIS_INSTANCE` (or `ARTEMIS_INSTANCE_ETC`), as an instance's `bin/artemis` sets it, through a `xml:<bootstrap.xml>` argument, or through `--broker <broker.xml>`.
 
 ## Security differences

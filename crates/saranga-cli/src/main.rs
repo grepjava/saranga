@@ -7,6 +7,7 @@ use std::sync::Arc;
 use anyhow::Context;
 
 mod client;
+mod create;
 mod data;
 mod instance;
 
@@ -62,6 +63,9 @@ enum Command {
     /// Tools on a broker's data directory.
     #[command(subcommand)]
     Data(data::DataCommand),
+    /// Create a new broker instance, as `artemis create`: its bin/artemis
+    /// runs this saranga.
+    Create(Box<create::CreateArgs>),
     /// Create a queue, or delete, update, purge or print stats of queues.
     #[command(subcommand)]
     Queue(client::queue::QueueCommand),
@@ -128,6 +132,7 @@ async fn main() -> std::process::ExitCode {
             | Command::Transfer(_)
             | Command::Check(_)
             | Command::Stop { .. }
+            | Command::Create(_)
     );
     let logs = tracing_subscriber::fmt().with_env_filter(
         EnvFilter::try_from_default_env()
@@ -172,6 +177,7 @@ async fn run_client(command: Command) -> anyhow::Result<()> {
             broker,
             configuration,
         } => stop(broker, configuration),
+        Command::Create(a) => create::run(*a),
         _ => unreachable!("not a client command"),
     }
 }
@@ -186,7 +192,7 @@ fn report_client_error(e: &anyhow::Error) {
         println!("Usage: saranga help [<args>...]");
         println!("use 'help <command>' for more information");
         println!("      [<args>...]");
-    } else if let Some(c) = e.downcast_ref::<client::check::CheckFailed>() {
+    } else if let Some(c) = e.downcast_ref::<client::CliError>() {
         eprintln!("{c}");
     } else if let Some(c) = e.downcast_ref::<client::jms::ConnectFailed>() {
         eprintln!("Connection failed::{c}");
@@ -240,6 +246,9 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
                 system: system_properties,
                 broker_properties: properties,
             };
+            // Without either, the instance whose bin/artemis runs this
+            // (ARTEMIS_INSTANCE), if any.
+            let etc = etc.or_else(client::instance_etc);
             let instance = match (config, etc) {
                 (Some(c), _) => Some(instance::Instance::from_broker_xml(&c, options)?),
                 (None, Some(e)) => Some(instance::Instance::from_etc(&e, options)?),
@@ -544,6 +553,20 @@ fn mask(
     Ok(())
 }
 
+/// SIGTERM, as `artemis-service stop` and service managers send it: a
+/// clean stop, as the JVM's shutdown hook makes it for Artemis.
+async fn terminated() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut s) = signal(SignalKind::terminate()) {
+            s.recv().await;
+            return;
+        }
+    }
+    std::future::pending::<()>().await
+}
+
 /// `-D name=value`; a bare `-D name` is the empty string, as in Java.
 fn parse_system_property(s: &str) -> Result<(String, String), String> {
     let (k, v) = s.split_once('=').unwrap_or((s, ""));
@@ -654,6 +677,7 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
             Stop::Clean
         }
         _ = tokio::signal::ctrl_c() => Stop::Clean,
+        _ = terminated() => Stop::Clean,
         s = stop_files => s,
     };
     match stop {

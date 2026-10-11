@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use anyhow::bail;
 use saranga_server::management::json::Json;
 
-use super::ConnectionArgs;
 use super::jms::{Destination, JmsConnection};
 use super::management::Requestor;
+use super::{CliError, ConnectionArgs};
 
 #[derive(clap::Subcommand, Debug)]
 pub enum CheckCommand {
@@ -201,26 +201,14 @@ pub async fn run(cmd: CheckCommand) -> anyhow::Result<()> {
     let timeout = Duration::from_millis(check.timeout);
     match tokio::time::timeout(timeout, run_tasks(&check, kind, &tasks)).await {
         Ok(r) => r,
-        Err(_) => bail!(CheckFailed(format!("{kind} failed. Reason: timeout"))),
+        Err(_) => bail!(CliError(format!("{kind} failed. Reason: timeout"))),
     }
 }
-
-/// `CheckAbstract.fail`: `<kind> failed. Reason: <reason>`, exit status 1.
-#[derive(Debug)]
-pub struct CheckFailed(pub String);
-
-impl std::fmt::Display for CheckFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for CheckFailed {}
 
 /// An argument error, which Artemis meets in the check's thread and
 /// reports as the failed check's cause.
 fn check_failed(kind: &str, e: &anyhow::Error) -> anyhow::Error {
-    anyhow::Error::new(CheckFailed(format!(
+    anyhow::Error::new(CliError(format!(
         "{kind} failed. Reason: java.lang.IllegalArgumentException: {e}"
     )))
 }
@@ -377,10 +365,10 @@ async fn run_tasks(check: &CheckArgs, kind: &str, tasks: &[(String, Task)]) -> a
     context.requestor.close().await;
     conn.close().await;
     if let Some(reason) = stop {
-        bail!(CheckFailed(format!("{kind} failed. Reason: {reason}")));
+        bail!(CliError(format!("{kind} failed. Reason: {reason}")));
     }
     if success < tasks.len() {
-        bail!(CheckFailed(format!(
+        bail!(CliError(format!(
             "{kind} failed. Reason: checks not successful"
         )));
     }

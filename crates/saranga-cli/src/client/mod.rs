@@ -7,7 +7,7 @@
 //! CLI goes through the Core JMS client, [`jms`] does what that client does
 //! on the wire.
 
-use std::io::{BufRead, Write};
+use std::io::BufRead;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
@@ -45,7 +45,7 @@ impl Common {
     }
 
     /// `InputAbstract.input`: the default without input, else a non-empty
-    /// line.
+    /// line, asked for as `InputReader.inputLoop` asks.
     pub fn input(
         &self,
         property: &str,
@@ -55,11 +55,10 @@ impl Common {
         if self.is_silent_input() {
             return silent_default.map(str::to_owned);
         }
+        println!();
         loop {
-            println!();
             println!("{property}:");
-            print!("{prompt}");
-            let _ = std::io::stdout().flush();
+            println!("{prompt}");
             let mut line = String::new();
             if std::io::stdin().lock().read_line(&mut line).unwrap_or(0) == 0 {
                 return silent_default.map(str::to_owned);
@@ -103,18 +102,95 @@ impl Common {
         println!();
         loop {
             println!("{property}: is mandatory with this configuration:");
-            print!("{prompt}");
-            let _ = std::io::stdout().flush();
-            let mut line = String::new();
-            if std::io::stdin().lock().read_line(&mut line).unwrap_or(0) == 0 {
+            println!("{prompt}");
+            let Some(line) = read_password() else {
                 println!("Invalid Entry!");
                 bail!("no input");
-            }
+            };
             let line = line.trim();
             if line.is_empty() {
                 println!("Invalid Entry!");
             } else {
                 return Ok(line.to_owned());
+            }
+        }
+    }
+}
+
+/// A line from the terminal, not echoed (`Console.readPassword`).
+fn read_password() -> Option<String> {
+    let _echo = EchoOff::new();
+    let mut line = String::new();
+    let n = std::io::stdin().lock().read_line(&mut line).ok()?;
+    println!();
+    (n > 0).then(|| line.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+/// Terminal echo off until dropped.
+struct EchoOff {
+    #[cfg(unix)]
+    saved: Option<libc::termios>,
+    #[cfg(windows)]
+    saved: Option<u32>,
+}
+
+impl EchoOff {
+    #[cfg(unix)]
+    fn new() -> Self {
+        // SAFETY: tcgetattr and tcsetattr on stdin with a termios this
+        // function owns.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut t) != 0 {
+                return Self { saved: None };
+            }
+            let saved = t;
+            t.c_lflag &= !libc::ECHO;
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t);
+            Self { saved: Some(saved) }
+        }
+    }
+
+    #[cfg(windows)]
+    fn new() -> Self {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+        };
+        // SAFETY: console mode calls on this process's stdin handle.
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            let mut mode = 0u32;
+            if GetConsoleMode(handle, &mut mode) == 0 {
+                return Self { saved: None };
+            }
+            SetConsoleMode(handle, mode & !ENABLE_ECHO_INPUT);
+            Self { saved: Some(mode) }
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(t) = &self.saved {
+            // SAFETY: restores the attributes read in `new`.
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, t);
+            }
+        }
+        #[cfg(windows)]
+        if let Some(mode) = self.saved {
+            use windows_sys::Win32::System::Console::{
+                GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+            };
+            // SAFETY: restores the mode read in `new`.
+            unsafe {
+                SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), mode);
             }
         }
     }
@@ -132,6 +208,18 @@ impl std::fmt::Display for UsageError {
 }
 
 impl std::error::Error for UsageError {}
+
+/// A `CLIException`: its message alone, and exit status 1.
+#[derive(Debug)]
+pub struct CliError(pub String);
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CliError {}
 
 /// The connection options (`ConnectionConfigurationAbtract`,
 /// `ConnectionAbstract`).

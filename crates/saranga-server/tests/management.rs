@@ -377,13 +377,13 @@ async fn security_violations_are_notified() {
     ));
     config.security = Some(store.clone());
     let broker = Broker::start(config).await.unwrap();
-    op(
-        &broker,
-        "broker",
-        "createAddress",
-        vec![s("activemq.notifications"), s("MULTICAST")],
-    )
-    .await;
+    // The notification address exists once the broker is active.
+    assert!(
+        broker
+            .post_office()
+            .address_info("activemq.notifications")
+            .is_some()
+    );
     let mut queue = QueueSpec::new("notified", "activemq.notifications");
     queue.routing_type = Some(saranga_server::RoutingType::Multicast);
     queue.durable = false;
