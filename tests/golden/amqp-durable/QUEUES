@@ -3,4 +3,5 @@ amqp.golden.topic::amqp-golden.golden-sub
 amqp.golden.scheduled
 amqp.golden.acked
 amqp.golden.redelivered
+amqp.golden.large
 DLQ

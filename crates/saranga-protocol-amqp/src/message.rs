@@ -166,6 +166,22 @@ impl AmqpMessage {
         self.large
     }
 
+    /// `AMQPLargeMessage.toCore`'s first step: a standard message of the
+    /// file's encoding with this message's annotations, ID, expiration and
+    /// priority (which `setPriority` puts in its header).
+    pub fn standard_copy(&self, now: i64) -> Result<Self> {
+        let mut m = Self::new(self.message_format, self.data.to_vec(), now)?;
+        m.extra = self.extra.as_ref().map(JavaMap::hash_copy);
+        if self.expiration > 0 {
+            m.expiration = self.expiration;
+            m.expiration_reload = true;
+        }
+        m.message_annotations = self.message_annotations.clone();
+        m.message_id = self.message_id;
+        m.set_priority(self.priority);
+        Ok(m)
+    }
+
     /// A large message read back from its record and its file
     /// (`AMQPLargeMessagePersister.decode`, `readSavedEncoding`).
     pub fn from_large_record(

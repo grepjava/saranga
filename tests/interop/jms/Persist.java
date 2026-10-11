@@ -45,6 +45,8 @@ public class Persist {
         tests.put("largeMessages", new Test(Persist::largeBefore, Persist::largeAfter));
         tests.put("largeXaPrepared", new Test(Persist::largeXaBefore, Persist::largeXaAfter));
         tests.put("paging", new Test(Persist::pagingBefore, Persist::pagingAfter));
+        tests.put("amqpMessages", new Test(Persist::amqpBefore, Persist::amqpAfter));
+        tests.put("amqpDurableSubscription", new Test(Persist::amqpSubBefore, Persist::amqpSubAfter));
 
         int failed = 0;
         for (Map.Entry<String, Test> t : tests.entrySet()) {
@@ -107,7 +109,92 @@ public class Persist {
         for (String t : texts) p.send(s.createTextMessage(t));
     }
 
+    /** A session of an AMQP (Qpid JMS) connection to the same broker. */
+    static void amqpSession(String clientId, Body body) throws Exception {
+        java.net.URI u = new java.net.URI(url);
+        String amqp = "amqp://" + u.getHost() + ":" + u.getPort();
+        try (Connection c = new org.apache.qpid.jms.JmsConnectionFactory(amqp).createConnection()) {
+            if (clientId != null) c.setClientID(clientId);
+            c.start();
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                body.run(s);
+            }
+        }
+    }
+
+    static byte[] largeAmqpBody() {
+        byte[] b = new byte[300 * 1024];
+        new Random(42).nextBytes(b);
+        return b;
+    }
+
     // ------------------------------------------------------------------- tests
+
+    /**
+     * AMQP messages are kept in their own encoding: small ones in journal
+     * records, a large one (over amqpMinLargeMessageSize) in a file. One is
+     * acknowledged before the restart.
+     */
+    static void amqpBefore() throws Exception {
+        amqpSession(null, s -> {
+            Queue q = s.createQueue(name("amqp"));
+            MessageProducer p = s.createProducer(q);
+            p.setDeliveryMode(DeliveryMode.PERSISTENT);
+            // Highest priority, so it is the one consumed first.
+            p.send(s.createTextMessage("acked"), DeliveryMode.PERSISTENT, 9, 0);
+            TextMessage t = s.createTextMessage("amqp text");
+            t.setStringProperty("s", "v");
+            t.setIntProperty("i", 7);
+            t.setJMSCorrelationID("corr");
+            p.send(t, DeliveryMode.PERSISTENT, 6, 0);
+            MapMessage m = s.createMapMessage();
+            m.setString("k", "v");
+            p.send(m);
+            BytesMessage large = s.createBytesMessage();
+            large.writeBytes(largeAmqpBody());
+            p.send(large);
+            MessageConsumer c = s.createConsumer(q);
+            Message first = c.receive(5000);
+            check(first instanceof TextMessage && "acked".equals(((TextMessage) first).getText()), "first: " + first);
+            c.close();
+        });
+    }
+
+    static void amqpAfter() throws Exception {
+        amqpSession(null, s -> {
+            MessageConsumer c = s.createConsumer(s.createQueue(name("amqp")));
+            Message t = c.receive(5000);
+            check(t instanceof TextMessage && "amqp text".equals(((TextMessage) t).getText()), "text: " + t);
+            check("v".equals(t.getStringProperty("s")) && t.getIntProperty("i") == 7, "properties of " + t);
+            check("corr".equals(t.getJMSCorrelationID()) && t.getJMSPriority() == 6, "headers of " + t);
+            Message m = c.receive(5000);
+            check(m instanceof MapMessage && "v".equals(((MapMessage) m).getString("k")), "map: " + m);
+            Message l = c.receive(5000);
+            check(l instanceof BytesMessage, "large: " + l);
+            byte[] got = new byte[(int) ((BytesMessage) l).getBodyLength()];
+            ((BytesMessage) l).readBytes(got);
+            check(Arrays.equals(largeAmqpBody(), got), "large body of " + got.length + " bytes");
+            check(c.receive(500) == null, "nothing more, the acked message included");
+        });
+    }
+
+    /** An AMQP durable subscription and its message, read back as Core. */
+    static void amqpSubBefore() throws Exception {
+        amqpSession("amqp-persist-" + run, s -> {
+            Topic t = s.createTopic(name("amqptopic"));
+            s.createDurableSubscriber(t, "sub").close();
+            s.createProducer(t).send(s.createTextMessage("for the subscription"));
+        });
+    }
+
+    static void amqpSubAfter() throws Exception {
+        session(s -> {
+            String fqqn = name("amqptopic") + "::" + "amqp-persist-" + run + ".sub";
+            List<String> got = drain(s, s.createQueue(fqqn));
+            check(got.equals(List.of("for the subscription")), "subscription queue: " + got);
+        });
+        amqpSession("amqp-persist-" + run, s -> s.unsubscribe("sub"));
+    }
 
     /** Persistent messages survive with their properties and order; non-persistent ones do not. */
     static void durableQueueBefore() throws Exception {

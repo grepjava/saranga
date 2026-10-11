@@ -2,7 +2,8 @@
 //   java -cp '<artemis>/lib/*' AmqpDurable.java tcp://host:port
 //
 // Qpid JMS sends durable messages of every JMS body type with properties of
-// every type, to a queue and to a durable subscription. One message is
+// every type, to a queue and to a durable subscription. A large one is
+// kept in a file. One message is
 // scheduled, one has a time to live, one goes to the dead-letter address after
 // rollbacks (the broker rewrites its AMQP encoding), one is acknowledged and
 // one redelivered (a delivery count update). The journal then holds
@@ -69,6 +70,17 @@ public class AmqpDurable {
             grouped.setIntProperty("JMSXGroupSeq", 1);
             p.send(grouped);
             p.send(s.createTextMessage("long-lived"), DeliveryMode.PERSISTENT, 4, HUNDRED_YEARS);
+
+            // Over amqpMinLargeMessageSize: a large message in a file.
+            BytesMessage large = s.createBytesMessage();
+            byte[] body = new byte[150 * 1024];
+            for (int i = 0; i < body.length; i++) {
+                body[i] = (byte) i;
+            }
+            large.writeBytes(body);
+            large.setStringProperty("large", "yes");
+            MessageProducer largeProducer = s.createProducer(s.createQueue("amqp.golden.large"));
+            largeProducer.send(large);
 
             MessageProducer delayed = s.createProducer(s.createQueue("amqp.golden.scheduled"));
             delayed.setDeliveryDelay(SCHEDULED_AT - System.currentTimeMillis());

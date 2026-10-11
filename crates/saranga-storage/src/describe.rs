@@ -28,7 +28,7 @@ use saranga_message::CoreMessage;
 use crate::codec::*;
 use crate::ids;
 use crate::java;
-use crate::message::{AmqpMessageRecord, LargeMessageRecord, PersistedMessage};
+use crate::message::{LargeMessageRecord, PersistedMessage};
 
 const BINDINGS_BANNER: &str = "B I N D I N G S  J O U R N A L";
 const MESSAGES_BANNER: &str = "M E S S A G E S   J O U R N A L";
@@ -1315,10 +1315,11 @@ fn user_message_id(m: &CoreMessage) -> String {
         .unwrap_or_default()
 }
 
-/// Describes an AMQP message as `AMQPStandardMessage.toString` does,
-/// with its `getUserID` if it has one. The AMQP protocol, which knows the
-/// encoding, sets it ([`set_amqp_describer`]).
-pub type AmqpDescriber = fn(&AmqpMessageRecord) -> (Option<String>, String);
+/// Describes an AMQP message as `AMQPStandardMessage.toString` (or
+/// `AMQPLargeMessage`'s) does, with its `getUserID` if it has one; `None`
+/// for other records. The AMQP protocol, which knows the encoding, sets it
+/// ([`set_amqp_describer`]).
+pub type AmqpDescriber = fn(&PersistedMessage) -> Option<(Option<String>, String)>;
 
 static AMQP_DESCRIBER: std::sync::OnceLock<AmqpDescriber> = std::sync::OnceLock::new();
 
@@ -1344,9 +1345,9 @@ fn describe_message(m: &PersistedMessage, data: &[u8]) -> Described {
                 safe_text: Some(format!("CoreMessage(safe data, size={size})")),
             }
         }
-        PersistedMessage::Amqp(a) if AMQP_DESCRIBER.get().is_some() => {
-            let describe = AMQP_DESCRIBER.get().expect("checked");
-            let (user_id, text) = describe(a);
+        PersistedMessage::Amqp(a)
+            if let Some((user_id, text)) = AMQP_DESCRIBER.get().and_then(|d| d(m)) =>
+        {
             Described {
                 text: format!(
                     "Message(messageID={}{};msg={text}",
@@ -1373,6 +1374,20 @@ fn describe_message(m: &PersistedMessage, data: &[u8]) -> Described {
                 a.data.len()
             )),
         },
+        PersistedMessage::AmqpLarge(a)
+            if let Some((user_id, text)) = AMQP_DESCRIBER.get().and_then(|d| d(m)) =>
+        {
+            Described {
+                text: format!(
+                    "LargeMessage(messageID={}{};msg={text}",
+                    a.message_id,
+                    user_id
+                        .map(|u| format!(";userMessageID={u}"))
+                        .unwrap_or_default()
+                ),
+                safe_text: Some("AMQPLargeMessage(safe data)".into()),
+            }
+        }
         PersistedMessage::AmqpLarge(a) => Described {
             text: format!(
                 "LargeMessage(messageID={};msg=AMQPLargeMessage(<AMQP sections not printed by saranga>, address={})@{}",

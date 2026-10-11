@@ -18,18 +18,23 @@ failed=0
 # later phases (none at present).
 declare -A LATER=()
 
+# Scenarios whose messages get a new random user ID each time they are
+# read (AMQP message IDs that are not UUIDs, converted to Core).
+declare -A RANDOM_USER_IDS=([amqp-durable]=1)
+mask() { if [[ -n "${RANDOM_USER_IDS[$1]:-}" ]]; then sed -E 's/userID=[0-9a-f-]+/userID=*/'; else cat; fi; }
+
 echo "== Saranga recovers the golden data directories"
 for dir in "$ROOT"/tests/golden/*/; do
   s="$(basename "$dir")"
   [[ -f "$dir/data.tar.gz" && -f "$dir/recovered.txt" ]] || continue
-  got="$(bash "$ROOT/scripts/golden-verify.sh" "$s" saranga 2>/dev/null | tr -d '\r')"
-  if diff -q <(tr -d '\r' < "$dir/recovered.txt") <(echo "$got") >/dev/null; then
+  got="$(bash "$ROOT/scripts/golden-verify.sh" "$s" saranga 2>/dev/null | tr -d '\r' | mask "$s")"
+  if diff -q <(tr -d '\r' < "$dir/recovered.txt" | mask "$s") <(echo "$got") >/dev/null; then
     echo "ok       $s"
   elif [[ -n "${LATER[$s]:-}" ]]; then
     echo "expected $s (differs: ${LATER[$s]})"
   else
     echo "FAIL     $s"
-    diff <(tr -d '\r' < "$dir/recovered.txt") <(echo "$got") | head -20
+    diff <(tr -d '\r' < "$dir/recovered.txt" | mask "$s") <(echo "$got") | head -20
     failed=1
   fi
 done

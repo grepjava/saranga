@@ -4,7 +4,7 @@
 
 use saranga_storage::describe::properties_to_string;
 use saranga_storage::java;
-use saranga_storage::message::AmqpMessageRecord;
+use saranga_storage::message::PersistedMessage;
 
 use crate::convert::uuid_string;
 use crate::message::AmqpMessage;
@@ -17,16 +17,30 @@ pub fn register() {
 }
 
 /// `getUserID` and `toString` of a message read back from a record.
-pub fn describe(record: &AmqpMessageRecord) -> (Option<String>, String) {
+pub fn describe(record: &PersistedMessage) -> Option<(Option<String>, String)> {
     // The time only matters to a TTL, which toString does not show.
-    let Ok(m) = AmqpMessage::from_record(record, 0) else {
-        return (
+    let (decoded, class, address) = match record {
+        PersistedMessage::Amqp(r) => (
+            AmqpMessage::from_record(r, 0),
+            "AMQPStandardMessage",
+            r.address.clone(),
+        ),
+        // The file is not read: what is printed is in the record.
+        PersistedMessage::AmqpLarge(r) => (
+            AmqpMessage::from_large_record(r, Vec::new(), 0),
+            "AMQPLargeMessage",
+            r.address.clone(),
+        ),
+        PersistedMessage::Core(_) => return None,
+    };
+    let Ok(m) = decoded else {
+        return Some((
             None,
             format!(
-                "AMQPStandardMessage(<undecodable>, address={})",
-                java::nullable(record.address.as_ref())
+                "{class}(<undecodable>, address={})",
+                java::nullable(address.as_ref())
             ),
-        );
+        ));
     };
     let user_id = m
         .properties()
@@ -46,16 +60,22 @@ pub fn describe(record: &AmqpMessageRecord) -> (Option<String>, String) {
         .extra_properties
         .as_ref()
         .map_or_else(|| "null".into(), properties_to_string);
-    // Data print scans the message (getUserID) before toString: a header
-    // without durable is then not durable.
-    let durable = m.header().and_then(|h| h.durable).unwrap_or(false);
+    let (durable, size) = match record {
+        // The file's durability; getEncodeSize is 0.
+        PersistedMessage::AmqpLarge(r) => (r.durable, 0),
+        // Data print scans the message (getUserID) before toString: a
+        // header without durable is then not durable.
+        _ => (
+            m.header().and_then(|h| h.durable).unwrap_or(false),
+            m.encode_size(),
+        ),
+    };
     let text = format!(
-        "AMQPStandardMessage( [durable={durable}, messageID={}, address={}, size={}, scanningStatus=SCANNED, applicationProperties={application_properties}, messageAnnotations={message_annotations}, properties={properties}, extraProperties = {extra}]",
+        "{class}( [durable={durable}, messageID={}, address={}, size={size}, scanningStatus=SCANNED, applicationProperties={application_properties}, messageAnnotations={message_annotations}, properties={properties}, extraProperties = {extra}]",
         m.message_id(),
         java::nullable(m.address().as_ref()),
-        m.encode_size(),
     );
-    (user_id, text)
+    Some((user_id, text))
 }
 
 /// `AbstractMap.toString`.

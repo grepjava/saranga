@@ -186,7 +186,13 @@ impl NativeMessage for AmqpNative {
     }
 
     fn to_core(&self) -> CoreMessage {
-        convert::to_core(&self.message, now_millis())
+        let now = now_millis();
+        if self.message.is_large()
+            && let Ok(standard) = self.message.standard_copy(now)
+        {
+            return convert::to_core(&standard, now);
+        }
+        convert::to_core(&self.message, now)
     }
 
     fn persisted(&self) -> PersistedMessage {
