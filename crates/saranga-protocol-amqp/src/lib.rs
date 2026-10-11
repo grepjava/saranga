@@ -7,11 +7,18 @@
 //! - [`transport`], [`messaging`], [`transaction`] and [`sasl`]: the
 //!   specification's types.
 //! - [`frame`]: frames and protocol headers.
+//! - [`message`]: AMQP messages kept in their own encoding, and
+//!   [`native`], how the broker holds them.
+//! - [`convert`]: conversion to and from Core.
 
 pub mod codec;
 pub mod composite;
+pub mod convert;
 pub mod frame;
+pub mod javamap;
+pub mod message;
 pub mod messaging;
+pub mod native;
 pub mod sasl;
 pub mod transaction;
 pub mod transport;

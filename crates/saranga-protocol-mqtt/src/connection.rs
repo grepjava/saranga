@@ -156,7 +156,7 @@ impl DeliverySink for MqttSink {
         if self.shared.closed.load(Ordering::SeqCst) {
             return 0;
         }
-        if let Err(e) = publish_to_client(&self.shared, message.core(), self.consumer_id) {
+        if let Err(e) = publish_to_client(&self.shared, message.delivery_core(), self.consumer_id) {
             tracing::warn!(
                 "AMQ832000: Unable to send message to MQTT client {}: {}: {e}",
                 self.shared.client_id,
@@ -732,7 +732,7 @@ impl Core {
                 let Some(last) = retained.browse().await.pop() else {
                     continue;
                 };
-                let mut copy = last.message.core().clone();
+                let mut copy = last.message.delivery_core().clone();
                 copy.message_id = po.ids().next();
                 copy.properties.insert(
                     util::MQTT_MESSAGE_RETAIN_INITIAL_DISTRIBUTION_KEY.into(),

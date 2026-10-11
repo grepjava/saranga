@@ -359,7 +359,8 @@ impl DeliverySink for StompSink {
         if sub.closed.load(Ordering::SeqCst) {
             return 0;
         }
-        let core = message.core();
+        // A message of another protocol as Core (`toCore`).
+        let core = message.delivery_core();
         let frame = match convert::message_frame(
             self.kind,
             &sub.id,

@@ -11,10 +11,10 @@ use saranga_storage::RecordCodec;
 use saranga_storage::codec::{PersistentAddressBindingEncoding, PersistentQueueBindingEncoding};
 
 use crate::large::LargeMessageStore;
-use crate::message::{self, MessageRef, ServerMessage};
+use crate::message::{self, MessageDecoders, MessageRef, ServerMessage};
 use crate::postoffice::{AddressInfo, PostOffice, RoutingTypes};
 use crate::queue::{Queue, QueueConfig};
-use crate::storage::{RecoveredMessages, Storage, StoreResult, ids};
+use crate::storage::{RecoveredMessages, Storage, StoreResult, StoredMessage, ids};
 use crate::transaction::{ResourceManager, Transaction, TxState};
 use crate::{BrokerError, Result, RoutingType};
 
@@ -208,6 +208,7 @@ pub async fn load_messages(
     resource_manager: &ResourceManager,
     large_store: &Arc<LargeMessageStore>,
     stored: &mut std::collections::HashSet<i64>,
+    decoders: &MessageDecoders,
 ) -> Result<Vec<crate::storage::ExtraRecord>> {
     let RecoveredMessages {
         messages,
@@ -227,27 +228,32 @@ pub async fn load_messages(
         .into_iter()
         .map(|q| (q.id(), q))
         .collect();
-    let messages: HashMap<i64, Arc<ServerMessage>> = messages
-        .into_iter()
-        .map(|(id, m)| {
-            if !large.contains(&id) {
-                return (id, ServerMessage::new(m));
+    let mut decoded: HashMap<i64, Arc<ServerMessage>> = HashMap::with_capacity(messages.len());
+    for (id, m) in messages {
+        let message = match m {
+            StoredMessage::Core(m) if !large.contains(&id) => ServerMessage::new(m),
+            StoredMessage::Core(m) => {
+                stored.remove(&m.message_id);
+                let body = large_store.existing(m.message_id);
+                // parseLargeMessage: a copy written by an older broker may
+                // still share its original's file.
+                let body = match (body.path(), message::orig_message_id(&m)) {
+                    (Some(p), Some(orig)) if !p.exists() => {
+                        let original = large_store.existing(orig);
+                        original.set_keep(true);
+                        original.copy(m.message_id, true).unwrap_or(body)
+                    }
+                    _ => body,
+                };
+                ServerMessage::new_large(m, body)
             }
-            stored.remove(&m.message_id);
-            let body = large_store.existing(m.message_id);
-            // parseLargeMessage: a copy written by an older broker may
-            // still share its original's file.
-            let body = match (body.path(), message::orig_message_id(&m)) {
-                (Some(p), Some(orig)) if !p.exists() => {
-                    let original = large_store.existing(orig);
-                    original.set_keep(true);
-                    original.copy(m.message_id, true).unwrap_or(body)
-                }
-                _ => body,
-            };
-            (id, ServerMessage::new_large(m, body))
-        })
-        .collect();
+            StoredMessage::Native(record) => decoders
+                .decode(&record)
+                .map_err(|e| corrupt("loading the message journal", e))?,
+        };
+        decoded.insert(id, message);
+    }
+    let messages = decoded;
     let paging = post_office.paging();
     paging.load_records(cursor_acks, page_completes, page_txs);
     // The duplicate-ID caches, per address in journal order.

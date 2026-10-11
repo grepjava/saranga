@@ -118,6 +118,13 @@ pub trait ProtocolManager: Send + Sync + 'static {
     /// Serves the connection until it closes.
     fn serve(&self, broker: Arc<Broker>, connection: Connection) -> ServeFuture;
 
+    /// Reads the journal and page records of the protocol's own message
+    /// persisters (`MessagePersister`), when it keeps messages in its own
+    /// encoding.
+    fn message_decoder(&self) -> Option<Arc<crate::message::NativeDecoder>> {
+        None
+    }
+
     /// Called once the broker has loaded its journals
     /// (`loadProtocolServices`): the protocol loads its state and starts
     /// its periodic tasks. The broker accepts no connections until it is

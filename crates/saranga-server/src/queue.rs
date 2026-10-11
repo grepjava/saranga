@@ -37,7 +37,7 @@ pub type ConsumerId = u64;
 
 /// A queue or consumer filter (`Filter`).
 pub trait MessageFilter: Send + Sync + fmt::Debug {
-    fn matches(&self, message: &CoreMessage) -> bool;
+    fn matches(&self, message: &dyn saranga_filter::Filterable) -> bool;
     fn text(&self) -> &str;
 }
 
@@ -945,7 +945,7 @@ impl Consumer {
         self.reg
             .filter
             .as_ref()
-            .is_none_or(|f| f.matches(r.message.core()))
+            .is_none_or(|f| f.matches(&*r.message))
     }
 
     fn can_take(&self) -> bool {
@@ -1535,7 +1535,7 @@ impl Actor {
             Cmd::DeleteMatching { filter, reply } => {
                 let refs = self
                     .messages
-                    .take_where(|r| filter.as_ref().is_none_or(|f| f.matches(r.message.core())));
+                    .take_where(|r| filter.as_ref().is_none_or(|f| f.matches(&*r.message)));
                 let n = refs.len();
                 refs.into_iter().for_each(|r| self.kill(r));
                 let _ = reply.send(n);

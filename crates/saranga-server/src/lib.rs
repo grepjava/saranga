@@ -384,6 +384,14 @@ impl Broker {
             config.global_max_size,
             config.global_max_messages,
         );
+        let decoders = message::MessageDecoders::new(
+            config
+                .protocols
+                .iter()
+                .filter_map(|p| p.message_decoder())
+                .collect(),
+        );
+        paging.set_decoders(decoders.clone());
         // The page stores are found before the queues subscribe to them.
         paging
             .reload_stores(|a| config.settings.get_match(a))
@@ -418,6 +426,7 @@ impl Broker {
                 &resource_manager,
                 &large_messages,
                 &mut stored_large,
+                &decoders,
             )
             .await?;
             // Large messages in pages keep their files; the rest are the

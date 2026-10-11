@@ -1,11 +1,14 @@
 //! Messages as the broker holds them: routed once, shared by every queue
 //! and consumer through `Arc`, with the encoded form cached.
 
+use std::any::Any;
+use std::fmt;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use saranga_buffer::{PropertyValue, SimpleString, Writer};
 use saranga_message::CoreMessage;
+use saranga_storage::message::{CoreMessageRecord, PersistedMessage};
 
 use crate::RoutingType;
 use crate::large::LargeBody;
@@ -184,10 +187,85 @@ pub fn make_copy(
     copy
 }
 
+/// A message kept in its own protocol's encoding (`AMQPMessage`): the
+/// broker works on its [`view`](Self::view), and changes the broker makes
+/// to the view are carried over to the native form by
+/// [`updated`](Self::updated).
+pub trait NativeMessage: Send + Sync + fmt::Debug {
+    /// What the broker reads: the ID, address, durability, priority,
+    /// expiration and timestamp, and as properties the ones the broker
+    /// looks at (routing type, duplicate ID, groups, last value, scheduled
+    /// delivery, and the broker's own).
+    fn view(&self) -> CoreMessage;
+
+    /// `Message.toCore`: the message as a client of another protocol
+    /// receives it.
+    fn to_core(&self) -> CoreMessage;
+
+    /// The record its persister writes to the journal and to pages.
+    fn persisted(&self) -> PersistedMessage;
+
+    /// `getEncodeSize`.
+    fn encode_size(&self) -> usize;
+
+    /// `getObjectPropertyForFilter` and the header fields a filter reads.
+    fn filter_value(&self, identifier: &str) -> Option<saranga_filter::Value>;
+
+    /// The message after the broker changed its view from `before` to
+    /// `after` (`setAddress`, `setBrokerProperty`, ... then `reencode`).
+    fn updated(&self, before: &CoreMessage, after: &CoreMessage) -> Arc<dyn NativeMessage>;
+
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// Decodes the records of one protocol's persisters; `None` for records of
+/// other persisters.
+pub type NativeDecoder =
+    dyn Fn(&PersistedMessage) -> Option<Result<Arc<dyn NativeMessage>, String>> + Send + Sync;
+
+/// Turns persister records into messages: each protocol that persists its
+/// own messages adds a decoder.
+#[derive(Default, Clone)]
+pub struct MessageDecoders(Vec<Arc<NativeDecoder>>);
+
+impl fmt::Debug for MessageDecoders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MessageDecoders({})", self.0.len())
+    }
+}
+
+impl MessageDecoders {
+    pub fn new(decoders: Vec<Arc<NativeDecoder>>) -> Self {
+        Self(decoders)
+    }
+
+    /// The message a regular (not large) record holds.
+    pub fn decode(&self, record: &PersistedMessage) -> Result<Arc<ServerMessage>, String> {
+        if let PersistedMessage::Core(c) = record {
+            return Ok(ServerMessage::new(c.to_message()));
+        }
+        for d in &self.0 {
+            if let Some(r) = d(record) {
+                return r.map(ServerMessage::new_native);
+            }
+        }
+        Err(format!(
+            "couldn't find factory for persister {}",
+            record.persister_id()
+        ))
+    }
+}
+
 /// A message after the broker has assigned its ID and address.
 #[derive(Debug)]
 pub struct ServerMessage {
+    /// The message, or for a native message the broker's view of it.
     core: CoreMessage,
+    /// A message kept in another protocol's encoding.
+    native: Option<Arc<dyn NativeMessage>>,
+    /// A native message as a Core message, and its encoding, once a client
+    /// of another protocol needed it.
+    converted: OnceLock<(CoreMessage, Vec<u8>)>,
     /// `core` encoded as `CoreMessage.encode` writes it, the form carried by
     /// `SESS_RECEIVE_MSG`. For a large message, only its headers and
     /// properties (`encodeHeadersAndProperties`), the form `ADD_LARGE_MESSAGE`
@@ -212,7 +290,23 @@ impl ServerMessage {
         core.encode(&mut w);
         Arc::new(Self {
             core,
+            native: None,
+            converted: OnceLock::new(),
             encoded: w.into_vec(),
+            durable_refs: AtomicI32::new(0),
+            large: None,
+            refs: AtomicI32::new(0),
+            owner: OnceLock::new(),
+        })
+    }
+
+    /// A message kept in its own protocol's encoding.
+    pub fn new_native(native: Arc<dyn NativeMessage>) -> Arc<Self> {
+        Arc::new(Self {
+            core: native.view(),
+            native: Some(native),
+            converted: OnceLock::new(),
+            encoded: Vec::new(),
             durable_refs: AtomicI32::new(0),
             large: None,
             refs: AtomicI32::new(0),
@@ -227,6 +321,8 @@ impl ServerMessage {
         core.encode_headers_and_properties(&mut w);
         Arc::new(Self {
             core,
+            native: None,
+            converted: OnceLock::new(),
             encoded: w.into_vec(),
             durable_refs: AtomicI32::new(0),
             large: Some(body),
@@ -238,6 +334,9 @@ impl ServerMessage {
     /// The same message with other headers or properties, sharing a large
     /// body.
     pub fn with_core(&self, core: CoreMessage) -> Arc<Self> {
+        if let Some(n) = &self.native {
+            return Self::new_native(n.updated(&self.core, &core));
+        }
         match &self.large {
             Some(body) => Self::new_large(core, body.clone()),
             None => Self::new(core),
@@ -247,6 +346,9 @@ impl ServerMessage {
     /// A copy with its own message ID (`Message.copy(newID)`): a large
     /// message's body is copied to a file of its own.
     pub fn copy(&self, core: CoreMessage) -> Arc<Self> {
+        if let Some(n) = &self.native {
+            return Self::new_native(n.updated(&self.core, &core));
+        }
         match &self.large {
             None => Self::new(core),
             Some(body) => match body.copy(core.message_id, core.durable) {
@@ -270,12 +372,45 @@ impl ServerMessage {
         self.large.is_some()
     }
 
+    /// The message, or for a native message the broker's view of it.
     pub fn core(&self) -> &CoreMessage {
         &self.core
     }
 
+    /// The message kept in another protocol's encoding, if it is one.
+    pub fn native(&self) -> Option<&Arc<dyn NativeMessage>> {
+        self.native.as_ref()
+    }
+
+    fn converted(&self) -> Option<&(CoreMessage, Vec<u8>)> {
+        let n = self.native.as_ref()?;
+        Some(self.converted.get_or_init(|| {
+            let core = n.to_core();
+            let mut w = Writer::new();
+            core.encode(&mut w);
+            (core, w.into_vec())
+        }))
+    }
+
+    /// The message as a Core message, for delivery to a client of another
+    /// protocol (`Message.toCore`).
+    pub fn delivery_core(&self) -> &CoreMessage {
+        self.converted().map_or(&self.core, |c| &c.0)
+    }
+
+    /// [`delivery_core`](Self::delivery_core) as `CoreMessage.encode` writes
+    /// it, or for a large message its headers and properties.
     pub fn encoded(&self) -> &[u8] {
-        &self.encoded
+        self.converted().map_or(&self.encoded, |c| &c.1)
+    }
+
+    /// The record the message's persister writes to the journal and to
+    /// pages (`ADD_MESSAGE_PROTOCOL`).
+    pub fn persisted(&self) -> PersistedMessage {
+        match &self.native {
+            Some(n) => n.persisted(),
+            None => PersistedMessage::Core(CoreMessageRecord::new(self.core.clone())),
+        }
     }
 
     pub fn message_id(&self) -> i64 {
@@ -309,7 +444,10 @@ impl ServerMessage {
 
     /// `Message.getEncodeSize`, the size counted for memory accounting.
     pub fn encode_size(&self) -> usize {
-        self.encoded.len()
+        match &self.native {
+            Some(n) => n.encode_size(),
+            None => self.encoded.len(),
+        }
     }
 
     /// `refUp`: returns the new count.
@@ -334,6 +472,27 @@ impl ServerMessage {
             let _ = self.owner.set(s);
         }
         self.owner.get()
+    }
+}
+
+/// Filters read a native message as its protocol defines
+/// (`getObjectPropertyForFilter`), and any other message as Core.
+impl saranga_filter::Filterable for ServerMessage {
+    fn get(&self, identifier: &str) -> Option<saranga_filter::Value> {
+        match &self.native {
+            Some(n) => n.filter_value(identifier),
+            None => self.core.get(identifier),
+        }
+    }
+
+    fn try_get(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<saranga_filter::Value>, saranga_filter::PropertyError> {
+        match &self.native {
+            Some(n) => Ok(n.filter_value(identifier)),
+            None => self.core.try_get(identifier),
+        }
     }
 }
 

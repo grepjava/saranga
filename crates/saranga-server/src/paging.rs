@@ -32,14 +32,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak, mpsc};
 
 use saranga_journal::Completion;
 use saranga_paging::{PagedBody, PagedMessage};
-use saranga_storage::message::{CoreMessageRecord, PersistedMessage};
+use saranga_storage::message::PersistedMessage;
 
 use crate::large::LargeMessageStore;
-use crate::message::{PagePosition, ServerMessage};
+use crate::message::{MessageDecoders, PagePosition, ServerMessage};
 use crate::settings::{AddressFullPolicy, AddressSettings, PageFullPolicy};
 use crate::storage::{Pending, RecoveredCursorRecord, RecoveredPageTx, Storage, StoreResult};
 use crate::{BrokerError, Name};
@@ -89,6 +89,8 @@ pub struct PagingManager {
     dir: Option<PathBuf>,
     storage: Option<Arc<Storage>>,
     large: Arc<LargeMessageStore>,
+    /// Reads the messages of every protocol's persisters from pages.
+    decoders: OnceLock<MessageDecoders>,
     /// `global-max-size`; -1 for none.
     global_max_size: i64,
     /// `global-max-messages`; -1 for none.
@@ -118,6 +120,7 @@ impl PagingManager {
             dir: dir.filter(|_| storage.is_some()),
             storage,
             large,
+            decoders: OnceLock::new(),
             global_max_size,
             global_max_messages,
             global_size: AtomicI64::new(0),
@@ -129,6 +132,12 @@ impl PagingManager {
             loaded: AtomicBool::new(false),
             me: me.clone(),
         })
+    }
+
+    /// Sets how messages of other protocols are read from pages, before
+    /// any page is read.
+    pub fn set_decoders(&self, decoders: MessageDecoders) {
+        let _ = self.decoders.set(decoders);
     }
 
     /// Lets the queues read their pages: recovery is over (or there was
@@ -1030,9 +1039,7 @@ impl PagingStore {
             transaction_id: tx_id,
             body: match message.large() {
                 Some(_) => PagedBody::CoreLarge(message.core().clone()),
-                None => PagedBody::Message(PersistedMessage::Core(CoreMessageRecord::new(
-                    message.core().clone(),
-                ))),
+                None => PagedBody::Message(message.persisted()),
             },
             queue_ids: queues.iter().map(|q| q.id()).collect(),
         };
@@ -1130,20 +1137,38 @@ impl PagingStore {
 
     /// Decodes page records into entries.
     fn entries_of(&self, messages: Vec<PagedMessage>) -> Vec<Arc<PageEntry>> {
-        let large = self.manager.upgrade().map(|m| m.large.clone());
+        let manager = self.manager.upgrade();
         messages
             .into_iter()
             .enumerate()
             .map(|(nr, m)| {
-                let message = match m.body {
-                    PagedBody::Message(PersistedMessage::Core(c)) => {
+                let message = match (m.body, &manager) {
+                    (PagedBody::Message(PersistedMessage::Core(c)), _) => {
                         Some(ServerMessage::new(c.to_message()))
                     }
-                    PagedBody::CoreLarge(core) => large.as_ref().map(|store| {
-                        let body = store.existing(core.message_id);
+                    (PagedBody::Message(record), Some(manager)) => {
+                        match manager
+                            .decoders
+                            .get_or_init(MessageDecoders::default)
+                            .decode(&record)
+                        {
+                            Ok(m) => Some(m),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "page {} of {}: message {}: {e}",
+                                    self.address,
+                                    nr,
+                                    record.message_id()
+                                );
+                                None
+                            }
+                        }
+                    }
+                    (PagedBody::CoreLarge(core), Some(manager)) => {
+                        let body = manager.large.existing(core.message_id);
                         body.set_keep(true);
-                        ServerMessage::new_large(core, body)
-                    }),
+                        Some(ServerMessage::new_large(core, body))
+                    }
                     _ => None,
                 };
                 Arc::new(PageEntry {

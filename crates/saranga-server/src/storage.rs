@@ -107,15 +107,37 @@ fn encode_message(message: &CoreMessage, encoded: &[u8]) -> Vec<u8> {
 }
 
 /// A message's record: `ADD_LARGE_MESSAGE` for a large message
-/// (`LargeMessagePersister`), `ADD_MESSAGE_PROTOCOL` otherwise.
+/// (`LargeMessagePersister`), `ADD_MESSAGE_PROTOCOL` otherwise, written by
+/// the message's persister.
 fn message_record(m: &ServerMessage) -> (u8, Vec<u8>) {
     if m.is_large() {
         (ids::ADD_LARGE_MESSAGE, m.encoded().to_vec())
+    } else if m.native().is_some() {
+        (ids::ADD_MESSAGE_PROTOCOL, m.persisted().encode())
     } else {
         (
             ids::ADD_MESSAGE_PROTOCOL,
             encode_message(m.core(), m.encoded()),
         )
+    }
+}
+
+/// A message read back from the journal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StoredMessage {
+    /// A Core message (`CoreMessagePersister`), or a large message's
+    /// headers and properties.
+    Core(CoreMessage),
+    /// A message another protocol's persister wrote.
+    Native(PersistedMessage),
+}
+
+impl StoredMessage {
+    pub fn message_id(&self) -> i64 {
+        match self {
+            Self::Core(m) => m.message_id,
+            Self::Native(m) => m.message_id(),
+        }
     }
 }
 
@@ -127,13 +149,10 @@ fn decode_large_message(data: &[u8]) -> StoreResult<CoreMessage> {
 }
 
 /// Decodes an `ADD_MESSAGE_PROTOCOL` body (`MessagePersister.decode`).
-pub fn decode_message(data: &[u8]) -> StoreResult<CoreMessage> {
+pub fn decode_message(data: &[u8]) -> StoreResult<StoredMessage> {
     match PersistedMessage::decode(data) {
-        Ok(PersistedMessage::Core(rec)) => Ok(rec.to_message()),
-        Ok(other) => Err(JournalError::Corrupt(format!(
-            "message persister {} is not supported yet",
-            other.persister_id()
-        ))),
+        Ok(PersistedMessage::Core(rec)) => Ok(StoredMessage::Core(rec.to_message())),
+        Ok(other) => Ok(StoredMessage::Native(other)),
         Err(e) => Err(JournalError::Corrupt(format!("message record: {e}"))),
     }
 }
@@ -246,7 +265,7 @@ pub struct RecoveredPageTx {
 /// What the message journal holds (`loadMessageJournal`).
 #[derive(Debug, Default)]
 pub struct RecoveredMessages {
-    pub messages: HashMap<i64, CoreMessage>,
+    pub messages: HashMap<i64, StoredMessage>,
     /// The messages that are large: their bodies are files.
     pub large: HashSet<i64>,
     /// Per queue, in journal order.
@@ -350,7 +369,8 @@ impl Storage {
                     out.messages.insert(r.id, decode_message(&r.data)?);
                 }
                 ids::ADD_LARGE_MESSAGE => {
-                    out.messages.insert(r.id, decode_large_message(&r.data)?);
+                    out.messages
+                        .insert(r.id, StoredMessage::Core(decode_large_message(&r.data)?));
                     out.large.insert(r.id);
                 }
                 ids::ADD_MESSAGE => {
@@ -512,7 +532,7 @@ impl Storage {
     fn recover_prepared(
         &self,
         p: PreparedTransactionInfo,
-        messages: &mut HashMap<i64, CoreMessage>,
+        messages: &mut HashMap<i64, StoredMessage>,
         large: &mut HashSet<i64>,
     ) -> StoreResult<RecoveredTx> {
         let xid = decode_xid(&p.extra_data)?;
@@ -532,7 +552,7 @@ impl Storage {
                     messages.insert(r.id, decode_message(&r.data)?);
                 }
                 ids::ADD_LARGE_MESSAGE => {
-                    messages.insert(r.id, decode_large_message(&r.data)?);
+                    messages.insert(r.id, StoredMessage::Core(decode_large_message(&r.data)?));
                     large.insert(r.id);
                 }
                 ids::ADD_REF => tx.sends.push((ref_queue(&r.data)?, r.id)),
@@ -976,7 +996,7 @@ mod tests {
         let ours = encode_message(&m, w.as_slice());
         let theirs = PersistedMessage::Core(CoreMessageRecord::new(m.clone())).encode();
         assert_eq!(ours, theirs);
-        assert_eq!(decode_message(&ours).unwrap(), m);
+        assert_eq!(decode_message(&ours).unwrap(), StoredMessage::Core(m));
     }
 
     #[test]
@@ -1039,7 +1059,9 @@ mod tests {
         assert_eq!(q(1), vec![(11, 0)]);
         assert_eq!(q(2), vec![(10, 0), (11, 3)]);
         assert_eq!(r.messages.len(), 2);
-        assert_eq!(r.messages[&11].address, Some(SimpleString::from("q")));
+        assert!(
+            matches!(&r.messages[&11], StoredMessage::Core(m) if m.address == Some(SimpleString::from("q")))
+        );
     }
 
     #[test]

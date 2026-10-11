@@ -102,11 +102,11 @@ impl CoreDeliverySink {
     /// The message with the legacy prefix on its address, if it needs one.
     fn legacy(&self, message: &ServerMessage) -> Option<saranga_message::CoreMessage> {
         let prefix = self.legacy_prefix?;
-        let address = message.core().address.as_ref()?.to_string_lossy();
+        let address = message.delivery_core().address.as_ref()?.to_string_lossy();
         if address.starts_with(prefix) {
             return None;
         }
-        let mut core = message.core().clone();
+        let mut core = message.delivery_core().clone();
         core.address = Some(saranga_buffer::SimpleString::from(
             format!("{prefix}{address}").as_str(),
         ));
@@ -120,7 +120,7 @@ impl DeliverySink for CoreDeliverySink {
         let frame = if ctx.is_version_before_address_change() {
             let core = self
                 .legacy(message)
-                .unwrap_or_else(|| message.core().clone());
+                .unwrap_or_else(|| message.delivery_core().clone());
             let packet = SessionReceiveMessage1X {
                 end_of_message_position: legacy_end_of_message_position(&core),
                 message: core,

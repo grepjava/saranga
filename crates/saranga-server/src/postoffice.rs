@@ -1510,8 +1510,8 @@ impl PostOffice {
         {
             return None;
         }
-        let core = message.message.core();
-        let divert_matches = |d: &Divert| d.filter.as_ref().is_none_or(|f| f.matches(core));
+        let target: &crate::message::ServerMessage = &message.message;
+        let divert_matches = |d: &Divert| d.filter.as_ref().is_none_or(|f| f.matches(target));
         // Exclusive diverts take the message from everything else.
         if fqqn_queue.is_none() {
             let exclusive: Vec<Arc<Divert>> = entries
@@ -1526,7 +1526,7 @@ impl PostOffice {
         }
         let matches = |q: &Queue| {
             fqqn_queue.is_none_or(|n| &**q.name() == n)
-                && q.filter().is_none_or(|f| f.matches(core))
+                && q.filter().is_none_or(|f| f.matches(target))
         };
         let accepts = |q: &Queue| {
             let c = q.config();
@@ -1725,7 +1725,7 @@ impl Divert {
 pub struct SelectorFilters;
 
 impl crate::queue::MessageFilter for saranga_filter::Filter {
-    fn matches(&self, message: &saranga_message::CoreMessage) -> bool {
+    fn matches(&self, message: &dyn saranga_filter::Filterable) -> bool {
         saranga_filter::Filter::matches(self, message)
     }
 

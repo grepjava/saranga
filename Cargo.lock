@@ -1656,7 +1656,14 @@ dependencies = [
 name = "saranga-protocol-amqp"
 version = "0.0.1"
 dependencies = [
+ "saranga-buffer",
+ "saranga-filter",
+ "saranga-message",
+ "saranga-server",
+ "saranga-storage",
  "thiserror",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
