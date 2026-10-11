@@ -1693,6 +1693,10 @@ name = "saranga-protocol-openwire"
 version = "0.0.1"
 dependencies = [
  "flate2",
+ "saranga-buffer",
+ "saranga-client",
+ "saranga-message",
+ "saranga-storage",
  "thiserror",
 ]
 

@@ -267,6 +267,111 @@ pub fn base64_url(data: &[u8]) -> String {
     out
 }
 
+/// `new String(bytes, UTF_8)`: malformed input replaced as the JDK's
+/// `String.decodeUTF8_UTF16` does it, which differs from Rust's lossy
+/// decoding (an encoded surrogate is one U+FFFD, not three).
+pub fn utf8_string(src: &[u8]) -> String {
+    const REPL: char = '\u{fffd}';
+    let cont = |b: u8| b & 0xc0 == 0x80;
+    let malformed3 = |b1: u8, b2: u8| (b1 == 0xe0 && b2 & 0xe0 == 0x80) || !cont(b2);
+    let mut out = String::with_capacity(src.len());
+    let (mut sp, sl) = (0usize, src.len());
+    while sp < sl {
+        let b1 = src[sp];
+        sp += 1;
+        if b1 < 0x80 {
+            out.push(b1 as char);
+        } else if b1 >> 5 == 0b110 && b1 & 0x1e != 0 {
+            if sp < sl {
+                let b2 = src[sp];
+                sp += 1;
+                if !cont(b2) {
+                    out.push(REPL);
+                    sp -= 1;
+                } else {
+                    let c = (((b1 & 0x1f) as u32) << 6) | (b2 & 0x3f) as u32;
+                    out.push(char::from_u32(c).unwrap_or(REPL));
+                }
+                continue;
+            }
+            out.push(REPL);
+            break;
+        } else if b1 >> 4 == 0b1110 {
+            if sp + 1 < sl {
+                let (b2, b3) = (src[sp], src[sp + 1]);
+                sp += 2;
+                if malformed3(b1, b2) || !cont(b3) {
+                    out.push(REPL);
+                    sp -= 3;
+                    // malformed3(src, sp): one byte or two.
+                    let n = if malformed3(src[sp], src[sp + 1]) {
+                        1
+                    } else {
+                        2
+                    };
+                    sp += n;
+                } else {
+                    let c = (((b1 & 0x0f) as u32) << 12)
+                        | (((b2 & 0x3f) as u32) << 6)
+                        | (b3 & 0x3f) as u32;
+                    // A surrogate is malformed.
+                    out.push(char::from_u32(c).unwrap_or(REPL));
+                }
+                continue;
+            }
+            if sp < sl && malformed3(b1, src[sp]) {
+                out.push(REPL);
+                continue;
+            }
+            out.push(REPL);
+            break;
+        } else if b1 >> 3 == 0b11110 {
+            let malformed4_2 = |b1: u8, b2: u8| {
+                (b1 == 0xf0 && !(0x90..=0xbf).contains(&b2))
+                    || (b1 == 0xf4 && b2 & 0xf0 != 0x80)
+                    || !cont(b2)
+            };
+            if sp + 2 < sl {
+                let (b2, b3, b4) = (src[sp], src[sp + 1], src[sp + 2]);
+                sp += 3;
+                let uc = (((b1 & 0x07) as u32) << 18)
+                    | (((b2 & 0x3f) as u32) << 12)
+                    | (((b3 & 0x3f) as u32) << 6)
+                    | (b4 & 0x3f) as u32;
+                if !cont(b2) || !cont(b3) || !cont(b4) || !(0x10000..=0x10ffff).contains(&uc) {
+                    out.push(REPL);
+                    sp -= 4;
+                    // malformed4(src, sp): one, two or three bytes.
+                    let (c1, c2) = (src[sp], src[sp + 1]);
+                    sp += if c1 > 0xf4 || malformed4_2(c1, c2) {
+                        1
+                    } else if !cont(src[sp + 2]) {
+                        2
+                    } else {
+                        3
+                    };
+                } else {
+                    out.push(char::from_u32(uc).unwrap_or(REPL));
+                }
+                continue;
+            }
+            if b1 > 0xf4 || (sp < sl && malformed4_2(b1, src[sp])) {
+                out.push(REPL);
+                continue;
+            }
+            sp += 1;
+            out.push(REPL);
+            if sp < sl && !cont(src[sp]) {
+                continue;
+            }
+            break;
+        } else {
+            out.push(REPL);
+        }
+    }
+    out
+}
+
 /// `Arrays.hashCode(byte[])`, used here as a stand-in for Java identity
 /// hash codes, which carry no meaning.
 pub fn bytes_hash(data: &[u8]) -> i32 {

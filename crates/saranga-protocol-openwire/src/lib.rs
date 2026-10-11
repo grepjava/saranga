@@ -2,6 +2,9 @@
 
 pub mod codec;
 pub mod commands;
+pub mod convert;
+pub mod destination;
+pub mod primitive;
 
 pub use codec::{CodecError, TransactionId, WireFormat};
 pub use commands::DataStructure;

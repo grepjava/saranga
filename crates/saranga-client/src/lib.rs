@@ -43,7 +43,7 @@ mod error;
 pub mod message;
 mod producer;
 mod session;
-mod uuid;
+pub mod uuid;
 
 pub use connection::{Connection, ConnectionOptions};
 pub use consumer::{Consumer, ConsumerOptions, Delivery, FORCED_DELIVERY_MESSAGE};
