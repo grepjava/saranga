@@ -1655,6 +1655,9 @@ dependencies = [
 [[package]]
 name = "saranga-protocol-amqp"
 version = "0.0.1"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "saranga-protocol-mqtt"
