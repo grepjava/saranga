@@ -135,6 +135,21 @@ impl Instance {
             .map(|(_, v)| v.clone())
     }
 
+    /// `${sys:name}` in log4j's configuration: the system properties given
+    /// with `-D`, then those `artemis run` defines.
+    pub fn system_lookup(&self) -> crate::logging::Lookup {
+        let system = self.system.clone();
+        let properties = self.properties.clone();
+        Arc::new(move |name| {
+            system
+                .iter()
+                .rev()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .or_else(|| properties.get(name).cloned())
+        })
+    }
+
     /// A system property as `artemis run` defines it, then an environment
     /// variable (`XMLUtil.replaceSystemPropsInString`).
     pub fn lookup(&self, name: &str) -> Option<String> {

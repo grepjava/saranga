@@ -14,7 +14,7 @@ use crate::{Broker, RoutingType};
 pub const VERSION: &str = "2.57.0";
 
 /// `TimeUtils.printDuration`.
-fn print_duration(millis: i64) -> String {
+pub fn print_duration(millis: i64) -> String {
     let group = |n: i64| {
         let s = n.to_string();
         let mut out = String::new();

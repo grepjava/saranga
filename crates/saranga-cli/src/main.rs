@@ -10,6 +10,7 @@ mod client;
 mod create;
 mod data;
 mod instance;
+mod logging;
 mod web;
 
 use clap::{Parser, Subcommand};
@@ -135,15 +136,20 @@ async fn main() -> std::process::ExitCode {
             | Command::Stop { .. }
             | Command::Create(_)
     );
-    let logs = tracing_subscriber::fmt().with_env_filter(
-        EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(if client { "warn" } else { "info" })),
-    );
-    if client || matches!(cli.command, Command::Data(_)) {
-        // These commands print their report on stdout.
-        logs.with_writer(std::io::stderr).init();
+    if matches!(cli.command, Command::Run { .. }) {
+        // The broker logs as Artemis does, once its log4j2.properties is read.
+        logging::init_broker();
     } else {
-        logs.init();
+        let logs = tracing_subscriber::fmt().with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(if client { "warn" } else { "info" })),
+        );
+        if client || matches!(cli.command, Command::Data(_)) {
+            // These commands print their report on stdout.
+            logs.with_writer(std::io::stderr).init();
+        } else {
+            logs.init();
+        }
     }
     if client {
         return match run_client(cli.command).await {
@@ -255,6 +261,15 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
                 (None, Some(e)) => Some(instance::Instance::from_etc(&e, options)?),
                 (None, None) => None,
             };
+            if let Some(instance) = &instance {
+                logging::configure(
+                    logging::config_path(
+                        &instance.etc,
+                        instance.lookup("log4j2.configurationFile"),
+                    ),
+                    instance.system_lookup(),
+                );
+            }
             run(instance, bind).await
         }
         Command::Data(cmd) => data::run(cmd),
@@ -577,13 +592,29 @@ fn parse_system_property(s: &str) -> Result<(String, String), String> {
     Ok((k.to_owned(), v.to_owned()))
 }
 
+/// Saranga's version, in the startup and shutdown messages.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    tracing::info!("AMQ101000: Starting Saranga Server version {VERSION}");
     let filters = Arc::new(SelectorFilters);
     let served = SERVED_PROTOCOLS;
     let mut file_config = None;
     let (mut broker_config, mut binds, reload_period) = match &instance {
         Some(instance) => {
             let file = instance.broker_config()?;
+            tracing::info!(
+                "AMQ221000: Primary message broker is starting with configuration Broker Configuration (clustered=false,journalDirectory={},bindingsDirectory={},largeMessagesDirectory={},pagingDirectory={})",
+                file.journal_directory,
+                file.bindings_directory,
+                file.large_messages_directory,
+                file.paging_directory
+            );
+            if file.persistence_enabled {
+                // Buffered file I/O on every platform: Artemis's NIO.
+                tracing::info!("AMQ221012: Using NIO Journal");
+            }
             let binds = acceptors(&file, &served)?;
             let mut config = BrokerConfig::from_file_config(&file, filters, &instance.dir)?;
             let security = instance.security(&file)?;
@@ -621,6 +652,16 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
         }];
     }
     broker_config.protocols = protocol_managers(file_config.as_ref(), &binds);
+    tracing::info!(
+        "AMQ221043: Protocol module found: [saranga-server]. Adding protocol support for: CORE"
+    );
+    for p in &broker_config.protocols {
+        tracing::info!(
+            "AMQ221043: Protocol module found: [saranga-protocol-{}]. Adding protocol support for: {}",
+            p.name().to_ascii_lowercase(),
+            p.name()
+        );
+    }
     let broker = Broker::start(broker_config).await?;
     let mut servers = tokio::task::JoinSet::new();
     for Bind {
@@ -647,12 +688,19 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
         );
         servers.spawn(broker.clone().serve_acceptor(listener, acceptor));
     }
+    let mut web_started = false;
     if let (Some(instance), Some(file)) = (&instance, &file_config)
         && let Some(web) = instance.bootstrap.as_ref().and_then(|b| b.web.clone())
     {
         web::start(instance, file, &web, &broker).await?;
+        web_started = true;
     }
     tracing::info!("AMQ221007: Server is now active");
+    tracing::info!(
+        "AMQ221001: Saranga Message Broker version {VERSION} [{}, nodeID={}] ",
+        broker.management().config().name,
+        broker.node_id()
+    );
     let instance = instance.map(Arc::new);
     if let Some(instance) = &instance {
         spawn_config_reloader(instance.clone(), broker.clone(), reload_period);
@@ -692,9 +740,18 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
             std::process::exit(0);
         }
         Stop::Clean => {
+            if web_started {
+                // Its tasks end with the runtime.
+                tracing::info!("AMQ241005: Stopping embedded web server");
+                tracing::info!("AMQ241006: Stopped embedded web server");
+            }
             servers.abort_all();
             broker.stop()?;
-            tracing::info!("AMQ221002: Saranga Message Broker is stopped");
+            tracing::info!(
+                "AMQ221002: Saranga Message Broker version {VERSION} [{}] stopped, uptime {}",
+                broker.node_id(),
+                saranga_server::management::print_duration(started.elapsed().as_millis() as i64)
+            );
         }
     }
     Ok(())

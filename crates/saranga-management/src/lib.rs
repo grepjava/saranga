@@ -160,10 +160,7 @@ pub async fn start(
             let url = url.trim_matches('/');
             if war.starts_with("console") {
                 let base = format!("/{url}/jolokia");
-                tracing::info!(
-                    "AMQ241002: Artemis Jolokia REST API available at {}{base}",
-                    b.uri
-                );
+                tracing::info!("AMQ241002: Jolokia REST API available at {}{base}", b.uri);
                 let state = Arc::new(AppState {
                     agent: jolokia::Agent {
                         broker: broker.clone(),

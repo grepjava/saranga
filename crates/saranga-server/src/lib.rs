@@ -377,6 +377,7 @@ impl Broker {
             Some(sc) => {
                 let lock = node::NodeLock::acquire(&sc.messages.directory)
                     .map_err(|e| internal("journal directory lock", &e))?;
+                tracing::info!("AMQ221035: Primary Server Obtained primary lock");
                 let storage = Arc::new(
                     storage::Storage::open(sc.clone())
                         .map_err(|e| internal("opening the journals", &e))?,
