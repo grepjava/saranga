@@ -379,6 +379,8 @@ pub struct BrokerConfig {
     pub reject_empty_validated_user: bool,
     /// `management-address`.
     pub management_address: String,
+    /// `jmx-domain`: the domain of the management MBeans' names.
+    pub jmx_domain: String,
     /// `management-notification-address`.
     pub management_notification_address: String,
     /// `suppress-session-notifications`: no `SESSION_CREATED` and
@@ -537,6 +539,7 @@ impl Default for BrokerConfig {
             populate_validated_user: false,
             reject_empty_validated_user: false,
             management_address: "activemq.management".to_owned(),
+            jmx_domain: "org.apache.activemq.artemis".to_owned(),
             management_notification_address: "activemq.notifications".to_owned(),
             suppress_session_notifications: false,
             message_counter_enabled: false,

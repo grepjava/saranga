@@ -1,7 +1,22 @@
 [package]
 name = "saranga-management"
+description = "The broker's web server: the Jolokia-compatible management API and Prometheus metrics"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "service"] }
+tower = "0.5"
+roxmltree = "0.21"
+saranga-config = { path = "../saranga-config" }
+saranga-security = { path = "../saranga-security" }
+saranga-server = { path = "../saranga-server" }
+saranga-transport = { path = "../saranga-transport" }
+tokio = { version = "1", features = ["net", "rt", "macros", "time", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "time", "io-util"] }

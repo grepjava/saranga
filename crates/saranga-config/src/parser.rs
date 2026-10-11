@@ -495,6 +495,9 @@ fn parse_scalars(
     if let Some(name) = s.string("name") {
         config.name = name;
     }
+    if let Some(domain) = s.string("jmx-domain") {
+        config.jmx_domain = domain;
+    }
     if let Some(prefix) = s.string("system-property-prefix") {
         config.system_property_prefix = prefix;
     }

@@ -99,6 +99,8 @@ pub struct AddressSettings {
     /// `slow-consumer-check-period`, in seconds.
     pub slow_consumer_check_period: i64,
     pub slow_consumer_policy: saranga_config::SlowConsumerPolicy,
+    /// `enable-metrics`: the address's and its queues' meters.
+    pub enable_metrics: bool,
 }
 
 /// `PageFullMessagePolicy`.
@@ -198,6 +200,7 @@ impl Default for AddressSettings {
             slow_consumer_check_period:
                 saranga_config::AddressSettings::DEFAULT_SLOW_CONSUMER_CHECK_PERIOD,
             slow_consumer_policy: saranga_config::AddressSettings::DEFAULT_SLOW_CONSUMER_POLICY,
+            enable_metrics: saranga_config::AddressSettings::DEFAULT_ENABLE_METRICS,
             management_message_attribute_size_limit: 256,
         }
     }

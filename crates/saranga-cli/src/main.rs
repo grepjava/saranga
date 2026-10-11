@@ -10,6 +10,7 @@ mod client;
 mod create;
 mod data;
 mod instance;
+mod web;
 
 use clap::{Parser, Subcommand};
 use saranga_server::postoffice::SelectorFilters;
@@ -645,6 +646,11 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
             names.join(",")
         );
         servers.spawn(broker.clone().serve_acceptor(listener, acceptor));
+    }
+    if let (Some(instance), Some(file)) = (&instance, &file_config)
+        && let Some(web) = instance.bootstrap.as_ref().and_then(|b| b.web.clone())
+    {
+        web::start(instance, file, &web, &broker).await?;
     }
     tracing::info!("AMQ221007: Server is now active");
     let instance = instance.map(Arc::new);

@@ -32,7 +32,9 @@ pub use address_settings::{
     PageFullMessagePolicy, SettingValue, SlowConsumerPolicy, SlowConsumerThresholdMeasurementUnit,
     java_name,
 };
-pub use bootstrap::{BootstrapConfig, BootstrapSecurity, file_uri_path};
+pub use bootstrap::{
+    BootstrapConfig, BootstrapSecurity, WebApp, WebBinding, WebConfig, file_uri_path,
+};
 pub use broker::{
     AddressConfig, BrokerConfig, DivertConfig, DivertRoutingType, JaasModuleConfig, JournalConfig,
     JournalType, QueueConfig, TransformerConfig, Warning,

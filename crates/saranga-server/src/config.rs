@@ -177,6 +177,7 @@ fn resolve(s: &cfg::AddressSettings) -> AddressSettings {
         slow_consumer_threshold_measurement_unit: s.slow_consumer_threshold_measurement_unit(),
         slow_consumer_check_period: s.slow_consumer_check_period(),
         slow_consumer_policy: s.slow_consumer_policy(),
+        enable_metrics: s.enable_metrics(),
         management_message_attribute_size_limit: s.management_message_attribute_size_limit(),
     }
 }

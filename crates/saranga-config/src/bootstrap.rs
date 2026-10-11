@@ -39,9 +39,8 @@ pub struct BootstrapConfig {
     pub security: Option<BootstrapSecurity>,
     /// `<server configuration>`: a URI, normally `file:` and absolute.
     pub server_configuration: Option<String>,
-    /// Whether `<web>` is present: the embedded web console, which Saranga
-    /// does not have.
-    pub web: bool,
+    /// `<web>`: the embedded web server (`WebServerDTO`).
+    pub web: Option<WebConfig>,
     pub warnings: Vec<Warning>,
 }
 
@@ -57,7 +56,7 @@ impl BootstrapConfig {
         let mut config = Self {
             security: None,
             server_configuration: None,
-            web: false,
+            web: None,
             warnings: Vec::new(),
         };
         for child in root.children().filter(|c| c.is_element()) {
@@ -97,7 +96,7 @@ impl BootstrapConfig {
                     });
                 }
                 "server" => config.server_configuration = Some(attribute("configuration")?),
-                "web" => config.web = true,
+                "web" => config.web = Some(WebConfig::parse(child)),
                 // Management (`management.xml` holds the JMX side) and plugin
                 // components.
                 "authorization" | "naming" => config.warnings.push(Warning::Unsupported {
@@ -117,6 +116,110 @@ impl BootstrapConfig {
     /// `file:` URI.
     pub fn configuration_path(&self) -> Option<PathBuf> {
         self.server_configuration.as_deref().and_then(file_uri_path)
+    }
+}
+
+/// `<web>` (`WebServerDTO`): the embedded web server and its bindings.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebConfig {
+    /// `path`: the directory of the web applications.
+    pub path: String,
+    pub root_redirect_location: Option<String>,
+    /// `<binding>`s, or the one the legacy `bind` attribute and the
+    /// `<web>`-level TLS attributes and `<app>`s make.
+    pub bindings: Vec<WebBinding>,
+    pub warnings: Vec<Warning>,
+}
+
+/// `<binding>` (`BindingDTO`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebBinding {
+    pub name: Option<String>,
+    /// `http://host:port` or `https://host:port`.
+    pub uri: String,
+    pub client_auth: bool,
+    pub password_codec: Option<String>,
+    pub key_store_path: Option<String>,
+    pub key_store_type: Option<String>,
+    pub key_store_password: Option<String>,
+    pub trust_store_path: Option<String>,
+    pub trust_store_type: Option<String>,
+    pub trust_store_password: Option<String>,
+    pub included_tls_protocols: Option<String>,
+    pub excluded_tls_protocols: Option<String>,
+    pub included_cipher_suites: Option<String>,
+    pub excluded_cipher_suites: Option<String>,
+    pub ssl_auto_reload: bool,
+    pub apps: Vec<WebApp>,
+}
+
+/// `<app>` (`AppDTO`): a web application and the URL path it is at.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebApp {
+    pub name: Option<String>,
+    pub url: String,
+    pub war: String,
+}
+
+impl WebConfig {
+    fn parse(node: roxmltree::Node) -> Self {
+        let attr = |n: roxmltree::Node, a: &str| n.attribute(a).map(str::to_owned);
+        let flag = |n: roxmltree::Node, a: &str| {
+            n.attribute(a)
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+        };
+        let apps = |n: roxmltree::Node| -> Vec<WebApp> {
+            n.children()
+                .filter(|c| c.is_element() && c.tag_name().name() == "app")
+                .map(|c| WebApp {
+                    name: attr(c, "name"),
+                    url: attr(c, "url").unwrap_or_default(),
+                    war: attr(c, "war").unwrap_or_default(),
+                })
+                .collect()
+        };
+        let binding = |n: roxmltree::Node, uri: String, apps: Vec<WebApp>| WebBinding {
+            name: attr(n, "name"),
+            uri,
+            client_auth: flag(n, "clientAuth"),
+            password_codec: attr(n, "passwordCodec"),
+            key_store_path: attr(n, "keyStorePath"),
+            key_store_type: attr(n, "keyStoreType"),
+            key_store_password: attr(n, "keyStorePassword"),
+            trust_store_path: attr(n, "trustStorePath"),
+            trust_store_type: attr(n, "trustStoreType"),
+            trust_store_password: attr(n, "trustStorePassword"),
+            included_tls_protocols: attr(n, "includedTLSProtocols"),
+            excluded_tls_protocols: attr(n, "excludedTLSProtocols"),
+            included_cipher_suites: attr(n, "includedCipherSuites"),
+            excluded_cipher_suites: attr(n, "excludedCipherSuites"),
+            ssl_auto_reload: flag(n, "sslAutoReload"),
+            apps,
+        };
+        let mut config = Self {
+            path: attr(node, "path").unwrap_or_default(),
+            root_redirect_location: attr(node, "rootRedirectLocation"),
+            ..Self::default()
+        };
+        for child in node.children().filter(|c| c.is_element()) {
+            match child.tag_name().name() {
+                "binding" => {
+                    let uri = attr(child, "uri").unwrap_or_default();
+                    config.bindings.push(binding(child, uri, apps(child)));
+                }
+                "app" | "request-log" => {}
+                other => config.warnings.push(Warning::UnknownElement {
+                    parent: "web".to_owned(),
+                    name: other.to_owned(),
+                }),
+            }
+        }
+        // `WebServerDTO.getAllBindings`: the legacy `bind` is one more
+        // binding, with the `<web>`-level settings and apps.
+        if let Some(bind) = attr(node, "bind") {
+            config.bindings.insert(0, binding(node, bind, apps(node)));
+        }
+        config
     }
 }
 
@@ -192,7 +295,11 @@ mod tests {
             config.configuration_path(),
             Some(PathBuf::from("/var/lib/i/etc//broker.xml"))
         );
-        assert!(config.web);
+        let web = config.web.unwrap();
+        assert_eq!(web.path, "web");
+        assert_eq!(web.root_redirect_location.as_deref(), Some("console"));
+        assert_eq!(web.bindings.len(), 1);
+        assert_eq!(web.bindings[0].uri, "http://localhost:8161");
         assert!(config.warnings.is_empty());
     }
 

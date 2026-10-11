@@ -27,6 +27,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 saranga-client = { path = "../saranga-client" }
 saranga-filter = { path = "../saranga-filter" }
+saranga-management = { path = "../saranga-management" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
