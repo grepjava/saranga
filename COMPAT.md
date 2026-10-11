@@ -129,7 +129,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 
 ## Management differences
 - **`getVersion`** reports 2.57.0, the Artemis release whose management interface Saranga answers, so tools that check the version keep working.
-- **Operations that return Java-serialized data** are not supported: `browse` (its `CompositeData[]` travels as serialized Java objects) answers `no operation`. `listMessages` and `listMessagesAsJSON` give the same messages.
+- **`browse`** answers `no operation`, by design. Artemis answers it with JMX `CompositeData` objects, Java-serialized and base64-encoded inside the JSON, which only a Java client can read; Saranga does not produce Java serialization. `listMessages` and `listMessagesAsJSON` return the same messages as plain JSON, and the REST API's `browse` returns them as JSON too.
 - **`changeMessagesPriority`** changes the messages in memory. Artemis also changes paged messages it reads in through the queue's own cursor; Saranga leaves messages still in pages as they are.
 - **`listBindingsForAddress`** names a queue binding as `LocalQueueBinding [address=..., queue=...]`. Artemis prints its queue object there, with an identity hash.
 - **Not yet (stage 2 of Phase 8):** connections, sessions, consumers and producers (their counts read 0), transactions, users, security settings and roles (`getRoles` is empty), notifications, message counters, and `management-message-rbac`.
