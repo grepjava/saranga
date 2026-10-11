@@ -25,6 +25,8 @@ pub struct ConfiguredSettings {
 struct Rules {
     repository: cfg::HierarchicalRepository<cfg::AddressSettings>,
     cache: HashMap<String, Arc<AddressSettings>>,
+    /// Matches management added, kept over a configuration reload.
+    added: Vec<(String, cfg::AddressSettings)>,
 }
 
 impl ConfiguredSettings {
@@ -33,6 +35,7 @@ impl ConfiguredSettings {
             state: Mutex::new(Rules {
                 repository,
                 cache: HashMap::new(),
+                added: Vec::new(),
             }),
         }
     }
@@ -57,7 +60,36 @@ impl SettingsRepository for ConfiguredSettings {
 
     fn swap(&self, rules: cfg::HierarchicalRepository<cfg::AddressSettings>) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Matches added through management outlive a reload.
+        let mut rules = rules;
+        for (m, s) in &state.added {
+            let _ = rules.add_match(m, s.clone());
+        }
         state.repository = rules;
+        state.cache.clear();
+        true
+    }
+
+    fn configured(&self, address: &str) -> Option<cfg::AddressSettings> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.repository.get_match(address)
+    }
+
+    fn add_match(&self, m: &str, settings: cfg::AddressSettings) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.repository.add_match(m, settings.clone()).is_err() {
+            return false;
+        }
+        state.added.retain(|(k, _)| k != m);
+        state.added.push((m.to_owned(), settings));
+        state.cache.clear();
+        true
+    }
+
+    fn remove_match(&self, m: &str) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.repository.remove_match(m);
+        state.added.retain(|(k, _)| k != m);
         state.cache.clear();
         true
     }
@@ -85,6 +117,7 @@ fn resolve(s: &cfg::AddressSettings) -> AddressSettings {
         auto_delete_addresses_skip_usage_check: s.auto_delete_addresses_skip_usage_check(),
         config_delete_queues: s.config_delete_queues() == cfg::DeletionPolicy::Force,
         config_delete_addresses: s.config_delete_addresses() == cfg::DeletionPolicy::Force,
+        config_delete_diverts: s.config_delete_diverts() == cfg::DeletionPolicy::Force,
         default_purge_on_no_consumers: s.default_purge_on_no_consumers(),
         default_max_consumers: s.default_max_consumers(),
         default_exclusive_queue: s.default_exclusive_queue(),
@@ -139,6 +172,8 @@ fn resolve(s: &cfg::AddressSettings) -> AddressSettings {
             cfg::PageFullMessagePolicy::Drop => PageFullPolicy::Drop,
             cfg::PageFullMessagePolicy::Fail => PageFullPolicy::Fail,
         }),
+        management_browse_page_size: s.management_browse_page_size(),
+        management_message_attribute_size_limit: s.management_message_attribute_size_limit(),
     }
 }
 
@@ -314,6 +349,13 @@ impl BrokerConfig {
             // Protocol crates register themselves: whoever starts the
             // broker adds them.
             protocols: Vec::new(),
+            management: crate::management::ManagementConfig {
+                address: config.management_address.clone(),
+                notification_address: config.management_notification_address.clone(),
+                name: config.name.clone(),
+                file: Some(Arc::new(config.clone())),
+                file_path: None,
+            },
         })
     }
 }

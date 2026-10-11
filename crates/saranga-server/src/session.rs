@@ -491,6 +491,17 @@ impl ServerSession {
         self.send_message(message, Outgoing::Core(large), tx).await
     }
 
+    /// As [`ServerSession::send`], keeping the message's ID (a message the
+    /// broker made, as management's `sendMessage` does).
+    pub async fn send_with_id(&mut self, message: CoreMessage) -> Result<()> {
+        let tx = if self.auto_commit_sends {
+            None
+        } else {
+            self.tx.clone()
+        };
+        self.send_message(message, Outgoing::Core(None), tx).await
+    }
+
     /// Sends a message kept in its own protocol's encoding, which has no ID
     /// yet, in the session's transaction or none as for
     /// [`ServerSession::send`].
@@ -586,6 +597,15 @@ impl ServerSession {
             }
             (_, None) => (address, None),
         };
+        // handleManagementMessage: a message to the management address is
+        // a request, answered on its reply-to address.
+        if !self.unchecked && *address == *self.broker.management().address() {
+            let request = match &outgoing {
+                Outgoing::Native(native, ..) => native.to_core(),
+                Outgoing::Core(_) => message,
+            };
+            return Box::pin(self.handle_management_message(request, tx)).await;
+        }
         // The user must be allowed to send to the address (and to the queue
         // a fully qualified name picks).
         let (bare_address, fqqn_queue) = crate::postoffice::split_fqqn(&address);
@@ -697,6 +717,39 @@ impl ServerSession {
             }
         };
         self.deliver_routed(routed, tx, own_tx)
+    }
+
+    /// `ServerSessionImpl.handleManagementMessage`: with the `manage`
+    /// permission, the request is run and the reply sent to its reply-to
+    /// address, in the send's transaction.
+    async fn handle_management_message(
+        &mut self,
+        request: CoreMessage,
+        tx: Option<TxRef>,
+    ) -> Result<()> {
+        let address = self.broker.management().address().to_owned();
+        if let Err(e) = self.security_check(&address, None, CheckType::Manage) {
+            if let Some(tx) = &tx {
+                transaction::lock(tx).mark_rollback_only(&e);
+            }
+            return Err(e);
+        }
+        let broker = self.broker.clone();
+        let mut reply = broker.management().handle_message(&broker, &request).await;
+        let Some(reply_to) = crate::message::string_property(&request, crate::management::REPLY_TO)
+        else {
+            return Ok(());
+        };
+        let reply_to = ["queue://", "topic://", "temp-queue://", "temp-topic://"]
+            .iter()
+            .find_map(|p| reply_to.strip_prefix(p))
+            .unwrap_or(&reply_to)
+            .to_owned();
+        reply.address = Some(SimpleString::from(reply_to.as_str()));
+        self.unchecked = true;
+        let sent = self.send_message(reply, Outgoing::Core(None), tx).await;
+        self.unchecked = false;
+        sent
     }
 
     /// `MQTTUtil.sendMessageDirectlyToQueue`: the message goes to this one

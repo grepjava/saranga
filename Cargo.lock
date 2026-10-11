@@ -1747,6 +1747,7 @@ dependencies = [
 name = "saranga-server"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "saranga-buffer",
  "saranga-config",
  "saranga-core-protocol",
@@ -1762,6 +1763,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

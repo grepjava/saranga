@@ -491,6 +491,17 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
     let instance = instance.map(Arc::new);
     if let Some(instance) = &instance {
         spawn_config_reloader(instance.clone(), broker.clone(), reload_period);
+        // reloadConfigurationFile through management.
+        let loader = instance.clone();
+        broker.set_config_loader(Arc::new(move || {
+            loader
+                .broker_config()
+                .and_then(|c| {
+                    saranga_server::reload::Reload::from_file_config(&c)
+                        .map_err(anyhow::Error::from)
+                })
+                .map_err(|e| format!("{e:#}"))
+        }));
     }
     let stop_dir = instance
         .as_ref()

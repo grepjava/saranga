@@ -25,6 +25,9 @@ pub struct AddressSettings {
     pub config_delete_queues: bool,
     /// `config-delete-addresses` is `FORCE`.
     pub config_delete_addresses: bool,
+    /// `config-delete-diverts` FORCE: a journaled divert no longer
+    /// configured is deleted at startup.
+    pub config_delete_diverts: bool,
     pub default_purge_on_no_consumers: bool,
     pub default_max_consumers: i32,
     pub default_exclusive_queue: bool,
@@ -83,6 +86,12 @@ pub struct AddressSettings {
     pub page_limit_messages: Option<i64>,
     /// `page-full-policy`: what a paging address does past its limits.
     pub page_full_policy: Option<PageFullPolicy>,
+    /// `management-browse-page-size`: how many messages the listing
+    /// operations look at.
+    pub management_browse_page_size: i32,
+    /// `management-message-attribute-size-limit`: how much of a property
+    /// the listing operations show.
+    pub management_message_attribute_size_limit: i32,
 }
 
 /// `PageFullMessagePolicy`.
@@ -127,6 +136,7 @@ impl Default for AddressSettings {
             auto_delete_addresses_skip_usage_check: false,
             config_delete_queues: false,
             config_delete_addresses: false,
+            config_delete_diverts: false,
             default_purge_on_no_consumers: false,
             default_max_consumers: -1,
             default_exclusive_queue: false,
@@ -173,6 +183,8 @@ impl Default for AddressSettings {
             page_limit_bytes: None,
             page_limit_messages: None,
             page_full_policy: None,
+            management_browse_page_size: 200,
+            management_message_attribute_size_limit: 256,
         }
     }
 }
@@ -187,6 +199,23 @@ pub trait SettingsRepository: Send + Sync {
         &self,
         _rules: saranga_config::HierarchicalRepository<saranga_config::AddressSettings>,
     ) -> bool {
+        false
+    }
+
+    /// The settings as configured for an address, merged over its matches
+    /// and with nothing defaulted (`getMatch` for `toJSON`).
+    fn configured(&self, _address: &str) -> Option<saranga_config::AddressSettings> {
+        None
+    }
+
+    /// `addMatch`: settings for a match, added at runtime (management).
+    /// False if these settings cannot change.
+    fn add_match(&self, _match: &str, _settings: saranga_config::AddressSettings) -> bool {
+        false
+    }
+
+    /// `removeMatch`.
+    fn remove_match(&self, _match: &str) -> bool {
         false
     }
 }

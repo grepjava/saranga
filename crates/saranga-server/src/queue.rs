@@ -28,6 +28,11 @@ use crate::settings::AddressSettings;
 use crate::storage::{Pending, StoreResult};
 use crate::{IdGenerator, Name, RoutingType};
 
+#[path = "queue_control.rs"]
+mod control;
+
+pub use control::{ConsumerInfo, QueueStats, Selection, SelectionAction};
+
 /// `ClientConsumerImpl.FORCED_DELIVERY_MESSAGE`.
 pub const FORCED_DELIVERY_MESSAGE: &str = "_hornetq.forced.delivery.seq";
 
@@ -80,6 +85,10 @@ pub trait DeliverySink: Send + Sync {
     fn has_credits(&self, _message: &ServerMessage) -> bool {
         true
     }
+
+    /// `ServerConsumer.disconnect`: management removed the consumer's
+    /// queue, and the client is told its consumer is gone.
+    fn disconnect(&self, _consumer_id: i64) {}
 }
 
 /// The most of a large message's body sent in one pass of the queue, so
@@ -238,7 +247,20 @@ enum Cmd {
         id: ConsumerId,
         r: MessageRef,
     },
+    /// A management operation, run by the actor
+    /// ([`control`](self::control)).
+    Manage(Box<dyn FnOnce(&mut Actor) + Send>),
     Shutdown,
+}
+
+/// Why a reference left its queue (`AckReason`), for the queue's
+/// statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckReason {
+    Normal,
+    Killed,
+    Expired,
+    Replaced,
 }
 
 struct Shared {
@@ -271,6 +293,19 @@ struct Shared {
     used: AtomicBool,
     /// Found deletable by the last reaper pass (`isSwept`).
     swept: AtomicBool,
+    /// `messagesAdded`, `messagesAcknowledged`, `messagesExpired`,
+    /// `messagesKilled` and `messagesReplaced`.
+    messages_added: AtomicI64,
+    messages_acknowledged: AtomicI64,
+    messages_expired: AtomicI64,
+    messages_killed: AtomicI64,
+    messages_replaced: AtomicI64,
+    /// `paused`: nothing is delivered (browsers aside).
+    paused: AtomicBool,
+    /// The queue's address is paused (`AddressInfo.isPaused`).
+    address_paused: AtomicBool,
+    /// The `QUEUE_STATUS_RECORD` of a persisted pause; -1 for none.
+    pause_record: AtomicI64,
 }
 
 impl Shared {
@@ -334,6 +369,14 @@ impl Queue {
             consumer_removed_at: AtomicI64::new(-1),
             used: AtomicBool::new(false),
             swept: AtomicBool::new(false),
+            messages_added: AtomicI64::new(0),
+            messages_acknowledged: AtomicI64::new(0),
+            messages_expired: AtomicI64::new(0),
+            messages_killed: AtomicI64::new(0),
+            messages_replaced: AtomicI64::new(0),
+            paused: AtomicBool::new(false),
+            address_paused: AtomicBool::new(false),
+            pause_record: AtomicI64::new(-1),
         }));
         let actor = Actor {
             shared: queue.0.clone(),
@@ -475,6 +518,18 @@ impl Queue {
     /// synced; recovery deletes what a crash missed). A paged message is
     /// acknowledged on its page instead.
     pub fn post_acknowledge(&self, r: &MessageRef) {
+        self.post_acknowledge_for(r, AckReason::Normal);
+    }
+
+    /// [`Queue::post_acknowledge`], counted under `reason`.
+    pub fn post_acknowledge_for(&self, r: &MessageRef, reason: AckReason) {
+        let counter = match reason {
+            AckReason::Normal => &self.0.messages_acknowledged,
+            AckReason::Killed => &self.0.messages_killed,
+            AckReason::Expired => &self.0.messages_expired,
+            AckReason::Replaced => &self.0.messages_replaced,
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
         self.0.used.store(true, Ordering::SeqCst);
         if let Some(position) = &r.paged {
             if let Some(sub) = &self.0.paging
@@ -615,6 +670,7 @@ impl Queue {
     /// Adds a routed message to the tail (`addTail`).
     pub fn add(&self, r: MessageRef) {
         self.0.message_count.fetch_add(1, Ordering::SeqCst);
+        self.0.messages_added.fetch_add(1, Ordering::SeqCst);
         self.ref_up(&r);
         self.send(Cmd::Add(r));
     }
@@ -1157,7 +1213,7 @@ impl Actor {
             return;
         }
         if !self.track_last_value(&r, false) {
-            self.kill(r);
+            self.kill_for(r, AckReason::Replaced);
             return;
         }
         let ring = self.shared.config().ring_size;
@@ -1203,7 +1259,7 @@ impl Actor {
                 self.last_values.insert(key, id);
                 if let Some(at) = self.messages.find(|m| m.message_id() == current) {
                     let old = self.messages.remove(at);
-                    self.kill(old);
+                    self.kill_for(old, AckReason::Replaced);
                 }
             }
             _ => {
@@ -1298,7 +1354,12 @@ impl Actor {
 
     /// `acknowledge` outside any transaction, for a reference the broker
     /// drops (`AckReason.KILLED` / `EXPIRED`).
-    fn kill(&mut self, mut r: MessageRef) {
+    fn kill(&mut self, r: MessageRef) {
+        self.kill_for(r, AckReason::Killed);
+    }
+
+    /// [`Actor::kill`], counted under `reason`.
+    fn kill_for(&mut self, mut r: MessageRef, reason: AckReason) {
         self.forget_last_value(&r);
         let queue = self.queue();
         if let Err(e) = queue.store_ack(&mut r) {
@@ -1307,7 +1368,7 @@ impl Actor {
                 r.message_id()
             );
         }
-        queue.post_acknowledge(&r);
+        queue.post_acknowledge_for(&r, reason);
     }
 
     /// `sendToDeadLetterAddress`.
@@ -1340,7 +1401,7 @@ impl Actor {
                 "AMQ222149: Sending message {} to Dead Letter Address {dla} from {name}",
                 r.message_id()
             );
-            self.move_to(&dla, r, false);
+            self.move_to(&dla, r, AckReason::Killed, None);
         }
     }
 
@@ -1373,7 +1434,7 @@ impl Actor {
                     &s.expiry_queue_suffix,
                 );
                 if self.has_bindings(&expiry) {
-                    self.move_to(&expiry, r, true);
+                    self.move_to(&expiry, r, AckReason::Expired, None);
                 } else {
                     if !self.expiry_warned {
                         self.expiry_warned = true;
@@ -1381,7 +1442,7 @@ impl Actor {
                             "AMQ222146: Message has expired. No bindings for Expiry Address {expiry} so dropping it"
                         );
                     }
-                    self.kill(r);
+                    self.kill_for(r, AckReason::Expired);
                 }
             }
             None => {
@@ -1392,7 +1453,7 @@ impl Actor {
                         self.shared.name
                     );
                 }
-                self.kill(r);
+                self.kill_for(r, AckReason::Expired);
             }
         }
     }
@@ -1429,11 +1490,19 @@ impl Actor {
         }
     }
 
-    /// `move`: a copy of the message goes to `address` and the reference is
-    /// acknowledged, in one transaction.
-    fn move_to(&mut self, address: &str, mut r: MessageRef, expiry: bool) {
+    /// `move`: a copy of the message goes to `address` (to the queue
+    /// `target` only, when given) and the reference is acknowledged under
+    /// `reason`, in one transaction.
+    fn move_to(
+        &mut self,
+        address: &str,
+        mut r: MessageRef,
+        reason: AckReason,
+        target: Option<Queue>,
+    ) {
+        let expiry = reason == AckReason::Expired;
         let Some(po) = self.shared.post_office.upgrade() else {
-            self.kill(r);
+            self.kill_for(r, reason);
             return;
         };
         let now = now_millis();
@@ -1448,7 +1517,10 @@ impl Actor {
         message::apply_expiry_delay(&mut copy, &po.settings(address), now);
         let mut copy = MessageRef::new(r.message.copy(copy));
         copy.scheduled_time = message::scheduled_delivery_time(copy.message.core());
-        let routed = po.route_internal(&copy, address);
+        let routed = match target {
+            Some(q) => vec![(copy.clone(), vec![q])],
+            None => po.route_internal(&copy, address),
+        };
         // A paging dead-letter or expiry address takes the copy in its pages.
         let routed = match po.page_routed(routed.clone(), None) {
             Ok((routed, _)) => routed,
@@ -1490,7 +1562,7 @@ impl Actor {
                 q.add(m.clone());
             }
         }
-        queue.post_acknowledge(&r);
+        queue.post_acknowledge_for(&r, reason);
     }
 
     /// Handles one command; returns false to stop the actor.
@@ -1693,6 +1765,7 @@ impl Actor {
                 let expired = self.messages.take_where(|r| r.message.is_expired(now));
                 expired.into_iter().for_each(|r| self.expire(r));
             }
+            Cmd::Manage(op) => op(self),
             Cmd::Shutdown => {
                 self.delete_all_references();
                 return false;
@@ -1763,6 +1836,10 @@ impl Actor {
     /// another. Each message goes to the next consumer, round robin, in the
     /// highest priority group that has one able to take it.
     fn deliver(&mut self) {
+        if self.is_paused() {
+            self.deliver_to_browsers();
+            return;
+        }
         self.depage();
         // Large messages part-way out go first.
         let mut more = false;

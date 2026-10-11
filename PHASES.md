@@ -12,7 +12,7 @@ Saranga is built in twelve phases. Each one ends with something runnable, and it
 | 5 | Paging and large messages | Done |
 | 6 | Config and security | Done |
 | 7 | Protocols (AMQP, MQTT, STOMP, OpenWire, WebSockets) | Done |
-| 8 | Management and operations | Not started |
+| 8 | Management and operations | In progress |
 | 9 | High availability | Not started |
 | 10 | Clustering and federation | Not started |
 | 11 | Hardening and 1.0 | Not started |
@@ -295,6 +295,25 @@ The differences from Artemis are listed in COMPAT.md.
 - Logging and the audit log through `tracing`.
 
 **Exit check:** operational runbooks written for Artemis work with the Saranga equivalents.
+
+**Stages**, each committed on its own:
+1. **Management messages.** Messages sent to the management address (`activemq.management`), from any protocol, are handled as `ManagementServiceImpl.handleMessage` handles them: the resource and the attribute or operation from the `_AMQ_ResourceName`, `_AMQ_Attribute` and `_AMQ_OperationName` properties, the parameters as a JSON array in the body, matched to an operation by name and count and converted as `invokeOperation` converts them, and the result or the error text stored in the reply with `_AMQ_OperationSucceeded`. The `manage` permission is checked, and the reply goes to the reply-to address with the request's correlation ID. The queue statistics Artemis keeps (messages added, acknowledged, expired and killed; delivering, scheduled and durable counts and sizes; the first message's age). The `broker`, `address.<name>` and `queue.<name>` resources: their attributes, and the operations on addresses, queues, diverts, address settings and the messages in a queue.
+2. **Connections, sessions, consumers and producers, transactions and users.** Listing and closing them, with the JSON Artemis returns and the filtered, paged `list*` operations; prepared and heuristically completed transactions, with `xaForget`; the users of the basic security manager; security settings and their caches; management notifications to `activemq.notifications`; the view and edit permissions of `management-message-rbac`; message counters; and the slow-consumer policy.
+3. **The CLI.** The Artemis CLI's `queue`, `address`, `user`, `producer`, `consumer`, `browser`, `transfer`, `check` and `stop` work against Saranga, and `saranga` has the same commands, plus `create` for a broker instance.
+4. **The REST API and Prometheus metrics**, served on the `<web>` binding of `bootstrap.xml`. The REST API reads attributes and invokes operations of the same resources; the metrics have the names the Artemis Prometheus plugin exports.
+5. **Plugins, the critical analyzer, logging and the audit log.**
+6. **Exit check:** runbooks written for Artemis, run against Saranga.
+
+**Progress**
+- Stage 1 (management messages) is done. A message sent to the management address from Core, JMS or AMQP is a request, answered on its reply-to address with the request's correlation ID, as `ManagementServiceImpl.handleMessage` answers it. Its parts:
+  - **Dispatch.** Resources `broker`, `address.<name>`, `queue.<name>` and `divert.<name>`. Attributes are read as the control's getter would be, getters work as operations too, and an operation is matched by name, parameter count and the types `invokeOperation` accepts. Errors carry Artemis's texts (`AMQ229067`, `AMQ229069`, the operations' own).
+  - **JSON** is written as Johnzon writes it for Artemis: members in order, Java's number formats, the same escaping.
+  - **Queue statistics** as `QueueImpl` keeps them: messages added, acknowledged, expired, killed and replaced, with the reason each message left; delivering, scheduled and durable counts and sizes; persistent sizes; the first message's age.
+  - **Queue operations:** counting (with filters and grouping), listing (queued, scheduled, delivering, consumers, groups), removing, moving (with duplicate rejection and message counts), copying, expiring, sending to the dead-letter address, retrying from it, changing priority, delivering scheduled messages now, pausing (persisted or not), enabling and disabling, resetting counters and groups, and sending a message.
+  - **Address operations and attributes:** routed and unrouted counts, queue and binding names, paging state, pausing (persisted or not), blocking and unblocking producers, purging, the duplicate-ID cache, and sending a message.
+  - **Broker:** creating, updating and deleting addresses and queues in every form of the operations (text, JSON and positional), `getAddressInfo`, `listBindingsForAddress`, `listAddresses`, the paged, filtered and sorted `listQueues` and `listAddresses` views the CLI reads, diverts (created, updated and destroyed), address settings as JSON (added, read and removed), `reloadConfigurationFile`, and the broker's attributes, disk usage included.
+  - **Records.** Paused queues and addresses, address settings and diverts are journaled as Artemis journals them and recovered at startup (`tests/management.rs` checks a restart).
+  - **Interop.** [tests/interop/management/Management.java](tests/interop/management/Management.java) has 34 tests using `ClientRequestor`, `JMSManagementHelper` with a `QueueRequestor`, and Qpid JMS. They pass against Artemis 2.57.0 and against Saranga: `CONFIG=tests/interop/management/broker.xml SUITE_FILE=tests/interop/management/Management.java scripts/interop.sh saranga`.
 
 ## Phase 9: High availability
 

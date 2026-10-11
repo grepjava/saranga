@@ -227,6 +227,11 @@ impl PagingManager {
     }
 
     /// `isGlobalFull`.
+    /// `global-max-size`; -1 for none.
+    pub fn global_max_size(&self) -> i64 {
+        self.global_max_size
+    }
+
     pub fn is_global_full(&self) -> bool {
         (self.global_max_size >= 0
             && self.global_size.load(Ordering::SeqCst) >= self.global_max_size)
@@ -488,6 +493,8 @@ pub struct PagingStore {
     blocking: AtomicBool,
     /// Past `page-limit-bytes` or `page-limit-messages` (`pageFull`).
     page_full: AtomicBool,
+    /// `blockedViaAddressControl`.
+    blocked_via_management: AtomicBool,
     me: Weak<PagingStore>,
 }
 
@@ -530,6 +537,7 @@ impl PagingStore {
             }),
             blocked: Mutex::default(),
             blocking: AtomicBool::new(false),
+            blocked_via_management: AtomicBool::new(false),
             page_full: AtomicBool::new(false),
             me: me.clone(),
         });
@@ -667,6 +675,49 @@ impl PagingStore {
     /// `numberOfPages`.
     pub fn number_of_pages(&self) -> i64 {
         lock(&self.state).number_of_pages
+    }
+
+    /// `getPageSizeBytes`.
+    pub fn page_size_bytes(&self) -> i64 {
+        self.settings().page_size_bytes
+    }
+
+    /// The address's settings as the store applies them.
+    pub fn address_settings(&self) -> Arc<AddressSettings> {
+        self.settings()
+    }
+
+    /// `getAddressLimitPercent`: how full the address is, against its own
+    /// limit or, without one, the global limit.
+    pub fn address_limit_percent(&self) -> i32 {
+        let s = self.settings();
+        let size = self.size.load(Ordering::SeqCst);
+        let max = if s.max_size_bytes > 0 {
+            s.max_size_bytes
+        } else {
+            self.manager.upgrade().map_or(-1, |m| m.global_max_size)
+        };
+        if max <= 0 {
+            0
+        } else {
+            (size as f64 * 100.0 / max as f64) as i32
+        }
+    }
+
+    /// `block`: producers wait until [`PagingStore::unblock`].
+    pub fn block(&self) {
+        self.blocked_via_management.store(true, Ordering::SeqCst);
+    }
+
+    /// `unblock`.
+    pub fn unblock(&self) {
+        self.blocked_via_management.store(false, Ordering::SeqCst);
+        self.check_released_memory();
+    }
+
+    /// `isBlockedViaManagement`.
+    pub fn is_blocked_via_management(&self) -> bool {
+        self.blocked_via_management.load(Ordering::SeqCst)
     }
 
     /// (first page, current page).
@@ -919,7 +970,7 @@ impl PagingStore {
     /// `checkReleasedMemory`: below the limit, blocked producers get their
     /// credits.
     fn check_released_memory(&self) {
-        if self.is_full() {
+        if self.is_full() || self.blocked_via_management.load(Ordering::SeqCst) {
             return;
         }
         let waiting = std::mem::take(&mut *lock(&self.blocked));
@@ -938,6 +989,15 @@ impl PagingStore {
     /// `checkMemory` for a producer's credit request: `grant` runs now, or
     /// once memory is freed (BLOCK); FAIL refuses the credits.
     pub fn request_credits(&self, grant: Box<dyn FnOnce() + Send>) -> Credits {
+        // `blockedViaAddressControl`: producers wait whatever the policy.
+        if self.blocked_via_management.load(Ordering::SeqCst) {
+            lock(&self.blocked).push(grant);
+            if self.blocked_via_management.load(Ordering::SeqCst) {
+                return Credits::Blocked;
+            }
+            self.check_released_memory();
+            return Credits::Blocked;
+        }
         let s = self.settings();
         match s.address_full_policy {
             AddressFullPolicy::Fail if self.has_limit(&s) && self.is_full() => Credits::Failed,
@@ -1389,6 +1449,74 @@ impl PagingStore {
                 }
             }
             return Some(r);
+        }
+    }
+
+    /// The next paged message for `sub`'s queue from `it`, for a management
+    /// operation's own iterator (`pageSubscription.iterator()` in
+    /// `iterQueue`): as [`PagingStore::next`], but the queue's cursor state
+    /// is left alone, and messages of transactions not yet committed are
+    /// passed over.
+    pub fn scan(&self, sub: &Arc<PageSubscription>, it: &mut PageIterator) -> Option<PagedRef> {
+        let manager = self.manager.upgrade()?;
+        if !manager.loaded.load(Ordering::SeqCst) {
+            return None;
+        }
+        loop {
+            let (page, entry) = {
+                let mut st = lock(&self.state);
+                if !st.paging {
+                    return None;
+                }
+                let first = st.first_page.min(st.current_page_id);
+                if !it.started || it.page < first {
+                    it.page = first;
+                    it.nr = 0;
+                    it.started = true;
+                }
+                match self.lookup(&mut st, it.page, it.nr) {
+                    Lookup::Entry(e) => {
+                        it.nr += 1;
+                        (it.page, e)
+                    }
+                    Lookup::End => {
+                        let mut next = it.page + 1;
+                        while next <= st.current_page_id && sub.page_finished(next) {
+                            next += 1;
+                        }
+                        if next > st.current_page_id {
+                            return None;
+                        }
+                        it.page = next;
+                        it.nr = 0;
+                        continue;
+                    }
+                }
+            };
+            let nr = entry.nr;
+            if !entry.queue_ids.contains(&sub.queue_id) || sub.is_acked(page, nr) {
+                continue;
+            }
+            let Some(message) = entry.message.clone() else {
+                continue;
+            };
+            if entry.tx_id > 0
+                && !manager
+                    .transaction(entry.tx_id)
+                    .is_some_and(|tx| lock(&tx.state).committed)
+            {
+                continue;
+            }
+            return Some(PagedRef {
+                position: PagePosition {
+                    page,
+                    message_nr: nr,
+                    tx_id: entry.tx_id,
+                    size: persistent_size(&message),
+                    ack_record: -1,
+                },
+                message,
+            });
         }
     }
 
@@ -1943,6 +2071,13 @@ impl PageSubscription {
         {
             store.check_add(self.queue_id, value);
         }
+    }
+
+    /// `getPersistentSize`: the size of the paged messages not
+    /// acknowledged.
+    pub fn persistent_size(&self) -> i64 {
+        let s = lock(&self.state);
+        if s.empty { 0 } else { s.counter_size.max(0) }
     }
 
     /// `getMessageCount`: paged messages not acknowledged.

@@ -127,8 +127,16 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
   - The draft-00 handshake of clients that send no `Sec-WebSocket-Version`: they get `426 Upgrade Required`.
   - Core over HTTP (`httpEnabled`, `HttpAcceptorHandler`): an HTTP request without a WebSocket upgrade gets `403 Forbidden`.
 
+## Management differences
+- **`getVersion`** reports 2.57.0, the Artemis release whose management interface Saranga answers, so tools that check the version keep working.
+- **Operations that return Java-serialized data** are not supported: `browse` (its `CompositeData[]` travels as serialized Java objects) answers `no operation`. `listMessages` and `listMessagesAsJSON` give the same messages.
+- **`changeMessagesPriority`** changes the messages in memory. Artemis also changes paged messages it reads in through the queue's own cursor; Saranga leaves messages still in pages as they are.
+- **`listBindingsForAddress`** names a queue binding as `LocalQueueBinding [address=..., queue=...]`. Artemis prints its queue object there, with an identity hash.
+- **Not yet (stage 2 of Phase 8):** connections, sessions, consumers and producers (their counts read 0), transactions, users, security settings and roles (`getRoles` is empty), notifications, message counters, and `management-message-rbac`.
+- **Records.** Paused queues and addresses, address settings and diverts are journaled as Artemis journals them (`QUEUE_STATUS_RECORD`, `ADDRESS_STATUS_RECORD`, `ADDRESS_SETTING_RECORD_JSON`, `DIVERT_RECORD`), so they move with the data directory in both directions. Like Artemis, Saranga journals every deployed divert, configured ones included.
+
 ## Security differences
 - **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule` and `LDAPLoginModule` are supported. `Krb5LoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.
-- **Security managers.** The JAAS security manager (`<jaas-security>`) and `ActiveMQBasicSecurityManager` are supported. The basic manager keeps its users in the bindings journal, so its users move with the data directory in both directions. Any other `<security-manager>` class stops the broker from starting. As in Artemis, the basic manager has no users without persistence. Users can be added only through the bootstrap credentials until management arrives in Phase 8.
+- **Security managers.** The JAAS security manager (`<jaas-security>`) and `ActiveMQBasicSecurityManager` are supported. The basic manager keeps its users in the bindings journal, so its users move with the data directory in both directions. Any other `<security-manager>` class stops the broker from starting. As in Artemis, the basic manager has no users without persistence. Users can be added only through the bootstrap credentials until stage 2 of Phase 8.
 - **A role named `*`** in a security setting grants nothing in Artemis 2.57, despite looking like a wildcard. Saranga matches this.
 - **Security setting plugins** (`<security-setting-plugin>`) are not supported and produce a warning.

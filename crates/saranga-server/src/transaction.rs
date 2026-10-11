@@ -458,6 +458,27 @@ impl ResourceManager {
     }
 
     /// `getTimeoutSeconds`.
+    /// `getPreparedTransactionMessageCount`: how many acknowledgements of
+    /// the queue `queue_id` prepared transactions hold.
+    pub fn prepared_acks_on(&self, queue_id: i64) -> usize {
+        let txs: Vec<TxRef> = self
+            .txs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        txs.iter()
+            .map(|t| {
+                let t = lock(t);
+                if t.state != TxState::Prepared {
+                    return 0;
+                }
+                t.acks.iter().filter(|(q, _)| q.id() == queue_id).count()
+            })
+            .sum()
+    }
+
     pub fn timeout_seconds(&self) -> i32 {
         self.timeout_seconds
     }

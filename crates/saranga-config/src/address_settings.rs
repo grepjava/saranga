@@ -48,7 +48,108 @@ macro_rules! string_enum {
                 f.write_str(self.as_str())
             }
         }
+
+        impl AsSettingValue for $name {
+            fn setting_value(&self) -> SettingValue {
+                SettingValue::Text(self.as_str().to_owned())
+            }
+        }
     };
+}
+
+/// A setting's value as `AddressSettings.toJSON` writes it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingValue {
+    Text(String),
+    Long(i64),
+    Double(f64),
+    Bool(bool),
+}
+
+/// Turns a field into the value `toJSON` writes.
+pub trait AsSettingValue {
+    fn setting_value(&self) -> SettingValue;
+}
+
+impl AsSettingValue for String {
+    fn setting_value(&self) -> SettingValue {
+        SettingValue::Text(self.clone())
+    }
+}
+
+impl AsSettingValue for i64 {
+    fn setting_value(&self) -> SettingValue {
+        SettingValue::Long(*self)
+    }
+}
+
+impl AsSettingValue for i32 {
+    fn setting_value(&self) -> SettingValue {
+        SettingValue::Long(i64::from(*self))
+    }
+}
+
+impl AsSettingValue for f64 {
+    fn setting_value(&self) -> SettingValue {
+        SettingValue::Double(*self)
+    }
+}
+
+impl AsSettingValue for bool {
+    fn setting_value(&self) -> SettingValue {
+        SettingValue::Bool(*self)
+    }
+}
+
+/// The `<address-setting>` element that sets a field.
+fn element(field: &str) -> String {
+    match field {
+        "redelivery_multiplier" => "redelivery-delay-multiplier".to_owned(),
+        "page_cache_max_size" => "page-max-cache-size".to_owned(),
+        "address_full_message_policy" => "address-full-policy".to_owned(),
+        "disk_full_message_policy" => "disk-full-policy".to_owned(),
+        "page_full_message_policy" => "page-full-policy".to_owned(),
+        _ => field.replace('_', "-"),
+    }
+}
+
+/// The `metaBean` name of a field: its Rust name in camel case.
+pub fn java_name(field: &str) -> String {
+    if field == "send_to_dla_on_no_route" {
+        return "sendToDLAOnNoRoute".to_owned();
+    }
+    let mut out = String::with_capacity(field.len());
+    let mut upper = false;
+    for c in field.chars() {
+        if c == '_' {
+            upper = true;
+        } else if upper {
+            out.push(c.to_ascii_uppercase());
+            upper = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+impl AddressSettings {
+    /// `metaBean.fromJSON`: settings from `(metaBean name, value)` pairs,
+    /// each value as text. Names it does not know are left out, as
+    /// `fromJSON` leaves them; a value that does not parse is an error.
+    pub fn from_named_values(values: &[(String, String)]) -> Result<Self> {
+        let mut out = Self::default();
+        for (name, value) in values {
+            let Some(field) = Self::FIELDS.iter().find(|f| java_name(f) == *name) else {
+                continue;
+            };
+            if let Some(fragment) = crate::parser::address_setting_fragment(&element(field), value)?
+            {
+                out = Mergeable::merge_copy(&fragment, &out);
+            }
+        }
+        Ok(out)
+    }
 }
 
 string_enum!(
@@ -119,6 +220,21 @@ macro_rules! address_settings {
                 $(if self.$field.is_none() {
                     self.$field = other.$field.clone();
                 })+
+            }
+        }
+
+        impl AddressSettings {
+            /// The Rust names of the fields, in `metaBean` order.
+            pub const FIELDS: &'static [&'static str] = &[$(stringify!($field)),+];
+
+            /// The fields that are set, by their `metaBean` names, in
+            /// registration order (`toJSON` ignoring null attributes).
+            pub fn named_values(&self) -> Vec<(String, SettingValue)> {
+                let mut out = Vec::new();
+                $(if let Some(v) = &self.$field {
+                    out.push((java_name(stringify!($field)), v.setting_value()));
+                })+
+                out
             }
         }
 
@@ -428,4 +544,16 @@ impl AddressSettings {
     // `default_last_value_key`, `default_group_first_key`, `page_limit_bytes`,
     // `page_limit_messages`, `page_full_message_policy`,
     // `disk_full_message_policy`, `id_cache_size`, `initial_queue_buffer_size`.
+}
+
+impl AsSettingValue for RoutingType {
+    fn setting_value(&self) -> SettingValue {
+        SettingValue::Text(
+            match self {
+                RoutingType::Multicast => "MULTICAST",
+                RoutingType::Anycast => "ANYCAST",
+            }
+            .to_owned(),
+        )
+    }
 }

@@ -4,8 +4,8 @@
 //! `ServerSessionImpl` (`createQueue`, `checkAutoCreate`, the queries).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::error::{BrokerError, Result};
 use crate::message::{MessageRef, routing_type};
@@ -369,6 +369,13 @@ struct AddressEntry {
     /// name, the address, in `LocalQueueBinding`).
     anycast_next: AtomicUsize,
     diverts: Vec<Arc<Divert>>,
+    /// `routedMessageCount` and `unRoutedMessageCount`.
+    routed: AtomicI64,
+    unrouted: AtomicI64,
+    /// `AddressInfo.isPaused`: none of its queues deliver.
+    paused: bool,
+    /// The `ADDRESS_STATUS_RECORD` of a persisted pause; -1 for none.
+    pause_record: i64,
 }
 
 impl AddressEntry {
@@ -381,8 +388,25 @@ impl AddressEntry {
             queues: Vec::new(),
             anycast_next: AtomicUsize::new(0),
             diverts: Vec::new(),
+            routed: AtomicI64::new(0),
+            unrouted: AtomicI64::new(0),
+            paused: false,
+            pause_record: -1,
         }
     }
+}
+
+/// An address's statistics and state for management (`AddressControl`).
+#[derive(Clone)]
+pub struct AddressStatus {
+    pub info: AddressInfo,
+    pub created_at: i64,
+    pub routed: i64,
+    pub unrouted: i64,
+    pub paused: bool,
+    pub persisted_pause: bool,
+    pub queues: Vec<Queue>,
+    pub diverts: Vec<Arc<Divert>>,
 }
 
 #[derive(Default)]
@@ -402,6 +426,15 @@ pub struct PostOffice {
     wildcard: WildcardConfig,
     duplicates: crate::duplicate::DuplicateIdCaches,
     paging: Arc<crate::paging::PagingManager>,
+    /// The bindings-journal records of persisted configurations, by key
+    /// (`mapPersistedAddressSettings`, `mapPersistedDivertConfigurations`).
+    persisted: Mutex<Persisted>,
+}
+
+#[derive(Default)]
+struct Persisted {
+    address_settings: HashMap<String, i64>,
+    diverts: HashMap<String, i64>,
 }
 
 impl PostOffice {
@@ -422,7 +455,106 @@ impl PostOffice {
             wildcard,
             duplicates,
             paging,
+            persisted: Mutex::default(),
         })
+    }
+
+    fn persisted(&self) -> std::sync::MutexGuard<'_, Persisted> {
+        self.persisted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The configured settings for an address, merged over its matches,
+    /// for `getAddressSettingsAsJSON`.
+    pub fn settings_configured(&self, address: &str) -> Option<saranga_config::AddressSettings> {
+        self.settings.configured(address)
+    }
+
+    /// Gives every page store its settings again.
+    fn settings_changed(&self) {
+        for store in self.paging.stores() {
+            store.apply_settings(self.settings(store.address()));
+        }
+    }
+
+    /// `addAddressSettings(address, json)`: the settings apply to the match
+    /// at once, and are journaled (`PersistedAddressSettingJSON`) to apply
+    /// after a restart.
+    pub fn add_address_settings(
+        &self,
+        address_match: &str,
+        settings: saranga_config::AddressSettings,
+        json: &str,
+    ) -> Result<()> {
+        if !self.settings.add_match(address_match, settings) {
+            return Err(BrokerError::illegal_state(format!(
+                "Invalid address match {address_match}"
+            )));
+        }
+        self.settings_changed();
+        if let Some(s) = self.ids.storage() {
+            let body = saranga_storage::RecordCodec::encode(
+                &saranga_storage::codec::PersistedAddressSettingJson {
+                    address_match: address_match.into(),
+                    json: json.into(),
+                },
+            );
+            let old = self
+                .persisted()
+                .address_settings
+                .get(address_match)
+                .copied();
+            let id = s
+                .store_configuration(crate::storage::ids::ADDRESS_SETTING_RECORD_JSON, body, old)
+                .map_err(Self::io)?;
+            self.persisted()
+                .address_settings
+                .insert(address_match.to_owned(), id);
+        }
+        Ok(())
+    }
+
+    /// `removeAddressSettings`: the match goes, with its journal record.
+    pub fn remove_address_settings(&self, address_match: &str) -> Result<()> {
+        self.settings.remove_match(address_match);
+        self.settings_changed();
+        let old = self.persisted().address_settings.remove(address_match);
+        if let (Some(old), Some(s)) = (old, self.ids.storage()) {
+            s.delete_binding_record(old).map_err(Self::io)?;
+        }
+        Ok(())
+    }
+
+    /// A persisted address setting recovered from the bindings journal
+    /// (`recoverStoredAddressSettings`).
+    pub fn reload_address_settings(&self, record: i64, address_match: &str, json: &str) {
+        use crate::management::Json;
+        let values: Vec<(String, String)> = match Json::parse(json) {
+            Ok(Json::Object(members)) => members
+                .into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| {
+                    let v = match v {
+                        Json::String(s) => s,
+                        other => other.to_string(),
+                    };
+                    (k, v)
+                })
+                .collect(),
+            _ => {
+                tracing::warn!("address settings for {address_match} are not JSON: {json}");
+                return;
+            }
+        };
+        match saranga_config::AddressSettings::from_named_values(&values) {
+            Ok(settings) => {
+                self.settings.add_match(address_match, settings);
+                self.settings_changed();
+            }
+            Err(e) => tracing::warn!("address settings for {address_match}: {e}"),
+        }
+        self.persisted()
+            .address_settings
+            .insert(address_match.to_owned(), record);
     }
 
     pub fn paging(&self) -> &Arc<crate::paging::PagingManager> {
@@ -458,7 +590,10 @@ impl PostOffice {
             for (address, group) in by_address {
                 match self.paging_store(&address).page(&r.message, tx, &group)? {
                     crate::paging::Paged::No => keep.extend(group),
-                    crate::paging::Paged::Yes(p) => pending.extend(p),
+                    crate::paging::Paged::Yes(p) => {
+                        group.iter().for_each(Queue::paged_added);
+                        pending.extend(p);
+                    }
                     crate::paging::Paged::Dropped => {}
                 }
             }
@@ -575,6 +710,9 @@ impl PostOffice {
             self.me.clone(),
             Some(sub),
         );
+        if entry.paused {
+            queue.set_address_paused(true);
+        }
         entry.queues.push(queue.clone());
         state.queues.insert(queue.name().clone(), queue.clone());
         Ok(queue)
@@ -802,6 +940,9 @@ impl PostOffice {
             self.me.clone(),
             Some(sub),
         );
+        if entry.paused {
+            queue.set_address_paused(true);
+        }
         entry.queues.push(queue.clone());
         state.queues.insert(queue.name().clone(), queue.clone());
         Ok(queue)
@@ -1312,6 +1453,7 @@ impl PostOffice {
             }
             bindings = self.bindings_route(message, address);
         }
+        self.count_route(real, bindings.as_ref().is_some_and(|(q, _)| !q.is_empty()));
         let Some((queues, diverts)) = bindings else {
             return self.maybe_send_to_dla(message, real, to_dla, out);
         };
@@ -1417,6 +1559,80 @@ impl PostOffice {
         )
     }
 
+    /// `incrementRoutedMessageCount` or `incrementUnRoutedMessageCount`.
+    fn count_route(&self, address: &str, routed: bool) {
+        if let Some(e) = self.read().addresses.get(address) {
+            let counter = if routed { &e.routed } else { &e.unrouted };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// An address's statistics and state.
+    pub fn address_status(&self, name: &str) -> Option<AddressStatus> {
+        self.read().addresses.get(name).map(|e| AddressStatus {
+            info: e.info.clone(),
+            created_at: e.created_at,
+            routed: e.routed.load(Ordering::Relaxed),
+            unrouted: e.unrouted.load(Ordering::Relaxed),
+            paused: e.paused,
+            persisted_pause: e.pause_record >= 0,
+            queues: e.queues.clone(),
+            diverts: e.diverts.clone(),
+        })
+    }
+
+    /// `AddressControl.pause(persist)`: none of the address's queues
+    /// deliver until it resumes. With `persist` the pause outlives a
+    /// restart (`storeAddressStatus`). False if there is no such address.
+    pub fn pause_address(&self, name: &str, persist: bool) -> Result<bool> {
+        let mut state = self.write();
+        let Some(e) = state.addresses.get_mut(name) else {
+            return Ok(false);
+        };
+        if persist && let Some(s) = self.ids.storage() {
+            if e.pause_record >= 0 {
+                s.delete_binding_record(e.pause_record).map_err(Self::io)?;
+            }
+            e.pause_record = s.store_address_status(e.info.id).map_err(Self::io)?;
+        }
+        e.paused = true;
+        e.queues.iter().for_each(|q| q.set_address_paused(true));
+        Ok(true)
+    }
+
+    /// `AddressControl.resume`. False if there is no such address.
+    pub fn resume_address(&self, name: &str) -> Result<bool> {
+        let mut state = self.write();
+        let Some(e) = state.addresses.get_mut(name) else {
+            return Ok(false);
+        };
+        if e.pause_record >= 0
+            && let Some(s) = self.ids.storage()
+        {
+            s.delete_binding_record(e.pause_record).map_err(Self::io)?;
+        }
+        e.pause_record = -1;
+        e.paused = false;
+        e.queues.iter().for_each(|q| q.set_address_paused(false));
+        Ok(true)
+    }
+
+    /// A persisted address pause recovered from its `ADDRESS_STATUS_RECORD`.
+    pub fn reload_address_pause(&self, address_id: i64, record: i64) -> bool {
+        let mut state = self.write();
+        let Some(e) = state
+            .addresses
+            .values_mut()
+            .find(|e| e.info.id == address_id)
+        else {
+            return false;
+        };
+        e.paused = true;
+        e.pause_record = record;
+        e.queues.iter().for_each(|q| q.set_address_paused(true));
+        true
+    }
+
     /// Whether anything is bound to `address`
     /// (`lookupBindingsForAddress` not empty).
     pub fn has_bindings(&self, address: &str) -> bool {
@@ -1441,15 +1657,102 @@ impl PostOffice {
 
     /// `destroyDivert`: unbinds a divert. False if there is none.
     pub fn destroy_divert(&self, name: &str) -> bool {
-        let mut state = self.write();
-        for entry in state.addresses.values_mut() {
-            if let Some(i) = entry.diverts.iter().position(|d| *d.name == *name) {
-                entry.diverts.remove(i);
-                entry.binding_removed_at = crate::message::now_millis();
-                return true;
+        let found = {
+            let mut state = self.write();
+            let mut found = false;
+            for entry in state.addresses.values_mut() {
+                if let Some(i) = entry.diverts.iter().position(|d| *d.name == *name) {
+                    entry.diverts.remove(i);
+                    entry.binding_removed_at = crate::message::now_millis();
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        // deleteDivertConfiguration.
+        let old = self.persisted().diverts.remove(name);
+        if let (Some(old), Some(s)) = (old, self.ids.storage())
+            && let Err(e) = s.delete_binding_record(old)
+        {
+            tracing::warn!("deleting the record of divert {name}: {e}");
+        }
+        found
+    }
+
+    /// `ActiveMQServerImpl.deployDivert`: the divert is deployed and its
+    /// configuration journaled (`storeDivertConfiguration`).
+    pub fn deploy_divert_persisted(
+        &self,
+        d: &DivertDeployment,
+        transformers: &HashMap<String, TransformerFactory>,
+    ) -> Result<()> {
+        if self.deploy_divert(d, transformers)? {
+            self.store_divert(d)?;
+        }
+        Ok(())
+    }
+
+    fn store_divert(&self, d: &DivertDeployment) -> Result<()> {
+        let Some(s) = self.ids.storage() else {
+            return Ok(());
+        };
+        let old = self.persisted().diverts.get(&d.name).copied();
+        let body = saranga_storage::RecordCodec::encode(&d.record());
+        let id = s
+            .store_configuration(crate::storage::ids::DIVERT_RECORD, body, old)
+            .map_err(Self::io)?;
+        self.persisted().diverts.insert(d.name.clone(), id);
+        Ok(())
+    }
+
+    /// A divert's journal record, recovered (`recoverDivertConfigurations`).
+    pub fn reload_divert_record(&self, record: i64, name: &str) {
+        self.persisted().diverts.insert(name.to_owned(), record);
+    }
+
+    /// Deletes a recovered divert record without deploying the divert
+    /// (`config-delete-diverts` FORCE).
+    pub fn forget_divert_record(&self, name: &str) {
+        let old = self.persisted().diverts.remove(name);
+        if let (Some(old), Some(s)) = (old, self.ids.storage())
+            && let Err(e) = s.delete_binding_record(old)
+        {
+            tracing::warn!("deleting the record of divert {name}: {e}");
+        }
+    }
+
+    /// `updateDivert`: the forwarding address, filter, transformer and
+    /// routing type `d` gives replace the divert's. False if there is no
+    /// such divert.
+    pub fn update_divert(
+        &self,
+        d: DivertDeployment,
+        transformers: &HashMap<String, TransformerFactory>,
+    ) -> Result<bool> {
+        let Some(old) = self.divert(&d.name) else {
+            return Ok(false);
+        };
+        let mut new = old.deployment.clone();
+        if !d.forwarding_address.is_empty() {
+            new.forwarding_address = d.forwarding_address;
+        }
+        new.filter = d.filter;
+        new.transformer = d.transformer;
+        new.routing_type = d.routing_type;
+        let mut replacement = self.build_divert(&new, transformers)?;
+        replacement.routing_name = old.routing_name.clone();
+        {
+            let mut state = self.write();
+            for entry in state.addresses.values_mut() {
+                if let Some(slot) = entry.diverts.iter_mut().find(|x| x.name == old.name) {
+                    *slot = Arc::new(replacement);
+                    break;
+                }
             }
         }
-        false
+        self.store_divert(&new)?;
+        Ok(true)
     }
 
     /// Swaps the address settings' match rules and gives every page store
@@ -1473,7 +1776,31 @@ impl PostOffice {
         &self,
         d: &DivertDeployment,
         transformers: &HashMap<String, TransformerFactory>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let divert = self.build_divert(d, transformers)?;
+        let mut state = self.write();
+        if state
+            .addresses
+            .values()
+            .any(|e| e.diverts.iter().any(|d| d.name == divert.name))
+        {
+            tracing::warn!("AMQ222017: Divert {} already exists", divert.name);
+            return Ok(false);
+        }
+        let Some(entry) = state.addresses.get_mut(&*divert.address) else {
+            return Err(BrokerError::address_does_not_exist(&divert.address));
+        };
+        entry.diverts.push(Arc::new(divert));
+        Ok(true)
+    }
+
+    /// `DivertImpl` for a deployment: its filter compiled and its
+    /// transformer made.
+    fn build_divert(
+        &self,
+        d: &DivertDeployment,
+        transformers: &HashMap<String, TransformerFactory>,
+    ) -> Result<Divert> {
         let transformer = match &d.transformer {
             None => None,
             Some((class, properties)) => match transformers.get(class) {
@@ -1485,7 +1812,7 @@ impl PostOffice {
                 }
             },
         };
-        let divert = Divert {
+        Ok(Divert {
             name: d.name.as_str().into(),
             routing_name: d
                 .routing_name
@@ -1504,21 +1831,8 @@ impl PostOffice {
             filter: self.filters.create(d.filter.as_deref())?,
             routing_type: d.routing_type,
             transformer,
-        };
-        let mut state = self.write();
-        if state
-            .addresses
-            .values()
-            .any(|e| e.diverts.iter().any(|d| d.name == divert.name))
-        {
-            tracing::warn!("AMQ222017: Divert {} already exists", divert.name);
-            return Ok(());
-        }
-        let Some(entry) = state.addresses.get_mut(&*divert.address) else {
-            return Err(BrokerError::address_does_not_exist(&divert.address));
-        };
-        entry.diverts.push(Arc::new(divert));
-        Ok(())
+            deployment: d.clone(),
+        })
     }
 
     /// Routes through the bindings of `address` and of every wildcard
@@ -1660,6 +1974,8 @@ pub struct Divert {
     pub filter: Option<FilterRef>,
     pub routing_type: DivertRoutingType,
     pub transformer: Option<Arc<dyn Transformer>>,
+    /// The configuration it was deployed from.
+    pub deployment: DivertDeployment,
 }
 
 /// `Transformer`: rewrites the copies a divert makes. Transformers are Rust
@@ -1695,6 +2011,82 @@ pub enum DivertRoutingType {
     Anycast,
     Strip,
     Pass,
+}
+
+impl DivertRoutingType {
+    /// The type's byte in `PersistedDivertConfiguration`.
+    pub fn to_byte(self) -> u8 {
+        match self {
+            Self::Multicast => 0,
+            Self::Anycast => 1,
+            Self::Strip => 2,
+            Self::Pass => 3,
+        }
+    }
+
+    pub fn from_byte(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => Self::Multicast,
+            1 => Self::Anycast,
+            2 => Self::Strip,
+            3 => Self::Pass,
+            _ => return None,
+        })
+    }
+}
+
+impl DivertDeployment {
+    /// `PersistedDivertConfiguration` of this divert.
+    pub fn record(&self) -> saranga_storage::codec::PersistedDivertConfiguration {
+        use saranga_buffer::JString;
+        saranga_storage::codec::PersistedDivertConfiguration {
+            name: Some(JString::from(self.name.as_str())),
+            address: Some(JString::from(self.address.as_str())),
+            forwarding_address: Some(JString::from(self.forwarding_address.as_str())),
+            routing_name: self.routing_name.as_deref().map(JString::from),
+            exclusive: self.exclusive,
+            filter_string: self.filter.as_deref().map(JString::from),
+            routing_type: self.routing_type.to_byte(),
+            transformer: self.transformer.as_ref().map(|(class, props)| {
+                saranga_storage::codec::TransformerConfiguration {
+                    class_name: JString::from(class.as_str()),
+                    properties: props
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                Some(JString::from(k.as_str())),
+                                Some(JString::from(v.as_str())),
+                            )
+                        })
+                        .collect(),
+                }
+            }),
+        }
+    }
+
+    /// The divert a `PersistedDivertConfiguration` records.
+    pub fn from_record(r: &saranga_storage::codec::PersistedDivertConfiguration) -> Self {
+        let text = |s: &Option<saranga_buffer::JString>| s.as_ref().map(|s| s.to_string_lossy());
+        Self {
+            name: text(&r.name).unwrap_or_default(),
+            routing_name: text(&r.routing_name),
+            address: text(&r.address).unwrap_or_default(),
+            forwarding_address: text(&r.forwarding_address).unwrap_or_default(),
+            exclusive: r.exclusive,
+            filter: text(&r.filter_string),
+            routing_type: DivertRoutingType::from_byte(r.routing_type)
+                .unwrap_or(DivertRoutingType::Strip),
+            transformer: r.transformer.as_ref().map(|t| {
+                (
+                    t.class_name.to_string_lossy(),
+                    t.properties
+                        .iter()
+                        .filter_map(|(k, v)| Some((text(k)?, text(v).unwrap_or_default())))
+                        .collect(),
+                )
+            }),
+        }
+    }
 }
 
 impl Divert {

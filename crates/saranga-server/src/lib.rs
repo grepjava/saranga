@@ -8,9 +8,11 @@
 
 pub mod config;
 pub mod core_protocol;
+mod disk;
 pub mod duplicate;
 pub mod error;
 pub mod large;
+pub mod management;
 pub mod message;
 pub mod node;
 pub mod paging;
@@ -226,6 +228,9 @@ pub struct BrokerConfig {
     pub bootstrap_users: Vec<(String, String, Vec<String>)>,
     /// The protocols besides Core the broker serves.
     pub protocols: Vec<Arc<dyn protocol::ProtocolManager>>,
+    /// The management address, the broker's name and what management
+    /// reports of the configuration.
+    pub management: management::ManagementConfig,
 }
 
 impl BrokerConfig {
@@ -254,6 +259,7 @@ impl BrokerConfig {
             users: None,
             bootstrap_users: Vec::new(),
             protocols: Vec::new(),
+            management: management::ManagementConfig::default(),
         }
     }
 }
@@ -341,7 +347,13 @@ pub struct Broker {
     /// Message-journal records the broker does not know, until the
     /// protocol that owns them takes them.
     extra_records: Mutex<Vec<storage::ExtraRecord>>,
+    management: management::Management,
+    /// Reads the configuration again, for `reloadConfigurationFile`.
+    config_loader: Mutex<Option<ConfigLoader>>,
 }
+
+/// Reads the configuration files again (`ReloadManager`).
+pub type ConfigLoader = Arc<dyn Fn() -> std::result::Result<reload::Reload, String> + Send + Sync>;
 
 impl Broker {
     /// Starts the broker: with persistence, takes the journal directory's
@@ -407,12 +419,28 @@ impl Broker {
             ),
             paging.clone(),
         );
-        if let Some(s) = &storage {
-            recovery::load_bindings(s, &post_office, config.users.as_deref())?;
-        }
+        let recovered = match &storage {
+            Some(s) => recovery::load_bindings(s, &post_office, config.users.as_deref())?,
+            None => Default::default(),
+        };
         reload::deploy_addresses(&post_office, &config.addresses);
+        // recoverStoredDiverts: a journaled divert no longer configured is
+        // deployed again, or forgotten under config-delete-diverts FORCE.
+        for d in &recovered.diverts {
+            if config.diverts.iter().any(|c| c.name == d.name) {
+                continue;
+            }
+            if post_office.settings(&d.address).config_delete_diverts {
+                post_office.forget_divert_record(&d.name);
+            } else if let Err(e) = post_office.deploy_divert(d, &config.transformers) {
+                tracing::warn!(
+                    "AMQ222314: Failed to recover stored divert configuration {}: {e}",
+                    d.name
+                );
+            }
+        }
         for d in &config.diverts {
-            if let Err(e) = post_office.deploy_divert(d, &config.transformers) {
+            if let Err(e) = post_office.deploy_divert_persisted(d, &config.transformers) {
                 tracing::warn!("divert {}: {e}", d.name);
             }
         }
@@ -480,6 +508,8 @@ impl Broker {
             .chain(config.protocols)
             .collect(),
             extra_records: Mutex::new(extra_records),
+            management: management::Management::new(config.management),
+            config_loader: Mutex::new(None),
         });
         spawn_transaction_reaper(&broker, config.transaction_timeout_scan_period);
         // loadProtocolServices: each protocol sets itself up once the
@@ -513,6 +543,41 @@ impl Broker {
 
     pub fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// The management service.
+    pub fn management(&self) -> &management::Management {
+        &self.management
+    }
+
+    /// Divert transformers by class name.
+    pub fn transformers(&self) -> &HashMap<String, postoffice::TransformerFactory> {
+        &self.transformers
+    }
+
+    /// How `reloadConfigurationFile` reads the configuration again.
+    pub fn set_config_loader(&self, loader: ConfigLoader) {
+        *self.config_loader.lock().unwrap_or_else(|e| e.into_inner()) = Some(loader);
+    }
+
+    /// `reloadConfigurationFile`: the configuration is read again and
+    /// reloaded now.
+    pub async fn reload_configuration_file(&self) -> std::result::Result<(), String> {
+        let loader = self
+            .config_loader
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(load) = loader {
+            self.reload(load()?);
+        }
+        Ok(())
+    }
+
+    /// `removeConsumers` of `destroyQueue`: the queue's consumers are
+    /// closed and their clients told (`ServerConsumer.disconnect`).
+    pub async fn disconnect_consumers(&self, queue: &queue::Queue) {
+        queue.disconnect_consumers().await;
     }
 
     /// The security store, when security is enabled.

@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<!-- Management through messages (Management.java): DLQ and ExpiryQueue for
+     every address, and a few configured addresses and queues. -->
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+   <core xmlns="urn:activemq:core">
+      <name>management</name>
+      <persistence-enabled>true</persistence-enabled>
+      <security-enabled>false</security-enabled>
+      <acceptors>
+         <acceptor name="artemis">tcp://0.0.0.0:61616?protocols=CORE,AMQP</acceptor>
+      </acceptors>
+      <address-settings>
+         <address-setting match="#">
+            <dead-letter-address>DLQ</dead-letter-address>
+            <expiry-address>ExpiryQueue</expiry-address>
+            <auto-create-queues>true</auto-create-queues>
+            <auto-create-addresses>true</auto-create-addresses>
+         </address-setting>
+      </address-settings>
+      <addresses>
+         <address name="DLQ"><anycast><queue name="DLQ"/></anycast></address>
+         <address name="ExpiryQueue"><anycast><queue name="ExpiryQueue"/></anycast></address>
+         <address name="configured"><anycast><queue name="configured"/></anycast></address>
+      </addresses>
+   </core>
+</configuration>

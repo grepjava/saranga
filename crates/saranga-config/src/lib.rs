@@ -29,7 +29,8 @@ mod wildcard;
 pub use acceptor::AcceptorConfig;
 pub use address_settings::{
     AddressFullMessagePolicy, AddressSettings, DeletionPolicy, DiskFullMessagePolicy,
-    PageFullMessagePolicy, SlowConsumerPolicy, SlowConsumerThresholdMeasurementUnit,
+    PageFullMessagePolicy, SettingValue, SlowConsumerPolicy, SlowConsumerThresholdMeasurementUnit,
+    java_name,
 };
 pub use bootstrap::{BootstrapConfig, BootstrapSecurity, file_uri_path};
 pub use broker::{

@@ -305,6 +305,11 @@ pub struct Storage {
 impl Storage {
     /// Opens both journals (`JournalStorageManager.start`); nothing is loaded
     /// yet.
+    /// The message journal's directory.
+    pub fn journal_directory(&self) -> &std::path::Path {
+        &self.cfg.messages.directory
+    }
+
     pub fn open(cfg: StorageConfig) -> StoreResult<Self> {
         let messages = Journal::open(cfg.messages.clone())?;
         messages.replaceable_record(ids::UPDATE_DELIVERY_COUNT);
@@ -954,6 +959,64 @@ impl Storage {
         let tx = self.generate_id();
         self.bindings.append_delete_tx(tx, id, Vec::new())?;
         self.bindings.append_commit(tx, true, None)
+    }
+
+    /// Adds a bindings record outside a transaction, synced
+    /// (`bindingsJournal.appendAddRecord(..., true)`), under a new ID it
+    /// returns.
+    pub fn add_binding_record(&self, user_type: u8, body: Vec<u8>) -> StoreResult<i64> {
+        let id = self.generate_id();
+        self.bindings.append_add(id, user_type, body, true, None)?;
+        Ok(id)
+    }
+
+    /// Deletes a bindings record outside a transaction, if it is there
+    /// (`tryAppendDeleteRecord`).
+    pub fn delete_binding_record(&self, id: i64) -> StoreResult<()> {
+        self.bindings.append_delete(id, true, None).map(|_| ())
+    }
+
+    /// `storeConfiguration`: a persisted configuration (address settings,
+    /// a divert) under a new record ID it returns. The record it replaces,
+    /// if any, is deleted in the same transaction; a new one is added
+    /// outside any.
+    pub fn store_configuration(
+        &self,
+        user_type: u8,
+        body: Vec<u8>,
+        replaces: Option<i64>,
+    ) -> StoreResult<i64> {
+        let id = self.generate_id();
+        match replaces {
+            Some(old) => {
+                let tx = self.generate_id();
+                self.bindings.append_delete_tx(tx, old, Vec::new())?;
+                self.bindings.append_add_tx(tx, id, user_type, body)?;
+                self.bindings.append_commit(tx, true, None)?;
+            }
+            None => self.bindings.append_add(id, user_type, body, true, None)?,
+        }
+        Ok(id)
+    }
+
+    /// `storeQueueStatus` with `PAUSED`.
+    pub fn store_queue_status(&self, queue_id: i64) -> StoreResult<i64> {
+        let body = saranga_storage::codec::QueueStatusEncoding {
+            queue_id,
+            status: 0,
+        }
+        .encode();
+        self.add_binding_record(crate::storage::ids::QUEUE_STATUS_RECORD, body)
+    }
+
+    /// `storeAddressStatus` with `PAUSED`.
+    pub fn store_address_status(&self, address_id: i64) -> StoreResult<i64> {
+        let body = saranga_storage::codec::AddressStatusEncoding {
+            address_id,
+            status: 0,
+        }
+        .encode();
+        self.add_binding_record(crate::storage::ids::ADDRESS_STATUS_RECORD, body)
     }
 }
 

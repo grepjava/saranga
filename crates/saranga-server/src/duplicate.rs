@@ -147,8 +147,17 @@ impl DuplicateIdCache {
             .collect()
     }
 
+    /// How many IDs it holds (`getMap().size()`).
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
     /// `clear`: every ID's record is deleted, in one transaction.
-    fn clear(&mut self, next_id: impl Fn() -> i64) {
+    pub fn clear(&mut self, next_id: impl Fn() -> i64) {
         let records: Vec<i64> = self.slots.iter().flatten().map(|(_, r)| *r).collect();
         self.slots.clear();
         self.index.clear();

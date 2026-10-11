@@ -212,7 +212,7 @@ fn reconcile_diverts(
             }
             post_office.destroy_divert(&d.name);
         }
-        if let Err(e) = post_office.deploy_divert(&d, transformers) {
+        if let Err(e) = post_office.deploy_divert_persisted(&d, transformers) {
             tracing::warn!("divert {}: {e}", d.name);
         }
     }

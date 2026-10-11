@@ -152,13 +152,38 @@ pub fn load_bindings(
     storage: &Storage,
     post_office: &PostOffice,
     users: Option<&crate::users::Users>,
-) -> Result<()> {
+) -> Result<RecoveredBindings> {
     let records = storage
         .load_bindings()
         .map_err(|e| corrupt("loading the bindings journal", e))?;
     let mut queues = Vec::new();
+    let mut out = RecoveredBindings::default();
+    let mut queue_status = Vec::new();
+    let mut address_status = Vec::new();
     for r in records {
         match r.user_record_type {
+            ids::ADDRESS_SETTING_RECORD_JSON => {
+                let s = saranga_storage::codec::PersistedAddressSettingJson::decode(&r.data)
+                    .map_err(|e| corrupt("address setting", e))?;
+                post_office.reload_address_settings(r.id, &text(&s.address_match), &text(&s.json));
+            }
+            ids::DIVERT_RECORD => {
+                let d = saranga_storage::codec::PersistedDivertConfiguration::decode(&r.data)
+                    .map_err(|e| corrupt("divert", e))?;
+                let d = crate::postoffice::DivertDeployment::from_record(&d);
+                post_office.reload_divert_record(r.id, &d.name);
+                out.diverts.push(d);
+            }
+            ids::QUEUE_STATUS_RECORD => {
+                let s = saranga_storage::codec::QueueStatusEncoding::decode(&r.data)
+                    .map_err(|e| corrupt("queue status", e))?;
+                queue_status.push((r.id, s));
+            }
+            ids::ADDRESS_STATUS_RECORD => {
+                let s = saranga_storage::codec::AddressStatusEncoding::decode(&r.data)
+                    .map_err(|e| corrupt("address status", e))?;
+                address_status.push((r.id, s));
+            }
             ids::ADDRESS_BINDING_RECORD => {
                 let b = PersistentAddressBindingEncoding::decode(&r.data)
                     .map_err(|e| corrupt("address binding", e))?;
@@ -190,7 +215,34 @@ pub fn load_bindings(
             tracing::warn!("{e}");
         }
     }
-    Ok(())
+    // A pause persisted for a queue or address that is gone is dropped.
+    let by_id: HashMap<i64, Queue> = post_office
+        .queues()
+        .into_iter()
+        .map(|q| (q.id(), q))
+        .collect();
+    for (record, s) in queue_status {
+        match by_id.get(&s.queue_id) {
+            Some(q) if s.status == 0 => q.reload_pause(record),
+            _ => {
+                let _ = storage.delete_binding_record(record);
+            }
+        }
+    }
+    for (record, s) in address_status {
+        if s.status != 0 || !post_office.reload_address_pause(s.address_id, record) {
+            let _ = storage.delete_binding_record(record);
+        }
+    }
+    Ok(out)
+}
+
+/// What the bindings journal holds besides addresses, queues and users,
+/// for the broker to apply once its configuration is deployed.
+#[derive(Debug, Default)]
+pub struct RecoveredBindings {
+    /// Diverts journaled by `storeDivertConfiguration`.
+    pub diverts: Vec<crate::postoffice::DivertDeployment>,
 }
 
 /// `loadMessageJournal` with `handleAddMessage` and the prepared
