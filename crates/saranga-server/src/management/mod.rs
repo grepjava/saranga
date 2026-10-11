@@ -26,6 +26,7 @@ use saranga_message::{CoreMessage, message_type};
 
 use crate::Broker;
 pub use json::Json;
+use saranga_config::CheckType;
 pub(crate) use security::recovered as recovered_security_setting;
 
 /// `ManagementHelper.HDR_RESOURCE_NAME`.
@@ -56,6 +57,11 @@ pub struct ManagementConfig {
     pub notification_address: String,
     /// `suppress-session-notifications`.
     pub suppress_session_notifications: bool,
+    /// `management-rbac-prefix`, when `management-message-rbac` is on.
+    pub rbac_prefix: Option<String>,
+    /// `view-permission-method-match-pattern`, matched against the whole
+    /// method name.
+    pub view_permission: Option<regex::Regex>,
     /// The broker's `name`.
     pub name: String,
     /// The parsed `broker.xml`, for the attributes that report it.
@@ -70,12 +76,29 @@ impl Default for ManagementConfig {
             address: "activemq.management".to_owned(),
             notification_address: "activemq.notifications".to_owned(),
             suppress_session_notifications: false,
+            rbac_prefix: None,
+            view_permission: view_permission("^(get|is|count|list|browse|query).*$"),
             name: "localhost".to_owned(),
             file: None,
             file_path: None,
         }
     }
 }
+
+/// `Pattern.compile` of `view-permission-method-match-pattern`, for
+/// `Matcher.matches`: the whole name must match. `None` if it is not a
+/// pattern (the parser has refused it already).
+pub fn view_permission(pattern: &str) -> Option<regex::Regex> {
+    regex::Regex::new(&format!("^(?:{pattern})$")).ok()
+}
+
+/// Who sends a management message, for `management-message-rbac`: the
+/// security store and the sending session. `None` for the broker's own
+/// callers.
+pub type Caller<'a> = Option<(
+    &'a saranga_security::SecurityStore,
+    &'a saranga_security::SecurityAuth,
+)>;
 
 /// The broker's management service.
 pub struct Management {
@@ -113,6 +136,29 @@ impl Management {
         self.started_at
     }
 
+    /// `securityCheck` with `permissionForInvoke`: with
+    /// `management-message-rbac`, the view permission (a method the view
+    /// pattern matches) or the edit permission on
+    /// `<prefix>.<resource>.<method>`.
+    fn security_check(&self, caller: Caller, resource: &str, method: &str) -> Result<(), String> {
+        let (Some(prefix), Some((store, auth))) = (&self.config.rbac_prefix, caller) else {
+            return Ok(());
+        };
+        let view = self
+            .config
+            .view_permission
+            .as_ref()
+            .is_some_and(|p| p.is_match(method));
+        let check = if view {
+            CheckType::View
+        } else {
+            CheckType::Edit
+        };
+        store
+            .check(&format!("{prefix}.{resource}.{method}"), None, check, auth)
+            .map_err(|e| e.0)
+    }
+
     fn resource(&self, broker: &Broker, name: &str) -> Option<Resource> {
         let po = broker.post_office();
         if name == "broker" {
@@ -137,6 +183,7 @@ impl Management {
         broker: &Arc<Broker>,
         resource: &str,
         attribute: &str,
+        caller: Caller<'_>,
     ) -> Outcome {
         let problem = || format!("Problem while retrieving attribute {attribute}");
         let Some(r) = self.resource(broker, resource) else {
@@ -154,7 +201,19 @@ impl Management {
             Resource::Divert(d) => Ok(divert_attribute(d, &upper)),
         };
         match found {
-            Ok(Some(v)) => Ok(v),
+            // A boolean attribute is read through its `is` method.
+            Ok(Some(v)) => {
+                let getter = if matches!(v, Json::Bool(_)) {
+                    "is"
+                } else {
+                    "get"
+                };
+                let method = format!("{getter}{upper}");
+                match self.security_check(caller, resource, &method) {
+                    Ok(()) => Ok(v),
+                    Err(_) => Err(problem()),
+                }
+            }
             Ok(None) | Err(_) => Err(problem()),
         }
     }
@@ -166,12 +225,14 @@ impl Management {
         resource: &str,
         operation: &str,
         params: &[Json],
+        caller: Caller<'_>,
     ) -> Outcome {
         let Some(r) = self.resource(broker, resource) else {
             return Err(format!(
                 "AMQ229067: Cannot find resource with name {resource}"
             ));
         };
+        self.security_check(caller, resource, operation)?;
         let call = args::Call {
             op: operation,
             params,
@@ -214,7 +275,12 @@ impl Management {
     /// `handleMessage`: runs the request a message to the management
     /// address carries and returns the reply, to go to its reply-to
     /// address.
-    pub async fn handle_message(&self, broker: &Arc<Broker>, request: &CoreMessage) -> CoreMessage {
+    pub async fn handle_message(
+        &self,
+        broker: &Arc<Broker>,
+        request: &CoreMessage,
+        caller: Caller<'_>,
+    ) -> CoreMessage {
         let mut reply = CoreMessage {
             message_id: broker.post_office().ids().next(),
             message_type: message_type::TEXT,
@@ -241,7 +307,9 @@ impl Management {
         let outcome = if let Some(operation) = prop(HDR_OPERATION_NAME) {
             match operation_parameters(request) {
                 Ok(params) => {
-                    let o = self.invoke(broker, &resource, &operation, &params).await;
+                    let o = self
+                        .invoke(broker, &resource, &operation, &params, caller)
+                        .await;
                     if let Err(e) = &o {
                         tracing::warn!("AMQ222140: Error invoking {operation} on {resource}: {e}");
                     }
@@ -250,7 +318,7 @@ impl Management {
                 Err(e) => Some(Err(e)),
             }
         } else if let Some(attribute) = prop(HDR_ATTRIBUTE) {
-            let o = self.attribute(broker, &resource, &attribute).await;
+            let o = self.attribute(broker, &resource, &attribute, caller).await;
             if let Err(e) = &o {
                 tracing::warn!("AMQ222141: Error getting {attribute} on {resource}: {e}");
             }

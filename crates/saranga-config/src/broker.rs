@@ -384,6 +384,14 @@ pub struct BrokerConfig {
     /// `suppress-session-notifications`: no `SESSION_CREATED` and
     /// `SESSION_CLOSED` notifications.
     pub suppress_session_notifications: bool,
+    /// `management-message-rbac`: management messages also need the view
+    /// or edit permission on `<prefix>.<resource>.<method>`.
+    pub management_message_rbac: bool,
+    /// `management-rbac-prefix`.
+    pub management_rbac_prefix: String,
+    /// `view-permission-method-match-pattern`: the methods that need only
+    /// the view permission.
+    pub view_permission_method_match_pattern: String,
     /// `internal-naming-prefix`: the start of the names of the broker's own
     /// resources.
     pub internal_naming_prefix: String,
@@ -525,6 +533,9 @@ impl Default for BrokerConfig {
             management_address: "activemq.management".to_owned(),
             management_notification_address: "activemq.notifications".to_owned(),
             suppress_session_notifications: false,
+            management_message_rbac: false,
+            management_rbac_prefix: "mops".to_owned(),
+            view_permission_method_match_pattern: "^(get|is|count|list|browse|query).*$".to_owned(),
             internal_naming_prefix: "$.artemis.internal.".to_owned(),
             mqtt_session_scan_interval: 5000,
             mqtt_session_state_persistence_timeout: 5000,

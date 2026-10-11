@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<!-- management-message-rbac (Rbac.java): management messages need the view
+     or edit permission on mops.<resource>.<method> as well as manage on the
+     management address. -->
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+   <core xmlns="urn:activemq:core">
+      <name>rbac</name>
+      <persistence-enabled>false</persistence-enabled>
+      <security-enabled>true</security-enabled>
+      <management-message-rbac>true</management-message-rbac>
+      <acceptors>
+         <acceptor name="artemis">tcp://0.0.0.0:61616?protocols=CORE</acceptor>
+      </acceptors>
+      <security-settings>
+         <security-setting match="#">
+            <permission type="createNonDurableQueue" roles="amq,viewers,managers"/>
+            <permission type="deleteNonDurableQueue" roles="amq,viewers,managers"/>
+            <permission type="createAddress" roles="amq,viewers,managers"/>
+            <permission type="deleteAddress" roles="amq,viewers,managers"/>
+            <permission type="consume" roles="amq,viewers,managers"/>
+            <permission type="send" roles="amq,viewers,managers"/>
+            <permission type="manage" roles="amq,viewers,managers"/>
+         </security-setting>
+         <security-setting match="mops.#">
+            <permission type="view" roles="amq,viewers"/>
+            <permission type="edit" roles="amq"/>
+         </security-setting>
+         <security-setting match="mops.queue.configured.*">
+            <permission type="view" roles="amq,viewers"/>
+            <permission type="edit" roles="amq,viewers"/>
+         </security-setting>
+         <security-setting match="mops.broker.isStarted">
+            <permission type="view" roles="amq,viewers,managers"/>
+         </security-setting>
+      </security-settings>
+      <addresses>
+         <address name="configured"><anycast><queue name="configured"/></anycast></address>
+      </addresses>
+   </core>
+</configuration>

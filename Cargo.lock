@@ -1748,6 +1748,7 @@ name = "saranga-server"
 version = "0.0.1"
 dependencies = [
  "libc",
+ "regex",
  "saranga-buffer",
  "saranga-config",
  "saranga-core-protocol",

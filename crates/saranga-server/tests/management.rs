@@ -29,7 +29,7 @@ async fn start(dir: &Path) -> Arc<Broker> {
 async fn op(broker: &Arc<Broker>, resource: &str, operation: &str, params: Vec<Json>) -> Json {
     broker
         .management()
-        .invoke(broker, resource, operation, &params)
+        .invoke(broker, resource, operation, &params, None)
         .await
         .unwrap_or_else(|e| panic!("{operation}: {e}"))
 }
@@ -37,7 +37,7 @@ async fn op(broker: &Arc<Broker>, resource: &str, operation: &str, params: Vec<J
 async fn attr(broker: &Arc<Broker>, resource: &str, attribute: &str) -> Json {
     broker
         .management()
-        .attribute(broker, resource, attribute)
+        .attribute(broker, resource, attribute, None)
         .await
         .unwrap_or_else(|e| panic!("{attribute}: {e}"))
 }
@@ -166,7 +166,7 @@ async fn management_state_survives_a_restart() {
     assert!(
         broker
             .management()
-            .attribute(&broker, "divert.d", "ForwardingAddress")
+            .attribute(&broker, "divert.d", "ForwardingAddress", None)
             .await
             .is_err()
     );

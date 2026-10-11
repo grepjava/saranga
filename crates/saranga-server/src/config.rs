@@ -353,6 +353,12 @@ impl BrokerConfig {
                 address: config.management_address.clone(),
                 notification_address: config.management_notification_address.clone(),
                 suppress_session_notifications: config.suppress_session_notifications,
+                rbac_prefix: config
+                    .management_message_rbac
+                    .then(|| config.management_rbac_prefix.clone()),
+                view_permission: crate::management::view_permission(
+                    &config.view_permission_method_match_pattern,
+                ),
                 name: config.name.clone(),
                 file: Some(Arc::new(config.clone())),
                 file_path: None,

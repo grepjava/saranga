@@ -942,7 +942,11 @@ impl ServerSession {
             return Err(e);
         }
         let broker = self.broker.clone();
-        let mut reply = broker.management().handle_message(&broker, &request).await;
+        let caller = broker.security().map(|s| (&**s, &self.auth));
+        let mut reply = broker
+            .management()
+            .handle_message(&broker, &request, caller)
+            .await;
         let Some(reply_to) = crate::message::string_property(&request, crate::management::REPLY_TO)
         else {
             return Ok(());

@@ -539,6 +539,18 @@ fn parse_scalars(
     if let Some(v) = s.bool("suppress-session-notifications") {
         config.suppress_session_notifications = v;
     }
+    if let Some(v) = s.string("view-permission-method-match-pattern") {
+        // Pattern.compile at startup.
+        let name = "view-permission-method-match-pattern";
+        regex::Regex::new(&v).map_err(|e| ConfigError::invalid(name, &v, e.to_string()))?;
+        config.view_permission_method_match_pattern = v;
+    }
+    if let Some(v) = s.bool("management-message-rbac") {
+        config.management_message_rbac = v;
+    }
+    if let Some(v) = s.string("management-rbac-prefix") {
+        config.management_rbac_prefix = v;
+    }
     if let Some(v) = s.bool("large-message-sync") {
         config.large_message_sync = v;
     }
