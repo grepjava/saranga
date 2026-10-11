@@ -10,8 +10,8 @@ Saranga is built in twelve phases. Each one ends with something runnable, and it
 | 3 | Persistence, on-disk compatible (first usable release) | Done |
 | 4 | Queue semantics parity | Done |
 | 5 | Paging and large messages | Done |
-| 6 | Config and security | Not started |
-| 7 | Protocols (AMQP, MQTT, STOMP, OpenWire, WebSockets) | Not started |
+| 6 | Config and security | Done |
+| 7 | Protocols (AMQP, MQTT, STOMP, OpenWire, WebSockets) | In progress |
 | 8 | Management and operations | Not started |
 | 9 | High availability | Not started |
 | 10 | Clustering and federation | Not started |
@@ -214,6 +214,15 @@ The differences from Artemis are listed in COMPAT.md.
 **Exit check**
 - The client test matrix passes for every protocol: Qpid JMS, the ActiveMQ 5 client, Paho, a STOMP client, and Python, .NET and Rust AMQP clients.
 - Messages convert correctly between protocols, for example MQTT in and JMS out.
+
+**Stages**, each committed on its own:
+1. **Groundwork.** Protocol detection on one port from the first 8 bytes, as `ProtocolHandler` does, honouring each acceptor's `protocols`. A `ProtocolManager` trait that protocol crates implement and `saranga run` registers. A protocol-neutral server session (`ServerSessionImpl`) split out of the Core session, which every protocol drives.
+2. **STOMP** 1.0, 1.1 and 1.2: frames, heart-beating, subscriptions and ack modes, transactions, receipts and durable subscriptions.
+3. **MQTT** 3.1, 3.1.1 and 5: sessions and their persisted state, retained messages, wills, shared subscriptions, QoS 0, 1 and 2, and the MQTT 5 properties.
+4. **AMQP 1.0**: the type codec, SASL, connections, sessions and links, flow control, transactions, durable subscriptions, AMQP messages kept in their own format in the journal and in pages (as `AMQPMessagePersisterV3` writes them), and conversion to and from Core.
+5. **OpenWire**: the marshallers for every version, the prefetch model, advisories and virtual topics.
+6. **WebSockets** for every protocol.
+7. **Exit check**: the client matrix and conversion between protocols.
 
 ## Phase 8: Management and operations
 

@@ -1,12 +1,9 @@
 //! A Core session: one task handling one channel's packets in order.
 //! Ported from `ServerSessionPacketHandler` (dispatch, responses and
-//! confirmations) and `ServerSessionImpl` (sends, consumers, acknowledgement
-//! and local transactions).
+//! confirmations); the work itself is the protocol-neutral
+//! [`ServerSession`].
 
-use saranga_config::CheckType;
-use saranga_security::{Authenticated, SecurityAuth};
-
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use saranga_buffer::{JString, SimpleString};
@@ -23,22 +20,19 @@ use saranga_core_protocol::packets::session::{
 };
 use saranga_core_protocol::packets::xa::{
     SessionXAGetInDoubtXidsResponseMessage, SessionXAGetTimeoutResponseMessage,
-    SessionXAResponseMessage, SessionXASetTimeoutResponseMessage, Xid,
+    SessionXAResponseMessage, SessionXASetTimeoutResponseMessage,
 };
 use saranga_core_protocol::{ErrorType, Flagged, Packet, version};
 use saranga_message::CoreMessage;
+use saranga_security::Authenticated;
 use tokio::sync::mpsc;
 
 use super::{ConnShared, CoreDeliverySink};
-use crate::large::{LargeBody, LargeWriter};
-use crate::message::{MessageRef, ServerMessage, routing_type};
-use crate::postoffice::{
-    BindingQueryResult, Creator, QueueQueryResult, QueueSpec, RoutingTypes, queue_name_of,
-};
-use crate::queue::{ConsumerId, ConsumerRegistration, Queue};
-use crate::storage::{Pending, Storage};
-use crate::transaction::{self, Outcome, Transaction, TxError, TxRef, TxState, XaError, xa_code};
-use crate::{Broker, BrokerError, Name, Result, RoutingType};
+use crate::large::LargeWriter;
+use crate::postoffice::{BindingQueryResult, QueueQueryResult, QueueSpec, RoutingTypes};
+use crate::session::{Completion, ServerSession, SessionOptions};
+use crate::transaction::{TxError, XaError, xa_code};
+use crate::{Broker, BrokerError, Result, RoutingType};
 
 /// What the connection hands a session task.
 pub(crate) enum SessionInput {
@@ -64,12 +58,6 @@ pub(crate) struct CreateSession {
     pub client_id: Option<String>,
 }
 
-struct ServerConsumer {
-    id: ConsumerId,
-    queue: Queue,
-    browse_only: bool,
-}
-
 /// `ChannelImpl.confirm` state, used when the client set a confirmation
 /// window.
 struct Confirmations {
@@ -82,10 +70,7 @@ struct Confirmations {
 /// lined up are done (`OperationContext.executeOnCompletion` with
 /// `doConfirmAndResponse`).
 struct Done {
-    waits: Vec<Pending>,
-    /// Queue updates that must follow the journal writes
-    /// (`afterCompleteOperations`): routed references, committed outcomes.
-    actions: Vec<Box<dyn FnOnce() + Send>>,
+    completion: Completion,
     request: Request,
     response: Option<Packet>,
     flush: bool,
@@ -101,24 +86,13 @@ async fn completer(
     mut rx: mpsc::UnboundedReceiver<Done>,
 ) {
     while let Some(done) = rx.recv().await {
-        let mut failure = None;
-        for w in done.waits {
-            if let Err(e) = w.wait().await {
-                failure.get_or_insert(e);
-            }
-        }
-        if failure.is_none() {
-            for action in done.actions {
-                action();
-            }
-        }
-        let response = match failure {
+        let response = match done.completion.wait().await {
             // OperationContext.onError: the client gets the I/O error.
-            Some(e) => Some(exception_packet(
+            Err(e) => Some(exception_packet(
                 done.request,
                 &BrokerError::new(ErrorType::IoError, e.to_string()),
             )),
-            None => done.response,
+            Ok(()) => done.response,
         };
         let failed = matches!(
             response,
@@ -170,40 +144,16 @@ fn exception_packet(request: Request, e: &BrokerError) -> Packet {
 }
 
 pub(crate) struct CoreSession {
+    session: ServerSession,
     broker: Arc<Broker>,
     conn: Arc<ConnShared>,
     channel_id: i64,
-    name: String,
-    /// Who the session acts as, for permission checks.
-    auth: SecurityAuth,
-    /// The user the security manager validated (`getValidatedUser`).
-    validated_user: Option<String>,
     /// The size of the chunks large messages are sent to consumers in.
     min_large_message_size: i32,
-    /// XA sessions work in the transaction of the last `xaStart`, or in
-    /// none.
-    xa: bool,
-    auto_commit_sends: bool,
-    auto_commit_acks: bool,
-    pre_acknowledge: bool,
-    default_address: Option<Name>,
-    started: bool,
-    closed: bool,
-    consumers: BTreeMap<i64, ServerConsumer>,
     producers: HashMap<i32, Option<String>>,
-    /// The current transaction: always one for a local session.
-    tx: Option<TxRef>,
-    /// An XA branch ended but not yet prepared, committed or rolled back
-    /// (`pendingTX`), rolled back if the client fails.
-    pending_tx: Option<TxRef>,
-    timeout_seconds: i32,
     /// The large message being received (`currentLargeMessage`): its
     /// headers, and its body so far.
     large: Option<(CoreMessage, LargeWriter)>,
-    /// Journal writes lined up by the request being handled.
-    ops: Vec<Pending>,
-    /// Queue updates to make once those writes are done.
-    actions: Vec<Box<dyn FnOnce() + Send>>,
     completer: mpsc::UnboundedSender<Done>,
 }
 
@@ -250,10 +200,7 @@ impl CoreSession {
         request: CreateSession,
         authenticated: Authenticated,
     ) -> Self {
-        let tx =
-            (!request.xa).then(|| Transaction::new_ref(broker.post_office().ids().next(), None));
         let (completer_tx, completer_rx) = mpsc::unbounded_channel();
-        let security_info = conn.security_info();
         tokio::spawn(completer(
             conn.clone(),
             request.channel_id,
@@ -264,34 +211,29 @@ impl CoreSession {
             },
             completer_rx,
         ));
+        let session = ServerSession::new(
+            broker.clone(),
+            conn.client.clone(),
+            SessionOptions {
+                name: request.name,
+                username: request.username,
+                password: request.password,
+                xa: request.xa,
+                auto_commit_sends: request.auto_commit_sends,
+                auto_commit_acks: request.auto_commit_acks,
+                pre_acknowledge: request.pre_acknowledge,
+                default_address: request.default_address,
+            },
+            authenticated,
+        );
         Self {
+            session,
             broker,
             conn,
             channel_id: request.channel_id,
-            name: request.name,
-            auth: SecurityAuth {
-                username: request.username,
-                password: request.password,
-                connection: security_info,
-                subject: authenticated.subject,
-            },
-            validated_user: authenticated.validated_user,
             min_large_message_size: request.min_large_message_size,
-            xa: request.xa,
-            auto_commit_sends: request.auto_commit_sends,
-            auto_commit_acks: request.auto_commit_acks,
-            pre_acknowledge: request.pre_acknowledge,
-            default_address: request.default_address.map(Into::into),
-            started: false,
-            closed: false,
-            consumers: BTreeMap::new(),
             producers: HashMap::new(),
-            tx,
-            pending_tx: None,
-            timeout_seconds: -1,
             large: None,
-            ops: Vec::new(),
-            actions: Vec::new(),
             completer: completer_tx,
         }
     }
@@ -301,7 +243,7 @@ impl CoreSession {
             match input {
                 SessionInput::Packet(packet, size) => {
                     self.handle(*packet, size).await;
-                    if self.closed {
+                    if self.session.is_closed() {
                         break;
                     }
                 }
@@ -311,22 +253,14 @@ impl CoreSession {
                 }
             }
         }
-        if !self.closed {
+        if !self.session.is_closed() {
             self.close(true).await;
         }
     }
 
-    /// Routing on behalf of this session: its security checks and user.
-    fn creator(&self) -> Creator<'_> {
-        Creator {
-            security: self.broker.security().map(|s| (&**s, &self.auth)),
-            user: self.validated_user.as_deref(),
-        }
-    }
-
-    /// `ServerSessionImpl.securityCheck`.
-    fn security_check(&self, address: &str, queue: Option<&str>, check: CheckType) -> Result<()> {
-        self.creator().check(address, queue, check)
+    async fn close(&mut self, failed: bool) {
+        self.session.close(failed).await;
+        self.producers.clear();
     }
 
     fn send(&self, packet: impl Into<Packet>) {
@@ -348,31 +282,6 @@ impl CoreSession {
         }
     }
 
-    fn storage(&self) -> Option<Arc<Storage>> {
-        self.broker.post_office().ids().storage().cloned()
-    }
-
-    /// `newTransaction`, with its journal ID.
-    fn new_tx(&self, xid: Option<Xid>) -> TxRef {
-        Transaction::new_ref(self.broker.post_office().ids().next(), xid)
-    }
-
-    /// Journals a finished transaction's record, then applies it to the
-    /// queues: once the record is written when `defer` (commits), at once
-    /// otherwise (rollbacks).
-    fn finish(&mut self, mut outcome: Outcome, defer: bool) -> Result<()> {
-        let storage = self.storage();
-        if let Some(p) = outcome.write(storage.as_deref())? {
-            self.ops.push(p);
-        }
-        if defer && storage.is_some() {
-            self.actions.push(Box::new(move || outcome.apply()));
-        } else {
-            outcome.apply();
-        }
-        Ok(())
-    }
-
     fn exception(&self, request: Request, e: &BrokerError) -> Packet {
         exception_packet(request, e)
     }
@@ -381,8 +290,7 @@ impl CoreSession {
     /// up.
     fn respond(&mut self, request: Request, response: Option<Packet>, flush: bool) {
         let _ = self.completer.send(Done {
-            waits: std::mem::take(&mut self.ops),
-            actions: std::mem::take(&mut self.actions),
+            completion: self.session.take_completion(),
             request,
             response,
             flush,
@@ -403,10 +311,32 @@ impl CoreSession {
             Ok(None) => None,
             Err(e) if requires_response => Some(self.exception(request, &e)),
             Err(e) => {
-                tracing::warn!(session = %self.name, "{e}");
+                tracing::warn!(session = %self.session.name(), "{e}");
                 None
             }
         }
+    }
+
+    /// `ServerSessionImpl.send` of a whole message, or of a large one whose
+    /// body has arrived.
+    async fn send_message(
+        &mut self,
+        message: CoreMessage,
+        large: Option<Arc<crate::large::LargeBody>>,
+    ) -> Result<Option<Packet>> {
+        self.session.send(message, large).await.map(|()| None)
+    }
+
+    async fn acknowledge(
+        &mut self,
+        consumer_id: i64,
+        message_id: i64,
+        individual: bool,
+    ) -> Result<Option<Packet>> {
+        self.session
+            .acknowledge(consumer_id, message_id, individual)
+            .await
+            .map(|()| None)
     }
 
     async fn handle(&mut self, packet: Packet, size: usize) {
@@ -443,15 +373,8 @@ impl CoreSession {
                 false,
             ),
             Packet::SessionExpireMessage(p) => {
-                // ServerSessionImpl.expire
-                let result = match self.consumers.get(&p.consumer_id) {
-                    Some(c) => {
-                        c.queue.expire(c.id, p.message_id);
-                        Ok(None)
-                    }
-                    None => Err(BrokerError::consumer_doesnt_exist(p.consumer_id)),
-                };
-                (false, result, false)
+                let result = self.session.expire(p.consumer_id, p.message_id);
+                (false, result.map(|()| None), false)
             }
             Packet::SessionRequestProducerCreditsMessage(p) => {
                 // requestProducerCredits: a full address under BLOCK grants
@@ -459,7 +382,7 @@ impl CoreSession {
                 let store = self
                     .broker
                     .post_office()
-                    .paging_store(self.remove_prefix(&p.address.to_string_lossy()));
+                    .paging_store(self.session.remove_prefix(&p.address.to_string_lossy()));
                 let (conn, channel) = (self.conn.clone(), self.channel_id);
                 let (credits, address) = (p.credits, p.address.clone());
                 let grant = Box::new(move || {
@@ -476,20 +399,22 @@ impl CoreSession {
                 (false, Ok(None), false)
             }
             Packet::SessionConsumerFlowCreditMessage(p) => {
-                if let Some(c) = self.consumers.get(&p.consumer_id) {
-                    c.queue.credits(c.id, p.credits);
-                }
+                self.session.consumer_credits(p.consumer_id, p.credits);
                 (false, Ok(None), false)
             }
             Packet::SessionCreateConsumerMessage(p) => {
                 let queue_name = p.queue_name.to_string_lossy();
+                let sink = self.sink_factory();
+                let queue_name = self.session.remove_prefix(&queue_name).to_owned();
                 let result = self
+                    .session
                     .create_consumer(
                         p.id,
-                        self.remove_prefix(&queue_name).to_owned().as_str(),
+                        &queue_name,
                         p.filter_string.map(|f| f.to_string_lossy()),
                         p.priority,
                         p.browse_only,
+                        sink,
                     )
                     .await;
                 let result = result.map(|()| {
@@ -504,24 +429,10 @@ impl CoreSession {
                     .iter()
                     .filter_map(|&b| RoutingType::from_byte(b))
                     .for_each(|t| types.add(t));
-                // `getAddressAndRoutingType`: a prefix names the routing type.
-                let address = p.address.to_string_lossy();
-                let (address, prefixed) = self.strip_prefix(&address);
-                let address = address.to_owned();
-                if let Some(t) = prefixed {
-                    types = RoutingTypes::of(t);
-                }
                 let result = self
-                    .security_check(&address, None, CheckType::CreateAddress)
-                    .and_then(|()| {
-                        self.broker.post_office().add_or_update_address(
-                            &address,
-                            types,
-                            p.auto_created,
-                            false,
-                        )
-                    })
-                    .map(|_| None);
+                    .session
+                    .create_address(&p.address.to_string_lossy(), types, p.auto_created)
+                    .map(|()| None);
                 (p.requires_response, result, false)
             }
             Packet::CreateQueueMessage(p) => {
@@ -531,10 +442,10 @@ impl CoreSession {
                 spec.filter_string = p.filter_string.map(|f| f.to_string_lossy());
                 spec.durable = p.durable;
                 spec.temporary = p.temporary;
-                self.unprefix_queue(&mut spec);
+                self.session.unprefix_queue(&mut spec);
                 (
                     p.requires_response,
-                    self.create_queue(spec).map(|()| None),
+                    self.session.create_queue(spec).map(|_| None),
                     false,
                 )
             }
@@ -563,10 +474,10 @@ impl CoreSession {
                 spec.ring_size = p.ring_size.0;
                 spec.enabled = p.enabled.0;
                 spec.group_rebalance_pause_dispatch = p.group_rebalance_pause_dispatch.0;
-                self.unprefix_queue(&mut spec);
+                self.session.unprefix_queue(&mut spec);
                 (
                     p.requires_response,
-                    self.create_queue(spec).map(|()| None),
+                    self.session.create_queue(spec).map(|_| None),
                     false,
                 )
             }
@@ -578,7 +489,7 @@ impl CoreSession {
                 spec.durable = p.durable;
                 (
                     p.requires_response,
-                    self.create_shared_queue(spec).map(|()| None),
+                    self.session.create_shared_queue(spec).map(|()| None),
                     false,
                 )
             }
@@ -607,13 +518,14 @@ impl CoreSession {
                 spec.group_rebalance_pause_dispatch = p.group_rebalance_pause_dispatch.0;
                 (
                     p.requires_response,
-                    self.create_shared_queue(spec).map(|()| None),
+                    self.session.create_shared_queue(spec).map(|()| None),
                     false,
                 )
             }
             Packet::SessionDeleteQueueMessage(p) => (
                 true,
-                self.delete_queue(&p.queue_name.to_string_lossy())
+                self.session
+                    .delete_queue(&p.queue_name.to_string_lossy())
                     .map(|()| None),
                 false,
             ),
@@ -627,19 +539,20 @@ impl CoreSession {
                 (true, Ok(Some(response)), false)
             }
             Packet::SessionCommitMessage(_) | Packet::SessionCommitMessageV2(_) => {
-                (true, self.commit().map(|()| None), false)
+                (true, self.session.commit().map(|()| None), false)
             }
             Packet::RollbackMessage(p) => {
-                self.rollback(p.consider_last_message_as_delivered, false)
+                self.session
+                    .rollback(p.consider_last_message_as_delivered, false)
                     .await;
                 (true, Ok(None), false)
             }
             Packet::SessionStart(_) => {
-                self.set_started(true).await;
+                self.session.set_started(true).await;
                 (false, Ok(None), false)
             }
             Packet::SessionStop(_) => {
-                self.set_started(false).await;
+                self.session.set_started(false).await;
                 (true, Ok(None), false)
             }
             Packet::SessionCloseMessage(_) => {
@@ -647,18 +560,16 @@ impl CoreSession {
                 (true, Ok(None), true)
             }
             Packet::SessionConsumerCloseMessage(p) => {
-                self.close_consumer(p.consumer_id, false).await;
+                self.session.close_consumer(p.consumer_id, false).await;
                 (true, Ok(None), false)
             }
             Packet::SessionForceConsumerDelivery(p) => {
-                if let Some(c) = self.consumers.get(&p.consumer_id) {
-                    c.queue.force_delivery(c.id, p.sequence);
-                }
+                self.session.force_delivery(p.consumer_id, p.sequence);
                 (false, Ok(None), false)
             }
             Packet::SessionAddMetaDataMessage(p) => {
                 self.broker.add_session_metadata(
-                    &self.name,
+                    self.session.name(),
                     &p.key.to_string_lossy(),
                     &p.data.to_string_lossy(),
                 );
@@ -666,7 +577,7 @@ impl CoreSession {
             }
             Packet::SessionAddMetaDataMessageV2(p) => {
                 self.broker.add_session_metadata(
-                    &self.name,
+                    self.session.name(),
                     &p.key.to_string_lossy(),
                     &p.data.to_string_lossy(),
                 );
@@ -674,14 +585,15 @@ impl CoreSession {
             }
             Packet::SessionUniqueAddMetaDataMessage(p) => {
                 let (key, data) = (p.key.to_string_lossy(), p.data.to_string_lossy());
-                let result = if self
-                    .broker
-                    .add_unique_session_metadata(&self.name, &key, &data)
-                {
-                    Ok(None)
-                } else {
-                    Err(BrokerError::duplicate_metadata(&key, &data))
-                };
+                let result =
+                    if self
+                        .broker
+                        .add_unique_session_metadata(self.session.name(), &key, &data)
+                    {
+                        Ok(None)
+                    } else {
+                        Err(BrokerError::duplicate_metadata(&key, &data))
+                    };
                 (true, result, false)
             }
             Packet::CreateProducerMessage(p) => {
@@ -695,28 +607,36 @@ impl CoreSession {
                 (false, Ok(None), false)
             }
             Packet::SessionXAStartMessage(p) => {
-                (true, Self::xa_response(self.xa_start(p.xid)), false)
+                (true, Self::xa_response(self.session.xa_start(p.xid)), false)
             }
-            Packet::SessionXAEndMessage(p) => (true, Self::xa_response(self.xa_end(p.xid)), false),
-            Packet::SessionXAPrepareMessage(p) => {
-                (true, Self::xa_response(self.xa_prepare(p.xid)), false)
+            Packet::SessionXAEndMessage(p) => {
+                (true, Self::xa_response(self.session.xa_end(p.xid)), false)
             }
+            Packet::SessionXAPrepareMessage(p) => (
+                true,
+                Self::xa_response(self.session.xa_prepare(p.xid)),
+                false,
+            ),
             Packet::SessionXACommitMessage(p) => (
                 true,
-                Self::xa_response(self.xa_commit(p.xid, p.one_phase)),
+                Self::xa_response(self.session.xa_commit(p.xid, p.one_phase)),
                 false,
             ),
             Packet::SessionXARollbackMessage(p) => {
-                let result = self.xa_rollback(p.xid).await;
+                let result = self.session.xa_rollback(p.xid).await;
                 (true, Self::xa_response(result), false)
             }
             Packet::SessionXAJoinMessage(p) => {
-                (true, Self::xa_response(self.xa_join(p.xid)), false)
+                (true, Self::xa_response(self.session.xa_join(p.xid)), false)
             }
-            Packet::SessionXAResumeMessage(p) => {
-                (true, Self::xa_response(self.xa_resume(p.xid)), false)
+            Packet::SessionXAResumeMessage(p) => (
+                true,
+                Self::xa_response(self.session.xa_resume(p.xid)),
+                false,
+            ),
+            Packet::SessionXASuspend(_) => {
+                (true, Self::xa_response(self.session.xa_suspend()), false)
             }
-            Packet::SessionXASuspend(_) => (true, Self::xa_response(self.xa_suspend()), false),
             Packet::SessionXAForgetMessage(_) => {
                 // Heuristic completions come with management (Phase 8):
                 // there is never one to forget.
@@ -727,7 +647,7 @@ impl CoreSession {
                 (true, Self::xa_response(Err(e.into())), false)
             }
             Packet::SessionXAAfterFailedMessage(p) => {
-                self.xa_failed(p.xid);
+                self.session.xa_failed(p.xid);
                 // No response for this one.
                 (false, Ok(None), false)
             }
@@ -750,11 +670,7 @@ impl CoreSession {
                 false,
             ),
             Packet::SessionXASetTimeoutMessage(p) => {
-                // xaSetTimeout
-                self.timeout_seconds = p.timeout_seconds;
-                if let Some(tx) = &self.tx {
-                    transaction::lock(tx).timeout_seconds = p.timeout_seconds;
-                }
+                self.session.xa_set_timeout(p.timeout_seconds);
                 (
                     true,
                     Ok(Some(SessionXASetTimeoutResponseMessage { ok: true }.into())),
@@ -781,7 +697,7 @@ impl CoreSession {
                 false,
             ),
             other => {
-                tracing::warn!(session = %self.name, "unsupported packet {}", other.name());
+                tracing::warn!(session = %self.session.name(), "unsupported packet {}", other.name());
                 let e = BrokerError::new(
                     ErrorType::UnsupportedPacket,
                     format!("{} is not supported yet", other.name()),
@@ -791,20 +707,6 @@ impl CoreSession {
         };
         let response = self.outcome(request, requires_response, result);
         self.respond(request, response, flush);
-    }
-
-    /// `PostOfficeImpl.processRoute` with `PagingStore.page`: the queues of
-    /// an address that pages get the message in its pages instead of a
-    /// reference; a full address under DROP drops it, under FAIL refuses
-    /// the send.
-    fn page_routed(
-        &mut self,
-        routed: crate::postoffice::Routed,
-        tx: Option<&TxRef>,
-    ) -> Result<crate::postoffice::Routed> {
-        let (routed, pending) = self.broker.post_office().page_routed(routed, tx)?;
-        self.ops.extend(pending);
-        Ok(routed)
     }
 
     /// `sendLarge`: a large message's headers. Its body follows in
@@ -881,347 +783,6 @@ impl CoreSession {
         self.send_message(message, Some(body)).await
     }
 
-    /// `LargeServerMessageImpl.checkLargeMessage`: a message too big for a
-    /// journal record becomes a large message.
-    fn check_large_message(&self, message: &mut CoreMessage) -> Result<Option<Arc<LargeBody>>> {
-        let Some(max) = self.broker.max_record_size() else {
-            return Ok(None);
-        };
-        let mut w = saranga_buffer::Writer::new();
-        message.encode(&mut w);
-        if w.len() + 512 <= max {
-            return Ok(None);
-        }
-        let id = self.broker.post_office().ids().next();
-        let io = |e: std::io::Error| BrokerError::new(ErrorType::IoError, e.to_string());
-        let mut writer = self
-            .broker
-            .large_messages()
-            .create(id, message.durable)
-            .map_err(io)?;
-        for chunk in message.body.chunks(crate::large::CHUNK_SIZE) {
-            writer.append(chunk).map_err(io)?;
-        }
-        let size = message.body.len() as i64;
-        message.body = Vec::new();
-        message.message_id = id;
-        let key = SimpleString::from(crate::message::HDR_LARGE_BODY_SIZE);
-        if message.properties.get(&key).is_none() {
-            message
-                .properties
-                .insert(key, saranga_buffer::PropertyValue::Long(size));
-        }
-        Ok(Some(writer.finish().map_err(io)?))
-    }
-
-    /// `ServerSessionImpl.send`: assigns the ID, routes, and either adds to
-    /// the queues or holds the message in the transaction.
-    async fn send_message(
-        &mut self,
-        mut message: CoreMessage,
-        large: Option<Arc<LargeBody>>,
-    ) -> Result<Option<Packet>> {
-        let large = match large {
-            Some(body) => Some(body),
-            None => {
-                let body = self.check_large_message(&mut message)?;
-                if body.is_none() {
-                    message.message_id = self.broker.post_office().ids().next();
-                }
-                body
-            }
-        };
-        let address: Name = match &message.address {
-            Some(a) => {
-                let a: Name = a.to_string_lossy().into();
-                self.default_address.get_or_insert_with(|| a.clone());
-                a
-            }
-            None => {
-                let a = self
-                    .default_address
-                    .clone()
-                    .ok_or_else(BrokerError::no_address)?;
-                message.address = Some(SimpleString::from(&*a));
-                a
-            }
-        };
-        // doSend: an address with one of the acceptor's prefixes loses it
-        // and is routed with the prefix's routing type.
-        let (address, prefixed): (Name, Option<RoutingType>) = match self.strip_prefix(&address) {
-            (bare, Some(t)) => {
-                let bare: Name = bare.into();
-                message.address = Some(SimpleString::from(&*bare));
-                (bare, Some(t))
-            }
-            (_, None) => (address, None),
-        };
-        // The user must be allowed to send to the address (and to the queue
-        // a fully qualified name picks).
-        let (bare_address, fqqn_queue) = crate::postoffice::split_fqqn(&address);
-        if let Err(e) = self.security_check(bare_address, fqqn_queue, CheckType::Send) {
-            if !self.auto_commit_sends
-                && let Some(tx) = &self.tx
-            {
-                transaction::lock(tx).mark_rollback_only(&e);
-            }
-            return Err(e);
-        }
-        if self.broker.populate_validated_user()
-            && let Some(user) = &self.validated_user
-        {
-            message.properties.insert(
-                crate::message::HDR_VALIDATED_USER.into(),
-                saranga_buffer::PropertyValue::String(user.as_str().into()),
-            );
-        }
-        if self.broker.reject_empty_validated_user()
-            && message
-                .properties
-                .get(&SimpleString::from(crate::message::HDR_VALIDATED_USER))
-                .is_none()
-        {
-            return Err(BrokerError::reject_empty_validated_user());
-        }
-        let routing_type = prefixed.or_else(|| routing_type(&message));
-        // PostOfficeImpl.route: the address's expiry settings apply first.
-        let settings = self
-            .broker
-            .post_office()
-            .settings(crate::postoffice::split_fqqn(&address).0);
-        crate::message::apply_expiry_delay(&mut message, &settings, crate::message::now_millis());
-        let scheduled_time = crate::message::scheduled_delivery_time(&message);
-        let duplicate_id = crate::duplicate::duplicate_id_bytes(&message);
-        let mut r = MessageRef::new(match large {
-            Some(body) => ServerMessage::new_large(message, body),
-            None => ServerMessage::new(message),
-        });
-        r.scheduled_time = scheduled_time;
-        // doSend: outside a transaction when auto-committing or when an XA
-        // session has none.
-        let tx = if self.auto_commit_sends {
-            None
-        } else {
-            self.tx.clone()
-        };
-        let storage = self.storage();
-        // checkDuplicateID: a send outside a transaction gets one of its own
-        // so the ID is journaled with the message.
-        let mut own_tx: Option<(i64, bool)> = None;
-        if let Some(id) = duplicate_id {
-            let po = self.broker.post_office();
-            let cache = po.duplicate_cache(crate::postoffice::split_fqqn(&address).0);
-            let mut c = crate::duplicate::lock(&cache);
-            if c.contains(&id) {
-                tracing::warn!(
-                    "AMQ222059: Duplicate message detected - message will not be routed. Message information:\n{}",
-                    r.message.message_id()
-                );
-                if let Some(tx) = &tx {
-                    transaction::lock(tx).mark_rollback_only(&BrokerError::new(
-                        ErrorType::DuplicateIdRejected,
-                        format!(
-                            "Duplicate message detected - message will not be routed. Message information:{}",
-                            r.message.message_id()
-                        ),
-                    ));
-                }
-                return Ok(None);
-            }
-            let record = po.ids().next();
-            match &tx {
-                None => {
-                    let jtx = po.ids().next();
-                    c.store_tx(jtx, &id, record).map_err(io_error)?;
-                    own_tx = Some((jtx, c.is_persistent()));
-                    c.add_in_memory(id, record);
-                }
-                Some(tx) => {
-                    let mut t = transaction::lock(tx);
-                    c.store_tx(t.id, &id, record).map_err(io_error)?;
-                    t.persistent |= c.is_persistent();
-                    t.duplicates.push(crate::duplicate::PendingId {
-                        cache: cache.clone(),
-                        id,
-                        record,
-                    });
-                }
-            }
-        }
-        let routed = self
-            .broker
-            .post_office()
-            .route(&r, &address, routing_type, self.creator());
-        let routed = match routed.and_then(|routed| self.page_routed(routed, tx.as_ref())) {
-            Ok(routed) => routed,
-            Err(e) => {
-                if let Some(tx) = &tx {
-                    transaction::lock(tx).mark_rollback_only(&e);
-                }
-                if let (Some((jtx, true)), Some(s)) = (own_tx, &storage) {
-                    let _ = s.rollback(jtx);
-                }
-                return Err(e);
-            }
-        };
-        // processRouteToDurableQueues, for the message and each divert
-        // copy: the message record with its first durable reference, then
-        // one reference per durable queue.
-        match tx {
-            None => {
-                if let Some(s) = &storage {
-                    for (r, queues) in &routed {
-                        let message = &r.message;
-                        let scheduled_time = r.scheduled_time;
-                        let durable: Vec<&Queue> =
-                            queues.iter().filter(|q| q.is_durable_ref(r)).collect();
-                        let last = durable.len().saturating_sub(1);
-                        for (i, q) in durable.into_iter().enumerate() {
-                            let mid = message.message_id();
-                            if let Some((jtx, persistent)) = &mut own_tx {
-                                if message.durable_up() == 1 {
-                                    s.store_message_tx(*jtx, message).map_err(io_error)?;
-                                }
-                                s.store_reference_tx(*jtx, q.id(), mid).map_err(io_error)?;
-                                if scheduled_time > 0 {
-                                    s.update_scheduled_delivery_time_tx(
-                                        *jtx,
-                                        q.id(),
-                                        mid,
-                                        scheduled_time,
-                                    )
-                                    .map_err(io_error)?;
-                                }
-                                *persistent = true;
-                                continue;
-                            }
-                            if message.durable_up() == 1 {
-                                s.store_message(message).map_err(io_error)?;
-                            }
-                            self.ops.push(
-                                s.store_reference(q.id(), mid, i == last)
-                                    .map_err(io_error)?,
-                            );
-                            if scheduled_time > 0
-                                && let Some(p) = s
-                                    .update_scheduled_delivery_time(q.id(), mid, scheduled_time, 0)
-                                    .map_err(io_error)?
-                            {
-                                self.ops.push(p);
-                            }
-                        }
-                    }
-                    if let Some((jtx, true)) = own_tx {
-                        self.ops.push(s.commit(jtx).map_err(io_error)?);
-                    }
-                    // The references join their queues once journaled.
-                    self.actions.push(Box::new(move || {
-                        for (r, queues) in routed {
-                            for q in queues {
-                                q.add(r.clone());
-                            }
-                        }
-                    }));
-                } else {
-                    for (r, queues) in routed {
-                        for q in queues {
-                            q.add(r.clone());
-                        }
-                    }
-                }
-            }
-            Some(tx) => {
-                let mut t = transaction::lock(&tx);
-                for (r, queues) in routed {
-                    let message = &r.message;
-                    for q in queues.iter().filter(|q| q.is_durable_ref(&r)) {
-                        let Some(s) = &storage else { break };
-                        if message.durable_up() == 1 {
-                            s.store_message_tx(t.id, message).map_err(io_error)?;
-                        }
-                        s.store_reference_tx(t.id, q.id(), message.message_id())
-                            .map_err(io_error)?;
-                        if r.scheduled_time > 0 {
-                            s.update_scheduled_delivery_time_tx(
-                                t.id,
-                                q.id(),
-                                message.message_id(),
-                                r.scheduled_time,
-                            )
-                            .map_err(io_error)?;
-                        }
-                        t.persistent = true;
-                    }
-                    t.sends.extend(queues.into_iter().map(|q| (q, r.clone())));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    async fn acknowledge(
-        &mut self,
-        consumer_id: i64,
-        message_id: i64,
-        individual: bool,
-    ) -> Result<Option<Packet>> {
-        let tx = if self.auto_commit_acks {
-            None
-        } else {
-            self.tx.clone()
-        };
-        let Some(c) = self.consumers.get(&consumer_id) else {
-            let e = BrokerError::consumer_doesnt_exist(consumer_id);
-            if let Some(tx) = &self.tx {
-                transaction::lock(tx).mark_rollback_only(&e);
-            }
-            return Err(e);
-        };
-        let queue = c.queue.clone();
-        match queue.ack(c.id, message_id, individual, tx.is_some()).await {
-            Ok(refs) => {
-                // QueueImpl.acknowledge
-                let storage = self.storage();
-                let _ = storage;
-                let mut refs = refs;
-                match tx {
-                    Some(tx) => {
-                        let mut t = transaction::lock(&tx);
-                        let id = t.id;
-                        for r in &mut refs {
-                            if queue.store_ack_tx(id, r, &mut t.paging).map_err(io_error)? {
-                                t.persistent = true;
-                            }
-                        }
-                        t.acks.extend(refs.into_iter().map(|r| (queue.clone(), r)));
-                    }
-                    None => {
-                        for r in &mut refs {
-                            if let Some(p) = queue.store_ack(r).map_err(io_error)? {
-                                self.ops.push(p);
-                            }
-                            queue.post_acknowledge(r);
-                        }
-                    }
-                }
-                Ok(None)
-            }
-            Err(failed) => {
-                let e = BrokerError::consumer_no_reference(consumer_id, message_id, queue.name());
-                match tx {
-                    Some(tx) => {
-                        let mut t = transaction::lock(&tx);
-                        t.acks
-                            .extend(failed.refs.into_iter().map(|r| (queue.clone(), r)));
-                        t.mark_rollback_only(&e);
-                    }
-                    None => queue.reinsert(failed.refs),
-                }
-                Err(e)
-            }
-        }
-    }
-
     /// `createSessionXAResponseMessage` and
     /// `onActiveMQXAExceptionWhileHandlePacket`: XA requests are never
     /// response-async, so the answer is always the V1 message.
@@ -1247,678 +808,28 @@ impl CoreSession {
         }
     }
 
-    fn current_xid_is(&self, xid: &Xid) -> bool {
-        self.tx
-            .as_ref()
-            .is_some_and(|t| transaction::lock(t).xid.as_ref() == Some(xid))
-    }
-
-    /// `xaStart`: a transaction still open on the session is rolled back
-    /// (unless prepared) and replaced.
-    fn xa_start(&mut self, xid: Xid) -> Result<(), TxError> {
-        if let Some(old) = self.tx.take() {
-            let mut t = transaction::lock(&old);
-            tracing::warn!(
-                "AMQ222210: Session already had a transaction {} when xaStart {} was called",
-                t.xid
-                    .as_ref()
-                    .map(transaction::xid_string)
-                    .unwrap_or_default(),
-                transaction::xid_string(&xid)
-            );
-            if t.state != TxState::Prepared {
-                if let Some(x) = &t.xid {
-                    self.broker.resource_manager().remove(x);
-                }
-                if let Ok(outcome) = t.rollback() {
-                    drop(t);
-                    self.finish(outcome, false)?;
-                }
-            }
-        }
-        let tx = self.new_tx(Some(xid.clone()));
-        transaction::lock(&tx).timeout_seconds = self.timeout_seconds;
-        self.tx = Some(tx.clone());
-        if !self.broker.resource_manager().put(xid.clone(), tx) {
-            return Err(XaError::new(
-                xa_code::XAER_DUPID,
-                format!(
-                    "Cannot start, there is already a xid {}",
-                    transaction::xid_string(&xid)
-                ),
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    /// `xaEnd`.
-    fn xa_end(&mut self, xid: Xid) -> Result<(), TxError> {
-        if self.current_xid_is(&xid) {
-            let tx = self.tx.clone().expect("current transaction");
-            let state = transaction::lock(&tx).state;
-            match state {
-                TxState::Suspended => Err(XaError::new(
-                    xa_code::XAER_PROTO,
-                    "Cannot end, transaction is suspended",
-                )
-                .into()),
-                TxState::RolledBack => {
-                    self.tx = None;
-                    Err(XaError::new(
-                        xa_code::XAER_PROTO,
-                        "Cannot end, transaction is rolled back",
-                    )
-                    .into())
-                }
-                _ => {
-                    self.pending_tx = self.tx.take();
-                    Ok(())
-                }
-            }
-        } else {
-            // Ending a suspended branch (JTA 1.1, 3.4.4).
-            let Some(tx) = self.broker.resource_manager().get(&xid) else {
-                return Err(XaError::new(
-                    xa_code::XAER_NOTA,
-                    format!(
-                        "Cannot find suspended transaction to end {}",
-                        transaction::xid_string(&xid)
-                    ),
-                )
-                .into());
-            };
-            let mut t = transaction::lock(&tx);
-            match t.state {
-                TxState::Active => Ok(()),
-                TxState::Suspended => {
-                    t.state = TxState::Active;
-                    Ok(())
-                }
-                _ => Err(XaError::new(
-                    xa_code::XAER_PROTO,
-                    format!(
-                        "Transaction is not suspended {}",
-                        transaction::xid_string(&xid)
-                    ),
-                )
-                .into()),
-            }
-        }
-    }
-
-    fn not_found(xid: &Xid) -> TxError {
-        XaError::new(
-            xa_code::XAER_NOTA,
-            format!(
-                "Cannot find xid in resource manager: {}",
-                transaction::xid_string(xid)
-            ),
-        )
-        .into()
-    }
-
-    /// `xaPrepare`.
-    fn xa_prepare(&mut self, xid: Xid) -> Result<(), TxError> {
-        if self.current_xid_is(&xid) {
-            let current = self
-                .tx
-                .as_ref()
-                .and_then(|t| transaction::lock(t).xid.clone());
-            return Err(XaError::new(
-                xa_code::XAER_PROTO,
-                format!(
-                    "Cannot commit, session is currently doing work in a transaction {}",
-                    current
-                        .as_ref()
-                        .map(transaction::xid_string)
-                        .unwrap_or_default()
-                ),
-            )
-            .into());
-        }
-        let Some(tx) = self.broker.resource_manager().get(&xid) else {
-            return Err(Self::not_found(&xid));
-        };
-        let mut t = transaction::lock(&tx);
-        match t.state {
-            TxState::Suspended => Err(XaError::new(
-                xa_code::XAER_PROTO,
-                format!(
-                    "Cannot prepare transaction, it is suspended {}",
-                    transaction::xid_string(&xid)
-                ),
-            )
-            .into()),
-            TxState::Prepared => {
-                tracing::warn!(
-                    "AMQ222098: Ignoring prepare on xid as already called : {}",
-                    transaction::xid_string(&xid)
-                );
-                Ok(())
-            }
-            _ => match t.prepare() {
-                Ok(()) => {
-                    let (id, xid) = (t.id, t.xid.clone().expect("XA transaction"));
-                    if let Some(s) = self.storage() {
-                        t.paging.before_commit(&s, id).map_err(io_error)?;
-                        drop(t);
-                        self.ops.push(s.prepare(id, &xid).map_err(io_error)?);
-                    }
-                    Ok(())
-                }
-                Err(failed) => {
-                    let (e, outcome) = *failed;
-                    drop(t);
-                    self.finish(outcome, false)?;
-                    Err(e.into())
-                }
-            },
-        }
-    }
-
-    /// `xaCommit`.
-    fn xa_commit(&mut self, xid: Xid, one_phase: bool) -> Result<(), TxError> {
-        self.pending_tx = None;
-        if self.current_xid_is(&xid) {
-            let current = self
-                .tx
-                .as_ref()
-                .and_then(|t| transaction::lock(t).xid.clone());
-            return Err(XaError::new(
-                xa_code::XAER_PROTO,
-                format!(
-                    "Cannot commit, session is currently doing work in transaction {}",
-                    current
-                        .as_ref()
-                        .map(transaction::xid_string)
-                        .unwrap_or_default()
-                ),
-            )
-            .into());
-        }
-        let rm = self.broker.resource_manager();
-        let Some(tx) = rm.remove(&xid) else {
-            return Err(Self::not_found(&xid));
-        };
-        let mut t = transaction::lock(&tx);
-        if t.state == TxState::Suspended {
-            drop(t);
-            rm.put(xid.clone(), tx);
-            return Err(XaError::new(
-                xa_code::XAER_PROTO,
-                format!(
-                    "Cannot commit transaction, it is suspended {}",
-                    transaction::xid_string(&xid)
-                ),
-            )
-            .into());
-        }
-        let result = t.commit(one_phase);
-        drop(t);
-        match result {
-            Ok(outcome) => {
-                self.finish(outcome, true)?;
-                Ok(())
-            }
-            Err(failed) => {
-                let (e, outcome) = *failed;
-                self.finish(outcome, false)?;
-                Err(e.into())
-            }
-        }
-    }
-
-    /// `xaRollback`: rolls back the branch, and like Artemis also takes
-    /// back what this session's consumers are delivering.
-    async fn xa_rollback(&mut self, xid: Xid) -> Result<(), TxError> {
-        self.pending_tx = None;
-        if self.current_xid_is(&xid) {
-            let current = self
-                .tx
-                .as_ref()
-                .and_then(|t| transaction::lock(t).xid.clone());
-            return Err(XaError::new(
-                xa_code::XAER_PROTO,
-                format!(
-                    "Cannot roll back, session is currently doing work in a transaction {}",
-                    current
-                        .as_ref()
-                        .map(transaction::xid_string)
-                        .unwrap_or_default()
-                ),
-            )
-            .into());
-        }
-        let rm = self.broker.resource_manager();
-        let Some(tx) = rm.remove(&xid) else {
-            return Err(Self::not_found(&xid));
-        };
-        if transaction::lock(&tx).state == TxState::Suspended {
-            rm.put(xid.clone(), tx);
-            return Err(XaError::new(
-                xa_code::XAER_PROTO,
-                format!(
-                    "Cannot rollback transaction, it is suspended {}",
-                    transaction::xid_string(&xid)
-                ),
-            )
-            .into());
-        }
-        self.do_rollback(false, false, &tx).await?;
-        Ok(())
-    }
-
-    /// `xaJoin`.
-    fn xa_join(&mut self, xid: Xid) -> Result<(), TxError> {
-        let Some(tx) = self.broker.resource_manager().get(&xid) else {
-            return Err(Self::not_found(&xid));
-        };
-        if transaction::lock(&tx).state == TxState::Suspended {
-            return Err(XaError::new(
-                xa_code::XAER_PROTO,
-                format!(
-                    "Cannot join tx, it is suspended {}",
-                    transaction::xid_string(&xid)
-                ),
-            )
-            .into());
-        }
-        self.tx = Some(tx);
-        Ok(())
-    }
-
-    /// `xaResume`.
-    fn xa_resume(&mut self, xid: Xid) -> Result<(), TxError> {
-        if let Some(current) = &self.tx {
-            let x = transaction::lock(current).xid.clone();
-            return Err(XaError::new(
-                xa_code::XAER_PROTO,
-                format!(
-                    "Cannot resume, session is currently doing work in a transaction {}",
-                    x.as_ref().map(transaction::xid_string).unwrap_or_default()
-                ),
-            )
-            .into());
-        }
-        let Some(tx) = self.broker.resource_manager().get(&xid) else {
-            return Err(Self::not_found(&xid));
-        };
-        {
-            let mut t = transaction::lock(&tx);
-            if t.state != TxState::Suspended {
-                return Err(XaError::new(
-                    xa_code::XAER_PROTO,
-                    format!(
-                        "Cannot resume transaction, it is not suspended {}",
-                        transaction::xid_string(&xid)
-                    ),
-                )
-                .into());
-            }
-            t.state = TxState::Active;
-        }
-        self.tx = Some(tx);
-        Ok(())
-    }
-
-    /// `xaSuspend`.
-    fn xa_suspend(&mut self) -> Result<(), TxError> {
-        let Some(tx) = &self.tx else {
-            return Err(XaError::new(
-                xa_code::XAER_PROTO,
-                "Cannot suspend, session is not doing work in a transaction ",
-            )
-            .into());
-        };
-        let mut t = transaction::lock(tx);
-        match t.state {
-            TxState::Suspended => {
-                let x = t
-                    .xid
-                    .as_ref()
-                    .map(transaction::xid_string)
-                    .unwrap_or_default();
-                Err(XaError::new(
-                    xa_code::XAER_PROTO,
-                    format!("Cannot suspend, transaction is already suspended {x}"),
-                )
-                .into())
-            }
-            TxState::Active => {
-                t.state = TxState::Suspended;
-                drop(t);
-                self.tx = None;
-                Ok(())
-            }
-            _ => Err(BrokerError::internal("Can only suspend active transaction").into()),
-        }
-    }
-
-    /// `xaFailed`: after a failover the branch can only roll back.
-    fn xa_failed(&mut self, xid: Xid) {
-        let rm = self.broker.resource_manager();
-        let tx = rm.get(&xid).unwrap_or_else(|| {
-            let tx =
-                Transaction::new_ref(self.broker.post_office().ids().next(), Some(xid.clone()));
-            rm.put(xid, tx.clone());
-            tx
-        });
-        let effective = transaction::lock(&tx).is_effective();
-        if effective {
-            self.tx = None;
-        } else {
-            transaction::lock(&tx).mark_rollback_only(&BrokerError::new(
-                ErrorType::GenericException,
-                "Can't commit as a Failover happened during the operation",
-            ));
-            self.tx = Some(tx);
-        }
-    }
-
-    /// `ServerSessionImpl.createConsumer`.
-    async fn create_consumer(
-        &mut self,
-        consumer_id: i64,
-        queue_name: &str,
-        filter: Option<String>,
-        priority: i32,
-        browse_only: bool,
-    ) -> Result<()> {
-        let post_office = self.broker.post_office();
-        let name = queue_name_of(queue_name);
-        let queue = post_office
-            .queue(name)
-            .ok_or_else(|| BrokerError::no_such_queue(name))?;
-        let check = if browse_only {
-            CheckType::Browse
-        } else {
-            CheckType::Consume
-        };
-        let address = queue.config().address.clone();
-        if let Err(e) = self.security_check(&address, Some(name), check) {
-            // The pre-FQQN syntax (ARTEMIS-592): a security setting matching
-            // exactly `address.queue` still applies. Artemis appends the name
-            // as the client gave it, so an FQQN never matches.
-            let exact = format!("{address}.{queue_name}");
-            match self.broker.security() {
-                Some(s) if s.contains_exact_match(&exact) => {
-                    self.security_check(&exact, Some(name), check)?
-                }
-                _ => return Err(e),
-            }
-        }
-        let filter = post_office.filters().create(filter.as_deref())?;
-        let c = queue.config();
-        if !browse_only && c.max_consumers != -1 && queue.consumer_count() >= c.max_consumers {
-            return Err(BrokerError::max_consumer_limit_reached(&c.address, &c.name));
-        }
-        let id = self.broker.next_consumer_id();
-        queue.add_consumer(ConsumerRegistration {
-            id,
-            client_id: consumer_id,
-            sink: Arc::new(CoreDeliverySink {
-                conn: self.conn.clone(),
-                channel_id: self.channel_id,
-                chunk_size: self.min_large_message_size.max(1) as usize,
-                legacy_prefix: self.legacy_jms().then_some(
+    /// Makes a consumer's `CoreDeliverySink` once its queue is known.
+    fn sink_factory(
+        &self,
+    ) -> impl FnOnce(&crate::queue::Queue) -> Arc<dyn crate::queue::DeliverySink> + use<> {
+        let conn = self.conn.clone();
+        let channel_id = self.channel_id;
+        let chunk_size = self.min_large_message_size.max(1) as usize;
+        let legacy = self.legacy_jms();
+        move |queue| {
+            Arc::new(CoreDeliverySink {
+                conn,
+                channel_id,
+                chunk_size,
+                legacy_prefix: legacy.then_some(
                     if queue.config().routing_type == RoutingType::Anycast {
                         OLD_QUEUE_PREFIX
                     } else {
                         OLD_TOPIC_PREFIX
                     },
                 ),
-            }),
-            filter,
-            priority,
-            browse_only,
-            pre_acknowledge: self.pre_acknowledge,
-            started: self.started,
-        });
-        self.consumers.insert(
-            consumer_id,
-            ServerConsumer {
-                id,
-                queue,
-                browse_only,
-            },
-        );
-        Ok(())
-    }
-
-    async fn close_consumer(&mut self, consumer_id: i64, failed: bool) {
-        let Some(c) = self.consumers.remove(&consumer_id) else {
-            tracing::debug!(consumer_id, "closing an unknown consumer");
-            return;
-        };
-        c.queue.remove_consumer(c.id, failed).await;
-    }
-
-    /// `PrefixUtil.getAddressAndRoutingTypes` over the acceptor's prefixes:
-    /// the name without the first prefix it starts with, and that prefix's
-    /// routing type.
-    fn strip_prefix<'a>(&self, name: &'a str) -> (&'a str, Option<RoutingType>) {
-        for (prefix, t) in &self.conn.prefixes {
-            if let Some(rest) = name.strip_prefix(prefix.as_str()) {
-                return (rest, Some(*t));
-            }
+            })
         }
-        (name, None)
-    }
-
-    /// `ServerSessionImpl.removePrefix`.
-    fn remove_prefix<'a>(&self, name: &'a str) -> &'a str {
-        self.strip_prefix(name).0
-    }
-
-    /// `createQueue`'s prefix handling: the address's prefix picks the
-    /// routing type; address and name lose their prefixes.
-    fn unprefix_queue(&self, spec: &mut QueueSpec) {
-        let (address, t) = self.strip_prefix(&spec.address);
-        if let Some(t) = t {
-            spec.routing_type = Some(t);
-        }
-        spec.address = address.into();
-        spec.name = self.remove_prefix(&spec.name).into();
-    }
-
-    /// `ServerSessionImpl.createQueue`.
-    fn create_queue(&mut self, mut spec: QueueSpec) -> Result<()> {
-        // The user must be allowed to create the queue, and the address too
-        // if the queue's creation would create or extend it.
-        self.security_check(&spec.address, Some(&spec.name), create_check(spec.durable))?;
-        let post_office = self.broker.post_office();
-        let settings = post_office.settings(&spec.address);
-        let routing_type = spec
-            .routing_type
-            .unwrap_or(settings.default_queue_routing_type);
-        if settings.auto_create_addresses
-            && post_office
-                .address_info(&spec.address)
-                .is_none_or(|i| !i.routing_types.contains(routing_type))
-        {
-            self.security_check(&spec.address, Some(&spec.name), CheckType::CreateAddress)?;
-        }
-        spec.user = self.validated_user.clone();
-        let temporary = spec.temporary;
-        let queue = self.broker.post_office().create_queue(spec, false)?;
-        if temporary {
-            self.conn.add_temp_queue(queue.name().clone());
-        }
-        Ok(())
-    }
-
-    /// `CREATE_SHARED_QUEUE`: creates the queue unless one with the same
-    /// address and filter exists. Only the address loses its prefix.
-    fn create_shared_queue(&mut self, mut spec: QueueSpec) -> Result<()> {
-        spec.address = self.remove_prefix(&spec.address).into();
-        self.security_check(&spec.address, Some(&spec.name), create_check(spec.durable))?;
-        spec.user = self.validated_user.clone();
-        let existing = self.broker.post_office().queue_query(&spec.name);
-        if existing.exists
-            && existing.address == spec.address
-            && existing.filter_string == spec.filter_string
-        {
-            return Ok(());
-        }
-        self.broker
-            .post_office()
-            .create_queue(spec, false)
-            .map(|_| ())
-    }
-
-    fn delete_queue(&mut self, name: &str) -> Result<()> {
-        let post_office = self.broker.post_office();
-        let name = queue_name_of(self.remove_prefix(name));
-        let queue = post_office
-            .queue(name)
-            .ok_or_else(|| BrokerError::no_such_queue(name))?;
-        let address = queue.config().address.clone();
-        let check = if queue.is_durable() {
-            CheckType::DeleteDurableQueue
-        } else {
-            CheckType::DeleteNonDurableQueue
-        };
-        self.security_check(&address, Some(name), check)?;
-        post_office.delete_queue(name, true, false)?;
-        self.conn.remove_temp_queue(name);
-        // `destroyQueue(forceAutoDeleteAddress)`: a client's delete takes an
-        // auto-created address along whatever `auto-delete-addresses` says,
-        // if the user may delete it.
-        if post_office.address_auto_deletable(&address) {
-            self.security_check(&address, None, CheckType::DeleteAddress)?;
-            post_office.remove_address(&address);
-        }
-        Ok(())
-    }
-
-    /// `ServerSessionImpl.commit`: commits the current transaction (a
-    /// rollback-only one rolls back and fails instead) and starts the next.
-    fn commit(&mut self) -> Result<()> {
-        let tx = self.tx.take();
-        if !self.xa {
-            self.tx = Some(self.new_tx(None));
-        }
-        let Some(tx) = tx else {
-            return Ok(());
-        };
-        let result = transaction::lock(&tx).commit(true);
-        match result {
-            Ok(outcome) => self.finish(outcome, true),
-            Err(failed) => {
-                let (e, outcome) = *failed;
-                self.finish(outcome, false)?;
-                Err(e)
-            }
-        }
-    }
-
-    /// `ServerSessionImpl.rollback`.
-    async fn rollback(&mut self, last_as_delivered: bool, failed: bool) {
-        let tx = match self.tx.take() {
-            Some(tx) => tx,
-            None => self.new_tx(None),
-        };
-        if let Err(e) = self.do_rollback(failed, last_as_delivered, &tx).await {
-            tracing::warn!(session = %self.name, "rollback: {e}");
-        }
-        if !self.xa {
-            self.tx = Some(self.new_tx(None));
-        }
-    }
-
-    /// `doRollback`: takes back what this session's consumers are
-    /// delivering and rolls the transaction back, returning both to the
-    /// queues.
-    async fn do_rollback(
-        &mut self,
-        failed: bool,
-        last_as_delivered: bool,
-        tx: &TxRef,
-    ) -> Result<(), BrokerError> {
-        let was_started = self.started;
-        let mut cancelled = Vec::new();
-        for c in self.consumers.values() {
-            if c.browse_only {
-                continue;
-            }
-            let refs = c
-                .queue
-                .cancel_delivering(c.id, last_as_delivered, failed)
-                .await;
-            cancelled.extend(refs.into_iter().map(|r| (c.queue.clone(), r)));
-        }
-        let result = {
-            let mut t = transaction::lock(tx);
-            // What was delivered after a transaction already rolled back
-            // (timed out) goes back on its own.
-            if t.state == TxState::RolledBack {
-                Ok(Outcome::default())
-            } else {
-                t.rollback()
-            }
-        };
-        let (mut outcome, result) = match result {
-            Ok(o) => (o, Ok(())),
-            Err(e) => (Outcome::default(), Err(e)),
-        };
-        outcome.cancel.extend(cancelled);
-        let finished = self.finish(outcome, false);
-        if was_started && !failed {
-            for c in self.consumers.values() {
-                c.queue.set_started(c.id, true).await;
-            }
-        }
-        result.and(finished)
-    }
-
-    async fn set_started(&mut self, started: bool) {
-        self.started = started;
-        for c in self.consumers.values() {
-            c.queue.set_started(c.id, started).await;
-        }
-    }
-
-    /// `ServerSessionImpl.doClose`. A failed client's transactions roll back
-    /// unless prepared; a clean close rolls back only a local transaction,
-    /// leaving XA branches to the transaction manager. Then the consumers
-    /// close.
-    async fn close(&mut self, failed: bool) {
-        if self.closed {
-            return;
-        }
-        self.closed = true;
-        if failed {
-            for tx in [self.tx.take(), self.pending_tx.take()]
-                .into_iter()
-                .flatten()
-            {
-                let (xid, outcome) = {
-                    let mut t = transaction::lock(&tx);
-                    (t.xid.clone(), t.try_rollback())
-                };
-                if let Some(outcome) = outcome {
-                    if let Err(e) = self.finish(outcome, false) {
-                        tracing::warn!(session = %self.name, "AMQ222207: Unable to rollback on close: {e}");
-                    }
-                    if let Some(xid) = xid {
-                        self.broker.resource_manager().remove(&xid);
-                    }
-                }
-            }
-        } else if self
-            .tx
-            .as_ref()
-            .is_some_and(|t| transaction::lock(t).xid.is_none())
-        {
-            self.rollback(false, false).await;
-        }
-        let ids: Vec<i64> = self.consumers.keys().copied().collect();
-        for id in ids {
-            self.close_consumer(id, failed).await;
-        }
-        self.producers.clear();
-        self.broker.remove_session_metadata(&self.name);
     }
 
     /// A 1.x JMS client (`JMS_SESSION_IDENTIFIER_PROPERTY` set by a client
@@ -1928,7 +839,7 @@ impl CoreSession {
         self.conn.context().is_version_before_address_change()
             && self
                 .broker
-                .session_metadata(&self.name, JMS_SESSION_IDENTIFIER)
+                .session_metadata(self.session.name(), JMS_SESSION_IDENTIFIER)
                 .is_some()
     }
 
@@ -1939,10 +850,7 @@ impl CoreSession {
     /// With `legacy` (`SESS_QUEUEQUERY`), an old client gets the address
     /// with the old prefix of the queue's routing type.
     fn queue_query_response_legacy(&self, name: &str, legacy: bool) -> Packet {
-        let mut r = self
-            .broker
-            .post_office()
-            .queue_query(self.remove_prefix(name));
+        let mut r = self.session.queue_query(name);
         if legacy && r.exists && self.conn.context().is_version_before_address_change() {
             r.address = old_prefixed_address(&r.address, r.routing_type).into();
         }
@@ -1980,9 +888,8 @@ impl CoreSession {
     fn binding_query_response(&self, address: &str) -> Packet {
         let ctx = self.conn.context();
         let r = self
-            .broker
-            .post_office()
-            .binding_query(self.remove_prefix(address), ctx.is_version_new_fqqn());
+            .session
+            .binding_query(address, ctx.is_version_new_fqqn());
         let v = ctx.version;
         // An old JMS client asking about jms.queue.X or jms.topic.X gets the
         // queue names with that prefix (`convertQueueNames`).
@@ -2046,20 +953,6 @@ impl CoreSession {
             .into()
         }
     }
-}
-
-/// A journal failure as the client sees it (`ActiveMQIOErrorException`).
-/// The check that creating a queue of this durability needs.
-fn create_check(durable: bool) -> CheckType {
-    if durable {
-        CheckType::CreateDurableQueue
-    } else {
-        CheckType::CreateNonDurableQueue
-    }
-}
-
-fn io_error(e: saranga_journal::JournalError) -> BrokerError {
-    BrokerError::new(ErrorType::IoError, e.to_string())
 }
 
 /// `ClientSession.JMS_SESSION_IDENTIFIER_PROPERTY`.

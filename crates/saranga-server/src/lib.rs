@@ -18,6 +18,7 @@ pub mod postoffice;
 pub mod queue;
 pub mod recovery;
 pub mod reload;
+pub mod session;
 pub mod settings;
 pub mod storage;
 pub mod transaction;

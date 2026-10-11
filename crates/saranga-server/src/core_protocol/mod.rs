@@ -9,8 +9,8 @@
 mod session;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use saranga_buffer::JString;
@@ -37,7 +37,8 @@ use tokio::task::JoinHandle;
 
 use crate::message::ServerMessage;
 use crate::queue::DeliverySink;
-use crate::{Broker, BrokerError, Name};
+use crate::session::ClientConnection;
+use crate::{Broker, BrokerError};
 use session::{CoreSession, SessionInput};
 
 /// `ActiveMQClient.DEFAULT_CONNECTION_TTL`, used until the client's first
@@ -59,14 +60,8 @@ pub(crate) struct ConnShared {
     out: mpsc::UnboundedSender<Outgoing>,
     /// The negotiated channel version (`getChannelVersion`); 0 until set.
     version: AtomicI32,
-    client_id: Mutex<Option<String>>,
-    /// Temporary queues, deleted when the connection goes away.
-    temp_queues: Mutex<Vec<Name>>,
-    remote_address: String,
-    /// What the security store knows of this connection.
-    security_info: Arc<ConnectionInfo>,
-    /// The acceptor's address prefixes.
-    pub(crate) prefixes: Vec<(String, crate::RoutingType)>,
+    /// What every protocol's connection keeps.
+    pub(crate) client: Arc<ClientConnection>,
 }
 
 impl ConnShared {
@@ -86,26 +81,8 @@ impl ConnShared {
         self.send_raw(packet.into().encode_frame(channel_id, &self.context()));
     }
 
-    pub(crate) fn add_temp_queue(&self, name: Name) {
-        self.temp_queues
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(name);
-    }
-
-    pub(crate) fn remove_temp_queue(&self, name: &str) {
-        self.temp_queues
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|q| &**q != name);
-    }
-
-    pub(crate) fn remote_address(&self) -> &str {
-        &self.remote_address
-    }
-
     pub(crate) fn security_info(&self) -> Arc<ConnectionInfo> {
-        self.security_info.clone()
+        self.client.security_info()
     }
 }
 
@@ -231,18 +208,17 @@ pub async fn serve_stream<S>(
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
     let remote_address = peer.map(|a| a.to_string()).unwrap_or_default();
-    let security_info = Arc::new(info);
     let (mut rd, wr) = tokio::io::split(stream);
     let (out, rx) = mpsc::unbounded_channel();
     let writer = tokio::spawn(write_loop(wr, rx));
     let shared = Arc::new(ConnShared {
         out,
         version: AtomicI32::new(0),
-        client_id: Mutex::default(),
-        temp_queues: Mutex::default(),
-        remote_address,
-        security_info,
-        prefixes: acceptor.prefixes.clone(),
+        client: Arc::new(ClientConnection::new(
+            remote_address,
+            Arc::new(info),
+            acceptor.prefixes.clone(),
+        )),
     });
     // `CoreFrameWithSizeLimitDecoder`: with connection security, frames are
     // limited from the start.
@@ -265,7 +241,7 @@ pub async fn serve_stream<S>(
     };
     if let Err(e) = conn.read_loop(&mut rd).await {
         tracing::debug!(
-            remote = conn.shared.remote_address(),
+            remote = conn.shared.client.remote_address(),
             "connection ended: {e}"
         );
     }
@@ -464,7 +440,7 @@ impl Connection {
         if self.topology_subscribed {
             tracing::warn!(
                 "AMQ224166: Multiple topology subscriptions to connection from {}. Closing connection.",
-                self.shared.security_info.remote_address
+                self.shared.security_info().remote_address
             );
             return Err(ConnError::Protocol(
                 "multiple topology subscriptions".into(),
@@ -699,11 +675,7 @@ impl Connection {
             self.shared.version.store(request.version, Ordering::SeqCst);
         }
         if let Some(client_id) = &request.client_id {
-            *self
-                .shared
-                .client_id
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(client_id.clone());
+            self.shared.client.set_client_id(Some(client_id.clone()));
         }
         // `validateUser`: a refused login gets the security exception and
         // no session. Login modules may block (LDAP), so they run off the
@@ -778,25 +750,7 @@ impl Connection {
         for task in self.session_tasks.drain(..) {
             let _ = task.await;
         }
-        let temp = std::mem::take(
-            &mut *self
-                .shared
-                .temp_queues
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        );
-        let post_office = self.broker.post_office();
-        for name in temp {
-            let auto_delete_address = post_office
-                .queue(&name)
-                .map(|q| {
-                    post_office
-                        .settings(&q.config().address)
-                        .auto_delete_addresses
-                })
-                .unwrap_or(false);
-            let _ = post_office.delete_queue(&name, false, auto_delete_address);
-        }
+        self.shared.client.remove_temp_queues(&self.broker);
         let _ = self.shared.out.send(Outgoing::Close);
     }
 }
