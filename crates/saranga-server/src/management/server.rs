@@ -876,6 +876,11 @@ pub(super) async fn invoke(
             .collect();
         return Some(Ok(Json::from(names)));
     }
+    // The members of the cluster connections' topologies: none until
+    // clustering.
+    if call.is("listNetworkTopology", &[]).is_some() {
+        return Some(Ok(Json::from("[]")));
+    }
     if let Some(a) = call.is("listQueues", &[S, I, I]) {
         return Some(super::views::list_queues(broker, a.s(0).as_deref(), a.i(1), a.i(2)).await);
     }

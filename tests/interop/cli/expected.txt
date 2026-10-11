@@ -1,0 +1,424 @@
+=== queue create --name cliq --address cliq --anycast --durable --auto-create-address
+Connection brokerURL = URL
+Queue [name=cliq, address=cliq, routingType=ANYCAST, durable=true, purgeOnNoConsumers=false, autoCreateAddress=false, exclusive=false, lastValue=false, lastValueKey=null, nonDestructive=false, consumersBeforeDispatch=0, delayBeforeDispatch=-1, autoCreateAddress=false] created successfully.
+--- exit 0
+=== queue create --name cliq --address cliq --anycast --durable --auto-create-address
+Connection brokerURL = URL
+Failed to create queue cliq. Reason: AMQ229019: Queue cliq already exists on address cliq
+--- exit 0
+=== queue create --name clim --address clia --multicast --no-durable --auto-create-address --filter color='red' --max-consumers 3 --purge-on-no-consumers
+Connection brokerURL = URL
+Queue [name=clim, address=clia, routingType=MULTICAST, filter=color='red', durable=false, maxConsumers=3, purgeOnNoConsumers=true, autoCreateAddress=false, exclusive=false, lastValue=false, lastValueKey=null, nonDestructive=false, consumersBeforeDispatch=0, delayBeforeDispatch=-1, autoCreateAddress=false] created successfully.
+--- exit 0
+=== queue update --name cliq --anycast --max-consumers 4
+Connection brokerURL = URL
+Queue [name=cliq, address=cliq, routingType=ANYCAST, durable=true, maxConsumers=4, purgeOnNoConsumers=false, autoCreateAddress=false, exclusive=false, lastValue=false, lastValueKey=null, nonDestructive=false, consumersBeforeDispatch=0, delayBeforeDispatch=-1, autoCreateAddress=false] updated successfully.
+--- exit 0
+=== queue update --name nosuch --anycast
+Connection brokerURL = URL
+Failed to update nosuch. Reason: AMQ229017: Queue nosuch does not exist
+--- exit 0
+=== producer --destination queue://cliq --message-count 5
+Connection brokerURL = URL
+Producer ActiveMQQueue[cliq], thread=0 Started to calculate elapsed time ...
+
+Producer ActiveMQQueue[cliq], thread=0 Produced: 5 messages
+Producer ActiveMQQueue[cliq], thread=0 Elapsed time in second : # s
+Producer ActiveMQQueue[cliq], thread=0 Elapsed time in milli second : # milli seconds
+--- exit 0
+=== producer --destination cliq --message-count 2 --message hello --verbose
+Connection brokerURL = URL
+Producer ActiveMQQueue[cliq], thread=0 Started to calculate elapsed time ...
+
+Producer ActiveMQQueue[cliq], thread=0 Sent: hello
+Producer ActiveMQQueue[cliq], thread=0 Sent: hello
+Producer ActiveMQQueue[cliq], thread=0 Produced: 2 messages
+Producer ActiveMQQueue[cliq], thread=0 Elapsed time in second : # s
+Producer ActiveMQQueue[cliq], thread=0 Elapsed time in milli second : # milli seconds
+--- exit 0
+=== producer --destination queue://cliq --message-count 3 --text-size 20 --non-persistent --group g1 --properties [{"type":"int","key":"k","value":"7"},{"type":"string","key":"s","value":"v"}]
+Connection brokerURL = URL
+Producer ActiveMQQueue[cliq], thread=0 Started to calculate elapsed time ...
+
+Producer ActiveMQQueue[cliq], thread=0 Produced: 3 messages
+Producer ActiveMQQueue[cliq], thread=0 Elapsed time in second : # s
+Producer ActiveMQQueue[cliq], thread=0 Elapsed time in milli second : # milli seconds
+--- exit 0
+=== producer --destination queue://cliq --message-count 2 --message-size 10 --commit-interval 1
+Connection brokerURL = URL
+Producer ActiveMQQueue[cliq], thread=0 Started to calculate elapsed time ...
+
+Producer ActiveMQQueue[cliq], thread=0 Committing transaction: 0
+Producer ActiveMQQueue[cliq], thread=0 Produced: 2 messages
+Producer ActiveMQQueue[cliq], thread=0 Elapsed time in second : # s
+Producer ActiveMQQueue[cliq], thread=0 Elapsed time in milli second : # milli seconds
+--- exit 0
+=== browser --destination queue://cliq
+Connection brokerURL = URL
+Consumer:: filter = null
+Consumer ActiveMQQueue[cliq], thread=0 trying to browse 1000 messages
+Consumer ActiveMQQueue[cliq], thread=0 browsing test message: 0
+Consumer ActiveMQQueue[cliq], thread=0 browsing test message: 1
+Consumer ActiveMQQueue[cliq], thread=0 browsing test message: 2
+Consumer ActiveMQQueue[cliq], thread=0 browsing test message: 3
+Consumer ActiveMQQueue[cliq], thread=0 browsing test message: 4
+Consumer ActiveMQQueue[cliq], thread=0 browsing hello
+Consumer ActiveMQQueue[cliq], thread=0 browsing hello
+Consumer ActiveMQQueue[cliq], thread=0 browsing Lorem ipsum dolor si
+Consumer ActiveMQQueue[cliq], thread=0 browsing Lorem ipsum dolor si
+Consumer ActiveMQQueue[cliq], thread=0 browsing Lorem ipsum dolor si
+Consumer ActiveMQQueue[cliq], thread=0 browsing ID:UUID
+Consumer ActiveMQQueue[cliq], thread=0 browsing ID:UUID
+Consumer ActiveMQQueue[cliq], thread=0 browsed: 12 messages
+Consumer ActiveMQQueue[cliq], thread=0 Browser thread finished
+--- exit 0
+=== browser --destination queue://cliq --message-count 3 --filter k = 7
+Connection brokerURL = URL
+Consumer:: filter = k = 7
+Consumer ActiveMQQueue[cliq], thread=0 trying to browse 3 messages
+Consumer ActiveMQQueue[cliq], thread=0 browsing Lorem ipsum dolor si
+Consumer ActiveMQQueue[cliq], thread=0 browsing Lorem ipsum dolor si
+Consumer ActiveMQQueue[cliq], thread=0 browsing Lorem ipsum dolor si
+Consumer ActiveMQQueue[cliq], thread=0 browsed: 3 messages
+Consumer ActiveMQQueue[cliq], thread=0 Browser thread finished
+--- exit 0
+=== queue stat --queueName cliq
+Connection brokerURL = URL
+|NAME|ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|    |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|cliq|cliq   |   0    |  12   |   12   |    0     |   0    |    0    |ANYCAST| false  |
+--- exit 0
+=== queue stat --queueName cliq --json
+{"data":[
+   {"id":"#","name":"cliq","address":"cliq","filter":"","durable":"true","paused":"false","persistedPause":"false","temporary":"false","purgeOnNoConsumers":"false","consumerCount":"0","maxConsumers":"4","autoCreated":"false","user":"","routingType":"ANYCAST","messagesAdded":"12","messageCount":"12","messagesAcked":"0","messagesExpired":"0","deliveringCount":"0","messagesKilled":"0","directDeliver":"false","exclusive":"false","lastValue":"false","lastValueKey":"","scheduledCount":"0","groupRebalance":"false","groupRebalancePauseDispatch":"false","groupBuckets":"-1","groupFirstKey":"","enabled":"true","ringSize":"-1","consumersBeforeDispatch":"0","delayBeforeDispatch":"-1","autoDelete":"false","internalQueue":"false"}
+],"count":1}
+--- exit 0
+=== queue stat --field MESSAGE_COUNT --operation GREATER_THAN --value 5
+Connection brokerURL = URL
+|NAME|ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|    |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|cliq|cliq   |   0    |  12   |   12   |    0     |   0    |    0    |ANYCAST| false  |
+--- exit 0
+=== queue stat --field name --operation EQUALS --value clim --single-line-header
+Connection brokerURL = URL
+|NAME|ADDRESS|CONSUMER_COUNT|MESSAGE_COUNT|MESSAGES_ADDED|DELIVERING_COUNT|MESSAGES_ACKED|SCHEDULED_COUNT|ROUTING_TYPE|INTERNAL|
+|clim|clia   |0             |0            |0             |0               |0             |0              |MULTICAST   |false   |
+--- exit 0
+=== queue stat --field NAME --operation NOPE --value x
+Connection brokerURL = URL
+'--operation' must be set to one of the following [CONTAINS, NOT_CONTAINS, EQUALS, GREATER_THAN, LESS_THAN]
+--- exit 0
+=== queue stat --field NAME --queueName x
+Connection brokerURL = URL
+'--field' and '--queueName' cannot be specified together.
+--- exit 0
+=== consumer --destination queue://cliq --message-count 2
+Connection brokerURL = URL
+Consumer:: filter = null
+Consumer ActiveMQQueue[cliq], thread=0 wait 3000ms until 2 messages are consumed
+Consumer ActiveMQQueue[cliq], thread=0 Consumed: 2 messages
+Consumer ActiveMQQueue[cliq], thread=0 Elapsed time in second : # s
+Consumer ActiveMQQueue[cliq], thread=0 Elapsed time in milli second : # milli seconds
+Consumer ActiveMQQueue[cliq], thread=0 Consumed: 2 messages
+Consumer ActiveMQQueue[cliq], thread=0 Consumer thread finished
+--- exit 0
+=== consumer --destination queue://cliq --message-count 2 --filter k = 7 --verbose
+Connection brokerURL = URL
+Consumer:: filter = k = 7
+Consumer ActiveMQQueue[cliq], thread=0 wait 3000ms until 2 messages are consumed
+Consumer ActiveMQQueue[cliq], thread=0 Received Lorem ipsum dolor si
+JMS Message ID:ID:UUID
+Received text sized at 20
+Consumer ActiveMQQueue[cliq], thread=0 Received Lorem ipsum dolor si
+JMS Message ID:ID:UUID
+Received text sized at 20
+Consumer ActiveMQQueue[cliq], thread=0 Consumed: 2 messages
+Consumer ActiveMQQueue[cliq], thread=0 Elapsed time in second : # s
+Consumer ActiveMQQueue[cliq], thread=0 Elapsed time in milli second : # milli seconds
+Consumer ActiveMQQueue[cliq], thread=0 Consumed: 2 messages
+Consumer ActiveMQQueue[cliq], thread=0 Consumer thread finished
+--- exit 0
+=== consumer --destination queue://cliq --message-count 20 --receive-timeout 500 --break-on-null
+Connection brokerURL = URL
+Consumer:: filter = null
+Consumer ActiveMQQueue[cliq], thread=0 wait 500ms until 20 messages are consumed
+Consumer ActiveMQQueue[cliq], thread=0 Consumed: 20 messages
+Consumer ActiveMQQueue[cliq], thread=0 Elapsed time in second : # s
+Consumer ActiveMQQueue[cliq], thread=0 Elapsed time in milli second : # milli seconds
+Consumer ActiveMQQueue[cliq], thread=0 Consumed: 8 messages
+Consumer ActiveMQQueue[cliq], thread=0 Consumer thread finished
+--- exit 0
+=== consumer --destination topic://clitopic --message-count 1 --receive-timeout 200 --break-on-null
+Connection brokerURL = URL
+Consumer:: filter = null
+Consumer ActiveMQTopic[clitopic], thread=0 wait 200ms until 1 messages are consumed
+Consumer ActiveMQTopic[clitopic], thread=0 Consumed: 1 messages
+Consumer ActiveMQTopic[clitopic], thread=0 Elapsed time in second : # s
+Consumer ActiveMQTopic[clitopic], thread=0 Elapsed time in milli second : # milli seconds
+Consumer ActiveMQTopic[clitopic], thread=0 Consumed: 0 messages
+Consumer ActiveMQTopic[clitopic], thread=0 Consumer thread finished
+--- exit 0
+=== consumer --destination topic://clitopic --message-count 1 --receive-timeout 200 --durable --clientID cid --break-on-null
+Connection brokerURL = URL
+Consumer:: filter = null
+Consumer:: clientID = cid
+Consumer ActiveMQTopic[clitopic], thread=0 wait 200ms until 1 messages are consumed
+Consumer ActiveMQTopic[clitopic], thread=0 Consumed: 1 messages
+Consumer ActiveMQTopic[clitopic], thread=0 Elapsed time in second : # s
+Consumer ActiveMQTopic[clitopic], thread=0 Elapsed time in milli second : # milli seconds
+Consumer ActiveMQTopic[clitopic], thread=0 Consumed: 0 messages
+Consumer ActiveMQTopic[clitopic], thread=0 Consumer thread finished
+--- exit 0
+=== producer --destination topic://clitopic --message-count 2
+Connection brokerURL = URL
+Producer ActiveMQTopic[clitopic], thread=0 Started to calculate elapsed time ...
+
+Producer ActiveMQTopic[clitopic], thread=0 Produced: 2 messages
+Producer ActiveMQTopic[clitopic], thread=0 Elapsed time in second : # s
+Producer ActiveMQTopic[clitopic], thread=0 Elapsed time in milli second : # milli seconds
+--- exit 0
+=== consumer --destination topic://clitopic --message-count 5 --receive-timeout 300 --durable --clientID cid --break-on-null
+Connection brokerURL = URL
+Consumer:: filter = null
+Consumer:: clientID = cid
+Consumer ActiveMQTopic[clitopic], thread=0 wait 300ms until 5 messages are consumed
+Consumer ActiveMQTopic[clitopic], thread=0 Consumed: 5 messages
+Consumer ActiveMQTopic[clitopic], thread=0 Elapsed time in second : # s
+Consumer ActiveMQTopic[clitopic], thread=0 Elapsed time in milli second : # milli seconds
+Consumer ActiveMQTopic[clitopic], thread=0 Consumed: 2 messages
+Consumer ActiveMQTopic[clitopic], thread=0 Consumer thread finished
+--- exit 0
+=== queue stat --queueName cid
+Connection brokerURL = URL
+|NAME                     |ADDRESS |CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED| ROUTING |INTERNAL|
+|                         |        | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  |  TYPE   |        |
+|cid.Consumer ActiveMQTopi|clitopic|   0    |   0   |   2    |    0     |   2    |    0    |MULTICAST| false  |
+|  c[clitopic], thread=0  |        |        |       |        |          |        |         |         |        |
+--- exit 0
+=== producer --destination queue://cliq --message-count 4
+Connection brokerURL = URL
+Producer ActiveMQQueue[cliq], thread=0 Started to calculate elapsed time ...
+
+Producer ActiveMQQueue[cliq], thread=0 Produced: 4 messages
+Producer ActiveMQQueue[cliq], thread=0 Elapsed time in second : # s
+Producer ActiveMQQueue[cliq], thread=0 Elapsed time in milli second : # milli seconds
+--- exit 0
+=== transfer --source-url URL --target-url URL --source-queue cliq --target-queue cliq2 --message-count 3 --silent
+Connection brokerURL = URL
+Transferred a total of 3 messages
+--- exit 0
+=== transfer --source-url URL --target-url URL --source-queue cliq --target-queue cliq2 --copy --silent
+Connection brokerURL = URL
+Transferred a total of 1 messages
+--- exit 0
+=== transfer --source-url URL --target-url URL --source-queue cliq2 --target-topic clitopic --commit-interval 1 --receive-timeout 200 --silent
+Connection brokerURL = URL
+Transferred 2 messages of 2
+Transferred 2 messages of 4
+Transferred a total of 4 messages
+--- exit 0
+=== queue stat --field ADDRESS --operation CONTAINS --value cli
+Connection brokerURL = URL
+|NAME                     |ADDRESS |CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED| ROUTING |INTERNAL|
+|                         |        | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  |  TYPE   |        |
+|cid.Consumer ActiveMQTopi|clitopic|   0    |   4   |   6    |    0     |   2    |    0    |MULTICAST| false  |
+|  c[clitopic], thread=0  |        |        |       |        |          |        |         |         |        |
+|clim                     |clia    |   0    |   0   |   0    |    0     |   0    |    0    |MULTICAST| false  |
+|cliq                     |cliq    |   0    |   1   |   16   |    0     |   15   |    0    | ANYCAST | false  |
+|cliq2                    |cliq2   |   0    |   0   |   4    |    0     |   4    |    0    | ANYCAST | false  |
+--- exit 0
+=== queue purge --name cliq
+Connection brokerURL = URL
+Queue cliq purged successfully.
+--- exit 0
+=== queue purge --name nosuch
+Connection brokerURL = URL
+Failed to purge queue nosuch. Reason: AMQ229067: Cannot find resource with name queue.nosuch
+--- exit 0
+=== queue delete --name cliq2
+Connection brokerURL = URL
+Queue cliq2 deleted successfully.
+--- exit 0
+=== queue delete --name nosuch
+Connection brokerURL = URL
+Failed to delete queue nosuch. Reason: AMQ229017: Queue nosuch does not exist
+--- exit 0
+=== queue delete --name clim --autoDeleteAddress
+Connection brokerURL = URL
+Queue clim deleted successfully.
+--- exit 0
+=== address create --name cliaddr --multicast
+Connection brokerURL = URL
+Address [name=cliaddr, routingTypes={MULTICAST}, autoCreated=false] created successfully.
+--- exit 0
+=== address create --name cliaddr --multicast
+Connection brokerURL = URL
+Failed to create address cliaddr. Reason: AMQ229204: Address already exists: cliaddr
+--- exit 0
+=== address create --name cliaddr2 --anycast --no-multicast
+Connection brokerURL = URL
+Address [name=cliaddr2, routingTypes={ANYCAST}, autoCreated=false] created successfully.
+--- exit 0
+=== address show --name cliaddr
+Connection brokerURL = URL
+Address [name=cliaddr, routingTypes={MULTICAST}, autoCreated=false]
+--- exit 0
+=== address show --name nosuch --bindings
+Connection brokerURL = URL
+
+--- exit 0
+=== address show --name nosuch
+Connection brokerURL = URL
+Failed to show address nosuch. Reason: AMQ229203: Address Does Not Exist: nosuch
+--- exit 0
+=== address update --name cliaddr --anycast --multicast
+Connection brokerURL = URL
+Address [name=cliaddr, routingTypes={MULTICAST,ANYCAST}, autoCreated=false] updated successfully.
+--- exit 0
+=== address delete --name cliaddr
+Connection brokerURL = URL
+Address cliaddr deleted successfully.
+--- exit 0
+=== address delete --name cliaddr2
+Connection brokerURL = URL
+Address cliaddr2 deleted successfully.
+--- exit 0
+=== address delete --name cliq
+Connection brokerURL = URL
+Failed to delete address cliq. Reason: AMQ229205: Address cliq has bindings
+--- exit 0
+=== address delete --name cliq --force
+Connection brokerURL = URL
+Address cliq deleted successfully.
+--- exit 0
+=== address show
+Connection brokerURL = URL
+$sys.mqtt.sessions
+activemq.management.UUID
+activemq.notifications
+cliq2
+clitopic
+DLQ
+ExpiryQueue
+--- exit 0
+=== user list
+Connection brokerURL = URL
+--- "user"(roles) ---
+"artemis"(amq)
+
+ Total: 1
+--- exit 0
+=== user add --user-command-user u1 --user-command-password p1 --role r1,r2
+Connection brokerURL = URL
+u1 added successfully.
+--- exit 0
+=== user add --user-command-user u1 --user-command-password p1 --role r1
+Connection brokerURL = URL
+Failed to add user u1. Reason: AMQ229223: User u1 already exists
+--- exit 0
+=== user add --user-command-user u2 --role r1
+Connection brokerURL = URL
+Must specify --user-command-password when using --silent option
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== user list --user-command-user u1
+Connection brokerURL = URL
+--- "user"(roles) ---
+"u1"(r2,r1)
+
+ Total: 1
+--- exit 0
+=== user reset --user-command-user u1 --user-command-password p2 --role r3
+Connection brokerURL = URL
+u1 reset successfully.
+--- exit 0
+=== user list
+Connection brokerURL = URL
+--- "user"(roles) ---
+"artemis"(amq)
+"u1"(r3)
+
+ Total: 2
+--- exit 0
+=== user rm --user-command-user u1
+Connection brokerURL = URL
+u1 removed successfully.
+--- exit 0
+=== user rm --user-command-user u1
+Connection brokerURL = URL
+Failed to remove user u1. Reason: AMQ229224: User u1 does not exist
+--- exit 0
+=== check node
+Connection brokerURL = URL
+Running NodeCheck
+Checking that the node is started ... success
+Checks run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: # sec - NodeCheck
+--- exit 0
+=== check node --up --diskUsage 99 --memoryUsage 99
+Connection brokerURL = URL
+Running NodeCheck
+Checking that the node is started ... success
+Checking that the disk usage is less then 99 ... success
+Checking that the memory usage is less then 99 ... success
+Checks run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: # sec - NodeCheck
+--- exit 0
+=== check node --diskUsage 0
+Connection brokerURL = URL
+NodeCheck failed. Reason: java.lang.IllegalArgumentException: Invalid disk usage percentage: 0
+--- exit 1
+=== check node --primary
+Connection brokerURL = URL
+Running NodeCheck
+Checking that the node has a primary ... failure: No primary found for the node UUID
+Checks run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: # sec - NodeCheck
+NodeCheck failed. Reason: failure: No primary found for the node UUID
+--- exit 1
+=== check node --peers 1
+Connection brokerURL = URL
+Running NodeCheck
+Checking that there are 1 peers ... failure: Insufficient peers: 1
+Checks run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: # sec - NodeCheck
+NodeCheck failed. Reason: failure: Insufficient peers: 1
+--- exit 1
+=== check queue --name DLQ
+Connection brokerURL = URL
+Running QueueCheck
+Checking that the queue DLQ exists and is not paused ... success
+Checks run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: # sec - QueueCheck
+--- exit 0
+=== check queue --name DLQ --produce 2 --browse 2 --consume 2
+Connection brokerURL = URL
+Running QueueCheck
+Checking that a producer can send 2 messages to the queue DLQ ... success
+Checking that a consumer can browse 2 messages from the queue DLQ ... success
+Checking that a consumer can consume 2 messages from the queue DLQ ... success
+Checks run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: # sec - QueueCheck
+--- exit 0
+=== check queue --name DLQ --browse 1 --fail-at-end
+Connection brokerURL = URL
+Running QueueCheck
+Checking that a consumer can browse 1 messages from the queue DLQ ... failure: Insufficient messages to browse: 0
+Checks run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: # sec - QueueCheck
+QueueCheck failed. Reason: checks not successful
+--- exit 1
+=== check queue --name DLQ --consume -1 --browse -1
+Connection brokerURL = URL
+Running QueueCheck
+Checking that a consumer can browse the queue DLQ ... success
+Checking that a consumer can consume the queue DLQ ... success
+Checks run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: # sec - QueueCheck
+--- exit 0
+=== check queue --name nosuch
+Connection brokerURL = URL
+Running QueueCheck
+Checking that the queue nosuch exists and is not paused ... error: Failed to get queue.nosuch.Paused. Reason: Problem while retrieving attribute Paused
+Checks run: 1, Failures: 0, Errors: 1, Skipped: 0, Time elapsed: # sec - QueueCheck
+QueueCheck failed. Reason: error: Failed to get queue.nosuch.Paused. Reason: Problem while retrieving attribute Paused
+--- exit 1
+=== check queue --name DLQ --produce 0
+Connection brokerURL = URL
+QueueCheck failed. Reason: java.lang.IllegalArgumentException: Invalid  number of messages to produce: 0
+--- exit 1

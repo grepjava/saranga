@@ -540,7 +540,13 @@ impl Broker {
         if broker.management.counters().enabled() {
             broker.management.counters().start(&broker);
         }
-        // The broker is active: notifications go out from now on.
+        // The broker is active: notifications go out from now on, to an
+        // address that exists so cluster bridges can connect
+        // (`ManagementServiceImpl.start`).
+        broker.post_office.add_memory_address(
+            &broker.management.config().notification_address,
+            RoutingType::Multicast,
+        );
         broker
             .post_office
             .set_notifier(notifications::Notifier::start(

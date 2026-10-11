@@ -739,6 +739,22 @@ impl PostOffice {
             .or_insert_with(|| AddressEntry::new(info));
     }
 
+    /// An address kept in memory only (`ActiveMQServer.addAddressInfo` of a
+    /// new `AddressInfo`): nothing when the address exists already.
+    pub fn add_memory_address(&self, name: &str, routing_type: RoutingType) {
+        if self.read().addresses.contains_key(name) {
+            return;
+        }
+        self.reload_address(AddressInfo {
+            id: self.ids.next(),
+            name: name.into(),
+            routing_types: RoutingTypes::of(routing_type),
+            auto_created: false,
+            temporary: false,
+            internal: false,
+        });
+    }
+
     /// A queue recovered from the bindings journal, under its persisted ID
     /// (`initQueues`). A name taken already gets a `-N` suffix.
     pub fn reload_queue(&self, id: i64, mut config: QueueConfig) -> Result<Queue> {

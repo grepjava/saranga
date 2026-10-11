@@ -324,7 +324,7 @@ fn write_files(users: (&Path, &Document), roles: (&Path, &Document)) -> Result<(
 
 /// `findRoles`: the roles listing `user`.
 fn find_roles(roles: &Document, user: &str) -> Vec<String> {
-    let mut out: Vec<String> = roles
+    let found: Vec<String> = roles
         .keys()
         .into_iter()
         .filter(|role| {
@@ -334,8 +334,44 @@ fn find_roles(roles: &Document, user: &str) -> Vec<String> {
                 .any(|list| list.split(',').any(|item| item.trim() == user))
         })
         .collect();
-    out.sort();
-    out
+    java_hash_order(found, false)
+}
+
+/// The iteration order of a Java `HashSet` (or `HashMap` keys) of strings
+/// added in this order: by bucket, then by insertion within a bucket.
+/// `copy` is a set made with `new HashSet<>(collection)`, whose table is
+/// sized for the collection up front; otherwise the table grows from 16 as
+/// items are added.
+fn java_hash_order(items: Vec<String>, copy: bool) -> Vec<String> {
+    let mut unique: Vec<String> = Vec::new();
+    for item in items {
+        if !unique.contains(&item) {
+            unique.push(item);
+        }
+    }
+    let n = unique.len();
+    let mut capacity: usize = if copy {
+        ((n as f32 / 0.75) as usize + 1).max(16).next_power_of_two()
+    } else {
+        16
+    };
+    while n as f32 > capacity as f32 * 0.75 {
+        capacity *= 2;
+    }
+    let bucket = |s: &str| {
+        let h = s
+            .encode_utf16()
+            .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(i32::from(c)));
+        let h = h ^ ((h as u32) >> 16) as i32;
+        (h as u32 as usize) & (capacity - 1)
+    };
+    let mut indexed: Vec<(usize, usize, String)> = unique
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| (bucket(&s), i, s))
+        .collect();
+    indexed.sort();
+    indexed.into_iter().map(|(_, _, s)| s).collect()
 }
 
 /// `addRoles`.
@@ -475,10 +511,17 @@ fn remove_user(m: &Management, broker: &Broker, user: &str) -> Outcome {
     Ok(Json::Null)
 }
 
-/// `listUser`, as `buildJsonUserList` writes it.
+/// `listUser`, as `buildJsonUserList` writes it: users in the order of the
+/// `HashMap` they are put in, each one's roles in the order of its
+/// `HashSet`.
 fn list_user(m: &Management, broker: &Broker, user: Option<&str>) -> Outcome {
-    let list = match user_store(m, broker)? {
-        UserStore::Basic(users) => users.list(user)?,
+    let list: Vec<(String, Vec<String>)> = match user_store(m, broker)? {
+        // `new HashSet<>(getRoles())`.
+        UserStore::Basic(users) => users
+            .list(user)?
+            .into_iter()
+            .map(|(u, roles)| (u, java_hash_order(roles, true)))
+            .collect(),
         UserStore::Files {
             users: user_file,
             roles: role_file,
@@ -497,6 +540,9 @@ fn list_user(m: &Management, broker: &Broker, user: Option<&str>) -> Outcome {
             }
         }
     };
+    let order = java_hash_order(list.iter().map(|(u, _)| u.clone()).collect(), false);
+    let mut list = list;
+    list.sort_by_key(|(u, _)| order.iter().position(|o| o == u));
     Ok(Json::from(
         Json::Array(
             list.into_iter()
@@ -625,4 +671,17 @@ pub(super) async fn invoke(
         return Some(Ok(Json::Null));
     }
     None
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::java_hash_order;
+
+    #[test]
+    fn hash_set_order() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // "r1" is in bucket 15 and "r2" in bucket 0 of a 16-slot table.
+        assert_eq!(java_hash_order(v(&["r1", "r2"]), false), v(&["r2", "r1"]));
+        assert_eq!(java_hash_order(v(&["amq"]), false), v(&["amq"]));
+    }
 }
