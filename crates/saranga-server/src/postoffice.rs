@@ -495,6 +495,11 @@ impl PostOffice {
         &*self.filters
     }
 
+    /// The broker's wildcard syntax (`getWildcardConfiguration`).
+    pub fn wildcard(&self) -> &WildcardConfig {
+        &self.wildcard
+    }
+
     pub fn ids(&self) -> &Arc<IdGenerator> {
         &self.ids
     }
@@ -710,6 +715,8 @@ impl PostOffice {
             .map(|q| (q.config().address.clone(), q.clone()))
         {
             return if ignore_if_exists {
+                // An auto-delete that was under way stops.
+                q.set_swept(false);
                 Ok(q)
             } else {
                 Err(BrokerError::queue_already_exists(&spec.name, &address))

@@ -237,6 +237,19 @@ The differences from Artemis are listed in COMPAT.md.
   - scheduled and expired messages, heart-beats and the TTL;
   - large messages in both directions;
   - messages crossing between STOMP and JMS.
+- Stage 3 (MQTT) is done. The codec follows Netty's `MqttDecoder` and `MqttEncoder` 4.1.137, which Artemis uses: the same validations, the same handling of a bad packet, and the same byte layout, including the order of MQTT 5 properties. [tests/interop/mqtt/Mqtt.java](tests/interop/mqtt/Mqtt.java) has 40 tests using Paho 1.2.5 (3.1.1 and 5), raw sockets for byte-level checks, and JMS. They pass against Artemis 2.57.0 and against Saranga: `CONFIG=tests/interop/mqtt/broker.xml SUITE_FILE=tests/interop/mqtt/Mqtt.java SUITE_CP='<artemis lib>/*;<paho mqttv3 jar>;<paho mqttv5 jar>' scripts/interop.sh saranga`. They cover:
+  - QoS 0, 1 and 2 in both directions, with QoS 2 duplicates and redelivery after a reconnect using the same packet ID;
+  - wildcards, and topics containing `.`;
+  - retained messages;
+  - persistent and clean sessions, and session-present;
+  - wills on failure and on keep-alive timeout, and no will after DISCONNECT;
+  - link stealing;
+  - MQTT 3.1 and its client ID rules;
+  - malformed packets;
+  - in MQTT 5: properties, subscription identifiers, no-local, retain handling, retain-as-published, shared subscriptions, session expiry, topic aliases, the CONNACK properties, authentication methods, reason codes and Receive Maximum;
+  - messages crossing between MQTT and JMS.
+
+  `tests/mqtt.rs` in `saranga-protocol-mqtt` checks that a session and its in-flight packet IDs survive a restart. Session state is kept in `$sys.mqtt.sessions`, packet-ID correlations as journal records of type 54, and QoS 2 packet IDs in the `mqtt.qos.*` duplicate-ID caches, all as Artemis keeps them.
 
 ## Phase 8: Management and operations
 

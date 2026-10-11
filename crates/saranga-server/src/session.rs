@@ -152,6 +152,11 @@ impl Completion {
         self.waits.is_empty() && self.actions.is_empty()
     }
 
+    /// Adds a journal write to wait for.
+    pub fn push(&mut self, wait: Pending) {
+        self.waits.push(wait);
+    }
+
     /// Adds another request's writes and updates to these.
     pub fn merge(&mut self, other: Completion) {
         self.waits.extend(other.waits);
@@ -779,6 +784,26 @@ impl ServerSession {
         }
     }
 
+    /// `ServerConsumerImpl.individualCancel`: a message the consumer is
+    /// delivering goes back to its queue.
+    pub fn cancel_one(&self, consumer_id: i64, message_id: i64, failed: bool) {
+        if let Some(c) = self.consumers.get(&consumer_id) {
+            c.queue.cancel_one(c.id, message_id, failed);
+        }
+    }
+
+    /// `ServerConsumerImpl.promptDelivery`.
+    pub fn prompt_delivery(&self, consumer_id: i64) {
+        if let Some(c) = self.consumers.get(&consumer_id) {
+            c.queue.prompt_delivery();
+        }
+    }
+
+    /// Whether the session has this consumer (`locateConsumer`).
+    pub fn has_consumer(&self, consumer_id: i64) -> bool {
+        self.consumers.contains_key(&consumer_id)
+    }
+
     /// The queue a consumer reads from.
     pub fn consumer_queue(&self, consumer_id: i64) -> Option<&Queue> {
         self.consumers.get(&consumer_id).map(|c| &c.queue)
@@ -1350,6 +1375,12 @@ impl ServerSession {
 
     /// `ServerSessionImpl.deleteQueue`.
     pub fn delete_queue(&mut self, name: &str) -> Result<()> {
+        self.delete_queue_with(name, true)
+    }
+
+    /// `deleteQueue(name, checkSecurity)`: without the check, the session's
+    /// user need not be allowed to delete the queue or its address.
+    pub fn delete_queue_with(&mut self, name: &str, check_security: bool) -> Result<()> {
         let post_office = self.broker.post_office();
         let name = queue_name_of(self.remove_prefix(name));
         let queue = post_office
@@ -1361,14 +1392,18 @@ impl ServerSession {
         } else {
             CheckType::DeleteNonDurableQueue
         };
-        self.security_check(&address, Some(name), check)?;
+        if check_security {
+            self.security_check(&address, Some(name), check)?;
+        }
         post_office.delete_queue(name, true, false)?;
         self.conn.remove_temp_queue(name);
         // `destroyQueue(forceAutoDeleteAddress)`: a client's delete takes an
         // auto-created address along whatever `auto-delete-addresses` says,
         // if the user may delete it.
         if post_office.address_auto_deletable(&address) {
-            self.security_check(&address, None, CheckType::DeleteAddress)?;
+            if check_security {
+                self.security_check(&address, None, CheckType::DeleteAddress)?;
+            }
             post_office.remove_address(&address);
         }
         Ok(())

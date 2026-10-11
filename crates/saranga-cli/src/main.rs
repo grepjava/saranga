@@ -130,8 +130,35 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// The protocols besides Core that `saranga run` serves.
-fn protocol_managers() -> Vec<Arc<dyn saranga_server::protocol::ProtocolManager>> {
-    vec![Arc::new(saranga_protocol_stomp::StompProtocol)]
+const SERVED_PROTOCOLS: [&str; 3] = ["CORE", "STOMP", "MQTT"];
+
+/// The protocols besides Core that `saranga run` serves, as configured.
+fn protocol_managers(
+    file: Option<&saranga_config::BrokerConfig>,
+    binds: &[Bind],
+) -> Vec<Arc<dyn saranga_server::protocol::ProtocolManager>> {
+    let mut mqtt = saranga_protocol_mqtt::MqttConfig::default();
+    if let Some(f) = file {
+        mqtt.session_scan_interval = f.mqtt_session_scan_interval;
+        mqtt.subscription_persistence_enabled = f.mqtt_subscription_persistence_enabled;
+        mqtt.internal_naming_prefix = f.internal_naming_prefix.clone();
+        mqtt.management_address = f.management_address.clone();
+        mqtt.management_notification_address = f.management_notification_address.clone();
+    }
+    // An acceptor that lists none of the protocols serves them all.
+    mqtt.served = binds.iter().any(|b| match &b.acceptor.protocols {
+        None => true,
+        Some(listed) => {
+            listed.iter().any(|p| p == "MQTT")
+                || !listed
+                    .iter()
+                    .any(|p| SERVED_PROTOCOLS.contains(&p.as_str()))
+        }
+    });
+    vec![
+        Arc::new(saranga_protocol_stomp::StompProtocol),
+        Arc::new(saranga_protocol_mqtt::MqttProtocol::new(mqtt)),
+    ]
 }
 
 /// An acceptor to open.
@@ -388,10 +415,8 @@ fn parse_system_property(s: &str) -> Result<(String, String), String> {
 
 async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> anyhow::Result<()> {
     let filters = Arc::new(SelectorFilters);
-    let protocols = protocol_managers();
-    let served: Vec<&str> = std::iter::once("CORE")
-        .chain(protocols.iter().map(|p| p.name()))
-        .collect();
+    let served = SERVED_PROTOCOLS;
+    let mut file_config = None;
     let (mut broker_config, mut binds, reload_period) = match &instance {
         Some(instance) => {
             let file = instance.broker_config()?;
@@ -402,6 +427,7 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
             config.users = security.users;
             config.bootstrap_users = security.bootstrap_users;
             let period = file.configuration_file_refresh_period.max(1) as u64;
+            file_config = Some(file);
             (config, binds, std::time::Duration::from_millis(period))
         }
         None => (
@@ -429,7 +455,7 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
             acceptor: Acceptor::default(),
         }];
     }
-    broker_config.protocols = protocols;
+    broker_config.protocols = protocol_managers(file_config.as_ref(), &binds);
     let broker = Broker::start(broker_config).await?;
     let mut servers = tokio::task::JoinSet::new();
     for Bind {

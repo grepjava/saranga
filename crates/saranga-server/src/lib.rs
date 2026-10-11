@@ -476,7 +476,7 @@ impl Broker {
         // loadProtocolServices: each protocol sets itself up once the
         // journals are loaded.
         for p in broker.protocols.clone() {
-            p.start(&broker);
+            p.start(&broker).await;
         }
         Ok(broker)
     }

@@ -530,8 +530,30 @@ fn parse_scalars(
     if let Some(v) = s.bool("persist-id-cache") {
         config.persist_id_cache = v;
     }
+    if let Some(v) = s.non_empty_string("management-address")? {
+        config.management_address = v;
+    }
+    if let Some(v) = s.non_empty_string("management-notification-address")? {
+        config.management_notification_address = v;
+    }
     if let Some(v) = s.bool("large-message-sync") {
         config.large_message_sync = v;
+    }
+    if let Some(v) = s.string("internal-naming-prefix") {
+        config.internal_naming_prefix = v;
+    }
+    if let Some(v) = s.i64("mqtt-session-scan-interval", Check::GtZero)? {
+        config.mqtt_session_scan_interval = v;
+    }
+    if let Some(v) = s.i64("mqtt-session-state-persistence-timeout", Check::GtZero)? {
+        config.warnings.push(Warning::Deprecated {
+            name: "mqtt-session-state-persistence-timeout".into(),
+            alternative: "mqtt-subscription-persistence-enabled",
+        });
+        config.mqtt_session_state_persistence_timeout = v;
+    }
+    if let Some(v) = s.bool("mqtt-subscription-persistence-enabled") {
+        config.mqtt_subscription_persistence_enabled = v;
     }
     parse_security_options(&s, config)?;
     if let Some(v) = s.i64("configuration-file-refresh-period", Check::GtZero)? {

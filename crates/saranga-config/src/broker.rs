@@ -208,6 +208,11 @@ pub enum Warning {
         key: String,
         reason: String,
     },
+    /// A deprecated setting was given (`AMQ221038`).
+    Deprecated {
+        name: String,
+        alternative: &'static str,
+    },
 }
 
 impl fmt::Display for Warning {
@@ -238,6 +243,10 @@ impl fmt::Display for Warning {
                 key,
                 reason,
             } => write!(f, "{source}: {key} was not applied: {reason}"),
+            Self::Deprecated { name, alternative } => write!(
+                f,
+                "AMQ221038: Configuration option '{name}' is deprecated and will be removed in a future version. Use '{alternative}' instead. Consult the manual for details."
+            ),
         }
     }
 }
@@ -368,6 +377,21 @@ pub struct BrokerConfig {
     pub password_codec: String,
     pub populate_validated_user: bool,
     pub reject_empty_validated_user: bool,
+    /// `management-address`.
+    pub management_address: String,
+    /// `management-notification-address`.
+    pub management_notification_address: String,
+    /// `internal-naming-prefix`: the start of the names of the broker's own
+    /// resources.
+    pub internal_naming_prefix: String,
+    /// `mqtt-session-scan-interval`: how often, in milliseconds, MQTT
+    /// sessions are checked for expiry and delayed wills.
+    pub mqtt_session_scan_interval: i64,
+    /// `mqtt-session-state-persistence-timeout`, deprecated.
+    pub mqtt_session_state_persistence_timeout: i64,
+    /// `mqtt-subscription-persistence-enabled`: MQTT sessions are kept in
+    /// `$sys.mqtt.sessions`.
+    pub mqtt_subscription_persistence_enabled: bool,
     /// Match string and roles, in document order; a repeated match
     /// replaces the earlier one.
     pub security_settings: Vec<(String, SecuritySetting)>,
@@ -492,6 +516,12 @@ impl Default for BrokerConfig {
             password_codec: crate::mask::DEFAULT_CODEC.to_owned(),
             populate_validated_user: false,
             reject_empty_validated_user: false,
+            management_address: "activemq.management".to_owned(),
+            management_notification_address: "activemq.notifications".to_owned(),
+            internal_naming_prefix: "$.artemis.internal.".to_owned(),
+            mqtt_session_scan_interval: 5000,
+            mqtt_session_state_persistence_timeout: 5000,
+            mqtt_subscription_persistence_enabled: true,
             security_settings: Vec::new(),
             security_setting_plugins: Vec::new(),
             jaas_configs: Vec::new(),

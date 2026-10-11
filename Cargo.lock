@@ -1556,6 +1556,7 @@ dependencies = [
  "clap",
  "saranga-config",
  "saranga-paging",
+ "saranga-protocol-mqtt",
  "saranga-protocol-stomp",
  "saranga-security",
  "saranga-server",
@@ -1658,6 +1659,19 @@ version = "0.0.1"
 [[package]]
 name = "saranga-protocol-mqtt"
 version = "0.0.1"
+dependencies = [
+ "saranga-buffer",
+ "saranga-config",
+ "saranga-core-protocol",
+ "saranga-message",
+ "saranga-security",
+ "saranga-server",
+ "saranga-storage",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "saranga-protocol-openwire"

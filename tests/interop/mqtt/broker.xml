@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<!-- MQTT and Core on one acceptor (Mqtt.java): a short session scan so
+     expiry and delayed wills show quickly, and a quick TTL check. -->
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+   <core xmlns="urn:activemq:core">
+      <name>mqtt</name>
+      <persistence-enabled>true</persistence-enabled>
+      <security-enabled>false</security-enabled>
+      <connection-ttl-check-interval>500</connection-ttl-check-interval>
+      <mqtt-session-scan-interval>500</mqtt-session-scan-interval>
+      <acceptors>
+         <acceptor name="artemis">tcp://0.0.0.0:61616?protocols=CORE,MQTT</acceptor>
+      </acceptors>
+      <address-settings>
+         <address-setting match="#">
+            <dead-letter-address>DLQ</dead-letter-address>
+            <expiry-address>ExpiryQueue</expiry-address>
+         </address-setting>
+      </address-settings>
+      <addresses>
+         <address name="DLQ"><anycast><queue name="DLQ"/></anycast></address>
+         <address name="ExpiryQueue"><anycast><queue name="ExpiryQueue"/></anycast></address>
+      </addresses>
+   </core>
+</configuration>

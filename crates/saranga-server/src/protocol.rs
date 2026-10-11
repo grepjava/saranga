@@ -120,8 +120,11 @@ pub trait ProtocolManager: Send + Sync + 'static {
 
     /// Called once the broker has loaded its journals
     /// (`loadProtocolServices`): the protocol loads its state and starts
-    /// its periodic tasks.
-    fn start(&self, _broker: &Arc<Broker>) {}
+    /// its periodic tasks. The broker accepts no connections until it is
+    /// done.
+    fn start(&self, _broker: &Arc<Broker>) -> ServeFuture {
+        Box::pin(async {})
+    }
 }
 
 /// The Core protocol (`CoreProtocolManager`).

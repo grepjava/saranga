@@ -2,6 +2,9 @@
 //! `news.europe`. Ported from `AddressImpl.matches` and
 //! `WildcardConfiguration`.
 
+/// `WildcardConfiguration.ESCAPE`.
+pub const ESCAPE: char = '\\';
+
 /// `WildcardConfiguration`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WildcardConfig {
@@ -23,8 +26,17 @@ impl Default for WildcardConfig {
 }
 
 impl WildcardConfig {
+    /// `isWild`: an any-words or single-word character not escaped with
+    /// `\`.
     pub fn is_wild(&self, address: &str) -> bool {
-        address.contains(self.any_words) || address.contains(self.single_word)
+        let mut previous = None;
+        for c in address.chars() {
+            if (c == self.any_words || c == self.single_word) && previous != Some(ESCAPE) {
+                return true;
+            }
+            previous = Some(c);
+        }
+        false
     }
 
     /// Whether `address` is matched by `pattern` (`AddressImpl.matches`,

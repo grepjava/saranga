@@ -69,6 +69,16 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **A `` that is the last byte read** waits for its `
 `. Artemis reports `There is a CR not followed by an LF` when the two arrive in different packets.
 
+## MQTT differences
+- **Artemis bugs not copied.**
+  - **Live retained messages to MQTT 5 wildcard subscriptions:** a retained PUBLISH sent while a client is subscribed by a filter other than the exact topic (such as `a/#`) never reaches that client in Artemis, because `publishToClient` looks the subscription up by topic name and fails. Saranga delivers it. The retain flag is set only when the subscription found under the topic name asks for retain-as-published.
+  - **Packet-ID records on a clean start:** Artemis's `JournalHashMap.clear` removes the client's packet-ID correlations from memory but leaves their records in the journal, so they come back after a restart. Saranga deletes them. Either broker reads the other's journal.
+- **A second CONNECT** on a connection closes it, after a DISCONNECT 0x8E (session taken over) for MQTT 5. That is what Artemis's link stealing ends up doing when the client ID is the same. Artemis would instead start a second session if the client ID differed.
+- **The connection TTL** closes a silent connection when it runs out. Artemis notices at its next `connection-ttl-check-interval`, up to that much later.
+- **`mqtt-session-state-persistence-timeout`** is accepted and reported as deprecated (`AMQ221038`), as in Artemis, but as a warning rather than at INFO level.
+- **Interceptors** (Java classes) and connection routers (redirects) are not supported. The cluster-wide `SESSION_CREATED` notification that disconnects a client connected to another node waits for clustering (Phase 10).
+- **A large message** (over the journal's record size) published as a retained message stays a regular message in the retained-message queue. Artemis converts it to a large message there.
+
 ## Security differences
 - **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule` and `LDAPLoginModule` are supported. `Krb5LoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.
 - **Security managers.** The JAAS security manager (`<jaas-security>`) and `ActiveMQBasicSecurityManager` are supported. The basic manager keeps its users in the bindings journal, so its users move with the data directory in both directions. Any other `<security-manager>` class stops the broker from starting. As in Artemis, the basic manager has no users without persistence. Users can be added only through the bootstrap credentials until management arrives in Phase 8.
