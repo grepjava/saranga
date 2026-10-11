@@ -115,6 +115,12 @@ pub trait ProtocolManager: Send + Sync + 'static {
         false
     }
 
+    /// `websocketSubprotocolIdentifiers`: the WebSocket subprotocols it
+    /// answers to.
+    fn websocket_subprotocols(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Serves the connection until it closes.
     fn serve(&self, broker: Arc<Broker>, connection: Connection) -> ServeFuture;
 
@@ -164,28 +170,24 @@ pub async fn detect_and_serve(
     info: ConnectionInfo,
     acceptor: Arc<Acceptor>,
 ) {
-    let mut header = Vec::with_capacity(8);
-    let read = async {
-        while header.len() < 8 {
-            let mut chunk = [0u8; 8];
-            let want = 8 - header.len();
-            match stream.read(&mut chunk[..want]).await {
-                Ok(0) | Err(_) => return false,
-                Ok(n) => header.extend_from_slice(&chunk[..n]),
-            }
-        }
-        true
-    };
+    let enabled = broker.protocols_for(&acceptor);
     // `handshake-timeout`: a client that sends too little is closed.
-    let complete = match acceptor.handshake_timeout {
-        Some(t) => tokio::time::timeout(t, read).await.unwrap_or(false),
-        None => read.await,
-    };
-    if !complete {
+    let Some(mut header) = read_header(&mut stream, acceptor.handshake_timeout).await else {
         tracing::debug!(?peer, "connection closed before its protocol was known");
         return;
+    };
+    // An HTTP request: a WebSocket upgrade, inside which the protocol is
+    // detected again (`switchToHttp`, `WebSocketServerHandler`).
+    if saranga_transport::websocket::is_http(&header) {
+        let Some(ws) = upgrade(stream, header, &acceptor, &enabled).await else {
+            return;
+        };
+        stream = ws;
+        let Some(h) = read_header(&mut stream, None).await else {
+            return;
+        };
+        header = h;
     }
-    let enabled = broker.protocols_for(&acceptor);
     let manager = enabled
         .iter()
         .find(|p| p.is_protocol(&header))
@@ -210,6 +212,87 @@ pub async fn detect_and_serve(
         acceptor,
     };
     manager.serve(broker, connection).await;
+}
+
+/// The first 8 bytes a client sends, within `timeout` if given.
+async fn read_header(stream: &mut Box<dyn Stream>, timeout: Option<Duration>) -> Option<Vec<u8>> {
+    let mut header = Vec::with_capacity(8);
+    let read = async {
+        while header.len() < 8 {
+            let mut chunk = [0u8; 8];
+            let want = 8 - header.len();
+            match stream.read(&mut chunk[..want]).await {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => header.extend_from_slice(&chunk[..n]),
+            }
+        }
+        true
+    };
+    let complete = match timeout {
+        Some(t) => tokio::time::timeout(t, read).await.unwrap_or(false),
+        None => read.await,
+    };
+    complete.then_some(header)
+}
+
+/// Answers an HTTP request with the WebSocket handshake, offering the
+/// subprotocols of the acceptor's protocols, and returns the stream inside
+/// the WebSocket. `None` when the request was refused.
+async fn upgrade(
+    stream: Box<dyn Stream>,
+    header: Vec<u8>,
+    acceptor: &Acceptor,
+    enabled: &[Arc<dyn ProtocolManager>],
+) -> Option<Box<dyn Stream>> {
+    use saranga_transport::websocket::{self, EncoderType, Upgrade};
+    let mut stream = Rewind::new(header, stream);
+    let (request, leftover) = match websocket::read_request(&mut stream).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("reading an HTTP request: {e}");
+            return None;
+        }
+    };
+    let p = |k: &str| acceptor.params.get(k).map(String::as_str);
+    let stomp_max = p("stompMaxFramePayloadLength").and_then(|v| v.parse::<i64>().ok());
+    if stomp_max.is_some() {
+        tracing::info!(
+            "AMQ221038: Configuration option 'stompMaxFramePayloadLength' is deprecated and will be removed in a future version. Use 'webSocketMaxFramePayloadLength' instead. Consult the manual for details."
+        );
+    }
+    let max_payload = p("webSocketMaxFramePayloadLength")
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v != -1)
+        .or(stomp_max.filter(|v| *v != -1))
+        .unwrap_or(websocket::DEFAULT_MAX_FRAME_PAYLOAD_LENGTH as i64)
+        .max(1) as usize;
+    let encoder = match p("webSocketEncoderType") {
+        None => EncoderType::Binary,
+        Some(t) => match EncoderType::parse(t) {
+            Some(e) => e,
+            None => {
+                tracing::error!("invalid webSocketEncoderType {t}");
+                return None;
+            }
+        },
+    };
+    let subprotocols: Vec<&str> = enabled
+        .iter()
+        .flat_map(|m| m.websocket_subprotocols().iter().copied())
+        .collect();
+    match websocket::handshake(&mut stream, &request, &subprotocols).await {
+        Ok(Upgrade::WebSocket) => Some(Box::new(websocket::WebSocketStream::new(
+            stream,
+            leftover,
+            max_payload,
+            encoder,
+        ))),
+        Ok(Upgrade::Closed) => None,
+        Err(e) => {
+            tracing::debug!("WebSocket handshake: {e}");
+            None
+        }
+    }
 }
 
 /// `TransportConstants.DEFAULT_HANDSHAKE_TIMEOUT`, in seconds.

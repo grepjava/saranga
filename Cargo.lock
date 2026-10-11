@@ -1787,6 +1787,7 @@ dependencies = [
  "rustls",
  "saranga-config",
  "saranga-security",
+ "sha1 0.10.7",
  "tempfile",
  "thiserror",
  "tokio",

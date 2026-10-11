@@ -162,6 +162,10 @@ impl ProtocolManager for MqttProtocol {
         }
     }
 
+    fn websocket_subprotocols(&self) -> &'static [&'static str] {
+        &["mqtt", "mqttv3.1"]
+    }
+
     fn serve(&self, broker: Arc<Broker>, connection: Connection) -> ServeFuture {
         let settings = Settings::from(&connection.acceptor, &self.config);
         let state = self.state.get().cloned();

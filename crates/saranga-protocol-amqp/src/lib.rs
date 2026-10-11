@@ -142,6 +142,10 @@ impl ProtocolManager for AmqpProtocol {
         header.starts_with(b"AMQP")
     }
 
+    fn websocket_subprotocols(&self) -> &'static [&'static str] {
+        &["amqp"]
+    }
+
     fn serve(&self, broker: Arc<Broker>, connection: Connection) -> ServeFuture {
         let settings = Settings::from(&connection.acceptor);
         let config = self.config.clone();

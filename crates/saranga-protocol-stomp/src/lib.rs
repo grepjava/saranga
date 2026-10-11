@@ -23,6 +23,10 @@ impl ProtocolManager for StompProtocol {
         header.starts_with(b"CONNECT") || header.starts_with(b"STOMP")
     }
 
+    fn websocket_subprotocols(&self) -> &'static [&'static str] {
+        &["v10.stomp", "v11.stomp", "v12.stomp"]
+    }
+
     fn serve(&self, broker: Arc<Broker>, connection: Connection) -> ServeFuture {
         Box::pin(connection::serve(broker, connection))
     }
