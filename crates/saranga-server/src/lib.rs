@@ -15,6 +15,7 @@ pub mod message;
 pub mod node;
 pub mod paging;
 pub mod postoffice;
+pub mod protocol;
 pub mod queue;
 pub mod recovery;
 pub mod reload;
@@ -142,6 +143,15 @@ pub struct Acceptor {
     /// one of these prefixes means the name without it, with that routing
     /// type (`CoreProtocolManager.getPrefixes`).
     pub prefixes: Vec<(String, RoutingType)>,
+    /// `protocols`: the protocols it serves; `None` for every protocol the
+    /// broker has.
+    pub protocols: Option<Vec<String>>,
+    /// `handshake-timeout`: how long a client has to send enough bytes to
+    /// pick its protocol; `None` for no limit.
+    pub handshake_timeout: Option<std::time::Duration>,
+    /// Every parameter of the acceptor's URI, for the protocols' own
+    /// settings.
+    pub params: HashMap<String, String>,
 }
 
 impl Acceptor {
@@ -162,6 +172,9 @@ impl Default for Acceptor {
             core_initial_max_frame_size: Self::CORE_INITIAL_MAX_FRAME_SIZE,
             core_max_frame_size: Self::CORE_MAX_FRAME_SIZE,
             prefixes: Vec::new(),
+            protocols: None,
+            handshake_timeout: Some(protocol::DEFAULT_HANDSHAKE_TIMEOUT),
+            params: HashMap::new(),
         }
     }
 }
@@ -211,6 +224,8 @@ pub struct BrokerConfig {
     /// Its bootstrap credentials: user, password and roles, added or
     /// updated once the journals are loaded (`completeInit`).
     pub bootstrap_users: Vec<(String, String, Vec<String>)>,
+    /// The protocols besides Core the broker serves.
+    pub protocols: Vec<Arc<dyn protocol::ProtocolManager>>,
 }
 
 impl BrokerConfig {
@@ -238,6 +253,7 @@ impl BrokerConfig {
             reject_empty_validated_user: false,
             users: None,
             bootstrap_users: Vec::new(),
+            protocols: Vec::new(),
         }
     }
 }
@@ -320,6 +336,8 @@ pub struct Broker {
     transformers: HashMap<String, postoffice::TransformerFactory>,
     populate_validated_user: bool,
     reject_empty_validated_user: bool,
+    /// Every protocol the broker serves, Core first.
+    protocols: Vec<Arc<dyn protocol::ProtocolManager>>,
 }
 
 impl Broker {
@@ -443,6 +461,11 @@ impl Broker {
             transformers: config.transformers,
             populate_validated_user: config.populate_validated_user,
             reject_empty_validated_user: config.reject_empty_validated_user,
+            protocols: std::iter::once(
+                Arc::new(protocol::CoreProtocol) as Arc<dyn protocol::ProtocolManager>
+            )
+            .chain(config.protocols)
+            .collect(),
         });
         spawn_transaction_reaper(&broker, config.transaction_timeout_scan_period);
         Ok(broker)
@@ -554,8 +577,33 @@ impl Broker {
         self.serve_acceptor(listener, Acceptor::default()).await
     }
 
-    /// Accepts Core connections the way `acceptor` says: with TLS, under a
-    /// security domain.
+    /// The protocols `acceptor` serves (`RemotingServiceImpl.locateProtocols`):
+    /// those it lists that the broker has, or every one when it lists none
+    /// of them.
+    pub fn protocols_for(&self, acceptor: &Acceptor) -> Vec<Arc<dyn protocol::ProtocolManager>> {
+        let listed: Vec<_> = match &acceptor.protocols {
+            None => Vec::new(),
+            Some(names) => self
+                .protocols
+                .iter()
+                .filter(|p| names.iter().any(|n| n == p.name()))
+                .cloned()
+                .collect(),
+        };
+        if listed.is_empty() {
+            self.protocols.clone()
+        } else {
+            listed
+        }
+    }
+
+    /// The names of every protocol the broker serves.
+    pub fn protocol_names(&self) -> Vec<&'static str> {
+        self.protocols.iter().map(|p| p.name()).collect()
+    }
+
+    /// Accepts connections the way `acceptor` says: with TLS, under a
+    /// security domain, for the protocols it enables.
     pub async fn serve_acceptor(
         self: Arc<Self>,
         listener: TcpListener,
@@ -572,20 +620,11 @@ impl Broker {
                 security_domain: acceptor.security_domain.clone(),
             };
             let broker = self.clone();
-            match &acceptor.tls {
-                None => {
-                    tokio::spawn(core_protocol::serve_stream(
-                        broker,
-                        stream,
-                        Some(peer),
-                        info,
-                        acceptor.clone(),
-                    ));
-                }
-                Some(tls) => {
-                    let tls = tls.clone();
-                    let acceptor = acceptor.clone();
-                    tokio::spawn(async move {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let stream: Box<dyn protocol::Stream> = match &acceptor.tls {
+                    None => Box::new(stream),
+                    Some(tls) => {
                         let stream = match tls.accept(stream).await {
                             Ok(s) => s,
                             Err(e) => {
@@ -597,11 +636,11 @@ impl Broker {
                             stream.get_ref().1.peer_certificates(),
                         )
                         .map(Arc::from);
-                        core_protocol::serve_stream(broker, stream, Some(peer), info, acceptor)
-                            .await;
-                    });
-                }
-            }
+                        Box::new(stream)
+                    }
+                };
+                protocol::detect_and_serve(broker, stream, Some(peer), info, acceptor).await;
+            });
         }
     }
 }

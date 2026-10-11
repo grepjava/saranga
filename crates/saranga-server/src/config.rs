@@ -311,6 +311,9 @@ impl BrokerConfig {
             reject_empty_validated_user: config.reject_empty_validated_user,
             users: None,
             bootstrap_users: Vec::new(),
+            // Protocol crates register themselves: whoever starts the
+            // broker adds them.
+            protocols: Vec::new(),
         })
     }
 }

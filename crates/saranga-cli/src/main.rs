@@ -129,6 +129,11 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// The protocols besides Core that `saranga run` serves.
+fn protocol_managers() -> Vec<Arc<dyn saranga_server::protocol::ProtocolManager>> {
+    Vec::new()
+}
+
 /// An acceptor to open.
 struct Bind {
     name: String,
@@ -136,35 +141,52 @@ struct Bind {
     acceptor: Acceptor,
 }
 
-/// The configured acceptors that speak Core, with their TLS settings
-/// (`NettyAcceptor`) and security domain.
-fn core_acceptors(file: &saranga_config::BrokerConfig) -> anyhow::Result<Vec<Bind>> {
+/// Every protocol Artemis has, by the name acceptors list it under.
+const ARTEMIS_PROTOCOLS: [&str; 6] = ["CORE", "AMQP", "STOMP", "HORNETQ", "MQTT", "OPENWIRE"];
+
+/// The configured acceptors, with their TLS settings (`NettyAcceptor`),
+/// security domain and protocols. `served` names the protocols Saranga
+/// has.
+fn acceptors(file: &saranga_config::BrokerConfig, served: &[&str]) -> anyhow::Result<Vec<Bind>> {
     let mut out = Vec::new();
     for a in &file.acceptors {
         let name = a.name.clone().unwrap_or_default();
-        // No list means every protocol the broker has.
-        let protocols = match a.protocols() {
-            p if p.is_empty() => ["CORE", "AMQP", "STOMP", "HORNETQ", "MQTT", "OPENWIRE"]
-                .map(str::to_owned)
-                .to_vec(),
-            p => p,
-        };
-        let others: Vec<&str> = protocols
+        let listed = a.protocols();
+        for p in &listed {
+            if !ARTEMIS_PROTOCOLS.contains(&p.as_str()) {
+                tracing::warn!(
+                    "AMQ222203: Classpath lacks a protocol-manager for protocol {p}, Protocol being ignored on acceptor {}",
+                    a.uri
+                );
+            }
+        }
+        // No list (or none Artemis knows) means every protocol.
+        let known: Vec<&str> = listed
             .iter()
             .map(String::as_str)
-            .filter(|p| *p != "CORE")
+            .filter(|p| ARTEMIS_PROTOCOLS.contains(p))
             .collect();
-        if !protocols.iter().any(|p| p == "CORE") {
+        let wanted: Vec<&str> = if known.is_empty() {
+            ARTEMIS_PROTOCOLS.to_vec()
+        } else {
+            known
+        };
+        let missing: Vec<&str> = wanted
+            .iter()
+            .copied()
+            .filter(|p| !served.contains(p))
+            .collect();
+        if missing.len() == wanted.len() {
             tracing::warn!(
                 "acceptor {name} was not opened: Saranga does not serve {} yet",
-                others.join(", ")
+                missing.join(", ")
             );
             continue;
         }
-        if !others.is_empty() {
+        if !missing.is_empty() {
             tracing::warn!(
-                "acceptor {name} serves CORE only: Saranga does not serve {} yet",
-                others.join(", ")
+                "acceptor {name} does not serve {}: Saranga does not serve them yet",
+                missing.join(", ")
             );
         }
         let host = a.host.as_deref().unwrap_or("localhost");
@@ -187,6 +209,15 @@ fn core_acceptors(file: &saranga_config::BrokerConfig) -> anyhow::Result<Vec<Bin
         )
         .and_then(|s| s.map(TlsAcceptor::new).transpose())
         .with_context(|| format!("acceptor {name}"))?;
+        let handshake_timeout = match a.param("handshake-timeout") {
+            None => Some(saranga_server::protocol::DEFAULT_HANDSHAKE_TIMEOUT),
+            Some(v) => {
+                let secs: i64 = v
+                    .parse()
+                    .with_context(|| format!("acceptor {name}: handshake-timeout={v:?}"))?;
+                (secs > 0).then(|| std::time::Duration::from_secs(secs as u64))
+            }
+        };
         out.push(Bind {
             name,
             address: format!("{host}:{port}"),
@@ -203,6 +234,13 @@ fn core_acceptors(file: &saranga_config::BrokerConfig) -> anyhow::Result<Vec<Bin
                 core_max_frame_size: size_param(a, "coreMaxFrameSize")?
                     .unwrap_or(Acceptor::CORE_MAX_FRAME_SIZE),
                 prefixes: prefixes(a),
+                protocols: (!listed.is_empty()).then_some(listed.clone()),
+                handshake_timeout,
+                params: a
+                    .params
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone().unwrap_or_default()))
+                    .collect(),
             },
         });
     }
@@ -350,10 +388,14 @@ fn parse_system_property(s: &str) -> Result<(String, String), String> {
 
 async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> anyhow::Result<()> {
     let filters = Arc::new(SelectorFilters);
-    let (broker_config, mut binds, reload_period) = match &instance {
+    let protocols = protocol_managers();
+    let served: Vec<&str> = std::iter::once("CORE")
+        .chain(protocols.iter().map(|p| p.name()))
+        .collect();
+    let (mut broker_config, mut binds, reload_period) = match &instance {
         Some(instance) => {
             let file = instance.broker_config()?;
-            let binds = core_acceptors(&file)?;
+            let binds = acceptors(&file, &served)?;
             let mut config = BrokerConfig::from_file_config(&file, filters, &instance.dir)?;
             let security = instance.security(&file)?;
             config.security = security.store;
@@ -387,6 +429,7 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
             acceptor: Acceptor::default(),
         }];
     }
+    broker_config.protocols = protocols;
     let broker = Broker::start(broker_config).await?;
     let mut servers = tokio::task::JoinSet::new();
     for Bind {
@@ -402,7 +445,15 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
             tls.spawn_reloader(reload_period);
         }
         // Artemis's log IDs, so log-based tooling keeps working (ADR 0003).
-        tracing::info!("AMQ221020: Started Core Acceptor at {address} for protocols [CORE]");
+        let names: Vec<&str> = broker
+            .protocols_for(&acceptor)
+            .iter()
+            .map(|p| p.name())
+            .collect();
+        tracing::info!(
+            "AMQ221020: Started NIO Acceptor at {address} for protocols [{}]",
+            names.join(",")
+        );
         servers.spawn(broker.clone().serve_acceptor(listener, acceptor));
     }
     tracing::info!("AMQ221007: Server is now active");
