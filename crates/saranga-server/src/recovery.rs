@@ -247,6 +247,13 @@ pub async fn load_messages(
                 };
                 ServerMessage::new_large(m, body)
             }
+            StoredMessage::Native(record) if record.is_large() => {
+                stored.remove(&record.message_id());
+                let body = large_store.existing(record.message_id());
+                decoders
+                    .decode_large(&record, body)
+                    .map_err(|e| corrupt("loading the message journal", e))?
+            }
             StoredMessage::Native(record) => decoders
                 .decode(&record)
                 .map_err(|e| corrupt("loading the message journal", e))?,
@@ -300,6 +307,7 @@ pub async fn load_messages(
                 persisted_count: r.delivery_count,
                 scheduled_time,
                 paged: None,
+                rejected_consumers: Vec::new(),
             });
         }
     }

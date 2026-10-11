@@ -221,6 +221,20 @@ enum Cmd {
         id: ConsumerId,
         message_id: i64,
         failed: bool,
+        /// `rejectConsumer`: never to this consumer again.
+        undeliverable: bool,
+    },
+    /// `ServerConsumerImpl.reject`: a delivering message goes to the
+    /// dead-letter address.
+    Reject {
+        id: ConsumerId,
+        message_id: i64,
+    },
+    /// `backToDelivering`: a reference a rolled back transaction had
+    /// acknowledged stays with the consumer as delivered.
+    BackToDelivering {
+        id: ConsumerId,
+        r: MessageRef,
     },
     Shutdown,
 }
@@ -713,7 +727,32 @@ impl Queue {
             id,
             message_id,
             failed,
+            undeliverable: false,
         });
+    }
+
+    /// As [`Queue::cancel_one`], and the message is not given to this
+    /// consumer again (`Message.rejectConsumer`).
+    pub fn cancel_undeliverable(&self, id: ConsumerId, message_id: i64, failed: bool) {
+        self.send(Cmd::CancelOne {
+            id,
+            message_id,
+            failed,
+            undeliverable: true,
+        });
+    }
+
+    /// `ServerConsumerImpl.reject`: a message the consumer is delivering
+    /// goes to the dead-letter address now.
+    pub fn reject(&self, id: ConsumerId, message_id: i64) {
+        self.send(Cmd::Reject { id, message_id });
+    }
+
+    /// `ServerConsumerImpl.backToDelivering`: the reference goes back to
+    /// the consumer's delivering list, or to the queue if the consumer is
+    /// gone.
+    pub fn back_to_delivering(&self, id: ConsumerId, r: MessageRef) {
+        self.send(Cmd::BackToDelivering { id, r });
     }
 
     /// `ServerSessionImpl.expire`: a delivered message the client found
@@ -856,7 +895,8 @@ impl Consumer {
     /// Hands a message to the sink; a large one starts a transfer.
     fn send(&mut self, message: &ServerMessage, delivery_count: i32) {
         let id = self.reg.client_id;
-        let size = match message.large() {
+        // A native message holds its whole encoding: it goes as it is.
+        let size = match message.large().filter(|_| message.native().is_none()) {
             None => self.reg.sink.deliver(id, message, delivery_count),
             Some(body) if !self.reg.sink.supports_large() => {
                 let mut core = message.core().clone();
@@ -942,10 +982,12 @@ impl Consumer {
     }
 
     fn accepts(&self, r: &MessageRef) -> bool {
-        self.reg
-            .filter
-            .as_ref()
-            .is_none_or(|f| f.matches(&*r.message))
+        !r.rejected_consumers.contains(&self.reg.id)
+            && self
+                .reg
+                .filter
+                .as_ref()
+                .is_none_or(|f| f.matches(&*r.message))
     }
 
     fn can_take(&self) -> bool {
@@ -1549,6 +1591,7 @@ impl Actor {
                 id,
                 message_id,
                 failed,
+                undeliverable,
             } => {
                 let r = self.consumer_mut(id).and_then(|c| {
                     let i = c
@@ -1561,7 +1604,27 @@ impl Actor {
                     if !failed {
                         r.delivery_count -= 1;
                     }
+                    if undeliverable {
+                        r.rejected_consumers.push(id);
+                    }
                     self.return_refs(vec![r]);
+                }
+            }
+            Cmd::BackToDelivering { id, r } => match self.consumer_mut(id) {
+                Some(c) => c.delivering.push_back(r),
+                None => self.return_refs(vec![r]),
+            },
+            Cmd::Reject { id, message_id } => {
+                let r = self.consumer_mut(id).and_then(|c| {
+                    let i = c
+                        .delivering
+                        .iter()
+                        .position(|r| r.message_id() == message_id)?;
+                    c.delivering.remove(i)
+                });
+                if let Some(r) = r {
+                    let s = self.queue().settings();
+                    self.send_to_dead_letter_address(r, &s);
                 }
             }
             Cmd::Reconfigure { reset_groups } => {

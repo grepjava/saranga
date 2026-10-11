@@ -218,10 +218,11 @@ pub trait NativeMessage: Send + Sync + fmt::Debug {
     fn as_any(&self) -> &dyn Any;
 }
 
-/// Decodes the records of one protocol's persisters; `None` for records of
-/// other persisters.
-pub type NativeDecoder =
-    dyn Fn(&PersistedMessage) -> Option<Result<Arc<dyn NativeMessage>, String>> + Send + Sync;
+/// Decodes the records of one protocol's persisters, with the contents of
+/// a large message's file; `None` for records of other persisters.
+pub type NativeDecoder = dyn Fn(&PersistedMessage, Option<Vec<u8>>) -> Option<Result<Arc<dyn NativeMessage>, String>>
+    + Send
+    + Sync;
 
 /// Turns persister records into messages: each protocol that persists its
 /// own messages adds a decoder.
@@ -244,9 +245,30 @@ impl MessageDecoders {
         if let PersistedMessage::Core(c) = record {
             return Ok(ServerMessage::new(c.to_message()));
         }
+        self.native(record, None).map(ServerMessage::new_native)
+    }
+
+    /// A large message of another protocol, with its file.
+    pub fn decode_large(
+        &self,
+        record: &PersistedMessage,
+        body: Arc<LargeBody>,
+    ) -> Result<Arc<ServerMessage>, String> {
+        let data = body
+            .read_all()
+            .map_err(|e| format!("large message {}: {e}", body.id()))?;
+        self.native(record, Some(data))
+            .map(|n| ServerMessage::new_native_large(n, body))
+    }
+
+    fn native(
+        &self,
+        record: &PersistedMessage,
+        data: Option<Vec<u8>>,
+    ) -> Result<Arc<dyn NativeMessage>, String> {
         for d in &self.0 {
-            if let Some(r) = d(record) {
-                return r.map(ServerMessage::new_native);
+            if let Some(r) = d(record, data.clone()) {
+                return r;
             }
         }
         Err(format!(
@@ -314,6 +336,21 @@ impl ServerMessage {
         })
     }
 
+    /// A large message kept in its own protocol's encoding, whose file is
+    /// `body`.
+    pub fn new_native_large(native: Arc<dyn NativeMessage>, body: Arc<LargeBody>) -> Arc<Self> {
+        Arc::new(Self {
+            core: native.view(),
+            native: Some(native),
+            converted: OnceLock::new(),
+            encoded: Vec::new(),
+            durable_refs: AtomicI32::new(0),
+            large: Some(body),
+            refs: AtomicI32::new(0),
+            owner: OnceLock::new(),
+        })
+    }
+
     /// A large message: `core` holds the headers and properties, `body` the
     /// body.
     pub fn new_large(core: CoreMessage, body: Arc<LargeBody>) -> Arc<Self> {
@@ -335,7 +372,11 @@ impl ServerMessage {
     /// body.
     pub fn with_core(&self, core: CoreMessage) -> Arc<Self> {
         if let Some(n) = &self.native {
-            return Self::new_native(n.updated(&self.core, &core));
+            let n = n.updated(&self.core, &core);
+            return match &self.large {
+                Some(body) => Self::new_native_large(n, body.clone()),
+                None => Self::new_native(n),
+            };
         }
         match &self.large {
             Some(body) => Self::new_large(core, body.clone()),
@@ -347,7 +388,20 @@ impl ServerMessage {
     /// message's body is copied to a file of its own.
     pub fn copy(&self, core: CoreMessage) -> Arc<Self> {
         if let Some(n) = &self.native {
-            return Self::new_native(n.updated(&self.core, &core));
+            let n = n.updated(&self.core, &core);
+            return match &self.large {
+                None => Self::new_native(n),
+                Some(body) => match body.copy(core.message_id, core.durable) {
+                    Ok(copy) => Self::new_native_large(n, copy),
+                    Err(e) => {
+                        tracing::warn!(
+                            "AMQ222181: Unable to copy large message {}: {e}",
+                            self.message_id()
+                        );
+                        Self::new_native_large(n, body.clone())
+                    }
+                },
+            };
         }
         match &self.large {
             None => Self::new(core),
@@ -532,6 +586,9 @@ pub struct MessageRef {
     pub scheduled_time: i64,
     /// Set for a message read from a page: it is not in the journal.
     pub paged: Option<PagePosition>,
+    /// Consumers the message is not given to again
+    /// (`Message.rejectConsumer`).
+    pub rejected_consumers: Vec<crate::queue::ConsumerId>,
 }
 
 impl MessageRef {
@@ -542,6 +599,7 @@ impl MessageRef {
             persisted_count: 0,
             scheduled_time: 0,
             paged: None,
+            rejected_consumers: Vec::new(),
         }
     }
 

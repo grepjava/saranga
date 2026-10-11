@@ -1037,9 +1037,10 @@ impl PagingStore {
         let tx_id = tx.map(|t| crate::transaction::lock(t).id).unwrap_or(-1);
         let paged = PagedMessage {
             transaction_id: tx_id,
-            body: match message.large() {
-                Some(_) => PagedBody::CoreLarge(message.core().clone()),
-                None => PagedBody::Message(message.persisted()),
+            body: match (message.large(), message.native()) {
+                (Some(_), Some(_)) => PagedBody::OtherLarge(message.persisted()),
+                (Some(_), None) => PagedBody::CoreLarge(message.core().clone()),
+                (None, _) => PagedBody::Message(message.persisted()),
             },
             queue_ids: queues.iter().map(|q| q.id()).collect(),
         };
@@ -1160,6 +1161,18 @@ impl PagingStore {
                                     nr,
                                     record.message_id()
                                 );
+                                None
+                            }
+                        }
+                    }
+                    (PagedBody::OtherLarge(record), Some(manager)) => {
+                        let body = manager.large.existing(record.message_id());
+                        body.set_keep(true);
+                        let decoders = manager.decoders.get_or_init(MessageDecoders::default);
+                        match decoders.decode_large(&record, body) {
+                            Ok(m) => Some(m),
+                            Err(e) => {
+                                tracing::warn!("page of {}: {e}", self.address);
                                 None
                             }
                         }

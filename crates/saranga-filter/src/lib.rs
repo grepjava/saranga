@@ -22,6 +22,7 @@ mod lexer;
 mod like;
 mod message;
 mod parser;
+pub mod translate;
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};

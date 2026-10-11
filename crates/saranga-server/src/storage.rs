@@ -110,10 +110,11 @@ fn encode_message(message: &CoreMessage, encoded: &[u8]) -> Vec<u8> {
 /// (`LargeMessagePersister`), `ADD_MESSAGE_PROTOCOL` otherwise, written by
 /// the message's persister.
 fn message_record(m: &ServerMessage) -> (u8, Vec<u8>) {
-    if m.is_large() {
-        (ids::ADD_LARGE_MESSAGE, m.encoded().to_vec())
-    } else if m.native().is_some() {
+    if m.native().is_some() {
+        // Large or not, its persister writes it (`AMQPLargeMessagePersister`).
         (ids::ADD_MESSAGE_PROTOCOL, m.persisted().encode())
+    } else if m.is_large() {
+        (ids::ADD_LARGE_MESSAGE, m.encoded().to_vec())
     } else {
         (
             ids::ADD_MESSAGE_PROTOCOL,

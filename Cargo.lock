@@ -1658,6 +1658,8 @@ name = "saranga-protocol-amqp"
 version = "0.0.1"
 dependencies = [
  "saranga-buffer",
+ "saranga-config",
+ "saranga-core-protocol",
  "saranga-filter",
  "saranga-message",
  "saranga-security",

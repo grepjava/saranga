@@ -44,18 +44,21 @@ impl AmqpNative {
 
 /// The decoder `saranga run` registers for the AMQP persisters.
 pub fn decoder() -> Arc<NativeDecoder> {
-    Arc::new(|record: &PersistedMessage| match record {
-        PersistedMessage::Amqp(r) => Some(
-            AmqpMessage::from_record(r, now_millis())
-                .map(AmqpNative::arc)
-                .map_err(|e| format!("AMQP message {}: {e}", r.message_id)),
-        ),
-        PersistedMessage::AmqpLarge(r) => Some(Err(format!(
-            "AMQP large message {}: AMQP large messages are not supported yet",
-            r.message_id
-        ))),
-        PersistedMessage::Core(_) => None,
-    })
+    Arc::new(
+        |record: &PersistedMessage, data: Option<Vec<u8>>| match record {
+            PersistedMessage::Amqp(r) => Some(
+                AmqpMessage::from_record(r, now_millis())
+                    .map(AmqpNative::arc)
+                    .map_err(|e| format!("AMQP message {}: {e}", r.message_id)),
+            ),
+            PersistedMessage::AmqpLarge(r) => Some(
+                AmqpMessage::from_large_record(r, data.unwrap_or_default(), now_millis())
+                    .map(AmqpNative::arc)
+                    .map_err(|e| format!("AMQP large message {}: {e}", r.message_id)),
+            ),
+            PersistedMessage::Core(_) => None,
+        },
+    )
 }
 
 /// An application property as the broker reads it
@@ -245,6 +248,7 @@ impl NativeMessage for AmqpNative {
         let props = m.properties();
         let value = match id {
             "JMSType" => props.and_then(|p| p.subject.clone()).map(F::String),
+            "__AMQ_CID" => m.connection_id().map(|c| F::String(c.to_owned())),
             "JMSXGroupID" => props.and_then(|p| p.group_id.clone()).map(F::String),
             "JMSXGroupSeq" => Some(F::Int(
                 props.and_then(|p| p.group_sequence).unwrap_or(0) as i32

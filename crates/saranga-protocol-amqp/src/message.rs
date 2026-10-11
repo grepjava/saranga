@@ -10,8 +10,9 @@
 use std::sync::Arc;
 
 use saranga_buffer::{PropertyValue, SimpleString, TypedProperties};
+use saranga_buffer::{Reader, Writer};
 use saranga_storage::ids::persister;
-use saranga_storage::message::{AmqpMessageRecord, PersistedMessage};
+use saranga_storage::message::{AmqpLargeMessageRecord, AmqpMessageRecord, PersistedMessage};
 
 use crate::codec::{self, Decoder, Result};
 use crate::composite::{Composite, Timestamp};
@@ -97,6 +98,21 @@ pub struct AmqpMessage {
     /// them.
     application_properties: Option<Vec<(String, Value)>>,
     remaining_body_position: Option<usize>,
+    /// `connectionID`: the sending connection's container ID, which no-local
+    /// filters read. Not stored.
+    connection_id: Option<String>,
+
+    // Where the other sections start, for a large message's record.
+    header_position: Option<usize>,
+    delivery_annotations_position: Option<usize>,
+    message_annotations_position: Option<usize>,
+    properties_position: Option<usize>,
+
+    /// An `AMQPLargeMessage`: the encoding is its file's, which the broker
+    /// never rewrites; changes to the sections are kept in its record.
+    large: bool,
+    /// `isReencoded`: a large message's sections changed.
+    reencoded: bool,
 }
 
 impl AmqpMessage {
@@ -127,7 +143,156 @@ impl AmqpMessage {
             application_properties_position: None,
             application_properties: None,
             remaining_body_position: None,
+            connection_id: None,
+            header_position: None,
+            delivery_annotations_position: None,
+            message_annotations_position: None,
+            properties_position: None,
+            large: false,
+            reencoded: false,
         }
+    }
+
+    /// Makes this a large message (`AMQPLargeMessage`): its application
+    /// properties are decoded now, as Artemis parses them.
+    pub fn make_large(&mut self) {
+        self.large = true;
+        if self.application_properties.is_none() && self.application_properties_position.is_some() {
+            self.application_properties = Some(self.application_properties());
+        }
+    }
+
+    pub fn is_large(&self) -> bool {
+        self.large
+    }
+
+    /// A large message read back from its record and its file
+    /// (`AMQPLargeMessagePersister.decode`, `readSavedEncoding`).
+    pub fn from_large_record(
+        record: &AmqpLargeMessageRecord,
+        data: Vec<u8>,
+        now: i64,
+    ) -> Result<Self> {
+        let mut m = Self::empty(record.message_format, data.into());
+        m.message_id = record.message_id;
+        m.large = true;
+        m.extra = record
+            .extra_properties
+            .as_ref()
+            .map(|p| JavaMap::decoded(p.entries().to_vec()));
+        if let Some(a) = &record.address {
+            m.set_address(a.clone());
+        }
+        let bad = |e: saranga_buffer::DecodeError| codec::CodecError::Invalid(e.to_string());
+        let mut r = Reader::new(&record.saved_encoding);
+        let pos = |r: &mut Reader<'_>| -> Result<Option<usize>> {
+            let p = r.i32().map_err(bad)?;
+            Ok(usize::try_from(p).ok())
+        };
+        let value = |r: &mut Reader<'_>| -> Result<Value> {
+            let mut d = Decoder::new(r.rest());
+            let v = d.read()?;
+            r.bytes(d.position()).map_err(bad)?;
+            Ok(v)
+        };
+        m.header_position = pos(&mut r)?;
+        m.encoded_header_size = r.i32().map_err(bad)?.max(0) as usize;
+        if let v @ Value::Described(..) = value(&mut r)? {
+            let h = <Header as Composite>::from_value(v)?;
+            if let Some(p) = h.priority {
+                m.priority = p.min(MAX_PRIORITY);
+            }
+            m.header = Some(h);
+        }
+        m.delivery_annotations_position = pos(&mut r)?;
+        m.encoded_delivery_annotations_size = r.i32().map_err(bad)?.max(0) as usize;
+        m.message_annotations_position = pos(&mut r)?;
+        if let Value::Described(_, body) = value(&mut r)? {
+            m.message_annotations = Some(JavaMap::linked(symbol_map(*body)?));
+        }
+        m.properties_position = pos(&mut r)?;
+        if let v @ Value::Described(..) = value(&mut r)? {
+            m.properties = Some(<Properties as Composite>::from_value(v)?);
+        }
+        m.application_properties_position = pos(&mut r)?;
+        m.remaining_body_position = pos(&mut r)?;
+        if let Value::Described(_, body) = value(&mut r)? {
+            m.application_properties = Some(string_map(*body)?);
+        }
+        if let Some(Timestamp(t)) = m.properties.as_ref().and_then(|p| p.absolute_expiry_time)
+            && t > 0
+        {
+            m.expiration = t;
+        } else if let Some(ttl) = m.header.as_ref().and_then(|h| h.ttl) {
+            m.expiration = now + i64::from(ttl);
+        }
+        if r.remaining() >= 8 {
+            m.expiration = r.i64().map_err(bad)?;
+            m.expiration_reload = true;
+        }
+        if !r.is_empty() {
+            m.reencoded = r.bool().map_err(bad)?;
+        }
+        m.reloaded = record.durable;
+        Ok(m)
+    }
+
+    /// `saveEncoding`: the positions and the decoded sections.
+    fn saved_encoding(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        let pos = |w: &mut Writer, p: Option<usize>| {
+            w.i32(p.map_or(-1, |p| p as i32));
+        };
+        let value = |w: &mut Writer, v: Option<Vec<u8>>| {
+            w.bytes(&v.unwrap_or_else(|| vec![codec::code::NULL]));
+        };
+        pos(&mut w, self.header_position);
+        w.i32(self.encoded_header_size as i32);
+        value(&mut w, self.header.as_ref().map(Composite::to_bytes));
+        pos(&mut w, self.delivery_annotations_position);
+        w.i32(self.encoded_delivery_annotations_size as i32);
+        pos(&mut w, self.message_annotations_position);
+        value(
+            &mut w,
+            self.message_annotations.as_ref().map(|ma| {
+                let mut out = Vec::new();
+                encode_annotations(section::MESSAGE_ANNOTATIONS, ma, &mut out);
+                out
+            }),
+        );
+        pos(&mut w, self.properties_position);
+        value(&mut w, self.properties.as_ref().map(Composite::to_bytes));
+        pos(&mut w, self.application_properties_position);
+        pos(&mut w, self.remaining_body_position);
+        value(
+            &mut w,
+            self.application_properties.as_ref().map(|ap| {
+                let mut out = Vec::new();
+                encode_section(
+                    section::APPLICATION_PROPERTIES,
+                    Value::Map(
+                        ap.iter()
+                            .map(|(k, v)| (Value::String(k.clone()), v.clone()))
+                            .collect(),
+                    ),
+                    &mut out,
+                );
+                out
+            }),
+        );
+        w.i64(self.expiration);
+        w.byte_buf_bool(self.reencoded);
+        w.into_vec()
+    }
+
+    /// `setConnectionID`.
+    pub fn set_connection_id(&mut self, id: Option<String>) {
+        self.connection_id = id;
+    }
+
+    /// `getConnectionID`.
+    pub fn connection_id(&self) -> Option<&str> {
+        self.connection_id.as_deref()
     }
 
     /// A message read back from the journal or a page
@@ -167,6 +332,10 @@ impl AmqpMessage {
         self.encoded_delivery_annotations_size = 0;
         self.application_properties_position = None;
         self.remaining_body_position = None;
+        self.header_position = None;
+        self.delivery_annotations_position = None;
+        self.message_annotations_position = None;
+        self.properties_position = None;
         let data = self.data.clone();
         let mut d = Decoder::new(&data);
         while d.has_remaining() {
@@ -179,6 +348,7 @@ impl AmqpMessage {
             };
             match section_code(&desc) {
                 Some(section::HEADER) => {
+                    self.header_position = Some(start);
                     let header = Header::from_described(&desc, *body)?;
                     if let Some(ttl) = header.ttl
                         && !self.expiration_reload
@@ -192,13 +362,16 @@ impl AmqpMessage {
                     self.encoded_header_size = size;
                 }
                 Some(section::DELIVERY_ANNOTATIONS) => {
+                    self.delivery_annotations_position = Some(start);
                     self.delivery_annotations = Some(*body);
                     self.encoded_delivery_annotations_size = size;
                 }
                 Some(section::MESSAGE_ANNOTATIONS) => {
+                    self.message_annotations_position = Some(start);
                     self.message_annotations = Some(JavaMap::linked(symbol_map(*body)?));
                 }
                 Some(section::PROPERTIES) => {
+                    self.properties_position = Some(start);
                     let p = Properties::from_described(&desc, *body)?;
                     if let Some(Timestamp(t)) = p.absolute_expiry_time
                         && t > 0
@@ -526,6 +699,12 @@ impl AmqpMessage {
         if let (Some(p), Some(a)) = (&mut self.properties, &self.address) {
             p.to = Some(a.to_string_lossy());
         }
+        if self.large {
+            // AMQPLargeMessage.reencode: the file stays; the sections go
+            // out from the record.
+            self.reencoded = true;
+            return;
+        }
         let mut out = Vec::with_capacity(self.data.len() + 64);
         if let Some(h) = &self.header {
             h.encode(&mut out);
@@ -573,7 +752,19 @@ impl AmqpMessage {
     pub fn copy(&self, new_id: i64, now: i64) -> Self {
         let mut c = Self::empty(self.message_format, self.data.clone());
         c.message_id = new_id;
-        c.extra = self.extra.as_ref().map(JavaMap::hash_copy);
+        // A large message's copy starts without extra properties.
+        c.extra = if self.large {
+            None
+        } else {
+            self.extra.as_ref().map(JavaMap::hash_copy)
+        };
+        if self.large {
+            if c.scan(now).is_err() {
+                return self.clone();
+            }
+            c.make_large();
+            return c;
+        }
         if c.scan(now).is_err() {
             // The original scanned; the bytes are the same.
             return self.clone();
@@ -608,13 +799,31 @@ impl AmqpMessage {
     }
 
     pub fn persisted(&self) -> PersistedMessage {
+        if self.large {
+            return PersistedMessage::AmqpLarge(self.large_record());
+        }
         PersistedMessage::Amqp(self.record())
+    }
+
+    /// The record `AMQPLargeMessagePersister` writes.
+    pub fn large_record(&self) -> AmqpLargeMessageRecord {
+        AmqpLargeMessageRecord {
+            message_id: self.message_id,
+            durable: self.is_durable(),
+            message_format: self.message_format,
+            address: self.address(),
+            extra_properties: self.record().extra_properties,
+            saved_encoding: self.saved_encoding(),
+        }
     }
 
     /// `getSendBuffer(deliveryCount)`: the encoding a consumer receives.
     /// A redelivery carries a header with the delivery count, and delivery
     /// annotations are dropped.
     pub fn send_buffer(&self, delivery_count: i32) -> Vec<u8> {
+        if self.large {
+            return self.large_send_buffer();
+        }
         if delivery_count <= 1 && self.delivery_annotations.is_none() {
             return self.data.to_vec();
         }
@@ -631,6 +840,44 @@ impl AmqpMessage {
         }
         let skip = self.encoded_header_size + self.encoded_delivery_annotations_size;
         out.extend(&self.data[skip.min(self.data.len())..]);
+        out
+    }
+}
+
+impl AmqpMessage {
+    /// `AMQPLargeMessageWriter`: the header as stored (its delivery count
+    /// is not updated), then the file after the header and delivery
+    /// annotations; a re-encoded message's annotations, properties and
+    /// application properties come from the record.
+    fn large_send_buffer(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.data.len() + 64);
+        if let Some(h) = &self.header {
+            h.encode(&mut out);
+        }
+        let mut position = self.encoded_header_size + self.encoded_delivery_annotations_size;
+        if self.reencoded
+            && let Some(body) = self.remaining_body_position
+        {
+            if let Some(ma) = &self.message_annotations {
+                encode_annotations(section::MESSAGE_ANNOTATIONS, ma, &mut out);
+            }
+            if let Some(p) = &self.properties {
+                p.encode(&mut out);
+            }
+            if let Some(ap) = &self.application_properties {
+                encode_section(
+                    section::APPLICATION_PROPERTIES,
+                    Value::Map(
+                        ap.iter()
+                            .map(|(k, v)| (Value::String(k.clone()), v.clone()))
+                            .collect(),
+                    ),
+                    &mut out,
+                );
+            }
+            position = body;
+        }
+        out.extend(&self.data[position.min(self.data.len())..]);
         out
     }
 }

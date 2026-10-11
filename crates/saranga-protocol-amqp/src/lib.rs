@@ -18,6 +18,7 @@ pub mod convert;
 pub mod describe;
 pub mod frame;
 pub mod javamap;
+pub mod link;
 pub mod message;
 pub mod messaging;
 pub mod native;
@@ -118,11 +119,16 @@ pub struct AmqpConfig {
 #[derive(Default)]
 pub struct AmqpProtocol {
     config: AmqpConfig,
+    /// The container IDs of the open connections.
+    containers: Arc<connection::ContainerIds>,
 }
 
 impl AmqpProtocol {
     pub fn new(config: AmqpConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            containers: Arc::default(),
+        }
     }
 }
 
@@ -139,7 +145,10 @@ impl ProtocolManager for AmqpProtocol {
     fn serve(&self, broker: Arc<Broker>, connection: Connection) -> ServeFuture {
         let settings = Settings::from(&connection.acceptor);
         let config = self.config.clone();
-        Box::pin(connection::serve(broker, connection, settings, config))
+        let containers = self.containers.clone();
+        Box::pin(connection::serve(
+            broker, connection, settings, config, containers,
+        ))
     }
 
     /// AMQP messages are kept in their own encoding:

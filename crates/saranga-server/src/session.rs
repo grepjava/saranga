@@ -218,8 +218,14 @@ pub struct ServerSession {
 enum Outgoing {
     /// A Core message, with the body of a large one.
     Core(Option<Arc<LargeBody>>),
-    /// A native message and its view before the send changed it.
-    Native(Arc<dyn NativeMessage>, CoreMessage),
+    /// A native message, its view before the send changed it, the routing
+    /// type the protocol chose for it, and a large message's file.
+    Native(
+        Arc<dyn NativeMessage>,
+        CoreMessage,
+        Option<RoutingType>,
+        Option<Arc<LargeBody>>,
+    ),
 }
 
 impl ServerSession {
@@ -453,11 +459,48 @@ impl ServerSession {
         native: Arc<dyn NativeMessage>,
         tx: Option<TxRef>,
     ) -> Result<()> {
+        self.send_native_to(native, tx, None, None).await
+    }
+
+    /// As [`ServerSession::send_native_in`], to `address` rather than the
+    /// message's own and with the routing type the protocol chose, if
+    /// given (`ServerSessionImpl.send(tx, address, routingType, ...)`).
+    pub async fn send_native_to(
+        &mut self,
+        native: Arc<dyn NativeMessage>,
+        tx: Option<TxRef>,
+        address: Option<&str>,
+        routing_type: Option<RoutingType>,
+    ) -> Result<()> {
+        self.send_native_large_to(native, None, tx, address, routing_type)
+            .await
+    }
+
+    /// As [`ServerSession::send_native_to`] for a large message whose file
+    /// is `body`; its ID is the file's.
+    pub async fn send_native_large_to(
+        &mut self,
+        native: Arc<dyn NativeMessage>,
+        body: Option<Arc<LargeBody>>,
+        tx: Option<TxRef>,
+        address: Option<&str>,
+        routing_type: Option<RoutingType>,
+    ) -> Result<()> {
         let view = native.view();
         let mut message = view.clone();
-        message.message_id = self.broker.post_office().ids().next();
-        self.send_message(message, Outgoing::Native(native, view), tx)
-            .await
+        // A large message has its ID already: its file is named after it.
+        if message.message_id == 0 {
+            message.message_id = self.broker.post_office().ids().next();
+        }
+        if let Some(a) = address {
+            message.address = Some(SimpleString::from(a));
+        }
+        self.send_message(
+            message,
+            Outgoing::Native(native, view, routing_type, body),
+            tx,
+        )
+        .await
     }
 
     /// The rest of `send`: `message` is the message, or the view of a
@@ -518,7 +561,11 @@ impl ServerSession {
         {
             return Err(BrokerError::reject_empty_validated_user());
         }
-        let routing_type = prefixed.or_else(|| routing_type(&message));
+        let chosen = match &outgoing {
+            Outgoing::Native(_, _, t, _) => *t,
+            Outgoing::Core(_) => None,
+        };
+        let routing_type = prefixed.or(chosen).or_else(|| routing_type(&message));
         // PostOfficeImpl.route: the address's expiry settings apply first.
         let settings = self
             .broker
@@ -530,8 +577,12 @@ impl ServerSession {
         let mut r = MessageRef::new(match outgoing {
             Outgoing::Core(Some(body)) => ServerMessage::new_large(message, body),
             Outgoing::Core(None) => ServerMessage::new(message),
-            Outgoing::Native(native, before) => {
-                ServerMessage::new_native(native.updated(&before, &message))
+            Outgoing::Native(native, before, _, body) => {
+                let n = native.updated(&before, &message);
+                match body {
+                    Some(b) => ServerMessage::new_native_large(n, b),
+                    None => ServerMessage::new_native(n),
+                }
             }
         });
         r.scheduled_time = scheduled_time;
@@ -836,6 +887,24 @@ impl ServerSession {
     pub fn cancel_one(&self, consumer_id: i64, message_id: i64, failed: bool) {
         if let Some(c) = self.consumers.get(&consumer_id) {
             c.queue.cancel_one(c.id, message_id, failed);
+        }
+    }
+
+    /// `individualCancel` after `rejectConsumer`: the message goes back,
+    /// but not to this consumer.
+    pub fn cancel_undeliverable(&self, consumer_id: i64, message_id: i64, failed: bool) {
+        if let Some(c) = self.consumers.get(&consumer_id) {
+            c.queue.cancel_undeliverable(c.id, message_id, failed);
+        }
+    }
+
+    /// `ServerConsumerImpl.reject`: the message goes to the dead-letter
+    /// address. A browser takes nothing, so rejects nothing.
+    pub fn reject(&self, consumer_id: i64, message_id: i64) {
+        if let Some(c) = self.consumers.get(&consumer_id)
+            && !c.browse_only
+        {
+            c.queue.reject(c.id, message_id);
         }
     }
 
@@ -1490,6 +1559,38 @@ impl ServerSession {
                 Err(e)
             }
         }
+    }
+
+    /// Rolls back a transaction of the caller's own, except that the
+    /// acknowledged messages `keep` names (consumer ID, message ID) stay
+    /// with their consumers as delivered, counted once more
+    /// (`ProtonTransactionRefsOperation`).
+    pub fn rollback_tx_keeping(&mut self, tx: &TxRef, keep: &[(i64, i64)]) -> Result<()> {
+        let kept: Vec<(ConsumerId, Queue, MessageRef)> = {
+            let mut t = transaction::lock(tx);
+            let mut kept = Vec::new();
+            let mut i = 0;
+            while i < t.acks.len() {
+                let (q, r) = &t.acks[i];
+                let owner = keep.iter().find_map(|(consumer, message)| {
+                    let c = self.consumers.get(consumer)?;
+                    (*message == r.message_id() && c.queue.id() == q.id()).then_some(c.id)
+                });
+                match owner {
+                    Some(id) => {
+                        let (q, mut r) = t.acks.remove(i);
+                        r.delivery_count += 1;
+                        kept.push((id, q, r));
+                    }
+                    None => i += 1,
+                }
+            }
+            kept
+        };
+        for (id, q, r) in kept {
+            q.back_to_delivering(id, r);
+        }
+        self.rollback_tx(tx)
     }
 
     /// Rolls back a transaction of the caller's own.
