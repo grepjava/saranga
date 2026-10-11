@@ -1,0 +1,14 @@
+# Phase 7 client matrix: AMQP 1.0 with fe2o3-amqp (src/main.rs). Not part
+# of the workspace; scripts/client-matrix.sh builds it in a directory of its
+# own.
+[package]
+name = "amqp_check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+fe2o3-amqp = "0.18.2"
+tokio = { version = "1", features = ["full"] }

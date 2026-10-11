@@ -4,7 +4,9 @@
 #
 #   scripts/interop.sh [saranga|artemis] [test-name...]
 #
-# SUITE=<name> picks tests/interop/jms/<name>.java (default Phase2), and
+# SUITE=<name> picks tests/interop/jms/<name>.java (default Phase2),
+# SUITE_FILE=<file.java> another Java suite, SUITE_CMD=<command> one that is
+# not Java (given the broker's host:port), and
 # CONFIG=<broker.xml> the configuration both brokers run with (default
 # tests/golden/etc/broker.xml, the image's own). ETC=<dir> adds the files of
 # a directory (login.config, users and roles) to both brokers' etc/; without
@@ -64,6 +66,12 @@ esac
 CP="$(native "$DIST/lib")/*"
 URL="tcp://127.0.0.1:$PORT"
 SUITE="${SUITE:-Phase2}"
+if [[ -n "${SUITE_CMD:-}" ]]; then
+  # A suite that is not Java (tests/interop/clients): the command gets the
+  # broker's host:port.
+  $SUITE_CMD "127.0.0.1:$PORT" "$@"
+  exit
+fi
 if [[ -n "${SUITE_FILE:-}" ]]; then
   # Another suite, on the reference client classpath unless SUITE_CP
   # names another (scripts/legacy-interop.sh).
