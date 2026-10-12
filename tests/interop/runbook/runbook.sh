@@ -25,6 +25,7 @@
 #   perf-tools         perf client
 #   data-tools         data exp, compact, and imp into a second instance;
 #                      restart recovery
+#   graceful-shutdown  a broker stopped while a consumer is connected
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -78,7 +79,7 @@ instance() {
     (cd "$dir/bin" && timeout 300 cmd /c "$(cygpath -w "$dir/bin/artemis.cmd")" "$@" < /dev/null 2>&1)
   else
     (cd "$dir/bin" && timeout 300 ./artemis "$@" < /dev/null 2>&1)
-  fi | grep -v -E "^WARNING: |NO_ARTEMIS_OOME_DUMP|operable program or batch file|^The system cannot find the file specified"
+  fi | grep --line-buffered -v -E "^WARNING: |NO_ARTEMIS_OOME_DUMP|operable program or batch file|^The system cannot find the file specified"
   return "${PIPESTATUS[0]}"
 }
 
@@ -234,6 +235,41 @@ suite() {
     instance "$I2" queue stat --queueName "$q" "${AUTH[@]}"
   done
   stop "$I2" "$PORT2"
+
+  # graceful-shutdown: a stopping broker waits for its clients, for ever
+  # or for graceful-shutdown-timeout.
+  step "graceful-shutdown: graceful-shutdown-enabled, no timeout"
+  sed -i 's#<persistence-enabled>true</persistence-enabled>#&\n      <graceful-shutdown-enabled>true</graceful-shutdown-enabled>#' "$I2/etc/broker.xml"
+  graceful 15000 "the consumer disconnected"
+  step "graceful-shutdown: graceful-shutdown-timeout 2000"
+  sed -i 's#<graceful-shutdown-enabled>true</graceful-shutdown-enabled>#&\n      <graceful-shutdown-timeout>2000</graceful-shutdown-timeout>#' "$I2/etc/broker.xml"
+  graceful 60000 "the timeout passed"
+}
+
+# The broker of i2 stopped while a consumer waits receive-timeout ms for a
+# message that does not come.
+graceful() {
+  local timeout="$1" until="$2" log="$I2/log/artemis.log" out="$WORK/consumer.out"
+  # The last stop's AMQ221002 comes after its port closes.
+  wait_for "$log" "AMQ221002" && sleep 1
+  : > "$log"
+  start "$I2" "$PORT2" && echo "listening"
+  instance "$I2" consumer --destination queue://graceful --message-count 1 \
+    --receive-timeout "$timeout" --break-on-null "${AUTH[@]}" > "$out" &
+  local consumer=$!
+  wait_for "$out" "messages are consumed" && sleep 1
+  local stopped_at=$SECONDS
+  step "artemis stop"
+  instance "$I2" stop
+  echo "--- exit ${PIPESTATUS[0]}"
+  sleep 1
+  if grep -q AMQ221002 "$log"; then echo "log: stopped at once"; else echo "log: still running"; fi
+  wait "$consumer"
+  step "artemis consumer (connected while the broker stopped)"
+  cat "$out"
+  wait_for "$log" "AMQ221002" && echo "log: AMQ221002: stopped once $until"
+  if (( SECONDS - stopped_at < 30 )); then echo "the consumer ended with the broker"; fi
+  wait_down "$PORT2" || echo "the broker in $I2 did not stop"
 }
 
 # Timings, IDs, paths and dates differ between runs and brokers.

@@ -389,9 +389,8 @@ impl ConsumerShared {
                 notified.as_mut().enable();
                 {
                     let mut st = self.state();
-                    if let Some(e) = &st.failure {
-                        return Err(e.clone());
-                    }
+                    // Closed or failed while waiting: Artemis's receive
+                    // returns null; only the next call fails (checkClosed).
                     if st.closed {
                         break None;
                     }

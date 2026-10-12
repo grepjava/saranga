@@ -538,6 +538,12 @@ fn parse_scalars(
     if let Some(v) = s.bool("suppress-session-notifications") {
         config.suppress_session_notifications = v;
     }
+    if let Some(v) = s.bool("graceful-shutdown-enabled") {
+        config.graceful_shutdown_enabled = v;
+    }
+    if let Some(v) = s.i64("graceful-shutdown-timeout", Check::MinusOneOrGeZero)? {
+        config.graceful_shutdown_timeout = v;
+    }
     if let Some(v) = s.bool("critical-analyzer") {
         config.critical_analyzer = v;
     }

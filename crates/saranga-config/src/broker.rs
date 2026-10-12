@@ -435,6 +435,11 @@ pub struct BrokerConfig {
     /// `suppress-session-notifications`: no `SESSION_CREATED` and
     /// `SESSION_CLOSED` notifications.
     pub suppress_session_notifications: bool,
+    /// `graceful-shutdown-enabled`: a stopping broker waits for its clients
+    /// to disconnect.
+    pub graceful_shutdown_enabled: bool,
+    /// `graceful-shutdown-timeout`, in milliseconds; -1 waits for ever.
+    pub graceful_shutdown_timeout: i64,
     /// `critical-analyzer`.
     pub critical_analyzer: bool,
     /// `critical-analyzer-timeout`, in milliseconds.
@@ -602,6 +607,8 @@ impl Default for BrokerConfig {
             jmx_domain: "org.apache.activemq.artemis".to_owned(),
             management_notification_address: "activemq.notifications".to_owned(),
             suppress_session_notifications: false,
+            graceful_shutdown_enabled: false,
+            graceful_shutdown_timeout: -1,
             critical_analyzer: true,
             critical_analyzer_timeout: 120_000,
             critical_analyzer_check_period: 0,

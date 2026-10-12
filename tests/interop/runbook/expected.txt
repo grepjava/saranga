@@ -168,3 +168,35 @@ Connection brokerURL = tcp://localhost:62416
 === artemis stop
 --- exit 0
 stopped
+=== graceful-shutdown: graceful-shutdown-enabled, no timeout
+listening
+=== artemis stop
+--- exit 0
+log: still running
+=== artemis consumer (connected while the broker stopped)
+Connection brokerURL = tcp://localhost:62416
+Consumer:: filter = null
+Consumer ActiveMQQueue[graceful], thread=0 wait 15000ms until 1 messages are consumed
+Consumer ActiveMQQueue[graceful], thread=0 Consumed: 1 messages
+Consumer ActiveMQQueue[graceful], thread=0 Elapsed time in second : # s
+Consumer ActiveMQQueue[graceful], thread=0 Elapsed time in milli second : # milli seconds
+Consumer ActiveMQQueue[graceful], thread=0 Consumed: 0 messages
+Consumer ActiveMQQueue[graceful], thread=0 Consumer thread finished
+log: AMQ221002: stopped once the consumer disconnected
+the consumer ended with the broker
+=== graceful-shutdown: graceful-shutdown-timeout 2000
+listening
+=== artemis stop
+--- exit 0
+log: still running
+=== artemis consumer (connected while the broker stopped)
+Connection brokerURL = tcp://localhost:62416
+Consumer:: filter = null
+Consumer ActiveMQQueue[graceful], thread=0 wait 60000ms until 1 messages are consumed
+Consumer ActiveMQQueue[graceful], thread=0 Consumed: 1 messages
+Consumer ActiveMQQueue[graceful], thread=0 Elapsed time in second : # s
+Consumer ActiveMQQueue[graceful], thread=0 Elapsed time in milli second : # milli seconds
+Consumer ActiveMQQueue[graceful], thread=0 Consumed: 0 messages
+Consumer ActiveMQQueue[graceful], thread=0 Consumer thread finished
+log: AMQ221002: stopped once the timeout passed
+the consumer ended with the broker

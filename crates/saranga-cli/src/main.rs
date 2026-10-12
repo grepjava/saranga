@@ -922,6 +922,11 @@ async fn run(
                 .map_err(|e| format!("{e:#}"))
         }));
     }
+    // graceful-shutdown-timeout, when graceful-shutdown-enabled.
+    let graceful = file_config
+        .as_ref()
+        .filter(|c| c.graceful_shutdown_enabled)
+        .map(|c| c.graceful_shutdown_timeout);
     let stop_dir = instance
         .as_ref()
         .and_then(|i| i.broker_xml.parent().map(Path::to_path_buf));
@@ -953,7 +958,11 @@ async fn run(
                 tracing::info!("AMQ241005: Stopping embedded web server");
                 tracing::info!("AMQ241006: Stopped embedded web server");
             }
+            // RemotingService.pauseAcceptors: no new connections.
             servers.abort_all();
+            if let Some(timeout) = graceful {
+                wait_for_clients(&broker, timeout).await;
+            }
             broker.stop()?;
             tracing::info!(
                 "AMQ221002: Saranga Message Broker version {VERSION} [{}] stopped, uptime {}",
@@ -963,6 +972,22 @@ async fn run(
         }
     }
     Ok(())
+}
+
+/// The graceful shutdown of `ActiveMQServerImpl.stop`: the clients
+/// connected are given `timeout` milliseconds (-1: for ever) to disconnect.
+async fn wait_for_clients(broker: &saranga_server::Broker, timeout: i64) {
+    let disconnected = async {
+        while !broker.registry().connections().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    };
+    if timeout < 0 {
+        disconnected.await;
+    } else {
+        let limit = std::time::Duration::from_millis(timeout as u64);
+        let _ = tokio::time::timeout(limit, disconnected).await;
+    }
 }
 
 #[cfg(test)]

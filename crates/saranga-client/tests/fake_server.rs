@@ -621,7 +621,10 @@ async fn server_disconnect_unblocks_and_fails() {
     let consumer = session.create_consumer("q", None, false).await.unwrap();
     let s2 = session.clone();
     let call = tokio::spawn(async move { s2.queue_query("q").await });
-    let receive = tokio::spawn(async move { consumer.receive(Duration::ZERO).await });
+    let receive = tokio::spawn(async move {
+        let m = consumer.receive(Duration::ZERO).await;
+        (m, consumer)
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
     fake.send(
         0,
@@ -633,7 +636,10 @@ async fn server_disconnect_unblocks_and_fails() {
     );
     let err = call.await.unwrap().unwrap_err();
     assert_eq!(err.kind(), Some(ErrorType::Unblocked), "{err}");
-    let err = receive.await.unwrap().unwrap_err();
+    // As Artemis's: the waiting receive gets nothing, the next one fails.
+    let (m, consumer) = receive.await.unwrap();
+    assert!(m.unwrap().is_none());
+    let err = consumer.receive(Duration::ZERO).await.unwrap_err();
     assert_eq!(err.kind(), Some(ErrorType::Disconnected), "{err}");
     assert_eq!(
         conn.failure().unwrap().kind(),
