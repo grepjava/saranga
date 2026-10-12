@@ -22,7 +22,8 @@
 #   masking-passwords  mask
 #   logging            the audit log turned on while running
 #   management         Jolokia reads, as the manual's curl commands do them;
-#                      listConnections while a consumer is connected
+#                      listConnections while a Core consumer, then an
+#                      OpenWire one, is connected
 #   versions           an acceptor's reload, with the manual's curl command
 #   data-retention     journal retention and replay through Jolokia; data
 #                      print and recover over the retention directory
@@ -230,6 +231,18 @@ suite() {
   jolokia_post '{"operation": "listConnections", "mbean": "org.apache.activemq.artemis:broker=\"0.0.0.0\"", "type": "exec", "arguments": [ "{\"field\":\"protocol\",\"operation\":\"EQUALS\",\"value\":\"CORE\"}", -1, -1 ] }'
   instance "$I1" producer --destination queue://waiting --message-count 1 "${AUTH[@]}" > /dev/null
   wait "$waiting"
+
+  # management: the OpenWire connections, with the ActiveMQ 5 client that
+  # Artemis ships connected.
+  java -cp "$(native "$DIST/lib")/*" "$(native "$HERE/OpenWireWait.java")" \
+    "tcp://localhost:$PORT1" admin admin openwire > "$WORK/openwire.out" 2>&1 &
+  waiting=$!
+  wait_for "$WORK/openwire.out" "connected" && sleep 1
+  jolokia "exec/$MBEAN/listConnections/%7B%22field%22:%22protocol%22,%22operation%22:%22EQUALS%22,%22value%22:%22OPENWIRE%22%7D/-1/-1"
+  jolokia_post '{"operation": "listConnections", "mbean": "org.apache.activemq.artemis:broker=\"0.0.0.0\"", "type": "exec", "arguments": [ "{\"field\":\"protocol\",\"operation\":\"EQUALS\",\"value\":\"OPENWIRE\"}", -1, -1 ] }'
+  instance "$I1" producer --destination queue://openwire --message-count 1 "${AUTH[@]}" > /dev/null
+  wait "$waiting"
+  grep -v '^WARNING' "$WORK/openwire.out"
 
   # versions (2.18.0): the keystores reloaded through the acceptor's reload
   # operation, with the manual's curl command. Jolokia's strict checking
@@ -471,7 +484,8 @@ normalize() {
     -e 's/"timestamp":[0-9]+/"timestamp":#/g' \
     -e 's/"id":"?[0-9]+"?/"id":#/g' \
     -e 's/\\"id\\":\\"[0-9]+\\"/\\"id\\":#/g' \
-    -e 's/(JMS Message ID:|messageID=|ID:)[^ ,]*/\1#/g' \
+    -e 's/(\\"clientID\\":\\"ID:)[^\\]*/\1#/g' \
+    -e 's/(JMS Message ID:|messageID=|ID:)[^ ,\\]*/\1#/g' \
     -e "s/$uuid/UUID/g" \
     -e 's/^result: .*/result: MASKED/' \
     -e 's/(Total time|time): [0-9.]+/\1: #/' \
