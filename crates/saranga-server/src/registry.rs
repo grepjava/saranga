@@ -104,6 +104,12 @@ impl Registry {
             .collect()
     }
 
+    /// Whether every connection is gone, failed ones included (their
+    /// registrations dropped).
+    pub fn all_closed(&self) -> bool {
+        lock(&self.connections).is_empty()
+    }
+
     pub fn connection(&self, id: &str) -> Option<Arc<ClientConnection>> {
         self.connections().into_iter().find(|c| c.id() == id)
     }

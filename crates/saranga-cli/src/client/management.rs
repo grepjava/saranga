@@ -54,6 +54,11 @@ impl Requestor {
     /// `ClientRequestor`'s temporary reply queue.
     pub async fn open(conn: &JmsConnection) -> anyhow::Result<Self> {
         let session = conn.conn.create_session(conn_session_options(conn)).await?;
+        Self::on(session).await
+    }
+
+    /// `ClientRequestor` on a session of its own.
+    pub async fn on(session: Session) -> anyhow::Result<Self> {
         session.start().await?;
         let reply_queue = format!(
             "{MANAGEMENT_ADDRESS}.{}",
@@ -120,7 +125,8 @@ impl Requestor {
                 break d;
             }
         };
-        self.consumer.acknowledge(&reply).await?;
+        // `ClientRequestor.request` leaves the reply unacknowledged; it
+        // goes with the reply queue.
         let message = &reply.message;
         let succeeded = matches!(
             message.property(HDR_OPERATION_SUCCEEDED),
@@ -161,8 +167,14 @@ pub async fn perform(
     args: &super::ConnectionArgs,
     request: impl AsyncFnOnce(&Requestor) -> anyhow::Result<Reply>,
 ) -> anyhow::Result<Reply> {
-    let conn = args.connect().await?;
-    let requestor = Requestor::open(&conn).await?;
+    let (conn, session) = args.core_session().await?;
+    let requestor = match Requestor::on(session).await {
+        Ok(r) => r,
+        Err(e) => {
+            conn.close().await;
+            return Err(e);
+        }
+    };
     let reply = request(&requestor).await;
     requestor.close().await;
     conn.close().await;

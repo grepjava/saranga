@@ -60,20 +60,6 @@ fn flag(properties: &HashMap<String, String>, key: &str) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
-/// `RemotingConnectionImpl.toString`, the transport connection named as
-/// Netty's (`NettyServerConnection@hash`), its hash taken from the ID.
-fn connection_string(c: &ClientConnection, node_id: &str) -> String {
-    let hash = u32::from_str_radix(c.id(), 16).unwrap_or(0) & 0x7fff_ffff;
-    format!(
-        "RemotingConnectionImpl [ID={}, clientID={}, nodeID={node_id}, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@{hash:x}[ID={}, local= {}, remote={}]]",
-        c.id(),
-        c.client_id().as_deref().unwrap_or("null"),
-        c.id(),
-        c.local_address(),
-        c.remote_address()
-    )
-}
-
 // ---------------------------------------------------------------------------
 
 /// `LoggingActiveMQServerPlugin`.
@@ -144,7 +130,7 @@ impl BrokerPlugin for Logging {
         if self.all || self.connections {
             tracing::info!(
                 "AMQ841000: created connection: {}",
-                connection_string(c, &self.node_id())
+                crate::audit::connection_string(c, &self.node_id())
             );
         }
     }
@@ -153,7 +139,7 @@ impl BrokerPlugin for Logging {
         if self.all || self.connections {
             tracing::info!(
                 "AMQ841001: destroyed connection: {}",
-                connection_string(c, &self.node_id())
+                crate::audit::connection_string(c, &self.node_id())
             );
         }
     }

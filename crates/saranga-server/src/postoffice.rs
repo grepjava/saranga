@@ -751,6 +751,7 @@ impl PostOffice {
             added
         };
         if added {
+            crate::audit::registered("AddressControlImpl", info.name.as_ref());
             self.plugins.each(|p| p.after_add_address(&info, true));
         }
     }
@@ -801,6 +802,7 @@ impl PostOffice {
         entry.queues.push(queue.clone());
         state.queues.insert(queue.name().clone(), queue.clone());
         drop(state);
+        crate::audit::registered("QueueControlImpl", queue.name().as_ref());
         self.notify_queue_binding(crate::notifications::NotificationType::BindingAdded, &queue);
         // Recovered: bound, not created.
         self.plugins.each(|p| {
@@ -894,6 +896,7 @@ impl PostOffice {
             .addresses
             .insert(info.name.clone(), AddressEntry::new(info.clone()));
         drop(state);
+        crate::audit::registered("AddressControlImpl", info.name.as_ref());
         self.plugins.each(|p| p.after_add_address(&info, false));
         Ok(info)
     }
@@ -929,6 +932,7 @@ impl PostOffice {
             .addresses
             .insert(info.name.clone(), AddressEntry::new(info.clone()));
         drop(state);
+        crate::audit::registered("AddressControlImpl", info.name.as_ref());
         self.plugins.each(|p| p.after_add_address(&info, false));
         Ok(info)
     }
@@ -1066,6 +1070,7 @@ impl PostOffice {
         entry.queues.push(queue.clone());
         state.queues.insert(queue.name().clone(), queue.clone());
         drop(state);
+        crate::audit::registered("QueueControlImpl", queue.name().as_ref());
         self.notify_queue_binding(crate::notifications::NotificationType::BindingAdded, &queue);
         self.plugins.each(|p| {
             let c = queue.config();
@@ -2031,6 +2036,7 @@ impl PostOffice {
         let filter = d.filter.clone().filter(|f| !f.trim().is_empty());
         entry.diverts.push(Arc::new(divert));
         drop(state);
+        crate::audit::registered("DivertControlImpl", &name);
         // BINDING_ADDED of the DivertBinding: its cluster name is its
         // unique name.
         let id = self.ids.next();

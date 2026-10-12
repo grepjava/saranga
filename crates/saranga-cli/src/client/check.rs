@@ -320,8 +320,16 @@ fn queue_tasks(args: &QueueArgs) -> anyhow::Result<Vec<(String, Task)>> {
 }
 
 async fn run_tasks(check: &CheckArgs, kind: &str, tasks: &[(String, Task)]) -> anyhow::Result<()> {
-    let conn = check.conn.connect().await?;
-    let requestor = Requestor::open(&conn).await?;
+    // createCoreConnectionFactory, then ActiveMQManagementProxy's session
+    // factory and session.
+    let (conn, session) = check.conn.core_session().await?;
+    let requestor = match Requestor::on(session).await {
+        Ok(r) => r,
+        Err(e) => {
+            conn.close().await;
+            return Err(e);
+        }
+    };
     let mut context = Context {
         conn: check.conn.clone(),
         requestor,

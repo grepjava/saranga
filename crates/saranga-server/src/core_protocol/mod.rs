@@ -759,7 +759,11 @@ impl Connection {
         session.entry().set_closer(Box::new(move |force| {
             let _ = closer.send(SessionInput::Close(force));
         }));
-        self.session_tasks.push(tokio::spawn(session.run(rx)));
+        // The session's packets are handled for its connection's subject
+        // and address (ActiveMQPacketHandler's AuditLogger thread locals).
+        let context = crate::audit::Context::Connection(self.shared.client.clone());
+        self.session_tasks
+            .push(tokio::spawn(crate::audit::scoped(context, session.run(rx))));
         self.sessions.insert(channel_id, tx);
         self.shared.send(
             CHANNEL_SESSION,

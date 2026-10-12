@@ -663,6 +663,7 @@ impl Broker {
     /// written out, and `server.lock` marked paused.
     pub fn stop(&self) -> Result<()> {
         if !self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            audit::management_stopped(self);
             for p in self.post_office.plugins().all() {
                 p.unregistered(self);
             }
@@ -935,7 +936,10 @@ impl Broker {
                         Box::new(stream)
                     }
                 };
-                protocol::detect_and_serve(broker, stream, Some(peer), local, info, acceptor).await;
+                let context = audit::Context::Remote(info.remote_address.clone());
+                let serve =
+                    protocol::detect_and_serve(broker, stream, Some(peer), local, info, acceptor);
+                audit::scoped(context, serve).await;
             });
         }
     }

@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use saranga_core_protocol::packets::cluster::{
-    SubscribeClusterTopologyUpdatesMessageV2, TopologyUpdate,
+    ConnectMessage, SubscribeClusterTopologyUpdatesMessageV2, TopologyUpdate,
 };
+use saranga_core_protocol::packets::cluster_types::{MapValue, PersistedMap};
 use saranga_core_protocol::packets::connection::{
     CreateSessionMessage, CreateSessionMessageV2, Ping,
 };
@@ -46,6 +47,12 @@ pub struct ConnectionOptions {
     pub connection_ttl: Option<Duration>,
     /// `callTimeout`: how long a blocking call waits for its response.
     pub call_timeout: Duration,
+    /// `connectionUser` and `connectionPassword`: with a user, the
+    /// connection authenticates (a `ConnectMessage` with PLAIN
+    /// credentials) before its first session, as the JMS client's
+    /// `createConnection(user, password)` makes it.
+    pub user: Option<String>,
+    pub password: Option<String>,
 }
 
 impl Default for ConnectionOptions {
@@ -54,6 +61,8 @@ impl Default for ConnectionOptions {
             client_failure_check_period: Some(defaults::CLIENT_FAILURE_CHECK_PERIOD),
             connection_ttl: Some(defaults::CONNECTION_TTL),
             call_timeout: defaults::CALL_TIMEOUT,
+            user: None,
+            password: None,
         }
     }
 }
@@ -298,6 +307,48 @@ impl Connection {
                 options.connection_ttl,
                 shutdown_rx,
             ));
+        }
+
+        // ClientSessionFactoryImpl.getConnection: sendConnect, with the
+        // credentials (RFC 4616: authzid NUL authcid NUL passwd).
+        if let Some(user) = &options.user {
+            let auth = format!("\0{user}\0{}", options.password.as_deref().unwrap_or(""));
+            let connect = ConnectMessage {
+                node_id: None,
+                fields: Some(PersistedMap {
+                    entries: vec![
+                        (
+                            ConnectMessage::FIELD_CLIENT_VERSION,
+                            MapValue::Integer(version::CURRENT),
+                        ),
+                        (
+                            ConnectMessage::FIELD_AUTH_MECHANISM,
+                            MapValue::String("PLAIN".into()),
+                        ),
+                        (
+                            ConnectMessage::FIELD_AUTH_DATA,
+                            MapValue::ByteArray(auth.into_bytes()),
+                        ),
+                    ],
+                }),
+            };
+            let channel1 = inner.channel(1).ok_or_else(Error::connection_destroyed)?;
+            let sent = inner
+                .send_blocking(&channel1, connect.into(), types::CONNECT_RESPONSE)
+                .await;
+            match sent {
+                Ok(Packet::ConnectResponseMessage(r)) => {
+                    inner.version.store(r.server_version(), Ordering::SeqCst);
+                }
+                Ok(other) => {
+                    inner.fail(Error::UnexpectedResponse(other.name()));
+                    return Err(Error::UnexpectedResponse(other.name()));
+                }
+                Err(e) => {
+                    inner.fail(e.clone());
+                    return Err(e);
+                }
+            }
         }
 
         inner.send(

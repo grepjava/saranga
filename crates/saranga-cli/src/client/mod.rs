@@ -274,8 +274,7 @@ impl ConnectionArgs {
         self.url.as_deref().unwrap_or(DEFAULT_BROKER_URL)
     }
 
-    /// A Core connection with this user and password, or the shell's
-    /// (`tryConnect`).
+    /// A Core connection with this user and password, or the shell's.
     pub async fn connect(&self) -> anyhow::Result<jms::JmsConnection> {
         let mut args = self.clone();
         crate::shell::recover(&mut args);
@@ -288,6 +287,35 @@ impl ConnectionArgs {
         .await?;
         crate::shell::save_connection(args.url(), args.user.as_deref(), args.password.as_deref());
         Ok(conn)
+    }
+
+    /// `tryConnect`, as making a connection factory does: a connection
+    /// made and closed at once.
+    pub async fn try_connect(&self) -> anyhow::Result<()> {
+        self.connect().await?.close().await;
+        Ok(())
+    }
+
+    /// `doManagement`'s connection and session: a session factory and one
+    /// session, each with this user and password (after the factory's
+    /// `tryConnect`).
+    pub async fn core_session(&self) -> anyhow::Result<(Connection, saranga_client::Session)> {
+        self.try_connect().await?;
+        let mut args = self.clone();
+        crate::shell::recover(&mut args);
+        let conn = open(args.url(), args.user.as_deref(), args.password.as_deref()).await?;
+        let options = saranga_client::SessionOptions {
+            username: args.user.clone(),
+            password: args.password.clone(),
+            ..saranga_client::SessionOptions::default()
+        };
+        match conn.create_session(options).await {
+            Ok(session) => Ok((conn, session)),
+            Err(e) => {
+                conn.close().await;
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -393,10 +421,20 @@ pub fn parse_url(url: &str) -> anyhow::Result<(String, u16)> {
     ))
 }
 
-/// Opens a Core connection to a URL.
-pub async fn open(url: &str) -> anyhow::Result<Connection> {
+/// Opens a Core connection to a URL, authenticated as `user` if given
+/// (`createSessionFactory(user, password)`).
+pub async fn open(
+    url: &str,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> anyhow::Result<Connection> {
     let (host, port) = parse_url(url)?;
-    Connection::connect((host.as_str(), port), ConnectionOptions::default())
+    let options = ConnectionOptions {
+        user: user.map(str::to_owned),
+        password: password.map(str::to_owned),
+        ..ConnectionOptions::default()
+    };
+    Connection::connect((host.as_str(), port), options)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create session factory; nested exception is {e}"))
 }

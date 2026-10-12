@@ -383,6 +383,8 @@ impl Producer {
         let is_large =
             4 + message.body.len() as i64 > session.options.min_large_message_size as i64;
         message.address = Some(address.clone());
+        // Encoded as Java's client encodes them: in its HashMap's order.
+        message.properties.sort_as_java_hash_map();
         let credits = session
             .credits
             .lock()

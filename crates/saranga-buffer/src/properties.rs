@@ -113,6 +113,27 @@ impl TypedProperties {
         Some(entries.remove(i).1)
     }
 
+    /// Puts the entries, taken as put in this order, in the order Java's
+    /// `TypedProperties` keeps them: a `new HashMap<>()` of those puts, as
+    /// the Java client encodes a message it made.
+    pub fn sort_as_java_hash_map(&mut self) {
+        let Some(entries) = self.0.as_mut() else {
+            return;
+        };
+        let hashes: Vec<i32> = entries
+            .iter()
+            .map(|(k, _)| {
+                k.as_bytes().iter().fold(0i32, |h, &b| {
+                    h.wrapping_mul(31).wrapping_add(i32::from(b as i8))
+                })
+            })
+            .collect();
+        let order = crate::java_hash::hash_map_order(&hashes, None);
+        let mut taken: Vec<Option<(SimpleString, PropertyValue)>> =
+            std::mem::take(entries).into_iter().map(Some).collect();
+        *entries = order.into_iter().filter_map(|i| taken[i].take()).collect();
+    }
+
     pub fn decode(r: &mut Reader<'_>) -> Result<Self> {
         if !r.not_null()? {
             return Ok(Self(None));

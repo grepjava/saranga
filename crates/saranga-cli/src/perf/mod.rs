@@ -223,6 +223,8 @@ impl PerfArgs {
         // are made to create the destinations.
         let mut connection = connection.clone();
         connection.client_id = None;
+        // The connection factory's `tryConnect`, then `lookupDestinations`'.
+        connection.try_connect().await?;
         let conn = connection.connect().await?;
         let session = conn.session(false).await;
         if let Ok(s) = &session {

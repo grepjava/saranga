@@ -963,6 +963,7 @@ async fn run(
             if let Some(timeout) = graceful {
                 wait_for_clients(&broker, timeout).await;
             }
+            close_connections(&broker).await;
             broker.stop()?;
             tracing::info!(
                 "AMQ221002: Saranga Message Broker version {VERSION} [{}] stopped, uptime {}",
@@ -972,6 +973,20 @@ async fn run(
         }
     }
     Ok(())
+}
+
+/// `RemotingServiceImpl.stop`: the connections left are closed before the
+/// rest of the broker stops.
+async fn close_connections(broker: &saranga_server::Broker) {
+    for c in broker.registry().connections() {
+        c.fail();
+    }
+    let closed = async {
+        while !broker.registry().all_closed() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), closed).await;
 }
 
 /// The graceful shutdown of `ActiveMQServerImpl.stop`: the clients

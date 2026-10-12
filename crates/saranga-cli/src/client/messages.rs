@@ -82,6 +82,8 @@ async fn connect(conn: &ConnectionArgs) -> anyhow::Result<JmsConnection> {
     if let Some(id) = &conn.client_id {
         println!("Consumer:: clientID = {id}");
     }
+    // The connection factory's `tryConnect`, then the command's own.
+    conn.try_connect().await?;
     conn.connect().await
 }
 

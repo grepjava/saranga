@@ -15,7 +15,8 @@ import sys
 
 # A measurement too fast for the clock is infinite: Java prints the sign as
 # `?` where the console's code page has no infinity.
-NUMBER = re.compile(r"-?\d+(\.\d+)?(E-?\d+)?|∞|Infinity|(?<![^ ])\?(?![^ ])")
+# DecimalFormat("###.##") drops a zero integer part: ".5".
+NUMBER = re.compile(r"-?(\d+(\.\d+)?|(?<![\d.])\.\d+)(E-?\d+)?|∞|Infinity|(?<![^ ])\?(?![^ ])")
 TOTAL = re.compile(r"^--- total (sent|completed|received):")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # The JVM's notices, and what only Artemis's --verbose prints.

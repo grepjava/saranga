@@ -476,6 +476,8 @@ async fn stat(mut args: StatArgs) -> anyhow::Result<()> {
         println!("filter is '{filter}'");
         println!("maxRows='{}'", args.max_rows);
     }
+    // `createConnectionFactory().close()`: its `tryConnect`.
+    args.conn.try_connect().await?;
     let params = || {
         vec![
             Json::from(filter.clone()),

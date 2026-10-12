@@ -447,7 +447,7 @@ impl ServerSession {
                 },
                 &options.name,
                 options.username.as_deref(),
-                conn.id(),
+                &conn,
                 options.auto_commit_sends,
                 options.auto_commit_acks,
                 options.pre_acknowledge,
@@ -519,7 +519,9 @@ impl ServerSession {
         crate::audit::SessionAudit {
             who: self.who(),
             session: &self.name,
-            connection_id: self.conn.id(),
+            connection: &self.conn,
+            node_id: self.broker.node_id(),
+            tx_id: self.tx.as_ref().map_or(-1, |t| transaction::lock(t).id),
             consumers: self.consumers.len(),
         }
     }
@@ -1086,9 +1088,11 @@ impl ServerSession {
         tx: Option<TxRef>,
     ) -> Result<()> {
         if crate::audit::base_enabled() {
-            let tx = tx.as_ref().map(transaction::lock);
-            self.audit().management_message(
-                tx.as_deref(),
+            // The session's transaction, whether the send is in it or not.
+            let audit = self.audit();
+            let session_tx = self.tx.as_ref().map(transaction::lock);
+            audit.management_message(
+                session_tx.as_deref(),
                 &crate::message::ServerMessage::new(request.clone()),
             );
         }
@@ -1108,34 +1112,52 @@ impl ServerSession {
             .management()
             .handle_message(&broker, &request, caller)
             .await;
-        // The request is logged as sent, as any other message.
+        let reply_to = crate::message::string_property(&request, crate::management::REPLY_TO).map(
+            |reply_to| {
+                ["queue://", "topic://", "temp-queue://", "temp-topic://"]
+                    .iter()
+                    .find_map(|p| reply_to.strip_prefix(p))
+                    .unwrap_or(&reply_to)
+                    .to_owned()
+            },
+        );
+        if let Some(reply_to) = &reply_to {
+            reply.address = Some(SimpleString::from(reply_to.as_str()));
+            self.unchecked = true;
+            let sent = self
+                .send_message(reply, Outgoing::Core(None), tx.clone())
+                .await;
+            self.unchecked = false;
+            sent?;
+        }
+        // The request is logged as sent once handled, as any other message;
+        // its routing context is the reply's (the session reuses one).
         if crate::audit::message_enabled() {
-            let message = crate::message::ServerMessage::new(request.clone());
+            let message = crate::message::ServerMessage::new(request);
             match &tx {
                 Some(tx) if !self.auto_commit_sends => {
                     let tx = crate::audit::transaction_string(&transaction::lock(tx));
                     crate::audit::send_in_transaction(self.who(), &message, &tx);
                 }
                 _ => {
-                    let context = crate::audit::routing_context("null", &[]);
+                    let context = match &reply_to {
+                        Some(address) => {
+                            let queues: Vec<Queue> = self
+                                .broker
+                                .post_office()
+                                .queues()
+                                .into_iter()
+                                .filter(|q| *q.config().address == **address)
+                                .collect();
+                            crate::audit::routing_context(address, &queues)
+                        }
+                        None => crate::audit::routing_context("null", &[]),
+                    };
                     crate::audit::sent(self.who(), &message, &context, None);
                 }
             }
         }
-        let Some(reply_to) = crate::message::string_property(&request, crate::management::REPLY_TO)
-        else {
-            return Ok(());
-        };
-        let reply_to = ["queue://", "topic://", "temp-queue://", "temp-topic://"]
-            .iter()
-            .find_map(|p| reply_to.strip_prefix(p))
-            .unwrap_or(&reply_to)
-            .to_owned();
-        reply.address = Some(SimpleString::from(reply_to.as_str()));
-        self.unchecked = true;
-        let sent = self.send_message(reply, Outgoing::Core(None), tx).await;
-        self.unchecked = false;
-        sent
+        Ok(())
     }
 
     /// `MQTTUtil.sendMessageDirectlyToQueue`: the message goes to this one

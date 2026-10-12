@@ -470,6 +470,7 @@ impl Queue {
             dispatching: false,
             dispatch_start: None,
             page_iter: PageIterator::default(),
+            removing: None,
         };
         tokio::spawn(actor.run(rx));
         queue
@@ -1185,6 +1186,9 @@ struct Actor {
     dispatching: bool,
     /// `dispatchStartTime`: when a delay-before-dispatch ends.
     dispatch_start: Option<i64>,
+    /// While management removes messages with the message audit log on:
+    /// those removed, logged when the removal ends.
+    removing: Option<Vec<Arc<ServerMessage>>>,
 }
 
 /// A message group as `MessageGroups` keys it: by group ID, or by bucket
@@ -2162,6 +2166,11 @@ impl Actor {
             refs.extend(c.delivering.drain(..));
         }
         let _ = storage;
+        if crate::audit::message_enabled() {
+            let messages: Vec<&ServerMessage> = refs.iter().map(|r| &*r.message).collect();
+            let tx_id = self.shared.ids.next();
+            crate::audit::removed(&self.shared.name, &messages, tx_id);
+        }
         for mut r in refs {
             // A paged message's cursor goes with the queue's subscription.
             if r.paged.is_none() {

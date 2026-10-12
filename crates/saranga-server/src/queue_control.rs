@@ -411,6 +411,22 @@ impl Actor {
     }
 
     fn act(&mut self, sel: &Selection, action: &SelectionAction) -> usize {
+        if !matches!(action, SelectionAction::Remove(_)) || !crate::audit::message_enabled() {
+            return self.act_unaudited(sel, action);
+        }
+        // `iterQueue`: the removals' acknowledgements, in a transaction.
+        self.removing = Some(Vec::new());
+        let hits = self.act_unaudited(sel, action);
+        let removed = self.removing.take().unwrap_or_default();
+        if !removed.is_empty() {
+            let messages: Vec<&ServerMessage> = removed.iter().map(|m| &**m).collect();
+            let tx_id = self.shared.ids.next();
+            crate::audit::removed(&self.shared.name, &messages, tx_id);
+        }
+        hits
+    }
+
+    fn act_unaudited(&mut self, sel: &Selection, action: &SelectionAction) -> usize {
         // `isExpiryDisabled`: a queue on its own expiry address keeps its
         // messages.
         if matches!(action, SelectionAction::Expire) {
@@ -556,7 +572,12 @@ impl Actor {
     /// still on it).
     fn act_on(&mut self, r: MessageRef, action: &SelectionAction) {
         match action {
-            SelectionAction::Remove(reason) => self.kill_for(r, *reason),
+            SelectionAction::Remove(reason) => {
+                if let Some(removed) = &mut self.removing {
+                    removed.push(r.message.clone());
+                }
+                self.kill_for(r, *reason)
+            }
             SelectionAction::Expire => self.expire(r),
             SelectionAction::SendToDeadLetter => {
                 let s = self.queue().settings();

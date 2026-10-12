@@ -5,6 +5,7 @@
 //! All multi-byte integers are big-endian, as in Netty's `ByteBuf`.
 
 mod codec;
+pub mod java_hash;
 mod jstring;
 mod properties;
 mod reader;

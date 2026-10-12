@@ -117,17 +117,121 @@ fn audit(logger: Logger, name: &str, args: &[&str]) {
     }
 }
 
+/// Who the current task acts for, as Artemis's `AuditLogger` thread locals
+/// hold it while a connection's packets are handled: a Core connection
+/// (its subject and address), or only an address (the other protocols'
+/// handlers set no subject).
+#[derive(Clone)]
+pub enum Context {
+    Connection(std::sync::Arc<crate::session::ClientConnection>),
+    Remote(String),
+}
+
+tokio::task_local! {
+    static CONTEXT: Context;
+}
+
+/// Runs `f` acting for `context`.
+pub async fn scoped<F: std::future::Future>(context: Context, f: F) -> F::Output {
+    CONTEXT.scope(context, f).await
+}
+
+/// `getCaller()` with the task's context: outside any connection, the
+/// MBean server's `internal`.
+fn current_caller() -> String {
+    CONTEXT
+        .try_with(|c| match c {
+            Context::Connection(conn) => {
+                log::caller(conn.subject().as_deref(), Some(conn.remote_address()))
+            }
+            Context::Remote(r) => log::caller(None, Some(r)),
+        })
+        .unwrap_or_else(|_| log::caller(None, Some("internal")))
+}
+
+/// `ManagementServiceImpl.registerInJMX`: registering a control asks it
+/// for its MBean info, audited for whoever the task acts for.
+pub(crate) fn registered(class: &str, key: &str) {
+    if log::base_enabled() {
+        let source = control_string(class, key);
+        audit(Logger::Base, "getMBeanInfo", &[&current_caller(), &source]);
+    }
+}
+
+/// A control's `Object.toString`.
+fn control_string(class: &str, key: &str) -> String {
+    format!(
+        "org.apache.activemq.artemis.core.management.impl.{class}@{:x}",
+        identity(("control", class, key))
+    )
+}
+
 /// `AbstractControl.getMBeanInfo`, as the MBean server's guard and Jolokia
 /// call it: `class` is the control's (`QueueControlImpl`), and the source
 /// is the control's `Object.toString`.
 pub fn mbean_info(class: &str, key: &str, who: Who<'_>) {
     if log::base_enabled() {
-        let source = format!(
-            "org.apache.activemq.artemis.core.management.impl.{class}@{:x}",
-            identity(("control", class, key))
-        );
+        let source = control_string(class, key);
         audit(Logger::Base, "getMBeanInfo", &[&who.caller(), &source]);
     }
+}
+
+/// `ManagementServiceImpl.stop`: each queue control is unregistered by its
+/// name, address and routing type, and each divert control by its unique
+/// name and address, the getters audited as the stopping thread calls
+/// them (`anonymous@internal`), in the order of the registries' maps.
+pub(crate) fn management_stopped(broker: &Broker) {
+    if !log::base_enabled() {
+        return;
+    }
+    let who = || {
+        Some(Who {
+            subject: None,
+            remote: Some("internal"),
+        })
+    };
+    let mut queues = broker.post_office().queues();
+    queues.sort_by_key(|q| q.id());
+    let names = queues.iter().map(|q| q.name().to_string()).collect();
+    for name in concurrent_hash_map_order(names) {
+        for getter in ["getName", "getAddress", "getRoutingType"] {
+            management_call(broker, Control::Queue, &name, getter, &[], who());
+        }
+    }
+    let names = broker
+        .post_office()
+        .diverts()
+        .iter()
+        .map(|d| d.name.to_string())
+        .collect();
+    for name in concurrent_hash_map_order(names) {
+        for getter in ["getUniqueName", "getAddress"] {
+            management_call(broker, Control::Divert, &name, getter, &[], who());
+        }
+    }
+}
+
+/// The iteration order of a Java `ConcurrentHashMap` with these string
+/// keys, put in this order: by bucket of the spread hash, in a table that
+/// grows from 16 as keys are added, then by insertion within a bucket.
+fn concurrent_hash_map_order(keys: Vec<String>) -> Vec<String> {
+    let mut n = 16usize;
+    while keys.len() >= n - (n >> 2) {
+        n *= 2;
+    }
+    let bucket = |s: &str| {
+        let h = s
+            .encode_utf16()
+            .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(i32::from(c)));
+        ((h ^ ((h as u32) >> 16) as i32) & 0x7fff_ffff) as usize & (n - 1)
+    };
+    let mut indexed: Vec<(usize, usize, String)> = keys
+        .into_iter()
+        .enumerate()
+        .map(|(i, k)| (bucket(&k), i, k))
+        .collect();
+    indexed.sort();
+    indexed.into_iter().map(|(_, _, k)| k).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +381,45 @@ pub(crate) fn transaction_string(t: &Transaction) -> String {
         t.sends.len() + t.acks.len(),
         identity(("tx", t.id))
     )
+}
+
+/// The acknowledgements of references the broker removes in a transaction
+/// of its own (`QueueImpl.iterQueue`: a queue deleted, messages removed
+/// through management). With no consumer, the caller is `system@internal`;
+/// each is added to the transaction (`nr operations` counting the refs
+/// operation and the audit operations before it), then logged once it
+/// commits, when the transaction's operations are gone.
+pub(crate) fn removed(queue: &str, messages: &[&ServerMessage], tx_id: i64) {
+    if !log::message_enabled() || messages.is_empty() {
+        return;
+    }
+    let mut system = Subject::default();
+    system.add(saranga_security::jaas::Principal::User("system".to_owned()));
+    let caller = log::caller(Some(&system), Some("internal"));
+    let created = crate::message::now_millis();
+    let tx = |state: &str, operations: usize| {
+        format!(
+            "TransactionImpl [xid=null, txID={tx_id}, xid=null, state={state}, createTime={created}({}), timeoutSeconds=-1, nr operations = {operations}]@{:x}",
+            crate::localtime::java_date(created),
+            identity(("tx", tx_id))
+        )
+    };
+    for (i, m) in messages.iter().enumerate() {
+        let tx = tx("ACTIVE", 1 + i);
+        audit(
+            Logger::Message,
+            "addAckToTransaction",
+            &[&caller, queue, &message_string(m), &tx],
+        );
+    }
+    let committed = tx("COMMITTED", 0);
+    for m in messages {
+        audit(
+            Logger::Message,
+            "coreAcknowledgeMessage",
+            &[&caller, queue, &message_string(m), &committed],
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -635,7 +778,7 @@ pub(crate) fn session_created(
     who: Who<'_>,
     name: &str,
     username: Option<&str>,
-    connection_id: &str,
+    connection: &crate::session::ClientConnection,
     auto_commit_sends: bool,
     auto_commit_acks: bool,
     pre_acknowledge: bool,
@@ -646,9 +789,9 @@ pub(crate) fn session_created(
         return;
     }
     let params = format!(
-        "with parameters: [{name}, {}, ****, 102400, RemotingConnectionImpl [ID={connection_id}, clientID=null, nodeID={}, transportConnection=null], {auto_commit_sends}, {auto_commit_acks}, {pre_acknowledge}, {xa}, {}, null, true, null]",
+        "with parameters: [{name}, {}, ****, 102400, {}, {auto_commit_sends}, {auto_commit_acks}, {pre_acknowledge}, {xa}, {}, null, true, null]",
         username.unwrap_or("null"),
-        broker.node_id(),
+        connection_string(connection, broker.node_id()),
         default_address.unwrap_or("null"),
     );
     audit(
@@ -658,11 +801,24 @@ pub(crate) fn session_created(
     );
 }
 
-/// `ServerSessionImpl.toString`, shortened to the session's name and its
-/// connection's ID.
-fn session_source(session: &str, connection_id: &str, consumers: usize) -> String {
+/// `RemotingConnectionImpl.toString`, the transport connection named as
+/// Netty's (`NettyServerConnection@hash`), its hash taken from the ID.
+pub(crate) fn connection_string(c: &crate::session::ClientConnection, node_id: &str) -> String {
+    let hash = u32::from_str_radix(c.id(), 16).unwrap_or(0) & 0x7fff_ffff;
     format!(
-        "ServerSessionImpl(name={session},consumers={consumers},txID=-1,remotingConnection=RemotingConnectionImpl [ID={connection_id}])"
+        "RemotingConnectionImpl [ID={}, clientID={}, nodeID={node_id}, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@{hash:x}[ID={}, local= {}, remote={}]]",
+        c.id(),
+        c.client_id().as_deref().unwrap_or("null"),
+        c.id(),
+        c.local_address(),
+        c.remote_address()
+    )
+}
+
+/// `ServerSessionImpl.toString`: `tx_id` is its transaction's, -1 for none.
+fn session_source(session: &str, connection: &str, consumers: usize, tx_id: i64) -> String {
+    format!(
+        "ServerSessionImpl(name={session},consumers={consumers},txID={tx_id},remotingConnection={connection})"
     )
 }
 
@@ -670,7 +826,10 @@ fn session_source(session: &str, connection_id: &str, consumers: usize) -> Strin
 pub(crate) struct SessionAudit<'a> {
     pub who: Who<'a>,
     pub session: &'a str,
-    pub connection_id: &'a str,
+    pub connection: &'a crate::session::ClientConnection,
+    pub node_id: &'a str,
+    /// The session's transaction's ID, -1 for none.
+    pub tx_id: i64,
     pub consumers: usize,
 }
 
@@ -679,7 +838,12 @@ impl SessionAudit<'_> {
         if !log::base_enabled() {
             return;
         }
-        let source = session_source(self.session, self.connection_id, self.consumers);
+        let source = session_source(
+            self.session,
+            &connection_string(self.connection, self.node_id),
+            self.consumers,
+            self.tx_id,
+        );
         audit(Logger::Base, name, &[&self.who.caller(), &source, &params]);
     }
 
@@ -716,7 +880,12 @@ impl SessionAudit<'_> {
         if !enabled(logger) {
             return;
         }
-        let source = session_source(self.session, self.connection_id, self.consumers);
+        let source = session_source(
+            self.session,
+            &connection_string(self.connection, self.node_id),
+            self.consumers,
+            self.tx_id,
+        );
         let params = format!("with parameters: [{}]", queue_configuration(spec));
         audit(
             logger,

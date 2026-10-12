@@ -99,7 +99,7 @@ impl JmsConnection {
         password: Option<String>,
         client_id: Option<String>,
     ) -> anyhow::Result<Self> {
-        let conn = super::open(url).await?;
+        let conn = super::open(url, user.as_deref(), password.as_deref()).await?;
         let options = SessionOptions {
             username: user.clone(),
             password: password.clone(),
