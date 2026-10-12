@@ -16,6 +16,7 @@
 # The procedures, each under the manual chapter it comes from:
 #   using-server       run an instance, find it active in its log, stop it
 #   using-cli          queue create and stat, producer, consumer, browser;
+#                      check node and queue, passing and failing;
 #                      the shell, connected with connect and with options
 #   security           user add, list and rm
 #   masking-passwords  mask
@@ -82,11 +83,14 @@ make_instance() {
 }
 
 # The instance's bin/artemis, run from its bin/ as the manual runs it.
-# Its standard input is the file IN names, or nothing.
+# Its standard input is the file IN names, or nothing. On Windows it is
+# called, so that its status is the command's, as at a cmd prompt: Artemis's
+# artemis.cmd ends with endlocal and GOTO :EOF, which a bare cmd /c reports
+# as 0.
 instance() {
   local dir="$1"; shift
   if windows; then
-    (cd "$dir/bin" && timeout 300 cmd /c "$(cygpath -w "$dir/bin/artemis.cmd")" "$@" < "${IN:-/dev/null}" 2>&1)
+    (cd "$dir/bin" && timeout 300 cmd /c call "$(cygpath -w "$dir/bin/artemis.cmd")" "$@" < "${IN:-/dev/null}" 2>&1)
   else
     (cd "$dir/bin" && timeout 300 ./artemis "$@" < "${IN:-/dev/null}" 2>&1)
   fi | grep --line-buffered -v -E "NO_ARTEMIS_OOME_DUMP|operable program or batch file|^The system cannot find the file specified" \
@@ -196,6 +200,12 @@ suite() {
   run consumer --destination queue://runbook --message-count 40
   run browser --destination queue://runbook --message-count 1
   run queue stat --queueName runbook
+
+  # using-cli: check, which ends with status 1 when a check fails (versions,
+  # 2.39.0).
+  run check node --up --diskUsage 99 --memoryUsage 99
+  run check queue --name runbook --up --browse 59 --produce 1 --consume 1
+  run check queue --name missing
 
   # security: users of the properties login module.
   run user add --user-command-user guest --user-command-password guest --role admin
@@ -445,6 +455,7 @@ normalize() {
     -e "s/$uuid/UUID/g" \
     -e 's/^result: .*/result: MASKED/' \
     -e 's/(Total time|time): [0-9.]+/\1: #/' \
+    -e 's/(Time elapsed:) [0-9.]+ sec/\1 # sec/' \
     -e 's/^DATE \[AUDIT\]\(([^()]|\([^()]*\))*\) /[AUDIT] /' \
     -e 's/@127\.0\.0\.1:[0-9]+/@127.0.0.1:PORT/g; s/(ControlImpl|NettyAcceptor)@[0-9a-f]+/\1@HASH/g' \
     -e 's/(\\"connectionID\\":\\")[0-9a-f]+/\1#/g; s/(\\"remoteAddress\\":\\"127\.0\.0\.1:)[0-9]+/\1#/g' \

@@ -44,6 +44,30 @@ Connection brokerURL = tcp://localhost:62316
 |       |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
 |runbook|runbook|   0    |  60   |  100   |    0     |   40   |    0    |ANYCAST| false  |
 --- exit 0
+=== artemis check node --up --diskUsage 99 --memoryUsage 99
+Connection brokerURL = tcp://localhost:62316
+Running NodeCheck
+Checking that the node is started ... success
+Checking that the disk usage is less then 99 ... success
+Checking that the memory usage is less then 99 ... success
+Checks run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: # sec - NodeCheck
+--- exit 0
+=== artemis check queue --name runbook --up --browse 59 --produce 1 --consume 1
+Connection brokerURL = tcp://localhost:62316
+Running QueueCheck
+Checking that the queue runbook exists and is not paused ... success
+Checking that a producer can send 1 messages to the queue runbook ... success
+Checking that a consumer can browse 59 messages from the queue runbook ... success
+Checking that a consumer can consume 1 messages from the queue runbook ... success
+Checks run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: # sec - QueueCheck
+--- exit 0
+=== artemis check queue --name missing
+Connection brokerURL = tcp://localhost:62316
+Running QueueCheck
+Checking that the queue missing exists and is not paused ... error: Failed to get queue.missing.Paused. Reason: Problem while retrieving attribute Paused
+Checks run: 1, Failures: 0, Errors: 1, Skipped: 0, Time elapsed: # sec - QueueCheck
+QueueCheck failed. Reason: error: Failed to get queue.missing.Paused. Reason: Problem while retrieving attribute Paused
+--- exit 1
 === artemis user add --user-command-user guest --user-command-password guest --role admin
 Connection brokerURL = tcp://localhost:62316
 guest added successfully.
@@ -67,7 +91,7 @@ result: MASKED
 === curl POST {"attribute": "Active", "mbean": "org.apache.activemq.artemis:broker=\"0.0.0.0\"", "type": "read"}
 {"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","attribute":"Active","type":"read"},"value":true,"status":200}
 === curl exec/org.apache.activemq.artemis:broker=%220.0.0.0%22/listQueues/%7B%22field%22:%22name%22,%22operation%22:%22EQUALS%22,%22value%22:%22runbook%22%7D/1/10
-{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","arguments":["{\"field\":\"name\",\"operation\":\"EQUALS\",\"value\":\"runbook\"}","1","10"],"type":"exec","operation":"listQueues"},"value":"{\"data\":[{\"id\":#,\"name\":\"runbook\",\"address\":\"runbook\",\"filter\":\"\",\"durable\":\"true\",\"paused\":\"false\",\"persistedPause\":\"false\",\"temporary\":\"false\",\"purgeOnNoConsumers\":\"false\",\"consumerCount\":\"0\",\"maxConsumers\":\"-1\",\"autoCreated\":\"false\",\"user\":\"\",\"routingType\":\"ANYCAST\",\"messagesAdded\":\"100\",\"messageCount\":\"60\",\"messagesAcked\":\"40\",\"messagesExpired\":\"0\",\"deliveringCount\":\"0\",\"messagesKilled\":\"0\",\"directDeliver\":\"false\",\"exclusive\":\"false\",\"lastValue\":\"false\",\"lastValueKey\":\"\",\"scheduledCount\":\"0\",\"groupRebalance\":\"false\",\"groupRebalancePauseDispatch\":\"false\",\"groupBuckets\":\"-1\",\"groupFirstKey\":\"\",\"enabled\":\"true\",\"ringSize\":\"-1\",\"consumersBeforeDispatch\":\"0\",\"delayBeforeDispatch\":\"-1\",\"autoDelete\":\"false\",\"internalQueue\":\"false\"}],\"count\":1}","status":200}
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","arguments":["{\"field\":\"name\",\"operation\":\"EQUALS\",\"value\":\"runbook\"}","1","10"],"type":"exec","operation":"listQueues"},"value":"{\"data\":[{\"id\":#,\"name\":\"runbook\",\"address\":\"runbook\",\"filter\":\"\",\"durable\":\"true\",\"paused\":\"false\",\"persistedPause\":\"false\",\"temporary\":\"false\",\"purgeOnNoConsumers\":\"false\",\"consumerCount\":\"0\",\"maxConsumers\":\"-1\",\"autoCreated\":\"false\",\"user\":\"\",\"routingType\":\"ANYCAST\",\"messagesAdded\":\"101\",\"messageCount\":\"60\",\"messagesAcked\":\"41\",\"messagesExpired\":\"0\",\"deliveringCount\":\"0\",\"messagesKilled\":\"0\",\"directDeliver\":\"false\",\"exclusive\":\"false\",\"lastValue\":\"false\",\"lastValueKey\":\"\",\"scheduledCount\":\"0\",\"groupRebalance\":\"false\",\"groupRebalancePauseDispatch\":\"false\",\"groupBuckets\":\"-1\",\"groupFirstKey\":\"\",\"enabled\":\"true\",\"ringSize\":\"-1\",\"consumersBeforeDispatch\":\"0\",\"delayBeforeDispatch\":\"-1\",\"autoDelete\":\"false\",\"internalQueue\":\"false\"}],\"count\":1}","status":200}
 === curl exec/org.apache.activemq.artemis:broker=%220.0.0.0%22/listConnections/%22%22/-1/-1
 {"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","arguments":["","-1","-1"],"type":"exec","operation":"listConnections"},"value":"{\"data\":[{\"connectionID\":\"#\",\"remoteAddress\":\"127.0.0.1:#\",\"users\":\"admin\",\"creationTime\":\"DATE\",\"implementation\":\"RemotingConnectionImpl\",\"protocol\":\"CORE\",\"clientID\":\"\",\"localAddress\":\"127.0.0.1:62316\",\"sessionCount\":2,\"proxyAddress\":\"\",\"proxyProtocolVersion\":\"\"}],\"count\":1}","status":200}
 === curl POST {"operation": "listConnections", "mbean": "org.apache.activemq.artemis:broker=\"0.0.0.0\"", "type": "exec", "arguments": [ "{\"field\":\"protocol\",\"operation\":\"EQUALS\",\"value\":\"CORE\"}", -1, -1 ] }
@@ -80,7 +104,7 @@ result: MASKED
 Connection brokerURL = tcp://localhost:62316
 |NAME   |ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
 |       |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
-|runbook|runbook|   0    |  60   |  100   |    0     |   40   |    0    |ANYCAST| false  |
+|runbook|runbook|   0    |  60   |  101   |    0     |   41   |    0    |ANYCAST| false  |
 --- exit 0
 === logging: log/audit.log
 [AUDIT] AMQ601707: User admin(amq)@127.0.0.1:PORT successfully created queue: runbook on address: runbook with routing type ANYCAST
@@ -165,7 +189,7 @@ Connection Successful!
 admin@tcp://localhost:62316 > Connection brokerURL = tcp://localhost:62316
 |NAME   |ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
 |       |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
-|runbook|runbook|   0    |  60   |  100   |    0     |   40   |    0    |ANYCAST| false  |
+|runbook|runbook|   0    |  60   |  101   |    0     |   41   |    0    |ANYCAST| false  |
 admin@tcp://localhost:62316 > Connection brokerURL = tcp://localhost:62316
 Connection information cleared!
 CLI > 
@@ -184,7 +208,7 @@ Type exit or press <CTRL-D> to leave the session:
 admin@tcp://localhost:62316 > Connection brokerURL = tcp://localhost:62316
 |NAME   |ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
 |       |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
-|runbook|runbook|   0    |  60   |  100   |    0     |   40   |    0    |ANYCAST| false  |
+|runbook|runbook|   0    |  60   |  101   |    0     |   41   |    0    |ANYCAST| false  |
 admin@tcp://localhost:62316 > Connection brokerURL = tcp://localhost:62316
 Connection information cleared!
 CLI > 
