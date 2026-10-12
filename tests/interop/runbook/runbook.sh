@@ -28,8 +28,8 @@
 #                      print and recover over the retention directory
 #   config-reload      an address added to broker.xml while running
 #   perf-tools         perf client; a target rate test with an HDR log
-#   data-tools         data exp, compact, and imp into a second instance;
-#                      restart recovery
+#   data-tools         data exp, compact, encode and decode, and imp into a
+#                      second instance; restart recovery
 #   graceful-shutdown  a broker stopped while a consumer is connected
 #   network-isolation  create --ping; the broker stopped while the network
 #                      is down and started again once it is back
@@ -311,6 +311,26 @@ suite() {
   echo "messages: $(grep -c '<message ' "$WORK/export.xml")"
   step "artemis data compact"
   instance "$I1" data compact
+  # encode and decode default to broker.xml's journal-directory as written,
+  # data/journal, which from bin/ is not there: the directory is given.
+  step "artemis data encode"
+  instance "$I1" data encode | grep -c '^operation@'
+  step "artemis data encode --directory ../data/journal"
+  instance "$I1" data encode --directory ../data/journal > "$WORK/journal.txt"
+  echo "--- exit ${PIPESTATUS[0]}"
+  grep -o '^operation@[A-Za-z]*' "$WORK/journal.txt" | sort -u
+  step "artemis data decode --input ../../journal.txt --directory ../data/decoded"
+  instance "$I1" data decode --input ../../journal.txt --directory ../data/decoded
+  echo "--- exit ${PIPESTATUS[0]}"
+  step "artemis data encode --directory ../data/decoded"
+  instance "$I1" data encode --directory ../data/decoded > "$WORK/decoded.txt"
+  # The same records, in any order; decode writes them uncompacted.
+  records() { grep '^operation@' "$1" | tr -d '\r' | sed -E 's/,compactCount@[0-9]+//' | sort; }
+  if diff <(records "$WORK/journal.txt") <(records "$WORK/decoded.txt") > /dev/null; then
+    echo "the decoded journal holds the encoded records"
+  else
+    echo "the decoded journal differs"
+  fi
   step "using-server: artemis run, again"
   start "$I1" "$PORT1" && echo "listening"
   run queue stat --queueName runbook

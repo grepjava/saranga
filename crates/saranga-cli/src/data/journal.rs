@@ -43,14 +43,18 @@ pub struct DecodeArgs {
 }
 
 impl JournalArgs {
-    /// The directory given, else broker.xml's journal directory, with the
-    /// CLI lock of the instance.
+    /// The directory given, else broker.xml's journal directory as written
+    /// (`getJournalDirectory`), so a relative one is under the current
+    /// directory, not the instance; with the CLI lock of the instance.
     fn directory(&self) -> anyhow::Result<(PathBuf, CliLock)> {
         let instance = crate::client::instance_dir();
         let lock = CliLock::take(instance.as_deref())?;
         let dir = match &self.directory {
             Some(d) => d.clone(),
-            None => self.dirs.unchecked()?.journal,
+            None => PathBuf::from(self.dirs.unchecked()?.config.map_or_else(
+                || saranga_config::BrokerConfig::DEFAULT_JOURNAL_DIR.to_owned(),
+                |c| c.journal_directory,
+            )),
         };
         Ok((dir, lock))
     }

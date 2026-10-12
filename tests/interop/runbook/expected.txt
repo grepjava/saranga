@@ -228,6 +228,16 @@ messages: 1260
 === artemis data compact
 Compactation succeeded for WORK/i1/data/journal
 Compactation succeeded for WORK/i1/data/bindings
+=== artemis data encode
+0
+=== artemis data encode --directory ../data/journal
+--- exit 0
+operation@AddRecord
+operation@Update
+=== artemis data decode --input ../../journal.txt --directory ../data/decoded
+--- exit 0
+=== artemis data encode --directory ../data/decoded
+the decoded journal holds the encoded records
 === using-server: artemis run, again
 listening
 === artemis queue stat --queueName runbook
