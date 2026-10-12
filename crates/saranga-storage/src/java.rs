@@ -165,16 +165,30 @@ fn java_decimal(sci: &str, plain: bool, zero: bool) -> String {
 /// `EEE MMM dd HH:mm:ss zzz yyyy`. `artemis data print` uses the JVM's
 /// default zone; the golden outputs were produced in UTC.
 pub fn date(millis: i64) -> String {
+    date_at_offset(millis, 0)
+}
+
+/// `new java.util.Date(millis).toString()` in a zone `offset` seconds
+/// from UTC, named as Java names a zone without an abbreviation of its
+/// own: `UTC`, else `GMT+08:00`.
+pub fn date_at_offset(millis: i64, offset: i64) -> String {
     const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    let secs = millis.div_euclid(1000);
+    let secs = millis.div_euclid(1000) + offset;
     let days = secs.div_euclid(86_400);
     let tod = secs.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
+    let zone = if offset == 0 {
+        "UTC".to_owned()
+    } else {
+        let sign = if offset < 0 { '-' } else { '+' };
+        let minutes = offset.abs() / 60;
+        format!("GMT{sign}{:02}:{:02}", minutes / 60, minutes % 60)
+    };
     format!(
-        "{} {} {:02} {:02}:{:02}:{:02} UTC {}",
+        "{} {} {:02} {:02}:{:02}:{:02} {zone} {}",
         DAYS[days.rem_euclid(7) as usize],
         MONTHS[(m - 1) as usize],
         d,

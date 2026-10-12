@@ -117,6 +117,19 @@ fn audit(logger: Logger, name: &str, args: &[&str]) {
     }
 }
 
+/// `AbstractControl.getMBeanInfo`, as the MBean server's guard and Jolokia
+/// call it: `class` is the control's (`QueueControlImpl`), and the source
+/// is the control's `Object.toString`.
+pub fn mbean_info(class: &str, key: &str, who: Who<'_>) {
+    if log::base_enabled() {
+        let source = format!(
+            "org.apache.activemq.artemis.core.management.impl.{class}@{:x}",
+            identity(("control", class, key))
+        );
+        audit(Logger::Base, "getMBeanInfo", &[&who.caller(), &source]);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Java's toString of the objects audit messages show
 
@@ -255,7 +268,7 @@ pub(crate) fn transaction_string(t: &Transaction) -> String {
         "TransactionImpl [xid={xid}, txID={}, xid={xid}, state={state}, createTime={}({}), timeoutSeconds={}, nr operations = {}]@{:x}",
         t.id,
         t.created,
-        saranga_storage::java::date(t.created),
+        crate::localtime::java_date(t.created),
         if t.timeout_seconds < 0 {
             300
         } else {

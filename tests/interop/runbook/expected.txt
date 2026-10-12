@@ -1,6 +1,7 @@
 === using-server: artemis run
 listening
 log: AMQ221007: Server is now active
+=== logging: audit loggers set to INFO
 === artemis queue create --name runbook --anycast --durable --auto-create-address --silent
 Connection brokerURL = tcp://localhost:62316
 Queue [name=runbook, address=runbook, routingType=ANYCAST, durable=true, purgeOnNoConsumers=false, autoCreateAddress=false, exclusive=false, lastValue=false, lastValueKey=null, nonDestructive=false, consumersBeforeDispatch=0, delayBeforeDispatch=-1, autoCreateAddress=false] created successfully.
@@ -67,6 +68,19 @@ result: MASKED
 {"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","attribute":"Active","type":"read"},"value":true,"status":200}
 === curl exec/org.apache.activemq.artemis:broker=%220.0.0.0%22/listQueues/%7B%22field%22:%22name%22,%22operation%22:%22EQUALS%22,%22value%22:%22runbook%22%7D/1/10
 {"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","arguments":["{\"field\":\"name\",\"operation\":\"EQUALS\",\"value\":\"runbook\"}","1","10"],"type":"exec","operation":"listQueues"},"value":"{\"data\":[{\"id\":#,\"name\":\"runbook\",\"address\":\"runbook\",\"filter\":\"\",\"durable\":\"true\",\"paused\":\"false\",\"persistedPause\":\"false\",\"temporary\":\"false\",\"purgeOnNoConsumers\":\"false\",\"consumerCount\":\"0\",\"maxConsumers\":\"-1\",\"autoCreated\":\"false\",\"user\":\"\",\"routingType\":\"ANYCAST\",\"messagesAdded\":\"100\",\"messageCount\":\"60\",\"messagesAcked\":\"40\",\"messagesExpired\":\"0\",\"deliveringCount\":\"0\",\"messagesKilled\":\"0\",\"directDeliver\":\"false\",\"exclusive\":\"false\",\"lastValue\":\"false\",\"lastValueKey\":\"\",\"scheduledCount\":\"0\",\"groupRebalance\":\"false\",\"groupRebalancePauseDispatch\":\"false\",\"groupBuckets\":\"-1\",\"groupFirstKey\":\"\",\"enabled\":\"true\",\"ringSize\":\"-1\",\"consumersBeforeDispatch\":\"0\",\"delayBeforeDispatch\":\"-1\",\"autoDelete\":\"false\",\"internalQueue\":\"false\"}],\"count\":1}","status":200}
+=== curl exec/org.apache.activemq.artemis:broker=%220.0.0.0%22/listConnections/%22%22/-1/-1
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","arguments":["","-1","-1"],"type":"exec","operation":"listConnections"},"value":"{\"data\":[{\"connectionID\":\"#\",\"remoteAddress\":\"127.0.0.1:#\",\"users\":\"admin\",\"creationTime\":\"DATE\",\"implementation\":\"RemotingConnectionImpl\",\"protocol\":\"CORE\",\"clientID\":\"\",\"localAddress\":\"127.0.0.1:62316\",\"sessionCount\":2,\"proxyAddress\":\"\",\"proxyProtocolVersion\":\"\"}],\"count\":1}","status":200}
+=== curl POST {"operation": "listConnections", "mbean": "org.apache.activemq.artemis:broker=\"0.0.0.0\"", "type": "exec", "arguments": [ "{\"field\":\"protocol\",\"operation\":\"EQUALS\",\"value\":\"CORE\"}", -1, -1 ] }
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","arguments":["{\"field\":\"protocol\",\"operation\":\"EQUALS\",\"value\":\"CORE\"}",-1,-1],"type":"exec","operation":"listConnections"},"value":"{\"data\":[{\"connectionID\":\"#\",\"remoteAddress\":\"127.0.0.1:#\",\"users\":\"admin\",\"creationTime\":\"DATE\",\"implementation\":\"RemotingConnectionImpl\",\"protocol\":\"CORE\",\"clientID\":\"\",\"localAddress\":\"127.0.0.1:62316\",\"sessionCount\":2,\"proxyAddress\":\"\",\"proxyProtocolVersion\":\"\"}],\"count\":1}","status":200}
+=== logging: log/audit.log
+[AUDIT] AMQ601707: User admin(amq)@127.0.0.1:PORT successfully created queue: runbook on address: runbook with routing type ANYCAST
+[AUDIT] AMQ601019: User admin(amq)@127.0.0.1:PORT is getting mbean info on target resource: org.apache.activemq.artemis.core.management.impl.ActiveMQServerControlImpl@HASH
+[AUDIT] AMQ601019: User admin(amq)@127.0.0.1:PORT is getting mbean info on target resource: org.apache.activemq.artemis.core.management.impl.ActiveMQServerControlImpl@HASH
+[AUDIT] AMQ601019: User admin(amq)@127.0.0.1:PORT is getting mbean info on target resource: org.apache.activemq.artemis.core.management.impl.ActiveMQServerControlImpl@HASH
+[AUDIT] AMQ601019: User admin(amq)@127.0.0.1:PORT is getting mbean info on target resource: org.apache.activemq.artemis.core.management.impl.ActiveMQServerControlImpl@HASH
+[AUDIT] AMQ601108: User admin(amq)@127.0.0.1:PORT is listing connections on target resource: ActiveMQServerImpl::name=0.0.0.0 with parameters: [, -1, -1]
+[AUDIT] AMQ601019: User admin(amq)@127.0.0.1:PORT is getting mbean info on target resource: org.apache.activemq.artemis.core.management.impl.ActiveMQServerControlImpl@HASH
+[AUDIT] AMQ601108: User admin(amq)@127.0.0.1:PORT is listing connections on target resource: ActiveMQServerImpl::name=0.0.0.0 with parameters: [{"field":"protocol","operation":"EQUALS","value":"CORE"}, -1, -1]
 === artemis producer --destination queue://history --message-count 600 --message-size 20000
 Connection brokerURL = tcp://localhost:62316
 Producer ActiveMQQueue[history], thread=0 Started to calculate elapsed time ...
@@ -121,8 +135,8 @@ log: AMQ221002: stopped
 === artemis data exp
 messages: 1260
 === artemis data compact
-Compactation succeeded for WORK/i1/data\journal
-Compactation succeeded for WORK/i1/data\bindings
+Compactation succeeded for WORK/i1/data/journal
+Compactation succeeded for WORK/i1/data/bindings
 === using-server: artemis run, again
 listening
 === artemis queue stat --queueName runbook

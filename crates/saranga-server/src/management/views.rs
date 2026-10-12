@@ -518,9 +518,9 @@ pub(super) async fn list_addresses(
     list(items, &ADDRESS_VIEW, options_text, page, page_size).await
 }
 
-/// `new Date(millis).toString()`, in UTC.
+/// `new Date(millis).toString()`, in the local time zone.
 pub(super) fn date(millis: i64) -> String {
-    saranga_storage::java::date(millis)
+    crate::localtime::java_date(millis)
 }
 
 /// The users of a connection's sessions, sorted and without repeats, a

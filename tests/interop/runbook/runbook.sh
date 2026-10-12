@@ -18,7 +18,9 @@
 #   using-cli          queue create and stat, producer, consumer, browser
 #   security           user add, list and rm
 #   masking-passwords  mask
-#   management         Jolokia reads, as the manual's curl commands do them
+#   logging            the audit log turned on while running
+#   management         Jolokia reads, as the manual's curl commands do them;
+#                      listConnections while a consumer is connected
 #   data-retention     journal retention and replay through Jolokia; data
 #                      print and recover over the retention directory
 #   config-reload      an address added to broker.xml while running
@@ -79,7 +81,9 @@ instance() {
     (cd "$dir/bin" && timeout 300 cmd /c "$(cygpath -w "$dir/bin/artemis.cmd")" "$@" < /dev/null 2>&1)
   else
     (cd "$dir/bin" && timeout 300 ./artemis "$@" < /dev/null 2>&1)
-  fi | grep --line-buffered -v -E "^WARNING: |NO_ARTEMIS_OOME_DUMP|operable program or batch file|^The system cannot find the file specified"
+  fi | grep --line-buffered -v -E "NO_ARTEMIS_OOME_DUMP|operable program or batch file|^The system cannot find the file specified" \
+    | sed -u -E -e '/^WARNING: /{' -e ':w' -e '$d' -e 'N' -e 's/^WARNING: [^\n]*\n(WARNING: )/\1/' -e 'tw' \
+      -e '/^WARNING: [^\n]*\n$/d' -e 's/^WARNING: [^\n]*\n//' -e '}'
   return "${PIPESTATUS[0]}"
 }
 
@@ -158,6 +162,12 @@ suite() {
   start "$I1" "$PORT1" && echo "listening"
   wait_for "$I1/log/artemis.log" "AMQ221007" && echo "log: AMQ221007: Server is now active"
 
+  # logging: the audit loggers turned on in log4j2.properties, which is
+  # reread every monitorInterval (5) seconds.
+  step "logging: audit loggers set to INFO"
+  sed -i -E 's/^(logger\.audit_(base|resource|message)\.level) = OFF/\1 = INFO/' "$I1/etc/log4j2.properties"
+  sleep 8
+
   # using-cli.
   run queue create --name runbook --anycast --durable --auto-create-address --silent
   run producer --destination queue://runbook --message-count 100
@@ -179,6 +189,21 @@ suite() {
   jolokia "read/$MBEAN/Active"
   jolokia_post '{"attribute": "Active", "mbean": "org.apache.activemq.artemis:broker=\"0.0.0.0\"", "type": "read"}'
   jolokia "exec/$MBEAN/listQueues/%7B%22field%22:%22name%22,%22operation%22:%22EQUALS%22,%22value%22:%22runbook%22%7D/1/10"
+
+  # management: the connections, with a consumer connected.
+  instance "$I1" consumer --destination queue://waiting --message-count 1 \
+    --receive-timeout 30000 "${AUTH[@]}" > "$WORK/waiting.out" &
+  local waiting=$!
+  wait_for "$WORK/waiting.out" "messages are consumed" && sleep 1
+  jolokia "exec/$MBEAN/listConnections/%22%22/-1/-1"
+  jolokia_post '{"operation": "listConnections", "mbean": "org.apache.activemq.artemis:broker=\"0.0.0.0\"", "type": "exec", "arguments": [ "{\"field\":\"protocol\",\"operation\":\"EQUALS\",\"value\":\"CORE\"}", -1, -1 ] }'
+  instance "$I1" producer --destination queue://waiting --message-count 1 "${AUTH[@]}" > /dev/null
+  wait "$waiting"
+
+  # logging: what the audit log says of the queue made, the Jolokia calls
+  # and the connections listed.
+  step "logging: log/audit.log"
+  grep -E 'AMQ601707|AMQ601108|AMQ601019: .*ActiveMQServerControlImpl' "$I1/log/audit.log"
 
   # data-retention: the history keeps what was sent; replay sends it again.
   run producer --destination queue://history --message-count 600 --message-size 20000
@@ -280,7 +305,7 @@ normalize() {
     -e 's/\x1b\[[0-9;]*m//g' \
     -e "s#$(native "$WORK" | sed 's#[.]#\\.#g')#WORK#g" \
     -e "s#$(cygpath -w "$WORK" 2>/dev/null | sed 's#\\#\\\\#g; s#[.]#\\.#g')#WORK#g" \
-    -e 's#WORK\\#WORK/#g; s#(WORK/[a-z0-9/]*)\\#\1/#g' \
+    -e 's#WORK\\#WORK/#g' -e ':sep' -e 's#(WORK/[a-z0-9/]*)\\#\1/#' -e 'tsep' \
     -e 's/^Usage: (artemis|saranga) help/Usage: CLI help/' \
     -e 's/(Elapsed time in milli second :) [0-9]+ milli/\1 # milli/' \
     -e 's/(Elapsed time in second :) [0-9]+ s/\1 # s/' \
@@ -292,6 +317,10 @@ normalize() {
     -e "s/$uuid/UUID/g" \
     -e 's/^result: .*/result: MASKED/' \
     -e 's/(Total time|time): [0-9.]+/\1: #/' \
+    -e 's/^DATE \[AUDIT\]\(([^()]|\([^()]*\))*\) /[AUDIT] /' \
+    -e 's/@127\.0\.0\.1:[0-9]+/@127.0.0.1:PORT/g; s/(ControlImpl)@[0-9a-f]+/\1@HASH/' \
+    -e 's/(\\"connectionID\\":\\")[0-9a-f]+/\1#/g; s/(\\"remoteAddress\\":\\"127\.0\.0\.1:)[0-9]+/\1#/g' \
+    -e 's/(\\"creationTime\\":\\")[^\\]*/\1DATE/g' \
     -e 's/"(lastValue|createdTimestamp|messagesAdded|persistentSize|durablePersistentSize|deliveringSize|scheduledSize)":"?[0-9]+"?/"\1":#/g'
 }
 

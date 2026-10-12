@@ -21,17 +21,39 @@ pub struct Caller {
     pub roles: Vec<String>,
     /// The subject the login gave, for the audit log.
     pub subject: Option<Arc<saranga_security::jaas::Subject>>,
+    /// The client's `host:port`, as Artemis's `JolokiaFilter` gives the
+    /// audit log the request's remote host and port.
+    pub remote: Option<String>,
 }
 
 impl Caller {
-    /// For the audit log: the console's requests carry no remote address
-    /// (`@unknown`), as Artemis's console thread has none.
+    /// `getMBeanInfo` on a bean's control, as Artemis's guard calls it
+    /// before each attribute and Jolokia before each operation.
+    fn mbean_info(&self, bean: &Bean) {
+        let (class, key) = match bean {
+            Bean::Broker => ("ActiveMQServerControlImpl", ""),
+            Bean::Address(n) => ("AddressControlImpl", n.as_str()),
+            Bean::Queue(n) => ("QueueControlImpl", n.as_str()),
+            Bean::Divert(n) => ("DivertControlImpl", n.as_str()),
+            Bean::Acceptor(n, _) => ("AcceptorControlImpl", n.as_str()),
+        };
+        saranga_server::audit::mbean_info(
+            class,
+            key,
+            saranga_server::audit::Who {
+                subject: self.subject.as_deref(),
+                remote: self.remote.as_deref(),
+            },
+        );
+    }
+
+    /// For the audit log.
     fn management(&self) -> saranga_server::management::Caller<'_> {
         saranga_server::management::Caller {
             security: None,
             who: Some(saranga_server::audit::Who {
                 subject: self.subject.as_deref(),
-                remote: None,
+                remote: self.remote.as_deref(),
             }),
         }
     }
@@ -507,6 +529,7 @@ impl Agent {
         bean: &Bean,
         attr: &str,
     ) -> Result<Json, Failure> {
+        caller.mbean_info(bean);
         let control = bean.control();
         let Some(info) = control.attr(attr).filter(|a| a.readable) else {
             return Err(Failure::new(
@@ -568,6 +591,10 @@ impl Agent {
         pattern: bool,
     ) -> Result<Json, Failure> {
         let control = bean.control();
+        if matches!(attrs, Attrs::All) {
+            // Jolokia lists the attributes from the MBean info.
+            caller.mbean_info(bean);
+        }
         let names: Vec<String> = match attrs {
             Attrs::All => control
                 .attrs
@@ -685,6 +712,7 @@ impl Agent {
             return Err(Failure::illegal("No MBean name given"));
         };
         let (n, bean) = self.bean(name)?;
+        caller.mbean_info(&bean);
         let op_name = req.operation.as_deref().unwrap_or("");
         let op = self.resolve(&n, bean.control(), op_name)?;
         if req.arguments.len() != op.params.len() {

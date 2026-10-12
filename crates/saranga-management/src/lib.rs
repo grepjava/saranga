@@ -268,8 +268,9 @@ fn forbidden() -> Response {
 }
 
 /// The roles and subject of the user the `Authorization: Basic` header
-/// names, when the broker's security manager validates it. The login is
-/// audited as the console's `JaasAuthenticator` audits it.
+/// names, when the broker's security manager validates it. Artemis's
+/// console does not audit this login (its `AuthenticationFilter` audits
+/// only the console's own login page).
 fn login(
     state: &AppState,
     headers: &HeaderMap,
@@ -288,32 +289,13 @@ fn login(
         security_domain: None,
         connection_id: None,
     };
-    use saranga_security::audit;
     let subject = match store
         .manager()
         .authenticate(Some(user), Some(password), &connection)
     {
         Ok(Some(subject)) => Arc::new(subject),
-        failed => {
-            if audit::resource_enabled() {
-                let reason = match failed {
-                    Err(e) => e.0,
-                    _ => "no subject".to_owned(),
-                };
-                audit::resource(audit::fill(
-                    "AMQ601716: User {} failed authentication on connection {}, reason: {}",
-                    &[&audit::caller(None, None), "null", &reason],
-                ));
-            }
-            return None;
-        }
+        _ => return None,
     };
-    if audit::resource_enabled() {
-        audit::resource(audit::fill(
-            "AMQ601715: User {} successfully authenticated on connection {}",
-            &[&audit::caller(Some(&subject), None), "null"],
-        ));
-    }
     let roles: Vec<String> = subject.roles().map(str::to_owned).collect();
     let allowed = state
         .console_roles
@@ -378,6 +360,7 @@ async fn jolokia_handler(
     let caller = jolokia::Caller {
         roles,
         subject: Some(subject),
+        remote: Some(format!("{}:{}", peer.ip(), peer.port())),
     };
     let scheme = if headers.get("x-forwarded-proto").is_some() {
         "https"

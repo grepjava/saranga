@@ -63,3 +63,8 @@ fn os_local_offset(_: i64) -> i64 {
 pub fn offset_millis(millis: i64) -> i64 {
     offset(millis.div_euclid(1000))
 }
+
+/// `new java.util.Date(millis).toString()` in the local time zone.
+pub fn java_date(millis: i64) -> String {
+    saranga_storage::java::date_at_offset(millis, offset_millis(millis))
+}
