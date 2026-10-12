@@ -35,5 +35,23 @@ ARTEMIS_INSTANCE_ETC='${artemis.instance.etc}'
 fi
 export ARTEMIS_INSTANCE ARTEMIS_INSTANCE_ETC
 
+# The shell's history file, which Artemis's bin/artemis passes on from the
+# profile it loads: artemis-utility.profile, but for run.
+if [ -z "$ARTEMIS_PROFILE" ] ; then
+  if [ "$1" = "run" ]; then
+    ARTEMIS_PROFILE='artemis.profile'
+  else
+    ARTEMIS_PROFILE="artemis-utility.profile"
+  fi
+fi
+if [ -f "$ARTEMIS_INSTANCE_ETC/${ARTEMIS_PROFILE}" ] ; then
+  ARTEMIS_SHELL_HISTORY=`. "$ARTEMIS_INSTANCE_ETC/${ARTEMIS_PROFILE}" > /dev/null 2>&1; echo "$ARTEMIS_SHELL_HISTORY"`
+fi
+if [ -n "$ARTEMIS_SHELL_HISTORY" ] ; then
+  export ARTEMIS_SHELL_HISTORY
+else
+  unset ARTEMIS_SHELL_HISTORY
+fi
+
 # SARANGA names another saranga to run.
 exec "${SARANGA:-${saranga}}" "$@"

@@ -26,7 +26,7 @@
 #   data-retention     journal retention and replay through Jolokia; data
 #                      print and recover over the retention directory
 #   config-reload      an address added to broker.xml while running
-#   perf-tools         perf client
+#   perf-tools         perf client; a target rate test with an HDR log
 #   data-tools         data exp, compact, and imp into a second instance;
 #                      restart recovery
 #   graceful-shutdown  a broker stopped while a consumer is connected
@@ -159,12 +159,14 @@ jolokia_post() {
   echo
 }
 # The shell of the instance i1, the lines of shell.in piped to it:
-# Artemis's reads them at its prompts through JLine's dumb terminal. The
-# banner and the prompt name the broker, and Saranga has no <TAB>
-# completion to offer.
+# Artemis's reads them at its prompts through JLine's dumb terminal. Its
+# history goes to ARTEMIS_SHELL_HISTORY, which an instance's Linux profile
+# sets to ~/.artemis_history; set here, the shell asks nothing on either
+# platform. The banner and the prompt name the broker, and Saranga has no
+# <TAB> completion to offer.
 shell_lines() { printf '%s\n' "$@" > "$WORK/shell.in"; }
 shell() {
-  IN="$WORK/shell.in" instance "$I1" "$@" | sed -E -e 's/\x1b\[[0-9;]*m//g' -e 's/\r$//' \
+  IN="$WORK/shell.in" ARTEMIS_SHELL_HISTORY="$(native "$WORK/shell-history")" instance "$I1" "$@" | sed -E -e 's/\x1b\[[0-9;]*m//g' -e 's/\r$//' \
     -e '/^ *[_/]/d' -e 's/^ (Apache Artemis|Saranga) [0-9.]+$/ BANNER/' \
     -e 's/(Apache Artemis|Saranga) [0-9.]+ > /CLI > /g' -e 's/ or press <TAB>//'
   echo  # the last prompt ends no line
@@ -257,13 +259,21 @@ suite() {
   step "artemis perf client"
   instance "$I1" perf client --message-count 100 --max-pending 100 "${AUTH[@]}" queue://perf \
     | grep -E "^--- (total (sent|completed|received)|result)"
+  # perf-tools: a target rate test, its latencies kept in an HDR histogram
+  # log. Rates and latencies differ from run to run; what each prints is
+  # compared.
+  step "artemis perf client --rate 500 --hdr ../rate.hdr --warmup 1 --duration 3 --max-pending 100 --show-latency --url tcp://localhost:$PORT1?confirmationWindowSize=20000 --consumer-url tcp://localhost:$PORT1 queue://TEST_QUEUE"
+  instance "$I1" perf client --rate 500 --hdr ../rate.hdr --warmup 1 --duration 3 --max-pending 100 \
+    --show-latency --url "tcp://localhost:$PORT1?confirmationWindowSize=20000" \
+    --consumer-url "tcp://localhost:$PORT1" "${AUTH[@]}" queue://TEST_QUEUE \
+    | sed -n -E -e '/^Connection brokerURL/p' -e '/^--- SUMMARY/,$p' | sed -E 's/[0-9]+(\.[0-9]+)?/#/g; s/ +/ /g; s/ $//'
+  step "the HDR histogram log"
+  head -2 "$I1/rate.hdr" | tr -d '\r'
+  grep -o '^Tag=[^,]*' "$I1/rate.hdr" | sort -u
 
-  # using-cli: the shell, bin/artemis alone; its first run asks whether to
-  # keep a history. connect keeps a connection for the commands after it,
-  # and the end of the input disconnects, then ends the shell.
-  step "using-cli: artemis (the shell), history refused"
-  shell_lines N
-  shell
+  # using-cli: the shell, bin/artemis alone. connect keeps a connection
+  # for the commands after it, and the end of the input disconnects, then
+  # ends the shell.
   step "using-cli: artemis (the shell): connect, then queue stat"
   shell_lines "connect --user=admin --password=admin --url tcp://localhost:$PORT1" "queue stat --queueName runbook"
   shell

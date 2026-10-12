@@ -134,23 +134,28 @@ Connection brokerURL = tcp://localhost:62316
 --- total sent:              100
 --- total completed:         100
 --- total received:          100 
-=== using-cli: artemis (the shell), history refused
-
-Allow shell history? (Y/N)
- BANNER
-
-
-Shell history disabled as recorded in WORK/i1/etc/history-file
-
-For a list of commands, type help:
-Type exit or press <CTRL-D> to leave the session:
-CLI > 
-
+=== artemis perf client --rate 500 --hdr ../rate.hdr --warmup 1 --duration 3 --max-pending 100 --show-latency --url tcp://localhost:62316?confirmationWindowSize=20000 --consumer-url tcp://localhost:62316 queue://TEST_QUEUE
+Connection brokerURL = tcp://localhost:#?confirmationWindowSize=#
+--- SUMMARY
+--- result: success
+--- total sent: #
+--- total blocked: #
+--- total completed: #
+--- total received: #
+--- aggregated delay send time: mean: # us - #%: # us - #%: # us - #%: # us - #%: # us - #%: # us - max: # us
+--- aggregated send time: mean: # us - #%: # us - #%: # us - #%: # us - #%: # us - #%: # us - max: # us
+--- aggregated transfer time: mean: # us - #%: # us - #%: # us - #%: # us - #%: # us - #%: # us - max: # us
+=== the HDR histogram log
+#[Histogram log format version 1.3]
+"StartTimestamp","Interval_Length","Interval_Max","Interval_Compressed_Histogram"
+Tag=delay send
+Tag=send
+Tag=transfer
 === using-cli: artemis (the shell): connect, then queue stat
  BANNER
 
 
-Shell history disabled as recorded in WORK/i1/etc/history-file
+Shell history being saved at WORK/shell-history
 
 For a list of commands, type help:
 Type exit or press <CTRL-D> to leave the session:
@@ -172,7 +177,7 @@ CLI >
 Connection brokerURL = tcp://localhost:62316
 CLI connected to broker tcp://localhost:62316, user:admin
 Connection Successful!
-Shell history disabled as recorded in WORK/i1/etc/history-file
+Shell history being saved at WORK/shell-history
 
 For a list of commands, type help:
 Type exit or press <CTRL-D> to leave the session:
