@@ -330,3 +330,107 @@ fn oversized_record_is_rejected() {
     let e = j.append_add(1, 45, vec![0; 5000], true, None).unwrap_err();
     assert!(e.to_string().starts_with("AMQ149005"), "{e}");
 }
+
+#[test]
+fn retention_keeps_a_copy_of_each_filled_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let history = dir.path().join("history");
+    let cfg = JournalConfig {
+        retention: Some(saranga_journal::Retention {
+            directory: history.clone(),
+            max_bytes: -1,
+            period_millis: 86_400_000,
+            local_offset: |_| 0,
+        }),
+        ..config(&dir.path().join("journal"))
+    };
+    let j = open(&cfg);
+    // Each record a sixth of a file: about five files filled.
+    for id in 1..=30 {
+        j.append_add(id, 45, vec![7u8; 10 * 1024], false, None)
+            .unwrap();
+        j.append_delete(id, false, None).unwrap();
+    }
+    j.stop().unwrap();
+    drop(j);
+
+    let mut copies: Vec<String> = std::fs::read_dir(&history)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    copies.sort();
+    assert!(copies.len() >= 3, "{copies:?}");
+    for c in &copies {
+        // activemq-data-yyyyMMddHHmmss-<id>.amq
+        let rest = c.strip_prefix("activemq-data-").unwrap();
+        let (date, id) = rest.strip_suffix(".amq").unwrap().split_once('-').unwrap();
+        assert_eq!(date.len(), 14);
+        id.parse::<i64>().unwrap();
+        // A copy is a whole journal file.
+        assert_eq!(
+            std::fs::metadata(history.join(c)).unwrap().len(),
+            cfg.file_size as u64
+        );
+    }
+    // The last filled file may still wait as .bkp; a restart copies it.
+    let journal = dir.path().join("journal");
+    let pending = |d: &Path| {
+        std::fs::read_dir(d)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".bkp")
+            })
+            .count()
+    };
+    let r = reload(&cfg);
+    assert!(r.committed.is_empty());
+    assert_eq!(pending(&journal), 0);
+
+    // The copies load as a journal of their own, as `data print --journal
+    // <history>` reads them.
+    let copy_cfg = JournalConfig {
+        retention: None,
+        ..config(&history)
+    };
+    let j = Journal::open(copy_cfg).unwrap();
+    let mut seen = 0;
+    struct Count<'a>(&'a mut usize);
+    impl saranga_journal::LoaderCallback for Count<'_> {
+        fn add_record(&mut self, _: RecordInfo) {
+            *self.0 += 1;
+        }
+        fn update_record(&mut self, _: RecordInfo) {}
+        fn delete_record(&mut self, _: i64) {}
+        fn add_prepared_transaction(&mut self, _: saranga_journal::PreparedTransactionInfo) {}
+    }
+    j.load(&mut Count(&mut seen)).unwrap();
+    assert!(seen >= 15, "{seen}");
+}
+
+#[test]
+fn retention_storage_limit_removes_the_oldest_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let history = dir.path().join("history");
+    let cfg = JournalConfig {
+        retention: Some(saranga_journal::Retention {
+            directory: history.clone(),
+            // Two files' worth.
+            max_bytes: 2 * 64 * 1024,
+            period_millis: -1,
+            local_offset: |_| 0,
+        }),
+        ..config(&dir.path().join("journal"))
+    };
+    let j = open(&cfg);
+    for id in 1..=60 {
+        j.append_add(id, 45, vec![7u8; 10 * 1024], false, None)
+            .unwrap();
+        j.append_delete(id, false, None).unwrap();
+    }
+    j.stop().unwrap();
+    assert_eq!(std::fs::read_dir(&history).unwrap().count(), 2);
+}

@@ -36,6 +36,17 @@ pub struct LargeMessageStore {
     /// Cleared when the broker stops, so that bodies dropped during
     /// shutdown keep their files.
     live: AtomicBool,
+    /// With journal retention, bodies are also recorded in the journal.
+    history: std::sync::OnceLock<History>,
+}
+
+/// The storage a body's bytes are recorded in for journal retention.
+struct History(Arc<crate::storage::Storage>);
+
+impl std::fmt::Debug for History {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("History")
+    }
 }
 
 impl LargeMessageStore {
@@ -44,7 +55,16 @@ impl LargeMessageStore {
             dir: Some(dir),
             sync,
             live: AtomicBool::new(true),
+            history: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Records each body written in `storage`'s journal, when it keeps
+    /// history (`addBytesToLargeMessage` with retention).
+    pub fn set_history(&self, storage: Arc<crate::storage::Storage>) {
+        if storage.is_history() {
+            let _ = self.history.set(History(storage));
+        }
     }
 
     /// Bodies held in memory (no persistence).
@@ -53,6 +73,7 @@ impl LargeMessageStore {
             dir: None,
             sync: false,
             live: AtomicBool::new(true),
+            history: std::sync::OnceLock::new(),
         })
     }
 
@@ -181,6 +202,9 @@ impl LargeWriter {
     }
 
     pub fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if let Some(History(storage)) = self.store.history.get() {
+            storage.large_body_history(self.id, bytes);
+        }
         match &mut self.file {
             Some((f, _)) => f.write_all(bytes)?,
             None => self.memory.extend_from_slice(bytes),

@@ -981,6 +981,33 @@ pub(super) async fn invoke(
                 .map(|()| Json::Null),
         );
     }
+    // Journal retention.
+    if let Some(a) = call.is("replay", &[S, S, S]) {
+        return Some(
+            crate::replay::replay(broker, None, None, a.s(0), a.s(1), a.s(2))
+                .await
+                .map(|()| Json::Null),
+        );
+    }
+    if let Some(a) = call.is("replay", &[S, S, S, S, S]) {
+        // `ReplayManager.newRetentionSimpleDateFormat().parse`.
+        let date = |s: Option<String>| -> Result<i64, String> {
+            let s = s.ok_or_else(|| {
+                "Cannot invoke \"String.length()\" because \"text\" is null".to_owned()
+            })?;
+            saranga_journal::local_date_millis(&s, crate::localtime::offset_millis)
+                .ok_or_else(|| format!("Unparseable date: \"{s}\""))
+        };
+        let dates = date(a.s(0)).and_then(|start| Ok((start, date(a.s(1))?)));
+        return Some(match dates {
+            Ok((start, end)) => {
+                crate::replay::replay(broker, Some(start), Some(end), a.s(2), a.s(3), a.s(4))
+                    .await
+                    .map(|()| Json::Null)
+            }
+            Err(e) => Err(e),
+        });
+    }
     if call.is("getStatus", &[]).is_some() {
         return Some(Ok(Json::from(status(m, broker).to_string())));
     }

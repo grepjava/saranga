@@ -136,6 +136,11 @@ impl PagingManager {
 
     /// Sets how messages of other protocols are read from pages, before
     /// any page is read.
+    /// The decoders of every protocol's persisters.
+    pub fn decoders(&self) -> MessageDecoders {
+        self.decoders.get().cloned().unwrap_or_default()
+    }
+
     pub fn set_decoders(&self, decoders: MessageDecoders) {
         let _ = self.decoders.set(decoders);
     }
@@ -1116,6 +1121,9 @@ impl PagingStore {
         };
         if roll {
             self.open_new_page(&mut st).map_err(io)?;
+        }
+        if let Some(storage) = &manager.storage {
+            storage.page_write_history(message, &paged.queue_ids);
         }
         let current = st.current.as_mut().expect("a current page");
         (&*current.file).write_all(&record).map_err(io)?;

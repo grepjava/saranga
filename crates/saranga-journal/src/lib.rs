@@ -11,13 +11,16 @@ pub mod control;
 pub mod format;
 mod io;
 mod journal;
+mod retention;
+
+pub use retention::{history_file_millis, local_date_millis};
 
 use std::sync::Arc;
 
 pub use io::Completion;
 pub use journal::{
     Journal, JournalConfig, JournalFileInfo, LoadInfo, LoadResult, LoaderCallback,
-    PreparedTransactionInfo, RecordInfo,
+    PreparedTransactionInfo, RecordInfo, Retention,
 };
 
 #[derive(Debug, Clone, thiserror::Error)]

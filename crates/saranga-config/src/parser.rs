@@ -438,10 +438,6 @@ const NOT_ACTED_ON: &[(&str, &str)] = &[
         "resource-limit-settings",
         "resource limits are not enforced",
     ),
-    (
-        "journal-retention-directory",
-        "journal retention is not supported; no history is kept",
-    ),
 ];
 
 /// Refuses what would make the broker something Saranga cannot be (an HA
@@ -723,7 +719,86 @@ fn parse_journal(s: &Settings<'_, '_>, j: &mut JournalConfig) -> Result<()> {
         &mut j.disk_scan_period,
         s.i32("disk-scan-period", Check::MinusOneOrGtZero)?,
     );
+    if let Some(n) = first(s.core, "journal-retention-directory") {
+        j.retention = Some(parse_journal_retention(n)?);
+    }
     Ok(())
+}
+
+/// `parseJournalRetention`.
+fn parse_journal_retention(n: Node<'_, '_>) -> Result<crate::broker::JournalRetention> {
+    const NAME: &str = "journal-retention-directory";
+    let directory = trimmed_text(n);
+    let max_bytes = match n.attribute("storage-limit") {
+        None => -1,
+        Some(t) => convert_text_bytes(t.trim())
+            .map_err(|_| ConfigError::invalid("storage-limit", t, "not a byte size"))?,
+    };
+    let period: i64 = match n.attribute("period") {
+        None => -1,
+        Some(t) => {
+            let v: i32 = parse_num("period", java_trim(t))?;
+            if v <= 0 {
+                return Err(ConfigError::invalid("period", v, "must be greater than 0"));
+            }
+            i64::from(v)
+        }
+    };
+    let unit_millis: i64 = match n
+        .attribute("unit")
+        .unwrap_or("DAYS")
+        .to_uppercase()
+        .as_str()
+    {
+        "NANOSECONDS" | "MICROSECONDS" => 0,
+        "MILLISECONDS" => 1,
+        "SECONDS" => 1000,
+        "MINUTES" => 60_000,
+        "HOURS" => 3_600_000,
+        "DAYS" => 86_400_000,
+        other => {
+            return Err(ConfigError::invalid(
+                "unit",
+                other,
+                "not a java.util.concurrent.TimeUnit",
+            ));
+        }
+    };
+    if directory.is_empty() {
+        return Err(ConfigError::invalid(
+            NAME,
+            "null",
+            "journal-retention-directory=null",
+        ));
+    }
+    if max_bytes == -1 && period == -1 {
+        return Err(ConfigError::invalid(
+            NAME,
+            &directory,
+            "configure either storage-limit or period on journal-retention-directory",
+        ));
+    }
+    // `setJournalRetentionPeriod(unit, period)`; a sub-millisecond unit
+    // rounds down, as `TimeUnit.toMillis` does.
+    let period_millis = if period <= 0 {
+        -1
+    } else {
+        match n
+            .attribute("unit")
+            .unwrap_or("DAYS")
+            .to_uppercase()
+            .as_str()
+        {
+            "NANOSECONDS" => period / 1_000_000,
+            "MICROSECONDS" => period / 1000,
+            _ => period * unit_millis,
+        }
+    };
+    Ok(crate::broker::JournalRetention {
+        directory,
+        max_bytes,
+        period_millis,
+    })
 }
 
 /// The `<core>` elements [`parse_scalars`] reads, which broker properties

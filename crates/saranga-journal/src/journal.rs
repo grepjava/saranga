@@ -48,6 +48,25 @@ pub struct JournalConfig {
     pub remove_extra_files_on_load: bool,
     /// `journal-max-attic-files`.
     pub max_attic_files: usize,
+    /// `setHistoryFolder`: keep a copy of each file the journal fills.
+    pub retention: Option<Retention>,
+}
+
+/// Journal retention (`journal-retention-directory`): each file the journal
+/// moves on from is copied to `directory` as
+/// `<prefix>-<yyyyMMddHHmmss>-<file ID>.<extension>`, and copies older than
+/// the period, or beyond the storage limit, are removed.
+#[derive(Debug, Clone)]
+pub struct Retention {
+    pub directory: PathBuf,
+    /// The storage limit in bytes; -1 for none.
+    pub max_bytes: i64,
+    /// Milliseconds; -1 for none.
+    pub period_millis: i64,
+    /// The local time zone's offset from UTC, in seconds, at an instant in
+    /// milliseconds: the copies are named in local time, as Artemis's
+    /// `GregorianCalendar` names them.
+    pub local_offset: fn(i64) -> i64,
 }
 
 impl JournalConfig {
@@ -67,6 +86,7 @@ impl JournalConfig {
             buffer_size: 490 * 1024,
             remove_extra_files_on_load: true,
             max_attic_files: 10,
+            retention: None,
         }
     }
 
@@ -152,7 +172,7 @@ pub struct JournalFileInfo {
     pub file_id: i64,
 }
 
-type FileKey = u64;
+pub(crate) type FileKey = u64;
 
 /// `JournalFileImpl`: a journal file and its reclaim accounting.
 #[derive(Debug)]
@@ -167,6 +187,8 @@ pub(crate) struct JFile {
     live_size: i64,
     pos_reclaim: bool,
     neg_reclaim: bool,
+    /// `setReclaimable`: false while a retention copy is pending.
+    pub(crate) reclaimable: bool,
     neg_counts: HashMap<FileKey, i32>,
 }
 
@@ -183,6 +205,7 @@ impl JFile {
             live_size: 0,
             pos_reclaim: false,
             neg_reclaim: false,
+            reclaimable: true,
             neg_counts: HashMap::new(),
         }
     }
@@ -192,7 +215,7 @@ impl JFile {
     }
 
     fn can_reclaim(&self) -> bool {
-        self.pos_reclaim && self.neg_reclaim
+        self.reclaimable && self.pos_reclaim && self.neg_reclaim
     }
 
     fn neg_count(&self, file: FileKey) -> i32 {
@@ -465,7 +488,7 @@ fn reclaim_scan(books: &mut Books, files: &[FileKey]) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum State {
+pub(crate) enum State {
     Started,
     Loaded,
     Failed,
@@ -473,7 +496,7 @@ enum State {
 
 pub(crate) struct Inner {
     pub(crate) cfg: JournalConfig,
-    state: State,
+    pub(crate) state: State,
     pub(crate) books: Books,
     pub(crate) data_files: VecDeque<FileKey>,
     free_files: VecDeque<FileKey>,
@@ -483,6 +506,8 @@ pub(crate) struct Inner {
     next_file_id: i64,
     auto_reclaim: bool,
     scratch: Vec<u8>,
+    /// `historyPendingFiles`: files waiting for their retention copy.
+    pub(crate) history_pending: Vec<FileKey>,
 }
 
 /// An Artemis journal in one directory.
@@ -526,6 +551,7 @@ impl Journal {
                 next_file_id: 0,
                 auto_reclaim: true,
                 scratch: Vec::new(),
+                history_pending: Vec::new(),
             }),
             writer,
         })
@@ -916,6 +942,13 @@ impl Journal {
         inner.move_next_file(&self.writer, false)
     }
 
+    /// `forceBackup`: the current file moves to the history now.
+    pub fn force_backup(&self) -> Result<()> {
+        let mut inner = self.lock();
+        inner.check_loaded()?;
+        inner.move_next_file(&self.writer, true)
+    }
+
     /// Runs reclaim now (`checkReclaimStatus`).
     pub fn check_reclaim_status(&self) -> Result<()> {
         let mut inner = self.lock();
@@ -984,7 +1017,7 @@ struct TxHolder {
 }
 
 impl Inner {
-    fn path(&self, name: &str) -> PathBuf {
+    pub(crate) fn path(&self, name: &str) -> PathBuf {
         self.cfg.directory.join(name)
     }
 
@@ -1010,7 +1043,7 @@ impl Inner {
     }
 
     /// `listFiles(extension)`: names ending with `.<extension>`.
-    fn list_files(&self, extension: &str) -> Result<Vec<String>> {
+    pub(crate) fn list_files(&self, extension: &str) -> Result<Vec<String>> {
         let suffix = format!(".{extension}");
         let mut out = Vec::new();
         for e in std::fs::read_dir(&self.cfg.directory).map_err(JournalError::io)? {
@@ -1107,6 +1140,7 @@ impl Inner {
             ));
         }
         self.check_control_file()?;
+        self.recover_history()?;
         let replaceable = std::mem::take(&mut self.books.replaceable);
         self.books = Books {
             replaceable,
@@ -1452,10 +1486,14 @@ impl Inner {
         if !self.data_files.contains(&cur) {
             self.data_files.push_back(cur);
         }
+        if self.cfg.retention.is_some() {
+            self.pend_history(cur)?;
+        }
         let next = self.open_file()?;
         self.current = Some(next);
         self.position = SIZE_HEADER as u64;
         if schedule_reclaim {
+            self.process_backup(writer)?;
             self.check_reclaim_status(writer)?;
             self.check_compact(writer)?;
         }

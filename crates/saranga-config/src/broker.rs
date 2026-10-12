@@ -69,6 +69,20 @@ pub struct JournalConfig {
     pub purge_page_folders: Option<bool>,
     pub max_disk_usage: Option<i32>,
     pub disk_scan_period: Option<i32>,
+    /// `<journal-retention-directory>`.
+    pub retention: Option<JournalRetention>,
+}
+
+/// `<journal-retention-directory>`: where a copy of each journal file is
+/// kept, and for how long.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalRetention {
+    /// As configured; relative to the instance.
+    pub directory: String,
+    /// `storage-limit` in bytes, -1 for none.
+    pub max_bytes: i64,
+    /// `period` in `unit`, in milliseconds; -1 for none.
+    pub period_millis: i64,
 }
 
 impl JournalConfig {
@@ -117,6 +131,7 @@ impl Default for JournalConfig {
             purge_page_folders: None,
             max_disk_usage: None,
             disk_scan_period: None,
+            retention: None,
         }
     }
 }

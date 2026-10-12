@@ -34,6 +34,8 @@ pub struct DataDirs {
     pub journal: PathBuf,
     pub paging: PathBuf,
     pub large_messages: PathBuf,
+    /// `getJournalRetentionLocation` and its settings, from broker.xml.
+    pub retention: Option<saranga_journal::Retention>,
     /// broker.xml, where there is one.
     pub config: Option<saranga_config::BrokerConfig>,
     /// The broker instance, if the tool runs in one.
@@ -55,6 +57,7 @@ impl DataDirArgs {
     pub fn unchecked(&self) -> anyhow::Result<DataDirs> {
         let instance = crate::client::instance_dir();
         let configured = self.configured(instance.as_deref())?;
+        let mut retention = None;
         let (config, defaults) = match configured {
             Some((config, dir)) => {
                 let s = saranga_server::config::storage_config(&config, &dir);
@@ -64,6 +67,7 @@ impl DataDirArgs {
                     s.paging.clone(),
                     s.large_messages.clone(),
                 ];
+                retention = s.messages.retention.clone();
                 (Some(config), d)
             }
             None => {
@@ -85,6 +89,7 @@ impl DataDirArgs {
             journal: self.journal.clone().unwrap_or(j),
             paging: self.paging.clone().unwrap_or(p),
             large_messages: self.large_messages.clone().unwrap_or(l),
+            retention,
             config,
             instance,
         };

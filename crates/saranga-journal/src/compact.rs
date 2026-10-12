@@ -49,6 +49,8 @@ impl Inner {
 
     fn compact_inner(&mut self, writer: &Writer) -> Result<()> {
         let files = self.take_data_files_for_compaction(writer)?;
+        // The files compacted away are copied to the history first.
+        self.process_backup(writer)?;
         if files.is_empty() {
             return Ok(());
         }

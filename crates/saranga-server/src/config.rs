@@ -281,6 +281,12 @@ pub fn storage_config(config: &cfg::BrokerConfig, instance: &Path) -> StorageCon
             datasync,
             buffer_size: j.buffer_size.unwrap_or(J::DEFAULT_BUFFER_SIZE).max(0) as usize,
             max_attic_files,
+            retention: j.retention.as_ref().map(|r| saranga_journal::Retention {
+                directory: dir(&r.directory),
+                max_bytes: r.max_bytes,
+                period_millis: r.period_millis,
+                local_offset: crate::localtime::offset_millis,
+            }),
             ..JournalConfig::messages(dir(&config.journal_directory))
         },
         bindings: JournalConfig {

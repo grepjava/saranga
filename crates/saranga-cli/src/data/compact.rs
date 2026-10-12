@@ -25,6 +25,13 @@ pub fn run(args: &DataDirArgs) -> anyhow::Result<()> {
             messages.file_size = n.max(0) as usize;
         }
     }
+    // With retention, the files compacted away are kept in the history
+    // (`setHistoryFolder(historyFolder, -1, -1)`).
+    messages.retention = d.retention.clone().map(|r| saranga_journal::Retention {
+        max_bytes: -1,
+        period_millis: -1,
+        ..r
+    });
     compact(
         messages,
         &[ids::UPDATE_DELIVERY_COUNT, ids::SET_SCHEDULED_DELIVERY_TIME],

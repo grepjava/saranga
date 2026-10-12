@@ -143,7 +143,7 @@ impl StoredMessage {
 }
 
 /// Decodes an `ADD_LARGE_MESSAGE` body (`parseLargeMessage`).
-fn decode_large_message(data: &[u8]) -> StoreResult<CoreMessage> {
+pub fn decode_large_message(data: &[u8]) -> StoreResult<CoreMessage> {
     LargeMessageRecord::decode(data)
         .map(|r| r.message)
         .map_err(corrupt("large message"))
@@ -629,6 +629,53 @@ impl Storage {
     /// `getMaxRecordSize` of the message journal.
     pub fn max_record_size(&self) -> usize {
         self.cfg.messages.max_record_size()
+    }
+
+    /// The journal retention settings, if any.
+    pub fn retention(&self) -> Option<&saranga_journal::Retention> {
+        self.cfg.messages.retention.as_ref()
+    }
+
+    /// `forceBackup`: the current journal file is copied to the history.
+    pub fn force_backup(&self) -> StoreResult<()> {
+        self.messages.force_backup()
+    }
+
+    /// `isHistory`: journal retention keeps a copy of each journal file.
+    pub fn is_history(&self) -> bool {
+        self.cfg.messages.retention.is_some()
+    }
+
+    /// `pageWrite` with retention: a paged message and its references are
+    /// written to the journal as events, so its history holds them too.
+    pub fn page_write_history(&self, message: &ServerMessage, queue_ids: &[i64]) {
+        if !self.is_history() {
+            return;
+        }
+        let id = message.message_id();
+        let (record_type, body) = message_record(message);
+        let _ = self
+            .messages
+            .append_add_event(id, record_type, body, false, None);
+        for q in queue_ids {
+            let _ = self
+                .messages
+                .append_add_event(id, ids::ADD_REF, ref_body(*q), false, None);
+        }
+    }
+
+    /// `historyBody`: a large message's body, as it is written, recorded
+    /// as `ADD_MESSAGE_BODY` events of at most 10 KiB.
+    pub fn large_body_history(&self, message_id: i64, bytes: &[u8]) {
+        for chunk in bytes.chunks(10 * 1024) {
+            let _ = self.messages.append_add_event(
+                message_id,
+                ids::ADD_MESSAGE_BODY,
+                chunk.to_vec(),
+                false,
+                None,
+            );
+        }
     }
 
     /// `storeMessage`: the message record, never synced (the reference that

@@ -196,8 +196,15 @@ impl PostOffice {
             return;
         };
         crate::message::apply_expiry_delay(&mut message, &self.settings(&address), now_millis());
-        let r = MessageRef::new(ServerMessage::new(message));
-        let routed = self.route_internal(&r, &address);
+        self.deliver_internal(ServerMessage::new(message), &address)
+            .await;
+    }
+
+    /// Routes a message the broker sends on its own to `address`, journals
+    /// its durable references and adds it to its queues once written.
+    pub async fn deliver_internal(&self, message: Arc<ServerMessage>, address: &str) {
+        let r = MessageRef::new(message);
+        let routed = self.route_internal(&r, address);
         let routed = match self.page_routed(routed.clone(), None) {
             Ok((routed, _)) => routed,
             Err(e) => {

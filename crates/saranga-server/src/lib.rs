@@ -14,6 +14,7 @@ mod disk;
 pub mod duplicate;
 pub mod error;
 pub mod large;
+pub mod localtime;
 pub mod management;
 pub mod message;
 pub mod node;
@@ -26,6 +27,7 @@ pub mod queue;
 pub mod recovery;
 pub mod registry;
 pub mod reload;
+pub mod replay;
 pub mod session;
 pub mod settings;
 mod slow_consumers;
@@ -411,6 +413,9 @@ impl Broker {
             }
             None => large::LargeMessageStore::in_memory(),
         };
+        if let Some(storage) = &storage {
+            large_messages.set_history(storage.clone());
+        }
         // recoverLargeMessagesOnFolder: the files there before loading.
         let mut stored_large = large_messages
             .start()
