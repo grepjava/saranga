@@ -5,10 +5,10 @@ Saranga, and the Jolokia layer against Artemis
     python -I tests/interop/web/web.py <saranga web URL> <saranga core URL> [<artemis web URL>]
 
 The users are admin/secret (role amq) and viewer/viewer (role view) on
-Saranga, artemis/artemis on Artemis. Artemis 2.57.0's console fails every
-MBean read and invocation on JDK 25 (docs/upstream/artemis-issues.md,
-issue 8), so the responses compared with it are those that need no MBean
-call: version, search, list, and the errors found before the call.
+Saranga, artemis/artemis on Artemis. Compared with Artemis: version, search
+and list, the errors found before an MBean is called, logins, and a run of
+MBean reads, writes, invocations, pattern reads and bulk requests on a
+queue each broker creates and destroys.
 """
 
 import base64
@@ -145,6 +145,79 @@ if ARTEMIS:
         reason = lambda h: {k.lower(): v for k, v in h.items()}.get("hawtio-forbidden-reason")
         check("artemis: " + name, (s[0], reason(s[1]), s[2]) == (a[0], reason(a[1]), a[2]),
               f"saranga {s[0]} {s[1]} artemis {a[0]} {a[1]}")
+
+CMP_QUEUE = 'org.apache.activemq.artemis:broker="0.0.0.0",component=addresses,address="web.cmp",subcomponent=queues,routing-type="anycast",queue="web.cmp"'
+CMP_ADDRESS = 'org.apache.activemq.artemis:broker="0.0.0.0",component=addresses,address="web.cmp"'
+QUEUE_ATTRIBUTES = ["MessageCount", "Address", "RoutingType", "Durable", "Temporary", "Filter",
+                    "MaxConsumers", "Paused", "Exclusive", "LastValue", "ConsumerCount",
+                    "DeliveringCount", "MessagesAdded", "PurgeOnNoConsumers", "Enabled"]
+
+
+def send_body(auth):
+    return json.dumps({"type": "exec", "mbean": CMP_QUEUE,
+                       "operation": "sendMessage(java.util.Map,int,java.lang.String,boolean,java.lang.String,java.lang.String)",
+                       "arguments": [{"color": "red"}, 3, "hello", True, auth[0], auth[1]]})
+
+
+# The same MBean reads, writes and invocations, in order, on each broker.
+# (name, path or None, body or None); a body is POSTed.
+MBEAN_STEPS = [
+    ("exec createQueue", "/exec/" + q(BROKER) + "/createQueue(java.lang.String,java.lang.String,java.lang.String)/web.cmp/web.cmp/ANYCAST", None),
+    ("read queue attributes", "/read/" + q(CMP_QUEUE) + "/" + ",".join(QUEUE_ATTRIBUTES), None),
+    ("read address QueueNames", "/read/" + q(CMP_ADDRESS) + "/QueueNames", None),
+    ("read address RoutingTypes", "/read/" + q(CMP_ADDRESS) + "/RoutingTypes", None),
+    ("exec sendMessage", None, "SEND"),
+    ("read MessageCount", "/read/" + q(CMP_QUEUE) + "/MessageCount", None),
+    ("exec countMessages", "/exec/" + q(CMP_QUEUE) + "/countMessages(java.lang.String)/color='red'", None),
+    ("exec countMessages none", "/exec/" + q(CMP_QUEUE) + "/countMessages(java.lang.String)/color='blue'", None),
+    # Artemis's Jetty refuses a raw [ in a path: Jolokia clients escape it.
+    ("exec listMessages path", "/exec/" + q(CMP_QUEUE) + "/listMessages(java.lang.String)/" + q("[null]") + "/0/color", None),
+    ("pattern read", "/read/" + q("org.apache.activemq.artemis:broker=*,component=addresses,address=\"web.cmp\",subcomponent=queues,routing-type=*,queue=*") + "/MessageCount,Address", None),
+    ("bulk", None, json.dumps([
+        {"type": "read", "mbean": CMP_QUEUE, "attribute": "MessageCount"},
+        {"type": "read", "mbean": CMP_ADDRESS, "attribute": "QueueNames"},
+        {"type": "exec", "mbean": CMP_QUEUE, "operation": "countMessages()"},
+        {"type": "read", "mbean": CMP_QUEUE, "attribute": "Nope"},
+    ])),
+    ("write", "/write/" + q(BROKER) + "/MessageCounterSamplePeriod/5000", None),
+    ("read written", "/read/" + q(BROKER) + "/MessageCounterSamplePeriod", None),
+    ("write back", "/write/" + q(BROKER) + "/MessageCounterSamplePeriod/10000", None),
+    ("exec operation error", "/exec/" + q(BROKER) + "/deleteAddress(java.lang.String)/nosuch", None),
+    ("exec removeAllMessages", "/exec/" + q(CMP_QUEUE) + "/removeAllMessages()", None),
+    ("exec destroyQueue", "/exec/" + q(BROKER) + "/destroyQueue(java.lang.String)/web.cmp", None),
+    ("read destroyed queue", "/read/" + q(CMP_QUEUE) + "/MessageCount", None),
+]
+
+
+def answers(v):
+    """A response without what differs between runs: timestamps, stack
+    traces, and the value sendMessage returns (the message's ID)."""
+    if isinstance(v, list):
+        return [answers(x) for x in v]
+    if not isinstance(v, dict):
+        return v
+    out = {k: x for k, x in v.items() if k not in ("timestamp", "stacktrace")}
+    if isinstance(out.get("request"), dict) and "sendMessage" in str(out["request"].get("operation")):
+        out["value"] = "#"
+        out["request"] = {k: x for k, x in out["request"].items() if k != "arguments"}
+    return normalize(out)
+
+
+def run_steps(base, auth):
+    results = []
+    for name, path, body in MBEAN_STEPS:
+        if body == "SEND":
+            body = send_body(auth)
+        results.append(answers(j(base, path or "", auth, body)))
+    return results
+
+
+if ARTEMIS:
+    for (name, _, _), mine, theirs in zip(MBEAN_STEPS, run_steps(SARANGA, SARANGA_AUTH),
+                                          run_steps(ARTEMIS, ARTEMIS_AUTH)):
+        check("artemis: " + name, mine == theirs,
+              f"\n  saranga {json.dumps(mine)[:1500]}\n  artemis {json.dumps(theirs)[:1500]}")
+
 
 # ------------------------------------------------------------ Saranga alone
 

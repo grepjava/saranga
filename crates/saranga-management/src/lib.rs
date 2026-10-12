@@ -14,6 +14,7 @@
 
 mod access;
 mod catalog;
+mod exceptions;
 mod jolokia;
 mod mbean;
 pub mod metrics;

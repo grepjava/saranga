@@ -263,6 +263,15 @@ impl ObjectName {
         format!("{}:{}", self.domain, list.join(","))
     }
 
+    /// `toString`: the keys as written.
+    pub fn serialized(&self) -> String {
+        let mut list: Vec<String> = self.props.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        if self.props_pattern {
+            list.push("*".to_owned());
+        }
+        format!("{}:{}", self.domain, list.join(","))
+    }
+
     /// `getCanonicalKeyPropertyListString`.
     pub fn canonical_props(&self) -> String {
         let c = self.canonical();

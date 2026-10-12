@@ -120,7 +120,10 @@ impl Request {
                     Json::Array(v.iter().map(|a| Json::from(a.clone())).collect()),
                 ),
             },
-            "exec" => e.put("arguments", Json::Array(self.arguments.clone())),
+            // As JolokiaExecRequest writes it: no arguments, no member.
+            "exec" if !self.arguments.is_empty() => {
+                e.put("arguments", Json::Array(self.arguments.clone()))
+            }
             _ => {}
         }
         e.put("type", self.kind);
@@ -473,7 +476,8 @@ impl Agent {
         Json::Array(names)
     }
 
-    /// The one MBean a non-pattern name names.
+    /// The one MBean a non-pattern name names; not found, it is named as
+    /// the request gave it (`ObjectName.toString`).
     fn bean(&self, name: &ObjectName) -> Result<(ObjectName, Bean), Failure> {
         self.beans()
             .into_iter()
@@ -481,7 +485,7 @@ impl Agent {
             .ok_or_else(|| {
                 Failure::new(
                     "javax.management.InstanceNotFoundException",
-                    name.canonical(),
+                    name.serialized(),
                     404,
                 )
             })
@@ -540,7 +544,7 @@ impl Agent {
             if matches!(&out, Json::Object(m) if m.is_empty()) {
                 return Err(Failure::new(
                     "javax.management.InstanceNotFoundException",
-                    format!("No matching MBean found for {}", name.canonical()),
+                    format!("No matching MBean found for {}", name.serialized()),
                     404,
                 ));
             }
@@ -624,7 +628,7 @@ impl Agent {
                 caller.management(),
             )
             .await
-            .map_err(|e| Failure::new("java.lang.Exception", e, 500))?;
+            .map_err(|e| Failure::new(error_type(&setter, &e), e, 500))?;
         Ok(old)
     }
 
@@ -746,7 +750,7 @@ impl Agent {
                     .await
             }
         }
-        .map_err(|e| Failure::new("java.lang.Exception", e, 500))?;
+        .map_err(|e| Failure::new(error_type(op.name, &e), e, 500))?;
         Ok(if op.ret == "void" { Json::Null } else { result })
     }
 
@@ -983,9 +987,43 @@ fn navigate(v: Json, path: Option<&str>) -> Result<Json, Failure> {
     Ok(cur)
 }
 
+/// The class of the exception an operation's error was thrown as, which
+/// Jolokia reports as `error_type`: the class Artemis's message bundle
+/// declares for the error's AMQ code. The `ActiveMQServerControl` methods
+/// that catch an `ActiveMQException` and throw an `IllegalStateException`
+/// with its message report that.
+fn error_type(operation: &str, message: &str) -> &'static str {
+    const RETHROWN: &[&str] = &[
+        "deleteAddress",
+        "createQueue",
+        "addAddressSettings",
+        "createBridge",
+    ];
+    let class = message
+        .strip_prefix("AMQ")
+        .and_then(|m| m.get(..6))
+        .and_then(|c| c.parse::<u32>().ok())
+        .and_then(|code| {
+            crate::exceptions::EXCEPTIONS
+                .binary_search_by_key(&code, |(c, _)| *c)
+                .ok()
+                .map(|i| crate::exceptions::EXCEPTIONS[i].1)
+        });
+    match class {
+        Some(c)
+            if c.starts_with("org.apache.activemq.artemis.api.core.ActiveMQ")
+                && RETHROWN.contains(&operation) =>
+        {
+            "java.lang.IllegalStateException"
+        }
+        Some(c) => c,
+        None => "java.lang.Exception",
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{signature_arity, split_path};
+    use super::{error_type, signature_arity, split_path};
 
     #[test]
     fn paths() {
@@ -993,5 +1031,22 @@ mod tests {
         assert_eq!(signature_arity("op(java.lang.String,int)"), Some(2));
         assert_eq!(signature_arity("op()"), Some(0));
         assert_eq!(signature_arity("op"), None);
+    }
+
+    #[test]
+    fn errors_have_their_java_classes() {
+        assert_eq!(
+            error_type("destroyQueue", "AMQ229017: Queue q does not exist"),
+            "org.apache.activemq.artemis.api.core.ActiveMQNonExistentQueueException"
+        );
+        // deleteAddress rethrows as IllegalStateException.
+        assert_eq!(
+            error_type("deleteAddress", "AMQ229203: Address Does Not Exist: a"),
+            "java.lang.IllegalStateException"
+        );
+        assert_eq!(
+            error_type("removeMessages", "no code"),
+            "java.lang.Exception"
+        );
     }
 }

@@ -153,7 +153,7 @@ Artemis serves its web console, with Jolokia, and the metrics plugin's app. Sara
 - **The metrics** where `bootstrap.xml` declares the metrics app. JVM, process and Netty metrics are not exported; the broker, address and queue metrics are.
 - **A Jolokia compatibility layer, not the web console.** Where `bootstrap.xml` declares the console's app, `/console/jolokia` answers the Jolokia 2.4.3 protocol from Rust: there is no JMX and no Java. The console's pages (hawtio) are not served, so the Artemis console must be run elsewhere and pointed at it. Without the console's app there is no Jolokia layer. Its approximations:
   - Only Artemis's MBeans exist: no `java.lang`, `JMImplementation` or `jolokia` MBeans.
-  - An operation that fails answers `error_type` `java.lang.Exception` with status 500 and the failure's text. Artemis's controls throw several exception classes.
+  - An operation that fails answers status 500 and the failure's text, with the `error_type` of the class Artemis's message bundles declare for its AMQ code (`scripts/gen-exception-catalog.py`), or `java.lang.IllegalStateException` for the `ActiveMQServerControl` methods that rethrow as one. A failure without an AMQ code answers `java.lang.Exception`, where Artemis may name another class.
   - `list` gives no `ctor` (constructors) entries.
   - Acceptors' `start` and `stop` are refused: Saranga does not start and stop acceptors through management yet.
   - The console roles come from `-Dhawtio.roles`, `HAWTIO_ROLES` in `artemis.profile` or `-Dhawtio.roles=` in `artemis.profile.cmd`, and are `amq` by default.
