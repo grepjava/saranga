@@ -49,8 +49,8 @@ pub struct ExportArgs {
 }
 
 pub fn run(args: ExportArgs) -> anyhow::Result<()> {
+    let _lock = CliLock::take(crate::client::instance_dir().as_deref())?;
     let d = args.dirs.resolve()?;
-    let _lock = CliLock::take(d.instance.as_deref())?;
     let file_size = d
         .config
         .as_ref()

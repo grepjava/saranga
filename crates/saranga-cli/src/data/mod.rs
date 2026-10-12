@@ -59,30 +59,73 @@ pub struct PrintArgs {
 
 pub async fn run(cmd: DataCommand) -> anyhow::Result<()> {
     match cmd {
-        DataCommand::Compact(a) => compact::run(&a),
-        DataCommand::Exp(a) => export::run(a),
+        DataCommand::Compact(a) => treat_error(compact::run(&a)),
+        DataCommand::Exp(a) => treat_error(export::run(a)),
         DataCommand::Imp(a) => import::run(a).await,
-        DataCommand::Encode(a) => journal::encode(&a),
-        DataCommand::Decode(a) => journal::decode(&a),
-        DataCommand::Recover(a) => recover::run(&a),
-        DataCommand::Print(a) => {
-            let d = a.dirs.resolve()?;
-            let _lock = dirs::CliLock::take(d.instance.as_deref())?;
-            let opts = PrintDataOptions {
-                safe: a.safe,
-                reclaimed: a.reclaimed,
-                skip_bindings: a.skip_bindings,
-                skip_journal: a.skip_journal,
-                max_pages: u32::try_from(a.max_pages).ok(),
-                print_pages: Some(saranga_paging::print::print_pages),
-            };
-            let (bindings, journal, paging) = (d.bindings, d.journal, d.paging);
-            let stdout = std::io::stdout();
-            let mut out = std::io::BufWriter::new(stdout.lock());
-            saranga_protocol_amqp::describe::register();
-            print_data(&mut out, &bindings, &journal, &paging, &opts)?;
-            out.flush()?;
+        DataCommand::Encode(a) => treat_error(journal::encode(&a)),
+        DataCommand::Decode(a) => treat_error(journal::decode(&a)),
+        DataCommand::Recover(a) => treat_error(recover::run(&a)),
+        DataCommand::Print(a) => treat_error(print(&a)),
+    }
+}
+
+/// `Configurable.treatError`: what fails in the tool is reported on stderr
+/// between blank lines, and the command still succeeds. A held lock (a
+/// `CLIException`) and the directories `getParameterConfiguration` finds
+/// missing (a `RuntimeException`) are thrown before the tool runs, so they
+/// end the command.
+fn treat_error(result: anyhow::Result<()>) -> anyhow::Result<()> {
+    match result {
+        Err(e)
+            if e.downcast_ref::<crate::client::CliError>().is_none()
+                && e.downcast_ref::<crate::client::UsageError>().is_none() =>
+        {
+            eprintln!();
+            eprintln!("Error:{e:#}");
+            eprintln!();
             Ok(())
         }
+        r => r,
+    }
+}
+
+/// The directories of `print` and `recover`, which `getParameterConfiguration`
+/// checks before the tool runs.
+fn parameter_dirs(args: &dirs::DataDirArgs) -> anyhow::Result<dirs::DataDirs> {
+    args.resolve()
+        .map_err(|e| crate::client::UsageError(format!("{e:#}")).into())
+}
+
+fn print(a: &PrintArgs) -> anyhow::Result<()> {
+    let _lock = dirs::CliLock::take(crate::client::instance_dir().as_deref())?;
+    let d = parameter_dirs(&a.dirs)?;
+    let opts = PrintDataOptions {
+        safe: a.safe,
+        reclaimed: a.reclaimed,
+        skip_bindings: a.skip_bindings,
+        skip_journal: a.skip_journal,
+        max_pages: u32::try_from(a.max_pages).ok(),
+        print_pages: Some(saranga_paging::print::print_pages),
+    };
+    let (bindings, journal, paging) = (d.bindings, d.journal, d.paging);
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    saranga_protocol_amqp::describe::register();
+    print_data(&mut out, &bindings, &journal, &paging, &opts)?;
+    out.flush()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tools_errors_are_treated_but_not_what_is_thrown_before() {
+        assert!(treat_error(Err(anyhow::anyhow!("broken"))).is_ok());
+        let lock = treat_error(Err(crate::client::CliError("held".into()).into()));
+        assert!(lock.is_err());
+        let usage = treat_error(Err(crate::client::UsageError("missing".into()).into()));
+        assert!(usage.is_err());
     }
 }

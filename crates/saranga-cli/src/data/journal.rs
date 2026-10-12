@@ -200,7 +200,7 @@ pub fn decode(args: &DecodeArgs) -> anyhow::Result<()> {
     let journal = Journal::open(config).with_context(|| format!("opening {}", dir.display()))?;
     journal.load_all()?;
     let input = std::fs::File::open(&args.input)
-        .with_context(|| format!("opening {}", args.input.display()))?;
+        .map_err(|e| anyhow::anyhow!(super::dirs::file_not_found(&args.input, &e)))?;
     let mut counters: HashMap<i64, i32> = HashMap::new();
     for (n, line) in std::io::BufReader::new(input).lines().enumerate() {
         let line_number = n + 1;

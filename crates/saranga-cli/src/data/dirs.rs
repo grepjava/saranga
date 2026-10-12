@@ -44,10 +44,22 @@ pub struct DataDirs {
 
 impl DataDirArgs {
     /// The directories given, else those of the instance's broker.xml,
-    /// else `./data/*` outside an instance. Each must exist.
+    /// else `./data/*` outside an instance. Each must exist
+    /// (`DBOption.getParameterConfiguration`).
     pub fn resolve(&self) -> anyhow::Result<DataDirs> {
-        let dirs = self.unchecked()?;
-        for dir in [&dirs.bindings, &dirs.journal, &dirs.paging] {
+        let mut dirs = self.unchecked()?;
+        // The directories from the configuration are made absolute
+        // (`getAbsolutePath`), the ones given are not.
+        let cwd = std::env::current_dir().unwrap_or_default();
+        for (dir, given) in [
+            (&mut dirs.bindings, &self.bindings),
+            (&mut dirs.journal, &self.journal),
+            (&mut dirs.paging, &self.paging),
+            (&mut dirs.large_messages, &self.large_messages),
+        ] {
+            if given.is_none() && dir.is_relative() {
+                *dir = cwd.join(&*dir);
+            }
             check_exists(dir)?;
         }
         Ok(dirs)
@@ -71,7 +83,8 @@ impl DataDirArgs {
                 (Some(config), d)
             }
             None => {
-                let data = Path::new("./data");
+                // `./data` under the broker instance `.`.
+                let data = Path::new(".").join(".").join("data");
                 (
                     None,
                     [
@@ -123,7 +136,7 @@ impl DataDirArgs {
 }
 
 /// `DataAbstract.checkIfDirectoryExists`.
-pub fn check_exists(dir: &Path) -> anyhow::Result<()> {
+fn check_exists(dir: &Path) -> anyhow::Result<()> {
     if !dir.exists() {
         anyhow::bail!(
             "Could not find folder: {}, please pass --bindings, --journal and --paging as arguments",
@@ -161,11 +174,70 @@ impl CliLock {
             .open(place.join("cli.lock"))
             .with_context(|| format!("opening {}", place.join("cli.lock").display()))?;
         if file.try_lock().is_err() {
-            anyhow::bail!(
+            return Err(crate::client::CliError(format!(
                 "Error: There is another process using the server at {}. Cannot start the process!",
                 place.display()
-            );
+            ))
+            .into());
         }
         Ok(Self(Some(file)))
+    }
+}
+
+/// The message of the `FileNotFoundException` Java throws opening a file:
+/// the path, then the system's reason in parentheses.
+pub fn file_not_found(path: &Path, e: &std::io::Error) -> String {
+    let reason = e.to_string();
+    let reason = reason.split(" (os error").next().unwrap_or(&reason);
+    format!("{} ({})", path.display(), reason.trim_end_matches('.'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_held_lock_is_a_cli_exception() {
+        let dir = tempfile::tempdir().unwrap();
+        let _held = CliLock::hold(dir.path()).unwrap();
+        let e = CliLock::hold(dir.path()).err().unwrap();
+        let e = e.downcast_ref::<crate::client::CliError>().unwrap();
+        assert!(e.0.starts_with("Error: There is another process using the server at "));
+    }
+
+    #[test]
+    fn file_not_found_is_as_java_reports_it() {
+        let e = std::io::Error::from_raw_os_error(2);
+        let reason = e.to_string();
+        let reason = reason.split(" (os error").next().unwrap();
+        assert_eq!(
+            file_not_found(Path::new("nosuch"), &e),
+            format!("nosuch ({})", reason.trim_end_matches('.'))
+        );
+        assert!(!file_not_found(Path::new("x"), &e).contains("os error"));
+    }
+
+    #[test]
+    fn the_parameter_directories_include_large_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let [b, j, p] = ["b", "j", "p"].map(|d| {
+            std::fs::create_dir(dir.path().join(d)).unwrap();
+            Some(dir.path().join(d))
+        });
+        let mut args = DataDirArgs {
+            bindings: b,
+            journal: j,
+            paging: p,
+            large_messages: Some(dir.path().join("l")),
+            broker: None,
+        };
+        let e = args.resolve().err().unwrap().to_string();
+        assert!(e.starts_with("Could not find folder: "), "{e}");
+        assert!(
+            e.contains(&dir.path().join("l").display().to_string()),
+            "{e}"
+        );
+        args.large_messages = args.bindings.clone();
+        assert!(args.resolve().is_ok());
     }
 }

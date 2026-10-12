@@ -38,9 +38,8 @@ const OF_INTEREST: [u8; 5] = [
 ];
 
 pub fn run(args: &RecoverArgs) -> anyhow::Result<()> {
-    let d = args.dirs.unchecked()?;
-    let _lock = CliLock::take(d.instance.as_deref())?;
-    super::dirs::check_exists(&d.journal)?;
+    let _lock = CliLock::take(crate::client::instance_dir().as_deref())?;
+    let d = super::parameter_dirs(&args.dirs)?;
     let target = &args.target;
     if !target.exists() {
         std::fs::create_dir_all(target)

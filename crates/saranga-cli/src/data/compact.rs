@@ -10,8 +10,9 @@ use saranga_storage::ids;
 use super::dirs::{CliLock, DataDirArgs};
 
 pub fn run(args: &DataDirArgs) -> anyhow::Result<()> {
-    let d = args.resolve()?;
-    let _lock = CliLock::take(d.instance.as_deref())?;
+    let _lock = CliLock::take(crate::client::instance_dir().as_deref())?;
+    // `getFileConfiguration`: compact checks none of the directories.
+    let d = args.unchecked()?;
     let journal = d.config.as_ref().map(|c| &c.journal);
     let mut messages = JournalConfig::messages(&d.journal);
     if let Some(j) = journal {
@@ -55,6 +56,16 @@ pub fn run(args: &DataDirArgs) -> anyhow::Result<()> {
 fn compact(mut config: JournalConfig, replaceable: &[u8]) -> anyhow::Result<()> {
     config.remove_extra_files_on_load = true;
     let dir = config.directory.clone();
+    if !dir.is_dir() {
+        // Java creates the first file of a missing directory, and fails.
+        let tmp = dir.join(format!(
+            "{}-1.{}.tmp",
+            config.file_prefix, config.file_extension
+        ));
+        if let Err(e) = std::fs::File::open(&tmp) {
+            anyhow::bail!(super::dirs::file_not_found(&tmp, &e));
+        }
+    }
     let journal = Journal::open(config).with_context(|| format!("opening {}", dir.display()))?;
     for &r in replaceable {
         journal.replaceable_record(r);

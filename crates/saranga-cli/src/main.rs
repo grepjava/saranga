@@ -198,6 +198,13 @@ async fn main() -> std::process::ExitCode {
     }
     match run_command(cli.command).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e)
+            if e.downcast_ref::<client::UsageError>().is_some()
+                || e.downcast_ref::<client::CliError>().is_some() =>
+        {
+            report_client_error(&e);
+            std::process::ExitCode::FAILURE
+        }
         Err(e) => {
             eprintln!("Error: {e:?}");
             std::process::ExitCode::FAILURE
