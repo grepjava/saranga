@@ -6,8 +6,12 @@ use std::sync::{Arc, Mutex, Weak};
 
 use saranga_buffer::SimpleString;
 use saranga_core_protocol::packets::connection::{SessionStart, SessionStop};
+use saranga_core_protocol::packets::large::{
+    SessionSendContinuationMessage, SessionSendContinuationMessageV2,
+    SessionSendContinuationMessageV3, SessionSendLargeMessage,
+};
 use saranga_core_protocol::packets::session::*;
-use saranga_core_protocol::{Flagged, Packet, types};
+use saranga_core_protocol::{FRAME_HEADER_SIZE, Flagged, Packet, types};
 use saranga_message::CoreMessage;
 
 use crate::channel::{Channel, supports};
@@ -15,6 +19,7 @@ use crate::connection::ConnInner;
 use crate::consumer::{Consumer, ConsumerOptions, ConsumerShared};
 use crate::defaults;
 use crate::error::{Error, ErrorType, Result};
+use crate::message;
 use crate::producer::{CreditManager, Producer, ProducerShared};
 
 /// Session settings, with the `ServerLocatorImpl` defaults a plain
@@ -38,7 +43,16 @@ pub struct SessionOptions {
     pub ack_batch_size: i32,
     pub consumer_window_size: i32,
     pub producer_window_size: i32,
+    /// Messages whose body exceeds this are sent as large messages: the
+    /// headers, then the body in chunks of this size.
     pub min_large_message_size: i32,
+    /// Large message bodies are sent zlib-compressed (`_AMQ_LARGE_COMPRESSED`);
+    /// one that compresses below `min_large_message_size` goes as a regular
+    /// message.
+    pub compress_large_messages: bool,
+    /// The `Deflater` level for compressed bodies: 0 to 9, or -1 for the
+    /// default.
+    pub compression_level: i32,
 }
 
 impl Default for SessionOptions {
@@ -58,6 +72,8 @@ impl Default for SessionOptions {
             consumer_window_size: defaults::CONSUMER_WINDOW_SIZE,
             producer_window_size: defaults::PRODUCER_WINDOW_SIZE,
             min_large_message_size: defaults::MIN_LARGE_MESSAGE_SIZE,
+            compress_large_messages: defaults::COMPRESS_LARGE_MESSAGES,
+            compression_level: defaults::COMPRESSION_LEVEL,
         }
     }
 }
@@ -557,6 +573,75 @@ impl SessionInner {
         }
     }
 
+    /// `ActiveMQSessionContext.sendInitialChunkOnLargeMessage`: the headers
+    /// and properties (`SessionSendLargeMessage`, not blocking). Returns
+    /// their encode size, the credits the header takes.
+    pub(crate) fn send_initial_chunk_on_large_message(&self, message: CoreMessage) -> Result<i32> {
+        let size = message::headers_and_properties_encode_size(&message);
+        self.send(SessionSendLargeMessage { message })?;
+        Ok(size)
+    }
+
+    /// `ActiveMQSessionContext.sendLargeMessageChunk`: a body chunk in the
+    /// continuation packet for the negotiated version. Only the last chunk
+    /// of a blocking send waits for the broker. Returns the packet size
+    /// (`getPacketSize`), the credits the chunk takes.
+    pub(crate) async fn send_large_message_chunk(
+        &self,
+        message_body_size: i64,
+        send_blocking: bool,
+        last_chunk: bool,
+        chunk: Vec<u8>,
+        sender_id: i32,
+    ) -> Result<i32> {
+        let ctx = self.conn.context();
+        let requires_response = last_chunk && send_blocking;
+        // The frame header, the chunk with its length, `continues`, the body
+        // size on the last chunk and `requiresResponse`
+        // (`SessionSendContinuationMessage.expectedEncodeSize`).
+        let mut size = FRAME_HEADER_SIZE + 4 + chunk.len() + 1 + 1;
+        if last_chunk {
+            size += 8;
+        }
+        // confirmationWindow is -1, so a response is required only when blocking.
+        let packet: Packet = if ctx.is_version_before_async_response_change() {
+            SessionSendContinuationMessage {
+                body: chunk,
+                continues: !last_chunk,
+                message_body_size,
+                requires_response,
+            }
+            .into()
+        } else if ctx.is_before_producer_metrics_changed() {
+            size += 8;
+            SessionSendContinuationMessageV2 {
+                body: chunk,
+                continues: !last_chunk,
+                message_body_size,
+                requires_response,
+                correlation_id: Some(0),
+            }
+            .into()
+        } else {
+            size += 8 + 4;
+            SessionSendContinuationMessageV3 {
+                body: chunk,
+                continues: !last_chunk,
+                message_body_size,
+                requires_response,
+                correlation_id: Some(0),
+                sender_id,
+            }
+            .into()
+        };
+        if requires_response {
+            self.send_blocking(packet, types::NULL_RESPONSE).await?;
+        } else {
+            self.send(packet)?;
+        }
+        Ok(size as i32)
+    }
+
     async fn flush_acks(&self) -> Result<()> {
         for c in self.consumers() {
             c.flush_acks(self).await?;
@@ -648,16 +733,14 @@ impl SessionInner {
                     c.handle_message(p.message, p.delivery_count, packet_size);
                 }
             }
-            // Large messages are not supported: the chunks are dropped, but
-            // their credits go back so the consumer window does not stall.
             Packet::SessionReceiveClientLargeMessage(p) => {
                 if let Some(c) = consumer(p.consumer_id) {
-                    c.discard_unsupported(self, packet_size);
+                    c.handle_large_message(p.message, p.delivery_count, packet_size);
                 }
             }
             Packet::SessionReceiveContinuationMessage(p) => {
                 if let Some(c) = consumer(p.consumer_id) {
-                    c.discard_unsupported(self, packet_size);
+                    c.handle_large_message_continuation(self, p.body, packet_size, p.continues);
                 }
             }
             Packet::SessionProducerCreditsMessage(p) => {

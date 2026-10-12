@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+flate2 = "1"
 saranga-buffer = { path = "../saranga-buffer" }
 saranga-core-protocol = { path = "../saranga-core-protocol" }
 saranga-message = { path = "../saranga-message" }
@@ -13,4 +14,5 @@ thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
+saranga-server = { path = "../saranga-server" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }

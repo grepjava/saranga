@@ -10,6 +10,7 @@ use saranga_client::message::{self, MessageExt};
 use saranga_client::*;
 use saranga_core_protocol::packets::cluster::*;
 use saranga_core_protocol::packets::connection::*;
+use saranga_core_protocol::packets::large::*;
 use saranga_core_protocol::packets::message::*;
 use saranga_core_protocol::packets::session::*;
 use saranga_core_protocol::{Context, Direction, HANDSHAKE, Packet, read_frame};
@@ -215,6 +216,9 @@ fn broker_reply(ch: i64, p: &Packet) -> Vec<(i64, Packet)> {
         }
         Packet::SessionSendMessageV3(s) if s.requires_response => {
             vec![(ch, null_response(s.correlation_id))]
+        }
+        Packet::SessionSendContinuationMessageV3(s) if s.requires_response => {
+            vec![(ch, null_response(s.correlation_id.unwrap_or(-1)))]
         }
         Packet::SessionAcknowledgeMessage(a) if a.requires_response => {
             vec![(ch, null_response(-1))]
@@ -851,21 +855,241 @@ async fn producer_flow_control_off_and_address_full() {
     assert_eq!(err.kind(), Some(ErrorType::AddressFull), "{err}");
 }
 
+/// The next continuation chunk: (body, continues, message body size,
+/// requires response).
+async fn next_chunk(fake: &mut Fake) -> (Vec<u8>, bool, i64, bool) {
+    match fake.next().await {
+        (10, Packet::SessionSendContinuationMessageV3(c)) => {
+            assert_eq!(c.sender_id, 1);
+            (
+                c.body,
+                c.continues,
+                c.message_body_size,
+                c.requires_response,
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 #[tokio::test]
-async fn large_messages_are_rejected() {
+async fn large_messages_are_sent_in_chunks() {
     let (conn, mut fake) = setup().await;
-    let session = open_session(&conn, &mut fake, SessionOptions::default()).await;
+    let options = SessionOptions {
+        producer_window_size: -1,
+        min_large_message_size: 1024,
+        ..SessionOptions::default()
+    };
+    let session = open_session(&conn, &mut fake, options).await;
     let producer = session.create_producer(Some("q")).await.unwrap();
-    // 4 + body > min-large-message-size (100 KiB).
-    let err = producer
-        .send(message::bytes_message(&vec![0u8; 102_400 - 3]))
-        .await
-        .unwrap_err();
-    assert!(matches!(err, Error::LargeMessage { .. }), "{err}");
+    let _create = fake.next().await;
+
+    // 4 + body <= min-large-message-size: a regular send.
     producer
-        .send(message::bytes_message(&vec![0u8; 102_400 - 4]))
+        .send(message::bytes_message(&[7; 1020]))
         .await
         .unwrap();
+    assert!(matches!(
+        fake.next().await,
+        (10, Packet::SessionSendMessageV3(_))
+    ));
+
+    // The headers, then chunks of 1024 bytes; only the last one (durable,
+    // so blocking) asks for a response and carries the body size.
+    let body: Vec<u8> = (0..2500u32).map(|i| i as u8).collect();
+    let mut m = message::bytes_message(&body);
+    m.put_string_property("p", "v");
+    producer.send(m).await.unwrap();
+    match fake.next().await {
+        (10, Packet::SessionSendLargeMessage(l)) => {
+            assert!(l.message.body.is_empty());
+            assert_eq!(l.message.address.as_ref().unwrap().to_string(), "q");
+            assert_eq!(l.message.string_property("p").as_deref(), Some("v"));
+            assert_eq!(l.message.property(message::HDR_LARGE_COMPRESSED), None);
+        }
+        other => panic!("{other:?}"),
+    }
+    let mut received = Vec::new();
+    for _ in 0..2 {
+        let (chunk, continues, _, requires_response) = next_chunk(&mut fake).await;
+        assert_eq!(chunk.len(), 1024);
+        assert!(continues && !requires_response);
+        received.extend(chunk);
+    }
+    let (chunk, continues, size, requires_response) = next_chunk(&mut fake).await;
+    assert_eq!((chunk.len(), continues, size), (452, false, 2500));
+    assert!(requires_response);
+    received.extend(chunk);
+    assert_eq!(received, body);
+
+    // A multiple of the chunk size ends with an empty last chunk, as Java
+    // reads the body until end of stream. Non-durable: nothing blocks.
+    let mut m = message::bytes_message(&[1; 2048]);
+    m.set_durable(false);
+    producer.send(m).await.unwrap();
+    assert!(matches!(
+        fake.next().await,
+        (10, Packet::SessionSendLargeMessage(_))
+    ));
+    for _ in 0..2 {
+        let (chunk, continues, _, _) = next_chunk(&mut fake).await;
+        assert_eq!((chunk.len(), continues), (1024, true));
+    }
+    let (chunk, continues, size, requires_response) = next_chunk(&mut fake).await;
+    assert_eq!((chunk.len(), continues, size), (0, false, 2048));
+    assert!(!requires_response);
+
+    // Headers of min-large-message-size or more are refused, nothing sent.
+    let mut m = message::bytes_message(&[0; 2000]);
+    m.put_string_property("big", &"x".repeat(600));
+    let err = producer.send(m).await.unwrap_err();
+    assert_eq!(err.kind(), Some(ErrorType::IllegalState), "{err}");
+    assert!(err.to_string().contains("AMQ219022"), "{err}");
+    fake.assert_quiet().await;
+}
+
+#[tokio::test]
+async fn compressed_large_messages() {
+    let (conn, mut fake) = setup().await;
+    let options = SessionOptions {
+        producer_window_size: -1,
+        min_large_message_size: 1024,
+        compress_large_messages: true,
+        ..SessionOptions::default()
+    };
+    let session = open_session(&conn, &mut fake, options).await;
+    let producer = session.create_producer(Some("q")).await.unwrap();
+    let _create = fake.next().await;
+
+    // Compressed below the minimum: a regular message with its real size.
+    producer
+        .send(message::bytes_message(&[b'a'; 10_000]))
+        .await
+        .unwrap();
+    match fake.next().await {
+        (10, Packet::SessionSendMessageV3(s)) => {
+            let m = s.message;
+            assert!(m.body.len() < 1024);
+            assert_eq!(
+                m.property(message::HDR_LARGE_COMPRESSED),
+                Some(&PropertyValue::Bool(true))
+            );
+            assert_eq!(
+                m.property(message::HDR_LARGE_BODY_SIZE),
+                Some(&PropertyValue::Long(10_000))
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Still large once compressed: chunks of compressed bytes, and the
+    // uncompressed size on the last one.
+    let mut x = 0x2545_f491u32;
+    let noise: Vec<u8> = (0..5000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect();
+    producer.send(message::bytes_message(&noise)).await.unwrap();
+    match fake.next().await {
+        (10, Packet::SessionSendLargeMessage(l)) => assert_eq!(
+            l.message.property(message::HDR_LARGE_COMPRESSED),
+            Some(&PropertyValue::Bool(true))
+        ),
+        other => panic!("{other:?}"),
+    }
+    let mut compressed = 0;
+    loop {
+        let (chunk, continues, size, _) = next_chunk(&mut fake).await;
+        compressed += chunk.len();
+        if !continues {
+            assert_eq!(size, 5000);
+            break;
+        }
+        assert_eq!(chunk.len(), 1024);
+    }
+    assert!(compressed > 1024);
+}
+
+#[tokio::test]
+async fn large_messages_are_received_whole() {
+    let (conn, mut fake) = setup().await;
+    let session = open_session(&conn, &mut fake, SessionOptions::default()).await;
+    session.start().await.unwrap();
+    let _start = fake.next().await;
+    let consumer = session
+        .create_consumer_with(
+            "q",
+            ConsumerOptions {
+                window_size: Some(4096),
+                ..ConsumerOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let _create = fake.next().await;
+    assert_eq!(flow_credits(&fake.next().await.1), 4096);
+
+    let body: Vec<u8> = (0..2500u32).map(|i| (i % 251) as u8).collect();
+    let mut m = message::bytes_message(&[]);
+    m.message_id = 42;
+    m.put_string_property("p", "v");
+    let header: Packet = SessionReceiveLargeMessage {
+        consumer_id: 0,
+        delivery_count: 1,
+        large_message_size: body.len() as i64,
+        message: m,
+    }
+    .into();
+    let header_size = frame(10, &header).len() as i32;
+    let chunk = |range: std::ops::Range<usize>, continues| -> Packet {
+        SessionReceiveContinuationMessage {
+            body: body[range].to_vec(),
+            continues,
+            consumer_id: 0,
+        }
+        .into()
+    };
+    let chunk_size = frame(10, &chunk(0..1000, true)).len() as i32;
+    fake.send(10, header);
+    fake.send(10, chunk(0..1000, true));
+    fake.send(10, chunk(1000..2000, true));
+    // Not read yet: the chunks' credits are held.
+    fake.assert_quiet().await;
+    assert_eq!(consumer.buffered(), 1);
+
+    let receive = tokio::spawn(async move {
+        let d = consumer.receive(WAIT).await.unwrap().unwrap();
+        (consumer, d)
+    });
+    // Taken: the header, then the chunks held (past the 2048 client window).
+    assert_eq!(
+        flow_credits(&fake.next().await.1),
+        header_size + 2 * chunk_size
+    );
+    fake.send(10, chunk(2000..2500, false));
+    let (consumer, d) = receive.await.unwrap();
+    assert_eq!(d.message_id(), 42);
+    assert_eq!(d.message.body, body);
+    assert_eq!(d.message.string_property("p").as_deref(), Some("v"));
+    assert_eq!(d.message.address.as_ref().unwrap().to_string(), "q");
+    assert_eq!(d.flow_control_size(), header_size);
+    assert!(d.encode_size() > 2500);
+
+    // A regular message after it arrives in order.
+    fake.send(10, delivery(0, 43, "after", 4));
+    let d = consumer.receive(WAIT).await.unwrap().unwrap();
+    assert_eq!(d.message.text().unwrap().as_deref(), Some("after"));
+
+    // A continuation with no large message in progress: credits go back.
+    fake.send(10, chunk(0..1000, false));
+    fake.assert_quiet().await;
+    fake.send(10, chunk(0..1000, false));
+    let credits = flow_credits(&fake.next().await.1);
+    assert!(credits >= 2048, "{credits}");
 }
 
 #[tokio::test]

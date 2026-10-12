@@ -9,6 +9,10 @@
 //! reaches the client window the whole amount is sent back. With window 0
 //! (slow consumer) each `receive` first sends 1 credit, and the credits
 //! returned for the message are one less to make up for it.
+//!
+//! A large message counts its header packet when `receive` takes it (never
+//! discounted, as its chunks follow), then each chunk as its body is read
+//! (see [`crate::large`]).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -26,7 +30,8 @@ use tokio::time::Instant;
 
 use crate::defaults;
 use crate::error::{Error, Result};
-use crate::message::MessageExt;
+use crate::large::{self, LargeMessageController};
+use crate::message::{self, HDR_LARGE_BODY_SIZE, HDR_LARGE_COMPRESSED, MessageExt};
 use crate::session::{QueueQuery, SessionInner};
 
 /// `ClientConsumerImpl.NUM_PRIORITIES`.
@@ -66,6 +71,8 @@ pub struct Delivery {
     flow_control_size: i32,
     encode_size: i32,
     forced_delivery_seq: Option<i64>,
+    /// The body of a large message, until `receive` has read it.
+    large: Option<Arc<LargeMessageController>>,
 }
 
 impl Delivery {
@@ -95,6 +102,9 @@ struct ConsumerState {
     last_acked: Option<i64>,
     ack_individually: bool,
     force_delivery_count: i64,
+    /// The large message whose chunks are arriving
+    /// (`currentLargeMessageController`).
+    current_large: Option<Arc<LargeMessageController>>,
 }
 
 impl ConsumerState {
@@ -153,6 +163,7 @@ impl ConsumerShared {
                 last_acked: None,
                 ack_individually: false,
                 force_delivery_count: 0,
+                current_large: None,
             }),
             notify: Notify::new(),
         }
@@ -162,12 +173,84 @@ impl ConsumerShared {
         self.state.lock().expect("consumer")
     }
 
-    /// `ClientConsumerImpl.handleRegularMessage`.
+    /// `ClientConsumerImpl.handleMessage`.
     pub(crate) fn handle_message(&self, mut message: CoreMessage, delivery_count: i32, size: i32) {
         let mut st = self.state();
         if st.closing {
             return;
         }
+        // The message buffer is the frame minus its header and the trailing
+        // consumer ID and delivery count (`copyMessageBuffer`).
+        let mut encode_size = size - FRAME_HEADER_SIZE as i32 - 12;
+        // handleCompressedMessageSentAsRegular: a large body that compressed
+        // below the minimum. Its credits stay those of a regular message.
+        if is_compressed(&message) && inflate_body(&mut message) {
+            encode_size = full_encode_size(&message);
+        }
+        self.handle_regular_message(&mut st, message, delivery_count, size, encode_size, None);
+    }
+
+    /// `ClientConsumerImpl.handleLargeMessage`: the headers are queued at
+    /// once; the body follows in continuation packets.
+    pub(crate) fn handle_large_message(
+        &self,
+        message: CoreMessage,
+        delivery_count: i32,
+        size: i32,
+    ) {
+        let mut st = self.state();
+        if st.closing {
+            return;
+        }
+        let controller = Arc::new(LargeMessageController::default());
+        st.current_large = Some(controller.clone());
+        // ClientLargeMessageImpl.getEncodeSize, until the body is read.
+        let encode_size = 4 + 4 + message::headers_and_properties_encode_size(&message);
+        self.handle_regular_message(
+            &mut st,
+            message,
+            delivery_count,
+            size,
+            encode_size,
+            Some(controller),
+        );
+    }
+
+    /// `ClientConsumerImpl.handleLargeMessageContinuation`.
+    pub(crate) fn handle_large_message_continuation(
+        &self,
+        session: &SessionInner,
+        chunk: Vec<u8>,
+        size: i32,
+        continues: bool,
+    ) {
+        let mut st = self.state();
+        if st.closing {
+            return;
+        }
+        let Some(controller) = st.current_large.clone() else {
+            // No message to add to: the credits go straight back.
+            self.flow_control(&mut st, session, size, false);
+            return;
+        };
+        if !continues {
+            st.current_large = None;
+        }
+        if let Some((credits, discount)) = controller.add_packet(chunk, size, continues) {
+            self.flow_control(&mut st, session, credits, discount);
+        }
+    }
+
+    /// `ClientConsumerImpl.handleRegularMessage`.
+    fn handle_regular_message(
+        &self,
+        st: &mut ConsumerState,
+        mut message: CoreMessage,
+        delivery_count: i32,
+        size: i32,
+        encode_size: i32,
+        large: Option<Arc<LargeMessageController>>,
+    ) {
         if message.address.is_none() {
             message.address = self.queue_info.address.as_deref().map(Into::into);
         }
@@ -181,24 +264,46 @@ impl ConsumerShared {
             st.ack_individually = true;
         }
         let priority = (message.priority as usize).min(NUM_PRIORITIES - 1);
-        // The message buffer is the frame minus its header and the trailing
-        // consumer ID and delivery count (`copyMessageBuffer`).
-        let encode_size = size - FRAME_HEADER_SIZE as i32 - 12;
         st.buffer[priority].push_back(Delivery {
             message,
             delivery_count,
             flow_control_size: size,
             encode_size,
             forced_delivery_seq,
+            large,
         });
-        drop(st);
         self.notify.notify_waiters();
     }
 
-    /// A large message (not supported): returns its credits and drops it.
-    pub(crate) fn discard_unsupported(&self, session: &SessionInner, size: i32) {
-        let mut st = self.state();
-        self.flow_control(&mut st, session, size, false);
+    /// `ClientLargeMessageImpl.checkBuffer` (`saveBuffer`): gives back the
+    /// credits of the chunks that came so far, waits for the rest of the
+    /// body and inflates it if it was compressed.
+    async fn read_large_body(
+        &self,
+        session: &SessionInner,
+        d: &mut Delivery,
+        controller: &LargeMessageController,
+    ) -> Result<()> {
+        if let Some((credits, discount)) = controller.start_reading(false) {
+            self.flow_control(&mut self.state(), session, credits, discount);
+        }
+        d.message.body = controller
+            .wait_completion(session.conn.call_timeout)
+            .await?;
+        if is_compressed(&d.message) {
+            inflate_body(&mut d.message);
+        }
+        d.encode_size = full_encode_size(&d.message);
+        Ok(())
+    }
+
+    /// `resetLargeMessageController`: cancels the message whose chunks are
+    /// arriving, giving back the credits of those not read.
+    fn reset_large_message_controller(&self, st: &mut ConsumerState, session: &SessionInner) {
+        if let Some(controller) = st.current_large.take() {
+            let credits = controller.cancel();
+            self.flow_control(st, session, credits, false);
+        }
     }
 
     /// `ClientConsumerImpl.flowControl`.
@@ -233,8 +338,9 @@ impl ConsumerShared {
         session: &SessionInner,
         d: &Delivery,
     ) {
+        // A large message's chunks follow, so its header is not discounted.
         if d.flow_control_size != 0 {
-            self.flow_control(st, session, d.flow_control_size, true);
+            self.flow_control(st, session, d.flow_control_size, d.large.is_none());
         }
     }
 
@@ -328,7 +434,7 @@ impl ConsumerShared {
                 continue;
             }
 
-            let Some(m) = m else {
+            let Some(mut m) = m else {
                 self.reset_if_slow_consumer(session);
                 return Ok(None);
             };
@@ -346,6 +452,12 @@ impl ConsumerShared {
             let expired = m.message.is_expired();
             self.flow_control_before_consumption(&mut self.state(), session, &m);
             if expired {
+                // discardBody: the chunks are consumed and dropped.
+                if let Some(controller) = m.large.take()
+                    && let Some((credits, discount)) = controller.start_reading(true)
+                {
+                    self.flow_control(&mut self.state(), session, credits, discount);
+                }
                 session.expire(self.id, m.message.message_id)?;
                 if self.client_window_size == 0 {
                     self.start_slow_consumer(session);
@@ -354,6 +466,9 @@ impl ConsumerShared {
                     continue;
                 }
                 return Ok(None);
+            }
+            if let Some(controller) = m.large.take() {
+                self.read_large_body(session, &mut m, &controller).await?;
             }
             return Ok(Some(m));
         }
@@ -432,8 +547,13 @@ impl ConsumerShared {
         let mut st = self.state();
         let buffered: Vec<Delivery> = st.buffer.iter_mut().flat_map(|q| q.drain(..)).collect();
         for d in &buffered {
+            if let Some(controller) = &d.large {
+                let credits = controller.cancel();
+                self.flow_control(&mut st, session, credits, false);
+            }
             self.flow_control_before_consumption(&mut st, session, d);
         }
+        self.reset_large_message_controller(&mut st, session);
     }
 
     /// `ClientConsumerImpl.doCleanUp(true)`: errors are swallowed.
@@ -445,6 +565,7 @@ impl ConsumerShared {
             }
             st.closing = true;
             st.closed = true;
+            self.reset_large_message_controller(&mut st, session);
         }
         self.notify.notify_waiters();
         let _ = self.flush_acks(session).await;
@@ -467,6 +588,9 @@ impl ConsumerShared {
             let mut st = self.state();
             st.failure = Some(err.clone());
             st.closed = true;
+            if let Some(controller) = st.current_large.take() {
+                controller.cancel();
+            }
         }
         self.notify.notify_waiters();
     }
@@ -566,4 +690,36 @@ impl Consumer {
     pub async fn close(&self) {
         self.shared.close(&self.session).await
     }
+}
+
+/// `ClientMessageImpl.isCompressed`: `_AMQ_LARGE_COMPRESSED` is true.
+fn is_compressed(message: &CoreMessage) -> bool {
+    matches!(
+        message.property(HDR_LARGE_COMPRESSED),
+        Some(PropertyValue::Bool(true))
+    )
+}
+
+/// Inflates a compressed body in place and clears `_AMQ_LARGE_COMPRESSED`
+/// (`unsetCompressionPropertyIfNeeded`). A body that does not inflate is
+/// left as it came, still marked compressed. Returns whether it inflated.
+fn inflate_body(message: &mut CoreMessage) -> bool {
+    let size_hint = match message.property(HDR_LARGE_BODY_SIZE) {
+        Some(PropertyValue::Long(n)) => (*n).clamp(0, i32::MAX as i64) as usize,
+        _ => 0,
+    };
+    match large::inflate(&message.body, size_hint) {
+        Ok(body) => {
+            message.body = body;
+            message.put_property(HDR_LARGE_COMPRESSED, PropertyValue::Bool(false));
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// `CoreMessage.getEncodeSize` of a message holding its whole body: the
+/// end-of-body position, the body, then headers and properties.
+fn full_encode_size(message: &CoreMessage) -> i32 {
+    4 + message.body.len() as i32 + message::headers_and_properties_encode_size(message)
 }

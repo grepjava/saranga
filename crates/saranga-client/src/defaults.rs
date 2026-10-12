@@ -11,6 +11,10 @@ pub const CONNECTION_TTL: Duration = Duration::from_millis(60_000);
 pub const CALL_TIMEOUT: Duration = Duration::from_millis(30_000);
 /// `DEFAULT_MIN_LARGE_MESSAGE_SIZE` (100 KiB).
 pub const MIN_LARGE_MESSAGE_SIZE: i32 = 100 * 1024;
+/// `DEFAULT_COMPRESS_LARGE_MESSAGES`.
+pub const COMPRESS_LARGE_MESSAGES: bool = false;
+/// `DEFAULT_COMPRESSION_LEVEL`: -1, `Deflater.DEFAULT_COMPRESSION`.
+pub const COMPRESSION_LEVEL: i32 = -1;
 /// `DEFAULT_CONSUMER_WINDOW_SIZE` (1 MiB).
 pub const CONSUMER_WINDOW_SIZE: i32 = 1024 * 1024;
 /// `DEFAULT_CONFIRMATION_WINDOW_SIZE`: -1, no resend cache.

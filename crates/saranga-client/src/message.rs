@@ -33,6 +33,10 @@ pub const HDR_DUPLICATE_DETECTION_ID: &str = "_AMQ_DUPL_ID";
 pub const HDR_SCHEDULED_DELIVERY_TIME: &str = "_AMQ_SCHED_DELIVERY";
 /// `Message.HDR_GROUP_ID`.
 pub const HDR_GROUP_ID: &str = "_AMQ_GROUP_ID";
+/// `Message.HDR_LARGE_COMPRESSED`: the body is zlib-compressed.
+pub const HDR_LARGE_COMPRESSED: &str = "_AMQ_LARGE_COMPRESSED";
+/// `Message.HDR_LARGE_BODY_SIZE`: the (uncompressed) size of a large body.
+pub const HDR_LARGE_BODY_SIZE: &str = "_AMQ_LARGE_SIZE";
 
 /// The default JMS and Core priority.
 pub const DEFAULT_PRIORITY: u8 = 4;
@@ -42,6 +46,13 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// `CoreMessage.getHeadersAndPropertiesEncodeSize`.
+pub(crate) fn headers_and_properties_encode_size(message: &CoreMessage) -> i32 {
+    let mut w = Writer::new();
+    message.encode_headers_and_properties(&mut w);
+    w.len() as i32
 }
 
 /// `ClientSession.createMessage(type, durable)`: timestamp now, priority 4,

@@ -23,15 +23,6 @@ pub enum Error {
     /// A frame from the broker did not decode.
     #[error("decode error: {0}")]
     Decode(#[from] DecodeError),
-    /// The message would be sent as a large message, which this client does
-    /// not support (see [`crate::Producer::send`]).
-    #[error(
-        "message body of {body_size} bytes exceeds min-large-message-size {min_large_message_size}; large messages are not supported"
-    )]
-    LargeMessage {
-        body_size: usize,
-        min_large_message_size: i32,
-    },
     /// A broker answer of a type the call did not expect.
     #[error("unexpected response packet {0}")]
     UnexpectedResponse(&'static str),
@@ -130,6 +121,32 @@ impl Error {
         Self::amq(
             ErrorType::AddressFull,
             format!("AMQ219058: Address \"{address}\" is full. Message encode size = {size}B"),
+        )
+    }
+
+    /// `ActiveMQClientMessageBundle.headerSizeTooBig`.
+    pub(crate) fn header_size_too_big(header_size: i32) -> Self {
+        Self::amq(
+            ErrorType::IllegalState,
+            format!(
+                "AMQ219022: Header size ({header_size}) is too big, use the messageBody for large data, or increase minLargeMessageSize"
+            ),
+        )
+    }
+
+    /// `ActiveMQClientMessageBundle.timeoutOnLargeMessage`.
+    pub(crate) fn timeout_on_large_message() -> Self {
+        Self::amq(
+            ErrorType::LargeMessageErrorBody,
+            "AMQ219028: Timeout waiting for LargeMessage Body",
+        )
+    }
+
+    /// `ActiveMQClientMessageBundle.largeMessageInterrupted`.
+    pub(crate) fn large_message_interrupted() -> Self {
+        Self::amq(
+            ErrorType::LargeMessageInterrupted,
+            "AMQ219060: Large Message Transmission interrupted on consumer shutdown.",
         )
     }
 }

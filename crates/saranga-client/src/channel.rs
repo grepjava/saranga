@@ -120,6 +120,8 @@ pub(crate) fn correlation_id(packet: &Packet) -> i64 {
         Packet::ActiveMQExceptionMessageV2(p) => p.correlation_id.unwrap_or(-1),
         Packet::SessionSendMessageV2(p) => p.correlation_id,
         Packet::SessionSendMessageV3(p) => p.correlation_id,
+        Packet::SessionSendContinuationMessageV2(p) => p.correlation_id.unwrap_or(-1),
+        Packet::SessionSendContinuationMessageV3(p) => p.correlation_id.unwrap_or(-1),
         Packet::SessionCommitMessageV2(p) => p.correlation_id.unwrap_or(-1),
         _ => -1,
     }
@@ -130,6 +132,8 @@ pub(crate) fn set_correlation_id(packet: &mut Packet, id: i64) {
     match packet {
         Packet::SessionSendMessageV2(p) => p.correlation_id = id,
         Packet::SessionSendMessageV3(p) => p.correlation_id = id,
+        Packet::SessionSendContinuationMessageV2(p) => p.correlation_id = Some(id),
+        Packet::SessionSendContinuationMessageV3(p) => p.correlation_id = Some(id),
         Packet::SessionCommitMessageV2(p) => p.correlation_id = Some(id),
         _ => {}
     }

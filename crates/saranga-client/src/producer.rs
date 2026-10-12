@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use saranga_buffer::{SimpleString, Writer};
+use saranga_buffer::{PropertyValue, SimpleString, Writer};
 use saranga_core_protocol::packets::session::{
     RemoveProducerMessage, SessionRequestProducerCreditsMessage,
 };
@@ -21,6 +21,8 @@ use saranga_message::CoreMessage;
 use tokio::sync::Notify;
 
 use crate::error::{Error, Result};
+use crate::large;
+use crate::message::{self, HDR_LARGE_BODY_SIZE, HDR_LARGE_COMPRESSED, MessageExt};
 use crate::session::SessionInner;
 
 /// `ClientProducerCreditManagerImpl.MAX_ANONYMOUS_CREDITS_CACHE_SIZE`.
@@ -343,9 +345,10 @@ impl Producer {
     /// and it blocks on non-durable sends. It first waits for producer
     /// credits for the message's encode size.
     ///
-    /// Messages whose body exceeds `min_large_message_size` would have to be
-    /// streamed as large messages, which is not supported: they fail with
-    /// [`Error::LargeMessage`] and nothing is sent.
+    /// A message whose body exceeds the session's `min_large_message_size`
+    /// is sent as a large message: its headers and properties, then its
+    /// body in chunks of `min_large_message_size` bytes, compressed first
+    /// when the session compresses large messages.
     pub async fn send(&self, message: CoreMessage) -> Result<()> {
         self.do_send(None, message).await
     }
@@ -356,7 +359,7 @@ impl Producer {
         self.do_send(Some(address.into()), message).await
     }
 
-    /// `ClientProducerImpl.doSend` and `sendRegularMessage`.
+    /// `ClientProducerImpl.doSend`.
     async fn do_send(&self, address: Option<SimpleString>, mut message: CoreMessage) -> Result<()> {
         if self.is_closed() {
             return Err(Error::producer_closed());
@@ -367,13 +370,8 @@ impl Producer {
             .or_else(|| self.shared.address.clone())
             .ok_or_else(|| Error::InvalidArgument("no address to send to".into()))?;
         // The body buffer's writer index includes its 4-byte offset.
-        let min_large = session.options.min_large_message_size;
-        if 4 + message.body.len() as i64 > min_large as i64 {
-            return Err(Error::LargeMessage {
-                body_size: message.body.len(),
-                min_large_message_size: min_large,
-            });
-        }
+        let is_large =
+            4 + message.body.len() as i64 > session.options.min_large_message_size as i64;
         message.address = Some(address.clone());
         let credits = session
             .credits
@@ -385,6 +383,23 @@ impl Producer {
         } else {
             self.shared.block_on_non_durable_send
         };
+        if is_large {
+            self.large_message_send(message, send_blocking, credits.as_deref())
+                .await
+        } else {
+            self.send_regular_message(message, send_blocking, credits.as_deref())
+                .await
+        }
+    }
+
+    /// `ClientProducerImpl.sendRegularMessage`.
+    async fn send_regular_message(
+        &self,
+        message: CoreMessage,
+        send_blocking: bool,
+        credits: Option<&ProducerCredits>,
+    ) -> Result<()> {
+        let session = &self.session;
         // getCreditsOnSendingFull: the message's encode size.
         let mut w = Writer::new();
         message.encode(&mut w);
@@ -394,6 +409,76 @@ impl Producer {
         session
             .send_full_message(message, send_blocking, self.shared.id)
             .await
+    }
+
+    /// `ClientProducerImpl.largeMessageSend`, `largeMessageSendBuffered` and
+    /// `largeMessageSendStreamed`: the header, then the body in chunks of
+    /// `min_large_message_size`, each sent and then paid for in credits. As
+    /// Java reads the body until end of stream, a body that is a multiple
+    /// of the chunk size ends with an empty last chunk.
+    async fn large_message_send(
+        &self,
+        mut message: CoreMessage,
+        send_blocking: bool,
+        credits: Option<&ProducerCredits>,
+    ) -> Result<()> {
+        let session = &self.session;
+        let options = &session.options;
+        let header_size = message::headers_and_properties_encode_size(&message);
+        if header_size >= options.min_large_message_size {
+            return Err(Error::header_size_too_big(header_size));
+        }
+        let chunk_size = options.min_large_message_size as usize;
+        let mut body = std::mem::take(&mut message.body);
+        // The size the broker records: the bytes read from the body, before
+        // any compression.
+        let message_body_size = body.len() as i64;
+        if options.compress_large_messages {
+            message.put_property(HDR_LARGE_COMPRESSED, PropertyValue::Bool(true));
+            body = large::deflate(&body, options.compression_level)?;
+            // Compressed below the minimum, it is sent as a regular message
+            // carrying its real size.
+            if body.len() < chunk_size {
+                message.put_property(HDR_LARGE_BODY_SIZE, PropertyValue::Long(message_body_size));
+                message.body = body;
+                return self
+                    .send_regular_message(message, send_blocking, credits)
+                    .await;
+            }
+        }
+        // sendInitialLargeMessageHeader: the credits are taken after the send.
+        let used = session.send_initial_chunk_on_large_message(message)?;
+        if let Some(credits) = credits {
+            credits.acquire(session, used).await?;
+        }
+        let mut chunks = body.chunks_exact(chunk_size);
+        for chunk in &mut chunks {
+            let used = session
+                .send_large_message_chunk(
+                    message_body_size,
+                    send_blocking,
+                    false,
+                    chunk.to_vec(),
+                    self.shared.id,
+                )
+                .await?;
+            if let Some(credits) = credits {
+                credits.acquire(session, used).await?;
+            }
+        }
+        let used = session
+            .send_large_message_chunk(
+                message_body_size,
+                send_blocking,
+                true,
+                chunks.remainder().to_vec(),
+                self.shared.id,
+            )
+            .await?;
+        if let Some(credits) = credits {
+            credits.acquire(session, used).await?;
+        }
+        Ok(())
     }
 
     /// Closes the producer (`RemoveProducerMessage`, not blocking).

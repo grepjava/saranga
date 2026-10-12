@@ -8,10 +8,14 @@
 //! client: the same packets, in the same order, with the same blocking,
 //! correlation and flow-control rules.
 //!
-//! Not supported: large messages (sends fail with [`Error::LargeMessage`];
-//! received large messages are dropped after returning their credits), XA,
-//! a confirmation window (resend cache), failover and reconnection, and
-//! message handlers (use [`Consumer::receive`]).
+//! Large messages are sent in chunks and received whole: `receive` returns
+//! them once the last chunk arrived, their body buffered in memory (as
+//! `ClientLargeMessageImpl` does without an output stream), and inflated if
+//! compressed. Streaming bodies to and from `InputStream`/`OutputStream`
+//! is not supported.
+//!
+//! Not supported: XA, a confirmation window (resend cache), failover and
+//! reconnection, and message handlers (use [`Consumer::receive`]).
 //!
 //! ```no_run
 //! # async fn demo() -> saranga_client::Result<()> {
@@ -40,6 +44,7 @@ mod connection;
 mod consumer;
 pub mod defaults;
 mod error;
+mod large;
 pub mod message;
 mod producer;
 mod session;
