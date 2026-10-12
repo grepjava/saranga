@@ -7,12 +7,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::bail;
 use saranga_client::message::{HDR_GROUP_ID, bytes_message, new_message, text_message};
-use saranga_client::{
-    CoreMessage, MessageExt, PropertyValue, QueueConfiguration, RoutingType, message_type,
-};
+use saranga_client::{CoreMessage, MessageExt, PropertyValue, message_type};
 use saranga_server::management::json::Json;
 
-use super::jms::{Destination, JmsConnection, JmsSession, message, subscription_queue, text_or_id};
+use super::jms::{Destination, JmsConnection, JmsSession, message, text_or_id};
 use super::{Common, ConnectionArgs, UsageError};
 
 /// The text `--text-size` and `--object-size` messages are cut from
@@ -882,15 +880,9 @@ pub async fn transfer(args: TransferArgs) -> anyhow::Result<()> {
                 .or(args.shared_subscription.as_ref())
             {
                 let durable = args.shared_durable_subscription.is_some();
-                shared_consumer(
-                    &source,
-                    topic,
-                    name,
-                    durable,
-                    &source_conn,
-                    args.filter.as_deref(),
-                )
-                .await?
+                source
+                    .shared_consumer(topic, name, durable, args.filter.as_deref())
+                    .await?
             } else {
                 bail!(UsageError(
                     "you must specify either --durable-consumer, --shared-durable-subscription or --shared-subscription with a JMS topic"
@@ -970,54 +962,6 @@ pub async fn transfer(args: TransferArgs) -> anyhow::Result<()> {
     target_conn.close().await;
     source_conn.close().await;
     Ok(())
-}
-
-/// `ActiveMQSession.createSharedConsumer`: the subscription queue, made
-/// shared when it is missing or different.
-async fn shared_consumer(
-    session: &JmsSession,
-    topic: &str,
-    name: &str,
-    durable: bool,
-    conn: &JmsConnection,
-    selector: Option<&str>,
-) -> anyhow::Result<saranga_client::Consumer> {
-    let s = &session.session;
-    let filter = selector
-        .filter(|f| !f.is_empty())
-        .map(saranga_filter::translate::convert_to_activemq_filter_string);
-    let query = s.address_query(topic).await?;
-    if !query.exists && !query.auto_create_addresses {
-        bail!("Destination {topic} does not exist");
-    }
-    let escape = |s: &str| s.replace('\\', "\\\\").replace('.', "\\.");
-    let queue = match (&conn.client_id, durable) {
-        (Some(id), true) => subscription_queue(id, name),
-        (Some(id), false) => format!("nonDurable.{}.{}", escape(id), escape(name)),
-        (None, true) => escape(name),
-        (None, false) => format!("nonDurable.{}", escape(name)),
-    };
-    let sub = s.queue_query(&queue).await?;
-    if (!sub.exists
-        || sub.address.as_deref() != Some(topic)
-        || sub.filter_string.as_deref() != filter.as_deref())
-        && sub.configuration_managed != Some(true)
-    {
-        let mut config = QueueConfiguration::new(&queue)
-            .address(topic)
-            .routing_type(RoutingType::Multicast)
-            .durable(durable);
-        if let Some(f) = &filter {
-            config = config.filter(f.as_str());
-        }
-        config.max_consumers = Some(query.default_max_consumers);
-        config.purge_on_no_consumers = Some(query.default_purge_on_no_consumers);
-        match s.create_shared_queue(config).await {
-            Err(e) if e.kind() == Some(saranga_client::ErrorType::QueueExists) => {}
-            r => r?,
-        }
-    }
-    Ok(s.create_consumer(&queue, None, false).await?)
 }
 
 #[cfg(test)]

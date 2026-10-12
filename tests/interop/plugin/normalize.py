@@ -55,4 +55,6 @@ def main(path):
             print(line)
 
 
+# The same file on every platform.
+sys.stdout.reconfigure(newline="\n")
 main(sys.argv[1])

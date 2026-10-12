@@ -11,6 +11,7 @@ mod create;
 mod data;
 mod instance;
 mod logging;
+mod perf;
 mod web;
 
 use clap::{Parser, Subcommand};
@@ -103,6 +104,12 @@ enum Command {
         /// xml:${ARTEMIS_INSTANCE}/etc/bootstrap.xml.
         configuration: Option<String>,
     },
+    /// Use 'help perf' for sub commands list.
+    #[command(subcommand)]
+    Perf(perf::PerfCommand),
+    /// Calculate the journal-buffer-timeout to use with the current data
+    /// folder.
+    PerfJournal(perf::journal::PerfJournalArgs),
     /// Print version information.
     Version,
     /// Information on current folder and instance.
@@ -151,6 +158,8 @@ async fn main() -> std::process::ExitCode {
             | Command::Browser(_)
             | Command::Transfer(_)
             | Command::Check(_)
+            | Command::Perf(_)
+            | Command::PerfJournal(_)
             | Command::Stop { .. }
             | Command::Kill { .. }
             | Command::Version
@@ -201,6 +210,8 @@ async fn run_client(command: Command) -> anyhow::Result<()> {
         Command::Browser(a) => client::messages::browser(a).await,
         Command::Transfer(a) => client::messages::transfer(a).await,
         Command::Check(c) => client::check::run(c).await,
+        Command::Perf(c) => perf::run(c).await,
+        Command::PerfJournal(a) => perf::journal::run(&a),
         Command::Stop {
             broker,
             configuration,

@@ -1,0 +1,210 @@
+=== perf producer --max-pending 0 --message-count 100 --persistent queue://perfq
+--- SUMMARY
+--- aggregated send time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- result: success
+--- total blocked: N
+--- total completed: 100
+--- total sent: 100
+Connection brokerURL = tcp://N.N:N
+--- exit 0
+=== perf consumer --message-count 100 queue://perfq
+--- SUMMARY
+--- aggregated transfer time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- result: success
+--- total received: 100
+Connection brokerURL = tcp://N.N:N
+--- exit 0
+=== perf client --max-pending 0 --message-count 100 --show-latency queue://perfc
+--- SUMMARY
+--- aggregated send time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- aggregated transfer time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- result: success
+--- total blocked: N
+--- total completed: 100
+--- total received: 100
+--- total sent: 100
+Connection brokerURL = tcp://N.N:N
+--- exit 0
+=== perf producer --max-pending 0 --message-count 10 --producers 2 --num-destinations 2 queue://pn
+--- SUMMARY
+--- aggregated send time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- result: success
+--- total blocked: N
+--- total completed: 8
+--- total sent: 8
+Connection brokerURL = tcp://N.N:N
+--- exit 0
+=== perf consumer --message-count 8 queue://pn0 queue://pn1
+--- SUMMARY
+--- aggregated transfer time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- result: success
+--- total received: 8
+Connection brokerURL = tcp://N.N:N
+--- exit 0
+=== perf client --max-pending 0 --message-count 105 --commit-interval 10 --tx queue://ptx
+--- SUMMARY
+--- aggregated send time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- aggregated transfer time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- result: success
+--- total blocked: N
+--- total completed: 105
+--- total received: 105
+--- total sent: 105
+Connection brokerURL = tcp://N.N:N
+--- exit 0
+=== perf client --max-pending 0 --message-count 50 --consumers 2 topic://pt
+--- SUMMARY
+--- aggregated send time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- aggregated transfer time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- result: success
+--- total blocked: N
+--- total completed: 50
+--- total received: 100
+--- total sent: 50
+Connection brokerURL = tcp://N.N:N
+--- exit 0
+=== perf client --max-pending 0 --durable --clientID pc --message-count 50 topic://pd
+--- SUMMARY
+--- aggregated send time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- aggregated transfer time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- result: success
+--- total blocked: N
+--- total completed: 50
+--- total received: 50
+--- total sent: 50
+Connection brokerURL = tcp://N.N:N
+--- exit 0
+=== perf client --max-pending 0 --shared 2 --consumers 2 --message-count 40 topic://ps
+--- SUMMARY
+--- aggregated send time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- aggregated transfer time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- result: success
+--- total blocked: N
+--- total completed: 40
+--- total received: 80
+--- total sent: 40
+Connection brokerURL = tcp://N.N:N
+--- exit 0
+=== perf client --max-pending 0 --shared 1 --durable --clientID sd --message-count 20 topic://psd
+ [<args>...]
+--- SUMMARY
+--- aggregated send time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- aggregated transfer time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- result: success
+--- total blocked: N
+--- total completed: 20
+--- total received: 20
+--- total sent: 20
+Connection brokerURL = tcp://N.N:N
+Usage: CLI help [<args>...]
+javax.jms.IllegalStateException: Cannot unsubscribe durable subscription psdN since it has active subscribers
+use 'help <command>' for more information
+--- exit 1
+=== perf producer --max-pending 0 --duration 2 --warmup 1 --show-latency queue://pdur
+--- SUMMARY
+--- aggregated send time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- blocked: N msg/sec
+--- completed: N msg/sec
+--- result: success
+--- send ack time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- sent: N msg/sec
+--- total blocked: N
+--- total completed: N
+--- total sent: N
+--- warmup false
+Connection brokerURL = tcp://N.N:N
+--- exit 0
+=== perf consumer --duration 2 --show-latency queue://pdur
+--- SUMMARY
+--- aggregated transfer time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- received: N msg/sec
+--- result: success
+--- total received: N
+--- transfer time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- warmup false
+Connection brokerURL = tcp://N.N:N
+--- exit 0
+=== perf client --max-pending 0 --message-count 300 --rate 200 --show-latency --json <work>/r.json --hdr <work>/h.hdr topic://pr
+--- SUMMARY
+--- aggregated delay send time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- aggregated send time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- aggregated transfer time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- blocked: N msg/sec
+--- completed: N msg/sec
+--- received: N msg/sec
+--- result: success
+--- send ack time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- send delay time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- sent: N msg/sec
+--- total blocked: N
+--- total completed: 300
+--- total received: 300
+--- total sent: 300
+--- transfer time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- warmup false
+Connection brokerURL = tcp://N.N:N
+--- exit 0
+=== json
+summary totals {"totalSent": N, "totalCompleted": N, "totalReceived": N}
+{sampleType:str,time:int,result:str,totalSent:int,totalBlocked:int,totalCompleted:int,totalReceived:int,totalDelaySendTime:{mean:str,N:int,N:int,N:int,N:int,N:int,max:int,count:int},totalSendTime:{mean:str,N:int,N:int,N:int,N:int,N:int,max:int,count:int},totalTransferTime:{mean:str,N:int,N:int,N:int,N:int,N:int,max:int,count:int}}
+{sampleType:str,warmup:bool,time:int,sent:int,delayed:int,completed:int,received:int,delaySendTime:{mean:str,N:int,N:int,N:int,N:int,N:int,max:int,count:int},sendTime:{mean:str,N:int,N:int,N:int,N:int,N:int,max:int,count:int},transferTime:{mean:str,N:int,N:int,N:int,N:int,N:int,max:int,count:int}}
+=== hdr
+"StartTimestamp","Interval_Length","Interval_Max","Interval_Compressed_Histogram"
+#[Histogram log format version N]
+=== perf client --max-pending 0 --message-count 0 --duration 2 --rate 50 --clientID x queue://pid
+--- SUMMARY
+--- aggregated delay send time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- aggregated send time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- aggregated transfer time: mean: N us - N%: N us - N%: N us - N%: N us - N%: N us - N%: N us - max: N us
+--- blocked: N msg/sec
+--- completed: N msg/sec
+--- received: N msg/sec
+--- result: success
+--- sent: N msg/sec
+--- total blocked: N
+--- total completed: N
+--- total received: N
+--- total sent: N
+--- warmup false
+Connection brokerURL = tcp://N.N:N
+--- exit 0
+=== perf client --max-pending 0 --durable queue://nope
+ [<args>...]
+The clientID must be set on durable subscriptions
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+--- exit 1
+=== perf-journal --writes 20 --tries 2
+<journal-buffer-timeout>N</journal-buffer-timeout>
+Auto tuning journal ...
+Performing N tests writing N blocks of N on each test, sync=true with journalType = NIO
+You should use this following configuration:
+Your journal-buffer-timeout should be:N
+Your system can execute N writes per millisecond
+--- exit 0
+=== perf-journal --writes 20 --tries 2 --verbose --no-sync --sync-writes --journal-type ASYNCIO
+*** Notice: The recommendation for AsyncIO journal is to not use --sync-writes ***
+*** The measures here will be useful to understand your device ***
+*** however the result here won't represent the best configuration option ***
+**************************************************
+*******************************************************************************************
+<journal-buffer-timeout>N</journal-buffer-timeout>
+Auto tuning journal ...
+Blocks per millisecond::N
+N of N calculation
+Performing N tests writing N blocks of N on each test, sync=false with journalType = ASYNCIO
+Time = N milliseconds
+Using org.apache.activemq.artemis.core.io.nio.NIOSequentialFileFactory to calculate sync times, alignment=N
+Writes / millisecond = N
+You should use this following configuration:
+Your journal-buffer-timeout should be:N
+Your system can execute N writes per millisecond
+bufferTimeout = N
+your system could make a sync every N nanoseconds, and this will be your timeout
+--- exit 0
+=== perf-journal --journal-type nope
+ [<args>...]
+Invalid JournalType:nope valid Types: NIO,ASYNCIO,MAPPED
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+--- exit 1

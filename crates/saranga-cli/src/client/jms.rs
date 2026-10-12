@@ -143,6 +143,33 @@ impl JmsConnection {
             },
             ..SessionOptions::default()
         };
+        self.jms_session(options, transacted).await
+    }
+
+    /// A session whose sends do not block, as a JMS producer sending with
+    /// a `CompletionListener` does.
+    pub async fn async_send_session(&self, transacted: bool) -> anyhow::Result<JmsSession> {
+        let options = SessionOptions {
+            username: self.user.clone(),
+            password: self.password.clone(),
+            auto_commit_sends: !transacted,
+            auto_commit_acks: !transacted,
+            ack_batch_size: if transacted {
+                TRANSACTION_BATCH_SIZE
+            } else {
+                0
+            },
+            block_on_durable_send: false,
+            ..SessionOptions::default()
+        };
+        self.jms_session(options, transacted).await
+    }
+
+    async fn jms_session(
+        &self,
+        options: SessionOptions,
+        transacted: bool,
+    ) -> anyhow::Result<JmsSession> {
         let session = self.conn.create_session(options).await?;
         session.add_metadata(JMS_SESSION, "").await?;
         if let Some(id) = &self.client_id {
@@ -152,7 +179,14 @@ impl JmsConnection {
             session,
             transacted,
             conn_id: self.conn_id.clone(),
+            client_id: self.client_id.clone(),
         })
+    }
+
+    /// `close`, for a connection that is shared.
+    pub async fn shutdown(&self) {
+        self.initial.close().await;
+        self.conn.close().await;
     }
 
     /// The user and password the connection was made with.
@@ -179,17 +213,34 @@ impl std::fmt::Display for ConnectFailed {
 impl std::error::Error for ConnectFailed {}
 
 /// An `ActiveMQSession` in `AUTO_ACKNOWLEDGE` or `SESSION_TRANSACTED` mode.
+#[derive(Clone)]
 pub struct JmsSession {
     pub session: Session,
     pub transacted: bool,
     conn_id: String,
+    client_id: Option<String>,
 }
 
 /// `ActiveMQDestination.createQueueNameForSubscription` for a durable
 /// subscription: `<clientID>.<name>`, each with `\` and `.` escaped.
 pub fn subscription_queue(client_id: &str, name: &str) -> String {
-    let escape = |s: &str| s.replace('\\', "\\\\").replace('.', "\\.");
     format!("{}.{}", escape(client_id), escape(name))
+}
+
+/// `DestinationUtil.escape`.
+fn escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('.', "\\.")
+}
+
+/// `DestinationUtil.createQueueNameForSubscription`: the queue of a
+/// (shared or not) subscription.
+pub fn subscription_queue_name(durable: bool, client_id: Option<&str>, name: &str) -> String {
+    match (client_id, durable) {
+        (Some(id), true) => subscription_queue(id, name),
+        (Some(id), false) => format!("nonDurable.{}.{}", escape(id), escape(name)),
+        (None, true) => escape(name),
+        (None, false) => format!("nonDurable.{}", escape(name)),
+    }
 }
 
 impl JmsSession {
@@ -280,21 +331,102 @@ impl JmsSession {
         &self,
         producer: &Producer,
         dest: &Destination,
+        message: CoreMessage,
+        persistent: bool,
+        ttl: i64,
+    ) -> anyhow::Result<CoreMessage> {
+        self.send_with(producer, dest, message, persistent, ttl, true, true)
+            .await
+    }
+
+    /// `doSendx` of a producer that may disable the message ID and the
+    /// timestamp (`setDisableMessageID`, `setDisableMessageTimestamp`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_with(
+        &self,
+        producer: &Producer,
+        dest: &Destination,
         mut message: CoreMessage,
         persistent: bool,
         ttl: i64,
+        message_id: bool,
+        timestamp: bool,
     ) -> anyhow::Result<CoreMessage> {
         let now = now_millis();
         message
             .set_durable(persistent)
             .set_priority(DEFAULT_PRIORITY)
             .set_expiration(if ttl == 0 { 0 } else { now + ttl })
-            .set_timestamp(now)
-            .set_new_user_id()
+            .set_timestamp(if timestamp { now } else { 0 });
+        if message_id {
+            message.set_new_user_id();
+        } else {
+            message.set_user_id(None);
+        }
+        message
             .put_string_property(CONNECTION_ID, &self.conn_id)
             .set_routing_type(dest.routing_type());
         producer.send(message.clone()).await?;
         Ok(message)
+    }
+
+    /// `ActiveMQSession.createSharedConsumer` / `createSharedDurableConsumer`:
+    /// the subscription's queue, made shared when it is missing or
+    /// different.
+    pub async fn shared_consumer(
+        &self,
+        topic: &str,
+        name: &str,
+        durable: bool,
+        selector: Option<&str>,
+    ) -> anyhow::Result<Consumer> {
+        let s = &self.session;
+        let filter = selector
+            .filter(|f| !f.is_empty())
+            .map(saranga_filter::translate::convert_to_activemq_filter_string);
+        let query = s.address_query(topic).await?;
+        if !query.exists && !query.auto_create_addresses {
+            bail!("Destination {topic} does not exist");
+        }
+        let queue = subscription_queue_name(durable, self.client_id.as_deref(), name);
+        let sub = s.queue_query(&queue).await?;
+        if (!sub.exists
+            || sub.address.as_deref() != Some(topic)
+            || sub.filter_string.as_deref() != filter.as_deref())
+            && sub.configuration_managed != Some(true)
+        {
+            let config = self.queue_config(
+                &queue,
+                topic,
+                RoutingType::Multicast,
+                filter.as_deref(),
+                durable,
+                &query,
+            );
+            ignore_exists(s.create_shared_queue(config).await)?;
+        }
+        Ok(s.create_consumer(&queue, None, false).await?)
+    }
+
+    /// `ActiveMQSession.unsubscribe`: the durable subscription's queue
+    /// deleted, unless it has consumers. Its errors read as the JMS
+    /// exceptions' `toString`.
+    pub async fn unsubscribe(&self, name: &str) -> anyhow::Result<()> {
+        let queue = subscription_queue_name(true, self.client_id.as_deref(), name);
+        let s = &self.session;
+        let response = s.queue_query(&queue).await?;
+        if !response.exists {
+            bail!(
+                "javax.jms.InvalidDestinationException: Cannot unsubscribe, subscription with name {name} does not exist"
+            );
+        }
+        if response.consumer_count != 0 {
+            bail!(
+                "javax.jms.IllegalStateException: Cannot unsubscribe durable subscription {name} since it has active subscribers"
+            );
+        }
+        s.delete_queue(&queue).await?;
+        Ok(())
     }
 
     /// `ActiveMQSession.createConsumer` / `createDurableSubscriber`: a

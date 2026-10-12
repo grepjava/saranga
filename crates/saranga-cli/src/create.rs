@@ -4,13 +4,12 @@
 //! `artemis` (and `saranga`) script that runs this `saranga` for the
 //! instance, so the instance's scripts and runbooks work as they are.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use anyhow::{Context, bail};
 
 use crate::client::{Common, UsageError};
+use crate::perf::journal::{decimal_format, sync_test, to_nanos};
 
 macro_rules! template {
     ($name:literal) => {
@@ -841,9 +840,17 @@ fn auto_tune(
         );
     } else {
         let writes = 250;
-        match sync_test(data, 4096, writes, 5, !args.no_fsync, args.common.verbose) {
+        match sync_test(
+            data,
+            "journal-test.tmp",
+            4096,
+            writes,
+            5,
+            !args.no_fsync,
+            args.common.verbose,
+        ) {
             Ok(time) => {
-                let nanoseconds = to_nanos(time, writes);
+                let nanoseconds = to_nanos(time, writes, args.common.verbose);
                 let per_ms = decimal_format(writes as f64 / time as f64);
                 sync.put("${nanoseconds}", nanoseconds.to_string());
                 sync.put("${writesPerMillisecond}", per_ms.clone());
@@ -882,105 +889,6 @@ fn auto_tune(
     let page = sync.read("etc/page-sync-settings.txt")?;
     f.put("${page-sync.settings}", page);
     Ok(())
-}
-
-/// `SyncCalculation.syncTest` on NIO: the best of `tries` runs of `blocks`
-/// synced writes of `block_size` bytes, in milliseconds.
-fn sync_test(
-    data: &Path,
-    block_size: usize,
-    blocks: usize,
-    tries: usize,
-    fsync: bool,
-    verbose: bool,
-) -> anyhow::Result<u64> {
-    use std::io::{Seek, SeekFrom};
-    let path = data.join("journal-test.tmp");
-    let _ = std::fs::remove_file(&path);
-    let block = vec![b't'; block_size];
-    let result = (|| -> anyhow::Result<u64> {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-        file.write_all(&vec![0u8; block_size * blocks])?;
-        file.sync_all()?;
-        let mut best = u64::MAX;
-        for n in 0..tries {
-            if verbose {
-                println!("**************************************************");
-                println!("{n} of {tries} calculation");
-            }
-            file.seek(SeekFrom::Start(0))?;
-            let start = Instant::now();
-            for _ in 0..blocks {
-                file.write_all(&block)?;
-                if fsync {
-                    file.sync_data()?;
-                }
-            }
-            let time = start.elapsed().as_millis() as u64;
-            if verbose {
-                println!("Time = {time} milliseconds");
-                println!(
-                    "Writes / millisecond = {}",
-                    decimal_format(blocks as f64 / time as f64)
-                );
-                println!("bufferTimeout = {}", to_nanos(time, blocks));
-                println!("**************************************************");
-            }
-            best = best.min(time);
-        }
-        Ok(best)
-    })();
-    let _ = std::fs::remove_file(&path);
-    result
-}
-
-/// `SyncCalculation.toNanos`: the nanoseconds a write takes.
-fn to_nanos(time_ms: u64, blocks: usize) -> u64 {
-    let per_ms = blocks as f64 / time_ms as f64;
-    (1_000_000.0 / per_ms) as u64
-}
-
-/// `new DecimalFormat("###.##").format(d)`: at most two decimals, rounded
-/// half-even, without trailing zeros or a leading zero.
-fn decimal_format(d: f64) -> String {
-    if d.is_infinite() {
-        return "\u{221e}".to_owned();
-    }
-    if d.is_nan() {
-        return "\u{fffd}".to_owned();
-    }
-    let scaled = d * 100.0;
-    let floor = scaled.floor();
-    let rest = scaled - floor;
-    let cents = if (rest - 0.5).abs() < 1e-9 {
-        if floor as i64 % 2 == 0 {
-            floor
-        } else {
-            floor + 1.0
-        }
-    } else {
-        scaled.round()
-    } as i64;
-    let (int, frac) = (cents / 100, cents % 100);
-    let mut out = if int == 0 {
-        String::new()
-    } else {
-        int.to_string()
-    };
-    if frac != 0 {
-        let f = format!("{frac:02}");
-        out.push('.');
-        out.push_str(f.trim_end_matches('0'));
-    }
-    if out.is_empty() {
-        out.push('0');
-    }
-    out
 }
 
 /// The hash `artemis create` writes for the user's password
