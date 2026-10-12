@@ -72,6 +72,16 @@ result: MASKED
 {"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","arguments":["","-1","-1"],"type":"exec","operation":"listConnections"},"value":"{\"data\":[{\"connectionID\":\"#\",\"remoteAddress\":\"127.0.0.1:#\",\"users\":\"admin\",\"creationTime\":\"DATE\",\"implementation\":\"RemotingConnectionImpl\",\"protocol\":\"CORE\",\"clientID\":\"\",\"localAddress\":\"127.0.0.1:62316\",\"sessionCount\":2,\"proxyAddress\":\"\",\"proxyProtocolVersion\":\"\"}],\"count\":1}","status":200}
 === curl POST {"operation": "listConnections", "mbean": "org.apache.activemq.artemis:broker=\"0.0.0.0\"", "type": "exec", "arguments": [ "{\"field\":\"protocol\",\"operation\":\"EQUALS\",\"value\":\"CORE\"}", -1, -1 ] }
 {"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","arguments":["{\"field\":\"protocol\",\"operation\":\"EQUALS\",\"value\":\"CORE\"}",-1,-1],"type":"exec","operation":"listConnections"},"value":"{\"data\":[{\"connectionID\":\"#\",\"remoteAddress\":\"127.0.0.1:#\",\"users\":\"admin\",\"creationTime\":\"DATE\",\"implementation\":\"RemotingConnectionImpl\",\"protocol\":\"CORE\",\"clientID\":\"\",\"localAddress\":\"127.0.0.1:62316\",\"sessionCount\":2,\"proxyAddress\":\"\",\"proxyProtocolVersion\":\"\"}],\"count\":1}","status":200}
+=== versions: curl reload of the acceptor artemis
+{"error_type":"java.lang.Exception","error":"java.lang.Exception : Origin null is not allowed to call this agent","status":403}
+=== versions: curl reload of the acceptor artemis, with an Origin
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\",component=acceptors,name=\"artemis\"","type":"exec","operation":"reload"},"value":null,"status":200}
+=== artemis queue stat --queueName runbook
+Connection brokerURL = tcp://localhost:62316
+|NAME   |ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|       |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|runbook|runbook|   0    |  60   |  100   |    0     |   40   |    0    |ANYCAST| false  |
+--- exit 0
 === logging: log/audit.log
 [AUDIT] AMQ601707: User admin(amq)@127.0.0.1:PORT successfully created queue: runbook on address: runbook with routing type ANYCAST
 [AUDIT] AMQ601019: User admin(amq)@127.0.0.1:PORT is getting mbean info on target resource: org.apache.activemq.artemis.core.management.impl.ActiveMQServerControlImpl@HASH
@@ -81,6 +91,8 @@ result: MASKED
 [AUDIT] AMQ601108: User admin(amq)@127.0.0.1:PORT is listing connections on target resource: ActiveMQServerImpl::name=0.0.0.0 with parameters: [, -1, -1]
 [AUDIT] AMQ601019: User admin(amq)@127.0.0.1:PORT is getting mbean info on target resource: org.apache.activemq.artemis.core.management.impl.ActiveMQServerControlImpl@HASH
 [AUDIT] AMQ601108: User admin(amq)@127.0.0.1:PORT is listing connections on target resource: ActiveMQServerImpl::name=0.0.0.0 with parameters: [{"field":"protocol","operation":"EQUALS","value":"CORE"}, -1, -1]
+[AUDIT] AMQ601019: User admin(amq)@127.0.0.1:PORT is getting mbean info on target resource: org.apache.activemq.artemis.core.management.impl.AcceptorControlImpl@HASH
+[AUDIT] AMQ601022: User admin(amq)@127.0.0.1:PORT is doing reload on target resource: org.apache.activemq.artemis.core.remoting.impl.netty.NettyAcceptor@HASH
 === artemis producer --destination queue://history --message-count 600 --message-size 20000
 Connection brokerURL = tcp://localhost:62316
 Producer ActiveMQQueue[history], thread=0 Started to calculate elapsed time ...

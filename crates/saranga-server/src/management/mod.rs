@@ -3,7 +3,8 @@
 //! management address from any protocol.
 //!
 //! A resource is named as `ResourceNames` names it: `broker`,
-//! `address.<name>`, `queue.<name>` and `divert.<name>`. An attribute is
+//! `address.<name>`, `queue.<name>`, `divert.<name>` and
+//! `acceptor.<name>`. An attribute is
 //! read as the control's getter would be, and an operation is matched to
 //! one of the control's methods by name and parameter count, its
 //! parameters converted from JSON as `invokeOperation` converts them.
@@ -132,6 +133,7 @@ enum Resource {
     Address(String),
     Queue(crate::queue::Queue),
     Divert(Arc<crate::postoffice::Divert>),
+    Acceptor(String),
 }
 
 impl Resource {
@@ -143,6 +145,7 @@ impl Resource {
             Resource::Address(a) => (Control::Address, a.clone()),
             Resource::Queue(q) => (Control::Queue, q.name().to_string()),
             Resource::Divert(d) => (Control::Divert, d.name.to_string()),
+            Resource::Acceptor(a) => (Control::Acceptor, a.clone()),
         }
     }
 }
@@ -227,6 +230,9 @@ impl Management {
         if let Some(d) = name.strip_prefix("divert.") {
             return po.divert(d).map(Resource::Divert);
         }
+        if let Some(a) = name.strip_prefix("acceptor.") {
+            return broker.acceptor(a).map(|_| Resource::Acceptor(a.to_owned()));
+        }
         None
     }
 
@@ -253,6 +259,7 @@ impl Management {
             Resource::Address(a) => address::attribute(broker, a, &upper).await,
             Resource::Queue(q) => queue::attribute(broker, q, &upper).await,
             Resource::Divert(d) => Ok(divert_attribute(d, &upper)),
+            Resource::Acceptor(a) => Ok(acceptor_attribute(broker, a, &upper)),
         };
         match found {
             // A boolean attribute is read through its `is` method.
@@ -357,6 +364,7 @@ impl Management {
             Resource::Address(a) => address::invoke(broker, a, &call).await,
             Resource::Queue(q) => queue::invoke(broker, q, &call).await,
             Resource::Divert(_) => None,
+            Resource::Acceptor(a) => invoke_acceptor(broker, a, &call).await,
         };
         if let Some(outcome) = found {
             return outcome;
@@ -372,6 +380,7 @@ impl Management {
                         Resource::Address(a) => address::attribute(broker, a, attr).await,
                         Resource::Queue(q) => queue::attribute(broker, q, attr).await,
                         Resource::Divert(d) => Ok(divert_attribute(d, attr)),
+                        Resource::Acceptor(a) => Ok(acceptor_attribute(broker, a, attr)),
                     };
                     match value {
                         Ok(Some(v)) => return Ok(v),
@@ -481,6 +490,44 @@ fn store_result(reply: &mut CoreMessage, result: Json) {
 }
 
 /// `DivertControl`'s attributes.
+/// `AcceptorControl`'s attributes.
+fn acceptor_attribute(broker: &Broker, name: &str, attr: &str) -> Option<Json> {
+    let (acceptor, started) = broker.acceptor(name)?;
+    Some(match attr {
+        "Name" => Json::from(name),
+        "FactoryClassName" => Json::from(crate::acceptors::FACTORY),
+        "Parameters" => {
+            let mut params: Vec<_> = acceptor.params.iter().collect();
+            params.sort();
+            let mut m = Json::object();
+            for (k, v) in params {
+                m.put(k, v.clone());
+            }
+            m
+        }
+        "Started" => Json::from(started),
+        _ => return None,
+    })
+}
+
+/// `AcceptorControl`'s operations.
+async fn invoke_acceptor(
+    broker: &Arc<Broker>,
+    name: &str,
+    call: &args::Call<'_>,
+) -> Option<Outcome> {
+    if !call.params.is_empty() {
+        return None;
+    }
+    let done = |r: Result<(), String>| r.map(|()| Json::Null);
+    Some(match call.op {
+        "start" => done(broker.start_acceptor(name).await),
+        "stop" => done(broker.stop_acceptor(name).await),
+        "reload" => done(broker.reload_acceptor(name).await),
+        _ => return None,
+    })
+}
+
 fn divert_attribute(d: &crate::postoffice::Divert, name: &str) -> Option<Json> {
     use crate::postoffice::DivertRoutingType as T;
     Some(match name {

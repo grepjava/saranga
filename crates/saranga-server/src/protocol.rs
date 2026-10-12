@@ -167,29 +167,38 @@ impl ProtocolManager for CoreProtocol {
 /// to the one that takes clients without a handshake, or to Core.
 pub async fn detect_and_serve(
     broker: Arc<Broker>,
-    mut stream: Box<dyn Stream>,
+    stream: Box<dyn Stream>,
     peer: Option<SocketAddr>,
     local: Option<SocketAddr>,
     info: ConnectionInfo,
     acceptor: Arc<Acceptor>,
 ) {
+    if let Some((manager, connection)) = detect(&broker, stream, peer, local, info, acceptor).await
+    {
+        manager.serve(broker, connection).await;
+    }
+}
+
+/// The protocol a connection speaks, from its first bytes.
+pub(crate) async fn detect(
+    broker: &Broker,
+    mut stream: Box<dyn Stream>,
+    peer: Option<SocketAddr>,
+    local: Option<SocketAddr>,
+    info: ConnectionInfo,
+    acceptor: Arc<Acceptor>,
+) -> Option<(Arc<dyn ProtocolManager>, Connection)> {
     let enabled = broker.protocols_for(&acceptor);
     // `handshake-timeout`: a client that sends too little is closed.
     let Some(mut header) = read_header(&mut stream, acceptor.handshake_timeout).await else {
         tracing::debug!(?peer, "connection closed before its protocol was known");
-        return;
+        return None;
     };
     // An HTTP request: a WebSocket upgrade, inside which the protocol is
     // detected again (`switchToHttp`, `WebSocketServerHandler`).
     if saranga_transport::websocket::is_http(&header) {
-        let Some(ws) = upgrade(stream, header, &acceptor, &enabled).await else {
-            return;
-        };
-        stream = ws;
-        let Some(h) = read_header(&mut stream, None).await else {
-            return;
-        };
-        header = h;
+        stream = upgrade(stream, header, &acceptor, &enabled).await?;
+        header = read_header(&mut stream, None).await?;
     }
     let manager = enabled
         .iter()
@@ -206,7 +215,7 @@ pub async fn detect_and_serve(
             acceptor.port,
             names.join(", ")
         );
-        return;
+        return None;
     };
     let connection = Connection {
         stream: Rewind::new(header, stream),
@@ -215,7 +224,7 @@ pub async fn detect_and_serve(
         info,
         acceptor,
     };
-    manager.serve(broker, connection).await;
+    Some((manager, connection))
 }
 
 /// The first 8 bytes a client sends, within `timeout` if given.

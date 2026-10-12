@@ -543,7 +543,8 @@ impl Agent {
             return Err(Self::denied("attribute", attr));
         }
         if let Bean::Acceptor(n, params) = bean {
-            return Ok(acceptor_attribute(n, params, attr));
+            let started = self.broker.acceptor(n).is_some_and(|(_, s)| s);
+            return Ok(acceptor_attribute(n, params, started, attr));
         }
         self.broker
             .management()
@@ -734,16 +735,6 @@ impl Agent {
                 403,
             ));
         }
-        if matches!(bean, Bean::Acceptor(..)) {
-            return Err(Failure::new(
-                "java.lang.UnsupportedOperationException",
-                format!(
-                    "Saranga does not {} acceptors through management yet",
-                    op.name
-                ),
-                500,
-            ));
-        }
         let management = self.broker.management();
         let result = match (&bean, op.name) {
             // Composite data, which management messages cannot carry.
@@ -904,12 +895,10 @@ impl Agent {
 }
 
 /// `AcceptorControl`'s attributes.
-fn acceptor_attribute(name: &str, params: &[(String, String)], attr: &str) -> Json {
+fn acceptor_attribute(name: &str, params: &[(String, String)], started: bool, attr: &str) -> Json {
     match attr {
         "Name" => Json::from(name),
-        "FactoryClassName" => {
-            Json::from("org.apache.activemq.artemis.core.remoting.impl.netty.NettyAcceptorFactory")
-        }
+        "FactoryClassName" => Json::from(saranga_server::acceptors::FACTORY),
         "Parameters" => {
             let mut m = Json::object();
             for (k, v) in params {
@@ -917,7 +906,7 @@ fn acceptor_attribute(name: &str, params: &[(String, String)], attr: &str) -> Js
             }
             m
         }
-        "Started" => Json::from(true),
+        "Started" => Json::from(started),
         _ => Json::Null,
     }
 }

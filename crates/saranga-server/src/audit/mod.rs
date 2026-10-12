@@ -323,7 +323,11 @@ fn source(broker: &Broker, control: Control, name: &str) -> String {
         Control::Queue => queue_string(broker, name),
         Control::Address => address_string(broker, name),
         Control::Divert => divert_string(broker, name),
-        Control::Acceptor => format!("NettyAcceptor [{name}]"),
+        // NettyAcceptor has no toString: Object's.
+        Control::Acceptor => format!(
+            "org.apache.activemq.artemis.core.remoting.impl.netty.NettyAcceptor@{:x}",
+            identity(("acceptor", name))
+        ),
     }
 }
 

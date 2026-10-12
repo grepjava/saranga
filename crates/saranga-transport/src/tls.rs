@@ -359,6 +359,15 @@ impl TlsAcceptor {
         }
     }
 
+    /// Reads the stores again (`NettyAcceptor.reload`), keeping the
+    /// previous ones if they cannot be read.
+    pub fn reload(&self) -> Result<(), TlsError> {
+        let now = stamps(&self.settings.files());
+        let config = self.settings.server_config()?;
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = (config, now);
+        Ok(())
+    }
+
     /// With `sslAutoReload`, checks the store files every `period`.
     pub fn spawn_reloader(self: &Arc<Self>, period: Duration) {
         if !self.settings.auto_reload {

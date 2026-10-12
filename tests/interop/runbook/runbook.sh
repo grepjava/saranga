@@ -21,6 +21,7 @@
 #   logging            the audit log turned on while running
 #   management         Jolokia reads, as the manual's curl commands do them;
 #                      listConnections while a consumer is connected
+#   versions           an acceptor's reload, with the manual's curl command
 #   data-retention     journal retention and replay through Jolokia; data
 #                      print and recover over the retention directory
 #   config-reload      an address added to broker.xml while running
@@ -200,10 +201,25 @@ suite() {
   instance "$I1" producer --destination queue://waiting --message-count 1 "${AUTH[@]}" > /dev/null
   wait "$waiting"
 
+  # versions (2.18.0): the keystores reloaded through the acceptor's reload
+  # operation, with the manual's curl command. Jolokia's strict checking
+  # refuses it without an Origin, so it is run again with the Origin the
+  # management chapter gives; the acceptor takes clients again.
+  local reload='{"type":"exec", "mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\",component=acceptors,name=\"artemis\"", "operation":"reload"}'
+  step "versions: curl reload of the acceptor artemis"
+  curl -s --user admin:admin --header "Content-Type: application/json" --request POST \
+    --data "$reload" "http://localhost:$WEB1/console/jolokia/exec"
+  echo
+  step "versions: curl reload of the acceptor artemis, with an Origin"
+  curl -s -H "Origin: http://localhost" --user admin:admin --header "Content-Type: application/json" \
+    --request POST --data "$reload" "http://localhost:$WEB1/console/jolokia/exec"
+  echo
+  run queue stat --queueName runbook
+
   # logging: what the audit log says of the queue made, the Jolokia calls
   # and the connections listed.
   step "logging: log/audit.log"
-  grep -E 'AMQ601707|AMQ601108|AMQ601019: .*ActiveMQServerControlImpl' "$I1/log/audit.log"
+  grep -E 'AMQ601707|AMQ601108|AMQ601022|AMQ601019: .*(ActiveMQServerControlImpl|AcceptorControlImpl)' "$I1/log/audit.log"
 
   # data-retention: the history keeps what was sent; replay sends it again.
   run producer --destination queue://history --message-count 600 --message-size 20000
@@ -318,7 +334,7 @@ normalize() {
     -e 's/^result: .*/result: MASKED/' \
     -e 's/(Total time|time): [0-9.]+/\1: #/' \
     -e 's/^DATE \[AUDIT\]\(([^()]|\([^()]*\))*\) /[AUDIT] /' \
-    -e 's/@127\.0\.0\.1:[0-9]+/@127.0.0.1:PORT/g; s/(ControlImpl)@[0-9a-f]+/\1@HASH/' \
+    -e 's/@127\.0\.0\.1:[0-9]+/@127.0.0.1:PORT/g; s/(ControlImpl|NettyAcceptor)@[0-9a-f]+/\1@HASH/g' \
     -e 's/(\\"connectionID\\":\\")[0-9a-f]+/\1#/g; s/(\\"remoteAddress\\":\\"127\.0\.0\.1:)[0-9]+/\1#/g' \
     -e 's/(\\"creationTime\\":\\")[^\\]*/\1DATE/g' \
     -e 's/"(lastValue|createdTimestamp|messagesAdded|persistentSize|durablePersistentSize|deliveringSize|scheduledSize)":"?[0-9]+"?/"\1":#/g'

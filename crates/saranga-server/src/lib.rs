@@ -6,6 +6,7 @@
 //! follows ADR 0001: one task per connection and per session, one actor
 //! per queue.
 
+pub mod acceptors;
 pub mod audit;
 pub mod config;
 pub mod core_protocol;
@@ -382,6 +383,7 @@ pub struct Broker {
     stopped: std::sync::atomic::AtomicBool,
     /// The critical analyzer asked for the broker to stop.
     shutdown: tokio::sync::Notify,
+    acceptors: acceptors::Acceptors,
 }
 
 /// Reads the configuration files again (`ReloadManager`).
@@ -570,6 +572,7 @@ impl Broker {
             security_records: Mutex::default(),
             stopped: Default::default(),
             shutdown: tokio::sync::Notify::new(),
+            acceptors: Default::default(),
         });
         for p in broker.post_office.plugins().all() {
             p.registered(&broker);
@@ -891,22 +894,46 @@ impl Broker {
         listener: TcpListener,
         acceptor: Acceptor,
     ) -> std::io::Result<()> {
-        let acceptor = Arc::new(acceptor);
+        let closing = Arc::new(tokio::sync::Notify::new());
+        self.serve_shared(listener, Arc::new(acceptor), closing)
+            .await;
+        Ok(())
+    }
+
+    /// Accepts until aborted. `closing` ends the connections still in
+    /// their TLS handshake or protocol detection; the others are failed.
+    async fn serve_shared(
+        self: Arc<Self>,
+        listener: TcpListener,
+        acceptor: Arc<Acceptor>,
+        closing: Arc<tokio::sync::Notify>,
+    ) {
         // NettyAcceptor.start: ACCEPTOR_STARTED with the port it listens on.
         let port = listener
             .local_addr()
             .map_or(i32::from(acceptor.port), |a| i32::from(a.port()));
         let host = acceptor.host.clone();
-        self.post_office.notify(notifications::NotificationType::AcceptorStarted, move |_| {
-            use saranga_buffer::PropertyValue as V;
-            vec![
-                ("factory", notifications::string(Some("org.apache.activemq.artemis.core.remoting.impl.netty.NettyAcceptorFactory"))),
-                ("host", notifications::string(Some(&host))),
-                ("port", V::Int(port)),
-            ]
-        });
+        self.post_office.notify(
+            notifications::NotificationType::AcceptorStarted,
+            move |_| {
+                use saranga_buffer::PropertyValue as V;
+                vec![
+                    ("factory", notifications::string(Some(acceptors::FACTORY))),
+                    ("host", notifications::string(Some(&host))),
+                    ("port", V::Int(port)),
+                ]
+            },
+        );
         loop {
-            let (stream, peer) = listener.accept().await?;
+            let (stream, peer) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    // Netty logs a failed accept and goes on accepting.
+                    tracing::warn!("acceptor {}: accept failed: {e}", acceptor.name);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             tracing::debug!(%peer, "connection accepted");
             let _ = stream.set_nodelay(true);
             let local = stream.local_addr().ok();
@@ -918,27 +945,40 @@ impl Broker {
             };
             let broker = self.clone();
             let acceptor = acceptor.clone();
+            let closing = closing.clone();
             tokio::spawn(async move {
-                let stream: Box<dyn protocol::Stream> = match &acceptor.tls {
-                    None => Box::new(stream),
-                    Some(tls) => {
-                        let stream = match tls.accept(stream).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::debug!(%peer, "TLS handshake failed: {e}");
-                                return;
-                            }
-                        };
-                        info.certificates = saranga_transport::tls::peer_certificates(
-                            stream.get_ref().1.peer_certificates(),
-                        )
-                        .map(Arc::from);
-                        Box::new(stream)
+                let closed = closing.notified();
+                let context = audit::Context::Remote(info.remote_address.clone());
+                let detector = broker.clone();
+                let setup = async move {
+                    let stream: Box<dyn protocol::Stream> = match &acceptor.tls {
+                        None => Box::new(stream),
+                        Some(tls) => {
+                            let stream = match tls.accept(stream).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::debug!(%peer, "TLS handshake failed: {e}");
+                                    return None;
+                                }
+                            };
+                            info.certificates = saranga_transport::tls::peer_certificates(
+                                stream.get_ref().1.peer_certificates(),
+                            )
+                            .map(Arc::from);
+                            Box::new(stream)
+                        }
+                    };
+                    protocol::detect(&detector, stream, Some(peer), local, info, acceptor).await
+                };
+                let serve = async move {
+                    let detected = tokio::select! {
+                        d = setup => d,
+                        () = closed => None,
+                    };
+                    if let Some((manager, connection)) = detected {
+                        manager.serve(broker, connection).await;
                     }
                 };
-                let context = audit::Context::Remote(info.remote_address.clone());
-                let serve =
-                    protocol::detect_and_serve(broker, stream, Some(peer), local, info, acceptor);
                 audit::scoped(context, serve).await;
             });
         }

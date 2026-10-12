@@ -21,7 +21,6 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use saranga_server::postoffice::SelectorFilters;
 use saranga_server::{Acceptor, Broker, BrokerConfig};
 use saranga_transport::{TlsAcceptor, TlsSettings};
-use tokio::net::TcpListener;
 
 #[derive(Parser)]
 #[command(
@@ -723,21 +722,6 @@ fn prefixes(a: &saranga_config::AcceptorConfig) -> Vec<(String, saranga_server::
     out
 }
 
-/// Binds the acceptor's host the way Netty does: to the one address
-/// `InetAddress.getByName` gives, which is the first IPv4 address when the
-/// name has one (`localhost` is 127.0.0.1, not `::1`).
-async fn bind_acceptor(address: &str) -> std::io::Result<TcpListener> {
-    let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host(address).await?.collect();
-    addrs.sort_by_key(|a| !a.is_ipv4());
-    match addrs.first() {
-        Some(a) => TcpListener::bind(a).await,
-        None => Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("{address} resolves to no address"),
-        )),
-    }
-}
-
 /// `artemis mask` (`Mask.execute`).
 fn mask(
     password: &str,
@@ -869,30 +853,19 @@ async fn run(
         );
     }
     let broker = Broker::start(broker_config).await?;
-    let mut servers = tokio::task::JoinSet::new();
     for Bind {
         name,
         address,
         acceptor,
     } in binds
     {
-        let listener = bind_acceptor(&address)
-            .await
-            .with_context(|| format!("acceptor {name} on {address}"))?;
         if let Some(tls) = &acceptor.tls {
             tls.spawn_reloader(reload_period);
         }
-        // Artemis's log IDs, so log-based tooling keeps working (ADR 0003).
-        let names: Vec<&str> = broker
-            .protocols_for(&acceptor)
-            .iter()
-            .map(|p| p.name())
-            .collect();
-        tracing::info!(
-            "AMQ221020: Started NIO Acceptor at {address} for protocols [{}]",
-            names.join(",")
-        );
-        servers.spawn(broker.clone().serve_acceptor(listener, acceptor));
+        broker
+            .add_acceptor(&name, &address, acceptor)
+            .await
+            .with_context(|| format!("acceptor {name} on {address}"))?;
     }
     let mut web_started = false;
     if let (Some(instance), Some(file)) = (&instance, &file_config)
@@ -937,10 +910,6 @@ async fn run(
         }
     };
     let stop = tokio::select! {
-        Some(result) = servers.join_next() => {
-            result??;
-            Stop::Clean
-        }
         _ = tokio::signal::ctrl_c() => Stop::Clean,
         _ = terminated() => Stop::Clean,
         // The critical analyzer's SHUTDOWN policy.
@@ -959,7 +928,7 @@ async fn run(
                 tracing::info!("AMQ241006: Stopped embedded web server");
             }
             // RemotingService.pauseAcceptors: no new connections.
-            servers.abort_all();
+            broker.pause_acceptors().await;
             if let Some(timeout) = graceful {
                 wait_for_clients(&broker, timeout).await;
             }

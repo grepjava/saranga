@@ -31,6 +31,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use saranga_server::Broker;
+use saranga_server::management::json::Json;
 use saranga_transport::TlsAcceptor;
 use tokio::net::TcpListener;
 
@@ -91,6 +92,15 @@ impl Cors {
             }
         }
         cors
+    }
+
+    /// `CorsChecker.check` of a request's Origin or Referer: with
+    /// origins listed, a request without either is refused.
+    fn allows_checked(&self, origin: Option<&str>) -> bool {
+        match origin {
+            Some(o) => self.allows(o),
+            None => self.allow_origins.is_empty(),
+        }
     }
 
     fn allows(&self, origin: &str) -> bool {
@@ -316,18 +326,6 @@ async fn jolokia_handler(
         .get(header::ORIGIN)
         .and_then(|o| o.to_str().ok())
         .map(str::to_owned);
-    if let Some(o) = &origin
-        && state.cors.strict
-        && !state.cors.allows(o)
-    {
-        return secure(
-            (
-                StatusCode::FORBIDDEN,
-                format!("Origin {o} is not allowed to call this agent"),
-            )
-                .into_response(),
-        );
-    }
     let cors = |mut r: Response| {
         if let Some(o) = &origin
             && state.cors.allows(o)
@@ -342,21 +340,44 @@ async fn jolokia_handler(
         }
         secure(r)
     };
+    // `handleCorsPreflightRequest`: only an allowed origin gets headers.
     if method == Method::OPTIONS {
         let mut r = StatusCode::OK.into_response();
-        r.headers_mut().insert(
-            header::ACCESS_CONTROL_ALLOW_METHODS,
-            HeaderValue::from_static("GET, POST"),
-        );
-        if let Some(h) = headers.get(header::ACCESS_CONTROL_REQUEST_HEADERS) {
-            r.headers_mut()
-                .insert(header::ACCESS_CONTROL_ALLOW_HEADERS, h.clone());
+        if origin.as_deref().is_some_and(|o| state.cors.allows(o)) {
+            if let Some(h) = headers.get(header::ACCESS_CONTROL_REQUEST_HEADERS) {
+                r.headers_mut()
+                    .insert(header::ACCESS_CONTROL_ALLOW_HEADERS, h.clone());
+            }
+            r.headers_mut().insert(
+                header::ACCESS_CONTROL_MAX_AGE,
+                HeaderValue::from_static("31536000"),
+            );
         }
         return cors(r);
     }
     let Some((roles, subject)) = login(&state, &headers, peer) else {
         return forbidden();
     };
+    // `<strict-checking/>`: the Origin, or else the Referer, must be
+    // allowed (`HttpRequestHandler.checkAccess`); Jolokia answers a
+    // refusal as an error.
+    let checked = origin.clone().or_else(|| {
+        headers
+            .get(header::REFERER)
+            .and_then(|o| o.to_str().ok())
+            .map(|r| r.replace(['\r', '\n'], ""))
+    });
+    if state.cors.strict && !state.cors.allows_checked(checked.as_deref()) {
+        let shown = checked.as_deref().unwrap_or("null");
+        let mut error = Json::object();
+        error.put("error_type", "java.lang.Exception");
+        error.put(
+            "error",
+            format!("java.lang.Exception : Origin {shown} is not allowed to call this agent"),
+        );
+        error.put("status", 403i64);
+        return cors(json_response(&error));
+    }
     let caller = jolokia::Caller {
         roles,
         subject: Some(subject),
@@ -383,17 +404,7 @@ async fn jolokia_handler(
         state.agent.get(&caller, &path, &url).await
     };
     match answer {
-        jolokia::Answer::Json(j) => cors(
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, "application/json"),
-                    (header::CACHE_CONTROL, "no-cache"),
-                ],
-                j.to_string(),
-            )
-                .into_response(),
-        ),
+        jolokia::Answer::Json(j) => cors(json_response(&j)),
         jolokia::Answer::BadRequest(m) => cors(
             (
                 StatusCode::BAD_REQUEST,
@@ -403,6 +414,19 @@ async fn jolokia_handler(
                 .into_response(),
         ),
     }
+}
+
+/// A Jolokia answer: always 200, the status in the JSON.
+fn json_response(j: &Json) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        j.to_string(),
+    )
+        .into_response()
 }
 
 /// `%XX` escapes decoded; invalid ones kept as they are.
