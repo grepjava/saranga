@@ -1714,10 +1714,13 @@ dependencies = [
  "clap",
  "flate2",
  "libc",
+ "saranga-buffer",
  "saranga-client",
  "saranga-config",
  "saranga-filter",
+ "saranga-journal",
  "saranga-management",
+ "saranga-message",
  "saranga-paging",
  "saranga-protocol-amqp",
  "saranga-protocol-mqtt",
@@ -1737,9 +1740,11 @@ dependencies = [
 name = "saranga-client"
 version = "0.0.1"
 dependencies = [
+ "flate2",
  "saranga-buffer",
  "saranga-core-protocol",
  "saranga-message",
+ "saranga-server",
  "thiserror",
  "tokio",
 ]

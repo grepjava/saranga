@@ -61,6 +61,10 @@ enum Command {
         /// broker properties. Repeatable.
         #[arg(short = 'D', value_name = "NAME=VALUE", value_parser = parse_system_property)]
         system_properties: Vec<(String, String)>,
+        /// This will allow the server to kill itself. Useful for tests
+        /// (e.g. failover tests).
+        #[arg(long)]
+        allow_kill: bool,
     },
     /// Tools on a broker's data directory.
     #[command(subcommand)]
@@ -92,6 +96,20 @@ enum Command {
     /// Stop the broker of an instance, as `artemis stop`: STOP_ME next to
     /// its broker.xml.
     Stop {
+        /// Override the broker configuration from the bootstrap.xml.
+        #[arg(long)]
+        broker: Option<PathBuf>,
+        /// Broker Configuration URI. Default:
+        /// xml:${ARTEMIS_INSTANCE}/etc/bootstrap.xml.
+        configuration: Option<String>,
+    },
+    /// Print version information.
+    Version,
+    /// Information on current folder and instance.
+    Pwd,
+    /// Kill a broker started with --allow-kill, as `artemis kill`: KILL_ME
+    /// next to its broker.xml.
+    Kill {
         /// Override the broker configuration from the bootstrap.xml.
         #[arg(long)]
         broker: Option<PathBuf>,
@@ -134,6 +152,9 @@ async fn main() -> std::process::ExitCode {
             | Command::Transfer(_)
             | Command::Check(_)
             | Command::Stop { .. }
+            | Command::Kill { .. }
+            | Command::Version
+            | Command::Pwd
             | Command::Create(_)
     );
     if matches!(cli.command, Command::Run { .. }) {
@@ -183,10 +204,73 @@ async fn run_client(command: Command) -> anyhow::Result<()> {
         Command::Stop {
             broker,
             configuration,
-        } => stop(broker, configuration),
+        } => control_file(broker, configuration, "STOP_ME"),
+        Command::Kill {
+            broker,
+            configuration,
+        } => control_file(broker, configuration, "KILL_ME"),
         Command::Create(a) => create::run(*a),
+        Command::Version => {
+            // PrintVersion
+            println!(
+                "Saranga {VERSION} (Apache Artemis {})",
+                saranga_server::management::VERSION
+            );
+            println!("Saranga home: {}", broker_home());
+            println!("Saranga instance: {}", broker_instance());
+            Ok(())
+        }
+        Command::Pwd => {
+            let line = "*".repeat(127);
+            println!();
+            println!("{line}");
+            println!("* Artemis instance:: {}", broker_instance());
+            println!("* Home:: {}", broker_home());
+            println!(
+                "* etc:: {}",
+                client::instance_etc()
+                    .map(|e| e.display().to_string().replace('\\', "/"))
+                    .unwrap_or_else(|| format!("{}/etc", broker_instance()))
+            );
+            let here = std::env::current_dir()
+                .and_then(|d| d.canonicalize())
+                .map(|d| dunce_path(&d))
+                .unwrap_or_default();
+            println!("* Current dir:{here}");
+            println!("{line}");
+            println!();
+            Ok(())
+        }
         _ => unreachable!("not a client command"),
     }
+}
+
+/// `getBrokerHome`: `ARTEMIS_HOME`, as the scripts set it, else the
+/// directory above saranga's.
+fn broker_home() -> String {
+    std::env::var("ARTEMIS_HOME")
+        .ok()
+        .or_else(|| {
+            let exe = std::env::current_exe().ok()?;
+            Some(dunce_path(exe.parent()?.parent()?))
+        })
+        .unwrap_or_else(|| "null".to_owned())
+        .replace('\\', "/")
+}
+
+/// `getBrokerInstance`: `ARTEMIS_INSTANCE`, with forward slashes, or
+/// `null`.
+fn broker_instance() -> String {
+    client::instance_dir().map_or_else(
+        || "null".to_owned(),
+        |d| d.display().to_string().replace('\\', "/"),
+    )
+}
+
+/// A path without Windows' `\\?\` verbatim prefix.
+fn dunce_path(p: &Path) -> String {
+    let s = p.display().to_string();
+    s.strip_prefix(r"\\?\").map(str::to_owned).unwrap_or(s)
 }
 
 /// Reports a failed command as `Artemis.execute` does: a `CLIException`'s
@@ -210,9 +294,14 @@ fn report_client_error(e: &anyhow::Error) {
     }
 }
 
-/// `artemis stop`: `STOP_ME` in the directory of the instance's
-/// broker.xml, which the running broker looks for.
-fn stop(broker: Option<PathBuf>, configuration: Option<String>) -> anyhow::Result<()> {
+/// `artemis stop` (`STOP_ME`) and `artemis kill` (`KILL_ME`): the file in
+/// the directory of the instance's broker.xml, which the running broker
+/// looks for.
+fn control_file(
+    broker: Option<PathBuf>,
+    configuration: Option<String>,
+    file: &str,
+) -> anyhow::Result<()> {
     let broker_xml = match broker {
         Some(b) => PathBuf::from(b.to_string_lossy().trim_start_matches("file:")),
         None => {
@@ -235,8 +324,8 @@ fn stop(broker: Option<PathBuf>, configuration: Option<String>) -> anyhow::Resul
         .create(true)
         .truncate(false)
         .write(true)
-        .open(dir.join("STOP_ME"))
-        .with_context(|| format!("creating {}", dir.join("STOP_ME").display()))?;
+        .open(dir.join(file))
+        .with_context(|| format!("creating {}", dir.join(file).display()))?;
     Ok(())
 }
 
@@ -248,6 +337,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             bind,
             properties,
             system_properties,
+            allow_kill,
         } => {
             let options = instance::Options {
                 system: system_properties,
@@ -270,9 +360,15 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
                     instance.system_lookup(),
                 );
             }
-            run(instance, bind).await
+            // Run is a LockAbstract: the data tools refuse an instance whose
+            // broker runs.
+            let _lock = match &instance {
+                Some(i) => Some(data::dirs::CliLock::hold(&i.dir)?),
+                None => None,
+            };
+            run(instance, bind, allow_kill).await
         }
-        Command::Data(cmd) => data::run(cmd),
+        Command::Data(cmd) => data::run(cmd).await,
         Command::Mask {
             password,
             hash,
@@ -457,15 +553,16 @@ enum Stop {
 }
 
 /// `Run.addShutdownHook`: `STOP_ME` next to the configuration stops the
-/// broker, `KILL_ME` halts it at once (the files are removed on start).
-async fn watch_stop_files(dir: PathBuf) -> Stop {
+/// broker, `KILL_ME` halts it at once with `--allow-kill` (the files are
+/// removed on start).
+async fn watch_stop_files(dir: PathBuf, allow_kill: bool) -> Stop {
     let stop = dir.join("STOP_ME");
     let kill = dir.join("KILL_ME");
     let _ = std::fs::remove_file(&stop);
     let _ = std::fs::remove_file(&kill);
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if kill.exists() {
+        if allow_kill && kill.exists() {
             let _ = std::fs::remove_file(&kill);
             return Stop::Halt;
         }
@@ -596,7 +693,11 @@ fn parse_system_property(s: &str) -> Result<(String, String), String> {
 /// Saranga's version, in the startup and shutdown messages.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> anyhow::Result<()> {
+async fn run(
+    instance: Option<instance::Instance>,
+    bind: Option<SocketAddr>,
+    allow_kill: bool,
+) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     tracing::info!("AMQ101000: Starting Saranga Server version {VERSION}");
     let filters = Arc::new(SelectorFilters);
@@ -722,7 +823,7 @@ async fn run(instance: Option<instance::Instance>, bind: Option<SocketAddr>) -> 
         .and_then(|i| i.broker_xml.parent().map(Path::to_path_buf));
     let stop_files = async {
         match stop_dir {
-            Some(dir) => watch_stop_files(dir).await,
+            Some(dir) => watch_stop_files(dir, allow_kill).await,
             None => std::future::pending().await,
         }
     };

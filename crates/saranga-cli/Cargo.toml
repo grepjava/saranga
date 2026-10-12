@@ -14,6 +14,9 @@ anyhow = "1"
 flate2 = "1"
 clap = { version = "4", features = ["derive"] }
 saranga-config = { path = "../saranga-config" }
+saranga-buffer = { path = "../saranga-buffer" }
+saranga-journal = { path = "../saranga-journal" }
+saranga-message = { path = "../saranga-message" }
 saranga-paging = { path = "../saranga-paging" }
 saranga-security = { path = "../saranga-security" }
 saranga-protocol-amqp = { path = "../saranga-protocol-amqp" }

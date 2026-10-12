@@ -29,7 +29,7 @@ use crate::Broker;
 pub use json::Json;
 use saranga_config::CheckType;
 pub(crate) use security::recovered as recovered_security_setting;
-pub use server::print_duration;
+pub use server::{VERSION, print_duration};
 
 /// `ManagementHelper.HDR_RESOURCE_NAME`.
 pub const HDR_RESOURCE_NAME: &str = "_AMQ_ResourceName";

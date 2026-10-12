@@ -108,6 +108,15 @@ fn stores(paging: &Path) -> Vec<Store> {
     stores
 }
 
+/// The page stores under `paging` in the order Artemis's paging manager
+/// lists them (`getStoreNames`): their addresses and folders.
+pub fn store_folders(paging: &Path) -> Vec<(String, PathBuf)> {
+    stores(paging)
+        .into_iter()
+        .map(|s| (s.address, s.folder))
+        .collect()
+}
+
 /// `NullStorageLargeServerMessage.toString` (`data print` reads large
 /// messages with a `NullStorageManager`).
 fn null_storage_large_to_string(m: &CoreMessage) -> String {

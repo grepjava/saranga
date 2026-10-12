@@ -1,7 +1,14 @@
 //! `saranga data`: tools on a broker's data directory (`artemis data`).
 
 use std::io::Write;
-use std::path::PathBuf;
+
+mod compact;
+pub mod dirs;
+mod export;
+mod import;
+mod journal;
+mod recover;
+mod xml;
 
 use clap::{Args, Subcommand};
 use saranga_storage::describe::{PrintDataOptions, print_data};
@@ -11,22 +18,28 @@ pub enum DataCommand {
     /// Prints the bindings and message journals, as `artemis data print`
     /// does. Don't use it on the data of a running broker.
     Print(PrintArgs),
+    /// Compact the journal of a non running server.
+    Compact(dirs::DataDirArgs),
+    /// Export all message-data using an XML that could be interpreted by
+    /// any system.
+    Exp(export::ExportArgs),
+    /// Import all message-data using an XML that could be interpreted by
+    /// any system.
+    Imp(import::ImportArgs),
+    /// Encode a set of journal files into an internal encoded data format.
+    Encode(journal::JournalArgs),
+    /// Decode a journal's internal format into a new set of journal files.
+    Decode(journal::DecodeArgs),
+    /// Recover (undelete) every message on the journal by creating a new
+    /// output journal. Rolled back and acked messages will be sent out to
+    /// the output as much as possible.
+    Recover(recover::RecoverArgs),
 }
 
 #[derive(Args)]
 pub struct PrintArgs {
-    /// The folder used for messages (the message journal).
-    #[arg(long)]
-    journal: PathBuf,
-    /// The folder used for bindings.
-    #[arg(long)]
-    bindings: PathBuf,
-    /// The folder used for paged messages.
-    #[arg(long)]
-    paging: Option<PathBuf>,
-    /// The folder used for large messages (not read by `data print`).
-    #[arg(long)]
-    large_messages: Option<PathBuf>,
+    #[command(flatten)]
+    dirs: dirs::DataDirArgs,
     /// Print the data structure without showing your data.
     #[arg(long)]
     safe: bool,
@@ -44,10 +57,17 @@ pub struct PrintArgs {
     skip_journal: bool,
 }
 
-pub fn run(cmd: DataCommand) -> anyhow::Result<()> {
+pub async fn run(cmd: DataCommand) -> anyhow::Result<()> {
     match cmd {
+        DataCommand::Compact(a) => compact::run(&a),
+        DataCommand::Exp(a) => export::run(a),
+        DataCommand::Imp(a) => import::run(a).await,
+        DataCommand::Encode(a) => journal::encode(&a),
+        DataCommand::Decode(a) => journal::decode(&a),
+        DataCommand::Recover(a) => recover::run(&a),
         DataCommand::Print(a) => {
-            let _ = a.large_messages;
+            let d = a.dirs.resolve()?;
+            let _lock = dirs::CliLock::take(d.instance.as_deref())?;
             let opts = PrintDataOptions {
                 safe: a.safe,
                 reclaimed: a.reclaimed,
@@ -56,22 +76,11 @@ pub fn run(cmd: DataCommand) -> anyhow::Result<()> {
                 max_pages: u32::try_from(a.max_pages).ok(),
                 print_pages: Some(saranga_paging::print::print_pages),
             };
-            let paging = a
-                .paging
-                .unwrap_or_else(|| a.journal.with_file_name("paging"));
-            // DataAbstract.checkIfDirectoryExists.
-            for dir in [&a.bindings, &a.journal, &paging] {
-                if !dir.exists() {
-                    anyhow::bail!(
-                        "Could not find folder: {}, please pass --bindings, --journal and --paging as arguments",
-                        dir.display()
-                    );
-                }
-            }
+            let (bindings, journal, paging) = (d.bindings, d.journal, d.paging);
             let stdout = std::io::stdout();
             let mut out = std::io::BufWriter::new(stdout.lock());
             saranga_protocol_amqp::describe::register();
-            print_data(&mut out, &a.bindings, &a.journal, &paging, &opts)?;
+            print_data(&mut out, &bindings, &journal, &paging, &opts)?;
             out.flush()?;
             Ok(())
         }

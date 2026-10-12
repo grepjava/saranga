@@ -118,3 +118,48 @@ async fn non_exclusive_divert_copies() {
     assert_eq!(queues(&routed), ["src", "dst"]);
     assert_eq!(routed[0].0.message_id(), 1);
 }
+
+/// `_AMQ_ROUTE_TO` (as `artemis data imp` sends): the message goes to the
+/// queues it names, not round robin, and loses the header.
+#[tokio::test]
+async fn route_to_ids_pick_the_queues() {
+    let b = Broker::start(BrokerConfig::new(Arc::new(SelectorFilters)))
+        .await
+        .unwrap();
+    let po = b.post_office();
+    let spec = |name: &str| {
+        let mut q = QueueSpec::new(name, "to");
+        q.routing_type = Some(RoutingType::Anycast);
+        q.auto_create_address = Some(true);
+        po.create_queue(q, false).unwrap()
+    };
+    let (_a, b2, c) = (spec("a"), spec("b"), spec("c"));
+    let mut ids = b2.id().to_be_bytes().to_vec();
+    ids.extend(c.id().to_be_bytes());
+    ids.extend(12345_i64.to_be_bytes());
+    let mut core = CoreMessage {
+        message_id: 1,
+        address: Some(SimpleString::from("to")),
+        ..Default::default()
+    };
+    core.properties
+        .insert("_AMQ_ROUTE_TO".into(), PropertyValue::Bytes(ids));
+    let routed = po
+        .route(
+            &MessageRef::new(ServerMessage::new(core)),
+            "to",
+            None,
+            Default::default(),
+        )
+        .unwrap();
+    assert_eq!(queues(&routed), ["b", "c"]);
+    assert!(
+        routed[0]
+            .0
+            .message
+            .core()
+            .properties
+            .get(&"_AMQ_ROUTE_TO".into())
+            .is_none()
+    );
+}

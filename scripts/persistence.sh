@@ -75,7 +75,7 @@ restart_artemis() {
 
 start_saranga() {
   cargo build -q --release -p saranga-cli --manifest-path "$(native "$ROOT/Cargo.toml")"
-  "$ROOT/target/release/saranga" run --config "$(native "$INSTANCE/etc/broker.xml")" \
+  "$ROOT/target/release/saranga" run --allow-kill --config "$(native "$INSTANCE/etc/broker.xml")" \
     --bind "127.0.0.1:$PORT" > "$WORK/saranga-$1.log" 2>&1 &
   BROKER_PID=$!
   wait_port

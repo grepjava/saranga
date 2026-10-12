@@ -569,11 +569,20 @@ impl Broker {
         }
         // The broker is active: notifications go out from now on, to an
         // address that exists so cluster bridges can connect
-        // (`ManagementServiceImpl.start`).
-        broker.post_office.add_memory_address(
-            &broker.management.config().notification_address,
-            RoutingType::Multicast,
-        );
+        // (`ManagementServiceImpl.start`). `addAddressInfo` journals it.
+        let notifications = broker.management.config().notification_address.clone();
+        if broker.post_office.address_info(&notifications).is_none()
+            && let Err(e) = broker.post_office.add_or_update_address(
+                &notifications,
+                RoutingTypes::of(RoutingType::Multicast),
+                false,
+                false,
+            )
+        {
+            tracing::warn!(
+                "AMQ222270: Unable to create management notification address: {notifications}: {e}"
+            );
+        }
         broker
             .post_office
             .set_notifier(notifications::Notifier::start(

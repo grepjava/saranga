@@ -755,22 +755,6 @@ impl PostOffice {
         }
     }
 
-    /// An address kept in memory only (`ActiveMQServer.addAddressInfo` of a
-    /// new `AddressInfo`): nothing when the address exists already.
-    pub fn add_memory_address(&self, name: &str, routing_type: RoutingType) {
-        if self.read().addresses.contains_key(name) {
-            return;
-        }
-        self.reload_address(AddressInfo {
-            id: self.ids.next(),
-            name: name.into(),
-            routing_types: RoutingTypes::of(routing_type),
-            auto_created: false,
-            temporary: false,
-            internal: false,
-        });
-    }
-
     /// A queue recovered from the bindings journal, under its persisted ID
     /// (`initQueues`). A name taken already gets a `-N` suffix.
     pub fn reload_queue(&self, id: i64, mut config: QueueConfig) -> Result<Queue> {
@@ -1646,6 +1630,20 @@ impl PostOffice {
         {
             return Err(BrokerError::address_does_not_exist(real));
         }
+        // routeFromCluster: a message naming the queues it goes to
+        // (`_AMQ_ROUTE_TO`, as `artemis data imp` and cluster bridges send
+        // it) goes to those of the address's queues, unless an exclusive
+        // divert takes it. The header goes.
+        if let Some((ids, stripped)) = route_to(message)
+            && !self.has_exclusive_divert(&stripped, real)
+        {
+            let queues = self.queues_by_id(real, &ids, &stripped);
+            self.count_route(real, !queues.is_empty());
+            if !queues.is_empty() {
+                out.push((stripped, queues));
+            }
+            return Ok(());
+        }
         // simpleRoute
         let mut bindings = self.bindings_route(message, address);
         if bindings.is_none() && auto_create {
@@ -1698,6 +1696,40 @@ impl PostOffice {
             }
         }
         Ok(())
+    }
+
+    /// Whether an exclusive divert of `address` takes the message.
+    fn has_exclusive_divert(&self, message: &MessageRef, address: &str) -> bool {
+        let state = self.read();
+        state.addresses.get(address).is_some_and(|e| {
+            e.diverts.iter().any(|d| {
+                d.exclusive
+                    && d.filter
+                        .as_ref()
+                        .is_none_or(|f| f.matches(&*message.message))
+            })
+        })
+    }
+
+    /// The queues of `address` with these IDs, in their order; an ID bound
+    /// to nothing there is logged (`bindingNotFound`).
+    fn queues_by_id(&self, address: &str, ids: &[i64], message: &MessageRef) -> Vec<Queue> {
+        let state = self.read();
+        let bound: &[Queue] = state
+            .addresses
+            .get(address)
+            .map_or(&[], |e| e.queues.as_slice());
+        let mut out = Vec::new();
+        for &id in ids {
+            match bound.iter().find(|q| q.id() == id) {
+                Some(q) => out.push(q.clone()),
+                None => tracing::warn!(
+                    "AMQ222196: Could not find binding with id={id} on routeFromCluster for message={} binding = {address}",
+                    message.message_id()
+                ),
+            }
+        }
+        out
     }
 
     /// `maybeSendToDLA`: with `send-to-dla-on-no-route`, a message nothing
@@ -2396,4 +2428,36 @@ impl FilterFactory for SelectorFilters {
             Err(_) => Err(BrokerError::invalid_filter(text.unwrap_or_default())),
         }
     }
+}
+
+/// `Message.HDR_ROUTE_TO_IDS` and `HDR_ROUTE_TO_ACK_IDS`.
+const HDR_ROUTE_TO_IDS: &str = "_AMQ_ROUTE_TO";
+const HDR_ROUTE_TO_ACK_IDS: &str = "_AMQ_ACK_ROUTE_TO";
+
+/// The queue IDs a message's `_AMQ_ROUTE_TO` names (big-endian longs),
+/// and the message without that header or `_AMQ_ACK_ROUTE_TO`.
+fn route_to(message: &MessageRef) -> Option<(Vec<i64>, MessageRef)> {
+    use saranga_buffer::{PropertyValue, SimpleString};
+    let core = message.message.core();
+    let Some(PropertyValue::Bytes(bytes)) =
+        core.properties.get(&SimpleString::from(HDR_ROUTE_TO_IDS))
+    else {
+        return None;
+    };
+    let ids = bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_be_bytes(*c))
+        .collect();
+    let mut stripped = core.clone();
+    stripped
+        .properties
+        .remove(&SimpleString::from(HDR_ROUTE_TO_IDS));
+    stripped
+        .properties
+        .remove(&SimpleString::from(HDR_ROUTE_TO_ACK_IDS));
+    let mut r = MessageRef::new(message.message.with_core(stripped));
+    r.scheduled_time = message.scheduled_time;
+    Some((ids, r))
 }
