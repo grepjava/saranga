@@ -539,11 +539,14 @@ struct Connection {
 pub async fn serve(broker: Arc<Broker>, manager: Arc<Manager>, c: Accepted) {
     let remote = c.info.remote_address.trim_start_matches('/').to_owned();
     let local = local_address(&c);
-    let client = Arc::new(ClientConnection::new(
-        Transport::socket("OPENWIRE", "OpenWireConnection", c.peer, c.local),
-        Arc::new(c.info),
-        c.acceptor.prefixes.clone(),
-    ));
+    let client = Arc::new(
+        ClientConnection::new(
+            Transport::socket("OPENWIRE", "OpenWireConnection", c.peer, c.local),
+            Arc::new(c.info),
+            c.acceptor.prefixes.clone(),
+        )
+        .with_acceptor(&c.acceptor.name),
+    );
     let _registered = broker.registry().add(&client);
     let failed = client.clone();
     let (mut rd, wr) = tokio::io::split(c.stream);

@@ -1,0 +1,106 @@
+--- connection 1
+AMQ841000: created connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841001: destroyed connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841002: created session name: UUID, session connectionID: CID, remote address ADDR
+AMQ841003: closed session with session name: UUID, failed: false, RemoteAddress: ADDR
+AMQ841004: added session metadata for session name : UUID, key: jms-session, data:
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+--- connection 2
+AMQ841000: created connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841001: destroyed connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841002: created session name: UUID, session connectionID: CID, remote address ADDR
+AMQ841003: closed session with session name: UUID, failed: false, RemoteAddress: ADDR
+AMQ841005: created consumer with ID: MID, with session name: UUID
+AMQ841006: closed consumer ID: 0, with  consumer Session: UUID, failed: false
+AMQ841007: created queue: QueueImpl[name=activemq.management.UUID, postOffice=PostOfficeImpl [server=ActiveMQServerImpl::name=0.0.0.0], temp=true]@HASH
+AMQ841007: created queue: QueueImpl[name=pq, postOffice=PostOfficeImpl [server=ActiveMQServerImpl::name=0.0.0.0], temp=false]@HASH
+AMQ841008: destroyed queue: QueueImpl[name=activemq.management.UUID, postOffice=PostOfficeImpl [server=ActiveMQServerImpl::name=0.0.0.0], temp=true]@HASH, with args address: activemq.management.UUID, session: SESSION, checkConsumerCount: true, removeConsumers: false, autoDeleteAddress: true
+AMQ841009: sent message with ID: MID, result: OK, transaction: UNAVAILABLE
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: OK
+AMQ841012: delivered message with message ID: MID, to consumer on address: activemq.management.UUID, queue: activemq.management.UUID, consumer sessionID: UUID, consumerID: 0
+AMQ841014: acknowledged message: Reference[MID]:NON-RELIABLE:CoreMessage[messageID=MID, durable=false, userID=null, priority=0, timestamp=0, expiration=0, durable=false, address=activemq.management.UUID, size=937, properties=TypedProperties[JMSCorrelationID=null, JMSReplyTo=activemq.management.UUID, _AMQ_OperationSucceeded=true]]@HASH, with transaction: TX
+--- connection 3
+AMQ841000: created connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841001: destroyed connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841002: created session name: UUID, session connectionID: CID, remote address ADDR
+AMQ841003: closed session with session name: UUID, failed: false, RemoteAddress: ADDR
+AMQ841004: added session metadata for session name : UUID, key: jms-session, data:
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+--- connection 4
+AMQ841000: created connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841001: destroyed connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841002: created session name: UUID, session connectionID: CID, remote address ADDR
+AMQ841002: created session name: UUID, session connectionID: CID, remote address ADDR
+AMQ841003: closed session with session name: UUID, failed: false, RemoteAddress: ADDR
+AMQ841003: closed session with session name: UUID, failed: false, RemoteAddress: ADDR
+AMQ841004: added session metadata for session name : UUID, key: jms-session, data:
+AMQ841009: sent message with ID: MID, result: OK, transaction: UNAVAILABLE
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: OK
+--- connection 5
+AMQ841000: created connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841001: destroyed connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841002: created session name: UUID, session connectionID: CID, remote address ADDR
+AMQ841003: closed session with session name: UUID, failed: false, RemoteAddress: ADDR
+AMQ841004: added session metadata for session name : UUID, key: jms-session, data:
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+--- connection 6
+AMQ841000: created connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841001: destroyed connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841002: created session name: UUID, session connectionID: CID, remote address ADDR
+AMQ841002: created session name: UUID, session connectionID: CID, remote address ADDR
+AMQ841003: closed session with session name: UUID, failed: false, RemoteAddress: ADDR
+AMQ841003: closed session with session name: UUID, failed: false, RemoteAddress: ADDR
+AMQ841004: added session metadata for session name : UUID, key: jms-session, data:
+AMQ841005: created consumer with ID: MID, with session name: UUID
+AMQ841006: closed consumer ID: 0, with  consumer Session: UUID, failed: false
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841012: delivered message with message ID: MID, to consumer on address: pq, queue: pq, consumer sessionID: UUID, consumerID: 0
+AMQ841014: acknowledged message: Reference[MID]:RELIABLE:CoreMessage[messageID=MID, durable=true, userID=UUID, priority=4, timestamp=TIME, expiration=0, durable=true, address=pq, size=360, properties=TypedProperties[ThreadSent=Producer ActiveMQQueue[pq], _AMQ_ROUTING_TYPE=1, __AMQ_CID=UUID, count=0, thread=0]]@HASH, with transaction: TX
+--- connection 7
+AMQ841000: created connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841001: destroyed connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841002: created session name: UUID, session connectionID: CID, remote address ADDR
+AMQ841003: closed session with session name: UUID, failed: false, RemoteAddress: ADDR
+AMQ841004: added session metadata for session name : UUID, key: jms-session, data:
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+--- connection 8
+AMQ841000: created connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841001: destroyed connection: RemotingConnectionImpl [ID=CID, clientID=null, nodeID=UUID, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@HASH[ID=CID, local= ADDR, remote=ADDR]]
+AMQ841002: created session name: UUID, session connectionID: CID, remote address ADDR
+AMQ841003: closed session with session name: UUID, failed: false, RemoteAddress: ADDR
+AMQ841005: created consumer with ID: MID, with session name: UUID
+AMQ841006: closed consumer ID: 0, with  consumer Session: UUID, failed: false
+AMQ841007: created queue: QueueImpl[name=activemq.management.UUID, postOffice=PostOfficeImpl [server=ActiveMQServerImpl::name=0.0.0.0], temp=true]@HASH
+AMQ841008: destroyed queue: QueueImpl[name=activemq.management.UUID, postOffice=PostOfficeImpl [server=ActiveMQServerImpl::name=0.0.0.0], temp=true]@HASH, with args address: activemq.management.UUID, session: SESSION, checkConsumerCount: true, removeConsumers: false, autoDeleteAddress: true
+AMQ841008: destroyed queue: QueueImpl[name=pq, postOffice=PostOfficeImpl [server=ActiveMQServerImpl::name=0.0.0.0], temp=false]@HASH, with args address: pq, session: SESSION, checkConsumerCount: true, removeConsumers: false, autoDeleteAddress: false
+AMQ841009: sent message with ID: MID, result: OK, transaction: UNAVAILABLE
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: NO_BINDINGS
+AMQ841010: routed message with ID: MID, result: OK
+AMQ841012: delivered message with message ID: MID, to consumer on address: activemq.management.UUID, queue: activemq.management.UUID, consumer sessionID: UUID, consumerID: 0
+AMQ841014: acknowledged message: Reference[MID]:NON-RELIABLE:CoreMessage[messageID=MID, durable=false, userID=null, priority=0, timestamp=0, expiration=0, durable=false, address=activemq.management.UUID, size=397, properties=TypedProperties[JMSCorrelationID=null, JMSReplyTo=activemq.management.UUID, _AMQ_OperationSucceeded=true]]@HASH, with transaction: TX

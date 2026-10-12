@@ -1393,11 +1393,14 @@ pub async fn serve(
     settings: Settings,
 ) {
     let remote = c.info.remote_address.clone();
-    let client = Arc::new(ClientConnection::new(
-        Transport::socket("MQTT", "MQTTConnection", c.peer, c.local),
-        Arc::new(c.info),
-        c.acceptor.prefixes.clone(),
-    ));
+    let client = Arc::new(
+        ClientConnection::new(
+            Transport::socket("MQTT", "MQTTConnection", c.peer, c.local),
+            Arc::new(c.info),
+            c.acceptor.prefixes.clone(),
+        )
+        .with_acceptor(&c.acceptor.name),
+    );
     let _registered = broker.registry().add(&client);
     let failed = client.clone();
     let (mut rd, wr) = tokio::io::split(c.stream);

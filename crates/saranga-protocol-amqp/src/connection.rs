@@ -469,11 +469,14 @@ pub async fn serve(
     config: AmqpConfig,
     registry: Arc<ContainerIds>,
 ) {
-    let client = Arc::new(ClientConnection::new(
-        Transport::socket("AMQP", "ActiveMQProtonRemotingConnection", c.peer, c.local),
-        Arc::new(c.info),
-        c.acceptor.prefixes.clone(),
-    ));
+    let client = Arc::new(
+        ClientConnection::new(
+            Transport::socket("AMQP", "ActiveMQProtonRemotingConnection", c.peer, c.local),
+            Arc::new(c.info),
+            c.acceptor.prefixes.clone(),
+        )
+        .with_acceptor(&c.acceptor.name),
+    );
     let _registered = broker.registry().add(&client);
     let (rd, wr) = tokio::io::split(c.stream);
     let (out_tx, out_rx) = mpsc::unbounded_channel();

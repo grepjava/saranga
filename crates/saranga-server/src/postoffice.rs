@@ -431,6 +431,8 @@ pub struct PostOffice {
     persisted: Mutex<Persisted>,
     /// Management notifications, once the broker is active.
     notifier: RwLock<Option<crate::notifications::Notifier>>,
+    /// The broker's plugins.
+    plugins: Arc<crate::plugin::Plugins>,
 }
 
 #[derive(Default)]
@@ -459,7 +461,13 @@ impl PostOffice {
             paging,
             persisted: Mutex::default(),
             notifier: RwLock::default(),
+            plugins: Arc::default(),
         })
+    }
+
+    /// The broker's plugins (`getBrokerPlugins`).
+    pub fn plugins(&self) -> &Arc<crate::plugin::Plugins> {
+        &self.plugins
     }
 
     /// Notifications are sent from now on (the broker is active).
@@ -733,10 +741,18 @@ impl PostOffice {
 
     /// An address recovered from the bindings journal.
     pub fn reload_address(&self, info: AddressInfo) {
-        self.write()
-            .addresses
-            .entry(info.name.clone())
-            .or_insert_with(|| AddressEntry::new(info));
+        let added = {
+            let mut state = self.write();
+            let added = !state.addresses.contains_key(&info.name);
+            state
+                .addresses
+                .entry(info.name.clone())
+                .or_insert_with(|| AddressEntry::new(info.clone()));
+            added
+        };
+        if added {
+            self.plugins.each(|p| p.after_add_address(&info, true));
+        }
     }
 
     /// An address kept in memory only (`ActiveMQServer.addAddressInfo` of a
@@ -802,6 +818,11 @@ impl PostOffice {
         state.queues.insert(queue.name().clone(), queue.clone());
         drop(state);
         self.notify_queue_binding(crate::notifications::NotificationType::BindingAdded, &queue);
+        // Recovered: bound, not created.
+        self.plugins.each(|p| {
+            let c = queue.config();
+            p.after_add_binding(&c.name, &c.address);
+        });
         Ok(queue)
     }
 
@@ -863,20 +884,33 @@ impl PostOffice {
             }
             return Ok(entry.info.clone());
         }
-        let info = AddressInfo {
-            id: self.ids.next(),
+        let mut info = AddressInfo {
+            id: 0,
             name: name.into(),
             routing_types,
             auto_created,
             temporary,
             internal: false,
         };
+        if !self.plugins.is_empty() {
+            // beforeAddAddress, outside the lock: the address has no ID yet.
+            drop(state);
+            self.plugins.check(|p| p.before_add_address(&info, false))?;
+            state = self.write();
+            if state.addresses.contains_key(name) {
+                drop(state);
+                return self.add_or_update_address(name, routing_types, auto_created, temporary);
+            }
+        }
+        info.id = self.ids.next();
         if !temporary && let Some(s) = self.ids.storage() {
             crate::recovery::store_address(s, &info).map_err(Self::io)?;
         }
         state
             .addresses
             .insert(info.name.clone(), AddressEntry::new(info.clone()));
+        drop(state);
+        self.plugins.each(|p| p.after_add_address(&info, false));
         Ok(info)
     }
 
@@ -887,20 +921,31 @@ impl PostOffice {
         if let Some(entry) = state.addresses.get(name) {
             return Ok(entry.info.clone());
         }
-        let info = AddressInfo {
-            id: self.ids.next(),
+        let mut info = AddressInfo {
+            id: 0,
             name: name.into(),
             routing_types: RoutingTypes::of(routing_type),
             auto_created: true,
             temporary: false,
             internal: true,
         };
+        if !self.plugins.is_empty() {
+            drop(state);
+            self.plugins.check(|p| p.before_add_address(&info, false))?;
+            state = self.write();
+            if let Some(entry) = state.addresses.get(name) {
+                return Ok(entry.info.clone());
+            }
+        }
+        info.id = self.ids.next();
         if let Some(s) = self.ids.storage() {
             crate::recovery::store_address(s, &info).map_err(Self::io)?;
         }
         state
             .addresses
             .insert(info.name.clone(), AddressEntry::new(info.clone()));
+        drop(state);
+        self.plugins.each(|p| p.after_add_address(&info, false));
         Ok(info)
     }
 
@@ -931,7 +976,10 @@ impl PostOffice {
                 {
                     tracing::warn!("removing address {name}: {e}");
                 }
-                state.addresses.remove(name);
+                let info = state.addresses.remove(name).map(|e| e.info);
+                drop(state);
+                self.plugins
+                    .each(|p| p.after_remove_address(name, info.as_ref()));
                 true
             }
             _ => false,
@@ -958,6 +1006,7 @@ impl PostOffice {
                 Err(BrokerError::queue_already_exists(&spec.name, &address))
             };
         }
+        self.plugins.check(|p| p.before_create_queue(&spec))?;
         let settings = self.settings(&spec.address);
         spec.apply_dynamic_defaults(&settings);
         let auto_create_address = spec.auto_create_address == Some(true) || spec.temporary;
@@ -1034,6 +1083,11 @@ impl PostOffice {
         state.queues.insert(queue.name().clone(), queue.clone());
         drop(state);
         self.notify_queue_binding(crate::notifications::NotificationType::BindingAdded, &queue);
+        self.plugins.each(|p| {
+            let c = queue.config();
+            p.after_add_binding(&c.name, &c.address);
+            p.after_create_queue(&queue);
+        });
         Ok(queue)
     }
 
@@ -1132,6 +1186,23 @@ impl PostOffice {
         check_consumers: bool,
         auto_delete_address: bool,
     ) -> Result<()> {
+        self.delete_queue_forcing(
+            name,
+            check_consumers,
+            auto_delete_address,
+            auto_delete_address,
+        )
+    }
+
+    /// [`PostOffice::delete_queue`] for a caller that removes the address
+    /// itself (`forceAutoDeleteAddress`, as the plugins are told).
+    pub fn delete_queue_forcing(
+        &self,
+        name: &str,
+        check_consumers: bool,
+        auto_delete_address: bool,
+        force_auto_delete_address: bool,
+    ) -> Result<()> {
         let queue = self
             .queue(name)
             .ok_or_else(|| BrokerError::no_such_queue(name))?;
@@ -1141,6 +1212,7 @@ impl PostOffice {
                 queue.consumer_count(),
             ));
         }
+        self.plugins.check(|p| p.before_destroy_queue(name))?;
         let address = queue.config().address.clone();
         {
             let mut state = self.write();
@@ -1162,6 +1234,10 @@ impl PostOffice {
         );
         queue.unsubscribe();
         queue.shutdown();
+        self.plugins.each(|p| {
+            p.after_remove_binding(name, &address);
+            p.after_destroy_queue(&queue, check_consumers, force_auto_delete_address);
+        });
         if auto_delete_address && self.address_auto_deletable(&address) {
             self.remove_address(&address);
         }
@@ -1501,14 +1577,25 @@ impl PostOffice {
         creator: Creator<'_>,
     ) -> Result<Routed> {
         let mut out = Vec::new();
-        self.route_into(
+        let plugins = &self.plugins;
+        plugins.check(|p| p.before_message_route(&message.message))?;
+        match self.route_into(
             message,
             address,
             routing_type,
             Hop::client(creator),
             &mut out,
-        )?;
-        Ok(out)
+        ) {
+            Ok(()) => {
+                let status = crate::plugin::RoutingStatus::of(&out);
+                plugins.each(|p| p.after_message_route(&message.message, status));
+                Ok(out)
+            }
+            Err(e) => {
+                plugins.each(|p| p.on_message_route_exception(&message.message, &e));
+                Err(e)
+            }
+        }
     }
 
     /// `PostOfficeImpl.route` for a message the broker itself sends (a
@@ -1517,8 +1604,22 @@ impl PostOffice {
     pub fn route_internal(&self, message: &MessageRef, address: &str) -> Routed {
         let mut out = Vec::new();
         let routing_type = routing_type(message.message.core());
-        if let Err(e) = self.route_into(message, address, routing_type, Hop::internal(), &mut out) {
-            tracing::debug!("routing to {address}: {e}");
+        let plugins = &self.plugins;
+        let routed = plugins
+            .check(|p| p.before_message_route(&message.message))
+            .and_then(|()| {
+                self.route_into(message, address, routing_type, Hop::internal(), &mut out)
+            });
+        match routed {
+            Ok(()) => {
+                let status = crate::plugin::RoutingStatus::of(&out);
+                plugins.each(|p| p.after_message_route(&message.message, status));
+            }
+            Err(e) => {
+                tracing::debug!("routing to {address}: {e}");
+                plugins.each(|p| p.on_message_route_exception(&message.message, &e));
+                out.clear();
+            }
         }
         out
     }

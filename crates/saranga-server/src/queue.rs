@@ -89,6 +89,12 @@ pub trait DeliverySink: Send + Sync {
     /// `ServerConsumer.disconnect`: management removed the consumer's
     /// queue, and the client is told its consumer is gone.
     fn disconnect(&self, _consumer_id: i64, _reason: &str) {}
+
+    /// Whether the broker's plugins let this consumer have the message
+    /// (`callBrokerMessagePluginsCanAccept`).
+    fn accepts(&self, _message: &ServerMessage) -> bool {
+        true
+    }
 }
 
 /// The most of a large message's body sent in one pass of the queue, so
@@ -607,6 +613,10 @@ impl Queue {
         };
         counter.fetch_add(1, Ordering::SeqCst);
         self.0.used.store(true, Ordering::SeqCst);
+        if let Some(po) = self.0.post_office.upgrade() {
+            po.plugins()
+                .each(|p| p.message_acknowledged(r, self, reason));
+        }
         if let Some(position) = &r.paged {
             if let Some(sub) = &self.0.paging
                 && let Some(store) = sub.store()
@@ -1138,6 +1148,7 @@ impl Consumer {
                 .filter
                 .as_ref()
                 .is_none_or(|f| f.matches(&*r.message))
+            && self.reg.sink.accepts(&r.message)
     }
 
     fn can_take(&self) -> bool {
@@ -1505,6 +1516,10 @@ impl Actor {
                 None => Arc::default(),
             }
         };
+        if let Some(po) = self.shared.post_office.upgrade() {
+            let expiry = s.expiry_address.as_deref().filter(|a| !a.is_empty());
+            po.plugins().each(|p| p.message_expired(&r, &queue, expiry));
+        }
         match s.expiry_address.clone().filter(|a| !a.is_empty()) {
             Some(expiry) => {
                 self.create_resources(

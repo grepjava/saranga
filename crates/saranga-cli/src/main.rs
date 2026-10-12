@@ -411,9 +411,10 @@ fn acceptors(file: &saranga_config::BrokerConfig, served: &[&str]) -> anyhow::Re
             }
         };
         out.push(Bind {
-            name,
+            name: name.clone(),
             address: format!("{host}:{port}"),
             acceptor: Acceptor {
+                name,
                 tls,
                 security_domain: a.param("securityDomain").map(str::to_owned),
                 host: host.to_owned(),

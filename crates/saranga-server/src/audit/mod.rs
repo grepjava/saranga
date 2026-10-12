@@ -138,19 +138,20 @@ pub(crate) fn server_string(broker: &Broker) -> String {
 /// `QueueImpl.toString`.
 fn queue_string(broker: &Broker, name: &str) -> String {
     match broker.post_office().queue(name) {
-        Some(q) => format!(
-            "QueueImpl[name={name}, postOffice=PostOfficeImpl [server={}], temp={}]@{:x}",
-            server_string(broker),
-            q.config().temporary,
-            identity(("queue", q.id()))
-        ),
+        Some(q) => queue_display(broker, &q),
         None => "null".to_owned(),
     }
 }
 
-/// `QueueImpl.toString` of a queue.
+/// `QueueImpl.toString` of a queue, which may be gone from the broker.
 pub(crate) fn queue_display(broker: &Broker, q: &crate::queue::Queue) -> String {
-    queue_string(broker, q.name())
+    format!(
+        "QueueImpl[name={}, postOffice=PostOfficeImpl [server={}], temp={}]@{:x}",
+        q.name(),
+        server_string(broker),
+        q.config().temporary,
+        identity(("queue", q.id()))
+    )
 }
 
 /// `AddressInfo.toString`.
@@ -941,9 +942,34 @@ pub(crate) struct AuditedSink {
     pub subject: Option<std::sync::Arc<Subject>>,
     pub remote: String,
     pub queue: String,
+    /// The broker's plugins, told of each delivery.
+    pub plugins: std::sync::Arc<crate::plugin::Plugins>,
+    /// The consumer, for the plugins.
+    pub consumer: std::sync::OnceLock<std::sync::Weak<crate::registry::ConsumerEntry>>,
 }
 
 impl AuditedSink {
+    fn consumer(&self) -> Option<std::sync::Arc<crate::registry::ConsumerEntry>> {
+        if self.plugins.is_empty() {
+            return None;
+        }
+        self.consumer.get().and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Delivers with the plugins' `beforeDeliver` and `afterDeliver`.
+    fn delivering(&self, message: &ServerMessage, deliver: impl FnOnce() -> i64) -> i64 {
+        self.log(message);
+        let consumer = self.consumer();
+        if let Some(c) = &consumer {
+            self.plugins.each(|p| p.before_deliver(c, message));
+        }
+        let credits = deliver();
+        if let Some(c) = &consumer {
+            self.plugins.each(|p| p.after_deliver(c, message));
+        }
+        credits
+    }
+
     fn log(&self, message: &ServerMessage) {
         if log::message_enabled() {
             let who = Who {
@@ -971,8 +997,9 @@ impl AuditedSink {
 
 impl crate::queue::DeliverySink for AuditedSink {
     fn deliver(&self, consumer_id: i64, message: &ServerMessage, delivery_count: i32) -> i64 {
-        self.log(message);
-        self.inner.deliver(consumer_id, message, delivery_count)
+        self.delivering(message, || {
+            self.inner.deliver(consumer_id, message, delivery_count)
+        })
     }
 
     fn deliver_large(
@@ -982,9 +1009,10 @@ impl crate::queue::DeliverySink for AuditedSink {
         body_size: i64,
         delivery_count: i32,
     ) -> i64 {
-        self.log(message);
-        self.inner
-            .deliver_large(consumer_id, message, body_size, delivery_count)
+        self.delivering(message, || {
+            self.inner
+                .deliver_large(consumer_id, message, body_size, delivery_count)
+        })
     }
 
     fn deliver_continuation(&self, consumer_id: i64, chunk: Vec<u8>, continues: bool) -> i64 {
@@ -1006,6 +1034,16 @@ impl crate::queue::DeliverySink for AuditedSink {
 
     fn disconnect(&self, consumer_id: i64, reason: &str) {
         self.inner.disconnect(consumer_id, reason)
+    }
+
+    fn accepts(&self, message: &ServerMessage) -> bool {
+        if self.plugins.is_empty() {
+            return true;
+        }
+        // Until the consumer is known it takes nothing a plugin might
+        // refuse it.
+        self.consumer()
+            .is_some_and(|c| self.plugins.can_accept(&c, message))
     }
 }
 

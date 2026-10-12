@@ -27,6 +27,12 @@ pub enum NotificationType {
     SessionCreated,
     SessionClosed,
     BindingUpdated,
+    ConnectionCreated,
+    ConnectionDestroyed,
+    AddressAdded,
+    AddressRemoved,
+    MessageDelivered,
+    MessageExpired,
 }
 
 impl NotificationType {
@@ -44,6 +50,12 @@ impl NotificationType {
             Self::SessionCreated => "SESSION_CREATED",
             Self::SessionClosed => "SESSION_CLOSED",
             Self::BindingUpdated => "BINDING_UPDATED",
+            Self::ConnectionCreated => "CONNECTION_CREATED",
+            Self::ConnectionDestroyed => "CONNECTION_DESTROYED",
+            Self::AddressAdded => "ADDRESS_ADDED",
+            Self::AddressRemoved => "ADDRESS_REMOVED",
+            Self::MessageDelivered => "MESSAGE_DELIVERED",
+            Self::MessageExpired => "MESSAGE_EXPIRED",
         }
     }
 }
@@ -70,6 +82,8 @@ pub mod hdr {
     pub const CONNECTION_NAME: &str = "_AMQ_ConnectionName";
     pub const PROTOCOL_NAME: &str = "_AMQ_Protocol_Name";
     pub const CLIENT_ID: &str = "_AMQ_Client_ID";
+    pub const ROUTING_TYPE: &str = "_AMQ_Routing_Type";
+    pub const MESSAGE_ID: &str = "_AMQ_Message_ID";
 }
 
 /// A string property, or null (`SimpleString.of(null)`).

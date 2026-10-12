@@ -306,6 +306,30 @@ pub fn storage_config(config: &cfg::BrokerConfig, instance: &Path) -> StorageCon
     }
 }
 
+/// `<broker-plugins>`: Saranga's ports of Artemis's own plugins. Another
+/// class is Java code Saranga cannot run, and starting without it could
+/// leave out what it enforces, so the broker does not start.
+fn plugins(config: &cfg::BrokerConfig) -> cfg::Result<Vec<Arc<dyn crate::plugin::BrokerPlugin>>> {
+    config
+        .broker_plugins
+        .iter()
+        .map(|p| {
+            let invalid = |reason: String| cfg::ConfigError::InvalidValue {
+                name: "broker-plugin class-name".to_owned(),
+                value: p.class_name.clone(),
+                reason,
+            };
+            match crate::plugin::from_config(&p.class_name, &p.properties) {
+                Some(Ok(plugin)) => Ok(plugin),
+                Some(Err(e)) => Err(invalid(e)),
+                None => Err(invalid(
+                    "Saranga has no port of this plugin, and cannot run Java plugins".to_owned(),
+                )),
+            }
+        })
+        .collect()
+}
+
 impl BrokerConfig {
     /// The broker configuration a `broker.xml` describes, with the broker
     /// instance directory its relative data directories are under.
@@ -355,6 +379,7 @@ impl BrokerConfig {
             // broker adds them.
             protocols: Vec::new(),
             critical: crate::critical::CriticalConfig::from_file(config),
+            plugins: plugins(config)?,
             management: crate::management::ManagementConfig {
                 address: config.management_address.clone(),
                 notification_address: config.management_notification_address.clone(),

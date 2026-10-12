@@ -185,6 +185,11 @@ fn fire(broker: &Arc<Broker>, config: &CriticalConfig, component: &str) {
         "AMQ222199: Thread dump: {}",
         thread_dump(broker, config.timeout)
     );
+    // sendCriticalNotification.
+    broker
+        .post_office()
+        .plugins()
+        .each(|p| p.critical_failure(component));
     match config.policy {
         // Runtime.halt(70): no shutdown, no hooks.
         CriticalAnalyzerPolicy::Halt => std::process::exit(70),

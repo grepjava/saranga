@@ -26,6 +26,7 @@ pub struct Registry {
     total_sessions: AtomicI64,
     total_consumers: AtomicI64,
     next_producer_id: AtomicI64,
+    plugins: Arc<crate::plugin::Plugins>,
 }
 
 /// Keeps a connection listed until dropped.
@@ -39,6 +40,8 @@ impl Drop for Registration {
     fn drop(&mut self) {
         if let Some(r) = self.registry.upgrade() {
             lock(&r.connections).remove(&self.key);
+            r.plugins
+                .each(|p| p.after_destroy_connection(&self.connection));
         }
         if audit::resource_enabled() {
             let c = &self.connection;
@@ -56,6 +59,18 @@ impl Drop for Registration {
 }
 
 impl Registry {
+    /// A registry whose connections the plugins are told of.
+    pub fn new(plugins: Arc<crate::plugin::Plugins>) -> Self {
+        Self {
+            plugins,
+            ..Self::default()
+        }
+    }
+
+    pub fn plugins(&self) -> &Arc<crate::plugin::Plugins> {
+        &self.plugins
+    }
+
     /// Lists `connection` until the returned registration is dropped
     /// (`RemotingServiceImpl.connectionCreated` / `removeConnection`).
     pub fn add(self: &Arc<Self>, connection: &Arc<ClientConnection>) -> Registration {
@@ -72,6 +87,7 @@ impl Registry {
                 ],
             ));
         }
+        self.plugins.each(|p| p.after_create_connection(connection));
         Registration {
             registry: Arc::downgrade(self),
             key,
@@ -207,8 +223,8 @@ impl SessionEntry {
         lock(&self.consumers).insert(consumer.id, consumer);
     }
 
-    pub(crate) fn remove_consumer(&self, id: i64) {
-        lock(&self.consumers).remove(&id);
+    pub(crate) fn remove_consumer(&self, id: i64) -> Option<Arc<ConsumerEntry>> {
+        lock(&self.consumers).remove(&id)
     }
 
     /// Producers are tracked by address, as a Core client before 2.28

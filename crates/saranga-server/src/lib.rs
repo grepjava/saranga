@@ -19,6 +19,7 @@ pub mod message;
 pub mod node;
 pub mod notifications;
 pub mod paging;
+pub mod plugin;
 pub mod postoffice;
 pub mod protocol;
 pub mod queue;
@@ -131,6 +132,8 @@ pub struct AddressDeployment {
 /// How an acceptor treats its connections.
 #[derive(Clone)]
 pub struct Acceptor {
+    /// The acceptor's `name`.
+    pub name: String,
     /// `sslEnabled`: the handshake to run first.
     pub tls: Option<Arc<saranga_transport::TlsAcceptor>>,
     /// `securityDomain`: the JAAS domain its clients log in through.
@@ -171,6 +174,7 @@ impl Acceptor {
 impl Default for Acceptor {
     fn default() -> Self {
         Self {
+            name: String::new(),
             tls: None,
             security_domain: None,
             host: "localhost".to_owned(),
@@ -238,6 +242,8 @@ pub struct BrokerConfig {
     pub management: management::ManagementConfig,
     /// The critical analyzer.
     pub critical: critical::CriticalConfig,
+    /// Plugins (`<broker-plugins>`, or the embedding application's own).
+    pub plugins: Vec<Arc<dyn plugin::BrokerPlugin>>,
 }
 
 impl BrokerConfig {
@@ -268,6 +274,7 @@ impl BrokerConfig {
             protocols: Vec::new(),
             management: management::ManagementConfig::default(),
             critical: critical::CriticalConfig::default(),
+            plugins: Vec::new(),
         }
     }
 }
@@ -438,6 +445,11 @@ impl Broker {
             ),
             paging.clone(),
         );
+        // registerBrokerPlugins: before anything is loaded, so the plugins
+        // see the addresses and queues recovered and deployed.
+        for p in &config.plugins {
+            post_office.plugins().register(p.clone());
+        }
         let recovered = match &storage {
             Some(s) => recovery::load_bindings(s, &post_office, config.users.as_deref())?,
             None => Default::default(),
@@ -507,6 +519,7 @@ impl Broker {
             Some(l) => l.node_id().to_owned(),
             None => uuid::Uuid::new_v4().to_string(),
         };
+        let registry = Arc::new(registry::Registry::new(post_office.plugins().clone()));
         let broker = Arc::new(Self {
             node_id,
             post_office,
@@ -529,12 +542,15 @@ impl Broker {
             extra_records: Mutex::new(extra_records),
             management: management::Management::new(config.management),
             config_loader: Mutex::new(None),
-            registry: Arc::default(),
+            registry,
             users: config.users.clone(),
             security_records: Mutex::default(),
             stopped: Default::default(),
             shutdown: tokio::sync::Notify::new(),
         });
+        for p in broker.post_office.plugins().all() {
+            p.registered(&broker);
+        }
         // recoverStoredSecuritySettings.
         for (id, s) in &recovered.security_settings {
             let address_match = s.address_match.to_string_lossy();
@@ -598,11 +614,27 @@ impl Broker {
         self.shutdown.notified().await;
     }
 
+    /// `registerBrokerPlugin`: installs a plugin in the running broker.
+    pub fn register_plugin(self: &Arc<Self>, plugin: Arc<dyn plugin::BrokerPlugin>) {
+        self.post_office.plugins().register(plugin.clone());
+        plugin.registered(self);
+    }
+
+    /// `unRegisterBrokerPlugin`.
+    pub fn unregister_plugin(&self, plugin: &Arc<dyn plugin::BrokerPlugin>) {
+        if self.post_office.plugins().unregister(plugin) {
+            plugin.unregistered(self);
+        }
+    }
+
     /// A clean stop: the ID generator's checkpoint and the journals are
     /// written out, and `server.lock` marked paused.
     pub fn stop(&self) -> Result<()> {
-        self.stopped
-            .store(true, std::sync::atomic::Ordering::Release);
+        if !self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            for p in self.post_office.plugins().all() {
+                p.unregistered(self);
+            }
+        }
         self.large_messages.stop();
         self.post_office.paging().stop();
         if let Some(s) = &self.storage {
@@ -732,6 +764,9 @@ impl Broker {
             .entry(session.to_owned())
             .or_default()
             .insert(key.to_owned(), data.to_owned());
+        self.post_office
+            .plugins()
+            .each(|p| p.after_session_metadata_added(session, key, data));
     }
 
     /// `addUniqueMetaData`: refuses a key/value pair another session holds.
@@ -746,6 +781,10 @@ impl Broker {
         all.entry(session.to_owned())
             .or_default()
             .insert(key.to_owned(), data.to_owned());
+        drop(all);
+        self.post_office
+            .plugins()
+            .each(|p| p.after_session_metadata_added(session, key, data));
         true
     }
 

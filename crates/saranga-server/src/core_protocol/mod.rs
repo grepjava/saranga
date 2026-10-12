@@ -231,11 +231,14 @@ pub async fn serve_stream<S>(
     let shared = Arc::new(ConnShared {
         out,
         version: AtomicI32::new(0),
-        client: Arc::new(ClientConnection::new(
-            Transport::socket("CORE", "RemotingConnectionImpl", peer, local),
-            Arc::new(info),
-            acceptor.prefixes.clone(),
-        )),
+        client: Arc::new(
+            ClientConnection::new(
+                Transport::socket("CORE", "RemotingConnectionImpl", peer, local),
+                Arc::new(info),
+                acceptor.prefixes.clone(),
+            )
+            .with_acceptor(&acceptor.name),
+        ),
     });
     let _registered = broker.registry().add(&shared.client);
     // `CoreFrameWithSizeLimitDecoder`: with connection security, frames are

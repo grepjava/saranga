@@ -99,6 +99,8 @@ pub struct ClientConnection {
     subject: Mutex<Option<Arc<saranga_security::jaas::Subject>>>,
     /// The acceptor's address prefixes.
     prefixes: Vec<(String, RoutingType)>,
+    /// The name of the acceptor the connection came in on.
+    acceptor: Option<String>,
     sessions: Mutex<Vec<Arc<SessionEntry>>>,
     /// Management closed the connection (`fail`).
     failed: AtomicBool,
@@ -131,6 +133,7 @@ impl ClientConnection {
             security_info,
             subject: Mutex::default(),
             prefixes,
+            acceptor: None,
             sessions: Mutex::default(),
             failed: AtomicBool::new(false),
             killed: AtomicBool::new(false),
@@ -138,8 +141,19 @@ impl ClientConnection {
         }
     }
 
+    /// Names the acceptor the connection came in on.
+    pub fn with_acceptor(mut self, name: &str) -> Self {
+        self.acceptor = (!name.is_empty()).then(|| name.to_owned());
+        self
+    }
+
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// The name of the acceptor the connection came in on, if any.
+    pub fn acceptor(&self) -> Option<&str> {
+        self.acceptor.as_deref()
     }
 
     pub fn protocol(&self) -> &'static str {
@@ -454,6 +468,10 @@ impl ServerSession {
         conn.add_session(entry.clone());
         broker.registry().session_created();
         session_notification(&broker, &conn, &entry, NotificationType::SessionCreated);
+        broker
+            .post_office()
+            .plugins()
+            .each(|p| p.after_create_session(&entry));
         Self {
             broker,
             conn,
@@ -862,6 +880,17 @@ impl ServerSession {
             }
             (_, None) => (address, None),
         };
+        // beforeSend: a session's own sends, not the replies the broker
+        // sends for it.
+        let plugins = (!self.unchecked)
+            .then(|| self.broker.post_office().plugins().clone())
+            .filter(|p| !p.is_empty());
+        if let Some(plugins) = &plugins
+            && let Err(e) = plugins.check(|p| p.before_send(&entry, &message, tx.is_some()))
+        {
+            plugins.each(|p| p.on_send_exception(&entry, &message, &e));
+            return Err(e);
+        }
         // handleManagementMessage: a message to the management address is
         // a request, answered on its reply-to address.
         if !self.unchecked && *address == *self.broker.management().address() {
@@ -869,7 +898,26 @@ impl ServerSession {
                 Outgoing::Native(native, ..) => native.to_core(),
                 Outgoing::Core(_) => message,
             };
-            return Box::pin(self.handle_management_message(request, tx)).await;
+            let Some(plugins) = plugins else {
+                return Box::pin(self.handle_management_message(request, tx)).await;
+            };
+            let sent = ServerMessage::new(request.clone());
+            let handled = Box::pin(self.handle_management_message(request, tx.clone())).await;
+            match &handled {
+                Ok(()) => {
+                    let t = tx.as_ref().map(transaction::lock);
+                    plugins.each(|p| {
+                        p.after_send(
+                            &entry,
+                            &sent,
+                            crate::plugin::RoutingStatus::Ok,
+                            t.as_deref(),
+                        )
+                    });
+                }
+                Err(e) => plugins.each(|p| p.on_send_exception(&entry, sent.core(), e)),
+            }
+            return handled;
         }
         // The user must be allowed to send to the address (and to the queue
         // a fully qualified name picks).
@@ -962,6 +1010,17 @@ impl ServerSession {
                         ),
                     ));
                 }
+                if let Some(plugins) = &plugins {
+                    let t = tx.as_ref().map(transaction::lock);
+                    plugins.each(|p| {
+                        p.after_send(
+                            &entry,
+                            &r.message,
+                            crate::plugin::RoutingStatus::DuplicatedId,
+                            t.as_deref(),
+                        )
+                    });
+                }
                 return Ok(());
             }
             let record = po.ids().next();
@@ -997,10 +1056,25 @@ impl ServerSession {
                 if let (Some((jtx, true)), Some(s)) = (own_tx, &storage) {
                     let _ = s.rollback(jtx);
                 }
+                if let Some(plugins) = &plugins {
+                    plugins.each(|p| p.on_send_exception(&entry, r.message.core(), &e));
+                }
                 return Err(e);
             }
         };
-        self.deliver_routed(routed, tx, own_tx)
+        let Some(plugins) = plugins else {
+            return self.deliver_routed(routed, tx, own_tx);
+        };
+        let status = crate::plugin::RoutingStatus::of(&routed);
+        let sent = self.deliver_routed(routed, tx.clone(), own_tx);
+        match &sent {
+            Ok(()) => {
+                let t = tx.as_ref().map(transaction::lock);
+                plugins.each(|p| p.after_send(&entry, &r.message, status, t.as_deref()));
+            }
+            Err(e) => plugins.each(|p| p.on_send_exception(&entry, r.message.core(), e)),
+        }
+        sent
     }
 
     /// `ServerSessionImpl.handleManagementMessage`: with the `manage`
@@ -1890,6 +1964,9 @@ impl ServerSession {
             None,
         );
         let post_office = self.broker.post_office();
+        post_office.plugins().check(|p| {
+            p.before_create_consumer(consumer_id, queue_name, filter.as_deref(), browse_only)
+        })?;
         let name = queue_name_of(queue_name);
         let queue = post_office
             .queue(name)
@@ -1921,13 +1998,28 @@ impl ServerSession {
         let id = self.broker.next_consumer_id();
         // Its deliveries go through the audit log's message logger, which
         // can be turned on while it consumes.
-        let sink: Arc<dyn DeliverySink> = Arc::new(crate::audit::AuditedSink {
+        let audited = Arc::new(crate::audit::AuditedSink {
             inner: sink(&queue),
             subject: self.auth.subject.clone(),
             remote: self.conn.remote_address().to_owned(),
             queue: queue.name().to_string(),
+            plugins: post_office.plugins().clone(),
+            consumer: Default::default(),
         });
+        let sink: Arc<dyn DeliverySink> = audited.clone();
         let metrics = Arc::new(ConsumerMetrics::default());
+        let consumer = Arc::new(ConsumerEntry {
+            id: consumer_id,
+            sequential_id: id,
+            session: self.name.clone(),
+            queue: queue.clone(),
+            filter: filter_string.clone(),
+            browse_only,
+            created: crate::message::now_millis(),
+            metrics: metrics.clone(),
+            sink: sink.clone(),
+        });
+        let _ = audited.consumer.set(Arc::downgrade(&consumer));
         queue.add_consumer(ConsumerRegistration {
             id,
             client_id: consumer_id,
@@ -1939,18 +2031,11 @@ impl ServerSession {
             started: self.started,
             metrics: metrics.clone(),
         });
-        self.entry.add_consumer(Arc::new(ConsumerEntry {
-            id: consumer_id,
-            sequential_id: id,
-            session: self.name.clone(),
-            queue: queue.clone(),
-            filter: filter_string.clone(),
-            browse_only,
-            created: crate::message::now_millis(),
-            metrics: metrics.clone(),
-            sink,
-        }));
+        self.entry.add_consumer(consumer.clone());
         self.broker.registry().consumer_created();
+        post_office
+            .plugins()
+            .each(|p| p.after_create_consumer(&consumer));
         if !browse_only {
             // CONSUMER_CREATED: the address, or the FQQN the client named.
             let c = queue.config();
@@ -1999,8 +2084,15 @@ impl ServerSession {
             tracing::debug!(consumer_id, "closing an unknown consumer");
             return;
         };
-        self.entry.remove_consumer(consumer_id);
+        let plugins = self.broker.post_office().plugins().clone();
+        let entry = self.entry.remove_consumer(consumer_id);
+        if let Some(e) = &entry {
+            plugins.each(|p| p.before_close_consumer(e, failed));
+        }
         c.queue.remove_consumer(c.id, failed).await;
+        if let Some(e) = &entry {
+            plugins.each(|p| p.after_close_consumer(e, failed));
+        }
         if !c.browse_only {
             let address = c.queue.config().address.to_string();
             let props = self.consumer_props(consumer_id, &c.queue, c.filter.as_deref());
@@ -2172,7 +2264,7 @@ impl ServerSession {
         if check_security {
             self.security_check(&address, Some(name), check)?;
         }
-        post_office.delete_queue(name, true, false)?;
+        post_office.delete_queue_forcing(name, true, false, true)?;
         self.conn.remove_temp_queue(name);
         // `destroyQueue(forceAutoDeleteAddress)`: a client's delete takes an
         // auto-created address along whatever `auto-delete-addresses` says,
@@ -2407,6 +2499,8 @@ impl ServerSession {
             return;
         }
         self.closed = true;
+        let plugins = self.broker.post_office().plugins().clone();
+        plugins.each(|p| p.before_close_session(&self.entry, failed));
         if failed {
             for tx in [self.tx.take(), self.pending_tx.take()]
                 .into_iter()
@@ -2445,6 +2539,7 @@ impl ServerSession {
             &self.entry,
             NotificationType::SessionClosed,
         );
+        plugins.each(|p| p.after_close_session(&self.entry, failed));
     }
 
     /// What `CONSUMER_CREATED` and `CONSUMER_CLOSED` say of a consumer.
