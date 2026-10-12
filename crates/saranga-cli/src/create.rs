@@ -51,7 +51,7 @@ const TEMPLATES: &[(&str, &str)] = &[
     template!("bin/instance.cmd"),
 ];
 
-fn template_text(name: &str) -> anyhow::Result<&'static str> {
+pub(crate) fn template_text(name: &str) -> anyhow::Result<&'static str> {
     TEMPLATES
         .iter()
         .find(|(n, _)| *n == name)
@@ -62,10 +62,10 @@ fn template_text(name: &str) -> anyhow::Result<&'static str> {
 /// The placeholders, replaced in the order they were added
 /// (`applyFilters` over a `LinkedHashMap`).
 #[derive(Default)]
-struct Filters(Vec<(String, String)>);
+pub(crate) struct Filters(Vec<(String, String)>);
 
 impl Filters {
-    fn put(&mut self, key: &str, value: impl Into<String>) {
+    pub(crate) fn put(&mut self, key: &str, value: impl Into<String>) {
         let value = value.into();
         match self.0.iter_mut().find(|(k, _)| k == key) {
             Some((_, v)) => *v = value,
@@ -73,15 +73,82 @@ impl Filters {
         }
     }
 
-    fn apply(&self, content: &str) -> String {
+    pub(crate) fn apply(&self, content: &str) -> String {
         self.0
             .iter()
             .fold(content.to_owned(), |c, (k, v)| c.replace(k.as_str(), v))
     }
 
     /// `readTextFile`: a template with the placeholders so far.
-    fn read(&self, name: &str) -> anyhow::Result<String> {
+    pub(crate) fn read(&self, name: &str) -> anyhow::Result<String> {
         Ok(self.apply(template_text(name)?))
+    }
+}
+
+/// `InstallAbstract`'s options, shared by `create` and `upgrade`.
+#[derive(clap::Args, Debug)]
+pub struct InstallArgs {
+    /// The instance directory to hold the broker's configuration and data.
+    /// Path must be writable.
+    pub(crate) directory: PathBuf,
+    /// Directory where the configuration is located. Paths can be absolute
+    /// or relative to the instance directory. Default: etc.
+    #[arg(long, default_value = "etc")]
+    pub(crate) etc: String,
+    /// Directory where the data is stored. Paths can be absolute or
+    /// relative to the instance directory. Default: data.
+    #[arg(long, default_value = "data")]
+    pub(crate) data: String,
+    /// Directory written as the profiles' ARTEMIS_HOME. Default: the
+    /// directory of this saranga.
+    #[arg(long)]
+    pub(crate) home: Option<PathBuf>,
+    /// The encoding that text files should use. Default: UTF-8 (the only
+    /// one saranga writes).
+    #[arg(long, default_value = "UTF-8")]
+    pub(crate) encoding: String,
+    /// Force Windows script creation. Default: based on your actual system.
+    #[arg(long)]
+    pub(crate) windows: bool,
+    /// Force Linux or Cygwin script creation. Default: based on your actual
+    /// system.
+    #[arg(long, alias = "linux")]
+    pub(crate) cygwin: bool,
+    /// Extra Java options to be passed to the profile (written to it; not
+    /// used by saranga).
+    #[arg(long = "java-options", allow_hyphen_values = true)]
+    pub(crate) java_options: Vec<String>,
+    /// Extra Java options to be passed to the utility profile.
+    #[arg(long = "java-utility-options", allow_hyphen_values = true)]
+    pub(crate) java_utility_options: Vec<String>,
+    /// Define the -Xmx memory parameter in the profile. Default: 2G.
+    #[arg(long = "java-memory", default_value = "2G")]
+    pub(crate) java_memory: String,
+}
+
+impl InstallArgs {
+    /// `InstallAbstract.run`: whether the scripts are Windows ones.
+    pub(crate) fn is_windows(&self) -> bool {
+        if self.windows {
+            true
+        } else if self.cygwin {
+            false
+        } else {
+            cfg!(windows) && std::env::var("OSTYPE").as_deref() != Ok("cygwin")
+        }
+    }
+
+    /// `getJavaOptions`: each option followed by a space.
+    pub(crate) fn java_options(&self) -> String {
+        self.java_options.iter().map(|s| format!("{s} ")).collect()
+    }
+
+    /// `getJavaUtilityOptions`.
+    pub(crate) fn java_utility_options(&self) -> String {
+        self.java_utility_options
+            .iter()
+            .map(|s| format!("{s} "))
+            .collect()
     }
 }
 
@@ -89,42 +156,8 @@ impl Filters {
 pub struct CreateArgs {
     #[command(flatten)]
     common: Common,
-    /// The instance directory to hold the broker's configuration and data.
-    /// Path must be writable.
-    directory: PathBuf,
-    /// Directory where the configuration is located. Paths can be absolute
-    /// or relative to the instance directory. Default: etc.
-    #[arg(long, default_value = "etc")]
-    etc: String,
-    /// Directory where the data is stored. Paths can be absolute or
-    /// relative to the instance directory. Default: data.
-    #[arg(long, default_value = "data")]
-    data: String,
-    /// Directory written as the profiles' ARTEMIS_HOME. Default: the
-    /// directory of this saranga.
-    #[arg(long)]
-    home: Option<PathBuf>,
-    /// The encoding that text files should use. Default: UTF-8 (the only
-    /// one saranga writes).
-    #[arg(long, default_value = "UTF-8")]
-    encoding: String,
-    /// Force Windows script creation. Default: based on your actual system.
-    #[arg(long)]
-    windows: bool,
-    /// Force Linux or Cygwin script creation. Default: based on your actual
-    /// system.
-    #[arg(long, alias = "linux")]
-    cygwin: bool,
-    /// Extra Java options to be passed to the profile (written to it; not
-    /// used by saranga).
-    #[arg(long = "java-options", allow_hyphen_values = true)]
-    java_options: Vec<String>,
-    /// Extra Java options to be passed to the utility profile.
-    #[arg(long = "java-utility-options", allow_hyphen_values = true)]
-    java_utility_options: Vec<String>,
-    /// Define the -Xmx memory parameter in the profile. Default: 2G.
-    #[arg(long = "java-memory", default_value = "2G")]
-    java_memory: String,
+    #[command(flatten)]
+    install: InstallArgs,
     /// Broker's host name. Default: 0.0.0.0.
     #[arg(long)]
     host: Option<String>,
@@ -357,11 +390,11 @@ impl Unsupported {
 /// `Create.run`.
 pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
     args.unsupported.check()?;
-    if !args.encoding.eq_ignore_ascii_case("UTF-8") {
+    if !args.install.encoding.eq_ignore_ascii_case("UTF-8") {
         bail!("saranga create writes UTF-8 files only");
     }
     // `checkDirectory`.
-    let directory = &args.directory;
+    let directory = &args.install.directory;
     if !directory.exists() {
         std::fs::create_dir_all(directory).map_err(|_| {
             UsageError(format!(
@@ -376,13 +409,7 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
         )));
     }
     let directory = canonical(directory)?;
-    let windows = if args.windows {
-        true
-    } else if args.cygwin {
-        false
-    } else {
-        cfg!(windows) && std::env::var("OSTYPE").as_deref() != Ok("cygwin")
-    };
+    let windows = args.install.is_windows();
     let nix = !windows;
 
     // `setupJournalType`.
@@ -509,7 +536,7 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
     f.put("${mqtt.port}", (1883 + offset).to_string());
     f.put("${http.host}", args.http_host.clone());
     f.put("${http.port}", (args.http_port + offset).to_string());
-    f.put("${data.dir}", args.data.clone());
+    f.put("${data.dir}", args.install.data.clone());
     f.put("${max-hops}", "1");
     f.put("${message-load-balancing}", "ON_DEMAND");
     let user = args
@@ -558,46 +585,33 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
     f.put("${cluster-user}", "");
     f.put("${cluster-password}", "");
     f.put("${address-queue.settings}", addresses_and_queues(&args));
-    let home = match &args.home {
+    let home = match &args.install.home {
         Some(h) => canonical(h)?,
         None => saranga_home()?,
     };
     f.put("${home}", path(&home));
 
     std::fs::create_dir_all(directory.join("bin"))?;
-    let etc = create_directory(&args.etc, &directory)?;
+    let etc = create_directory(&args.install.etc, &directory)?;
     std::fs::create_dir_all(directory.join("tmp"))?;
     std::fs::create_dir_all(directory.join("lib"))?;
-    let data = create_directory(&args.data, &directory)?;
+    let data = create_directory(&args.install.data, &directory)?;
     let log = create_directory("log", &directory)?;
     let oome = log.join("oom_dump.hprof");
 
-    // `addScriptFilters`.
-    let java_options: String = args.java_options.iter().map(|s| format!("{s} ")).collect();
-    let java_utility_options: String = args
-        .java_utility_options
-        .iter()
-        .map(|s| format!("{s} "))
-        .collect();
-    f.put("${artemis.home}", path(&home));
-    f.put("@artemis.instance@", path(&directory));
-    f.put(
-        "${artemis.instance.name}",
-        directory
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-    );
-    f.put("${java.home}", "");
-    f.put("${artemis.instance.etc.uri}", file_uri(&etc));
-    f.put("${artemis.instance.etc}", path(&etc));
-    f.put("${artemis.instance.oome.dump}", path(&oome));
-    f.put("${artemis.instance.data}", path(&data));
-    f.put("${java-memory}", args.java_memory.clone());
-    f.put("${java-opts}", java_options.clone());
-    f.put("${java-utility-opts}", java_utility_options);
-    f.put("${role}", args.role.clone());
-    f.put("${saranga}", path(&std::env::current_exe()?));
+    let java_options = args.install.java_options();
+    add_script_filters(
+        &mut f,
+        &args.install,
+        &ScriptDirs {
+            home: &home,
+            instance: &directory,
+            etc: &etc,
+            data: &data,
+            oome: &oome,
+        },
+        &args.role,
+    )?;
 
     let allow_anonymous = allow_anonymous_given.unwrap_or_else(|| {
         args.common.input_boolean(
@@ -610,11 +624,11 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
         match &args.retention_max_bytes {
             Some(max) => format!(
                 "<journal-retention-directory period=\"{}\" unit=\"DAYS\" storage-limit=\"{max}\">{}/retention</journal-retention-directory>",
-                args.retention_days, args.data
+                args.retention_days, args.install.data
             ),
             None => format!(
                 "<journal-retention-directory period=\"{}\" unit=\"DAYS\">{}/retention</journal-retention-directory>",
-                args.retention_days, args.data
+                args.retention_days, args.install.data
             ),
         }
     } else {
@@ -648,7 +662,7 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
     };
     f.put("${journal-retention}", retention);
     f.put("${java-opts}", java_options);
-    f.put("${java-memory}", args.java_memory.clone());
+    f.put("${java-memory}", args.install.java_memory.clone());
 
     let writer = Writer {
         force: args.force,
@@ -774,6 +788,44 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
         );
         println!();
     }
+    Ok(())
+}
+
+/// The directories the scripts and profiles name.
+pub(crate) struct ScriptDirs<'a> {
+    pub home: &'a Path,
+    pub instance: &'a Path,
+    pub etc: &'a Path,
+    pub data: &'a Path,
+    pub oome: &'a Path,
+}
+
+/// `Create.addScriptFilters`, and the `saranga` the scripts run.
+pub(crate) fn add_script_filters(
+    f: &mut Filters,
+    install: &InstallArgs,
+    dirs: &ScriptDirs,
+    role: &str,
+) -> anyhow::Result<()> {
+    f.put("${artemis.home}", path(dirs.home));
+    f.put("@artemis.instance@", path(dirs.instance));
+    f.put(
+        "${artemis.instance.name}",
+        dirs.instance
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    );
+    f.put("${java.home}", "");
+    f.put("${artemis.instance.etc.uri}", file_uri(dirs.etc));
+    f.put("${artemis.instance.etc}", path(dirs.etc));
+    f.put("${artemis.instance.oome.dump}", path(dirs.oome));
+    f.put("${artemis.instance.data}", path(dirs.data));
+    f.put("${java-memory}", install.java_memory.clone());
+    f.put("${java-opts}", install.java_options());
+    f.put("${java-utility-opts}", install.java_utility_options());
+    f.put("${role}", role);
+    f.put("${saranga}", path(&std::env::current_exe()?));
     Ok(())
 }
 
@@ -967,7 +1019,7 @@ fn create_directory(name: &str, root: &Path) -> anyhow::Result<PathBuf> {
 }
 
 /// `File.getCanonicalPath`, without Windows' `\\?\` prefix.
-fn canonical(p: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn canonical(p: &Path) -> anyhow::Result<PathBuf> {
     let c = std::fs::canonicalize(p).with_context(|| format!("{}", p.display()))?;
     let s = c.to_string_lossy();
     Ok(PathBuf::from(
@@ -975,13 +1027,13 @@ fn canonical(p: &Path) -> anyhow::Result<PathBuf> {
     ))
 }
 
-fn path(p: &Path) -> String {
+pub(crate) fn path(p: &Path) -> String {
     p.display().to_string()
 }
 
 /// `File.toURI().toString()` of a directory: `file:/C:/dir/` or
 /// `file:/dir/`.
-fn file_uri(dir: &Path) -> String {
+pub(crate) fn file_uri(dir: &Path) -> String {
     let mut s = dir.display().to_string().replace('\\', "/");
     if !s.starts_with('/') {
         s.insert(0, '/');
@@ -1003,13 +1055,13 @@ fn file_uri(dir: &Path) -> String {
 }
 
 /// The directory of this `saranga`, as the instance's home.
-fn saranga_home() -> anyhow::Result<PathBuf> {
+pub(crate) fn saranga_home() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     canonical(exe.parent().context("saranga has no directory")?)
 }
 
 #[cfg(unix)]
-fn make_exec(p: &Path) -> anyhow::Result<()> {
+pub(crate) fn make_exec(p: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(p)?.permissions();
     perms.set_mode(perms.mode() | 0o755);
@@ -1018,7 +1070,7 @@ fn make_exec(p: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn make_exec(_: &Path) -> anyhow::Result<()> {
+pub(crate) fn make_exec(_: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 

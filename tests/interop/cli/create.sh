@@ -123,4 +123,56 @@ else
   fail "saranga runs an artemis instance"; cat "$WORK/run-a.log"
 fi
 
+# 4. upgrade: two like Artemis instances, one upgraded by `saranga upgrade`
+#    and one by `artemis upgrade`, print the same steps and end with the
+#    same etc/ (but for ARTEMIS_HOME). Saranga leaves Windows' service
+#    wrapper alone, and writes bin/saranga beside bin/artemis.
+upgrade_output() {
+  sed -E -e 's/\r$//' -e "s#$(cygpath -w "$WORK" 2>/dev/null | sed 's#\\#\\\\#g; s#[.]#\\.#g')#WORK#g" \
+    -e "s#$(native "$WORK" | sed 's#[.]#\\.#g')#WORK#g" -e 's#up-[sa]#up#g' \
+    -e 's#artemis.home=.*#artemis.home=HOME#' | grep -v -E 'artemis-service\.(exe|xml)|saranga(\.cmd)?$'
+}
+upgrade_compare() {
+  local label="$1"; shift
+  local s="$WORK/up-s" a="$WORK/up-a"
+  rm -rf "$s" "$a"
+  artemis create "$(native "$s")" --silent --no-autotune --user u --password p --require-login \
+    --java-memory 3G "$@" > /dev/null
+  artemis create "$(native "$a")" --silent --no-autotune --user u --password p --require-login \
+    --java-memory 3G "$@" > /dev/null
+  "$SARANGA" upgrade "$(native "$s")" "$@" 2>&1 | upgrade_output > "$WORK/up-s.out"
+  artemis upgrade "$(native "$a")" "$@" | upgrade_output > "$WORK/up-a.out"
+  local bad=0
+  diff -u "$WORK/up-a.out" "$WORK/up-s.out" || bad=1
+  rm -f "$WORK"/norm-*
+  normalize_tree "$s" s
+  normalize_tree "$a" a
+  for f in "$a"/etc/*; do
+    f="$(basename "$f")"
+    diff -u "$WORK/norm-a-$f" "$WORK/norm-s-$f" || bad=1
+  done
+  grep -q -- '-Xmx3G' "$s/etc/artemis.profile"* || { bad=1; echo "-Xmx not kept"; }
+  [[ -f "$s/bin/saranga" || -f "$s/bin/saranga.cmd" ]] || { bad=1; echo "no bin/saranga"; }
+  [[ $bad == 0 ]] && pass "upgrade $label" || fail "upgrade $label"
+}
+upgrade_compare defaults
+upgrade_compare nix --cygwin
+
+# The upgraded instance runs saranga; `artemis upgrade` takes it back.
+artemis create "$(native "$WORK/up-r")" --silent --no-autotune --user u --password p --require-login > /dev/null
+"$SARANGA" upgrade "$(native "$WORK/up-r")" > /dev/null 2>&1
+instance_cmd() {
+  if windows; then cmd /c "$(cygpath -w "$1/bin/artemis.cmd")" "${@:2}" < /dev/null 2>&1
+  else "$1/bin/artemis" "${@:2}" 2>&1; fi
+}
+out="$(instance_cmd "$WORK/up-r" version)"
+[[ "$out" == *"Saranga instance: $(native "$WORK/up-r")"* ]] && pass "upgraded instance runs saranga" \
+  || fail "upgraded instance runs saranga: $out"
+artemis upgrade "$(native "$WORK/up-r")" > /dev/null
+out="$(instance_cmd "$WORK/up-r" version)"
+[[ "$out" == *"Apache Artemis $VERSION"* ]] && pass "artemis upgrade takes it back" \
+  || fail "artemis upgrade takes it back: $out"
+"$SARANGA" upgrade "$(native "$WORK/up-r")" > /dev/null 2>&1
+[[ -d "$WORK/up-r/old-config-bkp.2" ]] && pass "upgrade backups" || fail "upgrade backups"
+
 if [[ $FAILED == 0 ]]; then echo "ALL PASSED"; else echo "$FAILED FAILED"; exit 1; fi

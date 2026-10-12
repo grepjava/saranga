@@ -29,8 +29,9 @@ if [ -z "$ARTEMIS_INSTANCE" ] ; then
   ARTEMIS_INSTANCE=`cd "$ARTEMIS_INSTANCE/.." && pwd`
 fi
 
+# At the start of its line, where upgrade looks for it.
 if [ -z "$ARTEMIS_INSTANCE_ETC" ] ; then
-  ARTEMIS_INSTANCE_ETC='${artemis.instance.etc}'
+ARTEMIS_INSTANCE_ETC='${artemis.instance.etc}'
 fi
 export ARTEMIS_INSTANCE ARTEMIS_INSTANCE_ETC
 

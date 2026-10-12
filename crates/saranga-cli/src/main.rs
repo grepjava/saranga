@@ -7,14 +7,16 @@ use std::sync::Arc;
 use anyhow::Context;
 
 mod client;
+mod completion;
 mod create;
 mod data;
 mod instance;
 mod logging;
 mod perf;
+mod upgrade;
 mod web;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use saranga_server::postoffice::SelectorFilters;
 use saranga_server::{Acceptor, Broker, BrokerConfig};
 use saranga_transport::{TlsAcceptor, TlsSettings};
@@ -73,6 +75,17 @@ enum Command {
     /// Create a new broker instance, as `artemis create`: its bin/artemis
     /// runs this saranga.
     Create(Box<create::CreateArgs>),
+    /// Update a broker instance to this saranga, keeping all the data and
+    /// broker.xml, as `artemis upgrade`. Warning: backup your instance
+    /// before using this command and compare the files.
+    Upgrade(Box<upgrade::UpgradeArgs>),
+    /// Generates the auto complete script file to be used in bash or zsh.
+    /// Usage: source <(./artemis completion)
+    Completion {
+        /// the script used to start artemis. (default ./artemis)
+        #[arg(long = "start-script", default_value = "./artemis")]
+        start_script: String,
+    },
     /// Create a queue, or delete, update, purge or print stats of queues.
     #[command(subcommand)]
     Queue(client::queue::QueueCommand),
@@ -165,6 +178,8 @@ async fn main() -> std::process::ExitCode {
             | Command::Version
             | Command::Pwd
             | Command::Create(_)
+            | Command::Upgrade(_)
+            | Command::Completion { .. }
     );
     if matches!(cli.command, Command::Run { .. }) {
         // The broker logs as Artemis does, once its log4j2.properties is read.
@@ -221,6 +236,11 @@ async fn run_client(command: Command) -> anyhow::Result<()> {
             configuration,
         } => control_file(broker, configuration, "KILL_ME"),
         Command::Create(a) => create::run(*a),
+        Command::Upgrade(a) => upgrade::run(&a),
+        Command::Completion { start_script } => {
+            print!("{}", completion::script(&Cli::command(), &start_script));
+            Ok(())
+        }
         Command::Version => {
             // PrintVersion
             println!(

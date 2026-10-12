@@ -288,14 +288,25 @@ impl ConnectionArgs {
 /// The broker instance the command belongs to: `ARTEMIS_INSTANCE`, as the
 /// instance's `bin/artemis` (or `bin/saranga`) script sets it.
 pub fn instance_dir() -> Option<PathBuf> {
-    std::env::var_os("ARTEMIS_INSTANCE").map(PathBuf::from)
+    env_path("ARTEMIS_INSTANCE")
+}
+
+/// A path from the environment, without the quotes a Windows script's
+/// `set NAME="path"` leaves on it.
+fn env_path(name: &str) -> Option<PathBuf> {
+    let v = std::env::var_os(name)?;
+    let s = v.to_string_lossy();
+    Some(
+        match s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            Some(inner) => PathBuf::from(inner),
+            None => PathBuf::from(v),
+        },
+    )
 }
 
 /// The instance's `etc/`: `ARTEMIS_INSTANCE_ETC`, else `<instance>/etc`.
 pub fn instance_etc() -> Option<PathBuf> {
-    std::env::var_os("ARTEMIS_INSTANCE_ETC")
-        .map(PathBuf::from)
-        .or_else(|| instance_dir().map(|d| d.join("etc")))
+    env_path("ARTEMIS_INSTANCE_ETC").or_else(|| instance_dir().map(|d| d.join("etc")))
 }
 
 /// `getBrokerURLInstance`: the URL of the instance's acceptor called
