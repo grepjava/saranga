@@ -134,6 +134,56 @@ Connection brokerURL = tcp://localhost:62316
 --- total sent:              100
 --- total completed:         100
 --- total received:          100 
+=== using-cli: artemis (the shell), history refused
+
+Allow shell history? (Y/N)
+ BANNER
+
+
+Shell history disabled as recorded in WORK/i1/etc/history-file
+
+For a list of commands, type help:
+Type exit or press <CTRL-D> to leave the session:
+CLI > 
+
+=== using-cli: artemis (the shell): connect, then queue stat
+ BANNER
+
+
+Shell history disabled as recorded in WORK/i1/etc/history-file
+
+For a list of commands, type help:
+Type exit or press <CTRL-D> to leave the session:
+CLI > Connection brokerURL = tcp://localhost:62316
+CLI connected to broker tcp://localhost:62316, user:admin
+Connection Successful!
+admin@tcp://localhost:62316 > Connection brokerURL = tcp://localhost:62316
+|NAME   |ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|       |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|runbook|runbook|   0    |  60   |  100   |    0     |   40   |    0    |ANYCAST| false  |
+admin@tcp://localhost:62316 > Connection brokerURL = tcp://localhost:62316
+Connection information cleared!
+CLI > 
+
+=== using-cli: artemis shell --user admin --password admin --url tcp://localhost:62316: queue stat, exit
+ BANNER
+
+
+Connection brokerURL = tcp://localhost:62316
+CLI connected to broker tcp://localhost:62316, user:admin
+Connection Successful!
+Shell history disabled as recorded in WORK/i1/etc/history-file
+
+For a list of commands, type help:
+Type exit or press <CTRL-D> to leave the session:
+admin@tcp://localhost:62316 > Connection brokerURL = tcp://localhost:62316
+|NAME   |ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|       |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|runbook|runbook|   0    |  60   |  100   |    0     |   40   |    0    |ANYCAST| false  |
+admin@tcp://localhost:62316 > Connection brokerURL = tcp://localhost:62316
+Connection information cleared!
+CLI > 
+
 === artemis stop
 --- exit 0
 stopped

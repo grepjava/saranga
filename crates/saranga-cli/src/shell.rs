@@ -8,12 +8,12 @@
 //! - There is no line editing, completion or recall of earlier lines. The
 //!   history file is still written as JLine writes it, so an Artemis shell
 //!   on the same instance recalls the lines.
-//! - Without a terminal, the lines of standard input run as Artemis runs
-//!   piped input (`runPipedMode`): without a prompt or the history question,
-//!   split at blanks, skipping blank lines and `#` comments, up to `exit` or
-//!   `quit`.
+//! - Without a terminal the shell reads the lines of standard input at its
+//!   prompts, as Artemis's does through JLine's dumb terminal. Artemis reads
+//!   the history answer with a `Scanner` that buffers the input after it, so
+//!   the lines that follow the answer are lost there; here they run.
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -194,11 +194,6 @@ pub async fn shell(args: ShellArgs) {
 /// or from standard input until it ends.
 pub async fn run(print_banner_first: bool, history: Option<PathBuf>) {
     IN_SHELL.store(true, Ordering::Relaxed);
-    if !std::io::stdin().is_terminal() {
-        piped().await;
-        IN_SHELL.store(false, Ordering::Relaxed);
-        return;
-    }
     let instance = crate::client::instance_dir();
     let default_file = absolute(
         &instance
@@ -299,26 +294,6 @@ async fn end_of_input() -> bool {
         return false;
     }
     true
-}
-
-/// `runPipedMode`.
-async fn piped() {
-    let stdin = std::io::stdin();
-    loop {
-        let mut line = String::new();
-        match tokio::task::block_in_place(|| stdin.lock().read_line(&mut line)) {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
-        }
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line == "exit" || line == "quit" {
-            return;
-        }
-        execute(line.split_whitespace().map(str::to_owned).collect()).await;
-    }
 }
 
 /// One command line, parsed as the shell's command line and run.

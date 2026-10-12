@@ -15,7 +15,8 @@
 #
 # The procedures, each under the manual chapter it comes from:
 #   using-server       run an instance, find it active in its log, stop it
-#   using-cli          queue create and stat, producer, consumer, browser
+#   using-cli          queue create and stat, producer, consumer, browser;
+#                      the shell, connected with connect and with options
 #   security           user add, list and rm
 #   masking-passwords  mask
 #   logging            the audit log turned on while running
@@ -81,12 +82,13 @@ make_instance() {
 }
 
 # The instance's bin/artemis, run from its bin/ as the manual runs it.
+# Its standard input is the file IN names, or nothing.
 instance() {
   local dir="$1"; shift
   if windows; then
-    (cd "$dir/bin" && timeout 300 cmd /c "$(cygpath -w "$dir/bin/artemis.cmd")" "$@" < /dev/null 2>&1)
+    (cd "$dir/bin" && timeout 300 cmd /c "$(cygpath -w "$dir/bin/artemis.cmd")" "$@" < "${IN:-/dev/null}" 2>&1)
   else
-    (cd "$dir/bin" && timeout 300 ./artemis "$@" < /dev/null 2>&1)
+    (cd "$dir/bin" && timeout 300 ./artemis "$@" < "${IN:-/dev/null}" 2>&1)
   fi | grep --line-buffered -v -E "NO_ARTEMIS_OOME_DUMP|operable program or batch file|^The system cannot find the file specified" \
     | sed -u -E -e '/^WARNING: /{' -e ':w' -e '$d' -e 'N' -e 's/^WARNING: [^\n]*\n(WARNING: )/\1/' -e 'tw' \
       -e '/^WARNING: [^\n]*\n$/d' -e 's/^WARNING: [^\n]*\n//' -e '}'
@@ -155,6 +157,17 @@ jolokia_post() {
   curl -s -H "Origin: http://localhost" -u admin:admin --header "Content-type: application/json" \
     --request POST --data "$1" "http://localhost:$WEB1/console/jolokia/"
   echo
+}
+# The shell of the instance i1, the lines of shell.in piped to it:
+# Artemis's reads them at its prompts through JLine's dumb terminal. The
+# banner and the prompt name the broker, and Saranga has no <TAB>
+# completion to offer.
+shell_lines() { printf '%s\n' "$@" > "$WORK/shell.in"; }
+shell() {
+  IN="$WORK/shell.in" instance "$I1" "$@" | sed -E -e 's/\x1b\[[0-9;]*m//g' -e 's/\r$//' \
+    -e '/^ *[_/]/d' -e 's/^ (Apache Artemis|Saranga) [0-9.]+$/ BANNER/' \
+    -e 's/(Apache Artemis|Saranga) [0-9.]+ > /CLI > /g' -e 's/ or press <TAB>//'
+  echo  # the last prompt ends no line
 }
 # The lines of data print about messages sent to an address.
 messages_to() { grep -c -E "userRecordType=(45|31);.*address=$1[],]" || true; }
@@ -244,6 +257,19 @@ suite() {
   step "artemis perf client"
   instance "$I1" perf client --message-count 100 --max-pending 100 "${AUTH[@]}" queue://perf \
     | grep -E "^--- (total (sent|completed|received)|result)"
+
+  # using-cli: the shell, bin/artemis alone; its first run asks whether to
+  # keep a history. connect keeps a connection for the commands after it,
+  # and the end of the input disconnects, then ends the shell.
+  step "using-cli: artemis (the shell), history refused"
+  shell_lines N
+  shell
+  step "using-cli: artemis (the shell): connect, then queue stat"
+  shell_lines "connect --user=admin --password=admin --url tcp://localhost:$PORT1" "queue stat --queueName runbook"
+  shell
+  step "using-cli: artemis shell --user admin --password admin --url tcp://localhost:$PORT1: queue stat, exit"
+  shell_lines "queue stat --queueName runbook" exit
+  shell shell --user admin --password admin --url "tcp://localhost:$PORT1"
 
   # using-server: stop, and the log says so.
   stop "$I1" "$PORT1"
