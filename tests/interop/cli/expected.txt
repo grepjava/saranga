@@ -422,3 +422,32 @@ QueueCheck failed. Reason: error: Failed to get queue.nosuch.Paused. Reason: Pro
 Connection brokerURL = URL
 QueueCheck failed. Reason: java.lang.IllegalArgumentException: Invalid  number of messages to produce: 0
 --- exit 1
+=== shell
+Connection brokerURL = URL
+CLI connected to broker URL, user:null
+Connection Successful!
+Connection brokerURL = URL
+Queue [name=clishell, address=clishell, routingType=ANYCAST, durable=false, purgeOnNoConsumers=false, autoCreateAddress=false, exclusive=false, lastValue=false, lastValueKey=null, nonDestructive=false, consumersBeforeDispatch=0, delayBeforeDispatch=-1, autoCreateAddress=false] created successfully.
+Connection brokerURL = URL
+Producer ActiveMQQueue[clishell], thread=0 Started to calculate elapsed time ...
+
+Producer ActiveMQQueue[clishell], thread=0 Produced: 2 messages
+Producer ActiveMQQueue[clishell], thread=0 Elapsed time in second : # s
+Producer ActiveMQQueue[clishell], thread=0 Elapsed time in milli second : # milli seconds
+Connection brokerURL = URL
+|NAME    |ADDRESS |CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|        |        | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|clishell|clishell|   0    |   2   |   2    |    0     |   0    |    0    |ANYCAST| false  |
+Connection brokerURL = URL
+Consumer:: filter = null
+Consumer ActiveMQQueue[clishell], thread=0 wait 3000ms until 2 messages are consumed
+Consumer ActiveMQQueue[clishell], thread=0 Consumed: 2 messages
+Consumer ActiveMQQueue[clishell], thread=0 Elapsed time in second : # s
+Consumer ActiveMQQueue[clishell], thread=0 Elapsed time in milli second : # milli seconds
+Consumer ActiveMQQueue[clishell], thread=0 Consumed: 2 messages
+Consumer ActiveMQQueue[clishell], thread=0 Consumer thread finished
+Connection brokerURL = URL
+Queue clishell deleted successfully.
+Connection brokerURL = URL
+Connection information cleared!
+--- exit 0

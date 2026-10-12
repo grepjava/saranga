@@ -39,6 +39,20 @@ run() {
   cli "$@" --url "$URL" --silent </dev/null 2>&1
   echo "--- exit $?"
 }
+# The shell, its lines piped: connect keeps the URL for the commands after
+# it, and nothing after exit runs. Artemis runs piped lines from
+# ShellPiped.java; saranga, alone, takes them from standard input.
+shell() {
+  echo "=== shell"
+  printf 'NO_HISTORY\n' > "$INSTANCE/etc/history-file"
+  printf '%s\n' "$@" | case "${CLI:-artemis}" in
+    artemis)
+      timeout 120 java -cp "$(native "$DIST/lib")/*" -Dartemis.home="$(native "$DIST")" \
+        -Dartemis.instance="$(native "$INSTANCE")" "$(native "$HERE/ShellPiped.java")" ;;
+    saranga) ARTEMIS_INSTANCE="$(native "$INSTANCE")" timeout 120 "$ROOT/target/release/saranga" ;;
+  esac 2>&1
+  echo "--- exit $?"
+}
 # Commands without --url.
 run_bare() {
   echo "=== $*"
@@ -121,6 +135,14 @@ suite() {
   run check queue --name DLQ --consume -1 --browse -1
   run check queue --name nosuch
   run check queue --name DLQ --produce 0
+  # shell
+  shell "# the shell's connection" "" "connect --url $URL" \
+    "queue create --name clishell --address clishell --anycast --auto-create-address --silent" \
+    "producer --destination queue://clishell --message-count 2" \
+    "queue stat --queueName clishell --silent" \
+    "consumer --destination queue://clishell --message-count 2" \
+    "queue delete --name clishell --autoDeleteAddress --silent" \
+    "disconnect" "exit" "version"
 }
 
 # Timings, generated names and ports differ between runs and brokers.

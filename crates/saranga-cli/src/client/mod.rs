@@ -254,6 +254,7 @@ impl ConnectionArgs {
     /// `ConnectionConfigurationAbtract.execute`: the URL, from the
     /// instance's acceptor without `--url`, printed unless `quiet`.
     pub fn resolve(&mut self, quiet: bool) -> anyhow::Result<()> {
+        crate::shell::recover(self);
         if !self.protocol.eq_ignore_ascii_case("core") {
             bail!(UsageError(format!(
                 "protocol {} not supported",
@@ -273,15 +274,20 @@ impl ConnectionArgs {
         self.url.as_deref().unwrap_or(DEFAULT_BROKER_URL)
     }
 
-    /// A Core connection with this user and password.
+    /// A Core connection with this user and password, or the shell's
+    /// (`tryConnect`).
     pub async fn connect(&self) -> anyhow::Result<jms::JmsConnection> {
-        jms::JmsConnection::connect(
-            self.url(),
-            self.user.clone(),
-            self.password.clone(),
-            self.client_id.clone(),
+        let mut args = self.clone();
+        crate::shell::recover(&mut args);
+        let conn = jms::JmsConnection::connect(
+            args.url(),
+            args.user.clone(),
+            args.password.clone(),
+            args.client_id.clone(),
         )
-        .await
+        .await?;
+        crate::shell::save_connection(args.url(), args.user.as_deref(), args.password.as_deref());
+        Ok(conn)
     }
 }
 

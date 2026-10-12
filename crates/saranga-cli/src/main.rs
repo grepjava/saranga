@@ -13,10 +13,11 @@ mod data;
 mod instance;
 mod logging;
 mod perf;
+mod shell;
 mod upgrade;
 mod web;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use saranga_server::postoffice::SelectorFilters;
 use saranga_server::{Acceptor, Broker, BrokerConfig};
 use saranga_transport::{TlsAcceptor, TlsSettings};
@@ -29,8 +30,9 @@ use tokio::net::TcpListener;
     about = "A message broker compatible with Apache ActiveMQ Artemis"
 )]
 struct Cli {
+    /// Without a command, the shell.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -155,13 +157,86 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// A shell running the CLI's commands, as `artemis shell`. `saranga`
+    /// without a command starts it too.
+    Shell(shell::ShellArgs),
+    /// Connect to the broker validating credentials for commands.
+    #[command(hide = true)]
+    Connect(client::ConnectionArgs),
+    /// Clear previously typed user credentials.
+    #[command(hide = true)]
+    Disconnect(client::ConnectionArgs),
+}
+
+/// The command line (`Artemis.buildCommand`). In the shell, `connect` and
+/// `disconnect` are offered and `run` and `shell` are not; outside it, the
+/// reverse.
+fn command_line(in_shell: bool) -> clap::Command {
+    let (shown, hidden) = if in_shell {
+        (["connect", "disconnect"], ["run", "shell"])
+    } else {
+        (["run", "shell"], ["connect", "disconnect"])
+    };
+    let mut command = Cli::command();
+    for name in shown {
+        command = command.mut_subcommand(name, |c| c.hide(false));
+    }
+    for name in hidden {
+        command = command.mut_subcommand(name, |c| c.hide(true));
+    }
+    command
 }
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
+    let mut command_line = command_line(false);
+    let cli = Cli::from_arg_matches(&command_line.clone().get_matches())
+        .unwrap_or_else(|e| e.format(&mut command_line).exit());
+    let command = match cli.command {
+        Some(Command::Connect(_)) | Some(Command::Disconnect(_)) => {
+            let name = if matches!(cli.command, Some(Command::Connect(_))) {
+                "connect"
+            } else {
+                "disconnect"
+            };
+            command_line
+                .error(
+                    clap::error::ErrorKind::InvalidSubcommand,
+                    format!("unrecognized subcommand '{name}'"),
+                )
+                .exit()
+        }
+        Some(c) => c,
+        // `Artemis.run`: the shell, by default.
+        None => {
+            logging::init_utility(client::instance_etc().as_deref());
+            shell::run(true, None).await;
+            return std::process::ExitCode::SUCCESS;
+        }
+    };
+    if matches!(command, Command::Run { .. }) {
+        // The broker logs as Artemis does, once its log4j2.properties is read.
+        logging::init_broker();
+    } else {
+        // bin/artemis runs every other command with artemis-utility.profile.
+        logging::init_utility(client::instance_etc().as_deref());
+    }
+    if let Command::Shell(args) = command {
+        shell::shell(args).await;
+        return std::process::ExitCode::SUCCESS;
+    }
+    if execute(command).await {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    }
+}
+
+/// Runs a command and reports its failure as `Artemis.execute` does; false
+/// when it failed.
+async fn execute(command: Command) -> bool {
     let client = matches!(
-        cli.command,
+        command,
         Command::Queue(_)
             | Command::Address(_)
             | Command::User(_)
@@ -179,35 +254,30 @@ async fn main() -> std::process::ExitCode {
             | Command::Create(_)
             | Command::Upgrade(_)
             | Command::Completion { .. }
+            | Command::Connect(_)
+            | Command::Disconnect(_)
     );
-    if matches!(cli.command, Command::Run { .. }) {
-        // The broker logs as Artemis does, once its log4j2.properties is read.
-        logging::init_broker();
-    } else {
-        // bin/artemis runs every other command with artemis-utility.profile.
-        logging::init_utility(client::instance_etc().as_deref());
-    }
     if client {
-        return match run_client(cli.command).await {
-            Ok(()) => std::process::ExitCode::SUCCESS,
+        return match run_client(command).await {
+            Ok(()) => true,
             Err(e) => {
                 report_client_error(&e);
-                std::process::ExitCode::FAILURE
+                false
             }
         };
     }
-    match run_command(cli.command).await {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+    match run_command(command).await {
+        Ok(()) => true,
         Err(e)
             if e.downcast_ref::<client::UsageError>().is_some()
                 || e.downcast_ref::<client::CliError>().is_some() =>
         {
             report_client_error(&e);
-            std::process::ExitCode::FAILURE
+            false
         }
         Err(e) => {
             eprintln!("Error: {e:?}");
-            std::process::ExitCode::FAILURE
+            false
         }
     }
 }
@@ -235,8 +305,10 @@ async fn run_client(command: Command) -> anyhow::Result<()> {
         } => control_file(broker, configuration, "KILL_ME"),
         Command::Create(a) => create::run(*a),
         Command::Upgrade(a) => upgrade::run(&a),
+        Command::Connect(a) => shell::connect(a).await,
+        Command::Disconnect(a) => shell::disconnect(a),
         Command::Completion { start_script } => {
-            print!("{}", completion::script(&Cli::command(), &start_script));
+            print!("{}", completion::script(&command_line(false), &start_script));
             Ok(())
         }
         Command::Version => {

@@ -26,7 +26,7 @@ saranga-protocol-stomp = { path = "../saranga-protocol-stomp" }
 saranga-server = { path = "../saranga-server" }
 saranga-storage = { path = "../saranga-storage" }
 saranga-transport = { path = "../saranga-transport" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 saranga-client = { path = "../saranga-client" }
