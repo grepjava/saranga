@@ -68,6 +68,8 @@ pub struct JournalConfig {
     pub page_sync_timeout: Option<i32>,
     pub purge_page_folders: Option<bool>,
     pub max_disk_usage: Option<i32>,
+    /// `min-disk-free`, in bytes; it overrides `max-disk-usage`.
+    pub min_disk_free: Option<i64>,
     pub disk_scan_period: Option<i32>,
     /// `<journal-retention-directory>`.
     pub retention: Option<JournalRetention>,
@@ -130,6 +132,7 @@ impl Default for JournalConfig {
             page_sync_timeout: None,
             purge_page_folders: None,
             max_disk_usage: None,
+            min_disk_free: None,
             disk_scan_period: None,
             retention: None,
         }

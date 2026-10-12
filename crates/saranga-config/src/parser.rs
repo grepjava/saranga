@@ -716,6 +716,10 @@ fn parse_journal(s: &Settings<'_, '_>, j: &mut JournalConfig) -> Result<()> {
         s.i32("max-disk-usage", Check::PercentageOrMinusOne)?,
     );
     set(
+        &mut j.min_disk_free,
+        s.text_bytes("min-disk-free", Check::MinusOneOrGtZero)?,
+    );
+    set(
         &mut j.disk_scan_period,
         s.i32("disk-scan-period", Check::MinusOneOrGtZero)?,
     );

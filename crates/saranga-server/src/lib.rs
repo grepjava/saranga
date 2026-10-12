@@ -10,7 +10,7 @@ pub mod audit;
 pub mod config;
 pub mod core_protocol;
 pub mod critical;
-mod disk;
+pub mod disk;
 pub mod duplicate;
 pub mod error;
 pub mod large;
@@ -246,6 +246,10 @@ pub struct BrokerConfig {
     pub critical: critical::CriticalConfig,
     /// Plugins (`<broker-plugins>`, or the embedding application's own).
     pub plugins: Vec<Arc<dyn plugin::BrokerPlugin>>,
+    /// `max-disk-usage` or `min-disk-free` with `disk-scan-period`: producers
+    /// are held back while the stores' disks are full. Only with
+    /// persistence.
+    pub disk_monitor: Option<disk::MonitorConfig>,
 }
 
 impl BrokerConfig {
@@ -277,6 +281,7 @@ impl BrokerConfig {
             management: management::ManagementConfig::default(),
             critical: critical::CriticalConfig::default(),
             plugins: Vec::new(),
+            disk_monitor: None,
         }
     }
 }
@@ -514,6 +519,19 @@ impl Broker {
         }
         if config.message_expiry_scan_period > 0 {
             spawn_expiry_reaper(&post_office, config.message_expiry_scan_period);
+        }
+        // deployFileStoreMonitor.
+        if let (Some(monitor), Some(sc)) = (config.disk_monitor, &config.storage) {
+            disk::spawn_monitor(
+                monitor,
+                vec![
+                    sc.paging.clone(),
+                    sc.messages.directory.clone(),
+                    sc.large_messages.clone(),
+                    sc.bindings.directory.clone(),
+                ],
+                post_office.paging(),
+            );
         }
         // Empty auto-created queues and addresses go before clients come.
         post_office.reap(true);

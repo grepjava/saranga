@@ -1565,6 +1565,28 @@ pub fn init_broker() {
         .init();
 }
 
+/// Starts logging as the utility commands do (`artemis-utility.profile`):
+/// WARN to the console in Artemis's pattern, then the instance's
+/// `log4j2-utility.properties`, found on the classpath through etc/.
+pub fn init_utility(etc: Option<&Path>) {
+    let env = EnvFilter::try_from_default_env().ok();
+    let shared = Arc::new(Shared {
+        config: RwLock::new(Arc::new(Config::console(WARN, false))),
+        levels: env.is_none(),
+    });
+    let _ = SHARED.set(shared.clone());
+    tracing_subscriber::registry()
+        .with(env)
+        .with(ArtemisLayer { shared })
+        .init();
+    if let Some(etc) = etc {
+        configure(
+            etc.join("log4j2-utility.properties"),
+            Arc::new(|k| std::env::var(k).ok()),
+        );
+    }
+}
+
 /// Where `-Dlog4j2.configurationFile` points, else `etc/log4j2.properties`.
 pub fn config_path(etc: &Path, configured: Option<String>) -> PathBuf {
     match configured {

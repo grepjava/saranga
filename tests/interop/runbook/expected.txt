@@ -1,0 +1,170 @@
+=== using-server: artemis run
+listening
+log: AMQ221007: Server is now active
+=== artemis queue create --name runbook --anycast --durable --auto-create-address --silent
+Connection brokerURL = tcp://localhost:62316
+Queue [name=runbook, address=runbook, routingType=ANYCAST, durable=true, purgeOnNoConsumers=false, autoCreateAddress=false, exclusive=false, lastValue=false, lastValueKey=null, nonDestructive=false, consumersBeforeDispatch=0, delayBeforeDispatch=-1, autoCreateAddress=false] created successfully.
+--- exit 0
+=== artemis producer --destination queue://runbook --message-count 100
+Connection brokerURL = tcp://localhost:62316
+Producer ActiveMQQueue[runbook], thread=0 Started to calculate elapsed time ...
+
+Producer ActiveMQQueue[runbook], thread=0 Produced: 100 messages
+Producer ActiveMQQueue[runbook], thread=0 Elapsed time in second : # s
+Producer ActiveMQQueue[runbook], thread=0 Elapsed time in milli second : # milli seconds
+--- exit 0
+=== artemis queue stat --queueName runbook
+Connection brokerURL = tcp://localhost:62316
+|NAME   |ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|       |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|runbook|runbook|   0    |  100  |  100   |    0     |   0    |    0    |ANYCAST| false  |
+--- exit 0
+=== artemis consumer --destination queue://runbook --message-count 40
+Connection brokerURL = tcp://localhost:62316
+Consumer:: filter = null
+Consumer ActiveMQQueue[runbook], thread=0 wait 3000ms until 40 messages are consumed
+Consumer ActiveMQQueue[runbook], thread=0 Consumed: 40 messages
+Consumer ActiveMQQueue[runbook], thread=0 Elapsed time in second : # s
+Consumer ActiveMQQueue[runbook], thread=0 Elapsed time in milli second : # milli seconds
+Consumer ActiveMQQueue[runbook], thread=0 Consumed: 40 messages
+Consumer ActiveMQQueue[runbook], thread=0 Consumer thread finished
+--- exit 0
+=== artemis browser --destination queue://runbook --message-count 1
+Connection brokerURL = tcp://localhost:62316
+Consumer:: filter = null
+Consumer ActiveMQQueue[runbook], thread=0 trying to browse 1 messages
+Consumer ActiveMQQueue[runbook], thread=0 browsing test message: 40
+Consumer ActiveMQQueue[runbook], thread=0 browsed: 1 messages
+Consumer ActiveMQQueue[runbook], thread=0 Browser thread finished
+--- exit 0
+=== artemis queue stat --queueName runbook
+Connection brokerURL = tcp://localhost:62316
+|NAME   |ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|       |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|runbook|runbook|   0    |  60   |  100   |    0     |   40   |    0    |ANYCAST| false  |
+--- exit 0
+=== artemis user add --user-command-user guest --user-command-password guest --role admin
+Connection brokerURL = tcp://localhost:62316
+guest added successfully.
+--- exit 0
+=== artemis user list --user-command-user guest
+Connection brokerURL = tcp://localhost:62316
+--- "user"(roles) ---
+"guest"(admin)
+
+ Total: 1
+--- exit 0
+=== artemis user rm --user-command-user guest
+Connection brokerURL = tcp://localhost:62316
+guest removed successfully.
+--- exit 0
+=== artemis mask
+DATE WARN  [org.apache.activemq.artemis.logs] AMQ202017: Algorithm two-way is deprecated and will be removed from the default codec in a future version. Use a custom codec instead. Consult the manual for details.
+result: MASKED
+=== curl read/org.apache.activemq.artemis:broker=%220.0.0.0%22/Active
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","attribute":"Active","type":"read"},"value":true,"status":200}
+=== curl POST {"attribute": "Active", "mbean": "org.apache.activemq.artemis:broker=\"0.0.0.0\"", "type": "read"}
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","attribute":"Active","type":"read"},"value":true,"status":200}
+=== curl exec/org.apache.activemq.artemis:broker=%220.0.0.0%22/listQueues/%7B%22field%22:%22name%22,%22operation%22:%22EQUALS%22,%22value%22:%22runbook%22%7D/1/10
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","arguments":["{\"field\":\"name\",\"operation\":\"EQUALS\",\"value\":\"runbook\"}","1","10"],"type":"exec","operation":"listQueues"},"value":"{\"data\":[{\"id\":#,\"name\":\"runbook\",\"address\":\"runbook\",\"filter\":\"\",\"durable\":\"true\",\"paused\":\"false\",\"persistedPause\":\"false\",\"temporary\":\"false\",\"purgeOnNoConsumers\":\"false\",\"consumerCount\":\"0\",\"maxConsumers\":\"-1\",\"autoCreated\":\"false\",\"user\":\"\",\"routingType\":\"ANYCAST\",\"messagesAdded\":\"100\",\"messageCount\":\"60\",\"messagesAcked\":\"40\",\"messagesExpired\":\"0\",\"deliveringCount\":\"0\",\"messagesKilled\":\"0\",\"directDeliver\":\"false\",\"exclusive\":\"false\",\"lastValue\":\"false\",\"lastValueKey\":\"\",\"scheduledCount\":\"0\",\"groupRebalance\":\"false\",\"groupRebalancePauseDispatch\":\"false\",\"groupBuckets\":\"-1\",\"groupFirstKey\":\"\",\"enabled\":\"true\",\"ringSize\":\"-1\",\"consumersBeforeDispatch\":\"0\",\"delayBeforeDispatch\":\"-1\",\"autoDelete\":\"false\",\"internalQueue\":\"false\"}],\"count\":1}","status":200}
+=== artemis producer --destination queue://history --message-count 600 --message-size 20000
+Connection brokerURL = tcp://localhost:62316
+Producer ActiveMQQueue[history], thread=0 Started to calculate elapsed time ...
+
+Producer ActiveMQQueue[history], thread=0 Produced: 600 messages
+Producer ActiveMQQueue[history], thread=0 Elapsed time in second : # s
+Producer ActiveMQQueue[history], thread=0 Elapsed time in milli second : # milli seconds
+--- exit 0
+=== artemis queue create --name replayed --anycast --durable --auto-create-address --silent
+Connection brokerURL = tcp://localhost:62316
+Queue [name=replayed, address=replayed, routingType=ANYCAST, durable=true, purgeOnNoConsumers=false, autoCreateAddress=false, exclusive=false, lastValue=false, lastValueKey=null, nonDestructive=false, consumersBeforeDispatch=0, delayBeforeDispatch=-1, autoCreateAddress=false] created successfully.
+--- exit 0
+=== curl POST {"type": "exec", "mbean": "org.apache.activemq.artemis:broker=\"0.0.0.0\"", "operation": "replay(java.lang.String,java.lang.String,java.lang.String)", "arguments": ["history", "replayed", null]}
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","arguments":["history","replayed",null],"type":"exec","operation":"replay(java.lang.String,java.lang.String,java.lang.String)"},"value":null,"status":200}
+=== artemis queue stat --queueName replayed
+Connection brokerURL = tcp://localhost:62316
+|NAME    |ADDRESS |CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|        |        | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|replayed|replayed|   0    |  600  |  600   |    0     |   0    |    0    |ANYCAST| false  |
+--- exit 0
+=== curl POST {"type": "exec", "mbean": "org.apache.activemq.artemis:broker=\"0.0.0.0\"", "operation": "replay(java.lang.String,java.lang.String,java.lang.String,java.lang.String,java.lang.String)", "arguments": ["20000101000000", "20000102000000", "history", "replayed", null]}
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","arguments":["20000101000000","20000102000000","history","replayed",null],"type":"exec","operation":"replay(java.lang.String,java.lang.String,java.lang.String,java.lang.String,java.lang.String)"},"value":null,"status":200}
+=== artemis queue stat --queueName replayed
+Connection brokerURL = tcp://localhost:62316
+|NAME    |ADDRESS |CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|        |        | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|replayed|replayed|   0    |  600  |  600   |    0     |   0    |    0    |ANYCAST| false  |
+--- exit 0
+=== config-reload: add the address reloaded to broker.xml
+log: deployed queue reloaded
+=== artemis queue stat --queueName reloaded
+Connection brokerURL = tcp://localhost:62316
+|NAME    |ADDRESS |CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|        |        | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|reloaded|reloaded|   0    |   0   |   0    |    0     |   0    |    0    |ANYCAST| false  |
+--- exit 0
+=== artemis perf client
+--- result:              success
+--- total sent:              100
+--- total completed:         100
+--- total received:          100 
+=== artemis stop
+--- exit 0
+stopped
+log: AMQ221002: stopped
+=== artemis data print --journal ../data/retention
+1200
+=== artemis data recover --journal ../data/retention --target ../data/recovered --large-messages ../data/large-messages
+--- exit 0
+=== artemis data print --journal ../data/recovered
+1200
+=== artemis data exp
+messages: 1260
+=== artemis data compact
+Compactation succeeded for WORK/i1/data\journal
+Compactation succeeded for WORK/i1/data\bindings
+=== using-server: artemis run, again
+listening
+=== artemis queue stat --queueName runbook
+Connection brokerURL = tcp://localhost:62316
+|NAME   |ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|       |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|runbook|runbook|   0    |  60   |   60   |    0     |   0    |    0    |ANYCAST| false  |
+--- exit 0
+=== artemis queue stat --queueName replayed
+Connection brokerURL = tcp://localhost:62316
+|NAME    |ADDRESS |CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|        |        | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|replayed|replayed|   0    |  600  |  600   |    0     |   0    |    0    |ANYCAST| false  |
+--- exit 0
+=== artemis queue stat --queueName reloaded
+Connection brokerURL = tcp://localhost:62316
+|NAME    |ADDRESS |CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|        |        | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|reloaded|reloaded|   0    |   0   |   0    |    0     |   0    |    0    |ANYCAST| false  |
+--- exit 0
+=== artemis stop
+--- exit 0
+stopped
+=== data-tools: artemis data imp into another instance
+listening
+Processed 1000 messages
+--- exit 0
+=== artemis queue stat --queueName runbook (imported)
+Connection brokerURL = tcp://localhost:62416
+|NAME   |ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|       |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|runbook|runbook|   0    |  60   |   60   |    0     |   0    |    0    |ANYCAST| false  |
+=== artemis queue stat --queueName history (imported)
+Connection brokerURL = tcp://localhost:62416
+|NAME   |ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|       |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|history|history|   0    |  600  |  600   |    0     |   0    |    0    |ANYCAST| false  |
+=== artemis queue stat --queueName replayed (imported)
+Connection brokerURL = tcp://localhost:62416
+|NAME    |ADDRESS |CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|        |        | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|replayed|replayed|   0    |  600  |  600   |    0     |   0    |    0    |ANYCAST| false  |
+=== artemis stop
+--- exit 0
+stopped

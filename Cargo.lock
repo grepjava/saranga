@@ -1742,11 +1742,14 @@ version = "0.0.1"
 dependencies = [
  "flate2",
  "saranga-buffer",
+ "saranga-config",
  "saranga-core-protocol",
  "saranga-message",
  "saranga-server",
+ "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1764,6 +1767,7 @@ dependencies = [
  "roxmltree",
  "sha1 0.10.7",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

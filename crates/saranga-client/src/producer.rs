@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use saranga_buffer::{PropertyValue, SimpleString, Writer};
 use saranga_core_protocol::packets::session::{
@@ -112,7 +113,16 @@ impl ProducerCredits {
                     break;
                 }
             }
-            notified.await;
+            // ClientProducerCreditsImpl.actualAcquire: a word every 10 s.
+            while tokio::time::timeout(Duration::from_secs(10), notified.as_mut())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "AMQ212054: Destination address={} is blocked. If the system is configured to block make sure you consume messages on this configuration.",
+                    self.address.to_string_lossy()
+                );
+            }
         }
         // ClientProducerCreditsImpl.afterAcquired
         let mut st = self.state();

@@ -21,7 +21,6 @@ use saranga_server::postoffice::SelectorFilters;
 use saranga_server::{Acceptor, Broker, BrokerConfig};
 use saranga_transport::{TlsAcceptor, TlsSettings};
 use tokio::net::TcpListener;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(
@@ -185,16 +184,8 @@ async fn main() -> std::process::ExitCode {
         // The broker logs as Artemis does, once its log4j2.properties is read.
         logging::init_broker();
     } else {
-        let logs = tracing_subscriber::fmt().with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(if client { "warn" } else { "info" })),
-        );
-        if client || matches!(cli.command, Command::Data(_)) {
-            // These commands print their report on stdout.
-            logs.with_writer(std::io::stderr).init();
-        } else {
-            logs.init();
-        }
+        // bin/artemis runs every other command with artemis-utility.profile.
+        logging::init_utility(client::instance_etc().as_deref());
     }
     if client {
         return match run_client(cli.command).await {

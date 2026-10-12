@@ -3,7 +3,7 @@
 # output, normalized, with tests/interop/cli/expected.txt (made with the
 # Artemis CLI against Artemis 2.57.0).
 #
-#   CONFIG=tests/interop/cli/broker.xml SUITE_CMD=tests/interop/cli/cli.sh \
+#   CLI=artemis|saranga SUITE_CMD=tests/interop/cli/cli.sh \
 #     scripts/interop.sh saranga|artemis
 #
 # CLI=artemis (the default) runs the Artemis CLI of the reference

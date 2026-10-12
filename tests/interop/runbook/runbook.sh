@@ -38,7 +38,10 @@ native() { command -v cygpath >/dev/null && cygpath -m "$1" || echo "$1"; }
 windows() { [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; }
 
 cargo build -q --release -p saranga-cli --manifest-path "$(native "$ROOT/Cargo.toml")" || exit 1
-WORK="$(mktemp -d)"
+# Under target/: Artemis blocks producers once the disk is more than
+# max-disk-usage (90%) full, and the system temp dir is often on such a disk.
+mkdir -p "$ROOT/target/runbook"
+WORK="$(mktemp -d -p "$ROOT/target/runbook")"
 cleanup() {
   for i in "$WORK"/i1 "$WORK"/i2; do
     [[ -d "$i" ]] && instance "$i" stop > /dev/null 2>&1
@@ -76,6 +79,7 @@ instance() {
   else
     (cd "$dir/bin" && timeout 300 ./artemis "$@" < /dev/null 2>&1)
   fi | grep -v -E "^WARNING: |NO_ARTEMIS_OOME_DUMP|operable program or batch file|^The system cannot find the file specified"
+  return "${PIPESTATUS[0]}"
 }
 
 PIDS=()
@@ -100,6 +104,14 @@ wait_down() {
     sleep 0.2
   done
   return 1
+}
+# "artemis stop" takes no user: it only drops a file the broker watches for.
+stop() {
+  local dir="$1" port="$2"
+  step "artemis stop"
+  instance "$dir" stop
+  echo "--- exit ${PIPESTATUS[0]}"
+  if wait_down "$port"; then echo "stopped"; else echo "the broker in $dir did not stop"; fi
 }
 # Waits for a line in a file.
 wait_for() {
@@ -134,7 +146,7 @@ jolokia_post() {
   echo
 }
 # The lines of data print about messages sent to an address.
-messages_to() { grep -c -E "userRecordType=(45|31);.*address=$1[,\]]" || true; }
+messages_to() { grep -c -E "userRecordType=(45|31);.*address=$1[],]" || true; }
 
 suite() {
   make_instance "$I1" 700
@@ -187,8 +199,7 @@ suite() {
     | grep -E "^--- (total (sent|completed|received)|result)"
 
   # using-server: stop, and the log says so.
-  run stop
-  wait_down "$PORT1" && echo "stopped"
+  stop "$I1" "$PORT1"
   wait_for "$I1/log/artemis.log" "AMQ221002" && echo "log: AMQ221002: stopped"
 
   # data-retention: the CLI over the retention directory.
@@ -212,19 +223,17 @@ suite() {
   run queue stat --queueName runbook
   run queue stat --queueName replayed
   run queue stat --queueName reloaded
-  run stop
-  wait_down "$PORT1" && echo "stopped"
+  stop "$I1" "$PORT1"
 
   step "data-tools: artemis data imp into another instance"
   start "$I2" "$PORT2" && echo "listening"
-  instance "$I2" data imp --input "$(native "$WORK/export.xml")" --port "$PORT2" "${AUTH[@]}"
+  instance "$I2" data imp --input "$(native "$WORK/export.xml")" --host localhost --port "$PORT2" "${AUTH[@]}"
   echo "--- exit ${PIPESTATUS[0]}"
   for q in runbook history replayed; do
     step "artemis queue stat --queueName $q (imported)"
     instance "$I2" queue stat --queueName "$q" "${AUTH[@]}"
   done
-  instance "$I2" stop > /dev/null
-  wait_down "$PORT2" && echo "stopped"
+  stop "$I2" "$PORT2"
 }
 
 # Timings, IDs, paths and dates differ between runs and brokers.
@@ -238,8 +247,11 @@ normalize() {
     -e 's#WORK\\#WORK/#g; s#(WORK/[a-z0-9/]*)\\#\1/#g' \
     -e 's/^Usage: (artemis|saranga) help/Usage: CLI help/' \
     -e 's/(Elapsed time in milli second :) [0-9]+ milli/\1 # milli/' \
+    -e 's/(Elapsed time in second :) [0-9]+ s/\1 # s/' \
+    -e 's/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3} /DATE /' \
     -e 's/"timestamp":[0-9]+/"timestamp":#/g' \
     -e 's/"id":"?[0-9]+"?/"id":#/g' \
+    -e 's/\\"id\\":\\"[0-9]+\\"/\\"id\\":#/g' \
     -e 's/(JMS Message ID:|messageID=|ID:)[^ ,]*/\1#/g' \
     -e "s/$uuid/UUID/g" \
     -e 's/^result: .*/result: MASKED/' \

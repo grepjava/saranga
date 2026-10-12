@@ -122,6 +122,9 @@ impl Codec {
         };
         let algorithm = match get("algorithm") {
             None | Some("two-way") => {
+                tracing::warn!(
+                    "AMQ202017: Algorithm two-way is deprecated and will be removed from the default codec in a future version. Use a custom codec instead. Consult the manual for details."
+                );
                 let key = match get("key") {
                     Some(k) => k.as_bytes().to_vec(),
                     None => match env(KEY_ENV_VAR) {

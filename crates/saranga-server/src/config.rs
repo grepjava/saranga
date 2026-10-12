@@ -11,7 +11,9 @@ use saranga_config as cfg;
 use crate::postoffice::{
     DivertDeployment, DivertRoutingType, FilterFactory, QueueSpec, RoutingTypes,
 };
-use crate::settings::{AddressFullPolicy, AddressSettings, PageFullPolicy, SettingsRepository};
+use crate::settings::{
+    AddressFullPolicy, AddressSettings, DiskFullPolicy, PageFullPolicy, SettingsRepository,
+};
 use crate::storage::StorageConfig;
 use crate::wildcard::WildcardConfig;
 use crate::{AddressDeployment, BrokerConfig, RoutingType};
@@ -158,6 +160,11 @@ fn resolve(s: &cfg::AddressSettings) -> AddressSettings {
             cfg::AddressFullMessagePolicy::Block => AddressFullPolicy::Block,
             cfg::AddressFullMessagePolicy::Fail => AddressFullPolicy::Fail,
             cfg::AddressFullMessagePolicy::Drop => AddressFullPolicy::Drop,
+        },
+        disk_full_policy: match s.disk_full_message_policy {
+            Some(cfg::DiskFullMessagePolicy::Fail) => DiskFullPolicy::Fail,
+            Some(cfg::DiskFullMessagePolicy::Drop) => DiskFullPolicy::Drop,
+            Some(cfg::DiskFullMessagePolicy::Block) | None => DiskFullPolicy::Block,
         },
         max_size_bytes: s.max_size_bytes(),
         max_size_messages: s.max_size_messages(),
@@ -386,6 +393,11 @@ impl BrokerConfig {
             protocols: Vec::new(),
             critical: crate::critical::CriticalConfig::from_file(config),
             plugins: plugins(config)?,
+            disk_monitor: crate::disk::MonitorConfig::new(
+                config.journal.max_disk_usage.unwrap_or(90),
+                config.journal.min_disk_free.unwrap_or(-1),
+                config.journal.disk_scan_period.map_or(5000, i64::from),
+            ),
             management: crate::management::ManagementConfig {
                 address: config.management_address.clone(),
                 notification_address: config.management_notification_address.clone(),

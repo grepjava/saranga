@@ -9,6 +9,7 @@ license.workspace = true
 regex = "1"
 roxmltree = "0.21"
 thiserror = "2"
+tracing = "0.1"
 blowfish = "0.9"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 rand = "0.9"

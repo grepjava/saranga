@@ -397,16 +397,24 @@ impl CoreSession {
             Packet::SessionRequestProducerCreditsMessage(p) => {
                 // requestProducerCredits: a full address under BLOCK grants
                 // them once memory is freed, under FAIL refuses them.
-                let store = self
-                    .broker
-                    .post_office()
-                    .paging_store(self.session.remove_prefix(&p.address.to_string_lossy()));
+                let raw = p.address.to_string_lossy();
+                let addr = self.session.remove_prefix(&raw);
                 let (conn, channel) = (self.conn.clone(), self.channel_id);
                 let (credits, address) = (p.credits, p.address.clone());
-                let grant = Box::new(move || {
+                let grant: Box<dyn FnOnce() + Send> = Box::new(move || {
                     conn.send(channel, SessionProducerCreditsMessage { credits, address });
                 });
-                if let crate::paging::Credits::Failed = store.request_credits(grant) {
+                // getPageStore: the management address has no store, so
+                // what is sent to it is never blocked.
+                let store_name = addr.split_once("::").map_or(addr, |(a, _)| a);
+                if store_name.starts_with(self.broker.management().address()) {
+                    grant();
+                } else if let crate::paging::Credits::Failed = self
+                    .broker
+                    .post_office()
+                    .paging_store(addr)
+                    .request_credits(grant)
+                {
                     self.send(
                         saranga_core_protocol::packets::session::SessionProducerCreditsFailMessage {
                             credits: p.credits,

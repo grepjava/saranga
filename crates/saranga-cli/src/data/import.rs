@@ -29,6 +29,17 @@ pub struct ImportArgs {
     /// Password used to connect.
     #[arg(long)]
     password: Option<String>,
+    /// The host used to import the data. Default: null.
+    #[arg(long, hide = true)]
+    host: Option<String>,
+    /// The port used to import the data. Default: 61616.
+    #[arg(long, default_value_t = 61616, hide = true)]
+    port: u16,
+    /// Import every message using a single transction. If anything goes wrong
+    /// during the process the entire import will be aborted. Default: false.
+    // Read by none of XmlDataImporter's command line paths.
+    #[arg(long, hide = true)]
+    transaction: bool,
     /// How often to commit.
     #[arg(long = "commit-interval", default_value_t = 1000, hide = true)]
     commit_interval: u64,
@@ -53,11 +64,15 @@ const GENERIC_IGNORED_FILTER: &str = "__AMQX=-1";
 const HDR_ROUTE_TO_IDS: &str = "_AMQ_ROUTE_TO";
 
 pub async fn run(args: ImportArgs) -> anyhow::Result<()> {
-    // XmlDataImporter does not resolve the instance's acceptor.
-    let url = args
-        .url
-        .clone()
-        .unwrap_or_else(|| crate::client::DEFAULT_BROKER_URL.to_owned());
+    // XmlDataImporter does not resolve the instance's acceptor, and takes
+    // --port only along with --host.
+    let url = match &args.host {
+        Some(host) => format!("tcp://{host}:{}", args.port),
+        None => args
+            .url
+            .clone()
+            .unwrap_or_else(|| crate::client::DEFAULT_BROKER_URL.to_owned()),
+    };
     let conn = crate::client::jms::JmsConnection::connect(
         &url,
         args.user.clone(),

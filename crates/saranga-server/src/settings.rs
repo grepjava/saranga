@@ -66,6 +66,9 @@ pub struct AddressSettings {
     pub id_cache_size: Option<i32>,
     /// `address-full-policy`.
     pub address_full_policy: AddressFullPolicy,
+    /// `disk-full-policy`: what producers get while the disk is past
+    /// `max-disk-usage` or `min-disk-free`.
+    pub disk_full_policy: DiskFullPolicy,
     /// `max-size-bytes`; -1 for no limit of the address's own.
     pub max_size_bytes: i64,
     /// `max-size-messages`; -1 for no limit.
@@ -108,6 +111,18 @@ pub struct AddressSettings {
 pub enum PageFullPolicy {
     Drop,
     Fail,
+}
+
+/// `DiskFullMessagePolicy`: what an address does while the disk is full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiskFullPolicy {
+    /// Producers get no more credits until the disk has room again.
+    #[default]
+    Block,
+    /// Sends fail.
+    Fail,
+    /// New messages are dropped.
+    Drop,
 }
 
 /// `AddressFullMessagePolicy`: what an address does at its size limit.
@@ -182,6 +197,7 @@ impl Default for AddressSettings {
             expiry_queue_suffix: String::new(),
             id_cache_size: None,
             address_full_policy: AddressFullPolicy::Page,
+            disk_full_policy: DiskFullPolicy::Block,
             max_size_bytes: -1,
             max_size_messages: -1,
             page_size_bytes: 10 * 1024 * 1024,

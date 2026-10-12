@@ -40,7 +40,7 @@ use saranga_storage::message::PersistedMessage;
 
 use crate::large::LargeMessageStore;
 use crate::message::{MessageDecoders, PagePosition, ServerMessage};
-use crate::settings::{AddressFullPolicy, AddressSettings, PageFullPolicy};
+use crate::settings::{AddressFullPolicy, AddressSettings, DiskFullPolicy, PageFullPolicy};
 use crate::storage::{Pending, RecoveredCursorRecord, RecoveredPageTx, Storage, StoreResult};
 use crate::{BrokerError, Name};
 
@@ -105,6 +105,8 @@ pub struct PagingManager {
     syncer: Mutex<Option<mpsc::Sender<SyncRequest>>>,
     /// Queues read their pages only once the cursors are recovered.
     loaded: AtomicBool,
+    /// The disk is past `max-disk-usage` or `min-disk-free` (`diskFull`).
+    disk_full: AtomicBool,
     me: Weak<PagingManager>,
 }
 
@@ -125,6 +127,7 @@ impl PagingManager {
             global_max_messages,
             global_size: AtomicI64::new(0),
             global_messages: AtomicI64::new(0),
+            disk_full: AtomicBool::new(false),
             stores: Mutex::default(),
             transactions: Mutex::default(),
             blocked: Mutex::default(),
@@ -238,8 +241,9 @@ impl PagingManager {
     }
 
     pub fn is_global_full(&self) -> bool {
-        (self.global_max_size >= 0
-            && self.global_size.load(Ordering::SeqCst) >= self.global_max_size)
+        self.is_disk_full()
+            || (self.global_max_size >= 0
+                && self.global_size.load(Ordering::SeqCst) >= self.global_max_size)
             || (self.global_max_messages >= 0
                 && self.global_messages.load(Ordering::SeqCst) >= self.global_max_messages)
     }
@@ -247,10 +251,65 @@ impl PagingManager {
     fn add_global(&self, size: i64, messages: i64) {
         self.global_size.fetch_add(size, Ordering::SeqCst);
         self.global_messages.fetch_add(messages, Ordering::SeqCst);
-        if (size < 0 || messages < 0) && !self.is_global_full() {
+        if size < 0 || messages < 0 {
+            self.check_memory_release();
+        }
+    }
+
+    /// `checkMemoryRelease`: below the limits, the blocked stores let their
+    /// producers go.
+    fn check_memory_release(&self) {
+        if !self.is_global_full() {
             let blocked = std::mem::take(&mut *lock(&self.blocked));
             for s in blocked.iter().filter_map(Weak::upgrade) {
                 s.check_released_memory();
+            }
+        }
+    }
+
+    /// `isDiskFull`.
+    pub fn is_disk_full(&self) -> bool {
+        self.disk_full.load(Ordering::SeqCst)
+    }
+
+    /// `LocalMonitor.tick`: the disk monitor's verdict on the last store it
+    /// read.
+    pub fn disk_tick(
+        &self,
+        usable: u64,
+        total: u64,
+        within_limit: bool,
+        limit: crate::disk::Limit,
+    ) {
+        let space = || {
+            (
+                crate::disk::human_bytes(usable),
+                crate::disk::human_bytes(total),
+                format!("{:.1}%", crate::disk::usage_of(usable, total) * 100.0),
+            )
+        };
+        if within_limit {
+            if self.disk_full.swap(false, Ordering::SeqCst) {
+                let (usable, total, usage) = space();
+                match limit {
+                    crate::disk::Limit::MaxUsage(_) => tracing::info!(
+                        "AMQ222211: Free storage space is at {usable} of {total} total. Usage rate is {usage} which is below the configured <max-disk-usage>. System will unblock producers."
+                    ),
+                    crate::disk::Limit::MinFree(_) => tracing::warn!(
+                        "AMQ224129: Free storage space is at {usable} which is above the configured <min-disk-free>. System will unblock producers."
+                    ),
+                }
+            }
+            self.check_memory_release();
+        } else if !self.disk_full.swap(true, Ordering::SeqCst) {
+            let (usable, total, usage) = space();
+            match limit {
+                crate::disk::Limit::MaxUsage(_) => tracing::warn!(
+                    "AMQ222210: Free storage space is at {usable} of {total} total. Usage rate is {usage} which is beyond the configured <max-disk-usage>. System will start blocking producers."
+                ),
+                crate::disk::Limit::MinFree(_) => tracing::warn!(
+                    "AMQ224128: Free storage space is at {usable} which is below the configured <min-disk-free>. System will start blocking producers."
+                ),
             }
         }
     }
@@ -1004,6 +1063,33 @@ impl PagingStore {
             return Credits::Blocked;
         }
         let s = self.settings();
+        if let Some(m) = self.manager.upgrade()
+            && m.is_disk_full()
+        {
+            match s.disk_full_policy {
+                DiskFullPolicy::Fail => return Credits::Failed,
+                DiskFullPolicy::Block => {
+                    lock(&self.blocked).push(grant);
+                    // The disk may have room again meanwhile.
+                    if !m.is_disk_full() {
+                        self.check_released_memory();
+                        return Credits::Granted;
+                    }
+                    lock(&m.blocked).push(self.me.clone());
+                    if !self.blocking.swap(true, Ordering::SeqCst) {
+                        tracing::warn!(
+                            "AMQ222212: Disk Full! Blocking message production on address '{}'. Clients will report blocked.",
+                            self.address
+                        );
+                    }
+                    return Credits::Blocked;
+                }
+                DiskFullPolicy::Drop => {
+                    grant();
+                    return Credits::Granted;
+                }
+            }
+        }
         match s.address_full_policy {
             AddressFullPolicy::Fail if self.has_limit(&s) && self.is_full() => Credits::Failed,
             AddressFullPolicy::Block if self.has_limit(&s) && self.is_full() => {
@@ -1034,6 +1120,20 @@ impl PagingStore {
         }
     }
 
+    /// `pageStoreDropMessages`, once until paging stops.
+    fn warn_dropping(&self) {
+        let mut st = lock(&self.state);
+        if !st.drop_warned {
+            st.drop_warned = true;
+            drop(st);
+            tracing::warn!(
+                "AMQ222039: Messages sent to address '{}' are being dropped; {}",
+                self.address,
+                self.page_info()
+            );
+        }
+    }
+
     /// `page`: under DROP or FAIL a full address drops or refuses the
     /// message; under PAGE a paging address writes it to the current page
     /// for `queue_ids`. `tx` is the transaction sending it, if any.
@@ -1044,6 +1144,21 @@ impl PagingStore {
         queues: &[crate::queue::Queue],
     ) -> Result<Paged, BrokerError> {
         let s = self.settings();
+        // A full disk drops or refuses the message first.
+        if matches!(
+            s.disk_full_policy,
+            DiskFullPolicy::Drop | DiskFullPolicy::Fail
+        ) && self.manager.upgrade().is_some_and(|m| m.is_disk_full())
+        {
+            if s.disk_full_policy == DiskFullPolicy::Fail {
+                return Err(BrokerError::new(
+                    saranga_core_protocol::ErrorType::AddressFull,
+                    format!("AMQ229102: Address \"{}\" is full.", self.address),
+                ));
+            }
+            self.warn_dropping();
+            return Ok(Paged::Dropped);
+        }
         match s.address_full_policy {
             AddressFullPolicy::Drop | AddressFullPolicy::Fail => {
                 if !self.is_full() {
@@ -1055,16 +1170,7 @@ impl PagingStore {
                         format!("AMQ229102: Address \"{}\" is full.", self.address),
                     ));
                 }
-                let mut st = lock(&self.state);
-                if !st.drop_warned {
-                    st.drop_warned = true;
-                    drop(st);
-                    tracing::warn!(
-                        "AMQ222039: Messages sent to address '{}' are being dropped; {}",
-                        self.address,
-                        self.page_info()
-                    );
-                }
+                self.warn_dropping();
                 return Ok(Paged::Dropped);
             }
             AddressFullPolicy::Block => return Ok(Paged::No),
