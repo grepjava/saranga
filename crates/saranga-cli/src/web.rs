@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use saranga_config::{BrokerConfig, WebBinding, WebConfig};
-use saranga_server::Broker;
 use saranga_transport::{TlsAcceptor, TlsSettings};
 
 use crate::instance::Instance;
@@ -121,7 +120,7 @@ pub async fn start(
     instance: &Instance,
     file: &BrokerConfig,
     web: &WebConfig,
-    broker: &Arc<Broker>,
+    current: &Arc<saranga_server::Current>,
 ) -> anyhow::Result<()> {
     tracing::info!("AMQ241003: Starting embedded web server");
     let bindings = web
@@ -148,14 +147,14 @@ pub async fn start(
         .collect();
     let options = saranga_management::Options {
         domain: file.jmx_domain.clone(),
-        broker_name: broker.management().config().name.clone(),
+        broker_name: current.get().management().config().name.clone(),
         access: saranga_management::access_list(&instance.etc),
         console_roles: console_roles(instance),
         cors: saranga_management::cors(&instance.etc),
         root_redirect: web.root_redirect_location.clone(),
         acceptors,
     };
-    saranga_management::start(broker.clone(), bindings, options)
+    saranga_management::start(current.clone(), bindings, options)
         .await
         .context("starting the web server")
 }

@@ -544,6 +544,29 @@ fn parse_scalars(
     if let Some(v) = s.i64("graceful-shutdown-timeout", Check::MinusOneOrGeZero)? {
         config.graceful_shutdown_timeout = v;
     }
+    set(
+        &mut config.network_check_list,
+        s.string("network-check-list"),
+    );
+    set(
+        &mut config.network_check_url_list,
+        s.string("network-check-URL-list"),
+    );
+    if let Some(v) = s.i64("network-check-period", Check::GtZero)? {
+        config.network_check_period = v;
+    }
+    if let Some(v) = s.i32("network-check-timeout", Check::GtZero)? {
+        config.network_check_timeout = v;
+    }
+    set(&mut config.network_check_nic, s.string("network-check-NIC"));
+    set(
+        &mut config.network_check_ping_command,
+        s.string("network-check-ping-command"),
+    );
+    set(
+        &mut config.network_check_ping6_command,
+        s.string("network-check-ping6-command"),
+    );
     if let Some(v) = s.bool("critical-analyzer") {
         config.critical_analyzer = v;
     }
@@ -851,6 +874,11 @@ const SCALAR_ELEMENTS: &[&str] = &[
     "max-redelivery-records",
     "message-expiry-scan-period",
     "name",
+    "network-check-list",
+    "network-check-period",
+    "network-check-ping-command",
+    "network-check-ping6-command",
+    "network-check-timeout",
     "page-sync-timeout",
     "paging-directory",
     "password-codec",

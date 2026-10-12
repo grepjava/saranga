@@ -203,6 +203,15 @@ The analyzer reads `critical-analyzer`, `critical-analyzer-timeout`, `critical-a
 - **The "thread dump"** (AMQ222199) lists the components in a critical path and how long each has been there. A Rust process cannot dump its threads' stacks.
 - **What a path covers.** A queue is in its critical path while its task handles one command, and a session while it sends or acknowledges, so the paths are not drawn exactly where Artemis's `CriticalMeasure`s are.
 
+## Network check differences
+`saranga run` reads `network-check-list`, `network-check-URL-list`, `network-check-period`, `network-check-timeout` and the ping commands as Artemis does (`NetworkHealthCheck`). Each address and URL is checked once as it is added, with AMQ202001, AMQ202002 and AMQ202003, and then every period. While none answers, the broker is stopped (AMQ201001). Once one answers again, a new broker is started on the same data and ports (AMQ201000), and the web server serves it. The runbook suite takes an instance made with `create --ping` through a network outage and back. The differences:
+- **Reachability.** Without a custom ping command, an address first gets a TCP connection to its echo port (7), and a refusal counts as an answer, as `InetAddress.isReachable` does without privileges. Saranga never sends ICMP itself. When there is no answer, it runs the ping command, as Artemis does.
+- **`network-check-NIC`** is reported and not used: the addresses are checked through any interface.
+- **`https` URLs** are reported and not checked, as Saranga has no root certificate store. `http` and `file` URLs are checked.
+- **Host names** are given to the ping command as the address they resolve to. Artemis gives the canonical host name from a reverse lookup.
+- **An unhealthy network at startup** stops the broker right after it has started, as in Artemis. Artemis's `run` then fails to register the web server with the stopped broker (`IllegalStateException`) and the process exits. Saranga keeps the process and its web server, and starts the broker once the network answers.
+- **While the broker is stopped**, the web server serves the stopped broker's last state. Artemis unregisters its MBeans.
+
 ## Broker plugin differences
 A plugin is Rust code implementing `saranga_server::plugin::BrokerPlugin`, the equivalent of `ActiveMQServerPlugin`, registered by an embedding application in `BrokerConfig::plugins` or with `Broker::register_plugin`. `<broker-plugins>` in `broker.xml` selects Saranga's ports of the plugins Artemis ships, by their Java class names and with their properties: `LoggingActiveMQServerPlugin`, `NotificationActiveMQServerPlugin`, `BrokerMessageAuthorizationPlugin` and `ConnectionPeriodicExpiryPlugin`. [tests/interop/plugin/plugin.sh](tests/interop/plugin/plugin.sh) checks the logging plugin's lines for a CLI session against Artemis 2.57.0's. The differences:
 - **Other classes.** A `<broker-plugin>` naming any other class is Java code Saranga cannot run, and the broker does not start: leaving out what such a plugin enforces could open what it closes. The same goes for a built-in plugin's own configuration errors.

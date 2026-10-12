@@ -347,6 +347,25 @@ fn spawn_transaction_reaper(broker: &Arc<Broker>, period_ms: i64) {
     });
 }
 
+/// The broker an instance runs now. The network check stops a broker and
+/// starts a new one in its place, and what serves the instance (the web
+/// server, the configuration reloader) follows it here.
+pub struct Current(std::sync::RwLock<Arc<Broker>>);
+
+impl Current {
+    pub fn new(broker: Arc<Broker>) -> Arc<Self> {
+        Arc::new(Current(std::sync::RwLock::new(broker)))
+    }
+
+    pub fn get(&self) -> Arc<Broker> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set(&self, broker: Arc<Broker>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = broker;
+    }
+}
+
 pub struct Broker {
     node_id: String,
     post_office: Arc<PostOffice>,

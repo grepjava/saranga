@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use saranga_server::Broker;
+use saranga_server::Current;
 use saranga_server::management::json::Json;
 
 use crate::access::AccessList;
@@ -61,7 +61,7 @@ impl Caller {
 
 /// The agent: the broker's MBeans and the access list.
 pub struct Agent {
-    pub broker: Arc<Broker>,
+    pub broker: Arc<Current>,
     pub domain: String,
     pub broker_name: String,
     pub access: AccessList,
@@ -481,7 +481,7 @@ impl Agent {
 
     fn beans(&self) -> Vec<(ObjectName, Bean)> {
         registered(
-            &self.broker,
+            &self.broker.get(),
             &self.domain,
             &self.broker_name,
             &self.acceptors,
@@ -543,12 +543,18 @@ impl Agent {
             return Err(Self::denied("attribute", attr));
         }
         if let Bean::Acceptor(n, params) = bean {
-            let started = self.broker.acceptor(n).is_some_and(|(_, s)| s);
+            let started = self.broker.get().acceptor(n).is_some_and(|(_, s)| s);
             return Ok(acceptor_attribute(n, params, started, attr));
         }
         self.broker
+            .get()
             .management()
-            .attribute(&self.broker, &bean.resource(), attr, caller.management())
+            .attribute(
+                &self.broker.get(),
+                &bean.resource(),
+                attr,
+                caller.management(),
+            )
             .await
             .map_err(|e| Failure::new("java.lang.UnsupportedOperationException", e, 500))
     }
@@ -647,9 +653,10 @@ impl Agent {
         };
         let value = convert(req.value.as_ref().unwrap_or(&Json::Null), info.type_name)?;
         self.broker
+            .get()
             .management()
             .invoke(
-                &self.broker,
+                &self.broker.get(),
                 &bean.resource(),
                 &setter,
                 &[value],
@@ -735,7 +742,8 @@ impl Agent {
                 403,
             ));
         }
-        let management = self.broker.management();
+        let broker = self.broker.get();
+        let management = broker.management();
         let result = match (&bean, op.name) {
             // Composite data, which management messages cannot carry.
             (Bean::Queue(q), "browse") => {
@@ -754,13 +762,13 @@ impl Agent {
                     [p, size, f, ..] => (Some((i(p), i(size))), s(f)),
                 };
                 management
-                    .browse(&self.broker, q, page, filter, caller.management())
+                    .browse(&broker, q, page, filter, caller.management())
                     .await
             }
             _ => {
                 management
                     .invoke(
-                        &self.broker,
+                        &broker,
                         &bean.resource(),
                         op.name,
                         &params,

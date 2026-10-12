@@ -29,6 +29,8 @@
 #   data-tools         data exp, compact, and imp into a second instance;
 #                      restart recovery
 #   graceful-shutdown  a broker stopped while a consumer is connected
+#   network-isolation  create --ping; the broker stopped while the network
+#                      is down and started again once it is back
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -47,7 +49,7 @@ cargo build -q --release -p saranga-cli --manifest-path "$(native "$ROOT/Cargo.t
 mkdir -p "$ROOT/target/runbook"
 WORK="$(mktemp -d -p "$ROOT/target/runbook")"
 cleanup() {
-  for i in "$WORK"/i1 "$WORK"/i2; do
+  for i in "$WORK"/i1 "$WORK"/i2 "$WORK"/i3; do
     [[ -d "$i" ]] && instance "$i" stop > /dev/null 2>&1
   done
   sleep 2
@@ -64,8 +66,9 @@ artemis_home() {
 # A broker instance, made as BROKER says.
 make_instance() {
   local dir="$1" offset="$2"
+  shift 2
   local opts=(--silent --no-autotune --user admin --password admin --require-login
-    --port-offset "$offset" --journal-retention 1)
+    --port-offset "$offset" --journal-retention 1 "$@")
   case "$BROKER" in
     saranga) "$SARANGA" create "$(native "$dir")" "${opts[@]}" > /dev/null 2>&1 ;;
     artemis) artemis_home create "$(native "$dir")" "${opts[@]}" > /dev/null ;;
@@ -130,8 +133,8 @@ wait_for() {
 }
 
 step() { echo "=== $*"; }
-I1="$WORK/i1" I2="$WORK/i2"
-PORT1=62316 PORT2=62416 WEB1=8861
+I1="$WORK/i1" I2="$WORK/i2" I3="$WORK/i3"
+PORT1=62316 PORT2=62416 PORT3=62516 WEB1=8861
 AUTH=(--user admin --password admin)
 run() {
   step "artemis $*"
@@ -285,6 +288,45 @@ suite() {
   step "graceful-shutdown: graceful-shutdown-timeout 2000"
   sed -i 's#<graceful-shutdown-enabled>true</graceful-shutdown-enabled>#&\n      <graceful-shutdown-timeout>2000</graceful-shutdown-timeout>#' "$I2/etc/broker.xml"
   graceful 60000 "the timeout passed"
+
+  network
+}
+
+# network-isolation: an instance made with --ping, whose broker stops while
+# no address of network-check-list answers and starts again once one does.
+# Its ping command is changed to one that answers while a file exists.
+network() {
+  local log="$I3/log/artemis.log" flag
+  flag="$(native "$WORK/network-up")"
+  step "network-isolation: artemis create --ping 192.0.2.1"
+  make_instance "$I3" 900 --ping 192.0.2.1
+  grep -o "<network-check-list>.*</network-check-list>" "$I3/etc/broker.xml"
+  local ping="test -e $flag"
+  windows && ping="cmd /C if exist $flag (exit 0) else (exit 1)"
+  sed -i -e "s#<network-check-period>[0-9]*<#<network-check-period>1000<#" \
+    -e "s#<network-check-ping-command>.*</network-check-ping-command>#<network-check-ping-command>$ping</network-check-ping-command>#" \
+    "$I3/etc/broker.xml"
+  touch "$flag"
+  start "$I3" "$PORT3" && echo "listening"
+  # Artemis checks the network once the broker is active and before its
+  # web server starts; an outage between the two ends its run.
+  wait_for "$log" "AMQ241001"
+  step "the network goes down"
+  rm "$flag"
+  wait_for "$log" "AMQ221002" && grep -o "AMQ201001: .*" "$log"
+  wait_down "$PORT3" && echo "stopped"
+  step "the network comes back"
+  touch "$flag"
+  wait_for "$log" "AMQ201000" && grep -o "AMQ201000: .*" "$log"
+  for _ in $(seq 1 150); do
+    (echo > "/dev/tcp/127.0.0.1/$PORT3") 2>/dev/null && { echo "listening"; break; }
+    sleep 0.2
+  done
+  step "artemis producer --destination queue://network --message-count 1"
+  instance "$I3" producer --destination queue://network --message-count 1 "${AUTH[@]}"
+  step "artemis queue stat --queueName network"
+  instance "$I3" queue stat --queueName network "${AUTH[@]}"
+  stop "$I3" "$PORT3"
 }
 
 # The broker of i2 stopped while a consumer waits receive-timeout ms for a

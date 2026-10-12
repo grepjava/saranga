@@ -30,15 +30,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use saranga_config::CheckType;
 use saranga_security::{ConnectionInfo, SecurityAuth};
-use saranga_server::Broker;
 use saranga_server::audit::Who;
 use saranga_server::management::Caller;
 use saranga_server::management::json::Json;
+use saranga_server::{Broker, Current};
 
 use crate::Peer;
 
 /// The API's routes.
-pub(crate) fn router(broker: Arc<Broker>) -> Router {
+pub(crate) fn router(broker: Arc<Current>) -> Router {
     Router::new()
         .route("/api/{kind}/{a}/{b}", get(get3).post(post3))
         .route("/api/{kind}/{name}/{part}/{member}", get(get4).post(post4))
@@ -280,12 +280,13 @@ async fn browse(
 }
 
 async fn get3(
-    State(broker): State<Arc<Broker>>,
+    State(current): State<Arc<Current>>,
     Extension(Peer(peer)): Extension<Peer>,
     Path((kind, a, b)): Path<(String, String, String)>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
+    let broker = current.get();
     let auth = match login(&broker, &headers, peer) {
         Ok(a) => a,
         Err(r) => return *r,
@@ -301,12 +302,13 @@ async fn get3(
 }
 
 async fn post3(
-    State(broker): State<Arc<Broker>>,
+    State(current): State<Arc<Current>>,
     Extension(Peer(peer)): Extension<Peer>,
     Path((kind, a, b)): Path<(String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let broker = current.get();
     let auth = match login(&broker, &headers, peer) {
         Ok(a) => a,
         Err(r) => return *r,
@@ -319,11 +321,12 @@ async fn post3(
 }
 
 async fn get4(
-    State(broker): State<Arc<Broker>>,
+    State(current): State<Arc<Current>>,
     Extension(Peer(peer)): Extension<Peer>,
     Path((kind, name, part, member)): Path<(String, String, String, String)>,
     headers: HeaderMap,
 ) -> Response {
+    let broker = current.get();
     let auth = match login(&broker, &headers, peer) {
         Ok(a) => a,
         Err(r) => return *r,
@@ -336,12 +339,13 @@ async fn get4(
 }
 
 async fn post4(
-    State(broker): State<Arc<Broker>>,
+    State(current): State<Arc<Current>>,
     Extension(Peer(peer)): Extension<Peer>,
     Path((kind, name, part, member)): Path<(String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let broker = current.get();
     let auth = match login(&broker, &headers, peer) {
         Ok(a) => a,
         Err(r) => return *r,

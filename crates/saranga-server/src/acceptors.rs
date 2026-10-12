@@ -197,6 +197,16 @@ impl Broker {
             unbind(&r).await;
         }
     }
+
+    /// The connections no protocol has taken yet (in their TLS handshake
+    /// or protocol detection) are closed, as stopping the acceptors closes
+    /// every channel (`RemotingServiceImpl.stop`). The others are failed
+    /// through the registry.
+    pub fn close_unestablished(&self) {
+        for r in self.acceptors.all() {
+            r.closing.notify_waiters();
+        }
+    }
 }
 
 /// Stops accepting and closes the listener; whether it was listening.

@@ -30,7 +30,7 @@ use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
-use saranga_server::Broker;
+use saranga_server::Current;
 use saranga_server::management::json::Json;
 use saranga_transport::TlsAcceptor;
 use tokio::net::TcpListener;
@@ -114,7 +114,7 @@ impl Cors {
 
 struct AppState {
     agent: jolokia::Agent,
-    broker: Arc<Broker>,
+    broker: Arc<Current>,
     console_roles: Vec<String>,
     cors: Cors,
     base: String,
@@ -125,7 +125,7 @@ struct Peer(SocketAddr);
 
 /// Starts serving every binding; the tasks end with the runtime.
 pub async fn start(
-    broker: Arc<Broker>,
+    broker: Arc<Current>,
     bindings: Vec<Binding>,
     options: Options,
 ) -> std::io::Result<()> {
@@ -199,7 +199,7 @@ pub async fn start(
                     async move {
                         (
                             [(header::CONTENT_TYPE, metrics::CONTENT_TYPE)],
-                            metrics::scrape(&broker).await,
+                            metrics::scrape(&broker.get()).await,
                         )
                             .into_response()
                     }
@@ -292,7 +292,8 @@ fn login(
         .or_else(|| value.strip_prefix("basic "))?;
     let decoded = String::from_utf8(base64_decode(encoded.trim())?).ok()?;
     let (user, password) = decoded.split_once(':')?;
-    let store = state.broker.security()?;
+    let broker = state.broker.get();
+    let store = broker.security()?;
     let connection = saranga_security::ConnectionInfo {
         remote_address: format!("/{peer}"),
         certificates: None,

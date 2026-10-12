@@ -226,3 +226,27 @@ Consumer ActiveMQQueue[graceful], thread=0 Consumed: 0 messages
 Consumer ActiveMQQueue[graceful], thread=0 Consumer thread finished
 log: AMQ221002: stopped once the timeout passed
 the consumer ended with the broker
+=== network-isolation: artemis create --ping 192.0.2.1
+<network-check-list>192.0.2.1</network-check-list>
+listening
+=== the network goes down
+AMQ201001: Network is unhealthy, stopping service ActiveMQServerImpl::name=0.0.0.0
+stopped
+=== the network comes back
+AMQ201000: Network is healthy, starting service ActiveMQServerImpl::name=0.0.0.0
+listening
+=== artemis producer --destination queue://network --message-count 1
+Connection brokerURL = tcp://localhost:62516
+Producer ActiveMQQueue[network], thread=0 Started to calculate elapsed time ...
+
+Producer ActiveMQQueue[network], thread=0 Produced: 1 messages
+Producer ActiveMQQueue[network], thread=0 Elapsed time in second : # s
+Producer ActiveMQQueue[network], thread=0 Elapsed time in milli second : # milli seconds
+=== artemis queue stat --queueName network
+Connection brokerURL = tcp://localhost:62516
+|NAME   |ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|       |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|network|network|   0    |   1   |   1    |    0     |   0    |    0    |ANYCAST| false  |
+=== artemis stop
+--- exit 0
+stopped

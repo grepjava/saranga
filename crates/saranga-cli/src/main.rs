@@ -12,6 +12,7 @@ mod create;
 mod data;
 mod instance;
 mod logging;
+mod network;
 mod perf;
 mod shell;
 mod upgrade;
@@ -681,7 +682,7 @@ async fn watch_stop_files(dir: PathBuf, allow_kill: bool) -> Stop {
 /// reloads what can change while it runs (`ReloadManagerImpl`).
 fn spawn_config_reloader(
     instance: Arc<instance::Instance>,
-    broker: Arc<Broker>,
+    current: Arc<saranga_server::Current>,
     period: std::time::Duration,
 ) {
     tokio::spawn(async move {
@@ -700,7 +701,7 @@ fn spawn_config_reloader(
                 saranga_server::reload::Reload::from_file_config(&c).map_err(anyhow::Error::from)
             });
             match reload {
-                Ok(reload) => broker.reload(reload),
+                Ok(reload) => current.get().reload(reload),
                 Err(e) => tracing::warn!("configuration not reloaded: {e:#}"),
             }
         }
@@ -781,17 +782,25 @@ fn parse_system_property(s: &str) -> Result<(String, String), String> {
 /// Saranga's version, in the startup and shutdown messages.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-async fn run(
-    instance: Option<instance::Instance>,
+/// A broker `run` started, with what stopping it needs.
+struct Started {
+    broker: Arc<Broker>,
+    at: std::time::Instant,
+    file: Option<saranga_config::BrokerConfig>,
+    reload_period: std::time::Duration,
+}
+
+/// `ActiveMQServerImpl.internalStart` as `run` does it: the configuration
+/// read, the broker started and its acceptors bound.
+async fn boot(
+    instance: Option<&instance::Instance>,
     bind: Option<SocketAddr>,
-    allow_kill: bool,
-) -> anyhow::Result<()> {
-    let started = std::time::Instant::now();
-    tracing::info!("AMQ101000: Starting Saranga Server version {VERSION}");
+) -> anyhow::Result<Started> {
+    let at = std::time::Instant::now();
     let filters = Arc::new(SelectorFilters);
     let served = SERVED_PROTOCOLS;
     let mut file_config = None;
-    let (mut broker_config, mut binds, reload_period) = match &instance {
+    let (mut broker_config, mut binds, reload_period) = match instance {
         Some(instance) => {
             let file = instance.broker_config()?;
             tracing::info!(
@@ -862,27 +871,33 @@ async fn run(
         if let Some(tls) = &acceptor.tls {
             tls.spawn_reloader(reload_period);
         }
-        broker
+        if let Err(e) = broker
             .add_acceptor(&name, &address, acceptor)
             .await
-            .with_context(|| format!("acceptor {name} on {address}"))?;
+            .with_context(|| format!("acceptor {name} on {address}"))
+        {
+            // What did start stops again, so that a later start can bind.
+            let _ = stop_broker(&broker, None).await;
+            return Err(e);
+        }
     }
-    let mut web_started = false;
-    if let (Some(instance), Some(file)) = (&instance, &file_config)
-        && let Some(web) = instance.bootstrap.as_ref().and_then(|b| b.web.clone())
-    {
-        web::start(instance, file, &web, &broker).await?;
-        web_started = true;
-    }
+    Ok(Started {
+        broker,
+        at,
+        file: file_config,
+        reload_period,
+    })
+}
+
+/// The broker is active.
+fn announce(instance: Option<&Arc<instance::Instance>>, broker: &Arc<Broker>) {
     tracing::info!("AMQ221007: Server is now active");
     tracing::info!(
         "AMQ221001: Saranga Message Broker version {VERSION} [{}, nodeID={}] ",
         broker.management().config().name,
         broker.node_id()
     );
-    let instance = instance.map(Arc::new);
-    if let Some(instance) = &instance {
-        spawn_config_reloader(instance.clone(), broker.clone(), reload_period);
+    if let Some(instance) = instance {
         // reloadConfigurationFile through management.
         let loader = instance.clone();
         broker.set_config_loader(Arc::new(move || {
@@ -895,11 +910,84 @@ async fn run(
                 .map_err(|e| format!("{e:#}"))
         }));
     }
-    // graceful-shutdown-timeout, when graceful-shutdown-enabled.
-    let graceful = file_config
-        .as_ref()
+}
+
+/// `ActiveMQServerImpl.stop`: no new connections, the clients given
+/// `graceful-shutdown-timeout` when graceful shutdown is enabled, the rest
+/// closed, then the broker stopped.
+async fn stop_broker(
+    broker: &Arc<Broker>,
+    file: Option<&saranga_config::BrokerConfig>,
+) -> anyhow::Result<()> {
+    // RemotingService.pauseAcceptors: no new connections.
+    broker.pause_acceptors().await;
+    if let Some(timeout) = file
         .filter(|c| c.graceful_shutdown_enabled)
-        .map(|c| c.graceful_shutdown_timeout);
+        .map(|c| c.graceful_shutdown_timeout)
+    {
+        wait_for_clients(broker, timeout).await;
+    }
+    close_connections(broker).await;
+    broker.stop()?;
+    Ok(())
+}
+
+/// `reloadNetworkHealthCheck`: the network check of the configuration, if
+/// it has one, checked now and then every period. The receiver holds
+/// whether the network is healthy.
+async fn network_monitor(
+    file: saranga_config::BrokerConfig,
+) -> Option<tokio::sync::watch::Receiver<bool>> {
+    let (check, healthy) = tokio::task::spawn_blocking(move || {
+        network::NetworkCheck::from_config(&file).map(|c| {
+            let healthy = c.check();
+            (Arc::new(c), healthy)
+        })
+    })
+    .await
+    .ok()
+    .flatten()?;
+    let (tx, rx) = tokio::sync::watch::channel(healthy);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(check.period()).await;
+            let c = check.clone();
+            let Ok(healthy) = tokio::task::spawn_blocking(move || c.check()).await else {
+                break;
+            };
+            if tx.send(healthy).is_err() {
+                break;
+            }
+        }
+    });
+    Some(rx)
+}
+
+async fn run(
+    instance: Option<instance::Instance>,
+    bind: Option<SocketAddr>,
+    allow_kill: bool,
+) -> anyhow::Result<()> {
+    tracing::info!("AMQ101000: Starting Saranga Server version {VERSION}");
+    let instance = instance.map(Arc::new);
+    let started = boot(instance.as_deref(), bind).await?;
+    let current = saranga_server::Current::new(started.broker.clone());
+    let mut web_started = false;
+    if let (Some(instance), Some(file)) = (&instance, &started.file)
+        && let Some(web) = instance.bootstrap.as_ref().and_then(|b| b.web.clone())
+    {
+        web::start(instance, file, &web, &current).await?;
+        web_started = true;
+    }
+    announce(instance.as_ref(), &started.broker);
+    if let Some(instance) = &instance {
+        spawn_config_reloader(instance.clone(), current.clone(), started.reload_period);
+    }
+    let mut network = match &started.file {
+        Some(file) => network_monitor(file.clone()).await,
+        None => None,
+    };
+    let name = started.broker.management().config().name.clone();
     let stop_dir = instance
         .as_ref()
         .and_then(|i| i.broker_xml.parent().map(Path::to_path_buf));
@@ -909,12 +997,59 @@ async fn run(
             None => std::future::pending().await,
         }
     };
-    let stop = tokio::select! {
-        _ = tokio::signal::ctrl_c() => Stop::Clean,
-        _ = terminated() => Stop::Clean,
-        // The critical analyzer's SHUTDOWN policy.
-        _ = broker.shutdown_requested() => Stop::Clean,
-        s = stop_files => s,
+    tokio::pin!(stop_files);
+    let mut running = Some(started);
+    let stop = loop {
+        let is_running = running.is_some();
+        let broker = current.get();
+        // The network check stops a running broker while the network is
+        // unhealthy, and starts the one it stopped once it is healthy.
+        let network_changed = async {
+            let changed = match network.as_mut() {
+                Some(rx) => rx.wait_for(|h| *h != is_running).await.is_ok(),
+                None => false,
+            };
+            if !changed {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break Stop::Clean,
+            _ = terminated() => break Stop::Clean,
+            // The critical analyzer's SHUTDOWN policy.
+            _ = broker.shutdown_requested(), if is_running => break Stop::Clean,
+            s = &mut stop_files => break s,
+            _ = network_changed => {}
+        }
+        match running.take() {
+            Some(s) => {
+                tracing::warn!(
+                    "AMQ201001: Network is unhealthy, stopping service ActiveMQServerImpl::name={name}"
+                );
+                stop_broker(&s.broker, s.file.as_ref()).await?;
+                stopped(&s);
+            }
+            None => {
+                tracing::info!(
+                    "AMQ201000: Network is healthy, starting service ActiveMQServerImpl::name={name}"
+                );
+                match boot(instance.as_deref(), bind).await {
+                    Ok(s) => {
+                        current.set(s.broker.clone());
+                        announce(instance.as_ref(), &s.broker);
+                        running = Some(s);
+                    }
+                    Err(e) => {
+                        // Not started again until the next run, as
+                        // NetworkHealthCheck forgets it stopped it.
+                        tracing::warn!(
+                            "AMQ202004: Error starting component ActiveMQServerImpl::name={name} : {e:#}"
+                        );
+                        network = None;
+                    }
+                }
+            }
+        }
     };
     match stop {
         Stop::Halt => {
@@ -927,26 +1062,28 @@ async fn run(
                 tracing::info!("AMQ241005: Stopping embedded web server");
                 tracing::info!("AMQ241006: Stopped embedded web server");
             }
-            // RemotingService.pauseAcceptors: no new connections.
-            broker.pause_acceptors().await;
-            if let Some(timeout) = graceful {
-                wait_for_clients(&broker, timeout).await;
+            if let Some(s) = running {
+                stop_broker(&s.broker, s.file.as_ref()).await?;
+                stopped(&s);
             }
-            close_connections(&broker).await;
-            broker.stop()?;
-            tracing::info!(
-                "AMQ221002: Saranga Message Broker version {VERSION} [{}] stopped, uptime {}",
-                broker.node_id(),
-                saranga_server::management::print_duration(started.elapsed().as_millis() as i64)
-            );
         }
     }
     Ok(())
 }
 
+/// AMQ221002, with the uptime of this start.
+fn stopped(s: &Started) {
+    tracing::info!(
+        "AMQ221002: Saranga Message Broker version {VERSION} [{}] stopped, uptime {}",
+        s.broker.node_id(),
+        saranga_server::management::print_duration(s.at.elapsed().as_millis() as i64)
+    );
+}
+
 /// `RemotingServiceImpl.stop`: the connections left are closed before the
 /// rest of the broker stops.
 async fn close_connections(broker: &saranga_server::Broker) {
+    broker.close_unestablished();
     for c in broker.registry().connections() {
         c.fail();
     }

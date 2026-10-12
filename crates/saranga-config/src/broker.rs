@@ -440,6 +440,21 @@ pub struct BrokerConfig {
     pub graceful_shutdown_enabled: bool,
     /// `graceful-shutdown-timeout`, in milliseconds; -1 waits for ever.
     pub graceful_shutdown_timeout: i64,
+    /// `network-check-list`: comma-separated hosts, any one of which
+    /// answering keeps the broker running.
+    pub network_check_list: Option<String>,
+    /// `network-check-URL-list`: comma-separated URLs, as the list.
+    pub network_check_url_list: Option<String>,
+    /// `network-check-period`, in milliseconds.
+    pub network_check_period: i64,
+    /// `network-check-timeout`, in milliseconds.
+    pub network_check_timeout: i32,
+    /// `network-check-NIC`.
+    pub network_check_nic: Option<String>,
+    /// `network-check-ping-command`; `None` is the platform's default.
+    pub network_check_ping_command: Option<String>,
+    /// `network-check-ping6-command`; `None` is the platform's default.
+    pub network_check_ping6_command: Option<String>,
     /// `critical-analyzer`.
     pub critical_analyzer: bool,
     /// `critical-analyzer-timeout`, in milliseconds.
@@ -609,6 +624,13 @@ impl Default for BrokerConfig {
             suppress_session_notifications: false,
             graceful_shutdown_enabled: false,
             graceful_shutdown_timeout: -1,
+            network_check_list: None,
+            network_check_url_list: None,
+            network_check_period: 5000,
+            network_check_timeout: 1000,
+            network_check_nic: None,
+            network_check_ping_command: None,
+            network_check_ping6_command: None,
             critical_analyzer: true,
             critical_analyzer_timeout: 120_000,
             critical_analyzer_check_period: 0,
