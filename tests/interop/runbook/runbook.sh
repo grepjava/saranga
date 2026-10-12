@@ -31,6 +31,8 @@
 #   graceful-shutdown  a broker stopped while a consumer is connected
 #   network-isolation  create --ping; the broker stopped while the network
 #                      is down and started again once it is back
+#   upgrading          the home's upgrade tool run on a stopped instance;
+#                      broker.xml and messages kept, changed files backed up
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -290,6 +292,38 @@ suite() {
   graceful 60000 "the timeout passed"
 
   network
+  upgrading
+}
+
+# upgrading: "artemis upgrade" of the broker's home run on the stopped i3,
+# which keeps broker.xml and the data and backs up the files it changes in
+# old-config-bkp.<n> (.1 for an instance BROKER=upgraded already upgraded).
+upgrading() {
+  local before="$WORK/broker.xml.before" bkp
+  # The last stop's AMQ221002 comes after its port closes.
+  sleep 2
+  cp "$I3/etc/broker.xml" "$before"
+  step "upgrading: artemis upgrade, from the home's bin"
+  case "$BROKER" in
+    artemis) artemis_home upgrade "$(native "$I3")" > "$WORK/upgrade.out"; echo "--- exit ${PIPESTATUS[0]}" ;;
+    *) "$SARANGA" upgrade "$(native "$I3")" > "$WORK/upgrade.out" 2>&1; echo "--- exit $?" ;;
+  esac
+  cmp -s "$before" "$I3/etc/broker.xml" && echo "broker.xml kept"
+  bkp="$(ls -d "$I3"/old-config-bkp.* | sort -t. -k2 -n | tail -1)"
+  local missing=0 n=0 f
+  for f in "$bkp"/bin/* "$bkp"/etc/*; do
+    [[ -e "$f" ]] || continue
+    n=$((n + 1))
+    [[ -e "$I3/${f#"$bkp"/}" ]] || { echo "backed up but gone: ${f#"$bkp"/}"; missing=1; }
+  done
+  (( n > 0 && missing == 0 )) && echo "the changed scripts and profiles backed up in old-config-bkp"
+  step "upgrading: artemis run"
+  start "$I3" "$PORT3" && echo "listening"
+  step "artemis queue stat --queueName network"
+  instance "$I3" queue stat --queueName network "${AUTH[@]}"
+  step "artemis consumer --destination queue://network --message-count 1"
+  instance "$I3" consumer --destination queue://network --message-count 1 "${AUTH[@]}"
+  stop "$I3" "$PORT3"
 }
 
 # network-isolation: an instance made with --ping, whose broker stops while

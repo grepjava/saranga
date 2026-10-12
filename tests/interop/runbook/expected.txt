@@ -250,3 +250,26 @@ Connection brokerURL = tcp://localhost:62516
 === artemis stop
 --- exit 0
 stopped
+=== upgrading: artemis upgrade, from the home's bin
+--- exit 0
+broker.xml kept
+the changed scripts and profiles backed up in old-config-bkp
+=== upgrading: artemis run
+listening
+=== artemis queue stat --queueName network
+Connection brokerURL = tcp://localhost:62516
+|NAME   |ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|       |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|network|network|   0    |   1   |   1    |    0     |   0    |    0    |ANYCAST| false  |
+=== artemis consumer --destination queue://network --message-count 1
+Connection brokerURL = tcp://localhost:62516
+Consumer:: filter = null
+Consumer ActiveMQQueue[network], thread=0 wait 3000ms until 1 messages are consumed
+Consumer ActiveMQQueue[network], thread=0 Consumed: 1 messages
+Consumer ActiveMQQueue[network], thread=0 Elapsed time in second : # s
+Consumer ActiveMQQueue[network], thread=0 Elapsed time in milli second : # milli seconds
+Consumer ActiveMQQueue[network], thread=0 Consumed: 1 messages
+Consumer ActiveMQQueue[network], thread=0 Consumer thread finished
+=== artemis stop
+--- exit 0
+stopped
