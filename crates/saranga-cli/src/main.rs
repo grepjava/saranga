@@ -308,7 +308,10 @@ async fn run_client(command: Command) -> anyhow::Result<()> {
         Command::Connect(a) => shell::connect(a).await,
         Command::Disconnect(a) => shell::disconnect(a),
         Command::Completion { start_script } => {
-            print!("{}", completion::script(&command_line(false), &start_script));
+            print!(
+                "{}",
+                completion::script(&command_line(false), &start_script)
+            );
             Ok(())
         }
         Command::Version => {

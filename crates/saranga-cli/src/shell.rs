@@ -549,11 +549,11 @@ mod tests {
             h.add(line);
         }
         let text = std::fs::read_to_string(&file).unwrap();
-        let lines: Vec<&str> = text
-            .lines()
-            .map(|l| l.split_once(':').unwrap().1)
-            .collect();
-        assert_eq!(lines, ["queue stat", r"a\\b", r"x\ny", "i  j", "queue stat"]);
+        let lines: Vec<&str> = text.lines().map(|l| l.split_once(':').unwrap().1).collect();
+        assert_eq!(
+            lines,
+            ["queue stat", r"a\\b", r"x\ny", "i  j", "queue stat"]
+        );
         // A shell opened later does not repeat the last line either.
         let mut again = History::open(file.clone());
         again.add("queue stat");
