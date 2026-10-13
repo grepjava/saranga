@@ -24,6 +24,7 @@
 #   logging            the audit log turned on while running; a log4j2
 #                      configuration file of one's own, in JAVA_ARGS
 #   management         Jolokia reads, as the manual's curl commands do them;
+#                      the MBeans guarded by security-settings (mops.);
 #                      listConnections while a Core consumer, then an
 #                      OpenWire one, is connected
 #   versions           an acceptor's reload, with the manual's curl command
@@ -435,6 +436,7 @@ EOF
   graceful 60000 "the timeout passed"
 
   bootstrap
+  rbac
   network
   upgrading
 }
@@ -554,6 +556,42 @@ bootstrap() {
   step "curl read/$MBEAN/Active, on port $WEB3"
   curl -s -H "Origin: http://localhost" -u admin:admin "http://localhost:$WEB3/console/jolokia/read/$MBEAN/Active"
   echo
+  stop "$I2" "$PORT2"
+}
+
+# management: JMX authorization in broker.xml. With
+# ArtemisRbacMBeanServerBuilder in JAVA_ARGS and no <authorisation> in
+# management.xml, security-settings on mops. addresses guard the MBeans:
+# admin (roles amq and editor) may view and edit them, viewer (amq) only
+# view them; no one may force a failover, and only editors see the queues.
+rbac() {
+  local web=8961 rbac='-Djavax.management.builder.initial=org.apache.activemq.artemis.core.server.management.ArtemisRbacMBeanServerBuilder'
+  sed -i '/<authorisation>/,/<\/authorisation>/d' "$I2/etc/management.xml"
+  if windows; then
+    printf '\r\nset JAVA_ARGS=%%JAVA_ARGS%% %s\r\n' "$rbac" >> "$I2/etc/artemis.profile.cmd"
+  else
+    printf '\nJAVA_ARGS="$JAVA_ARGS %s"\n' "$rbac" >> "$I2/etc/artemis.profile"
+  fi
+  printf '\nviewer = viewer\n' >> "$I2/etc/artemis-users.properties"
+  sed -i -E 's/^amq ?= ?admin\r?$/amq = admin,viewer\neditor = admin/' "$I2/etc/artemis-roles.properties"
+  sed -i 's#</security-settings>#   <security-setting match="mops.\#">\n            <permission type="view" roles="amq"/>\n            <permission type="edit" roles="editor"/>\n         </security-setting>\n         <security-setting match="mops.broker.forceFailover">\n            <permission type="edit" roles=""/>\n         </security-setting>\n         <security-setting match="mops.queue.\#">\n            <permission type="view" roles="editor"/>\n         </security-setting>\n      </security-settings>#' "$I2/etc/broker.xml"
+  step "management: JAVA_ARGS: $rbac"
+  : > "$I2/log/artemis.log"
+  start "$I2" "$PORT2" && echo "listening"
+  wait_for "$I2/log/artemis.log" "AMQ221007" && echo "log: AMQ221007: Server is now active"
+  for _ in $(seq 1 100); do
+    curl -s -o /dev/null "http://localhost:$web/" && break
+    sleep 0.2
+  done
+  local dlq='org.apache.activemq.artemis:address=%22DLQ%22,broker=%220.0.0.0%22,component=addresses,queue=%22DLQ%22,routing-type=%22anycast%22,subcomponent=queues'
+  for user in admin viewer; do
+    for path in "read/$MBEAN/Active" "exec/$MBEAN/resetAllMessageCounters" "exec/$MBEAN/forceFailover" \
+      "search/org.apache.activemq.artemis:subcomponent=queues,queue=%22DLQ%22,*" "read/$dlq/MessageCount"; do
+      step "curl -u $user:$user $path"
+      curl -s -H "Origin: http://localhost" -u "$user:$user" "http://localhost:$web/console/jolokia/$path"
+      echo
+    done
+  done
   stop "$I2" "$PORT2"
 }
 

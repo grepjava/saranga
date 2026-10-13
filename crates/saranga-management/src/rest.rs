@@ -120,6 +120,7 @@ fn login(
         password: Some(password),
         connection,
         subject: authenticated.subject,
+        management: false,
     };
     store
         .check(

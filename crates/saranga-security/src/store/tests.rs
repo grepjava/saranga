@@ -92,6 +92,7 @@ fn auth(user: &str) -> SecurityAuth {
             ..Default::default()
         }),
         subject: None,
+        management: false,
     }
 }
 
@@ -224,9 +225,28 @@ fn caller_falls_back_to_the_subject() {
         password: None,
         connection: Arc::default(),
         subject: Some(Arc::new(subject)),
+        management: false,
     };
     let e = store.check("x", None, CheckType::Send, &a).unwrap_err();
     assert!(e.0.starts_with("AMQ229032: User: guest does"), "{e}");
+}
+
+#[test]
+fn a_management_caller_is_authorized_as_its_subject() {
+    let (store, _) = store(true);
+    let mut subject = Subject::default();
+    subject.add(Principal::User("web".into()));
+    subject.add(Principal::Role("a".into()));
+    let mut a = SecurityAuth {
+        subject: Some(Arc::new(subject)),
+        ..SecurityAuth::default()
+    };
+    // Otherwise the store logs in again, without credentials.
+    assert!(store.check("x", None, CheckType::Send, &a).is_err());
+    a.management = true;
+    store.check("x", None, CheckType::Send, &a).unwrap();
+    let e = store.check("x", None, CheckType::Manage, &a).unwrap_err();
+    assert!(e.0.starts_with("AMQ229032: User: web does"), "{e}");
 }
 
 #[test]

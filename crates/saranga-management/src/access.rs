@@ -58,6 +58,15 @@ impl Access {
     }
 }
 
+/// Whether `management.xml` has an `<authorisation>`.
+pub fn has_authorisation(xml: &str) -> bool {
+    roxmltree::Document::parse(xml).is_ok_and(|doc| {
+        doc.root_element()
+            .children()
+            .any(|c| c.is_element() && c.tag_name().name() == "authorisation")
+    })
+}
+
 /// `JMXAccessControlList`.
 #[derive(Debug, Clone)]
 pub struct AccessList {

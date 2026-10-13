@@ -37,6 +37,10 @@ pub struct SecurityAuth {
     /// (`RemotingConnection.getSubject`), named in error messages when the
     /// client gave no user name.
     pub subject: Option<Arc<Subject>>,
+    /// A management caller (`ManagementRemotingConnection`), such as a
+    /// web login guarded by `ArtemisRbacMBeanServerBuilder`: without a user
+    /// name and password, its subject is authorized as it is.
+    pub management: bool,
 }
 
 /// A successful authentication.
@@ -377,6 +381,9 @@ impl SecurityStore {
     /// `getSubjectForAuthorization`: the cached subject for the session's
     /// credentials, or a fresh login.
     fn subject_for_authorization(&self, auth: &SecurityAuth) -> Option<Arc<Subject>> {
+        if auth.management && auth.username.is_none() && auth.password.is_none() {
+            return auth.subject.clone();
+        }
         let key = authentication_cache_key(
             auth.username.as_deref(),
             auth.password.as_deref(),

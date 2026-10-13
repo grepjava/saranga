@@ -13,8 +13,8 @@ use std::sync::Arc;
 use saranga_server::Current;
 use saranga_server::management::json::Json;
 
-use crate::access::AccessList;
 use crate::mbean::{Bean, Control, ObjectName, Op, registered};
+use crate::rbac::Guard;
 
 /// Who is asking, and what they may do.
 pub struct Caller {
@@ -59,12 +59,12 @@ impl Caller {
     }
 }
 
-/// The agent: the broker's MBeans and the access list.
+/// The agent: the broker's MBeans and their guard.
 pub struct Agent {
     pub broker: Arc<Current>,
     pub domain: String,
     pub broker_name: String,
-    pub access: AccessList,
+    pub access: Guard,
     pub agent_id: String,
     /// The acceptors, by name, with their parameters.
     pub acceptors: Vec<(String, Vec<(String, String)>)>,
@@ -421,7 +421,7 @@ impl Agent {
     async fn execute(&self, caller: &Caller, req: &Request, url: &str) -> Result<Json, Failure> {
         match req.kind {
             "version" => Ok(self.version(url)),
-            "search" => Ok(self.search(req.mbean.as_ref())),
+            "search" => self.search(caller, req.mbean.as_ref()),
             "list" => self.list(caller, req.path.as_deref()),
             "read" => {
                 let v = self.read(caller, req).await?;
@@ -488,14 +488,59 @@ impl Agent {
         )
     }
 
-    fn search(&self, pattern: Option<&ObjectName>) -> Json {
+    fn search(&self, caller: &Caller, pattern: Option<&ObjectName>) -> Result<Json, Failure> {
         let names: Vec<Json> = self
-            .beans()
+            .query(caller)?
             .into_iter()
             .filter(|(n, _)| pattern.is_none_or(|p| p.matches(n)))
             .map(|(n, _)| Json::from(n.canonical()))
             .collect();
-        Json::Array(names)
+        Ok(Json::Array(names))
+    }
+
+    /// `queryNames`: the MBeans, those the RBAC guard lets the caller view.
+    fn query(&self, caller: &Caller) -> Result<Vec<(ObjectName, Bean)>, Failure> {
+        let mut beans = self.beans();
+        if let Guard::Rbac(r) = &self.access {
+            let broker = self.broker.get();
+            r.check_query(&broker, caller.subject.clone())
+                .map_err(Self::refused)?;
+            beans.retain(|(n, _)| r.visible(&broker, caller.subject.clone(), n));
+        }
+        Ok(beans)
+    }
+
+    /// A call the RBAC guard refuses: the security store's message.
+    fn refused(message: String) -> Failure {
+        Failure::new("java.lang.Exception", message, 403)
+    }
+
+    /// The guard's check of a method of an MBean (`get<Attribute>` for a
+    /// read); `denied` is how management.xml's guard refuses it.
+    fn check(
+        &self,
+        caller: &Caller,
+        name: &ObjectName,
+        method: &str,
+        denied: impl FnOnce() -> Failure,
+    ) -> Result<(), Failure> {
+        match &self.access {
+            Guard::Acl(l) if l.can_invoke(&caller.roles, name, method) => Ok(()),
+            Guard::Acl(_) => Err(denied()),
+            Guard::Rbac(r) => r
+                .check(&self.broker.get(), caller.subject.clone(), name, method)
+                .map_err(Self::refused),
+        }
+    }
+
+    /// `canInvoke`, for the MBean info.
+    fn can_invoke(&self, caller: &Caller, name: &ObjectName, method: &str) -> bool {
+        match &self.access {
+            Guard::Acl(l) => l.can_invoke(&caller.roles, name, method),
+            Guard::Rbac(r) => {
+                r.can_invoke(&self.broker.get(), caller.subject.clone(), name, method)
+            }
+        }
     }
 
     /// The one MBean a non-pattern name names; not found, it is named as
@@ -539,9 +584,7 @@ impl Agent {
             ));
         };
         let getter = format!("{}{attr}", if info.is { "is" } else { "get" });
-        if !self.access.can_invoke(&caller.roles, name, &getter) {
-            return Err(Self::denied("attribute", attr));
-        }
+        self.check(caller, name, &getter, || Self::denied("attribute", attr))?;
         if let Bean::Acceptor(n, params) = bean {
             let started = self.broker.get().acceptor(n).is_some_and(|(_, s)| s);
             return Ok(acceptor_attribute(n, params, started, attr));
@@ -566,7 +609,11 @@ impl Agent {
         if name.is_pattern() {
             // Every matching MBean that has the attributes.
             let mut out = Json::object();
-            for (n, bean) in self.beans().into_iter().filter(|(n, _)| name.matches(n)) {
+            for (n, bean) in self
+                .query(caller)?
+                .into_iter()
+                .filter(|(n, _)| name.matches(n))
+            {
                 if let Ok(v) = self.read_bean(caller, &n, &bean, &req.attrs, true).await {
                     out.put(&n.canonical(), v);
                 }
@@ -641,9 +688,7 @@ impl Agent {
             ));
         };
         let setter = format!("set{attr}");
-        if !self.access.can_invoke(&caller.roles, &n, &setter) {
-            return Err(Self::denied("attribute", attr));
-        }
+        self.check(caller, &n, &setter, || Self::denied("attribute", attr))?;
         let old = if info.readable {
             self.attribute(caller, &n, &bean, attr)
                 .await
@@ -735,13 +780,13 @@ impl Agent {
         for (arg, p) in req.arguments.iter().zip(op.params) {
             params.push(convert(arg, p.type_name)?);
         }
-        if !self.access.can_invoke(&caller.roles, &n, op.name) {
-            return Err(Failure::new(
+        self.check(caller, &n, op.name, || {
+            Failure::new(
                 "java.lang.SecurityException",
                 format!("User not authorized to access operation: {}", op.name),
                 403,
-            ));
-        }
+            )
+        })?;
         let broker = self.broker.get();
         let management = broker.management();
         let result = match (&bean, op.name) {
@@ -793,7 +838,7 @@ impl Agent {
             )));
         }
         let mut domains = Json::object();
-        for (n, bean) in self.beans() {
+        for (n, bean) in self.query(caller)? {
             let info = self.bean_info(caller, &n, &bean);
             let props = n.canonical_props();
             let mut d = domains.get(&n.domain).cloned().unwrap_or_else(Json::object);
@@ -830,7 +875,7 @@ impl Agent {
 
     fn bean_info(&self, caller: &Caller, name: &ObjectName, bean: &Bean) -> Json {
         let control = bean.control();
-        let can = |m: &str| self.access.can_invoke(&caller.roles, name, m);
+        let can = |m: &str| self.can_invoke(caller, name, m);
         let op_json = |o: &Op| {
             Json::object()
                 .with(

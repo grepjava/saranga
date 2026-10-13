@@ -358,6 +358,32 @@ log: AMQ221007: Server is now active
 === artemis stop
 --- exit 0
 stopped
+=== management: JAVA_ARGS: -Djavax.management.builder.initial=org.apache.activemq.artemis.core.server.management.ArtemisRbacMBeanServerBuilder
+listening
+log: AMQ221007: Server is now active
+=== curl -u admin:admin read/org.apache.activemq.artemis:broker=%220.0.0.0%22/Active
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","attribute":"Active","type":"read"},"value":true,"status":200}
+=== curl -u admin:admin exec/org.apache.activemq.artemis:broker=%220.0.0.0%22/resetAllMessageCounters
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","type":"exec","operation":"resetAllMessageCounters"},"value":null,"status":200}
+=== curl -u admin:admin exec/org.apache.activemq.artemis:broker=%220.0.0.0%22/forceFailover
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","type":"exec","operation":"forceFailover"},"error_type":"java.lang.Exception","error":"java.lang.Exception : AMQ229032: User: admin does not have permission='EDIT' on address mops.broker.forceFailover","status":403}
+=== curl -u admin:admin search/org.apache.activemq.artemis:subcomponent=queues,queue=%22DLQ%22,*
+{"request":{"mbean":"org.apache.activemq.artemis:queue=\"DLQ\",subcomponent=queues,*","type":"search"},"value":["org.apache.activemq.artemis:address=\"DLQ\",broker=\"0.0.0.0\",component=addresses,queue=\"DLQ\",routing-type=\"anycast\",subcomponent=queues"],"status":200}
+=== curl -u admin:admin read/org.apache.activemq.artemis:address=%22DLQ%22,broker=%220.0.0.0%22,component=addresses,queue=%22DLQ%22,routing-type=%22anycast%22,subcomponent=queues/MessageCount
+{"request":{"mbean":"org.apache.activemq.artemis:address=\"DLQ\",broker=\"0.0.0.0\",component=addresses,queue=\"DLQ\",routing-type=\"anycast\",subcomponent=queues","attribute":"MessageCount","type":"read"},"value":0,"status":200}
+=== curl -u viewer:viewer read/org.apache.activemq.artemis:broker=%220.0.0.0%22/Active
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","attribute":"Active","type":"read"},"value":true,"status":200}
+=== curl -u viewer:viewer exec/org.apache.activemq.artemis:broker=%220.0.0.0%22/resetAllMessageCounters
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","type":"exec","operation":"resetAllMessageCounters"},"error_type":"java.lang.Exception","error":"java.lang.Exception : AMQ229032: User: viewer does not have permission='EDIT' on address mops.broker.resetAllMessageCounters","status":403}
+=== curl -u viewer:viewer exec/org.apache.activemq.artemis:broker=%220.0.0.0%22/forceFailover
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","type":"exec","operation":"forceFailover"},"error_type":"java.lang.Exception","error":"java.lang.Exception : AMQ229032: User: viewer does not have permission='EDIT' on address mops.broker.forceFailover","status":403}
+=== curl -u viewer:viewer search/org.apache.activemq.artemis:subcomponent=queues,queue=%22DLQ%22,*
+{"request":{"mbean":"org.apache.activemq.artemis:queue=\"DLQ\",subcomponent=queues,*","type":"search"},"value":[],"status":200}
+=== curl -u viewer:viewer read/org.apache.activemq.artemis:address=%22DLQ%22,broker=%220.0.0.0%22,component=addresses,queue=%22DLQ%22,routing-type=%22anycast%22,subcomponent=queues/MessageCount
+{"request":{"mbean":"org.apache.activemq.artemis:address=\"DLQ\",broker=\"0.0.0.0\",component=addresses,queue=\"DLQ\",routing-type=\"anycast\",subcomponent=queues","attribute":"MessageCount","type":"read"},"error_type":"java.lang.Exception","error":"java.lang.Exception : AMQ229032: User: viewer does not have permission='VIEW' on address mops.queue.DLQ.getMessageCount","status":403}
+=== artemis stop
+--- exit 0
+stopped
 === network-isolation: artemis create --ping 192.0.2.1
 <network-check-list>192.0.2.1</network-check-list>
 listening

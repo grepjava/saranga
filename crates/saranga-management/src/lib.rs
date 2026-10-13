@@ -18,6 +18,7 @@ mod exceptions;
 mod jolokia;
 mod mbean;
 pub mod metrics;
+mod rbac;
 pub mod rest;
 
 use std::net::SocketAddr;
@@ -36,6 +37,7 @@ use saranga_transport::TlsAcceptor;
 use tokio::net::TcpListener;
 
 pub use access::AccessList;
+pub use rbac::{Guard, RBAC_BUILDER, Rbac};
 
 /// One `<binding>`, ready to serve.
 pub struct Binding {
@@ -55,8 +57,8 @@ pub struct Options {
     pub domain: String,
     /// The broker's name, the `broker` key of its MBeans.
     pub broker_name: String,
-    /// `management.xml`'s rules.
-    pub access: AccessList,
+    /// `management.xml`'s rules, or the RBAC guard.
+    pub access: Guard,
     /// The roles that may use the API (`HAWTIO_ROLES`); `*` is anyone.
     pub console_roles: Vec<String>,
     /// `jolokia-access.xml`'s CORS rules.
@@ -490,15 +492,24 @@ fn rand_u32() -> u32 {
     h.finish() as u32
 }
 
-/// `management.xml`'s rules from an instance's etc, or the default list.
-pub fn access_list(etc: &Path) -> AccessList {
-    match std::fs::read_to_string(etc.join("management.xml")) {
-        Ok(xml) => AccessList::parse(&xml).unwrap_or_else(|e| {
+/// The guard of an instance's MBeans: `management.xml`'s `<authorisation>`;
+/// without one, `rbac` when `builder` (`javax.management.builder.initial`)
+/// names `ArtemisRbacMBeanServerBuilder`, else the default list. Artemis
+/// sets the property to its own builder for an `<authorisation>`, over the
+/// one given.
+pub fn guard(etc: &Path, builder: Option<&str>, rbac: Rbac) -> Guard {
+    let xml = std::fs::read_to_string(etc.join("management.xml")).ok();
+    let authorisation = xml.as_deref().is_some_and(access::has_authorisation);
+    if !authorisation && builder == Some(RBAC_BUILDER) {
+        return Guard::Rbac(rbac);
+    }
+    Guard::Acl(match xml {
+        Some(xml) => AccessList::parse(&xml).unwrap_or_else(|e| {
             tracing::warn!("management.xml: {e}; using the default access list");
             AccessList::default_list()
         }),
-        Err(_) => AccessList::default_list(),
-    }
+        None => AccessList::default_list(),
+    })
 }
 
 /// `jolokia-access.xml` from an instance's etc.

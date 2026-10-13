@@ -148,7 +148,17 @@ pub async fn start(
     let options = saranga_management::Options {
         domain: file.jmx_domain.clone(),
         broker_name: current.get().management().config().name.clone(),
-        access: saranga_management::access_list(&instance.etc),
+        access: saranga_management::guard(
+            &instance.etc,
+            instance
+                .lookup("javax.management.builder.initial")
+                .as_deref(),
+            saranga_management::Rbac {
+                prefix: file.management_rbac_prefix.clone(),
+                delimiter: file.wildcard_addresses.delimiter,
+                domain: file.jmx_domain.clone(),
+            },
+        ),
         console_roles: console_roles(instance),
         cors: saranga_management::cors(&instance.etc),
         root_redirect: web.root_redirect_location.clone(),

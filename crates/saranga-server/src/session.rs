@@ -483,6 +483,7 @@ impl ServerSession {
                 password: options.password,
                 connection: security_info,
                 subject: authenticated.subject,
+                management: false,
             },
             validated_user: authenticated.validated_user,
             xa: options.xa,
