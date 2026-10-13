@@ -221,7 +221,109 @@ impl WebConfig {
         }
         config
     }
+
+    /// The `webconfig.` system properties applied over the configuration,
+    /// as `Run` does with `parsePrefixedProperties`: `<attribute>` of
+    /// `<web>`, `bindings.<binding>.<attribute>` and
+    /// `bindings.<binding>.apps.<app>.<attribute>`, a segment in double
+    /// quotes kept whole. A binding or an app is the one of that name, else
+    /// of that uri or url (`getName`), else a new one of that name. What
+    /// cannot be applied is returned, as Artemis records it in its status.
+    pub fn apply_system(&mut self, system: &[(String, String)]) -> Vec<Warning> {
+        let mut warnings = Vec::new();
+        for (key, value) in system {
+            let Some(key) = key.strip_prefix(SYSTEM_WEB_PROPERTY_PREFIX) else {
+                continue;
+            };
+            let path = crate::broker_properties::split_key(key, "\"");
+            let p: Vec<&str> = path.iter().map(String::as_str).collect();
+            if let Err(reason) = self.apply_one(&p, value) {
+                warnings.push(Warning::BrokerProperty {
+                    source: format!("system-{SYSTEM_WEB_PROPERTY_PREFIX}"),
+                    key: key.to_owned(),
+                    reason,
+                });
+            }
+        }
+        warnings
+    }
+
+    fn apply_one(&mut self, path: &[&str], value: &str) -> std::result::Result<(), String> {
+        let flag = |v: &str| match v.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(format!("{v:?} is not a boolean")),
+        };
+        let some = || Some(value.to_owned());
+        match path {
+            ["path"] => self.path = value.to_owned(),
+            ["rootRedirectLocation"] => self.root_redirect_location = some(),
+            ["bindings", name, rest @ ..] if !rest.is_empty() => {
+                let i = match self
+                    .bindings
+                    .iter()
+                    .position(|b| b.name.as_deref().unwrap_or(&b.uri) == *name)
+                {
+                    Some(i) => i,
+                    None => {
+                        self.bindings.push(WebBinding {
+                            name: Some((*name).to_owned()),
+                            ..WebBinding::default()
+                        });
+                        self.bindings.len() - 1
+                    }
+                };
+                let b = &mut self.bindings[i];
+                match rest {
+                    ["name"] => b.name = some(),
+                    ["uri"] => b.uri = value.to_owned(),
+                    ["clientAuth"] => b.client_auth = flag(value)?,
+                    ["passwordCodec"] => b.password_codec = some(),
+                    ["keyStorePath"] => b.key_store_path = some(),
+                    ["keyStoreType"] => b.key_store_type = some(),
+                    ["keyStorePassword"] => b.key_store_password = some(),
+                    ["trustStorePath"] => b.trust_store_path = some(),
+                    ["trustStoreType"] => b.trust_store_type = some(),
+                    ["trustStorePassword"] => b.trust_store_password = some(),
+                    ["includedTLSProtocols"] => b.included_tls_protocols = some(),
+                    ["excludedTLSProtocols"] => b.excluded_tls_protocols = some(),
+                    ["includedCipherSuites"] => b.included_cipher_suites = some(),
+                    ["excludedCipherSuites"] => b.excluded_cipher_suites = some(),
+                    ["sslAutoReload"] => b.ssl_auto_reload = flag(value)?,
+                    ["apps", app, attribute] => {
+                        let i = match b
+                            .apps
+                            .iter()
+                            .position(|a| a.name.as_deref().unwrap_or(&a.url) == *app)
+                        {
+                            Some(i) => i,
+                            None => {
+                                b.apps.push(WebApp {
+                                    name: Some((*app).to_owned()),
+                                    ..WebApp::default()
+                                });
+                                b.apps.len() - 1
+                            }
+                        };
+                        let a = &mut b.apps[i];
+                        match *attribute {
+                            "name" => a.name = some(),
+                            "url" => a.url = value.to_owned(),
+                            "war" => a.war = value.to_owned(),
+                            _ => return Err(format!("no app attribute {attribute}")),
+                        }
+                    }
+                    _ => return Err(format!("no binding attribute {}", rest.join("."))),
+                }
+            }
+            _ => return Err(format!("no web attribute {}", path.join("."))),
+        }
+        Ok(())
+    }
 }
+
+/// `ActiveMQDefaultConfiguration.DEFAULT_SYSTEM_WEB_PROPERTY_PREFIX`.
+pub const SYSTEM_WEB_PROPERTY_PREFIX: &str = "webconfig.";
 
 /// `new File(new URI(uri))` for a `file:` URI: `file:/a/b`, `file:///a/b`,
 /// `file:/C:/a`, with `%XX` escapes decoded.
@@ -332,5 +434,46 @@ mod tests {
         assert_eq!(file_uri_path("file:/a%20b"), Some(PathBuf::from("/a b")));
         assert_eq!(file_uri_path("http://x/y"), None);
         assert_eq!(file_uri_path("file://host/y"), None);
+    }
+
+    #[test]
+    fn webconfig_system_properties() {
+        let xml = r#"<broker xmlns="http://activemq.apache.org/schema">
+   <web path="web">
+       <binding name="artemis" uri="http://localhost:8161"/>
+       <binding uri="http://localhost:8163"><app url="console" war="console.war"/></binding>
+   </web>
+</broker>"#;
+        let mut web = BootstrapConfig::parse(xml, |_| None).unwrap().web.unwrap();
+        let system: Vec<(String, String)> = [
+            ("webconfig.bindings.artemis.clientAuth", "true"),
+            ("webconfig.bindings.my-binding.uri", "http://localhost:8162"),
+            ("webconfig.bindings.my-binding.apps.my-app.url", "my-app"),
+            (
+                "webconfig.bindings.my-binding.apps.my-app.war",
+                "my-app.war",
+            ),
+            (
+                "webconfig.bindings.\"http://localhost:8163\".apps.\"console\".war",
+                "my-console.war",
+            ),
+            ("webconfig.bindings.artemis.nosuch", "x"),
+            ("brokerconfig.name", "other"),
+        ]
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+        let warnings = web.apply_system(&system);
+        assert!(web.bindings[0].client_auth);
+        assert_eq!(web.bindings[1].apps[0].war, "my-console.war");
+        let b = &web.bindings[2];
+        assert_eq!(b.name.as_deref(), Some("my-binding"));
+        assert_eq!(b.uri, "http://localhost:8162");
+        assert_eq!(
+            (b.apps[0].url.as_str(), b.apps[0].war.as_str()),
+            ("my-app", "my-app.war")
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].to_string().contains("bindings.artemis.nosuch"));
     }
 }

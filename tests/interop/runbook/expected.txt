@@ -248,8 +248,13 @@ operation@Update
 --- exit 0
 === artemis data encode --directory ../data/decoded
 the decoded journal holds the encoded records
+=== web-server: -Dwebconfig.bindings.artemis.uri=http://localhost:8871 in JAVA_ARGS
 === using-server: artemis run, again
 listening
+=== curl read/org.apache.activemq.artemis:broker=%220.0.0.0%22/Active, on port 8871
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","attribute":"Active","type":"read"},"value":true,"status":200}
+=== curl read/org.apache.activemq.artemis:broker=%220.0.0.0%22/Active, on port 8861
+nothing listening
 === artemis queue stat --queueName runbook
 Connection brokerURL = tcp://localhost:62316
 |NAME   |ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|

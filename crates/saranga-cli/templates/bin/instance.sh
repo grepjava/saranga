@@ -35,8 +35,9 @@ ARTEMIS_INSTANCE_ETC='${artemis.instance.etc}'
 fi
 export ARTEMIS_INSTANCE ARTEMIS_INSTANCE_ETC
 
-# The shell's history file, which Artemis's bin/artemis passes on from the
-# profile it loads: artemis-utility.profile, but for run.
+# What Artemis's bin/artemis passes on from the profile it loads
+# (artemis-utility.profile, but for run): the shell's history file, and the
+# Java arguments, whose -D options are system properties for saranga run.
 if [ -z "$ARTEMIS_PROFILE" ] ; then
   if [ "$1" = "run" ]; then
     ARTEMIS_PROFILE='artemis.profile'
@@ -44,14 +45,19 @@ if [ -z "$ARTEMIS_PROFILE" ] ; then
     ARTEMIS_PROFILE="artemis-utility.profile"
   fi
 fi
-if [ -f "$ARTEMIS_INSTANCE_ETC/${ARTEMIS_PROFILE}" ] ; then
-  ARTEMIS_SHELL_HISTORY=`. "$ARTEMIS_INSTANCE_ETC/${ARTEMIS_PROFILE}" > /dev/null 2>&1; echo "$ARTEMIS_SHELL_HISTORY"`
-fi
-if [ -n "$ARTEMIS_SHELL_HISTORY" ] ; then
-  export ARTEMIS_SHELL_HISTORY
-else
-  unset ARTEMIS_SHELL_HISTORY
-fi
+for var in ARTEMIS_SHELL_HISTORY JAVA_ARGS JAVA_ARGS_APPEND ; do
+  if [ -f "$ARTEMIS_INSTANCE_ETC/${ARTEMIS_PROFILE}" ] ; then
+    value=$(. "$ARTEMIS_INSTANCE_ETC/${ARTEMIS_PROFILE}" > /dev/null 2>&1; eval "printf '%s' \"\$$var\"")
+  else
+    eval "value=\"\$$var\""
+  fi
+  if [ -n "$value" ] ; then
+    eval "$var=\"\$value\""
+    export $var
+  else
+    unset $var
+  fi
+done
 
 # SARANGA names another saranga to run.
 exec "${SARANGA:-${saranga}}" "$@"

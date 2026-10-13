@@ -143,7 +143,7 @@ wait_for() {
 
 step() { echo "=== $*"; }
 I1="$WORK/i1" I2="$WORK/i2" I3="$WORK/i3"
-PORT1=62316 PORT2=62416 PORT3=62516 WEB1=8861
+PORT1=62316 PORT2=62416 PORT3=62516 WEB1=8861 WEB2=8871
 AUTH=(--user admin --password admin)
 run() {
   step "artemis $*"
@@ -344,8 +344,27 @@ suite() {
   else
     echo "the decoded journal differs"
   fi
+
+  # web-server: a binding updated with a webconfig. system property, added
+  # to the JAVA_ARGS of the profile (which ends with no line end).
+  step "web-server: -Dwebconfig.bindings.artemis.uri=http://localhost:$WEB2 in JAVA_ARGS"
+  if windows; then
+    printf '\r\nset JAVA_ARGS=%%JAVA_ARGS%% -Dwebconfig.bindings.artemis.uri=http://localhost:%s\r\n' "$WEB2" >> "$I1/etc/artemis.profile.cmd"
+  else
+    printf '\nJAVA_ARGS="$JAVA_ARGS -Dwebconfig.bindings.artemis.uri=http://localhost:%s"\n' "$WEB2" >> "$I1/etc/artemis.profile"
+  fi
   step "using-server: artemis run, again"
   start "$I1" "$PORT1" && echo "listening"
+  for _ in $(seq 1 100); do
+    curl -s -o /dev/null "http://localhost:$WEB2/" && break
+    sleep 0.2
+  done
+  step "curl read/$MBEAN/Active, on port $WEB2"
+  curl -s -H "Origin: http://localhost" -u admin:admin "http://localhost:$WEB2/console/jolokia/read/$MBEAN/Active"
+  echo
+  step "curl read/$MBEAN/Active, on port $WEB1"
+  curl -s -o /dev/null -H "Origin: http://localhost" -u admin:admin "http://localhost:$WEB1/console/jolokia/read/$MBEAN/Active" \
+    || echo "nothing listening"
   run queue stat --queueName runbook
   run queue stat --queueName replayed
   run queue stat --queueName reloaded

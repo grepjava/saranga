@@ -49,8 +49,8 @@ pub struct Instance {
     pub broker_xml: PathBuf,
     pub bootstrap: Option<BootstrapConfig>,
     properties: HashMap<&'static str, String>,
-    /// System properties given on the command line, in order.
-    system: Vec<(String, String)>,
+    /// System properties: the profile's JAVA_ARGS, then the command line's.
+    pub system: Vec<(String, String)>,
     /// `--properties`: broker properties sources.
     broker_properties: Option<String>,
 }

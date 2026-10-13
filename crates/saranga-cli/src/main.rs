@@ -443,8 +443,10 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             system_properties,
             allow_kill,
         } => {
+            let mut system = java_args_system_properties();
+            system.extend(system_properties);
             let options = instance::Options {
-                system: system_properties,
+                system,
                 broker_properties: properties,
             };
             // Without either, the instance whose bin/artemis runs this
@@ -770,6 +772,28 @@ async fn terminated() {
     std::future::pending::<()>().await
 }
 
+/// The `-D` options of `JAVA_ARGS` and `JAVA_ARGS_APPEND`, which an
+/// instance's bin/artemis exports from its profile, in the order Artemis's
+/// passes them to Java, so that the command line's come after them and win.
+/// Outside an instance (no `ARTEMIS_INSTANCE`), none.
+fn java_args_system_properties() -> Vec<(String, String)> {
+    if std::env::var_os("ARTEMIS_INSTANCE").is_none() {
+        return Vec::new();
+    }
+    ["JAVA_ARGS", "JAVA_ARGS_APPEND"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .flat_map(|args| {
+            args.split_whitespace()
+                .filter_map(|a| {
+                    let d = a.trim_matches('"').strip_prefix("-D")?;
+                    parse_system_property(d).ok()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// `-D name=value`; a bare `-D name` is the empty string, as in Java.
 fn parse_system_property(s: &str) -> Result<(String, String), String> {
     let (k, v) = s.split_once('=').unwrap_or((s, ""));
@@ -974,8 +998,11 @@ async fn run(
     let current = saranga_server::Current::new(started.broker.clone());
     let mut web_started = false;
     if let (Some(instance), Some(file)) = (&instance, &started.file)
-        && let Some(web) = instance.bootstrap.as_ref().and_then(|b| b.web.clone())
+        && let Some(mut web) = instance.bootstrap.as_ref().and_then(|b| b.web.clone())
     {
+        for w in web.apply_system(&instance.system) {
+            tracing::warn!("{w}");
+        }
         web::start(instance, file, &web, &current).await?;
         web_started = true;
     }
