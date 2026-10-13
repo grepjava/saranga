@@ -161,8 +161,9 @@ impl Instance {
     fn read_bootstrap(&self, path: &Path) -> anyhow::Result<BootstrapConfig> {
         let xml =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let bootstrap = BootstrapConfig::parse(&xml, |n| self.lookup(n))
+        let mut bootstrap = BootstrapConfig::parse(&xml, |n| self.lookup(n))
             .with_context(|| format!("reading {}", path.display()))?;
+        bootstrap.apply_system_security(&self.system);
         for w in &bootstrap.warnings {
             tracing::warn!("{}: {w}", path.display());
         }

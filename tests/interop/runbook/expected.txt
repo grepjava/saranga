@@ -248,13 +248,19 @@ operation@Update
 --- exit 0
 === artemis data encode --directory ../data/decoded
 the decoded journal holds the encoded records
-=== web-server: -Dwebconfig.bindings.artemis.uri=http://localhost:8871 in JAVA_ARGS
+=== JAVA_ARGS: -Dwebconfig.bindings.artemis.uri=http://localhost:8871 -Dbrokerconfig.globalMaxSize=1000000 -Dsecurityconfig.manager.className=org.apache.activemq.artemis.spi.core.security.ActiveMQBasicSecurityManager -Dsecurityconfig.manager.properties.bootstrapUser=admin -Dsecurityconfig.manager.properties.bootstrapPassword=admin -Dsecurityconfig.manager.properties.bootstrapRole=amq
 === using-server: artemis run, again
 listening
-=== curl read/org.apache.activemq.artemis:broker=%220.0.0.0%22/Active, on port 8871
-{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","attribute":"Active","type":"read"},"value":true,"status":200}
+=== curl read/org.apache.activemq.artemis:broker=%220.0.0.0%22/GlobalMaxSize, on port 8871
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","attribute":"GlobalMaxSize","type":"read"},"value":1000000,"status":200}
 === curl read/org.apache.activemq.artemis:broker=%220.0.0.0%22/Active, on port 8861
 nothing listening
+=== artemis user add --user-command-user basic --user-command-password basic --role amq
+Connection brokerURL = tcp://localhost:62316
+basic added successfully.
+--- exit 0
+=== basic in etc/artemis-users.properties
+0
 === artemis queue stat --queueName runbook
 Connection brokerURL = tcp://localhost:62316
 |NAME   |ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|

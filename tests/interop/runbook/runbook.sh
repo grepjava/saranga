@@ -345,13 +345,22 @@ suite() {
     echo "the decoded journal differs"
   fi
 
-  # web-server: a binding updated with a webconfig. system property, added
-  # to the JAVA_ARGS of the profile (which ends with no line end).
-  step "web-server: -Dwebconfig.bindings.artemis.uri=http://localhost:$WEB2 in JAVA_ARGS"
+  # System properties in the profile's JAVA_ARGS (which ends with no line
+  # end): web-server's webconfig. property moving a binding, the
+  # configuration chapter's brokerconfig.globalMaxSize, and security's
+  # basic security manager by securityconfig. properties. The security
+  # chapter passes these to "artemis run", which refuses them (Unknown
+  # option); the profile passes them to Java.
+  local props="-Dwebconfig.bindings.artemis.uri=http://localhost:$WEB2 -Dbrokerconfig.globalMaxSize=1000000"
+  props="$props -Dsecurityconfig.manager.className=org.apache.activemq.artemis.spi.core.security.ActiveMQBasicSecurityManager"
+  props="$props -Dsecurityconfig.manager.properties.bootstrapUser=admin"
+  props="$props -Dsecurityconfig.manager.properties.bootstrapPassword=admin"
+  props="$props -Dsecurityconfig.manager.properties.bootstrapRole=amq"
+  step "JAVA_ARGS: $props"
   if windows; then
-    printf '\r\nset JAVA_ARGS=%%JAVA_ARGS%% -Dwebconfig.bindings.artemis.uri=http://localhost:%s\r\n' "$WEB2" >> "$I1/etc/artemis.profile.cmd"
+    printf '\r\nset JAVA_ARGS=%%JAVA_ARGS%% %s\r\n' "$props" >> "$I1/etc/artemis.profile.cmd"
   else
-    printf '\nJAVA_ARGS="$JAVA_ARGS -Dwebconfig.bindings.artemis.uri=http://localhost:%s"\n' "$WEB2" >> "$I1/etc/artemis.profile"
+    printf '\nJAVA_ARGS="$JAVA_ARGS %s"\n' "$props" >> "$I1/etc/artemis.profile"
   fi
   step "using-server: artemis run, again"
   start "$I1" "$PORT1" && echo "listening"
@@ -359,12 +368,16 @@ suite() {
     curl -s -o /dev/null "http://localhost:$WEB2/" && break
     sleep 0.2
   done
-  step "curl read/$MBEAN/Active, on port $WEB2"
-  curl -s -H "Origin: http://localhost" -u admin:admin "http://localhost:$WEB2/console/jolokia/read/$MBEAN/Active"
+  step "curl read/$MBEAN/GlobalMaxSize, on port $WEB2"
+  curl -s -H "Origin: http://localhost" -u admin:admin "http://localhost:$WEB2/console/jolokia/read/$MBEAN/GlobalMaxSize"
   echo
   step "curl read/$MBEAN/Active, on port $WEB1"
   curl -s -o /dev/null -H "Origin: http://localhost" -u admin:admin "http://localhost:$WEB1/console/jolokia/read/$MBEAN/Active" \
     || echo "nothing listening"
+  # The basic security manager keeps its users in the journal.
+  run user add --user-command-user basic --user-command-password basic --role amq
+  step "basic in etc/artemis-users.properties"
+  grep -c '^basic' "$I1/etc/artemis-users.properties"
   run queue stat --queueName runbook
   run queue stat --queueName replayed
   run queue stat --queueName reloaded

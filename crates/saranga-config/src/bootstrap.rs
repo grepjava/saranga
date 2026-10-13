@@ -112,6 +112,66 @@ impl BootstrapConfig {
         Ok(config)
     }
 
+    /// The `securityconfig.` system properties applied over the security
+    /// manager, as `BrokerFactory.populateSecurityWithSystemProperties`
+    /// does: `jaas.domain` makes it JAAS, else `manager.className` a
+    /// security manager, unless it is one already; then `jaas.domain` and
+    /// `jaas.certificateDomain`, or `manager.className` and each
+    /// `manager.properties.<key>`, replace or add to what bootstrap.xml says.
+    pub fn apply_system_security(&mut self, system: &[(String, String)]) {
+        let get = |name: &str| {
+            system
+                .iter()
+                .rev()
+                .find(|(k, _)| k.strip_prefix(SYSTEM_SECURITY_PROPERTY_PREFIX) == Some(name))
+                .map(|(_, v)| v.clone())
+        };
+        let domain = get("jaas.domain");
+        let certificate = get("jaas.certificateDomain");
+        let class = get("manager.className");
+        if domain.is_some() {
+            if !matches!(self.security, Some(BootstrapSecurity::Jaas { .. })) {
+                self.security = Some(BootstrapSecurity::Jaas {
+                    domain: String::new(),
+                    certificate_domain: None,
+                });
+            }
+        } else if class.is_some()
+            && !matches!(self.security, Some(BootstrapSecurity::Manager { .. }))
+        {
+            self.security = Some(BootstrapSecurity::Manager {
+                class_name: String::new(),
+                properties: Vec::new(),
+            });
+        }
+        match &mut self.security {
+            Some(BootstrapSecurity::Jaas {
+                domain: d,
+                certificate_domain: c,
+            }) => {
+                if let Some(domain) = domain {
+                    *d = domain;
+                }
+                if certificate.is_some() {
+                    *c = certificate;
+                }
+            }
+            Some(BootstrapSecurity::Manager {
+                class_name,
+                properties,
+            }) => {
+                if let Some(class) = class {
+                    *class_name = class;
+                }
+                let prefix = format!("{SYSTEM_SECURITY_PROPERTY_PREFIX}manager.properties.");
+                properties.extend(system.iter().filter_map(|(k, v)| {
+                    Some((k.strip_prefix(prefix.as_str())?.to_owned(), v.clone()))
+                }));
+            }
+            None => {}
+        }
+    }
+
     /// The `<server configuration>` URI as a file path, when it is a
     /// `file:` URI.
     pub fn configuration_path(&self) -> Option<PathBuf> {
@@ -325,6 +385,9 @@ impl WebConfig {
 /// `ActiveMQDefaultConfiguration.DEFAULT_SYSTEM_WEB_PROPERTY_PREFIX`.
 pub const SYSTEM_WEB_PROPERTY_PREFIX: &str = "webconfig.";
 
+/// `ActiveMQDefaultConfiguration.DEFAULT_SYSTEM_SECURITY_PROPERTY_PREFIX`.
+pub const SYSTEM_SECURITY_PROPERTY_PREFIX: &str = "securityconfig.";
+
 /// `new File(new URI(uri))` for a `file:` URI: `file:/a/b`, `file:///a/b`,
 /// `file:/C:/a`, with `%XX` escapes decoded.
 pub fn file_uri_path(uri: &str) -> Option<PathBuf> {
@@ -434,6 +497,55 @@ mod tests {
         assert_eq!(file_uri_path("file:/a%20b"), Some(PathBuf::from("/a b")));
         assert_eq!(file_uri_path("http://x/y"), None);
         assert_eq!(file_uri_path("file://host/y"), None);
+    }
+
+    #[test]
+    fn securityconfig_system_properties() {
+        let xml = r#"<broker xmlns="http://activemq.apache.org/schema">
+   <jaas-security domain="activemq"/>
+</broker>"#;
+        let props = |p: &[(&str, &str)]| -> Vec<(String, String)> {
+            p.iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let mut config = BootstrapConfig::parse(xml, |_| None).unwrap();
+        config.apply_system_security(&props(&[("securityconfig.jaas.certificateDomain", "Cert")]));
+        assert_eq!(
+            config.security,
+            Some(BootstrapSecurity::Jaas {
+                domain: "activemq".into(),
+                certificate_domain: Some("Cert".into())
+            })
+        );
+        let mut config = BootstrapConfig::parse(xml, |_| None).unwrap();
+        config.apply_system_security(&props(&[
+            ("securityconfig.manager.className", "x.Basic"),
+            ("securityconfig.manager.properties.bootstrapUser", "admin"),
+            ("securityconfig.manager.properties.bootstrapRole", "amq"),
+        ]));
+        assert_eq!(
+            config.security,
+            Some(BootstrapSecurity::Manager {
+                class_name: "x.Basic".into(),
+                properties: vec![
+                    ("bootstrapUser".into(), "admin".into()),
+                    ("bootstrapRole".into(), "amq".into())
+                ]
+            })
+        );
+        // jaas.domain wins over manager.className.
+        config.apply_system_security(&props(&[
+            ("securityconfig.manager.className", "y"),
+            ("securityconfig.jaas.domain", "Other"),
+        ]));
+        assert_eq!(
+            config.security,
+            Some(BootstrapSecurity::Jaas {
+                domain: "Other".into(),
+                certificate_domain: None
+            })
+        );
     }
 
     #[test]
