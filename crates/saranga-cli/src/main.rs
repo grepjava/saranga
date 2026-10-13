@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 
 mod client;
 mod completion;
@@ -69,6 +69,13 @@ enum Command {
         /// (e.g. failover tests).
         #[arg(long)]
         allow_kill: bool,
+        /// Override the broker configuration from the bootstrap.xml.
+        #[arg(long, conflicts_with = "config")]
+        broker: Option<String>,
+        /// Broker Configuration URI. Default:
+        /// xml:${ARTEMIS_INSTANCE}/etc/bootstrap.xml.
+        #[arg(conflicts_with = "config")]
+        configuration: Option<String>,
     },
     /// Tools on a broker's data directory.
     #[command(subcommand)]
@@ -398,6 +405,37 @@ fn report_client_error(e: &anyhow::Error) {
     }
 }
 
+/// `artemis run`'s configuration URI, as `BrokerFactory` takes it: only
+/// the `xml:` scheme, naming a bootstrap file (relative to the current
+/// directory), which must exist.
+fn bootstrap_path(uri: &str) -> anyhow::Result<PathBuf> {
+    // `java.net.URI`'s scheme: a letter, then letters, digits, `+`, `-`
+    // and `.`, before the first `:`.
+    let scheme = uri.split_once(':').map(|(s, _)| s).filter(|s| {
+        s.starts_with(|c: char| c.is_ascii_alphabetic())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    });
+    let Some(scheme) = scheme else {
+        bail!("Invalid configuration URI, no scheme specified: {uri}");
+    };
+    if scheme != "xml" {
+        bail!("Invalid configuration URI, can't find configuration scheme: {scheme}");
+    }
+    let path = PathBuf::from(&uri[scheme.len() + 1..]);
+    if !path.exists() {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        bail!("Invalid configuration URI, can't find file: {name}");
+    }
+    Ok(path)
+}
+
+/// `--broker`: the broker.xml, a `file:` URI or a path.
+fn broker_path(broker: &str) -> PathBuf {
+    saranga_config::file_uri_path(broker)
+        .unwrap_or_else(|| PathBuf::from(broker.trim_start_matches("file:")))
+}
+
 /// `artemis stop` (`STOP_ME`) and `artemis kill` (`KILL_ME`): the file in
 /// the directory of the instance's broker.xml, which the running broker
 /// looks for.
@@ -442,6 +480,8 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             properties,
             system_properties,
             allow_kill,
+            broker,
+            configuration,
         } => {
             let mut system = java_args_system_properties();
             system.extend(system_properties);
@@ -452,11 +492,25 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             // Without either, the instance whose bin/artemis runs this
             // (ARTEMIS_INSTANCE), if any.
             let etc = etc.or_else(client::instance_etc);
-            let instance = match (config, etc) {
-                (Some(c), _) => Some(instance::Instance::from_broker_xml(&c, options)?),
-                (None, Some(e)) => Some(instance::Instance::from_etc(&e, options)?),
-                (None, None) => None,
+            let bootstrap = configuration
+                .filter(|c| !c.is_empty())
+                .map(|c| bootstrap_path(&c))
+                .transpose()?;
+            let mut instance = match (config, etc, bootstrap) {
+                (Some(c), _, _) => Some(instance::Instance::from_broker_xml(&c, options)?),
+                (None, etc, Some(b)) => {
+                    // Outside an instance, the bootstrap file's directory.
+                    let etc = etc
+                        .or_else(|| b.parent().map(Path::to_path_buf))
+                        .unwrap_or_default();
+                    Some(instance::Instance::from_bootstrap(&etc, &b, options)?)
+                }
+                (None, Some(e), None) => Some(instance::Instance::from_etc(&e, options)?),
+                (None, None, None) => None,
             };
+            if let (Some(i), Some(b)) = (&mut instance, broker) {
+                i.broker_xml = broker_path(&b);
+            }
             if let Some(instance) = &instance {
                 logging::configure(
                     logging::config_path(
@@ -1147,5 +1201,26 @@ mod cli_tests {
     #[test]
     fn cli_is_well_formed() {
         super::Cli::command().debug_assert();
+    }
+
+    /// `artemis run`'s configuration URI, refused as `BrokerFactory`
+    /// refuses it.
+    #[test]
+    fn bootstrap_uri() {
+        let error = |uri: &str| super::bootstrap_path(uri).unwrap_err().to_string();
+        assert_eq!(
+            error("../etc/bootstrap.xml"),
+            "Invalid configuration URI, no scheme specified: ../etc/bootstrap.xml"
+        );
+        assert_eq!(
+            error("foo:../etc/bootstrap.xml"),
+            "Invalid configuration URI, can't find configuration scheme: foo"
+        );
+        assert_eq!(
+            error("xml:../etc/missing.xml"),
+            "Invalid configuration URI, can't find file: missing.xml"
+        );
+        let manifest = concat!("xml:", env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        assert!(super::bootstrap_path(manifest).is_ok());
     }
 }

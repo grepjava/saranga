@@ -59,11 +59,23 @@ impl Instance {
     /// An instance from its `etc/` directory: `bootstrap.xml` if there is
     /// one, else `broker.xml` next to it.
     pub fn from_etc(etc: &Path, options: Options) -> anyhow::Result<Self> {
+        let bootstrap_path = absolute(etc).join("bootstrap.xml");
+        Self::from_bootstrap(etc, &bootstrap_path, options)
+    }
+
+    /// An instance from its `etc/` directory and the bootstrap file given
+    /// as `artemis run`'s configuration (`xml:<path>`), which names
+    /// `broker.xml`; without the file, `broker.xml` in `etc/`.
+    pub fn from_bootstrap(
+        etc: &Path,
+        bootstrap_path: &Path,
+        options: Options,
+    ) -> anyhow::Result<Self> {
         let etc = absolute(etc);
         let mut instance = Self::new(etc.clone(), etc.join("broker.xml"), options);
-        let bootstrap_path = etc.join("bootstrap.xml");
         if bootstrap_path.exists() {
-            let bootstrap = instance.read_bootstrap(&bootstrap_path)?;
+            let bootstrap_path = &absolute(bootstrap_path);
+            let bootstrap = instance.read_bootstrap(bootstrap_path)?;
             if let Some(configured) = bootstrap.configuration_path() {
                 if configured.exists() {
                     instance.broker_xml = configured;

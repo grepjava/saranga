@@ -14,7 +14,8 @@
 # UPDATE=1 rewrites expected.txt instead of comparing.
 #
 # The procedures, each under the manual chapter it comes from:
-#   using-server       run an instance, find it active in its log, stop it
+#   using-server       run an instance, find it active in its log, stop it;
+#                      run it with another bootstrap file (xml:<path>)
 #   using-cli          queue create and stat, producer, consumer, browser;
 #                      check node and queue, passing and failing;
 #                      the shell, connected with connect and with options
@@ -102,12 +103,14 @@ instance() {
 }
 
 PIDS=()
+# Arguments after the port go to "artemis run".
 start() {
   local dir="$1" port="$2"
+  shift 2
   if windows; then
-    (cd "$dir/bin" && cmd /c "$(cygpath -w "$dir/bin/artemis.cmd")" run > "$dir/run.out" 2>&1 &)
+    (cd "$dir/bin" && cmd /c "$(cygpath -w "$dir/bin/artemis.cmd")" run "$@" > "$dir/run.out" 2>&1 &)
   else
-    (cd "$dir/bin" && ./artemis run > "$dir/run.out" 2>&1 &)
+    (cd "$dir/bin" && ./artemis run "$@" > "$dir/run.out" 2>&1 &)
   fi
   for _ in $(seq 1 300); do
     (echo > "/dev/tcp/127.0.0.1/$port") 2>/dev/null && return 0
@@ -144,7 +147,7 @@ wait_for() {
 
 step() { echo "=== $*"; }
 I1="$WORK/i1" I2="$WORK/i2" I3="$WORK/i3"
-PORT1=62316 PORT2=62416 PORT3=62516 WEB1=8861 WEB2=8871
+PORT1=62316 PORT2=62416 PORT3=62516 WEB1=8861 WEB2=8871 WEB3=8981
 AUTH=(--user admin --password admin)
 run() {
   step "artemis $*"
@@ -417,6 +420,7 @@ EOF
   sed -i 's#<graceful-shutdown-enabled>true</graceful-shutdown-enabled>#&\n      <graceful-shutdown-timeout>2000</graceful-shutdown-timeout>#' "$I2/etc/broker.xml"
   graceful 60000 "the timeout passed"
 
+  bootstrap
   network
   upgrading
 }
@@ -513,6 +517,30 @@ graceful() {
   wait_for "$log" "AMQ221002" && echo "log: AMQ221002: stopped once $until"
   if (( SECONDS - stopped_at < 30 )); then echo "the consumer ended with the broker"; fi
   wait_down "$PORT2" || echo "the broker in $I2 did not stop"
+}
+
+# using-server: "artemis run -- xml:path/to/bootstrap.xml", another
+# bootstrap file than etc/bootstrap.xml: a copy whose web binding is on
+# port WEB3. The path is relative to bin/; a file that is not there is
+# refused (ConfigurationException, with its stack trace from Artemis).
+bootstrap() {
+  local alt="$I2/etc/other-bootstrap.xml"
+  step "using-server: artemis run -- xml:../etc/missing.xml"
+  instance "$I2" run -- xml:../etc/missing.xml | grep -o 'Invalid configuration URI.*'
+  echo "--- exit ${PIPESTATUS[0]}"
+  sed -E "s#(uri=\"http://localhost:)[0-9]+#\1$WEB3#" "$I2/etc/bootstrap.xml" > "$alt"
+  step "using-server: artemis run -- xml:../etc/other-bootstrap.xml"
+  : > "$I2/log/artemis.log"
+  start "$I2" "$PORT2" -- xml:../etc/other-bootstrap.xml && echo "listening"
+  wait_for "$I2/log/artemis.log" "AMQ221007" && echo "log: AMQ221007: Server is now active"
+  for _ in $(seq 1 100); do
+    curl -s -o /dev/null "http://localhost:$WEB3/" && break
+    sleep 0.2
+  done
+  step "curl read/$MBEAN/Active, on port $WEB3"
+  curl -s -H "Origin: http://localhost" -u admin:admin "http://localhost:$WEB3/console/jolokia/read/$MBEAN/Active"
+  echo
+  stop "$I2" "$PORT2"
 }
 
 # Timings, IDs, paths and dates differ between runs and brokers.
