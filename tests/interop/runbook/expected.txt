@@ -248,9 +248,10 @@ operation@Update
 --- exit 0
 === artemis data encode --directory ../data/decoded
 the decoded journal holds the encoded records
-=== JAVA_ARGS: -Dwebconfig.bindings.artemis.uri=http://localhost:8871 -Dbrokerconfig.globalMaxSize=1000000 -Dsecurityconfig.manager.className=org.apache.activemq.artemis.spi.core.security.ActiveMQBasicSecurityManager -Dsecurityconfig.manager.properties.bootstrapUser=admin -Dsecurityconfig.manager.properties.bootstrapPassword=admin -Dsecurityconfig.manager.properties.bootstrapRole=amq
+=== JAVA_ARGS: -Dwebconfig.bindings.artemis.uri=http://localhost:8871 -Dbrokerconfig.globalMaxSize=1000000 -Dsecurityconfig.manager.className=org.apache.activemq.artemis.spi.core.security.ActiveMQBasicSecurityManager -Dsecurityconfig.manager.properties.bootstrapUser=admin -Dsecurityconfig.manager.properties.bootstrapPassword=admin -Dsecurityconfig.manager.properties.bootstrapRole=amq -Dlog4j2.configurationFile=file:///#/custom-log4j2.properties
 === using-server: artemis run, again
 listening
+log/custom.log: AMQ221007: Server is now active
 === curl read/org.apache.activemq.artemis:broker=%220.0.0.0%22/GlobalMaxSize, on port 8871
 {"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","attribute":"GlobalMaxSize","type":"read"},"value":1000000,"status":200}
 === curl read/org.apache.activemq.artemis:broker=%220.0.0.0%22/Active, on port 8861

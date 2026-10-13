@@ -20,7 +20,8 @@
 #                      the shell, connected with connect and with options
 #   security           user add, list and rm
 #   masking-passwords  mask
-#   logging            the audit log turned on while running
+#   logging            the audit log turned on while running; a log4j2
+#                      configuration file of one's own, in JAVA_ARGS
 #   management         Jolokia reads, as the manual's curl commands do them;
 #                      listConnections while a Core consumer, then an
 #                      OpenWire one, is connected
@@ -356,7 +357,20 @@ suite() {
   props="$props -Dsecurityconfig.manager.properties.bootstrapUser=admin"
   props="$props -Dsecurityconfig.manager.properties.bootstrapPassword=admin"
   props="$props -Dsecurityconfig.manager.properties.bootstrapRole=amq"
-  step "JAVA_ARGS: $props"
+  # logging's own configuration file, by log4j2.configurationFile.
+  cat > "$WORK/custom-log4j2.properties" <<'EOF'
+rootLogger.level = INFO
+rootLogger.appenderRef.custom.ref = custom
+appender.custom.type = File
+appender.custom.name = custom
+appender.custom.fileName = ${sys:artemis.instance}/log/custom.log
+appender.custom.layout.type = PatternLayout
+appender.custom.layout.pattern = %d %-5level [%logger] %msg%n
+EOF
+  local custom="file://$(native "$WORK/custom-log4j2.properties")"
+  [[ "$custom" == file://[A-Za-z]:* ]] && custom="file:///${custom#file://}"
+  step "JAVA_ARGS: $props -Dlog4j2.configurationFile=file:///#/custom-log4j2.properties"
+  props="$props -Dlog4j2.configurationFile=$custom"
   if windows; then
     printf '\r\nset JAVA_ARGS=%%JAVA_ARGS%% %s\r\n' "$props" >> "$I1/etc/artemis.profile.cmd"
   else
@@ -368,6 +382,7 @@ suite() {
     curl -s -o /dev/null "http://localhost:$WEB2/" && break
     sleep 0.2
   done
+  wait_for "$I1/log/custom.log" "AMQ221007" && echo "log/custom.log: AMQ221007: Server is now active"
   step "curl read/$MBEAN/GlobalMaxSize, on port $WEB2"
   curl -s -H "Origin: http://localhost" -u admin:admin "http://localhost:$WEB2/console/jolokia/read/$MBEAN/GlobalMaxSize"
   echo
