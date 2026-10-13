@@ -13,7 +13,7 @@ mod address;
 pub mod args;
 mod connections;
 mod counters;
-pub mod json;
+pub use saranga_buffer::json;
 mod messages;
 mod queue;
 mod security;

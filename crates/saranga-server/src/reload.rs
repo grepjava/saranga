@@ -21,6 +21,8 @@ pub struct Reload {
     pub security_settings: cfg::HierarchicalRepository<cfg::SecuritySetting>,
     pub addresses: Vec<AddressDeployment>,
     pub diverts: Vec<DivertDeployment>,
+    /// What the broker properties read reported (`setStatus`).
+    pub status: saranga_buffer::json::Json,
 }
 
 impl Reload {
@@ -36,6 +38,7 @@ impl Reload {
                 .map(crate::config::deployment)
                 .collect(),
             diverts: config.diverts.iter().map(crate::config::divert).collect(),
+            status: config.status.clone(),
         })
     }
 }
@@ -47,6 +50,10 @@ fn reloading(what: &str) {
 impl Broker {
     /// `deployReloadableConfigFromConfiguration`.
     pub fn reload(&self, reload: Reload) {
+        saranga_buffer::status::update(
+            saranga_buffer::status::CONFIGURATION_COMPONENT,
+            reload.status,
+        );
         reloading("security settings");
         if let Some(security) = &self.security {
             security.set_repository(reload.security_settings);

@@ -13,6 +13,8 @@ mod guest;
 mod ldap;
 mod properties_module;
 
+use saranga_buffer::json::Json;
+use saranga_buffer::status::{self, Adler32};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -312,6 +314,8 @@ struct CacheEntry {
     reload: bool,
     loaded_at: Option<SystemTime>,
     props: Arc<LoadedProperties>,
+    /// The checksum of the last read that succeeded.
+    checksum: u32,
 }
 
 /// `PropertiesLoader.staticCache`: files by path, read once, and read again
@@ -330,6 +334,7 @@ impl PropertiesCache {
                 reload,
                 loaded_at: None,
                 props: Arc::default(),
+                checksum: 0,
             });
         let stale = match entry.loaded_at {
             None => true,
@@ -345,7 +350,12 @@ impl PropertiesCache {
         if stale {
             let now = SystemTime::now();
             let entries = match std::fs::read(path) {
-                Ok(bytes) => crate::properties::parse(&bytes),
+                Ok(bytes) => {
+                    let entries = crate::properties::parse(&bytes);
+                    entry.checksum =
+                        Adler32::of_entries(entries.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+                    entries
+                }
                 Err(e) => {
                     tracing::error!(
                         "AMQ224085: Failed to load property PropsFile={}, reason: {e}",
@@ -356,9 +366,33 @@ impl PropertiesCache {
             };
             entry.props = Arc::new(LoadedProperties { entries });
             entry.loaded_at = Some(now);
+            report(path, entry.checksum, now);
         }
         entry.props.clone()
     }
+}
+
+/// `ReloadableProperties.updateStatus`: the file's checksum and the time
+/// it was read, in the server status.
+fn report(path: &Path, checksum: u32, at: SystemTime) {
+    let reload_time = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    status::update(
+        &format!("{}/properties/{name}", status::JAAS_COMPONENT),
+        status::hash_map(
+            vec![
+                ("Alder32", Json::from(checksum.to_string())),
+                ("Adler32", Json::from(checksum.to_string())),
+                ("reloadTime", Json::from(reload_time.to_string())),
+            ],
+            None,
+        ),
+    );
 }
 
 #[cfg(test)]

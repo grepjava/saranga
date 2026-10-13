@@ -358,6 +358,35 @@ log: AMQ221007: Server is now active
 === artemis stop
 --- exit 0
 stopped
+=== configuration: artemis run, --properties ../etc/props/
+listening
+log: AMQ221007: Server is now active
+=== artemis queue stat --queueName from
+Connection brokerURL = tcp://localhost:62416
+|NAME          |ADDRESS       |CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|              |              | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|fromJson      |fromJson      |   0    |   0   |   0    |    0     |   0    |    0    |ANYCAST| false  |
+|fromProperties|fromProperties|   0    |   0   |   0    |    0     |   0    |    0    |ANYCAST| false  |
+=== curl read/org.apache.activemq.artemis:broker=%220.0.0.0%22/Status
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","attribute":"Status","type":"read"},"value":"{\"configuration\":{\"properties\":{\"a.properties\":{\"alder32\":\"2681741588\",\"fileAlder32\":\"3237355806\",\"adler32\":\"2681741588\",\"fileAdler32\":\"3237355806\",\"errors\":[]},\"b.json\":{\"alder32\":\"415439854\",\"fileAlder32\":\"679682869\",\"adler32\":\"415439854\",\"fileAdler32\":\"679682869\",\"errors\":[]},\"system-brokerconfig.\":{\"alder32\":\"1\",\"fileAlder32\":\"0\",\"adler32\":\"1\",\"fileAdler32\":\"0\"}}},\"server\":{\"jaas\":{\"properties\":{\"artemis-users.properties\":{\"reloadTime\":\"#\",\"Alder32\":\"#\",\"Adler32\":\"#\"},\"artemis-roles.properties\":{\"reloadTime\":\"#\",\"Alder32\":\"#\",\"Adler32\":\"#\"}}},\"state\":\"STARTED\",\"version\":\"2.57.0\",\"nodeId\":\"UUID\",\"identity\":null,\"uptime\":\"#\"}}","status":200}
+=== artemis stop
+--- exit 0
+stopped
+=== configuration: artemis run, JAVA_ARGS: -Dbroker.properties=../etc/props/?filter=.*\.custom_props
+listening
+log: AMQ221007: Server is now active
+=== artemis queue stat --queueName from
+Connection brokerURL = tcp://localhost:62416
+|NAME          |ADDRESS       |CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|              |              | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|fromCustom    |fromCustom    |   0    |   0   |   0    |    0     |   0    |    0    |ANYCAST| false  |
+|fromJson      |fromJson      |   0    |   0   |   0    |    0     |   0    |    0    |ANYCAST| false  |
+|fromProperties|fromProperties|   0    |   0   |   0    |    0     |   0    |    0    |ANYCAST| false  |
+=== curl read/org.apache.activemq.artemis:broker=%220.0.0.0%22/Status
+{"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","attribute":"Status","type":"read"},"value":"{\"configuration\":{\"properties\":{\"c.custom_props\":{\"alder32\":\"2508529072\",\"fileAlder32\":\"3007258042\",\"adler32\":\"2508529072\",\"fileAdler32\":\"3007258042\",\"errors\":[]},\"system-brokerconfig.\":{\"alder32\":\"1\",\"fileAlder32\":\"0\",\"adler32\":\"1\",\"fileAdler32\":\"0\"}}},\"server\":{\"jaas\":{\"properties\":{\"artemis-users.properties\":{\"reloadTime\":\"#\",\"Alder32\":\"#\",\"Adler32\":\"#\"},\"artemis-roles.properties\":{\"reloadTime\":\"#\",\"Alder32\":\"#\",\"Adler32\":\"#\"}}},\"state\":\"STARTED\",\"version\":\"2.57.0\",\"nodeId\":\"UUID\",\"identity\":null,\"uptime\":\"#\"}}","status":200}
+=== artemis stop
+--- exit 0
+stopped
 === management: JAVA_ARGS: -Djavax.management.builder.initial=org.apache.activemq.artemis.core.server.management.ArtemisRbacMBeanServerBuilder
 listening
 log: AMQ221007: Server is now active

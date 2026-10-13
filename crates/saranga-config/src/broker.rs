@@ -505,6 +505,9 @@ pub struct BrokerConfig {
     /// properties.
     pub system_property_prefix: String,
     pub warnings: Vec<Warning>,
+    /// `ConfigurationImpl.jsonStatus`: what was read and applied from each
+    /// broker properties source, under `properties`.
+    pub status: saranga_buffer::json::Json,
 }
 
 impl BrokerConfig {
@@ -653,6 +656,7 @@ impl Default for BrokerConfig {
             system_property_prefix: crate::broker_properties::DEFAULT_SYSTEM_PROPERTY_PREFIX
                 .to_owned(),
             warnings: Vec::new(),
+            status: saranga_buffer::json::Json::object(),
         }
     }
 }

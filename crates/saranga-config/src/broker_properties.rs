@@ -24,6 +24,8 @@ use crate::broker::{
 };
 use crate::security::{CheckType, Role, SecuritySetting};
 use crate::{ConfigError, Result, RoutingType, mask};
+use saranga_buffer::json::Json;
+use saranga_buffer::status::Adler32;
 use std::path::Path;
 
 pub const DEFAULT_KEY_SURROUND: &str = "\"";
@@ -34,8 +36,7 @@ pub const DEFAULT_SYSTEM_PROPERTY_PREFIX: &str = "brokerconfig.";
 /// `ConfigurationImpl.parseProperties`: applies the comma-separated
 /// `sources` in order. A source ending in `/` is a directory whose files
 /// matching `.*\.(json|yaml|properties)` (or the regex of a `?filter=`
-/// query) are applied in name order. JSON and YAML files are reported and
-/// skipped. A file that cannot be read is an error, as it is in Artemis.
+/// query) are applied in name order. YAML files are reported and skipped. A file that cannot be read is an error, as it is in Artemis.
 pub fn apply_sources(
     config: &mut BrokerConfig,
     sources: &str,
@@ -89,19 +90,82 @@ pub fn apply_file(
         path: file.display().to_string(),
         source,
     })?;
-    if name.ends_with(".json") || name.ends_with(".yaml") {
-        return Ok(vec![problem(
+    // A file that does not load is reported, as Artemis reports it in its
+    // status as a loadError, and the others are applied.
+    let entries = if name.ends_with(".yaml") {
+        Err("YAML broker properties are not supported".to_owned())
+    } else if name.ends_with(".json") {
+        json_entries(&String::from_utf8_lossy(&bytes))
+    } else {
+        Ok(crate::properties::parse(&bytes))
+    };
+    match entries {
+        Ok(entries) => Ok(apply_counted(
+            config,
             &name,
-            "",
-            "JSON and YAML broker properties are not supported",
-        )]);
+            &entries,
+            Adler32::of(&bytes),
+            lookup,
+        )),
+        Err(e) => {
+            apply_status(config, &name, &[("loadError".to_owned(), e.clone())]);
+            Ok(vec![problem(&name, "", format!("loadError: {e}"))])
+        }
     }
-    Ok(apply(
-        config,
-        &name,
-        &crate::properties::parse(&bytes),
-        lookup,
-    ))
+}
+
+/// `InsertionOrderedProperties.loadJson`: an object's members become
+/// dotted keys, in order. A member name holding a dot is surrounded by the
+/// object's `key.surround` (or `brokerPropertiesKeySurround`), unless it
+/// starts with `key.` or is already surrounded. Arrays are joined with
+/// commas.
+fn json_entries(text: &str) -> std::result::Result<Vec<(String, String)>, String> {
+    let root = Json::parse(text)?;
+    if !matches!(root, Json::Object(_)) {
+        return Err("not a JSON object".to_owned());
+    }
+    let surround = ["key.surround", "brokerPropertiesKeySurround"]
+        .iter()
+        .find_map(|k| root.get(k)?.as_str())
+        .unwrap_or(DEFAULT_KEY_SURROUND)
+        .to_owned();
+    let mut out = Vec::new();
+    json_object(&surround, "", &root, &mut out)?;
+    Ok(out)
+}
+
+fn json_object(
+    surround: &str,
+    parent: &str,
+    object: &Json,
+    out: &mut Vec<(String, String)>,
+) -> std::result::Result<(), String> {
+    let Json::Object(members) = object else {
+        return Ok(());
+    };
+    for (name, value) in members {
+        let wrap = name.contains('.')
+            && !name.starts_with("key.")
+            && !(name.starts_with(surround) && name.ends_with(surround));
+        let key = if wrap {
+            format!("{parent}{surround}{name}{surround}")
+        } else {
+            format!("{parent}{name}")
+        };
+        let text = |v: &Json| match v {
+            Json::String(s) => s.clone(),
+            v => v.to_string(),
+        };
+        match value {
+            Json::Object(_) => json_object(surround, &format!("{key}."), value, out)?,
+            Json::Array(items) => {
+                out.push((key, items.iter().map(text).collect::<Vec<_>>().join(",")))
+            }
+            Json::Null => return Err("JSON value type not supported: NULL".to_owned()),
+            v => out.push((key, text(v))),
+        }
+    }
+    Ok(())
 }
 
 /// `parsePrefixedProperties(System.getProperties(), prefix)`: the system
@@ -117,9 +181,6 @@ pub fn apply_system(
         .iter()
         .filter_map(|(k, v)| Some((k.strip_prefix(&prefix)?.to_owned(), v.clone())))
         .collect();
-    if entries.is_empty() {
-        return Vec::new();
-    }
     apply(config, &format!("system-{prefix}"), &entries, lookup)
 }
 
@@ -130,6 +191,64 @@ pub fn apply(
     source: &str,
     entries: &[(String, String)],
     lookup: &dyn Fn(&str) -> Option<String>,
+) -> Vec<Warning> {
+    apply_counted(config, source, entries, 0, lookup)
+}
+
+/// [`apply`], recording in the configuration's status the checksum of the
+/// entries and of the file they were read from (`updateReadPropertiesStatus`)
+/// and, when there were any, the ones that were not applied
+/// (`updateApplyStatus`).
+fn apply_counted(
+    config: &mut BrokerConfig,
+    source: &str,
+    entries: &[(String, String)],
+    file_adler32: u32,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Vec<Warning> {
+    let adler32 = Adler32::of_entries(entries.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    let read = Json::object()
+        .with("alder32", adler32.to_string())
+        .with("fileAlder32", file_adler32.to_string())
+        .with("adler32", adler32.to_string())
+        .with("fileAdler32", file_adler32.to_string());
+    config.status = config
+        .status
+        .merge_and_update(&Json::at_path(&format!("properties/{source}"), read));
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let mut errors = Vec::new();
+    let warnings = apply_entries(config, source, entries, lookup, &mut errors);
+    apply_status(config, source, &errors);
+    warnings
+}
+
+/// `updateApplyStatus`: the entries (`key=value`) that were not applied and
+/// why.
+fn apply_status(config: &mut BrokerConfig, source: &str, errors: &[(String, String)]) {
+    let errors = Json::Array(
+        errors
+            .iter()
+            .map(|(value, reason)| {
+                Json::object()
+                    .with("value", value.as_str())
+                    .with("reason", reason.as_str())
+            })
+            .collect(),
+    );
+    config.status = config.status.merge_and_update(&Json::at_path(
+        &format!("properties/{source}/errors"),
+        errors,
+    ));
+}
+
+fn apply_entries(
+    config: &mut BrokerConfig,
+    source: &str,
+    entries: &[(String, String)],
+    lookup: &dyn Fn(&str) -> Option<String>,
+    errors: &mut Vec<(String, String)>,
 ) -> Vec<Warning> {
     let mut warnings = Vec::new();
     let mut entries: Vec<(String, String)> = entries.to_vec();
@@ -147,6 +266,7 @@ pub fn apply(
             match mask::resolve_mask(None, &value, Some(&config.password_codec)) {
                 Ok(v) => value = v,
                 Err(e) => {
+                    errors.push((format!("{key}={value}"), e.to_string()));
                     warnings.push(problem(source, &key, e.to_string()));
                     continue;
                 }
@@ -155,6 +275,7 @@ pub fn apply(
         let path = split_key(&key, &surround);
         let p: Vec<&str> = path.iter().map(String::as_str).collect();
         if let Err(reason) = apply_one(config, &p, &value, value == remove) {
+            errors.push((format!("{key}={value}"), reason.clone()));
             warnings.push(problem(source, &key, reason));
         }
     }
@@ -585,6 +706,68 @@ mod tests {
     }
 
     #[test]
+    fn status() {
+        let dir = std::env::temp_dir().join(format!("saranga-bps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.properties"),
+            "addressConfigurations.fromProperties.queueConfigs.fromProperties.routingType=ANYCAST\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.json"),
+            "{\"addressConfigurations\": {\"fromJson\": {\"queueConfigs\": {\"fromJson\": {\"routingType\": \"ANYCAST\"}}}}}\n",
+        )
+        .unwrap();
+        let d = dir.display().to_string().replace('\\', "/");
+        let mut c = BrokerConfig::default();
+        apply_sources(&mut c, &format!("{d}/"), &|_| None).unwrap();
+        apply_system(&mut c, &[], &|_| None);
+        apply(&mut c, "x.properties", &props("nonsense=1"), &|_| None);
+        // As Artemis 2.57.0 reports them for these files.
+        let expected = concat!(
+            r#"{"properties":{"#,
+            r#""a.properties":{"alder32":"2681741588","fileAlder32":"3237355806","adler32":"2681741588","fileAdler32":"3237355806","errors":[]},"#,
+            r#""b.json":{"alder32":"415439854","fileAlder32":"679682869","adler32":"415439854","fileAdler32":"679682869","errors":[]},"#,
+            r#""system-brokerconfig.":{"alder32":"1","fileAlder32":"0","adler32":"1","fileAdler32":"0"},"#,
+            r#""x.properties":{"#
+        );
+        let status = c.status.to_string();
+        assert!(status.starts_with(expected), "{status}");
+        let errors = c
+            .status
+            .get("properties")
+            .and_then(|p| p.get("x.properties"))
+            .and_then(|x| x.get("errors"))
+            .unwrap();
+        assert!(
+            errors
+                .to_string()
+                .starts_with(r#"[{"value":"nonsense=1","reason":"#)
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn json_keys() {
+        let e = json_entries(
+            r#"{"key.surround": "'", "a": {"b.c": {"d": [1, "x", true]}, "'e.f'": 1.5}, "g": false}"#,
+        )
+        .unwrap();
+        let e: Vec<(&str, &str)> = e.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(
+            e,
+            [
+                ("key.surround", "'"),
+                ("a.'b.c'.d", "1,x,true"),
+                ("a.'e.f'", "1.5"),
+                ("g", "false"),
+            ]
+        );
+        assert!(json_entries(r#"{"a": null}"#).is_err());
+    }
+
+    #[test]
     fn sources() {
         let dir = std::env::temp_dir().join(format!("saranga-bp-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("d")).unwrap();
@@ -602,6 +785,16 @@ mod tests {
         let w = apply_sources(&mut c, &format!("{d}/d/?filter=.*\\.txt"), &|_| None).unwrap();
         assert!(w.is_empty() && c.name == "txt");
         assert!(apply_sources(&mut c, &format!("{d}/missing.properties"), &|_| None).is_err());
+
+        write(
+            "b.json",
+            r#"{"name": "json", "idCacheSize": 9, "addressSettings": {"orders.#": {"maxDeliveryAttempts": 3}}}"#,
+        );
+        write("bad.json", "{\"name\": ");
+        let w = apply_sources(&mut c, &format!("{d}/b.json,{d}/bad.json"), &|_| None).unwrap();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!((c.name.as_str(), c.id_cache_size), ("json", 9));
+        assert!(c.address_settings.iter().any(|(m, _)| m == "orders.#"));
 
         let system = [
             ("brokerconfig.name".to_owned(), "sys".to_owned()),

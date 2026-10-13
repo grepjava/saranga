@@ -414,6 +414,15 @@ impl Broker {
     /// the configured ones, then recovers messages and prepared transactions
     /// (`ActiveMQServerImpl.initialisePart2` / `loadJournals`).
     pub async fn start(config: BrokerConfig) -> Result<Arc<Self>> {
+        // `ServerStatus`: one per process, cleared as a broker starts, and
+        // the configuration's status first (`internalStart`).
+        saranga_buffer::status::clear();
+        if let Some(file) = &config.management.file {
+            saranga_buffer::status::update(
+                saranga_buffer::status::CONFIGURATION_COMPONENT,
+                file.status.clone(),
+            );
+        }
         let internal =
             |what: &str, e: &dyn std::fmt::Display| BrokerError::internal(format!("{what}: {e}"));
         let (ids, storage, node_lock) = match &config.storage {

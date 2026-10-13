@@ -6,10 +6,12 @@
 
 mod codec;
 pub mod java_hash;
+pub mod json;
 mod jstring;
 mod properties;
 mod reader;
 mod simple_string;
+pub mod status;
 mod writer;
 
 pub use codec::Codec;

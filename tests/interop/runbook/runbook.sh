@@ -436,6 +436,7 @@ EOF
   graceful 60000 "the timeout passed"
 
   bootstrap
+  properties
   rbac
   network
   upgrading
@@ -559,6 +560,52 @@ bootstrap() {
   stop "$I2" "$PORT2"
 }
 
+# configuration: broker properties given to "artemis run --properties": a
+# directory ending in / applies its .properties and .json files in name
+# order, and a ?filter= query chooses the files by another regex. The
+# broker.properties system property names the sources in place of
+# --properties: given in the profile's JAVA_ARGS, as the arguments of
+# artemis.cmd go through cmd's CALL, which takes the "/?" of a filter for
+# a request for its help. The queues the files add stay in the bindings
+# journal after a restart. The broker's Status reports each source's
+# checksums and errors, and each JAAS properties file read.
+properties() {
+  local dir="$I2/etc/props" web=8961 profile
+  mkdir -p "$dir"
+  printf 'addressConfigurations.fromProperties.queueConfigs.fromProperties.routingType=ANYCAST\n' > "$dir/a.properties"
+  printf '{"addressConfigurations": {"fromJson": {"queueConfigs": {"fromJson": {"routingType": "ANYCAST"}}}}}\n' > "$dir/b.json"
+  printf 'addressConfigurations.fromCustom.queueConfigs.fromCustom.routingType=ANYCAST\n' > "$dir/c.custom_props"
+  local filter='-Dbroker.properties=../etc/props/?filter=.*\.custom_props'
+  if windows; then profile="$I2/etc/artemis.profile.cmd"; else profile="$I2/etc/artemis.profile"; fi
+  cp "$profile" "$WORK/profile.bak"
+  for run in "--properties ../etc/props/" "JAVA_ARGS: $filter"; do
+    step "configuration: artemis run, $run"
+    : > "$I2/log/artemis.log"
+    if [[ "$run" == --properties* ]]; then
+      start "$I2" "$PORT2" --properties ../etc/props/ && echo "listening"
+    else
+      if windows; then
+        printf '\r\nset JAVA_ARGS=%%JAVA_ARGS%% %s\r\n' "$filter" >> "$profile"
+      else
+        printf '\nJAVA_ARGS="$JAVA_ARGS %s"\n' "$filter" >> "$profile"
+      fi
+      start "$I2" "$PORT2" && echo "listening"
+    fi
+    wait_for "$I2/log/artemis.log" "AMQ221007" && echo "log: AMQ221007: Server is now active"
+    step "artemis queue stat --queueName from"
+    instance "$I2" queue stat --queueName from "${AUTH[@]}"
+    for _ in $(seq 1 100); do
+      curl -s -o /dev/null "http://localhost:$web/" && break
+      sleep 0.2
+    done
+    step "curl read/$MBEAN/Status"
+    curl -s -H "Origin: http://localhost" -u admin:admin "http://localhost:$web/console/jolokia/read/$MBEAN/Status"
+    echo
+    stop "$I2" "$PORT2"
+  done
+  cp "$WORK/profile.bak" "$profile"
+}
+
 # management: JMX authorization in broker.xml. With
 # ArtemisRbacMBeanServerBuilder in JAVA_ARGS and no <authorisation> in
 # management.xml, security-settings on mops. addresses guard the MBeans:
@@ -621,6 +668,7 @@ normalize() {
     -e 's/@127\.0\.0\.1:[0-9]+/@127.0.0.1:PORT/g; s/(ControlImpl|NettyAcceptor)@[0-9a-f]+/\1@HASH/g' \
     -e 's/(\\"connectionID\\":\\")[0-9a-f]+/\1#/g; s/(\\"remoteAddress\\":\\"127\.0\.0\.1:)[0-9]+/\1#/g' \
     -e 's/(\\"creationTime\\":\\")[^\\]*/\1DATE/g' \
+    -e 's/(\\"(reloadTime|Alder32|Adler32)\\":\\")[0-9]+/\1#/g; s/(\\"uptime\\":\\")[^\\]*/\1#/g' \
     -e 's/"(lastValue|createdTimestamp|messagesAdded|persistentSize|durablePersistentSize|deliveringSize|scheduledSize)":"?[0-9]+"?/"\1":#/g'
 }
 

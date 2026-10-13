@@ -223,21 +223,26 @@ pub(super) async fn attribute(
     }))
 }
 
-/// `getStatus`: the broker's state as JSON (`ServerStatus`).
+/// `getStatus`: the broker's state as JSON (`ServerStatus.asJson`), with
+/// what the configuration and the JAAS properties files reported in it.
 fn status(m: &Management, broker: &Broker) -> Json {
-    Json::object().with(
-        "server",
-        Json::object()
-            .with("version", VERSION)
-            .with("name", m.config.name.clone())
-            .with("identity", Json::Null)
-            .with("nodeId", broker.node_id())
-            .with(
+    // `updateServerStatus`: a HashMap, filled by putAll of the version
+    // and then four puts.
+    saranga_buffer::status::as_json(saranga_buffer::status::hash_map(
+        vec![
+            ("version", Json::from(VERSION)),
+            ("identity", Json::Null),
+            ("nodeId", Json::from(broker.node_id())),
+            (
                 "uptime",
-                print_duration(crate::message::now_millis() - m.started_at()),
-            )
-            .with("state", "STARTED"),
-    )
+                Json::from(print_duration(
+                    crate::message::now_millis() - m.started_at(),
+                )),
+            ),
+            ("state", Json::from("STARTED")),
+        ],
+        Some((2, 0.75)),
+    ))
 }
 
 /// `AddressInfoTextFormatter.Long`.

@@ -1,5 +1,6 @@
-//! The JSON management messages carry: parameters and results, and the
-//! JSON strings the list operations return. Written as Johnzon, which
+//! JSON, as `JsonUtil` in `artemis-commons` reads and writes it: the
+//! management messages' parameters and results, the JSON strings the list
+//! operations return, and JSON broker properties. Written as Johnzon, which
 //! Artemis uses, writes it: objects keep their insertion order, numbers
 //! are printed as Java prints a `long` or a `double`, and strings escape
 //! only quotes, backslashes and control characters.
@@ -87,6 +88,49 @@ impl Json {
             return Err(format!("Unexpected character at offset {}", p.i));
         }
         Ok(v)
+    }
+}
+
+impl Json {
+    /// `JsonUtil.mergeAndUpdate`: `self`'s members, in order, with
+    /// `update`'s merged in: objects are merged member by member, array
+    /// elements index by index, anything else is replaced, and new members
+    /// go last.
+    pub fn merge_and_update(&self, update: &Json) -> Json {
+        let (Json::Object(source), Json::Object(updates)) = (self, update) else {
+            return update.clone();
+        };
+        let mut out = source.clone();
+        for (key, value) in updates {
+            match out.iter_mut().find(|(k, _)| k == key) {
+                None => out.push((key.clone(), value.clone())),
+                Some((_, old)) => {
+                    *old = match (&*old, value) {
+                        (Json::Object(_), Json::Object(_)) => old.merge_and_update(value),
+                        (Json::Array(olds), Json::Array(news)) => Json::Array(
+                            news.iter()
+                                .enumerate()
+                                .map(|(i, n)| match (olds.get(i), n) {
+                                    (Some(o @ Json::Object(_)), Json::Object(_)) => {
+                                        o.merge_and_update(n)
+                                    }
+                                    _ => n.clone(),
+                                })
+                                .collect(),
+                        ),
+                        _ => value.clone(),
+                    }
+                }
+            }
+        }
+        Json::Object(out)
+    }
+
+    /// `JsonUtil.objectBuilderWithValueAtPath`: `value` nested in objects
+    /// along a `/`-separated path.
+    pub fn at_path(path: &str, value: Json) -> Json {
+        path.rsplit('/')
+            .fold(value, |v, key| Json::object().with(key, v))
     }
 }
 
