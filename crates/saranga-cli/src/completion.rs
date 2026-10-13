@@ -63,9 +63,7 @@ pub fn script(command: &clap::Command, start_script: &str) -> String {
 /// Each command's path (`/queue/create`) and the words that complete after
 /// it: its subcommands, then its long options.
 fn collect(command: &clap::Command, path: String, out: &mut Vec<(String, Vec<String>)>) {
-    let mut words: Vec<String> = command
-        .get_subcommands()
-        .filter(|c| !c.is_hide_set())
+    let mut words: Vec<String> = subcommands(command)
         .map(|c| c.get_name().to_owned())
         .collect();
     if command.has_subcommands() {
@@ -83,9 +81,17 @@ fn collect(command: &clap::Command, path: String, out: &mut Vec<(String, Vec<Str
         words.push("--help".to_owned());
     }
     out.push((path.clone(), words));
-    for sub in command.get_subcommands().filter(|c| !c.is_hide_set()) {
+    for sub in subcommands(command) {
         collect(sub, format!("{path}/{}", sub.get_name()), out);
     }
+}
+
+/// The subcommands shown, but `help`, which completes as clap's own help
+/// subcommand does.
+fn subcommands(command: &clap::Command) -> impl Iterator<Item = &clap::Command> {
+    command
+        .get_subcommands()
+        .filter(|c| !c.is_hide_set() && c.get_name() != "help")
 }
 
 #[cfg(test)]

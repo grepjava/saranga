@@ -352,6 +352,27 @@ struct Unsupported {
     static_cluster: Option<String>,
     #[arg(long, hide = true)]
     jdbc: bool,
+    // The JDBC store's settings, unused without --jdbc.
+    #[arg(long = "jdbc-bindings-table-name", hide = true)]
+    jdbc_bindings_table_name: Option<String>,
+    #[arg(long = "jdbc-message-table-name", hide = true)]
+    jdbc_message_table_name: Option<String>,
+    #[arg(long = "jdbc-large-message-table-name", hide = true)]
+    jdbc_large_message_table_name: Option<String>,
+    #[arg(long = "jdbc-page-store-table-name", hide = true)]
+    jdbc_page_store_table_name: Option<String>,
+    #[arg(long = "jdbc-node-manager-table-name", hide = true)]
+    jdbc_node_manager_table_name: Option<String>,
+    #[arg(long = "jdbc-connection-url", hide = true)]
+    jdbc_connection_url: Option<String>,
+    #[arg(long = "jdbc-driver-class-name", hide = true)]
+    jdbc_driver_class_name: Option<String>,
+    #[arg(long = "jdbc-network-timeout", hide = true)]
+    jdbc_network_timeout: Option<String>,
+    #[arg(long = "jdbc-lock-renew-period", hide = true)]
+    jdbc_lock_renew_period: Option<String>,
+    #[arg(long = "jdbc-lock-expiration", hide = true)]
+    jdbc_lock_expiration: Option<String>,
 }
 
 impl Unsupported {

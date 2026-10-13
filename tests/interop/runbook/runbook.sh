@@ -16,7 +16,10 @@
 # The procedures, each under the manual chapter it comes from:
 #   using-server       run an instance, find it active in its log, stop it;
 #                      run it with another bootstrap file (xml:<path>)
-#   using-cli          queue create and stat, producer, consumer, browser;
+#   using-cli          help, from an instance and from the home (and
+#                      using-server's help create, data-tools' help data
+#                      print); queue create and stat, producer, consumer,
+#                      browser;
 #                      check node and queue, passing and failing;
 #                      the shell, connected with connect and with options
 #   security           user add, list and rm
@@ -71,6 +74,14 @@ trap cleanup EXIT
 artemis_home() {
   java -cp "$(native "$DIST/lib")/*" -Dartemis.home="$(native "$DIST")" \
     org.apache.activemq.artemis.boot.Artemis "$@" 2>&1 | grep -v '^WARNING: '
+}
+
+# The home's CLI, outside any instance: Artemis's, or saranga.
+home() {
+  case "$BROKER" in
+    artemis) artemis_home "$@" ;;
+    *) env -u ARTEMIS_INSTANCE -u ARTEMIS_INSTANCE_ETC "$SARANGA" "$@" 2>&1 ;;
+  esac
 }
 
 # A broker instance, made as BROKER says.
@@ -189,6 +200,22 @@ messages_to() { grep -c -E "userRecordType=(45|31);.*address=$1[],]" || true; }
 suite() {
   make_instance "$I1" 700
   make_instance "$I2" 800
+
+  # using-cli: help, the list of commands, then a group's; using-server:
+  # help create; data-tools: help data print, from the home so that its
+  # default configuration names no instance. The instance's list has
+  # Artemis's lock, properties and activation commands, which Saranga has
+  # not (normalize).
+  step "using-cli: artemis help"
+  instance "$I1" help
+  step "using-cli: artemis help data"
+  instance "$I1" help data
+  step "using-cli: artemis help (home)"
+  home help
+  step "using-server: artemis help create (home)"
+  home help create
+  step "data-tools: artemis help data print (home)"
+  home help data print
 
   # using-server: "bin/artemis run", then the log says it is active.
   step "using-server: artemis run"
@@ -652,6 +679,8 @@ normalize() {
     -e "s#$(cygpath -w "$WORK" 2>/dev/null | sed 's#\\#\\\\#g; s#[.]#\\.#g')#WORK#g" \
     -e 's#WORK\\#WORK/#g' -e ':sep' -e 's#(WORK/[a-z0-9/]*)\\#\1/#' -e 'tsep' \
     -e 's/^Usage: (artemis|saranga) help/Usage: CLI help/' \
+    -e 's/^Usage: saranga /Usage: artemis /' \
+    -e '/^  (lock|properties|activation)  +/d' \
     -e 's/(Elapsed time in milli second :) [0-9]+ milli/\1 # milli/' \
     -e 's/(Elapsed time in second :) [0-9]+ s/\1 # s/' \
     -e 's/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3} /DATE /' \

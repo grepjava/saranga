@@ -10,6 +10,7 @@ mod client;
 mod completion;
 mod create;
 mod data;
+mod help;
 mod instance;
 mod logging;
 mod network;
@@ -27,7 +28,8 @@ use saranga_transport::{TlsAcceptor, TlsSettings};
 #[command(
     name = "saranga",
     version,
-    about = "A message broker compatible with Apache ActiveMQ Artemis"
+    about = "A message broker compatible with Apache ActiveMQ Artemis",
+    disable_help_subcommand = true
 )]
 struct Cli {
     /// Without a command, the shell.
@@ -76,6 +78,13 @@ enum Command {
         /// xml:${ARTEMIS_INSTANCE}/etc/bootstrap.xml.
         #[arg(conflicts_with = "config")]
         configuration: Option<String>,
+        /// The data folders, which `artemis run` takes and does not use:
+        /// the broker's are broker.xml's.
+        #[command(flatten)]
+        folders: data::dirs::FolderArgs,
+        /// Print additional information.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Tools on a broker's data directory.
     #[command(subcommand)]
@@ -124,6 +133,9 @@ enum Command {
         /// Broker Configuration URI. Default:
         /// xml:${ARTEMIS_INSTANCE}/etc/bootstrap.xml.
         configuration: Option<String>,
+        /// Print additional information.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Use 'help perf' for sub commands list.
     #[command(subcommand)]
@@ -132,9 +144,17 @@ enum Command {
     /// folder.
     PerfJournal(perf::journal::PerfJournalArgs),
     /// Print version information.
-    Version,
+    Version {
+        /// Print additional information.
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Information on current folder and instance.
-    Pwd,
+    Pwd {
+        /// Print additional information.
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Kill a broker started with --allow-kill, as `artemis kill`: KILL_ME
     /// next to its broker.xml.
     Kill {
@@ -144,6 +164,9 @@ enum Command {
         /// Broker Configuration URI. Default:
         /// xml:${ARTEMIS_INSTANCE}/etc/bootstrap.xml.
         configuration: Option<String>,
+        /// Print additional information.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Masks a password for the configuration files, as `artemis mask`:
     /// write the result as ENC(<result>).
@@ -163,6 +186,9 @@ enum Command {
         /// The broker.xml whose password codec --password-codec uses.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Print additional information.
+        #[arg(long)]
+        verbose: bool,
     },
     /// A shell running the CLI's commands, as `artemis shell`. `saranga`
     /// without a command starts it too.
@@ -173,6 +199,11 @@ enum Command {
     /// Clear previously typed user credentials.
     #[command(hide = true)]
     Disconnect(client::ConnectionArgs),
+    /// Print the help of the given command, as `artemis help` prints it.
+    Help {
+        /// The command and subcommand.
+        args: Vec<String>,
+    },
 }
 
 /// The command line (`Artemis.buildCommand`). In the shell, `connect` and
@@ -271,6 +302,15 @@ async fn main() -> std::process::ExitCode {
 /// Runs a command and reports its failure as `Artemis.execute` does; false
 /// when it failed.
 async fn execute(command: Command) -> bool {
+    if let Command::Help { args } = &command {
+        let mode = if client::instance_dir().is_some() {
+            help::Mode::Instance
+        } else {
+            help::Mode::Home
+        };
+        print!("{}", help::help("saranga", args, mode, shell::in_shell()));
+        return true;
+    }
     let client = matches!(
         command,
         Command::Queue(_)
@@ -285,8 +325,8 @@ async fn execute(command: Command) -> bool {
             | Command::PerfJournal(_)
             | Command::Stop { .. }
             | Command::Kill { .. }
-            | Command::Version
-            | Command::Pwd
+            | Command::Version { .. }
+            | Command::Pwd { .. }
             | Command::Create(_)
             | Command::Upgrade(_)
             | Command::Completion { .. }
@@ -335,10 +375,12 @@ async fn run_client(command: Command) -> anyhow::Result<()> {
         Command::Stop {
             broker,
             configuration,
+            ..
         } => control_file(broker, configuration, "STOP_ME"),
         Command::Kill {
             broker,
             configuration,
+            ..
         } => control_file(broker, configuration, "KILL_ME"),
         Command::Create(a) => create::run(*a),
         Command::Upgrade(a) => upgrade::run(&a),
@@ -351,7 +393,7 @@ async fn run_client(command: Command) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Command::Version => {
+        Command::Version { .. } => {
             // PrintVersion
             println!(
                 "Saranga {VERSION} (Apache Artemis {})",
@@ -361,7 +403,7 @@ async fn run_client(command: Command) -> anyhow::Result<()> {
             println!("Saranga instance: {}", broker_instance());
             Ok(())
         }
-        Command::Pwd => {
+        Command::Pwd { .. } => {
             let line = "*".repeat(127);
             println!();
             println!("{line}");
@@ -421,9 +463,15 @@ fn report_client_error(e: &anyhow::Error) {
     if let Some(u) = e.downcast_ref::<client::UsageError>() {
         eprintln!("{u}");
         println!();
-        println!("Usage: saranga help [<args>...]");
-        println!("use 'help <command>' for more information");
-        println!("      [<args>...]");
+        print!(
+            "{}",
+            help::help(
+                "saranga",
+                &["help".to_owned()],
+                help::Mode::Home,
+                shell::in_shell()
+            )
+        );
     } else if let Some(c) = e.downcast_ref::<client::CliError>() {
         eprintln!("{c}");
     } else if let Some(c) = e.downcast_ref::<client::ConfigurationError>() {
@@ -493,6 +541,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             allow_kill,
             broker,
             configuration,
+            ..
         } => {
             let mut system = java_args_system_properties();
             system.extend(system_properties);
@@ -546,6 +595,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             key,
             password_codec,
             config,
+            ..
         } => mask(
             &password,
             hash,

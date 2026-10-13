@@ -19,6 +19,9 @@ use crate::create::{
 pub struct UpgradeArgs {
     #[command(flatten)]
     install: InstallArgs,
+    /// `--verbose` and `--silent`: the upgrade asks nothing.
+    #[command(flatten)]
+    common: crate::client::Common,
 }
 
 /// The JVM arguments kept between upgrades, and their old names.

@@ -35,7 +35,8 @@ pub struct DataDirArgs {
     pub verbose: bool,
 }
 
-/// `DBOption`'s `--f` and `--output`, of `print`, `exp` and `recover`.
+/// `DBOption`'s `--f`, `--output` and JDBC options, of `print`, `exp` and
+/// `recover`.
 #[derive(Args, Clone, Default)]
 pub struct DbArgs {
     /// This will allow certain tools like print-data to be performed
@@ -47,11 +48,76 @@ pub struct DbArgs {
     /// Output name for the file.
     #[arg(long)]
     pub output: Option<PathBuf>,
+    #[command(flatten)]
+    pub jdbc: JdbcArgs,
+}
+
+/// `DBOption`'s JDBC store options. Saranga stores messages in files only:
+/// `--jdbc` is refused, and the others are taken and unused, as Artemis
+/// leaves them unused without it.
+#[derive(Args, Clone, Debug, Default)]
+pub struct JdbcArgs {
+    /// Whether to store message data in JDBC instead of local files.
+    /// Saranga does not.
+    #[arg(long)]
+    pub jdbc: bool,
+    /// Name of the jdbc bindings table.
+    #[arg(long = "jdbc-bindings-table-name", hide = true)]
+    pub bindings_table_name: Option<String>,
+    /// Name of the jdbc messages table.
+    #[arg(long = "jdbc-message-table-name", hide = true)]
+    pub message_table_name: Option<String>,
+    /// Name of the large messages table.
+    #[arg(long = "jdbc-large-message-table-name", hide = true)]
+    pub large_message_table_name: Option<String>,
+    /// Name of the page store messages table.
+    #[arg(long = "jdbc-page-store-table-name", hide = true)]
+    pub page_store_table_name: Option<String>,
+    /// Name of the jdbc node manager table.
+    #[arg(long = "jdbc-node-manager-table-name", hide = true)]
+    pub node_manager_table_name: Option<String>,
+    /// The URL used for the database connection.
+    #[arg(long = "jdbc-connection-url", hide = true)]
+    pub connection_url: Option<String>,
+    /// JDBC driver classname.
+    #[arg(long = "jdbc-driver-class-name", hide = true)]
+    pub driver_class_name: Option<String>,
+    /// JDBC username.
+    #[arg(long = "jdbc-user", hide = true)]
+    pub user: Option<String>,
+    /// JDBC password.
+    #[arg(long = "jdbc-password", hide = true)]
+    pub password: Option<String>,
+}
+
+/// The data folders `artemis run` takes, as `DataAbstract`'s, and does not
+/// use.
+#[derive(Args, Clone, Debug, Default)]
+pub struct FolderArgs {
+    /// The folder used for bindings. Default: read from broker.xml.
+    #[arg(long = "bindings")]
+    pub bindings: Option<PathBuf>,
+    /// The folder used for normal messages. Default: read from broker.xml.
+    #[arg(long = "journal")]
+    pub journal: Option<PathBuf>,
+    /// The folder used for paged messages. Default: read from broker.xml.
+    #[arg(long = "paging")]
+    pub paging: Option<PathBuf>,
+    /// The folder used for large-messages. Default: read from broker.xml.
+    #[arg(long = "large-messages")]
+    pub large_messages: Option<PathBuf>,
 }
 
 impl DbArgs {
-    /// The CLI lock (`OptionalLocking`): none taken with `--f`.
+    /// The CLI lock (`OptionalLocking`): none taken with `--f`. `--jdbc`
+    /// is refused first.
     pub fn lock(&self) -> anyhow::Result<CliLock> {
+        if self.jdbc.jdbc {
+            return Err(crate::client::CliError(
+                "saranga data does not support --jdbc: Saranga does not store messages in a database".to_owned(),
+            )
+            .into());
+        }
         let instance = crate::client::instance_dir();
         match instance {
             Some(_) if self.ignore_lock => Ok(CliLock(None)),
