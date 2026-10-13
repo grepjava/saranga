@@ -8,7 +8,8 @@
  *     java -cp "$DIST/lib/*" scripts/CliHelp.java > crates/saranga-cli/src/help/artemis-cli.json
  *
  * Descriptions are written as declared, `${...}` and all: picocli
- * interpolates them as it prints them, and so does saranga.
+ * interpolates them as it prints them, and so does saranga. What picocli
+ * completes each argument with is there too, for `saranga completion`.
  */
 
 import java.util.ArrayList;
@@ -84,7 +85,35 @@ public class CliHelp {
    static String arg(ArgSpec a) {
       return ",\"label\":" + str(a.paramLabel()) + ",\"arity\":" + str(a.arity().toString())
          + ",\"multi\":" + a.isMultiValue() + ",\"hidden\":" + a.hidden() + ",\"required\":" + a.required()
-         + ",\"description\":" + strs(a.description()) + candidates(a);
+         + ",\"description\":" + strs(a.description()) + candidates(a) + completion(a);
+   }
+
+   /*
+    * What picocli's AutoComplete.bash completes the argument with: its
+    * completion candidates (an enum's constants among them), and its type
+    * when that is one it completes or treats as a flag.
+    */
+   static String completion(ArgSpec a) {
+      StringBuilder out = new StringBuilder();
+      if (a.completionCandidates() != null) {
+         List<String> l = new ArrayList<>();
+         for (String c : a.completionCandidates()) {
+            l.add(str(c));
+         }
+         out.append(",\"completion\":[").append(String.join(",", l)).append("]");
+      }
+      Class<?> type = a.type();
+      if (a.typeInfo().isMultiValue()) {
+         type = a.typeInfo().getAuxiliaryTypes()[0];
+      }
+      if (a.type() == Boolean.TYPE || a.type() == Boolean.class) {
+         out.append(",\"type\":\"boolean\"");
+      } else if (type.equals(java.io.File.class) || type.getName().equals("java.nio.file.Path")) {
+         out.append(",\"type\":\"file\"");
+      } else if (type.equals(java.net.InetAddress.class)) {
+         out.append(",\"type\":\"host\"");
+      }
+      return out.toString();
    }
 
    static String candidates(ArgSpec a) {

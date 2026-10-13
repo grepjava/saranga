@@ -18,7 +18,8 @@
 #                      run it with another bootstrap file (xml:<path>)
 #   using-cli          help, from an instance and from the home (and
 #                      using-server's help create, data-tools' help data
-#                      print); queue create and stat, producer, consumer,
+#                      print); bash completion, the script sourced and TAB
+#                      pressed; queue create and stat, producer, consumer,
 #                      browser;
 #                      check node and queue, passing and failing;
 #                      the shell, connected with connect and with options
@@ -194,6 +195,19 @@ shell() {
     -e 's/(Apache Artemis|Saranga) [0-9.]+ > /CLI > /g' -e 's/ or press <TAB>//'
   echo  # the last prompt ends no line
 }
+# The candidates bash's TAB offers after "./artemis" and the words given,
+# the last one being completed, with the script completion.sh sourced:
+# what the function "complete" registered for artemis puts in COMPREPLY.
+# Saranga offers no lock, properties or activation commands.
+tab() {
+  step "using-cli: source <(./artemis completion), then ./artemis $*<TAB>"
+  bash -c 'source "$1" 2> /dev/null; shift
+    f="$(complete -p artemis)"; f="${f#*-F }"; f="${f%% *}"
+    COMP_WORDS=(./artemis "$@"); COMP_CWORD=$#; COMP_LINE="${COMP_WORDS[*]}"; COMP_POINT=${#COMP_LINE}
+    "$f" ./artemis "${COMP_WORDS[COMP_CWORD]}" "${COMP_WORDS[COMP_CWORD-1]}" 2> /dev/null
+    printf "%s\n" "${COMPREPLY[@]}"' tab "$WORK/completion.sh" "$@" | LC_ALL=C sort \
+    | grep -v -x -E 'lock|properties|activation'
+}
 # The lines of data print about messages sent to an address.
 messages_to() { grep -c -E "userRecordType=(45|31);.*address=$1[],]" || true; }
 
@@ -216,6 +230,13 @@ suite() {
   home help create
   step "data-tools: artemis help data print (home)"
   home help data print
+  # using-cli: "source <(./artemis completion)", then TAB after the command,
+  # after "create --" and after an option that takes one of a few values:
+  # what bash offers, from the function the script registers for artemis.
+  instance "$I1" completion | tr -d '\r' > "$WORK/completion.sh"
+  tab ""
+  tab create --
+  tab producer --protocol ""
 
   # using-server: "bin/artemis run", then the log says it is active.
   step "using-server: artemis run"

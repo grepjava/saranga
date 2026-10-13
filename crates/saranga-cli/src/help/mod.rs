@@ -43,25 +43,35 @@ pub enum Mode {
 #[derive(Debug, Clone)]
 pub struct Spec {
     pub name: String,
-    hidden: bool,
+    pub hidden: bool,
     description: Vec<String>,
     pub options: Vec<Arg>,
-    parameters: Vec<Arg>,
+    pub parameters: Vec<Arg>,
     pub commands: Vec<Spec>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Arg {
     pub names: Vec<String>,
-    label: String,
+    pub label: String,
     /// `arity`: its minimum and maximum (`None`: unbounded).
     arity: (usize, Option<usize>),
+    /// A positional parameter's `index`: its first and last position
+    /// (`None`: unbounded).
+    pub index: (usize, Option<usize>),
     /// Whether it takes more than one value (`isMultiValue`).
     multi: bool,
-    hidden: bool,
+    pub hidden: bool,
     required: bool,
     description: Vec<String>,
     candidates: Vec<String>,
+    /// `completionCandidates`, which picocli's completion script offers
+    /// (an enum's constants, or those declared).
+    pub completion: Option<Vec<String>>,
+    /// Its type, where the completion script cares: `boolean` (a flag),
+    /// `file` (`File` or `Path`, completed with file names) or `host`
+    /// (`InetAddress`, completed with host names).
+    pub kind: Option<String>,
 }
 
 impl Arg {
@@ -159,17 +169,19 @@ fn spec(json: &Json) -> Spec {
 fn arg(json: &Json) -> Arg {
     let text = |key: &str| json.get(key).and_then(Json::as_str).unwrap_or_default();
     let bound = |s: &str| s.parse::<usize>().ok();
-    let arity = match text("arity").split_once("..") {
+    let range = |key: &str, default: usize| match text(key).split_once("..") {
         Some((min, max)) => (bound(min).unwrap_or(0), bound(max)),
         None => {
-            let n = bound(text("arity")).unwrap_or(1);
+            let n = bound(text(key)).unwrap_or(default);
             (n, Some(n))
         }
     };
+    let arity = range("arity", 1);
     Arg {
         names: strings(json.get("names")),
         label: text("label").to_owned(),
         arity,
+        index: range("index", 0),
         multi: json.get("multi").and_then(Json::as_bool).unwrap_or(false),
         hidden: json.get("hidden").and_then(Json::as_bool).unwrap_or(false),
         required: json
@@ -178,6 +190,8 @@ fn arg(json: &Json) -> Arg {
             .unwrap_or(false),
         description: strings(json.get("description")),
         candidates: strings(json.get("candidates")),
+        completion: json.get("completion").map(|c| strings(Some(c))),
+        kind: json.get("type").and_then(Json::as_str).map(str::to_owned),
     }
 }
 
