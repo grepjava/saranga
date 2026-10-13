@@ -20,9 +20,17 @@ use crate::client::management::Requestor;
 
 #[derive(Args)]
 pub struct ImportArgs {
+    #[command(flatten)]
+    common: crate::client::Common,
     /// URL towards the broker.
     #[arg(long)]
     url: Option<String>,
+    /// Name used to find the default connection URL on the acceptor list.
+    /// If an acceptor with that name cannot be found the CLI will look for
+    /// a connector with the same name.
+    // XmlDataImporter connects to --url (or --host) all the same.
+    #[arg(long)]
+    acceptor: Option<String>,
     /// User used to connect.
     #[arg(long)]
     user: Option<String>,

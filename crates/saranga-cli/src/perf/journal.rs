@@ -50,9 +50,6 @@ pub struct PerfJournalArgs {
     /// option.
     #[arg(long = "f")]
     ignore_lock: bool,
-    /// Print additional information.
-    #[arg(long)]
-    verbose: bool,
     #[command(flatten)]
     dirs: DataDirArgs,
 }
@@ -110,9 +107,9 @@ pub fn run(args: &PerfJournalArgs) -> anyhow::Result<()> {
         args.writes,
         args.tries,
         datasync,
-        args.verbose,
+        args.dirs.verbose,
     )?;
-    let nanos = to_nanos(time, args.writes, args.verbose);
+    let nanos = to_nanos(time, args.writes, args.dirs.verbose);
     println!(
         "Your system can execute {} writes per millisecond",
         decimal_format(args.writes as f64 / time as f64)
@@ -143,7 +140,7 @@ fn notices(args: &PerfJournalArgs, journal_type: JournalType) {
         println!("{stars}");
         println!();
     }
-    if args.verbose {
+    if args.dirs.verbose {
         let factory = if journal_type == JournalType::Mapped {
             "org.apache.activemq.artemis.core.io.mapped.MappedSequentialFileFactory"
         } else {

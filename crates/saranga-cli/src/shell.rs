@@ -302,8 +302,9 @@ async fn execute(words: Vec<String>) {
     let mut command = crate::command_line(true);
     let matches = match command
         .clone()
-        .try_get_matches_from(std::iter::once("saranga".to_owned()).chain(words))
-    {
+        .try_get_matches_from(crate::artemis_spellings(
+            std::iter::once("saranga".to_owned()).chain(words).collect(),
+        )) {
         Ok(m) => m,
         Err(e) => {
             let _ = e.print();

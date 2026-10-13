@@ -21,15 +21,14 @@ use saranga_storage::codec::{
 use saranga_storage::message::{LargeMessageRecord, PersistedMessage};
 use saranga_storage::{ids, java};
 
-use super::dirs::{CliLock, DataDirArgs};
+use super::dirs::{DataDirArgs, DbArgs};
 
 #[derive(Args)]
 pub struct ExportArgs {
     #[command(flatten)]
     dirs: DataDirArgs,
-    /// Output name for the file.
-    #[arg(long)]
-    output: Option<PathBuf>,
+    #[command(flatten)]
+    db: DbArgs,
     /// How often to print progress in the console. Set to <= 0 to disable
     /// it.
     #[arg(
@@ -49,19 +48,14 @@ pub struct ExportArgs {
 }
 
 pub fn run(args: ExportArgs) -> anyhow::Result<()> {
-    let _lock = CliLock::take(crate::client::instance_dir().as_deref())?;
+    let _lock = args.db.lock()?;
+    let out = args.db.out()?;
     let d = args.dirs.resolve()?;
     let file_size = d
         .config
         .as_ref()
         .and_then(|c| c.journal.file_size)
         .map(|n| n.max(0) as usize);
-    let out: Box<dyn Write> = match &args.output {
-        Some(p) => {
-            Box::new(std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?)
-        }
-        None => Box::new(std::io::stdout().lock()),
-    };
     let mut exporter = Exporter {
         args: &args,
         large_messages: d.large_messages.clone(),

@@ -442,6 +442,31 @@ fn absolute(p: &Path) -> PathBuf {
     }
 }
 
+/// The configuration URI of `artemis run` and the data tools, as `BrokerFactory` takes it: only
+/// the `xml:` scheme, naming a bootstrap file (relative to the current
+/// directory), which must exist.
+pub fn bootstrap_path(uri: &str) -> anyhow::Result<PathBuf> {
+    // `java.net.URI`'s scheme: a letter, then letters, digits, `+`, `-`
+    // and `.`, before the first `:`.
+    let scheme = uri.split_once(':').map(|(s, _)| s).filter(|s| {
+        s.starts_with(|c: char| c.is_ascii_alphabetic())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    });
+    let Some(scheme) = scheme else {
+        bail!("Invalid configuration URI, no scheme specified: {uri}");
+    };
+    if scheme != "xml" {
+        bail!("Invalid configuration URI, can't find configuration scheme: {scheme}");
+    }
+    let path = PathBuf::from(&uri[scheme.len() + 1..]);
+    if !path.exists() {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        bail!("Invalid configuration URI, can't find file: {name}");
+    }
+    Ok(path)
+}
+
 /// `artemis.URI.instance`: the path as a URI path, `/C:/x%20y` on Windows.
 fn uri_path(p: &Path) -> String {
     let s = p.display().to_string().replace('\\', "/");

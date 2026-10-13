@@ -221,6 +221,19 @@ impl std::fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+/// A `ConfigurationException`: its message, then how a configuration URI
+/// is written, and exit status 1.
+#[derive(Debug)]
+pub struct ConfigurationError(pub String);
+
+impl std::fmt::Display for ConfigurationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConfigurationError {}
+
 /// The connection options (`ConnectionConfigurationAbtract`,
 /// `ConnectionAbstract`).
 #[derive(clap::Args, Clone, Debug, Default)]

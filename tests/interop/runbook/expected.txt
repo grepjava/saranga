@@ -223,6 +223,16 @@ admin@tcp://localhost:62316 > Connection brokerURL = tcp://localhost:62316
 Connection information cleared!
 CLI > 
 
+=== artemis data print
+Error: There is another process using the server at INSTANCE/lock. Cannot start the process!
+--- exit 1
+=== artemis data print --f --output ../print.txt
+--- exit 0
+Server's ID=UUID
+B I N D I N G S  J O U R N A L
+M E S S A G E S   J O U R N A L
+P A G I N G
+queue runbook: 4
 === artemis stop
 --- exit 0
 stopped

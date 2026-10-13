@@ -31,8 +31,10 @@
 #                      print and recover over the retention directory
 #   config-reload      an address added to broker.xml while running
 #   perf-tools         perf client; a target rate test with an HDR log
-#   data-tools         data exp, compact, encode and decode, and imp into a
-#                      second instance; restart recovery
+#   data-tools         data print of a running broker's data, refused, then
+#                      with --f and --output; data exp, compact, encode and
+#                      decode, and imp into a second instance; restart
+#                      recovery
 #   graceful-shutdown  a broker stopped while a consumer is connected
 #   network-isolation  create --ping; the broker stopped while the network
 #                      is down and started again once it is back
@@ -307,6 +309,18 @@ suite() {
   step "using-cli: artemis shell --user admin --password admin --url tcp://localhost:$PORT1: queue stat, exit"
   shell_lines "queue stat --queueName runbook" exit
   shell shell --user admin --password admin --url "tcp://localhost:$PORT1"
+
+  # data-tools: print refuses the data of a running broker (the CLI lock
+  # the broker holds); --f prints it all the same, with --output to a file.
+  step "artemis data print"
+  instance "$I1" data print | sed -E 's#server at .*[/\]lock\.#server at INSTANCE/lock.#'
+  echo "--- exit ${PIPESTATUS[0]}"
+  step "artemis data print --f --output ../print.txt"
+  instance "$I1" data print --f --output ../print.txt
+  echo "--- exit ${PIPESTATUS[0]}"
+  # Its banners, and the queue made with the CLI among the bindings.
+  awk 'p == 1 { print; p = 2; next } /^\*+$/ { p = (p == 2 ? 0 : 1) }' "$I1/print.txt" | tr -d '\r'
+  echo "queue runbook: $(grep -c 'name=runbook,' "$I1/print.txt")"
 
   # using-server: stop, and the log says so.
   stop "$I1" "$PORT1"

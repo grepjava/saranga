@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::Args;
 
-/// `--bindings`, `--journal`, `--paging`, `--large-messages` and `--broker`.
+/// `--bindings`, `--journal`, `--paging`, `--large-messages`, `--broker`,
+/// the configuration URI and `--verbose`.
 #[derive(Args, Clone, Default)]
 pub struct DataDirArgs {
     /// The folder used for bindings. Default: read from broker.xml.
@@ -26,6 +27,48 @@ pub struct DataDirArgs {
     /// Override the broker configuration from the bootstrap.xml.
     #[arg(long)]
     pub broker: Option<String>,
+    /// Broker Configuration URI. Default:
+    /// xml:${ARTEMIS_INSTANCE}/etc/bootstrap.xml.
+    pub configuration: Option<String>,
+    /// Print additional information.
+    #[arg(long)]
+    pub verbose: bool,
+}
+
+/// `DBOption`'s `--f` and `--output`, of `print`, `exp` and `recover`.
+#[derive(Args, Clone, Default)]
+pub struct DbArgs {
+    /// This will allow certain tools like print-data to be performed
+    /// ignoring any running servers. WARNING: Changing data concurrently
+    /// with a running broker may damage your data. Be careful with this
+    /// option.
+    #[arg(long = "f")]
+    pub ignore_lock: bool,
+    /// Output name for the file.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
+impl DbArgs {
+    /// The CLI lock (`OptionalLocking`): none taken with `--f`.
+    pub fn lock(&self) -> anyhow::Result<CliLock> {
+        let instance = crate::client::instance_dir();
+        match instance {
+            Some(_) if self.ignore_lock => Ok(CliLock(None)),
+            _ => CliLock::take(instance.as_deref()),
+        }
+    }
+
+    /// Where the tool prints: `--output`, created once the lock is held,
+    /// else standard output.
+    pub fn out(&self) -> anyhow::Result<Box<dyn std::io::Write>> {
+        Ok(match &self.output {
+            Some(p) => {
+                Box::new(File::create(p).with_context(|| format!("creating {}", p.display()))?)
+            }
+            None => Box::new(std::io::stdout()),
+        })
+    }
 }
 
 /// The data directories, and the journal settings a tool reading them needs.
@@ -116,7 +159,16 @@ impl DataDirArgs {
         instance: Option<&Path>,
     ) -> anyhow::Result<Option<(saranga_config::BrokerConfig, PathBuf)>> {
         let options = crate::instance::Options::default();
+        let configuration = self.configuration.as_deref().filter(|c| !c.is_empty());
         let inst = match (&self.broker, instance) {
+            (None, _) if configuration.is_some() => {
+                let bootstrap = crate::instance::bootstrap_path(configuration.unwrap_or_default())
+                    .map_err(|e| crate::client::ConfigurationError(e.to_string()))?;
+                let etc = crate::client::instance_etc()
+                    .or_else(|| bootstrap.parent().map(Path::to_path_buf))
+                    .unwrap_or_default();
+                crate::instance::Instance::from_bootstrap(&etc, &bootstrap, options)?
+            }
             (Some(b), _) => {
                 let path = b
                     .trim_start_matches("xml:")
@@ -230,6 +282,7 @@ mod tests {
             paging: p,
             large_messages: Some(dir.path().join("l")),
             broker: None,
+            ..DataDirArgs::default()
         };
         let e = args.resolve().err().unwrap().to_string();
         assert!(e.starts_with("Could not find folder: "), "{e}");

@@ -13,12 +13,14 @@ use saranga_journal::format::{self, FileHeader, Record};
 use saranga_journal::{Journal, JournalConfig};
 use saranga_storage::ids;
 
-use super::dirs::{CliLock, DataDirArgs};
+use super::dirs::{DataDirArgs, DbArgs};
 
 #[derive(Args)]
 pub struct RecoverArgs {
     #[command(flatten)]
     dirs: DataDirArgs,
+    #[command(flatten)]
+    db: DbArgs,
     /// Try to recover as many records as possible from reclaimed files.
     #[arg(long)]
     reclaimed: bool,
@@ -38,7 +40,8 @@ const OF_INTEREST: [u8; 5] = [
 ];
 
 pub fn run(args: &RecoverArgs) -> anyhow::Result<()> {
-    let _lock = CliLock::take(crate::client::instance_dir().as_deref())?;
+    let _lock = args.db.lock()?;
+    let mut print = args.db.out()?;
     let d = super::parameter_dirs(&args.dirs)?;
     let target = &args.target;
     if !target.exists() {
@@ -64,8 +67,6 @@ pub fn run(args: &RecoverArgs) -> anyhow::Result<()> {
     out.set_auto_reclaim(false);
     out.load_all()?;
 
-    let stdout = std::io::stdout();
-    let mut print = stdout.lock();
     let mut added: HashSet<i64> = HashSet::new();
     let mut refs: HashSet<(i64, i64)> = HashSet::new();
     // The large message whose body is being written, and its file.

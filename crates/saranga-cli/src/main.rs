@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 
 mod client;
 mod completion;
@@ -194,10 +194,39 @@ fn command_line(in_shell: bool) -> clap::Command {
     command
 }
 
+/// `data exp`'s `log-interval` and `undefined-prefix`, which Artemis's
+/// declares without dashes (`log-interval=<logInterval>`), as
+/// `--log-interval` and `--undefined-prefix`.
+pub fn artemis_spellings<T>(mut args: Vec<T>) -> Vec<T>
+where
+    T: From<String> + AsRef<std::ffi::OsStr>,
+{
+    let words: Vec<Option<String>> = args
+        .iter()
+        .map(|a| a.as_ref().to_str().map(str::to_owned))
+        .collect();
+    let Some(exp) = words
+        .windows(2)
+        .position(|w| w[0].as_deref() == Some("data") && w[1].as_deref() == Some("exp"))
+    else {
+        return args;
+    };
+    for (i, word) in words.iter().enumerate().skip(exp + 2) {
+        let Some(word) = word else { continue };
+        for name in ["log-interval", "undefined-prefix"] {
+            if word == name || word.starts_with(&format!("{name}=")) {
+                args[i] = T::from(format!("--{word}"));
+            }
+        }
+    }
+    args
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let mut command_line = command_line(false);
-    let cli = Cli::from_arg_matches(&command_line.clone().get_matches())
+    let args = artemis_spellings(std::env::args_os().collect());
+    let cli = Cli::from_arg_matches(&command_line.clone().get_matches_from(args))
         .unwrap_or_else(|e| e.format(&mut command_line).exit());
     let command = match cli.command {
         Some(Command::Connect(_)) | Some(Command::Disconnect(_)) => {
@@ -277,7 +306,8 @@ async fn execute(command: Command) -> bool {
         Ok(()) => true,
         Err(e)
             if e.downcast_ref::<client::UsageError>().is_some()
-                || e.downcast_ref::<client::CliError>().is_some() =>
+                || e.downcast_ref::<client::CliError>().is_some()
+                || e.downcast_ref::<client::ConfigurationError>().is_some() =>
         {
             report_client_error(&e);
             false
@@ -396,6 +426,12 @@ fn report_client_error(e: &anyhow::Error) {
         println!("      [<args>...]");
     } else if let Some(c) = e.downcast_ref::<client::CliError>() {
         eprintln!("{c}");
+    } else if let Some(c) = e.downcast_ref::<client::ConfigurationError>() {
+        eprintln!("{c}");
+        println!();
+        println!(
+            "Configuration should be specified as 'scheme:location'. Default configuration is 'xml:${{ARTEMIS_INSTANCE}}/etc/bootstrap.xml'"
+        );
     } else if let Some(c) = e.downcast_ref::<client::jms::ConnectFailed>() {
         eprintln!("Connection failed::{c}");
     } else if let Some(c) = e.downcast_ref::<saranga_client::Error>() {
@@ -403,31 +439,6 @@ fn report_client_error(e: &anyhow::Error) {
     } else {
         eprintln!("{e:#}");
     }
-}
-
-/// `artemis run`'s configuration URI, as `BrokerFactory` takes it: only
-/// the `xml:` scheme, naming a bootstrap file (relative to the current
-/// directory), which must exist.
-fn bootstrap_path(uri: &str) -> anyhow::Result<PathBuf> {
-    // `java.net.URI`'s scheme: a letter, then letters, digits, `+`, `-`
-    // and `.`, before the first `:`.
-    let scheme = uri.split_once(':').map(|(s, _)| s).filter(|s| {
-        s.starts_with(|c: char| c.is_ascii_alphabetic())
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
-    });
-    let Some(scheme) = scheme else {
-        bail!("Invalid configuration URI, no scheme specified: {uri}");
-    };
-    if scheme != "xml" {
-        bail!("Invalid configuration URI, can't find configuration scheme: {scheme}");
-    }
-    let path = PathBuf::from(&uri[scheme.len() + 1..]);
-    if !path.exists() {
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        bail!("Invalid configuration URI, can't find file: {name}");
-    }
-    Ok(path)
 }
 
 /// `--broker`: the broker.xml, a `file:` URI or a path.
@@ -494,7 +505,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             let etc = etc.or_else(client::instance_etc);
             let bootstrap = configuration
                 .filter(|c| !c.is_empty())
-                .map(|c| bootstrap_path(&c))
+                .map(|c| instance::bootstrap_path(&c))
                 .transpose()?;
             let mut instance = match (config, etc, bootstrap) {
                 (Some(c), _, _) => Some(instance::Instance::from_broker_xml(&c, options)?),
@@ -1203,11 +1214,41 @@ mod cli_tests {
         super::Cli::command().debug_assert();
     }
 
+    /// `data exp log-interval=0`, as Artemis's declares it.
+    #[test]
+    fn dashless_export_options() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            super::artemis_spellings(args(&[
+                "saranga",
+                "data",
+                "exp",
+                "log-interval=0",
+                "undefined-prefix",
+                "X"
+            ])),
+            args(&[
+                "saranga",
+                "data",
+                "exp",
+                "--log-interval=0",
+                "--undefined-prefix",
+                "X"
+            ])
+        );
+        let other = args(&["saranga", "data", "print", "log-interval=0"]);
+        assert_eq!(super::artemis_spellings(other.clone()), other);
+    }
+
     /// `artemis run`'s configuration URI, refused as `BrokerFactory`
     /// refuses it.
     #[test]
     fn bootstrap_uri() {
-        let error = |uri: &str| super::bootstrap_path(uri).unwrap_err().to_string();
+        let error = |uri: &str| {
+            super::instance::bootstrap_path(uri)
+                .unwrap_err()
+                .to_string()
+        };
         assert_eq!(
             error("../etc/bootstrap.xml"),
             "Invalid configuration URI, no scheme specified: ../etc/bootstrap.xml"
@@ -1221,6 +1262,6 @@ mod cli_tests {
             "Invalid configuration URI, can't find file: missing.xml"
         );
         let manifest = concat!("xml:", env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
-        assert!(super::bootstrap_path(manifest).is_ok());
+        assert!(super::instance::bootstrap_path(manifest).is_ok());
     }
 }

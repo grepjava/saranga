@@ -40,6 +40,8 @@ pub enum DataCommand {
 pub struct PrintArgs {
     #[command(flatten)]
     dirs: dirs::DataDirArgs,
+    #[command(flatten)]
+    db: dirs::DbArgs,
     /// Print the data structure without showing your data.
     #[arg(long)]
     safe: bool,
@@ -78,7 +80,9 @@ fn treat_error(result: anyhow::Result<()>) -> anyhow::Result<()> {
     match result {
         Err(e)
             if e.downcast_ref::<crate::client::CliError>().is_none()
-                && e.downcast_ref::<crate::client::UsageError>().is_none() =>
+                && e.downcast_ref::<crate::client::UsageError>().is_none()
+                && e.downcast_ref::<crate::client::ConfigurationError>()
+                    .is_none() =>
         {
             eprintln!();
             eprintln!("Error:{e:#}");
@@ -92,12 +96,20 @@ fn treat_error(result: anyhow::Result<()>) -> anyhow::Result<()> {
 /// The directories of `print` and `recover`, which `getParameterConfiguration`
 /// checks before the tool runs.
 fn parameter_dirs(args: &dirs::DataDirArgs) -> anyhow::Result<dirs::DataDirs> {
-    args.resolve()
-        .map_err(|e| crate::client::UsageError(format!("{e:#}")).into())
+    args.resolve().map_err(|e| {
+        if e.downcast_ref::<crate::client::ConfigurationError>()
+            .is_some()
+        {
+            e
+        } else {
+            crate::client::UsageError(format!("{e:#}")).into()
+        }
+    })
 }
 
 fn print(a: &PrintArgs) -> anyhow::Result<()> {
-    let _lock = dirs::CliLock::take(crate::client::instance_dir().as_deref())?;
+    let _lock = a.db.lock()?;
+    let mut out = std::io::BufWriter::new(a.db.out()?);
     let d = parameter_dirs(&a.dirs)?;
     let opts = PrintDataOptions {
         safe: a.safe,
@@ -108,8 +120,6 @@ fn print(a: &PrintArgs) -> anyhow::Result<()> {
         print_pages: Some(saranga_paging::print::print_pages),
     };
     let (bindings, journal, paging) = (d.bindings, d.journal, d.paging);
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
     saranga_protocol_amqp::describe::register();
     print_data(&mut out, &bindings, &journal, &paging, &opts)?;
     out.flush()?;
