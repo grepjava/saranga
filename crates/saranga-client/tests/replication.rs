@@ -1,6 +1,8 @@
 //! Replication between in-process Saranga brokers: a primary with data
 //! from before and after its backup registered, a primary stopped, and the
-//! backup becoming active on its copy with the same messages.
+//! backup becoming active on its copy with the same messages; then the
+//! primary restarted, copying the active backup's data and taking its node
+//! back.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +54,85 @@ async fn free_port() -> u16 {
 async fn serve(broker: &Arc<Broker>, port: u16) -> tokio::task::JoinHandle<std::io::Result<()>> {
     let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     tokio::spawn(broker.clone().serve_acceptor(listener, Acceptor::default()))
+}
+
+fn backup_config(bc: &BrokerConfig, fail_back: bool) -> BackupConfig {
+    let storage = bc.storage.clone().unwrap();
+    BackupConfig {
+        name: "backup".into(),
+        policy: saranga_config::Replication::default(),
+        cluster: bc.cluster.clone().unwrap(),
+        messages: storage.messages.clone(),
+        bindings: storage.bindings.clone(),
+        paging: storage.paging.clone(),
+        large_messages: storage.large_messages.clone(),
+        fail_back,
+    }
+}
+
+async fn wait_for_sync(primary: &Broker) {
+    for _ in 0..(WAIT.as_millis() / 20) {
+        if primary.is_replica_sync() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(primary.is_replica_sync(), "the backup never synchronized");
+}
+
+/// As the CLI stops a broker: its clients disconnected, the backup's
+/// connection left for the stop to end replication.
+async fn stop(broker: &Broker, acceptor: tokio::task::JoinHandle<std::io::Result<()>>) {
+    acceptor.abort();
+    let _ = acceptor.await;
+    for c in broker.registry().connections() {
+        if !broker.is_backup_connection(&c) {
+            c.disconnect();
+        }
+    }
+    for _ in 0..200 {
+        let registry = broker.registry();
+        let backups = registry
+            .connections()
+            .iter()
+            .filter(|c| broker.is_backup_connection(c))
+            .count();
+        if registry.registered() <= backups {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    broker.stop().unwrap();
+}
+
+async fn receive_all(port: u16, from: u32, to: u32) {
+    let conn = Connection::connect(("127.0.0.1", port), ConnectionOptions::default())
+        .await
+        .unwrap();
+    let session = conn
+        .create_session(SessionOptions::default())
+        .await
+        .unwrap();
+    let consumer = session
+        .create_consumer("replicated", None, false)
+        .await
+        .unwrap();
+    session.start().await.unwrap();
+    for i in from..to {
+        let d = consumer.receive(WAIT).await.unwrap().unwrap();
+        assert_eq!(
+            d.message.text().unwrap().as_deref(),
+            Some(format!("message {i}").as_str())
+        );
+    }
+    assert!(
+        consumer
+            .receive(Duration::from_millis(200))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    conn.close().await;
 }
 
 async fn send(session: &Session, producer: &Producer, from: u32, count: u32) {
@@ -106,25 +187,8 @@ async fn the_backup_takes_over_with_the_primarys_messages() {
     let backup_file = xml("backup", pb, pp, "<backup/>");
     let bc = config(&backup_file, bdir.path());
     let storage = bc.storage.clone().unwrap();
-    let backup = tokio::spawn(replicate(
-        BackupConfig {
-            name: "backup".into(),
-            policy: saranga_config::Replication::default(),
-            cluster: bc.cluster.clone().unwrap(),
-            messages: storage.messages.clone(),
-            bindings: storage.bindings.clone(),
-            paging: storage.paging.clone(),
-            large_messages: storage.large_messages.clone(),
-        },
-        "test",
-    ));
-    for _ in 0..(WAIT.as_millis() / 20) {
-        if primary.is_replica_sync() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(primary.is_replica_sync(), "the backup never synchronized");
+    let backup = tokio::spawn(replicate(backup_config(&bc, false), "test"));
+    wait_for_sync(&primary).await;
 
     // After: replicated as it is written. Some messages are consumed.
     send(&session, &producer, 300, 50).await;
@@ -154,18 +218,7 @@ async fn the_backup_takes_over_with_the_primarys_messages() {
         .unwrap();
 
     // The primary stops.
-    acceptor.abort();
-    let _ = acceptor.await;
-    for c in primary.registry().connections() {
-        c.disconnect();
-    }
-    for _ in 0..200 {
-        if primary.registry().all_closed() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    primary.stop().unwrap();
+    stop(&primary, acceptor).await;
     let node_id = tokio::time::timeout(WAIT, backup)
         .await
         .expect("the backup did not take over")
@@ -222,4 +275,106 @@ async fn the_backup_takes_over_with_the_primarys_messages() {
     conn.close().await;
     acceptor.abort();
     active.stop().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_restarted_primary_takes_its_node_back() {
+    let pdir = tempfile::tempdir().unwrap();
+    let bdir = tempfile::tempdir().unwrap();
+    let (pp, pb) = (free_port().await, free_port().await);
+    let primary_file = xml(
+        "primary",
+        pp,
+        pb,
+        "<primary><check-for-active-server>true</check-for-active-server></primary>",
+    );
+    let backup_file = xml(
+        "backup",
+        pb,
+        pp,
+        "<backup><allow-failback>true</allow-failback></backup>",
+    );
+    let send_some = |port: u16, from: u32, count: u32| async move {
+        let conn = Connection::connect(("127.0.0.1", port), ConnectionOptions::default())
+            .await
+            .unwrap();
+        let session = conn
+            .create_session(SessionOptions {
+                auto_commit_sends: false,
+                ..SessionOptions::default()
+            })
+            .await
+            .unwrap();
+        if from == 0 {
+            session
+                .create_queue(
+                    QueueConfiguration::new("replicated")
+                        .routing_type(RoutingType::Anycast)
+                        .durable(true),
+                )
+                .await
+                .unwrap();
+        }
+        let producer = session.create_producer(Some("replicated")).await.unwrap();
+        send(&session, &producer, from, count).await;
+        conn.close().await;
+    };
+
+    // A primary with messages, and its backup, which takes over.
+    let pc = config(&primary_file, pdir.path());
+    let primary = Broker::start(config(&primary_file, pdir.path()))
+        .await
+        .unwrap();
+    let acceptor = serve(&primary, pp).await;
+    send_some(pp, 0, 20).await;
+    let bc = config(&backup_file, bdir.path());
+    let backup = tokio::spawn(replicate(backup_config(&bc, false), "test"));
+    wait_for_sync(&primary).await;
+    stop(&primary, acceptor).await;
+    let node_id = tokio::time::timeout(WAIT, backup)
+        .await
+        .expect("the backup did not take over")
+        .unwrap()
+        .unwrap();
+
+    // The backup, active, gets more messages.
+    let lock_dir = bc.storage.as_ref().unwrap().messages.directory.clone();
+    saranga_server::node::write_node_id(&lock_dir, &node_id).unwrap();
+    let mut active_config = config(&backup_file, bdir.path());
+    let saranga_config::HaPolicy::ReplicationBackup(policy) = active_config.ha.policy.clone()
+    else {
+        panic!("{:?}", active_config.ha.policy)
+    };
+    active_config.ha.policy = saranga_config::HaPolicy::ReplicationPrimary(policy);
+    let active = Broker::start(active_config).await.unwrap();
+    let active_acceptor = serve(&active, pb).await;
+    send_some(pb, 20, 10).await;
+
+    // The primary starts again: its node is active on the backup, so it
+    // copies the backup's data and asks for its node back.
+    let cluster = pc.cluster.clone().unwrap();
+    use saranga_server::replication::backup::is_node_id_used;
+    assert!(is_node_id_used(&cluster, &node_id).await);
+    assert!(!is_node_id_used(&cluster, "no-such-node").await);
+    let failing_back = tokio::spawn(replicate(backup_config(&pc, true), "test"));
+    tokio::time::timeout(Duration::from_secs(30), active.failback_requested())
+        .await
+        .expect("the active backup never handed back");
+    stop(&active, active_acceptor).await;
+    let back = tokio::time::timeout(WAIT, failing_back)
+        .await
+        .expect("the primary did not take over")
+        .unwrap()
+        .unwrap();
+    assert_eq!(back, node_id);
+
+    // The primary, active again with everything.
+    let primary = Broker::start(config(&primary_file, pdir.path()))
+        .await
+        .unwrap();
+    assert_eq!(primary.node_id(), node_id);
+    let acceptor = serve(&primary, pp).await;
+    receive_all(pp, 0, 30).await;
+    acceptor.abort();
+    primary.stop().unwrap();
 }

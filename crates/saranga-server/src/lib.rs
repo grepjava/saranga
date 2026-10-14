@@ -922,6 +922,7 @@ impl Broker {
         if let Some(c) = &self.cluster {
             c.stop();
         }
+        self.stop_replicating();
         self.large_messages.stop();
         self.post_office.paging().stop();
         if let Some(s) = &self.storage {

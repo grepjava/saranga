@@ -18,7 +18,11 @@
 #      written.
 #   3. The primary is killed: the backup becomes active with what was left
 #      on the primary, the client fails over to it, and the CLI consumes
-#      the rest there.
+#      and produces there.
+#   4. The primary starts again (check-for-active-server): its node is
+#      active on the backup, so it copies the backup's data as a backup;
+#      the backup (allow-failback) hands back and replicates it again, and
+#      the client fails back. The CLI consumes the rest on the primary.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -106,7 +110,7 @@ declare -A SEEN
 said() {
   local who="$1" dir="$2" from="${SEEN[$1]:-0}"
   local lines
-  lines="$(grep -o -E 'AMQ22(1000|1002|1007|1010|1024|1031|1034|1035|1037|1109|2162)[^,]*' "$dir/log/artemis.log")"
+  lines="$(grep -o -E 'AMQ22(1000|1002|1007|1010|1024|1031|1034|1035|1037|1039|1109|2162)[^,]*' "$dir/log/artemis.log")"
   SEEN[$who]="$(printf '%s\n' "$lines" | grep -c .)"
   printf '%s\n' "$lines" | tail -n +"$((from + 1))" | grep . \
     | sed -E -e 's/(Apache Artemis|Saranga) Backup Server version [0-9.]+ \[[^]]*\]/BACKUP [ID]/' \
@@ -131,13 +135,16 @@ produce() {
 consume() {
   local dir="$1" port="$2" count="$3"
   instance "$dir" consumer --user admin --password admin --url "tcp://localhost:$port" \
-    --destination queue://cli --message-count "$count" --receive-timeout 5000 \
+    --destination queue://cli --message-count "$count" --receive-timeout 5000 --break-on-null \
     | grep -o "Consumed: .*"
 }
 
 suite() {
   make_instance "$PRIMARY" "$P" 2000 "$PORTB"
   make_instance "$BACKUP" "$B" 2100 "$PORTP" --backup
+  # Failback both ways.
+  perl -0pi -e 's|(<vote-on-replication-failure>true</vote-on-replication-failure>)|$1\n               <check-for-active-server>true</check-for-active-server>|' "$P/etc/broker.xml"
+  perl -0pi -e 's|<backup/>|<backup>\n               <allow-failback>true</allow-failback>\n            </backup>|' "$B/etc/broker.xml"
 
   # 1. Data before the backup.
   step "artemis run (primary)"
@@ -154,9 +161,9 @@ suite() {
   said backup "$B"
 
   # 2. Replicated as written.
-  step "Failover.java failover-once (in the background)"
+  step "Failover.java failover (in the background)"
   local out="$WORK/client.out"
-  client failover-once "tcp://localhost:$PORTP?ha=true&reconnectAttempts=-1&retryInterval=500" "$(native "$MARK")" 10 > "$out" &
+  client failover "tcp://localhost:$PORTP?ha=true&reconnectAttempts=-1&retryInterval=500" "$(native "$MARK")" 10 > "$out" &
   CLIENT_PID=$!
   wait_for "$out" "sent 10" && echo "client: sent 10"
   step "artemis producer (primary) 10, consumer 5"
@@ -170,16 +177,32 @@ suite() {
   wait_up "$PORTB" && wait_for "$B/log/artemis.log" AMQ221007 && echo "backup: listening"
   said backup "$B"
   touch "$MARK.1"
+  wait_for "$out" "sent 10" 2 && echo "client: failed over"
+  step "artemis consumer (backup) 20, producer (backup) 5"
+  consume "$B" "$PORTB" 20
+  produce "$B" "$PORTB" --message-count 5
+
+  # 4. Failback.
+  step "artemis run (primary, check-for-active-server)"
+  launch "$P"
+  wait_for "$P/log/artemis.log" AMQ221007 2 && wait_up "$PORTP" && echo "primary: active again"
+  wait_for "$B/log/artemis.log" AMQ221024 2 && wait_for "$B/log/artemis.log" AMQ221031 2 \
+    && echo "backup: synchronized again"
+  said primary "$P"
+  said backup "$B"
+  touch "$MARK.2"
   wait "$CLIENT_PID"
   CLIENT_PID=
   grep -E "^(failover event|received|sent|unexpected)" "$out" | sed 's/^/client: /'
-  step "artemis consumer (backup) 27, then 1"
-  consume "$B" "$PORTB" 27
-  consume "$B" "$PORTB" 1
+  step "artemis consumer (primary) 12, then 1"
+  consume "$P" "$PORTP" 12
+  consume "$P" "$PORTP" 1
 
-  step "artemis stop (backup)"
+  step "artemis stop (backup), artemis stop (primary)"
   instance "$B" stop > /dev/null
-  wait_down "$PORTB" && echo "backup: down"
+  sleep 3
+  instance "$P" stop > /dev/null
+  wait_down "$PORTP" && echo "primary: down"
 }
 
 OUT="$(mktemp)"

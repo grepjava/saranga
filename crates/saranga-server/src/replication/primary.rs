@@ -15,8 +15,9 @@ use saranga_core_protocol::packets::cluster::{
     BackupRegistrationMessage, BackupReplicationStartFailedMessage, backup_registration_problem,
 };
 use saranga_core_protocol::packets::replication::{
-    JournalContent, ReplicationPageEventMessage, ReplicationStartSyncMessage,
-    ReplicationSyncFileMessage, SyncData, SyncDataType, SyncFileChunk, SyncFileType,
+    JournalContent, PrimaryStopping, ReplicationPageEventMessage,
+    ReplicationPrimaryIsStoppingMessage, ReplicationStartSyncMessage, ReplicationSyncFileMessage,
+    SyncData, SyncDataType, SyncFileChunk, SyncFileType,
 };
 
 use super::{BINDINGS, JournalReplicator, MESSAGES, Replicator, lock};
@@ -65,10 +66,14 @@ impl Broker {
         let broker = self.clone();
         let replicator = r.clone();
         let timeout = Duration::from_millis(policy.initial_replication_sync_timeout.max(1) as u64);
+        // A primary restarted after its backup took over asks for its node
+        // back; this broker hands back if its policy allows it.
+        let fail_back = msg.backup_wants_fail_back && policy.allow_failback;
         tokio::spawn(async move {
             let b = broker.clone();
             let rr = replicator.clone();
-            let synced = tokio::task::spawn_blocking(move || b.synchronize(&rr, timeout)).await;
+            let synced =
+                tokio::task::spawn_blocking(move || b.synchronize(&rr, timeout, fail_back)).await;
             match synced {
                 Ok(Ok(())) => {
                     // `clusterConnection.nodeAnnounced`: the backup pairs
@@ -83,6 +88,9 @@ impl Broker {
                             Some(msg.connector),
                             true,
                         );
+                        if fail_back {
+                            broker.hand_back(cluster.clone(), replicator).await;
+                        }
                     }
                 }
                 Ok(Err(e)) => {
@@ -102,7 +110,12 @@ impl Broker {
     }
 
     /// `startReplication`'s synchronization, on a blocking thread.
-    fn synchronize(&self, r: &Arc<Replicator>, timeout: Duration) -> std::io::Result<()> {
+    fn synchronize(
+        &self,
+        r: &Arc<Replicator>,
+        timeout: Duration,
+        fail_back: bool,
+    ) -> std::io::Result<()> {
         let storage = self
             .storage
             .clone()
@@ -112,7 +125,8 @@ impl Broker {
         let start =
             |content: SyncDataType, ids: Vec<i64>, node_id: &str| ReplicationStartSyncMessage {
                 synchronization_is_finished: false,
-                allows_auto_fail_back: false,
+                // Only the journals' say whether this broker will hand back.
+                allows_auto_fail_back: fail_back && content != SyncDataType::LargeMessages,
                 node_id: node_id.into(),
                 data: Some(SyncData {
                     data_type: content,
@@ -235,6 +249,71 @@ impl Broker {
         r.synchronized
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// `startReplication` after a failback request: once the backup has
+    /// announced itself with this node ID (`BackupTopologyListener`, a
+    /// minute at most), this broker stops as if it failed, telling the
+    /// backup to take over (`fail(true)`), and starts again as its backup.
+    async fn hand_back(
+        self: &Arc<Self>,
+        cluster: Arc<crate::cluster::ClusterConnection>,
+        r: Arc<Replicator>,
+    ) {
+        let listener =
+            crate::cluster::FailbackListener::new(&self.node_id, cluster.connector().clone());
+        let _subscription = crate::cluster::Subscription::new(&cluster, listener.clone());
+        if !listener.wait(Duration::from_secs(60)).await {
+            tracing::error!(
+                "AMQ224057: Backup server that requested fail-back was not announced. Server will not stop for fail-back."
+            );
+            return;
+        }
+        if r.is_stopped() || self.is_stopped() {
+            return;
+        }
+        // `sendPrimaryIsStopping`, the first thing `stop` does when
+        // failing over.
+        r.send(
+            ReplicationPrimaryIsStoppingMessage {
+                primary_stopping: PrimaryStopping::StopCalled,
+            },
+            None,
+        );
+        self.failing_back
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.failback.notify_one();
+    }
+
+    /// The storage's stop with replication: when failing back, the backup
+    /// is told to take over (`FAIL_OVER`, five seconds at most for its
+    /// answer); then nothing more is replicated and its connection closes.
+    pub(crate) fn stop_replicating(&self) {
+        let Some(r) = lock(&self.replicating).clone() else {
+            return;
+        };
+        if self.failing_back.load(std::sync::atomic::Ordering::Acquire) && !r.is_stopped() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            r.send(
+                ReplicationPrimaryIsStoppingMessage {
+                    primary_stopping: PrimaryStopping::FailOver,
+                },
+                Some(Box::new(move |_| {
+                    let _ = tx.send(());
+                })),
+            );
+            let _ = rx.recv_timeout(Duration::from_secs(5));
+        }
+        self.replication_stopped(&r);
+        conn_fail(&r);
+    }
+
+    /// The connection of the backup this broker replicates to, which
+    /// `freeze` leaves open while the clients' close.
+    pub fn is_backup_connection(&self, c: &Arc<crate::session::ClientConnection>) -> bool {
+        lock(&self.replicating)
+            .as_ref()
+            .is_some_and(|r| Arc::ptr_eq(&r.conn.client, c))
     }
 
     /// `ReplicationFailureListener`: the backup's connection is gone. The

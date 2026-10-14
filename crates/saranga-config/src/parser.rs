@@ -608,14 +608,18 @@ fn parse_replication(
                 reason: "a backup does not scale down; it becomes active on its copy of the primary's data",
             });
         }
-    } else if let Some(c) = first(n, "check-for-live-server") {
-        warnings.push(Warning::Deprecated {
-            name: "check-for-live-server".to_owned(),
-            alternative: "check-for-active-server",
-        });
-        r.check_for_active_server = node_bool(c);
     } else {
-        r.check_for_active_server = bool_or("check-for-active-server", false);
+        // `ReplicatedPolicy.allowAutoFailBack`, which nothing configures.
+        r.allow_failback = true;
+        if let Some(c) = first(n, "check-for-live-server") {
+            warnings.push(Warning::Deprecated {
+                name: "check-for-live-server".to_owned(),
+                alternative: "check-for-active-server",
+            });
+            r.check_for_active_server = node_bool(c);
+        } else {
+            r.check_for_active_server = bool_or("check-for-active-server", false);
+        }
     }
     Ok(r)
 }

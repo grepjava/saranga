@@ -420,7 +420,9 @@ pub struct Replication {
     pub cluster_name: Option<String>,
     /// `check-for-active-server` (primary).
     pub check_for_active_server: bool,
-    /// `allow-failback` (backup).
+    /// `allow-failback` (backup): once active, it hands back to a primary
+    /// that restarts and asks for it. A primary always does
+    /// (`ReplicatedPolicy.allowAutoFailBack`).
     pub allow_failback: bool,
     /// `restart-backup` (backup).
     pub restart_backup: bool,

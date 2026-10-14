@@ -281,7 +281,18 @@ fn replication_policies() {
         (r.quorum_size, r.initial_replication_sync_timeout),
         (3, 9000)
     );
+    // A primary hands back to a restarted primary; it checks for one
+    // active with its node ID only when told to.
+    assert!(r.allow_failback && !r.check_for_active_server);
     assert!(!c.ha_policy.is_backup());
+
+    let c = parse(
+        "<configuration><core><ha-policy><replication><backup></backup></replication></ha-policy></core></configuration>",
+    );
+    let HaPolicy::ReplicationBackup(r) = &c.ha_policy else {
+        panic!("{:?}", c.ha_policy)
+    };
+    assert!(!r.allow_failback);
 
     let c = parse(
         "<configuration><core><ha-policy><replication><slave>           <allow-failback>true</allow-failback><max-saved-replicated-journals-size>0</max-saved-replicated-journals-size>         </slave></replication></ha-policy></core></configuration>",

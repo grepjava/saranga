@@ -44,6 +44,9 @@ pub struct BackupConfig {
     pub bindings: JournalConfig,
     pub paging: PathBuf,
     pub large_messages: PathBuf,
+    /// `attemptFailBack`: a primary that found its node active elsewhere
+    /// copies the active broker's data, asking it to hand back once done.
+    pub fail_back: bool,
 }
 
 /// `SharedNothingBackupActivation.run` up to the activation: returns the
@@ -155,6 +158,70 @@ async fn try_locate(
     }
 }
 
+/// `SharedNothingPrimaryActivation.isNodeIdUsed`: whether a broker of the
+/// cluster is active with this node ID, as an active backup is after its
+/// primary failed. The cluster connection's brokers are asked for their
+/// topology, and the broker it names for the node must take a session.
+pub async fn is_node_id_used(cluster: &ClusterConfig, node_id: &str) -> bool {
+    let options = ConnectionOptions {
+        reconnect_attempts: 0,
+        ..options(cluster)
+    };
+    for target in &cluster.static_connectors {
+        let Some((host, port)) = crate::cluster::socket_address(target) else {
+            continue;
+        };
+        // `listener.latch.await(5, SECONDS)`.
+        let connected = tokio::time::timeout(
+            Duration::from_secs(5),
+            Connection::connect((host.as_str(), port), options.clone()),
+        )
+        .await;
+        let Ok(Ok(conn)) = connected else {
+            continue;
+        };
+        let primary = conn
+            .topology()
+            .into_iter()
+            .find(|(id, _, _)| id == node_id)
+            .and_then(|(_, primary, _)| primary);
+        conn.close().await;
+        return match primary {
+            Some(p) => is_active(cluster, &p).await,
+            None => false,
+        };
+    }
+    false
+}
+
+/// `NodeIdListener.isActive`: a session as the cluster user.
+async fn is_active(cluster: &ClusterConfig, primary: &Connector) -> bool {
+    let options = ConnectionOptions {
+        reconnect_attempts: 0,
+        user: Some(cluster.cluster_user.clone()),
+        password: Some(cluster.cluster_password.clone()),
+        ..ConnectionOptions::default()
+    };
+    let session = async {
+        let conn = Connection::connect((primary.host.as_str(), primary.port), options)
+            .await
+            .ok()?;
+        let session = conn
+            .create_session(saranga_client::SessionOptions {
+                username: Some(cluster.cluster_user.clone()),
+                password: Some(cluster.cluster_password.clone()),
+                ..saranga_client::SessionOptions::default()
+            })
+            .await;
+        conn.close().await;
+        session.ok()
+    };
+    matches!(
+        tokio::time::timeout(Duration::from_secs(5), session).await,
+        Ok(Some(_))
+    )
+}
+
 /// One replication from a primary: registration, then the copy, until
 /// the connection goes or the primary says it stops.
 async fn attempt(cfg: &BackupConfig, conn: Connection, primary_node: String) -> io::Result<Signal> {
@@ -165,7 +232,7 @@ async fn attempt(cfg: &BackupConfig, conn: Connection, primary_node: String) -> 
         BackupRegistrationMessage {
             cluster_user: cfg.cluster.cluster_user.as_str().into(),
             cluster_password: cfg.cluster.cluster_password.as_str().into(),
-            backup_wants_fail_back: false,
+            backup_wants_fail_back: cfg.fail_back,
             connector: cfg.cluster.connector.clone(),
         }
         .into(),
@@ -174,9 +241,17 @@ async fn attempt(cfg: &BackupConfig, conn: Connection, primary_node: String) -> 
     let sender = conn.clone();
     let c = cfg.clone();
     let (synced, mut synced_rx) = tokio::sync::watch::channel(None);
+    // Dropped with this future when the broker stops while it is a
+    // backup: the endpoint's thread then lets go of the connection.
+    let (_running, stopped) = tokio::sync::watch::channel(());
+    let incoming = Incoming {
+        packets,
+        stopped,
+        handle: tokio::runtime::Handle::current(),
+    };
     let mut endpoint = tokio::task::spawn_blocking(move || {
         let mut e = Endpoint::new(c, synced);
-        let end = e.run(packets, &sender);
+        let end = e.run(incoming, &sender);
         (e, end)
     });
     // `BackupManager.announceBackup`, once the copy is complete.
@@ -221,6 +296,7 @@ async fn attempt(cfg: &BackupConfig, conn: Connection, primary_node: String) -> 
     }
     match end {
         End::PrimaryStopping(PrimaryStopping::FailOver) => Ok(Signal::FailOver(node_id)),
+        End::Stopped => Ok(Signal::Retry),
         End::PrimaryStopping(PrimaryStopping::StopCalled) | End::Disconnected => {
             if matches!(end, End::Disconnected) && !primary_is_down(cfg, &node_id, topology).await {
                 tracing::info!("AMQ221070: Restarting as backup based on quorum vote results.");
@@ -293,6 +369,8 @@ fn connector_transport(c: &Connector) -> saranga_core_protocol::transport::Trans
 /// How the replication ended.
 enum End {
     Disconnected,
+    /// The broker stopped while it was a backup.
+    Stopped,
     PrimaryStopping(PrimaryStopping),
 }
 
@@ -336,29 +414,19 @@ impl Endpoint {
 
     /// Handles packets until the connection goes, or the primary says it
     /// stops for good.
-    fn run(
-        &mut self,
-        mut packets: tokio::sync::mpsc::UnboundedReceiver<Packet>,
-        conn: &Connection,
-    ) -> End {
+    fn run(&mut self, mut incoming: Incoming, conn: &Connection) -> End {
         let mut stop_called: Option<std::time::Instant> = None;
         loop {
-            let packet = match stop_called {
-                None => match packets.blocking_recv() {
-                    Some(p) => p,
-                    None => return End::Disconnected,
-                },
-                // STOP_CALLED: the backup fails over once the primary has
-                // stopped, or after a minute at most.
-                Some(at) => {
-                    let left = WAIT_AFTER_STOP_CALLED.saturating_sub(at.elapsed());
-                    match recv_timeout(&mut packets, left) {
-                        Recv::Packet(p) => *p,
-                        Recv::Closed | Recv::TimedOut => {
-                            return End::PrimaryStopping(PrimaryStopping::StopCalled);
-                        }
-                    }
+            // STOP_CALLED: the backup fails over once the primary has
+            // stopped, or after a minute at most.
+            let left = stop_called.map(|at| WAIT_AFTER_STOP_CALLED.saturating_sub(at.elapsed()));
+            let packet = match incoming.recv(left) {
+                Recv::Packet(p) => *p,
+                Recv::Stopped => return End::Stopped,
+                Recv::Closed | Recv::TimedOut if stop_called.is_some() => {
+                    return End::PrimaryStopping(PrimaryStopping::StopCalled);
                 }
+                Recv::Closed | Recv::TimedOut => return End::Disconnected,
             };
             let stopping = match &packet {
                 Packet::ReplicationPrimaryIsStoppingMessage(m) => Some(m.primary_stopping),
@@ -546,6 +614,9 @@ impl Endpoint {
                 } else {
                     1
                 };
+                if self.cfg.fail_back && !m.allows_auto_fail_back {
+                    tracing::error!("AMQ224056: Primary server will not fail-back automatically");
+                }
                 let node_id = m.node_id.to_string_lossy();
                 if !node_id.is_empty() {
                     self.node_id = Some(node_id);
@@ -704,21 +775,42 @@ enum Recv {
     Packet(Box<Packet>),
     Closed,
     TimedOut,
+    Stopped,
 }
 
-/// `blocking_recv` with a timeout, polling.
-fn recv_timeout(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Packet>, timeout: Duration) -> Recv {
-    let until = std::time::Instant::now() + timeout;
-    loop {
-        match rx.try_recv() {
-            Ok(p) => return Recv::Packet(Box::new(p)),
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return Recv::Closed,
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-        }
-        if std::time::Instant::now() >= until {
-            return Recv::TimedOut;
-        }
-        std::thread::sleep(Duration::from_millis(20));
+/// The replication channel's packets, as the endpoint's thread waits for
+/// them.
+struct Incoming {
+    packets: tokio::sync::mpsc::UnboundedReceiver<Packet>,
+    /// Closed when the broker stops.
+    stopped: tokio::sync::watch::Receiver<()>,
+    handle: tokio::runtime::Handle,
+}
+
+impl Incoming {
+    /// The next packet, within `timeout` if there is one.
+    fn recv(&mut self, timeout: Option<Duration>) -> Recv {
+        let Self {
+            packets,
+            stopped,
+            handle,
+        } = self;
+        handle.block_on(async {
+            let limit = async {
+                match timeout {
+                    Some(t) => tokio::time::sleep(t).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                p = packets.recv() => match p {
+                    Some(p) => Recv::Packet(Box::new(p)),
+                    None => Recv::Closed,
+                },
+                _ = stopped.changed() => Recv::Stopped,
+                _ = limit => Recv::TimedOut,
+            }
+        })
     }
 }
 

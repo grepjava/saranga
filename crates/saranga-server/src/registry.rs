@@ -110,6 +110,11 @@ impl Registry {
         lock(&self.connections).is_empty()
     }
 
+    /// How many connections are registered, failed ones included.
+    pub fn registered(&self) -> usize {
+        lock(&self.connections).len()
+    }
+
     pub fn connection(&self, id: &str) -> Option<Arc<ClientConnection>> {
         self.connections().into_iter().find(|c| c.id() == id)
     }

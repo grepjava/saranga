@@ -932,10 +932,13 @@ struct Started {
 }
 
 /// `ActiveMQServerImpl.internalStart` as `run` does it: the configuration
-/// read, the broker started and its acceptors bound.
+/// read, the broker started and its acceptors bound. `as_backup`: a
+/// replicating broker that handed back to its restarted primary starts
+/// again as its backup, whatever its configured role.
 async fn boot(
     instance: Option<&instance::Instance>,
     bind: Option<SocketAddr>,
+    as_backup: bool,
 ) -> anyhow::Result<Started> {
     let at = std::time::Instant::now();
     *BOOT_STARTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(at);
@@ -947,7 +950,7 @@ async fn boot(
             let file = instance.broker_config()?;
             tracing::info!(
                 "AMQ221000: {} message broker is starting with configuration Broker Configuration (clustered={},journalDirectory={},bindingsDirectory={},largeMessagesDirectory={},pagingDirectory={})",
-                if file.ha_policy.is_backup() {
+                if file.ha_policy.is_backup() || as_backup {
                     "Backup"
                 } else {
                     "Primary"
@@ -1018,9 +1021,15 @@ async fn boot(
     });
     // A replicating backup copies its primary until the primary fails, then
     // starts as a replicating primary on its copy, with the primary's node ID.
-    if let Some(saranga_config::HaPolicy::ReplicationBackup(policy)) =
-        file_config.as_ref().map(|f| &f.ha_policy)
-        && let (Some(storage), Some(dir)) = (&broker_config.storage, &lock_dir)
+    if let (Some(storage), Some(dir), Some(file)) =
+        (&broker_config.storage, &lock_dir, file_config.as_ref())
+        && let Some((backup_policy, fail_back, active_policy)) = replica_role(
+            &file.ha_policy,
+            as_backup,
+            dir,
+            broker_config.cluster.as_ref(),
+        )
+        .await?
     {
         let Some(cluster) = broker_config.cluster.clone() else {
             anyhow::bail!("a replicating backup needs a cluster-connection to find its primary");
@@ -1034,12 +1043,13 @@ async fn boot(
         let node_id = saranga_server::replication::backup::replicate(
             saranga_server::replication::backup::BackupConfig {
                 name: broker_config.management.name.clone(),
-                policy: policy.clone(),
+                policy: backup_policy,
                 cluster,
                 messages: storage.messages.clone(),
                 bindings: storage.bindings.clone(),
                 paging: storage.paging.clone(),
                 large_messages: storage.large_messages.clone(),
+                fail_back,
             },
             VERSION,
         )
@@ -1053,7 +1063,7 @@ async fn boot(
             "AMQ221037: Saranga::name={} to become 'active'",
             broker_config.management.name
         );
-        broker_config.ha.policy = saranga_config::HaPolicy::ReplicationPrimary(policy.clone());
+        broker_config.ha.policy = saranga_config::HaPolicy::ReplicationPrimary(active_policy);
     }
     let backup = match (&lock_dir, &file_config) {
         (Some(dir), Some(file))
@@ -1104,6 +1114,63 @@ async fn boot(
         backup: backup.is_some(),
         lock_dir,
     })
+}
+
+/// Whether this start replicates another broker's data before it is
+/// active: the policy it replicates with, whether it asks for failback,
+/// and the policy it is then active with. A configured backup
+/// (`ReplicaPolicy`) is active with `check-for-active-server` off and its
+/// own `allow-failback`. A primary is a backup when it starts again after
+/// handing back, or, with `check-for-active-server`, when a broker of the
+/// cluster is active with its node ID (`isNodeIdUsed`); it asks that broker
+/// to hand back, and is active again with its own policy.
+async fn replica_role(
+    policy: &saranga_config::HaPolicy,
+    as_backup: bool,
+    dir: &Path,
+    cluster: Option<&saranga_server::cluster::ClusterConfig>,
+) -> anyhow::Result<
+    Option<(
+        saranga_config::Replication,
+        bool,
+        saranga_config::Replication,
+    )>,
+> {
+    use saranga_config::HaPolicy;
+    let primary = match policy {
+        HaPolicy::ReplicationBackup(p) => {
+            let active = saranga_config::Replication {
+                check_for_active_server: false,
+                ..p.clone()
+            };
+            return Ok(Some((p.clone(), false, active)));
+        }
+        HaPolicy::ReplicationPrimary(p) => p,
+        _ => return Ok(None),
+    };
+    // `ReplicatedPolicy.getReplicaPolicy`.
+    let replica = saranga_config::Replication {
+        allow_failback: false,
+        restart_backup: true,
+        ..primary.clone()
+    };
+    if as_backup {
+        return Ok(Some((replica, false, primary.clone())));
+    }
+    let Some(cluster) = cluster.filter(|_| primary.check_for_active_server) else {
+        return Ok(None);
+    };
+    let d = dir.to_path_buf();
+    let node_id = tokio::task::spawn_blocking(move || {
+        saranga_server::node::NodeManager::open(&d, None).map(|n| n.node_id())
+    })
+    .await?
+    .context("the primary's server.lock")?;
+    if saranga_server::replication::backup::is_node_id_used(cluster, &node_id).await {
+        Ok(Some((replica, true, primary.clone())))
+    } else {
+        Ok(None)
+    }
 }
 
 /// `SharedStoreBackupActivation.run` up to the activation: the backup lock,
@@ -1255,7 +1322,7 @@ async fn run(
     // A backup waits here for its primary to fail, and a primary for the
     // lock another broker holds; a stop ends the wait.
     let started = tokio::select! {
-        s = boot(instance.as_deref(), bind) => s?,
+        s = boot(instance.as_deref(), bind, false) => s?,
         _ = tokio::signal::ctrl_c() => {
             stopped_waiting();
             return Ok(());
@@ -1321,26 +1388,40 @@ async fn run(
         if failback {
             // The FailbackChecker's restart: stopped as if failed, so the
             // primary takes the lock; once it is active, a backup again.
+            // A replicating broker hands back to the primary it replicates
+            // to, and replicates it again at once.
             let Some(s) = running.take() else { continue };
             stop_broker(&s.broker, s.file.as_ref()).await?;
             stopped(&s);
-            let restart = matches!(
-                s.file.as_ref().map(|f| &f.ha_policy),
-                Some(saranga_config::HaPolicy::SharedStoreBackup {
-                    restart_backup: true,
-                    ..
-                })
-            );
+            let replicating = s
+                .file
+                .as_ref()
+                .is_some_and(|f| f.ha_policy.replication().is_some());
+            let restart = replicating
+                || matches!(
+                    s.file.as_ref().map(|f| &f.ha_policy),
+                    Some(saranga_config::HaPolicy::SharedStoreBackup {
+                        restart_backup: true,
+                        ..
+                    })
+                );
             let Some(dir) = s.lock_dir.clone() else {
                 continue;
             };
+            if replicating {
+                tracing::info!(
+                    "AMQ221039: Restarting as replicating backup server after primary restart"
+                );
+            }
             let rebooted = tokio::select! {
                 r = async {
-                    await_active_primary(dir).await?;
+                    if !replicating {
+                        await_active_primary(dir).await?;
+                    }
                     if !restart {
                         return Ok(None);
                     }
-                    boot(instance.as_deref(), bind).await.map(Some)
+                    boot(instance.as_deref(), bind, replicating).await.map(Some)
                 } => r?,
                 _ = tokio::signal::ctrl_c() => {
                     stopped_waiting();
@@ -1381,7 +1462,7 @@ async fn run(
                 tracing::info!(
                     "AMQ201000: Network is healthy, starting service ActiveMQServerImpl::name={name}"
                 );
-                match boot(instance.as_deref(), bind).await {
+                match boot(instance.as_deref(), bind, false).await {
                     Ok(s) => {
                         current.set(s.broker.clone());
                         announce(instance.as_ref(), &s);
@@ -1450,12 +1531,24 @@ fn stopped(s: &Started) {
 /// rest of the broker stops.
 async fn close_connections(broker: &saranga_server::Broker) {
     broker.close_unestablished();
-    // `freeze`: Core clients are told the node is going.
+    // `freeze`: Core clients are told the node is going. The backup's
+    // connection stays for the broker's stop to end replication.
     for c in broker.registry().connections() {
-        c.disconnect();
+        if !broker.is_backup_connection(&c) {
+            c.disconnect();
+        }
     }
     let closed = async {
-        while !broker.registry().all_closed() {
+        loop {
+            let registry = broker.registry();
+            let backups = registry
+                .connections()
+                .iter()
+                .filter(|c| broker.is_backup_connection(c))
+                .count();
+            if registry.registered() <= backups {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     };
