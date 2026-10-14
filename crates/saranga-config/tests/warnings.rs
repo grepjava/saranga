@@ -48,9 +48,8 @@ fn features_not_acted_on_are_reported() {
 }
 
 #[test]
-fn colocated_backups_pluggable_quorum_and_jdbc_are_refused() {
+fn colocated_backups_and_jdbc_are_refused() {
     for xml in [
-        "<ha-policy><replication><backup><manager/></backup></replication></ha-policy>",
         "<ha-policy><replication><colocated/></replication></ha-policy>",
         "<ha-policy><shared-store><colocated/></shared-store></ha-policy>",
         "<store><database-store><jdbc-connection-url>x</jdbc-connection-url></database-store></store>",
@@ -307,4 +306,61 @@ fn replication_policies() {
         (12, 5000, 30)
     );
     assert!(c.ha_policy.is_backup());
+}
+
+#[test]
+fn pluggable_replication_policies() {
+    let c = parse(
+        r#"<configuration><core><ha-policy><replication><primary>
+             <manager>
+               <properties>
+                 <property key="connect-string" value="127.0.0.1:6666,127.0.0.1:6667"/>
+                 <property key="session-ms" value="4000"/>
+               </properties>
+             </manager>
+             <coordination-id>peer-journal-001</coordination-id>
+           </primary></replication></ha-policy></core></configuration>"#,
+    );
+    let HaPolicy::ReplicationPrimary(r) = &c.ha_policy else {
+        panic!("{:?}", c.ha_policy)
+    };
+    let m = r.manager.as_ref().expect("a manager");
+    assert_eq!(
+        m.class_name,
+        "org.apache.activemq.artemis.lockmanager.zookeeper.CuratorDistributedLockManager"
+    );
+    assert_eq!(
+        m.properties["connect-string"],
+        "127.0.0.1:6666,127.0.0.1:6667"
+    );
+    assert_eq!(m.properties["session-ms"], "4000");
+    // `setCoordinationId`: dashes made dots; a primary never hands back.
+    assert_eq!(r.coordination_id.as_deref(), Some("peer.journal.001"));
+    assert!(!r.allow_failback);
+    assert_eq!(r.retry_replication_wait, 2000);
+
+    let c = parse(
+        r#"<configuration><core><ha-policy><replication><backup>
+             <manager><class-name>org.apache.activemq.artemis.lockmanager.file.FileBasedLockManager</class-name>
+               <properties><property key="locks-folder" value="/tmp/locks"/></properties></manager>
+             <allow-failback>true</allow-failback>
+           </backup></replication></ha-policy></core></configuration>"#,
+    );
+    let HaPolicy::ReplicationBackup(r) = &c.ha_policy else {
+        panic!("{:?}", c.ha_policy)
+    };
+    assert!(r.allow_failback);
+    assert_eq!(
+        r.manager.as_ref().unwrap().properties["locks-folder"],
+        "/tmp/locks"
+    );
+
+    let c = parse(
+        "<configuration><core><ha-policy><replication><primary><manager/><coordination-id>abc</coordination-id></primary></replication></ha-policy></core></configuration>",
+    );
+    let HaPolicy::ReplicationPrimary(r) = &c.ha_policy else {
+        panic!()
+    };
+    assert_eq!(r.coordination_id.as_deref(), Some("abc+"));
+    assert!(r.manager.as_ref().unwrap().properties.is_empty());
 }

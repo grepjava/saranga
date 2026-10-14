@@ -1,7 +1,22 @@
 [package]
 name = "saranga-ha"
+description = "High availability: Java-compatible file locks, the pluggable lock managers (ZooKeeper as Curator, files) and activation sequences"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

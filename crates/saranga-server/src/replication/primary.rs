@@ -220,7 +220,9 @@ impl Broker {
             }
         }
 
-        // sendSynchronizationDone: the backup is up to date once it answers.
+        // sendSynchronizationDone, with the node's activation sequence: the
+        // backup is up to date once it answers.
+        let sequence = self.activation_sequence();
         let (tx, rx) = std::sync::mpsc::channel();
         r.send(
             ReplicationStartSyncMessage {
@@ -229,7 +231,7 @@ impl Broker {
                 node_id: node_id.as_str().into(),
                 data: Some(SyncData {
                     data_type: SyncDataType::ActivationSequence,
-                    ids: vec![0],
+                    ids: vec![sequence],
                 }),
             },
             Some(Box::new(move |_| {
@@ -336,6 +338,23 @@ impl Broker {
             );
         }
         self.replication_stopped(r);
+        if let Some(c) = self.coordination.clone() {
+            // `onReplicationConnectionClose`: staying active, this broker
+            // moves the node's sequence past the backup's copy.
+            let failing_back = self.failing_back.load(std::sync::atomic::Ordering::Acquire);
+            if !self.is_stopped() && !failing_back {
+                let broker = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = c.ensure_sequential_access().await {
+                        tracing::error!(
+                            "Unexpected exception: {e} on attempted activation sequence increment; stopping server async"
+                        );
+                        broker.request_shutdown();
+                    }
+                });
+            }
+            return;
+        }
         let vote = self
             .replication_policy
             .as_ref()
@@ -375,6 +394,15 @@ impl Broker {
         self.post_office.paging().stop_replication();
         self.large_messages.stop_replication();
         r.stop();
+    }
+
+    /// `NodeManager.getNodeActivationSequence`: the coordinated one with a
+    /// lock manager; without, nothing writes it (-1).
+    fn activation_sequence(&self) -> i64 {
+        match &self.coordination {
+            Some(c) => c.sequence_blocking(),
+            None => saranga_ha::activation::NULL_SEQUENCE,
+        }
     }
 
     /// A backup is attached and has its copy of this broker's data

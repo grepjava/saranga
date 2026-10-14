@@ -15,7 +15,6 @@ pub mod critical;
 pub mod disk;
 pub mod duplicate;
 pub mod error;
-mod filelock;
 pub mod large;
 pub mod localtime;
 pub mod management;
@@ -450,6 +449,8 @@ pub struct Broker {
     replication_policy: Option<saranga_config::Replication>,
     /// The backup this broker replicates to.
     replicating: Mutex<Option<Arc<replication::Replicator>>>,
+    /// Replication with a lock manager: the node's lock and sequence.
+    coordination: Option<Arc<replication::pluggable::Coordination>>,
     /// A restarted primary asked this active backup to give way: it stops
     /// as if it had failed, and waits as a backup again.
     failing_back: std::sync::atomic::AtomicBool,
@@ -697,10 +698,13 @@ impl Broker {
         if config.address_queue_scan_period > 0 {
             spawn_address_queue_reaper(&post_office, config.address_queue_scan_period);
         }
-        let node_id = match &node_manager {
-            Some(n) => n.node_id(),
+        let coordination = config.ha.coordination.clone();
+        let node_id = match (&coordination, &node_manager) {
+            // A `coordination-id`, which `server.lock` cannot hold as it is.
+            (Some(c), _) => c.node_id().to_owned(),
+            (None, Some(n)) => n.node_id(),
             // `InVMNodeManager`: a time-based ID.
-            None => saranga_storage::java::uuid(&saranga_client::uuid::time_based()),
+            (None, None) => saranga_storage::java::uuid(&saranga_client::uuid::time_based()),
         };
         let registry = Arc::new(registry::Registry::new(post_office.plugins().clone()));
         let broker = Arc::new(Self {
@@ -720,6 +724,7 @@ impl Broker {
                 _ => None,
             },
             replicating: Mutex::new(None),
+            coordination: coordination.clone(),
             cluster: config
                 .cluster
                 .clone()
@@ -747,6 +752,9 @@ impl Broker {
         });
         for p in broker.post_office.plugins().all() {
             p.registered(&broker);
+        }
+        if let Some(c) = &coordination {
+            c.watch(Arc::downgrade(&broker));
         }
         // recoverStoredSecuritySettings.
         for (id, s) in &recovered.security_settings {
@@ -949,6 +957,11 @@ impl Broker {
 
     pub fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// With a lock manager: the node's lock and sequence this broker holds.
+    pub fn coordination(&self) -> Option<&Arc<replication::pluggable::Coordination>> {
+        self.coordination.as_ref()
     }
 
     /// The management service.

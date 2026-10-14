@@ -9,7 +9,7 @@
 //! over from. It is read and written under a lock on `server.lock`.
 //! `serverlock.1` is locked by the active broker, `serverlock.2` by the
 //! backup waiting for it to fail. The locks are those of a Java broker
-//! (see [`crate::filelock`]), so Java and Saranga brokers share a directory.
+//! (see [`saranga_ha::filelock`]), so Java and Saranga brokers share a directory.
 
 use std::fs::File;
 use std::io;
@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::filelock::{Held, LockFile};
+use saranga_ha::filelock::{Held, LockFile};
 
 pub const SERVER_LOCK_NAME: &str = "server.lock";
 const FIRST_TIME_START: u8 = b'0';
@@ -112,11 +112,44 @@ fn set_node_id(slot: &Mutex<String>, id: String) {
 /// is given the node ID of the primary whose data it copied, which it is
 /// from now on.
 pub fn write_node_id(dir: &Path, node_id: &str) -> io::Result<()> {
-    let id = uuid::Uuid::parse_str(node_id).map_err(io::Error::other)?;
+    let id = node_id_bytes(node_id)?;
     let n = NodeManager::open(dir, None)?;
     let f = n.channels[STATE_LOCK_POS].file();
-    write_at(f, id.as_bytes(), 3)?;
+    write_at(f, &id, 3)?;
     f.sync_all()
+}
+
+/// `new UUID(TYPE_TIME_BASED, UUID.stringToBytes(nodeID))`, as
+/// `setNodeID` stores a node ID: its hexadecimal pairs, dashes skipped
+/// (any other character counting as -1, as `Character.digit` gives it),
+/// with the version and variant bits forced. A `coordination-id` is not
+/// hexadecimal, so what is stored does not read back as it.
+pub fn node_id_bytes(node_id: &str) -> io::Result<[u8; 16]> {
+    let digit = |c: char| c.to_digit(16).map_or(-1i32, |d| d as i32);
+    let chars: Vec<char> = node_id.chars().collect();
+    let mut data = [0u8; 16];
+    let mut i = 0;
+    let mut n = 0;
+    while i < chars.len() {
+        while i < chars.len() && chars[i] == '-' {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        let (Some(&c1), Some(&c2)) = (chars.get(i), chars.get(i + 1)) else {
+            return Err(io::Error::other(format!("bad node ID {node_id}")));
+        };
+        i += 2;
+        let slot = data
+            .get_mut(n)
+            .ok_or_else(|| io::Error::other(format!("bad node ID {node_id}")))?;
+        *slot = ((digit(c1) << 4) + digit(c2)) as u8;
+        n += 1;
+    }
+    data[6] = (data[6] & 0x0F) | 0x10;
+    data[8] = (data[8] & 0x3F) | 0x80;
+    Ok(data)
 }
 
 /// The HA policy and the node manager's settings (`ha-policy`,
@@ -132,6 +165,8 @@ pub struct HaConfig {
     pub lock_monitor_period: Duration,
     /// `journal-lock-monitor-max-retries`.
     pub lock_monitor_max_retries: u32,
+    /// Replication with a lock manager: what the activation holds.
+    pub coordination: Option<std::sync::Arc<crate::replication::pluggable::Coordination>>,
 }
 
 impl Default for HaConfig {
@@ -142,6 +177,7 @@ impl Default for HaConfig {
             lock_acquisition_timeout: None,
             lock_monitor_period: Duration::from_secs(2),
             lock_monitor_max_retries: 0,
+            coordination: None,
         }
     }
 }
@@ -162,6 +198,7 @@ impl HaConfig {
                 config.journal_lock_monitor_timeout.max(1) as u64
             ),
             lock_monitor_max_retries: config.journal_lock_monitor_max_retries.max(0) as u32,
+            coordination: None,
         }
     }
 
@@ -494,6 +531,19 @@ impl NodeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_ids_stored_as_set_node_id_stores_them() {
+        let id = "7debb3d1-0d4b-11ec-9704-ae9213b68ac4";
+        let b = node_id_bytes(id).unwrap();
+        assert_eq!(saranga_storage::java::uuid(&b), id);
+        // A coordination-id, which is not hexadecimal.
+        let b = node_id_bytes("peer.journal.001").unwrap();
+        assert_eq!(
+            saranga_storage::java::uuid(&b),
+            "fedfefef-ef9f-1001-8000-000000000000"
+        );
+    }
 
     #[test]
     fn node_id_survives_restart_and_one_primary_at_a_time() {

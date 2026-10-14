@@ -47,10 +47,27 @@ pub struct BackupConfig {
     /// `attemptFailBack`: a primary that found its node active elsewhere
     /// copies the active broker's data, asking it to hand back once done.
     pub fail_back: bool,
+    /// Replication coordinated through a lock manager
+    /// (`ReplicationBackupActivation`): no votes.
+    pub pluggable: Option<Pluggable>,
+}
+
+/// What a backup coordinated through a lock manager needs.
+#[derive(Debug, Clone)]
+pub struct Pluggable {
+    /// The node manager's directory, where the node ID and the activation
+    /// sequence are written once the copy is complete.
+    pub lock_dir: PathBuf,
+    /// When failing back: the node ID this broker must replicate
+    /// (`NamedNodeIdLocatorForReplication`).
+    pub expected_node_id: Option<String>,
 }
 
 /// `SharedNothingBackupActivation.run` up to the activation: returns the
 /// node ID of the primary that failed, whose copy this backup now has.
+/// With a lock manager (`ReplicationBackupActivation.replicateAndFailover`)
+/// it returns once the primary is gone with the copy complete, and fails
+/// when the primary sends what this backup must not take.
 pub async fn replicate(cfg: BackupConfig, version: &str) -> io::Result<String> {
     let mut logged = false;
     loop {
@@ -59,10 +76,24 @@ pub async fn replicate(cfg: BackupConfig, version: &str) -> io::Result<String> {
             .await
             .map_err(io::Error::other)??;
         if !logged {
-            tracing::info!(
-                "AMQ221109: Saranga Backup Server version {version} [null] started; waiting for primary to fail before activating"
-            );
+            if cfg.pluggable.is_some() {
+                tracing::info!(
+                    "Saranga Backup Server version {version} [Saranga::name={}] started, awaiting connection to a primary to start replication",
+                    cfg.name
+                );
+            } else {
+                tracing::info!(
+                    "AMQ221109: Saranga Backup Server version {version} [null] started; waiting for primary to fail before activating"
+                );
+            }
             logged = true;
+        }
+        if let Some(id) = cfg
+            .pluggable
+            .as_ref()
+            .and_then(|p| p.expected_node_id.as_ref())
+        {
+            tracing::info!("awaiting connecting to node with NodeID = {id}");
         }
         let (conn, primary) = locate(&cfg).await;
         match attempt(&cfg, conn, primary).await? {
@@ -124,10 +155,15 @@ async fn try_locate(
         .ok()?;
     // Saranga's client keeps no backup group names, so `group-name` does
     // not choose among the primaries.
+    // When failing back, only the broker with this node's ID.
+    let expected = cfg
+        .pluggable
+        .as_ref()
+        .and_then(|p| p.expected_node_id.as_deref());
     let found = conn
         .topology()
         .into_iter()
-        .find(|(_, primary, _)| primary.is_some());
+        .find(|(id, primary, _)| primary.is_some() && expected.is_none_or(|e| e == id));
     let Some((node_id, Some(primary), _)) = found else {
         conn.close().await;
         return None;
@@ -256,7 +292,7 @@ async fn attempt(cfg: &BackupConfig, conn: Connection, primary_node: String) -> 
     });
     // `BackupManager.announceBackup`, once the copy is complete.
     let mut announcer = None;
-    let (endpoint, end) = loop {
+    let (mut endpoint, end) = loop {
         tokio::select! {
             r = &mut endpoint => break r.map_err(io::Error::other)?,
             Ok(()) = synced_rx.changed(), if announcer.is_none() => {
@@ -283,6 +319,7 @@ async fn attempt(cfg: &BackupConfig, conn: Connection, primary_node: String) -> 
         a.close().await;
     }
     let up_to_date = endpoint.up_to_date;
+    let refused = endpoint.refused.take();
     let node_id = endpoint.node_id.clone().unwrap_or(primary_node);
     let topology = conn.topology();
     conn.close().await;
@@ -290,9 +327,25 @@ async fn attempt(cfg: &BackupConfig, conn: Connection, primary_node: String) -> 
     tokio::task::spawn_blocking(move || endpoint.close(&c))
         .await
         .map_err(io::Error::other)?;
+    if let Some(e) = refused {
+        // `WrongNodeId`, `WrongActivationSequence`: the broker stops.
+        return Err(io::Error::other(e));
+    }
     if !up_to_date {
         // It cannot take over with half a copy: it starts again.
+        if cfg.pluggable.is_some() && !matches!(end, End::Stopped) {
+            tracing::info!(
+                "Replication failure while initial sync not yet completed: restart as backup"
+            );
+        }
         return Ok(Signal::Retry);
+    }
+    if cfg.pluggable.is_some() {
+        // The lock manager decides, not a vote.
+        return Ok(match end {
+            End::Stopped => Signal::Retry,
+            _ => Signal::FailOver(node_id),
+        });
     }
     match end {
         End::PrimaryStopping(PrimaryStopping::FailOver) => Ok(Signal::FailOver(node_id)),
@@ -384,6 +437,9 @@ struct Endpoint {
     journals: [Option<Journal>; 2],
     up_to_date: bool,
     node_id: Option<String>,
+    /// Why the primary's copy cannot be taken (`ReplicationObserver`'s
+    /// `WrongNodeId`, `WrongActivationSequence`).
+    refused: Option<String>,
     pages: Pages,
     large: Large,
     /// Told the primary's node ID once the copy is complete.
@@ -401,6 +457,7 @@ impl Endpoint {
             journals: [None, None],
             up_to_date: false,
             node_id: None,
+            refused: None,
         }
     }
 
@@ -435,6 +492,9 @@ impl Endpoint {
             let response = self.handle(packet);
             if let Some(r) = response {
                 let _ = conn.send_packet(CHANNEL_REPLICATION, r);
+            }
+            if self.refused.is_some() {
+                return End::Disconnected;
             }
             match stopping {
                 Some(PrimaryStopping::FailOver) => {
@@ -593,7 +653,13 @@ impl Endpoint {
     /// `handleStartReplicationSynchronization`.
     fn start_sync(&mut self, m: ReplicationStartSyncMessage) -> ReplicationResponseMessageV2 {
         if m.synchronization_is_finished {
-            if let Err(e) = self.finish_sync(m.node_id.to_string_lossy()) {
+            // The version of the data copied, which this backup activates
+            // with.
+            let sequence = match &m.data {
+                Some(d) if d.ids.len() == 1 => d.ids[0],
+                _ => 0,
+            };
+            if let Err(e) = self.finish_sync(m.node_id.to_string_lossy(), sequence) {
                 tracing::warn!("AMQ222185: Error handling replication packet: {e}");
                 return ReplicationResponseMessageV2 {
                     synchronization_is_finished_acknowledgement: false,
@@ -619,6 +685,10 @@ impl Endpoint {
                 }
                 let node_id = m.node_id.to_string_lossy();
                 if !node_id.is_empty() {
+                    if let Some(e) = self.wrong_node_id(&node_id) {
+                        self.refused = Some(e);
+                        return ReplicationResponseMessageV2::default();
+                    }
                     self.node_id = Some(node_id);
                 }
                 SyncJournal::start(self.journal_config(j), &data.ids)
@@ -635,7 +705,39 @@ impl Endpoint {
 
     /// `finishSynchronization`: the copies are complete; the journals are
     /// loaded to go on with what the primary appends.
-    fn finish_sync(&mut self, node_id: String) -> io::Result<()> {
+    /// `ReplicationObserver.validateNodeId`: the primary first seen, or
+    /// the one failed back to.
+    fn wrong_node_id(&self, node_id: &str) -> Option<String> {
+        let p = self.cfg.pluggable.as_ref()?;
+        let ok = match (&self.node_id, &p.expected_node_id) {
+            (Some(existing), _) => existing == node_id,
+            (None, Some(expected)) => expected == node_id,
+            (None, None) => true,
+        };
+        (!ok).then(|| {
+            tracing::error!(
+                "Stopping broker because of wrong node ID communication from primary: maybe a misbehaving primary?"
+            );
+            format!("wrong node ID {node_id} from the primary")
+        })
+    }
+
+    fn finish_sync(&mut self, node_id: String, sequence: i64) -> io::Result<()> {
+        if self.cfg.pluggable.is_some() {
+            // `onRemoteBackupUpToDate`.
+            if let Some(e) = self.wrong_node_id(&node_id) {
+                self.refused = Some(e);
+                return Ok(());
+            }
+            if sequence <= 0 {
+                tracing::error!("Illegal activation sequence {sequence} from NodeID = {node_id}");
+                tracing::error!(
+                    "Stopping broker because of wrong activation sequence communication from primary: maybe a misbehaving primary?"
+                );
+                self.refused = Some(format!("illegal activation sequence {sequence}"));
+                return Ok(());
+            }
+        }
         for j in 0..2 {
             if let Some(s) = self.syncing[j].take() {
                 s.finish().map_err(|e| io::Error::other(e.to_string()))?;
@@ -648,6 +750,12 @@ impl Endpoint {
             self.journals[j] = Some(journal);
         }
         self.large.finish_sync()?;
+        if let Some(p) = &self.cfg.pluggable {
+            // `nodeManager.stopBackup`: the node ID and its activation
+            // sequence persisted.
+            crate::node::write_node_id(&p.lock_dir, &node_id)?;
+            saranga_ha::activation::write_sequence(&p.lock_dir, sequence)?;
+        }
         self.node_id = Some(node_id.clone());
         self.up_to_date = true;
         self.synced.send_replace(Some(node_id.clone()));
@@ -1046,13 +1154,24 @@ impl Large {
 /// -1, none with 0).
 fn move_server_data(cfg: &BackupConfig) -> io::Result<()> {
     let max = cfg.policy.max_saved_replicated_journals_size;
+    // A primary failing back keeps its node ID (`preserveLockFiles`).
+    let keep = cfg
+        .pluggable
+        .as_ref()
+        .filter(|p| p.expected_node_id.is_some())
+        .map(|p| p.lock_dir.clone());
     for dir in [
         &cfg.bindings.directory,
         &cfg.messages.directory,
         &cfg.paging,
         &cfg.large_messages,
     ] {
-        move_data(dir, max)?;
+        let preserve: &[&str] = if keep.as_deref() == Some(dir.as_path()) {
+            &["server.lock", "serverlock"]
+        } else {
+            &[]
+        };
+        move_data(dir, max, preserve)?;
     }
     Ok(())
 }
@@ -1064,7 +1183,7 @@ fn old_folder_id(name: &str) -> Option<i32> {
 }
 
 /// `FileMoveManager.doMove`.
-fn move_data(dir: &Path, max: i32) -> io::Result<()> {
+fn move_data(dir: &Path, max: i32, preserve: &[&str]) -> io::Result<()> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Ok(());
     };
@@ -1074,6 +1193,7 @@ fn move_data(dir: &Path, max: i32) -> io::Result<()> {
         let name = e.file_name().to_string_lossy().into_owned();
         match old_folder_id(&name) {
             Some(id) => folders.push(id),
+            None if preserve.iter().any(|p| name.starts_with(p)) => {}
             None => files.push(name),
         }
     }
@@ -1138,7 +1258,7 @@ mod tests {
         let dir = d.path();
         for round in 1..=3 {
             fs::write(dir.join("a.amq"), format!("{round}")).unwrap();
-            move_data(dir, 2).unwrap();
+            move_data(dir, 2, &[]).unwrap();
         }
         let mut names: Vec<String> = fs::read_dir(dir)
             .unwrap()
@@ -1152,7 +1272,7 @@ mod tests {
         );
         // With none to keep, the old copies go too.
         fs::write(dir.join("b.amq"), "x").unwrap();
-        move_data(dir, 0).unwrap();
+        move_data(dir, 0, &[]).unwrap();
         assert_eq!(fs::read_dir(dir).unwrap().count(), 0);
     }
 }

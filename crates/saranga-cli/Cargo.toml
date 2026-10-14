@@ -24,6 +24,7 @@ saranga-protocol-mqtt = { path = "../saranga-protocol-mqtt" }
 saranga-protocol-openwire = { path = "../saranga-protocol-openwire" }
 saranga-protocol-stomp = { path = "../saranga-protocol-stomp" }
 saranga-server = { path = "../saranga-server" }
+saranga-ha = { path = "../saranga-ha" }
 saranga-storage = { path = "../saranga-storage" }
 saranga-transport = { path = "../saranga-transport" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }

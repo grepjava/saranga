@@ -375,7 +375,8 @@ mod tests {
         // The commands saranga has, and no shell commands.
         assert!(s.contains("  local cmds0=(help)\n"));
         assert!(s.contains("  local cmds1=(pwd)\n"));
-        assert!(!s.contains("_picocli_artemis_activation"));
+        assert!(s.contains("_picocli_artemis_activation_list()"));
+        assert!(!s.contains("_picocli_artemis_lock"));
         assert!(!s.contains("_picocli_artemis_connect"));
         assert!(s.contains("_picocli_artemis_perfjournal()"));
         // Option values: candidates, file names, nothing.

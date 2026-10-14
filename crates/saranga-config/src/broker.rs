@@ -443,6 +443,22 @@ pub struct Replication {
     pub quorum_vote_wait: i32,
     /// `retry-replication-wait`, in milliseconds.
     pub retry_replication_wait: i64,
+    /// `manager`: replication coordinated through a pluggable lock
+    /// manager (`ReplicationPrimaryPolicyConfiguration`,
+    /// `ReplicationBackupPolicyConfiguration`) instead of quorum votes.
+    pub manager: Option<LockManagerConfig>,
+    /// `coordination-id` (primary, with a manager): the node ID peers
+    /// competing to be primary share, as Artemis normalizes it.
+    pub coordination_id: Option<String>,
+}
+
+/// `DistributedLockManagerConfiguration`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockManagerConfig {
+    /// `class-name`, Curator's ZooKeeper manager by default.
+    pub class_name: String,
+    /// `properties`.
+    pub properties: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Replication {
@@ -462,6 +478,8 @@ impl Default for Replication {
             vote_retry_wait: 5_000,
             quorum_vote_wait: 30,
             retry_replication_wait: 2_000,
+            manager: None,
+            coordination_id: None,
         }
     }
 }

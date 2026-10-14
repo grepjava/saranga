@@ -544,12 +544,13 @@ fn parse_ha_policy(
                 } else {
                     return Ok(());
                 };
-                if first(node, "manager").is_some() {
-                    return Err(refuse(
-                        "replication with a pluggable quorum manager is not supported yet",
-                    ));
+                // Only `primary` and `backup` take a manager, as Artemis
+                // reads them.
+                let pluggable = matches!(node.tag_name().name(), "primary" | "backup");
+                let mut replication = parse_replication(node, backup, warnings)?;
+                if !pluggable && replication.manager.is_some() {
+                    replication = parse_replication_classic(node, backup, warnings)?;
                 }
-                let replication = parse_replication(node, backup, warnings)?;
                 config.ha_policy = if backup {
                     HaPolicy::ReplicationBackup(replication)
                 } else {
@@ -576,6 +577,24 @@ fn parse_replication(
     backup: bool,
     warnings: &mut Vec<Warning>,
 ) -> Result<crate::broker::Replication> {
+    parse_replication_with(n, backup, false, warnings)
+}
+
+/// `master` and `slave`, whose `manager` Artemis ignores.
+fn parse_replication_classic(
+    n: Node<'_, '_>,
+    backup: bool,
+    warnings: &mut Vec<Warning>,
+) -> Result<crate::broker::Replication> {
+    parse_replication_with(n, backup, true, warnings)
+}
+
+fn parse_replication_with(
+    n: Node<'_, '_>,
+    backup: bool,
+    classic: bool,
+    warnings: &mut Vec<Warning>,
+) -> Result<crate::broker::Replication> {
     let mut r = crate::broker::Replication::default();
     let int = |name: &str, default: i32| first(n, name).map_or(Ok(default), node_i32);
     let long = |name: &str, default: i64| first(n, name).map_or(Ok(default), node_i64);
@@ -599,6 +618,36 @@ fn parse_replication(
     r.quorum_vote_wait = int("quorum-vote-wait", r.quorum_vote_wait)?;
     // Artemis defaults it to the vote retry wait's default.
     r.retry_replication_wait = long("retry-replication-wait", r.vote_retry_wait)?;
+    if let Some(m) = first(n, "manager").filter(|_| !classic) {
+        // `createPluggableReplication*HaPolicy`: its own defaults, and no
+        // votes.
+        r.manager = Some(crate::broker::LockManagerConfig {
+            class_name: first(m, "class-name")
+                .map_or_else(|| DEFAULT_LOCK_MANAGER.to_owned(), trimmed_text),
+            properties: first(m, "properties")
+                .map(|p| {
+                    elements(p)
+                        .filter(|e| e.tag_name().name() == "property")
+                        .filter_map(|e| {
+                            Some((
+                                e.attribute("key")?.to_owned(),
+                                e.attribute("value")?.to_owned(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        });
+        r.retry_replication_wait = long("retry-replication-wait", 2_000)?;
+        if backup {
+            r.allow_failback = bool_or("allow-failback", false);
+        } else {
+            // A primary never hands back (`ReplicationPrimaryPolicy.with`).
+            r.allow_failback = false;
+            r.coordination_id = string("coordination-id").map(|c| coordination_id(&c));
+        }
+        return Ok(r);
+    }
     if backup {
         r.allow_failback = bool_or("allow-failback", r.allow_failback);
         r.restart_backup = bool_or("restart-backup", r.restart_backup);
@@ -622,6 +671,24 @@ fn parse_replication(
         }
     }
     Ok(r)
+}
+
+/// `ActiveMQDefaultConfiguration.getDefaultDistributedLockManagerClassName`.
+const DEFAULT_LOCK_MANAGER: &str =
+    "org.apache.activemq.artemis.lockmanager.zookeeper.CuratorDistributedLockManager";
+
+/// `ReplicationPrimaryPolicyConfiguration.setCoordinationId`: at most 16
+/// characters, an odd length padded with `+`, dashes made dots.
+fn coordination_id(id: &str) -> String {
+    let n = id.chars().count();
+    let id = if n >= 16 {
+        id.chars().take(16).collect()
+    } else if !n.is_multiple_of(2) {
+        format!("{id}+")
+    } else {
+        id.to_owned()
+    };
+    id.replace('-', ".")
 }
 
 /// Refuses what would make the broker something Saranga cannot be (a JDBC

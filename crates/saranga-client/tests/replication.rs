@@ -67,6 +67,7 @@ fn backup_config(bc: &BrokerConfig, fail_back: bool) -> BackupConfig {
         paging: storage.paging.clone(),
         large_messages: storage.large_messages.clone(),
         fail_back,
+        pluggable: None,
     }
 }
 
@@ -377,4 +378,139 @@ async fn the_restarted_primary_takes_its_node_back() {
     receive_all(pp, 0, 30).await;
     acceptor.abort();
     primary.stop().unwrap();
+}
+
+/// Replication coordinated through Artemis's file-based lock manager:
+/// the backup takes over once it has the node's lock with the latest
+/// activation sequence, and the restarted primary, its data stale, copies
+/// the active backup's and takes its node back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_a_lock_manager_the_latest_copy_activates() {
+    use saranga_server::replication::pluggable::{Activation, activate};
+    let locks = tempfile::tempdir().unwrap();
+    let pdir = tempfile::tempdir().unwrap();
+    let bdir = tempfile::tempdir().unwrap();
+    let (pp, pb) = (free_port().await, free_port().await);
+    let manager = format!(
+        r#"<manager><class-name>org.apache.activemq.artemis.lockmanager.file.FileBasedLockManager</class-name>
+             <properties><property key="locks-folder" value="{}"/></properties></manager>"#,
+        locks.path().display()
+    );
+    let primary_file = xml("primary", pp, pb, &format!("<primary>{manager}</primary>"));
+    let backup_file = xml(
+        "backup",
+        pb,
+        pp,
+        &format!("<backup>{manager}<allow-failback>true</allow-failback></backup>"),
+    );
+    let activation = |file: &saranga_config::BrokerConfig, dir: &std::path::Path| {
+        let c = config(file, dir);
+        let policy = file.ha_policy.replication().unwrap().clone();
+        let m = policy.manager.clone().unwrap();
+        Activation {
+            name: c.management.name.clone(),
+            manager: saranga_ha::lockmanager::LockManager::new(&m.class_name, &m.properties)
+                .unwrap(),
+            lock_dir: c.storage.as_ref().unwrap().messages.directory.clone(),
+            primary: !file.ha_policy.is_backup(),
+            as_backup: false,
+            coordination_id: None,
+            backup: backup_config(&c, false),
+            version: "test".into(),
+        }
+    };
+    let start = |file: &saranga_config::BrokerConfig,
+                 dir: &std::path::Path,
+                 a: saranga_server::replication::pluggable::Activated| {
+        let mut c = config(file, dir);
+        let policy = file.ha_policy.replication().unwrap().clone();
+        c.ha.policy = saranga_config::HaPolicy::ReplicationPrimary(policy);
+        c.ha.coordination = Some(a.coordination);
+        Broker::start(c)
+    };
+    let send_some = |port: u16, from: u32, count: u32| async move {
+        let conn = Connection::connect(("127.0.0.1", port), ConnectionOptions::default())
+            .await
+            .unwrap();
+        let session = conn
+            .create_session(SessionOptions {
+                auto_commit_sends: false,
+                ..SessionOptions::default()
+            })
+            .await
+            .unwrap();
+        if from == 0 {
+            session
+                .create_queue(
+                    QueueConfiguration::new("replicated")
+                        .routing_type(RoutingType::Anycast)
+                        .durable(true),
+                )
+                .await
+                .unwrap();
+        }
+        let producer = session.create_producer(Some("replicated")).await.unwrap();
+        send(&session, &producer, from, count).await;
+        conn.close().await;
+    };
+    let sequence = |dir: &std::path::Path| {
+        saranga_ha::activation::read_sequence(&dir.join("data/journal")).unwrap()
+    };
+
+    // The primary activates on its fresh data: sequence 1.
+    let a = activate(activation(&primary_file, pdir.path()))
+        .await
+        .unwrap();
+    assert!(!a.from_backup);
+    let primary = start(&primary_file, pdir.path(), a).await.unwrap();
+    let node_id = primary.node_id().to_owned();
+    let acceptor = serve(&primary, pp).await;
+    send_some(pp, 0, 20).await;
+    assert_eq!(sequence(pdir.path()), 1);
+
+    // The backup copies it, with its node ID and sequence.
+    let backup = tokio::spawn(activate(activation(&backup_file, bdir.path())));
+    wait_for_sync(&primary).await;
+    send_some(pp, 20, 5).await;
+    assert_eq!(sequence(bdir.path()), 1);
+
+    // The primary stops: the backup takes the lock and moves to 2.
+    stop(&primary, acceptor).await;
+    primary.coordination().unwrap().manager.stop().await;
+    let b = tokio::time::timeout(WAIT, backup)
+        .await
+        .expect("the backup did not take over")
+        .unwrap()
+        .unwrap();
+    assert!(b.from_backup);
+    assert_eq!(b.coordination.node_id(), node_id);
+    assert_eq!(sequence(bdir.path()), 2);
+    let active = start(&backup_file, bdir.path(), b).await.unwrap();
+    assert_eq!(active.node_id(), node_id);
+    let active_acceptor = serve(&active, pb).await;
+    send_some(pb, 25, 5).await;
+
+    // The primary starts again: at 1, its data is stale, so it copies the
+    // active backup's and asks for the node back.
+    let failing_back = tokio::spawn(activate(activation(&primary_file, pdir.path())));
+    tokio::time::timeout(Duration::from_secs(30), active.failback_requested())
+        .await
+        .expect("the active backup never handed back");
+    stop(&active, active_acceptor).await;
+    let c = active.coordination().unwrap().clone();
+    c.manager.stop().await;
+    c.await_failback().await;
+    let back = tokio::time::timeout(WAIT, failing_back)
+        .await
+        .expect("the primary did not take over")
+        .unwrap()
+        .unwrap();
+    assert_eq!(sequence(pdir.path()), 3);
+    let primary = start(&primary_file, pdir.path(), back).await.unwrap();
+    assert_eq!(primary.node_id(), node_id);
+    let acceptor = serve(&primary, pp).await;
+    receive_all(pp, 0, 30).await;
+    acceptor.abort();
+    primary.stop().unwrap();
+    primary.coordination().unwrap().manager.stop().await;
 }

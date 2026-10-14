@@ -1718,6 +1718,7 @@ dependencies = [
  "saranga-client",
  "saranga-config",
  "saranga-filter",
+ "saranga-ha",
  "saranga-journal",
  "saranga-management",
  "saranga-message",
@@ -1745,6 +1746,7 @@ dependencies = [
  "saranga-buffer",
  "saranga-config",
  "saranga-core-protocol",
+ "saranga-ha",
  "saranga-message",
  "saranga-server",
  "tempfile",
@@ -1794,6 +1796,15 @@ dependencies = [
 [[package]]
 name = "saranga-ha"
 version = "0.0.1"
+dependencies = [
+ "libc",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "saranga-journal"
@@ -1943,6 +1954,7 @@ dependencies = [
  "saranga-config",
  "saranga-core-protocol",
  "saranga-filter",
+ "saranga-ha",
  "saranga-journal",
  "saranga-message",
  "saranga-paging",

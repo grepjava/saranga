@@ -11,6 +11,7 @@
 //! response to its replication, or to the last replication before it.
 
 pub mod backup;
+pub mod pluggable;
 pub mod primary;
 pub mod quorum;
 

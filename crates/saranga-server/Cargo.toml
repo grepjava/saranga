@@ -11,6 +11,7 @@ saranga-client = { path = "../saranga-client" }
 saranga-config = { path = "../saranga-config" }
 saranga-core-protocol = { path = "../saranga-core-protocol" }
 saranga-filter = { path = "../saranga-filter" }
+saranga-ha = { path = "../saranga-ha" }
 saranga-journal = { path = "../saranga-journal" }
 saranga-storage = { path = "../saranga-storage" }
 saranga-message = { path = "../saranga-message" }

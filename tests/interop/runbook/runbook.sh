@@ -203,7 +203,7 @@ shell() {
 # The candidates bash's TAB offers after "./artemis" and the words given,
 # the last one being completed, with the script completion.sh sourced:
 # what the function "complete" registered for artemis puts in COMPREPLY.
-# Saranga offers no lock, properties or activation commands.
+# Saranga offers no lock or properties commands.
 tab() {
   step "using-cli: source <(./artemis completion), then ./artemis $*<TAB>"
   bash -c 'source "$1" 2> /dev/null; shift
@@ -211,7 +211,7 @@ tab() {
     COMP_WORDS=(./artemis "$@"); COMP_CWORD=$#; COMP_LINE="${COMP_WORDS[*]}"; COMP_POINT=${#COMP_LINE}
     "$f" ./artemis "${COMP_WORDS[COMP_CWORD]}" "${COMP_WORDS[COMP_CWORD-1]}" 2> /dev/null
     printf "%s\n" "${COMPREPLY[@]}"' tab "$WORK/completion.sh" "$@" | LC_ALL=C sort \
-    | grep -v -x -E 'lock|properties|activation'
+    | grep -v -x -E 'lock|properties'
 }
 # The lines of data print about messages sent to an address.
 messages_to() { grep -c -E "userRecordType=(45|31);.*address=$1[],]" || true; }
@@ -223,8 +223,8 @@ suite() {
   # using-cli: help, the list of commands, then a group's; using-server:
   # help create; data-tools: help data print, from the home so that its
   # default configuration names no instance. The instance's list has
-  # Artemis's lock, properties and activation commands, which Saranga has
-  # not (normalize).
+  # Artemis's lock and properties commands, which Saranga has not
+  # (normalize).
   step "using-cli: artemis help"
   instance "$I1" help
   step "using-cli: artemis help data"
@@ -768,7 +768,7 @@ normalize() {
     -e 's#WORK\\#WORK/#g' -e ':sep' -e 's#(WORK/[a-z0-9/]*)\\#\1/#' -e 'tsep' \
     -e 's/^Usage: (artemis|saranga) help/Usage: CLI help/' \
     -e 's/^Usage: saranga /Usage: artemis /' \
-    -e '/^  (lock|properties|activation)  +/d' \
+    -e '/^  (lock|properties)  +/d' \
     -e 's/(Elapsed time in milli second :) [0-9]+ milli/\1 # milli/' \
     -e 's/(Elapsed time in second :) [0-9]+ s/\1 # s/' \
     -e 's/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3} /DATE /' \

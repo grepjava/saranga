@@ -1,0 +1,69 @@
+=== zookeeper
+zookeeper: listening
+=== artemis run (primary)
+primary: listening
+primary: AMQ221000: Primary message broker is starting
+primary: AMQ221007: Server is now active
+=== artemis producer (primary) 20, then 2 large
+Produced: 20 messages
+Produced: 2 messages
+=== artemis run (backup)
+backup: synchronized
+backup: AMQ221000: Backup message broker is starting
+backup: AMQ222162: moving data away
+backup: AMQ221024: backup synchronized
+backup: AMQ221031: backup announced
+=== Failover.java failover (in the background)
+client: sent 10
+=== artemis producer (primary) 10, consumer 5
+Produced: 10 messages
+Consumed: 5 messages
+Consumed: 5 messages
+=== artemis kill (primary)
+primary: down
+backup: listening
+backup: AMQ221037: becoming active
+backup: AMQ221007: Server is now active
+client: failed over
+=== artemis consumer (backup) 20, producer (backup) 5
+Consumed: 20 messages
+Consumed: 20 messages
+Produced: 5 messages
+=== artemis run (primary, stale)
+primary: active again
+backup: synchronized again
+primary: AMQ221000: Primary message broker is starting
+primary: AMQ222162: moving data away
+primary: AMQ222162: moving data away
+primary: AMQ222162: moving data away
+primary: AMQ221024: backup synchronized
+primary: AMQ221037: becoming active
+primary: AMQ221007: Server is now active
+backup: AMQ221002: stopped
+backup: AMQ221039: Restarting as replicating backup server after primary restart
+backup: AMQ221000: Backup message broker is starting
+backup: AMQ222162: moving data away
+backup: AMQ222162: moving data away
+backup: AMQ221024: backup synchronized
+backup: AMQ221031: backup announced
+client: sent 10
+client: failover event: FAILURE_DETECTED
+client: failover event: FAILOVER_COMPLETED
+client: received 10
+client: sent 10
+client: failover event: FAILURE_DETECTED
+client: failover event: FAILOVER_COMPLETED
+client: received 10
+=== artemis consumer (primary) 12, then 1
+Consumed: 12 messages
+Consumed: 12 messages
+Consumed: 1 messages
+Consumed: 0 messages
+=== artemis stop (backup), artemis stop (primary)
+primary: down
+=== artemis activation list (primary)
+Local activation sequence for NodeID=ID: 4
+Coordinated activation sequence for NodeID=ID: 4
+=== artemis activation list (backup)
+Local activation sequence for NodeID=ID: 3
+Coordinated activation sequence for NodeID=ID: 4

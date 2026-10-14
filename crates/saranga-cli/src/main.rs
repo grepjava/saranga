@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
+mod activation;
 mod client;
 mod completion;
 mod create;
@@ -90,6 +91,9 @@ enum Command {
     /// Tools on a broker's data directory.
     #[command(subcommand)]
     Data(data::DataCommand),
+    /// The activation sequences of replication with a lock manager.
+    #[command(subcommand)]
+    Activation(activation::ActivationCommand),
     /// Create a new broker instance, as `artemis create`: its bin/artemis
     /// runs this saranga.
     Create(Box<create::CreateArgs>),
@@ -587,6 +591,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             run(instance, bind, allow_kill).await
         }
         Command::Data(cmd) => data::run(cmd).await,
+        Command::Activation(cmd) => activation::run(cmd).await,
         Command::Mask {
             password,
             hash,
@@ -1019,10 +1024,59 @@ async fn boot(
             .clone()
             .unwrap_or_else(|| storage.messages.directory.clone())
     });
-    // A replicating backup copies its primary until the primary fails, then
-    // starts as a replicating primary on its copy, with the primary's node ID.
+    // Replication with a lock manager: the manager decides which broker is
+    // active on the node's data.
     if let (Some(storage), Some(dir), Some(file)) =
         (&broker_config.storage, &lock_dir, file_config.as_ref())
+        && let Some(policy) = file.ha_policy.replication().filter(|r| r.manager.is_some())
+    {
+        let m = policy.manager.as_ref().expect("a manager");
+        let manager = saranga_ha::lockmanager::LockManager::new(&m.class_name, &m.properties)
+            .map_err(|e| anyhow::anyhow!("AMQ224000: Failure in initialisation: {e}"))?;
+        let Some(cluster) = broker_config.cluster.clone() else {
+            anyhow::bail!("a replicating broker needs a cluster-connection to find its peer");
+        };
+        let primary = !file.ha_policy.is_backup();
+        let activated = saranga_server::replication::pluggable::activate(
+            saranga_server::replication::pluggable::Activation {
+                name: broker_config.management.name.clone(),
+                manager,
+                lock_dir: dir.clone(),
+                primary,
+                as_backup,
+                coordination_id: policy.coordination_id.clone(),
+                backup: saranga_server::replication::backup::BackupConfig {
+                    name: broker_config.management.name.clone(),
+                    policy: policy.clone(),
+                    cluster,
+                    messages: storage.messages.clone(),
+                    bindings: storage.bindings.clone(),
+                    paging: storage.paging.clone(),
+                    large_messages: storage.large_messages.clone(),
+                    fail_back: false,
+                    pluggable: None,
+                },
+                version: VERSION.to_owned(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("AMQ224000: Failure in initialisation: {e}"))?;
+        if activated.from_backup {
+            tracing::info!(
+                "AMQ221037: Saranga::name={} to become 'active'",
+                broker_config.management.name
+            );
+        }
+        broker_config.ha.coordination = Some(activated.coordination);
+        // A backup is active with its own `allow-failback`; a primary
+        // never hands back.
+        broker_config.ha.policy = saranga_config::HaPolicy::ReplicationPrimary(policy.clone());
+    }
+    // A replicating backup copies its primary until the primary fails, then
+    // starts as a replicating primary on its copy, with the primary's node ID.
+    if broker_config.ha.coordination.is_none()
+        && let (Some(storage), Some(dir), Some(file)) =
+            (&broker_config.storage, &lock_dir, file_config.as_ref())
         && let Some((backup_policy, fail_back, active_policy)) = replica_role(
             &file.ha_policy,
             as_backup,
@@ -1050,6 +1104,7 @@ async fn boot(
                 paging: storage.paging.clone(),
                 large_messages: storage.large_messages.clone(),
                 fail_back,
+                pluggable: None,
             },
             VERSION,
         )
@@ -1268,6 +1323,10 @@ async fn stop_broker(
     }
     close_connections(broker).await;
     broker.stop()?;
+    // `close`: the lock manager stopped, its lock with it.
+    if let Some(c) = broker.coordination() {
+        c.manager.stop().await;
+    }
     Ok(())
 }
 
@@ -1408,6 +1467,9 @@ async fn run(
             let Some(dir) = s.lock_dir.clone() else {
                 continue;
             };
+            if let Some(c) = s.broker.coordination() {
+                c.await_failback().await;
+            }
             if replicating {
                 tracing::info!(
                     "AMQ221039: Restarting as replicating backup server after primary restart"

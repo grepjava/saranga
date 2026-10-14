@@ -29,7 +29,7 @@ fn open_files() -> &'static Open {
 
 /// A file opened for reading and writing, whose handle the process shares.
 #[derive(Clone)]
-pub(crate) struct LockFile {
+pub struct LockFile {
     shared: Arc<Shared>,
 }
 
@@ -46,11 +46,15 @@ impl LockFile {
                 .open(path)?;
         }
         let key = std::fs::canonicalize(path)?;
+        let file = OpenOptions::new().read(true).write(true).open(&key)?;
         let mut open = open_files().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(shared) = open.get(&key).and_then(Weak::upgrade) {
+        // The handle opened before, unless the file it has was moved away
+        // or replaced since.
+        if let Some(shared) = open.get(&key).and_then(Weak::upgrade)
+            && sys::same_file(&shared.file, &file)?
+        {
             return Ok(Self { shared });
         }
-        let file = OpenOptions::new().read(true).write(true).open(&key)?;
         let shared = Arc::new(Shared {
             file,
             locked: Mutex::new(false),
@@ -78,7 +82,7 @@ impl LockFile {
 }
 
 /// A lock held; dropping it releases it.
-pub(crate) struct Held {
+pub struct Held {
     shared: Arc<Shared>,
 }
 
@@ -122,6 +126,12 @@ mod sys {
     pub fn unlock(file: &File) -> io::Result<()> {
         set(file, libc::F_UNLCK as libc::c_short).map(|_| ())
     }
+
+    pub fn same_file(a: &File, b: &File) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let (a, b) = (a.metadata()?, b.metadata()?);
+        Ok(a.dev() == b.dev() && a.ino() == b.ino())
+    }
 }
 
 #[cfg(windows)]
@@ -139,6 +149,28 @@ mod sys {
 
     pub fn unlock(file: &File) -> io::Result<()> {
         file.unlock()
+    }
+
+    fn id(file: &File) -> io::Result<(u32, u32, u32)> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        // SAFETY: a zeroed BY_HANDLE_FILE_INFORMATION is valid, and the
+        // handle is open for as long as `file` is.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ))
+    }
+
+    pub fn same_file(a: &File, b: &File) -> io::Result<bool> {
+        Ok(id(a)? == id(b)?)
     }
 }
 
@@ -158,6 +190,20 @@ mod tests {
         drop(LockFile::open(&p).unwrap());
         assert!(a.try_lock().unwrap().is_none());
         drop(held);
+        assert!(b.try_lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_file_moved_away_is_not_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("server.lock");
+        let a = LockFile::open(&p).unwrap();
+        std::fs::create_dir(dir.path().join("old")).unwrap();
+        std::fs::rename(&p, dir.path().join("old/server.lock")).unwrap();
+        let b = LockFile::open(&p).unwrap();
+        assert!(!Arc::ptr_eq(&a.shared, &b.shared));
+        // Both lockable: they are different files.
+        let _ha = a.try_lock().unwrap().expect("free");
         assert!(b.try_lock().unwrap().is_some());
     }
 }
