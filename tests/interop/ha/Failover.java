@@ -11,6 +11,16 @@
 //   java -cp '<artemis>/lib/*' Failover.java failover-once <url> <marker> <count>
 //       the same, but the second round has no failover: it sends and
 //       receives on the server it failed over to.
+//   java -cp '<artemis>/lib/*' Failover.java load <url> <marker>
+//       a transacted producer sends messages to queue load, ten to a
+//       transaction, each with a duplicate ID, until <marker> exists, and a
+//       transacted consumer receives them, both on ha=true connections,
+//       while the brokers fail over and back. A transaction the failover
+//       rolls back is sent or received again; one whose outcome is unknown
+//       is sent again (the duplicate IDs reject it if it was committed).
+//       It prints "committed <n>" every hundred, then what was lost: a
+//       message whose transaction committed and that was never received, or
+//       one received by two commits that succeeded.
 // tests/interop/ha/failback.sh and replication.sh run it; it prints what it
 // saw.
 
@@ -30,6 +40,7 @@ public class Failover {
             case "topology" -> topology(args[1]);
             case "failover" -> failover(args[1], args[2], Integer.parseInt(args[3]), 2);
             case "failover-once" -> failover(args[1], args[2], Integer.parseInt(args[3]), 1);
+            case "load" -> load(args[1], args[2]);
             default -> throw new IllegalArgumentException(args[0]);
         }
         System.exit(0);
@@ -112,5 +123,129 @@ public class Failover {
                 System.out.println("received " + received);
             }
         }
+    }
+
+    static boolean duplicate(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof org.apache.activemq.artemis.api.core.ActiveMQDuplicateIdException
+                || (t.getMessage() != null && t.getMessage().contains("Duplicate message detected"))) {
+                return true;
+            }
+        }
+        return e instanceof JMSException j && j.getLinkedException() != null && duplicate(j.getLinkedException());
+    }
+
+    static void load(String url, String marker) throws Exception {
+        final int batch = 10;
+        ActiveMQConnectionFactory cf = new ActiveMQConnectionFactory(url, "admin", "admin");
+        Set<Integer> committed = ConcurrentHashMap.newKeySet();
+        Map<Integer, Integer> received = new HashMap<>();
+        Set<Integer> unknown = new HashSet<>();
+        int[] retries = new int[2];
+        Thread producer = new Thread(() -> {
+            try (Connection connection = cf.createConnection()) {
+                Session session = connection.createSession(true, Session.SESSION_TRANSACTED);
+                MessageProducer p = session.createProducer(session.createQueue("load"));
+                for (int n = 0; !Files.exists(Paths.get(marker)); n += batch) {
+                    boolean again = false;
+                    while (true) {
+                        try {
+                            for (int i = n; i < n + batch; i++) {
+                                TextMessage m = session.createTextMessage("message " + i);
+                                m.setIntProperty("n", i);
+                                m.setStringProperty("_AMQ_DUPL_ID", "load-" + i);
+                                p.send(m);
+                            }
+                            session.commit();
+                            break;
+                        } catch (JMSException e) {
+                            if (again && duplicate(e)) {
+                                break;
+                            }
+                            retries[0]++;
+                            again = true;
+                            try {
+                                session.rollback();
+                            } catch (JMSException ignored) {
+                            }
+                        }
+                    }
+                    for (int i = n; i < n + batch; i++) {
+                        committed.add(i);
+                    }
+                    if ((n + batch) % 100 == 0) {
+                        System.out.println("committed " + (n + batch));
+                    }
+                    Thread.sleep(20);
+                }
+            } catch (Exception e) {
+                e.printStackTrace(System.out);
+            }
+        });
+        producer.start();
+        try (Connection connection = cf.createConnection()) {
+            connection.start();
+            Session session = connection.createSession(true, Session.SESSION_TRANSACTED);
+            MessageConsumer consumer = session.createConsumer(session.createQueue("load"));
+            List<Integer> pending = new ArrayList<>();
+            long idle = 0;
+            while (true) {
+                Message m = null;
+                boolean committing = false;
+                try {
+                    m = consumer.receive(500);
+                    if (m != null) {
+                        pending.add(m.getIntProperty("n"));
+                    }
+                    if (!pending.isEmpty() && (m == null || pending.size() >= batch)) {
+                        committing = true;
+                        session.commit();
+                        for (int n : pending) {
+                            received.merge(n, 1, Integer::sum);
+                        }
+                        pending.clear();
+                    }
+                } catch (TransactionRolledBackException e) {
+                    retries[1]++;
+                    pending.clear();
+                } catch (JMSException e) {
+                    // A commit that may have happened; a receive the
+                    // failover interrupted is committed or rolled back with
+                    // the rest.
+                    if (!committing) {
+                        continue;
+                    }
+                    retries[1]++;
+                    unknown.addAll(pending);
+                    pending.clear();
+                    try {
+                        session.rollback();
+                    } catch (JMSException ignored) {
+                    }
+                }
+                idle = m == null ? idle + 1 : 0;
+                if (!producer.isAlive()
+                    && (received.keySet().containsAll(committed) || idle > 60)) {
+                    break;
+                }
+            }
+        }
+        producer.join();
+        int lost = 0, twice = 0;
+        for (int n : committed) {
+            if (!received.containsKey(n) && !unknown.contains(n)) {
+                lost++;
+                System.out.println("lost: message " + n);
+            }
+        }
+        for (Map.Entry<Integer, Integer> e : received.entrySet()) {
+            if (e.getValue() > 1) {
+                twice++;
+                System.out.println("received twice: message " + e.getKey());
+            }
+        }
+        System.err.println("retried: " + retries[0] + " producer, " + retries[1] + " consumer transactions; outcome unknown: " + unknown.size());
+        System.out.println("committed " + committed.size() + ", received " + received.size());
+        System.out.println("done: lost " + lost + ", received twice " + twice);
     }
 }

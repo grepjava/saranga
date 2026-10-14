@@ -369,7 +369,11 @@ async fn the_restarted_primary_takes_its_node_back() {
         .unwrap();
     assert_eq!(back, node_id);
 
-    // The primary, active again with everything.
+    // The primary, active again with everything, its node ID written to
+    // the new server.lock as boot writes it (the old one went with its old
+    // data).
+    let lock_dir = pc.storage.as_ref().unwrap().messages.directory.clone();
+    saranga_server::node::write_node_id(&lock_dir, &back).unwrap();
     let primary = Broker::start(config(&primary_file, pdir.path()))
         .await
         .unwrap();

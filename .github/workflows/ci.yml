@@ -28,6 +28,38 @@ jobs:
           for _ in $(seq 1 50); do (echo > /dev/tcp/127.0.0.1/61616) 2>/dev/null && break; sleep 0.2; done
           SARANGA_TEST_BROKER=127.0.0.1:61616 cargo test -p saranga-client --test broker
 
+  # Phase 9's exit check: a Java broker and a Saranga broker as each
+  # other's backup, failing over and back under load without losing a
+  # committed message. Artemis 2.57.0 is tagged but not published, so its
+  # distribution is built from the tag once and cached.
+  ha:
+    runs-on: ubuntu-latest
+    env:
+      ARTEMIS_VERSION: 2.57.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+      - id: artemis
+        uses: actions/cache@v4
+        with:
+          path: reference/activemq-artemis/artemis-distribution/target/apache-artemis-2.57.0-bin
+          key: artemis-dist-2.57.0
+      - name: Build the Artemis distribution
+        if: steps.artemis.outputs.cache-hit != 'true'
+        run: |
+          git clone -c core.autocrlf=false --depth 1 --branch "$ARTEMIS_VERSION" https://github.com/apache/activemq-artemis.git reference/activemq-artemis
+          cd reference/activemq-artemis
+          mvn -B -ntp install -pl artemis-distribution -am -DskipTests -Dcheckstyle.skip -Drat.skip -Denforcer.skip -Dmaven.javadoc.skip
+      - name: Java primary, Saranga backup
+        run: PRIMARY=artemis BACKUP=saranga tests/interop/ha/no-loss.sh
+      - name: Saranga primary, Java backup
+        run: PRIMARY=saranga BACKUP=artemis tests/interop/ha/no-loss.sh
+
   deny:
     runs-on: ubuntu-latest
     steps:
