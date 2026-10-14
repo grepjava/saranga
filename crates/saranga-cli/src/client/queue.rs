@@ -3,7 +3,7 @@
 use anyhow::bail;
 use saranga_server::management::json::Json;
 
-use super::management::{Reply, perform};
+use super::management::{Reply, perform, perform_simple};
 use super::{ConnectionArgs, UsageError};
 
 #[derive(clap::Subcommand, Debug)]
@@ -86,59 +86,63 @@ impl<'a> Queue<'a> {
         &self.args.conn.common
     }
 
-    fn name(&mut self) -> String {
+    fn name(&mut self) -> anyhow::Result<String> {
         if self.name.is_none() {
-            self.name = self
-                .common()
-                .input("--name", "What is the name of the queue?", Some(""));
+            self.name =
+                self.common()
+                    .input("--name", "What is the name of the queue?", Some(""))?;
         }
-        self.name.clone().unwrap_or_default()
+        Ok(self.name.clone().unwrap_or_default())
     }
 
-    fn address(&mut self) -> String {
-        let name = self.name();
-        let given = self.args.address.clone().filter(|a| !a.trim().is_empty());
-        let address = given.or_else(|| {
-            self.common().input(
+    fn address(&mut self) -> anyhow::Result<String> {
+        let name = self.name()?;
+        let address = match self.args.address.clone().filter(|a| !a.trim().is_empty()) {
+            Some(a) => Some(a),
+            None => self.common().input(
                 "--address",
                 &format!("What is the name of the address? <Enter for {name}>"),
                 None,
-            )
-        });
-        address.filter(|a| !a.trim().is_empty()).unwrap_or(name)
+            )?,
+        };
+        Ok(address.filter(|a| !a.trim().is_empty()).unwrap_or(name))
     }
 
-    fn is_anycast(&mut self) -> bool {
+    fn is_anycast(&mut self) -> anyhow::Result<bool> {
         if self.anycast.is_none() {
             self.anycast = self.multicast.map(|m| !m);
         }
-        *self.anycast.get_or_insert_with(|| {
-            self.args
-                .conn
-                .common
-                .input_boolean("--anycast", "Is this an anycast queue?", false)
-        })
+        if self.anycast.is_none() {
+            self.anycast = Some(self.common().input_boolean(
+                "--anycast",
+                "Is this an anycast queue?",
+                false,
+            )?);
+        }
+        Ok(self.anycast == Some(true))
     }
 
-    fn is_multicast(&mut self) -> bool {
+    fn is_multicast(&mut self) -> anyhow::Result<bool> {
         if self.multicast.is_none() {
             self.multicast = self.anycast.map(|a| !a);
         }
-        *self.multicast.get_or_insert_with(|| {
-            self.args
-                .conn
-                .common
-                .input_boolean("--multicast", "Is this a multicast queue?", false)
-        })
+        if self.multicast.is_none() {
+            self.multicast = Some(self.common().input_boolean(
+                "--multicast",
+                "Is this a multicast queue?",
+                false,
+            )?);
+        }
+        Ok(self.multicast == Some(true))
     }
 
     fn routing_type(&mut self) -> anyhow::Result<Option<&'static str>> {
-        if self.is_anycast() && self.is_multicast() {
+        if self.is_anycast()? && self.is_multicast()? {
             bail!(UsageError(
                 "--multicast and --anycast are exclusive options for a queue".to_owned()
             ));
         }
-        Ok(if self.is_multicast() {
+        Ok(if self.is_multicast()? {
             Some("MULTICAST")
         } else if self.anycast == Some(true) {
             Some("ANYCAST")
@@ -147,19 +151,19 @@ impl<'a> Queue<'a> {
         })
     }
 
-    fn durable(&self) -> bool {
-        if self.args.durable {
+    fn durable(&self) -> anyhow::Result<bool> {
+        Ok(if self.args.durable {
             true
         } else if self.args.no_durable {
             false
         } else {
             self.common()
-                .input_boolean("--durable", "Is this a durable queue?", false)
-        }
+                .input_boolean("--durable", "Is this a durable queue?", false)?
+        })
     }
 
-    fn purge_on_no_consumers(&self, use_input: bool) -> Option<bool> {
-        if self.args.purge_on_no_consumers {
+    fn purge_on_no_consumers(&self, use_input: bool) -> anyhow::Result<Option<bool>> {
+        Ok(if self.args.purge_on_no_consumers {
             Some(true)
         } else if self.args.preserve_on_no_consumers {
             Some(false)
@@ -168,19 +172,19 @@ impl<'a> Queue<'a> {
                 "--purge-on-no-consumers",
                 "Purge the contents of the queue once the last consumer disconnects?",
                 false,
-            ))
+            )?)
         } else {
             None
-        }
+        })
     }
 
-    fn auto_create_address(&self) -> bool {
-        self.args.auto_create_address
+    fn auto_create_address(&self) -> anyhow::Result<bool> {
+        Ok(self.args.auto_create_address
             || self.common().input_boolean(
                 "--auto-create-address",
                 "Automatically create the address if it doesn't exist?",
                 false,
-            )
+            )?)
     }
 }
 
@@ -228,16 +232,16 @@ pub async fn run(cmd: QueueCommand) -> anyhow::Result<()> {
             args.conn.resolve(false)?;
             let mut q = Queue::new(&args);
             let params = vec![
-                Json::from(q.address()),
+                Json::from(q.address()?),
                 opt(q.routing_type()?),
-                Json::from(q.name()),
+                Json::from(q.name()?),
                 opt(args.filter.as_deref()),
-                Json::from(q.durable()),
+                Json::from(q.durable()?),
                 Json::from(i64::from(args.max_consumers.unwrap_or(-1))),
-                Json::from(q.purge_on_no_consumers(true).unwrap_or(false)),
-                Json::from(q.auto_create_address()),
+                Json::from(q.purge_on_no_consumers(true)?.unwrap_or(false)),
+                Json::from(q.auto_create_address()?),
             ];
-            let name = q.name();
+            let name = q.name()?;
             let reply = perform(&args.conn, async |r| {
                 r.invoke("broker", "createQueue", params).await
             })
@@ -251,14 +255,14 @@ pub async fn run(cmd: QueueCommand) -> anyhow::Result<()> {
         QueueCommand::Update(mut args) => {
             args.conn.resolve(false)?;
             let mut q = Queue::new(&args);
-            let name = q.name();
+            let name = q.name()?;
             let params = vec![
                 Json::from(name.clone()),
                 opt(q.routing_type()?),
                 args.max_consumers
                     .map(|m| Json::from(i64::from(m)))
                     .unwrap_or(Json::Null),
-                q.purge_on_no_consumers(false)
+                q.purge_on_no_consumers(false)?
                     .map(Json::from)
                     .unwrap_or(Json::Null),
             ];
@@ -274,15 +278,15 @@ pub async fn run(cmd: QueueCommand) -> anyhow::Result<()> {
         }
         QueueCommand::Delete(mut args) => {
             args.conn.resolve(false)?;
-            let name = args
-                .name
-                .clone()
-                .or_else(|| {
+            let name = match args.name.clone() {
+                Some(n) => Some(n),
+                None => {
                     args.conn
                         .common
-                        .input("--name", "What is the name of the queue?", Some(""))
-                })
-                .unwrap_or_default();
+                        .input("--name", "What is the name of the queue?", Some(""))?
+                }
+            }
+            .unwrap_or_default();
             let params = vec![
                 Json::from(name.clone()),
                 Json::from(args.remove_consumers),
@@ -300,15 +304,15 @@ pub async fn run(cmd: QueueCommand) -> anyhow::Result<()> {
         }
         QueueCommand::Purge(mut args) => {
             args.conn.resolve(false)?;
-            let name = args
-                .name
-                .clone()
-                .or_else(|| {
+            let name = match args.name.clone() {
+                Some(n) => Some(n),
+                None => {
                     args.conn
                         .common
-                        .input("--name", "What is the name of the queue?", Some(""))
-                })
-                .unwrap_or_default();
+                        .input("--name", "What is the name of the queue?", Some(""))?
+                }
+            }
+            .unwrap_or_default();
             let reply = perform(&args.conn, async |r| {
                 r.invoke(&format!("queue.{name}"), "removeAllMessages", Vec::new())
                     .await
@@ -503,7 +507,7 @@ async fn stat(mut args: StatArgs) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    print_stats(&args, params()).await?;
+    single_execution(&args, params()).await?;
     let sleep = args.sleep.or(args.old_sleep);
     let use_loop = args.use_loop || sleep.is_some();
     let sleep = sleep.unwrap_or(60_000);
@@ -520,10 +524,21 @@ async fn stat(mut args: StatArgs) -> anyhow::Result<()> {
                 .map(|d| d.display().to_string())
                 .unwrap_or_else(|| "null".to_owned())
         );
-        if let Err(e) = print_stats(&args, params()).await {
+        if let Err(e) = single_execution(&args, params()).await {
             eprintln!("{e:#}");
         }
     }
+}
+
+/// `singleExeuction`: `SimpleManagement`'s node ID and network topology
+/// (which matter only to a cluster's report), then the report.
+async fn single_execution(args: &StatArgs, params: Vec<Json>) -> anyhow::Result<()> {
+    perform_simple(&args.conn, async |r| {
+        r.invoke("broker", "getNodeID", Vec::new()).await?;
+        r.invoke("broker", "listNetworkTopology", Vec::new()).await
+    })
+    .await?;
+    print_stats(args, params).await
 }
 
 async fn print_stats(args: &StatArgs, params: Vec<Json>) -> anyhow::Result<()> {

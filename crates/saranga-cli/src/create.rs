@@ -440,7 +440,7 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
             "--mapped",
             "Since you disabled syncs, it is recommended to use the Mapped Memory Journal. Do you want to use the Memory Mapped Journal",
             true,
-        )
+        )?
     {
         args.mapped = true;
         args.nio = false;
@@ -517,14 +517,14 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
             })?;
             let mut extra = format!(" keyStorePath=\"{key}\" keyStorePassword=\"{password}\"");
             if args.use_client_auth {
-                let trust = args
-                    .ssl_trust
-                    .clone()
-                    .or_else(|| {
+                let trust = match args.ssl_trust.clone() {
+                    Some(t) => Some(t),
+                    None => {
                         args.common
-                            .input("--ssl-trust", "What is the trust store path?", None)
-                    })
-                    .unwrap_or_default();
+                            .input("--ssl-trust", "What is the trust store path?", None)?
+                    }
+                }
+                .unwrap_or_default();
                 let trust_password =
                     args.ssl_trust_password.clone().map(Ok).unwrap_or_else(|| {
                         args.common.input_password(
@@ -560,14 +560,13 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
     f.put("${data.dir}", args.install.data.clone());
     f.put("${max-hops}", "1");
     f.put("${message-load-balancing}", "ON_DEMAND");
-    let user = args
-        .user
-        .clone()
-        .or_else(|| {
-            args.common
-                .input("--user", "What is the default username?", Some("admin"))
-        })
-        .unwrap_or_else(|| "admin".to_owned());
+    let user = match args.user.clone() {
+        Some(u) => Some(u),
+        None => args
+            .common
+            .input("--user", "What is the default username?", Some("admin"))?,
+    }
+    .unwrap_or_else(|| "admin".to_owned());
     f.put("${user}", user.clone());
     let password = match args.password.clone() {
         Some(p) => p,
@@ -634,13 +633,14 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
         &args.role,
     )?;
 
-    let allow_anonymous = allow_anonymous_given.unwrap_or_else(|| {
-        args.common.input_boolean(
+    let allow_anonymous = match allow_anonymous_given {
+        Some(a) => a,
+        None => args.common.input_boolean(
             "--allow-anonymous | --require-login",
             "Allow anonymous access?",
             true,
-        )
-    });
+        )?,
+    };
     let retention = if args.retention_days > 0 {
         match &args.retention_max_bytes {
             Some(max) => format!(

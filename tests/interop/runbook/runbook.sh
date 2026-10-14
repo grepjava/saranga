@@ -15,7 +15,9 @@
 #
 # The procedures, each under the manual chapter it comes from:
 #   using-server       run an instance, find it active in its log, stop it;
-#                      run it with another bootstrap file (xml:<path>)
+#                      run it with another bootstrap file (xml:<path>);
+#                      ${...} in broker.xml, from a system property, an
+#                      environment variable or the default
 #   using-cli          help, from an instance and from the home (and
 #                      using-server's help create, data-tools' help data
 #                      print); bash completion, the script sourced and TAB
@@ -35,7 +37,8 @@
 #   data-retention     journal retention and replay through Jolokia; data
 #                      print and recover over the retention directory
 #   config-reload      an address added to broker.xml while running
-#   perf-tools         perf client; a target rate test with an HDR log
+#   perf-tools         perf client; a target rate test with an HDR log; ten durable
+#                      topics, three producers and two consumers each
 #   data-tools         data print of a running broker's data, refused, then
 #                      with --f and --output; data exp, compact, encode and
 #                      decode, and imp into a second instance; restart
@@ -104,7 +107,10 @@ make_instance() {
 # Its standard input is the file IN names, or nothing. On Windows it is
 # called, so that its status is the command's, as at a cmd prompt: Artemis's
 # artemis.cmd ends with endlocal and GOTO :EOF, which a bare cmd /c reports
-# as 0.
+# as 0. The JVM's WARNING lines, and an empty line after them, are dropped
+# and line ends made \n, line by line for the commands whose output is
+# waited on; perl, as sed -u reads a byte at a time, too slow for data
+# print's output on Windows.
 instance() {
   local dir="$1"; shift
   if windows; then
@@ -112,8 +118,7 @@ instance() {
   else
     (cd "$dir/bin" && timeout 300 ./artemis "$@" < "${IN:-/dev/null}" 2>&1)
   fi | grep --line-buffered -v -E "NO_ARTEMIS_OOME_DUMP|operable program or batch file|^The system cannot find the file specified" \
-    | sed -u -E -e '/^WARNING: /{' -e ':w' -e '$d' -e 'N' -e 's/^WARNING: [^\n]*\n(WARNING: )/\1/' -e 'tw' \
-      -e '/^WARNING: [^\n]*\n$/d' -e 's/^WARNING: [^\n]*\n//' -e '}'
+    | perl -ne 'BEGIN { $| = 1 } s/\r\n\z/\n/; if (/^WARNING: /) { $w = 1; next } $b = $w && /^$/; $w = 0; print unless $b'
   return "${PIPESTATUS[0]}"
 }
 
@@ -348,6 +353,27 @@ suite() {
   step "the HDR histogram log"
   head -2 "$I1/rate.hdr" | tr -d '\r'
   grep -o '^Tag=[^,]*' "$I1/rate.hdr" | sort -u
+  # perf-tools, case 3: ten durable topics, each with three producers and
+  # two unshared consumers. As the manual gives it (its --show-latency
+  # mended), the command is refused: durable subscriptions need a client ID.
+  # With one, and a short duration, what it prints is compared, and every
+  # message is received twice. Its twenty subscriptions are then deleted
+  # with their addresses.
+  local case3=(--max-pending 100 --show-latency --url "tcp://localhost:$PORT1?confirmationWindowSize=20000"
+    --consumer-url "tcp://localhost:$PORT1" --producers 3 --consumers 2 --num-destinations 10 --durable --persistent)
+  step "artemis perf client --warmup 20 ${case3[*]} topic://DURABLE_TOPIC"
+  instance "$I1" perf client --warmup 20 "${case3[@]}" "${AUTH[@]}" topic://DURABLE_TOPIC
+  echo "--- exit ${PIPESTATUS[0]}"
+  step "artemis perf client --warmup 1 --duration 3 ${case3[*]} --clientID runbook topic://DURABLE_TOPIC"
+  instance "$I1" perf client --warmup 1 --duration 3 "${case3[@]}" --clientID runbook "${AUTH[@]}" topic://DURABLE_TOPIC \
+    > "$WORK/case3.txt"
+  sed -n -E -e '/^Connection brokerURL/p' -e '/^--- SUMMARY/,$p' "$WORK/case3.txt" \
+    | sed -E 's/[0-9]+(\.[0-9]+)?/#/g; s/ +/ /g; s/ $//'
+  tr -d '\r' < "$WORK/case3.txt" | awk '/^--- total completed:/ {c = $4} /^--- total received:/ {r = $4}
+    END {print "received twice what was completed: " (r == 2 * c && c > 0 ? "yes" : "no (" c ", " r ")")}'
+  step "artemis address delete --name DURABLE_TOPIC<0-9> --force"
+  for n in {0..9}; do instance "$I1" address delete --name "DURABLE_TOPIC$n" --force "${AUTH[@]}"; done \
+    | grep -c "^Address DURABLE_TOPIC[0-9] deleted successfully\.$"
 
   # using-cli: the shell, bin/artemis alone. connect keeps a connection
   # for the commands after it, and the end of the input disconnects, then
@@ -485,6 +511,7 @@ EOF
 
   bootstrap
   properties
+  substitution
   rbac
   network
   upgrading
@@ -651,6 +678,46 @@ properties() {
     echo
     stop "$I2" "$PORT2"
   done
+  cp "$WORK/profile.bak" "$profile"
+}
+
+# using-server: system property or environment variable substitution, the
+# acceptor artemis's port in broker.xml as ${RUNBOOK_PORT:<port>}: the
+# default, then an environment variable, then a system property in the
+# profile's JAVA_ARGS, which wins over the variable. The CLI finds the
+# broker by the same acceptor, substituted as the broker substitutes it;
+# its commands load artemis-utility.profile, not artemis.profile, so the
+# property is not theirs, and they try the variable's port: the connection
+# fails, a URL for a retry is asked for, and there is none (No line found).
+substitution() {
+  local xml="$I2/etc/broker.xml" env=62436 prop=62446 profile
+  if windows; then profile="$I2/etc/artemis.profile.cmd"; else profile="$I2/etc/artemis.profile"; fi
+  cp "$xml" "$WORK/broker.bak"
+  cp "$profile" "$WORK/profile.bak"
+  sed -i -E "s#(<acceptor name=\"artemis\">tcp://0\.0\.0\.0:)$PORT2#\1\${RUNBOOK_PORT:$PORT2}#" "$xml"
+  step "using-server: <acceptor name=\"artemis\">$(grep -o 'tcp://0\.0\.0\.0:\${[^}]*}' "$xml")"
+  start "$I2" "$PORT2" && echo "listening on the default port"
+  step "artemis queue stat --queueName from"
+  instance "$I2" queue stat --queueName from "${AUTH[@]}"
+  stop "$I2" "$PORT2"
+  step "using-server: RUNBOOK_PORT in the environment"
+  export RUNBOOK_PORT="$env"
+  start "$I2" "$env" && echo "listening on RUNBOOK_PORT's port"
+  step "artemis queue stat --queueName from"
+  instance "$I2" queue stat --queueName from "${AUTH[@]}"
+  stop "$I2" "$env"
+  step "using-server: JAVA_ARGS: -DRUNBOOK_PORT=$prop, RUNBOOK_PORT still in the environment"
+  if windows; then
+    printf '\r\nset JAVA_ARGS=%%JAVA_ARGS%% -DRUNBOOK_PORT=%s\r\n' "$prop" >> "$profile"
+  else
+    printf '\nJAVA_ARGS="$JAVA_ARGS -DRUNBOOK_PORT=%s"\n' "$prop" >> "$profile"
+  fi
+  start "$I2" "$prop" && echo "listening on the system property's port"
+  step "artemis queue stat --queueName from"
+  instance "$I2" queue stat --queueName from "${AUTH[@]}"
+  stop "$I2" "$prop"
+  unset RUNBOOK_PORT
+  cp "$WORK/broker.bak" "$xml"
   cp "$WORK/profile.bak" "$profile"
 }
 

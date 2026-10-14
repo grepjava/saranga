@@ -50,24 +50,26 @@ pub struct UserArgs {
 }
 
 impl UserArgs {
-    fn input_user(&mut self) {
+    fn input_user(&mut self) -> anyhow::Result<()> {
         if self.command_user.is_none() {
             self.command_user = self.conn.common.input(
                 "--user-command-user",
                 "Please provide the username to use for the chosen user command:",
                 None,
-            );
+            )?;
         }
+        Ok(())
     }
 
-    fn input_role(&mut self) {
+    fn input_role(&mut self) -> anyhow::Result<()> {
         if self.role.is_none() {
             self.role = self.conn.common.input(
                 "--role",
                 "What is the user's role(s)? Separate multiple roles with comma.",
                 None,
-            );
+            )?;
         }
+        Ok(())
     }
 
     fn input_password(&self, password: Option<String>) -> anyhow::Result<String> {
@@ -97,9 +99,9 @@ pub async fn run(cmd: UserCommand) -> anyhow::Result<()> {
             plaintext,
         } => {
             args.conn.resolve(false)?;
-            args.input_user();
+            args.input_user()?;
             let password = args.input_password(password)?;
-            args.input_role();
+            args.input_role()?;
             let params = vec![
                 opt(args.command_user.as_deref()),
                 Json::from(password),
@@ -126,7 +128,7 @@ pub async fn run(cmd: UserCommand) -> anyhow::Result<()> {
             plaintext,
         } => {
             args.conn.resolve(false)?;
-            args.input_user();
+            args.input_user()?;
             let password = args.input_password(password)?;
             let params = vec![
                 opt(args.command_user.as_deref()),
@@ -150,7 +152,7 @@ pub async fn run(cmd: UserCommand) -> anyhow::Result<()> {
         }
         UserCommand::Rm(mut args) => {
             args.conn.resolve(false)?;
-            args.input_user();
+            args.input_user()?;
             let params = vec![opt(args.command_user.as_deref())];
             let reply = perform(&args.conn, async |r| {
                 r.invoke("broker", "removeUser", params).await

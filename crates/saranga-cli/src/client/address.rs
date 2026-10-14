@@ -53,18 +53,18 @@ pub struct AddressArgs {
 }
 
 impl AddressArgs {
-    fn name(&mut self, require_input: bool) -> Option<String> {
+    fn name(&mut self, require_input: bool) -> anyhow::Result<Option<String>> {
         if self.name.is_none() && require_input {
-            self.name = self
-                .conn
-                .common
-                .input("--name", "What is the name of the address?", None);
+            self.name =
+                self.conn
+                    .common
+                    .input("--name", "What is the name of the address?", None)?;
         }
-        self.name.clone()
+        Ok(self.name.clone())
     }
 
-    fn is_anycast(&self) -> bool {
-        if self.no_anycast {
+    fn is_anycast(&self) -> anyhow::Result<bool> {
+        Ok(if self.no_anycast {
             false
         } else {
             self.anycast
@@ -72,12 +72,12 @@ impl AddressArgs {
                     "--anycast",
                     "Will this address support anycast queues?",
                     false,
-                )
-        }
+                )?
+        })
     }
 
-    fn is_multicast(&self) -> bool {
-        if self.no_multicast {
+    fn is_multicast(&self) -> anyhow::Result<bool> {
+        Ok(if self.no_multicast {
             false
         } else {
             self.multicast
@@ -85,21 +85,21 @@ impl AddressArgs {
                     "--multicast",
                     "Will this address support multicast queues?",
                     true,
-                )
-        }
+                )?
+        })
     }
 
     /// `getRoutingTypes`: `ANYCAST,MULTICAST`, either, or (none) the
     /// default or nothing.
-    fn routing_types(&self, use_default: bool) -> Option<String> {
-        let anycast = self.is_anycast();
-        let multicast = self.is_multicast();
-        match (anycast, multicast) {
+    fn routing_types(&self, use_default: bool) -> anyhow::Result<Option<String>> {
+        let anycast = self.is_anycast()?;
+        let multicast = self.is_multicast()?;
+        Ok(match (anycast, multicast) {
             (true, true) => Some("ANYCAST,MULTICAST".to_owned()),
             (true, false) => Some("ANYCAST".to_owned()),
             (false, true) => Some("MULTICAST".to_owned()),
             (false, false) => use_default.then(|| "MULTICAST".to_owned()),
-        }
+        })
     }
 }
 
@@ -111,8 +111,8 @@ pub async fn run(cmd: AddressCommand) -> anyhow::Result<()> {
     match cmd {
         AddressCommand::Create(mut args) => {
             args.conn.resolve(false)?;
-            let name = args.name(true);
-            let params = vec![opt(name.clone()), opt(args.routing_types(true))];
+            let name = args.name(true)?;
+            let params = vec![opt(name.clone()), opt(args.routing_types(true)?)];
             let reply = perform(&args.conn, async |r| {
                 r.invoke("broker", "createAddress", params).await
             })
@@ -129,8 +129,8 @@ pub async fn run(cmd: AddressCommand) -> anyhow::Result<()> {
         }
         AddressCommand::Update(mut args) => {
             args.conn.resolve(false)?;
-            let name = args.name(true);
-            let params = vec![opt(name.clone()), opt(args.routing_types(false))];
+            let name = args.name(true)?;
+            let params = vec![opt(name.clone()), opt(args.routing_types(false)?)];
             let reply = perform(&args.conn, async |r| {
                 r.invoke("broker", "updateAddress", params).await
             })
@@ -147,7 +147,7 @@ pub async fn run(cmd: AddressCommand) -> anyhow::Result<()> {
         }
         AddressCommand::Delete { mut args, force } => {
             args.conn.resolve(false)?;
-            let name = args.name(true);
+            let name = args.name(true)?;
             let params = vec![opt(name.clone()), Json::from(force)];
             let reply = perform(&args.conn, async |r| {
                 r.invoke("broker", "deleteAddress", params).await
@@ -165,7 +165,7 @@ pub async fn run(cmd: AddressCommand) -> anyhow::Result<()> {
         }
         AddressCommand::Show { mut args, bindings } => {
             args.conn.resolve(false)?;
-            let name = args.name(false);
+            let name = args.name(false)?;
             let reply = perform(&args.conn, async |r| match &name {
                 None => {
                     r.invoke("broker", "listAddresses", vec![Json::from("\n")])

@@ -643,6 +643,26 @@ Connection brokerURL = tcp://localhost:#?confirmationWindowSize=#
 Tag=delay send
 Tag=send
 Tag=transfer
+=== artemis perf client --warmup 20 --max-pending 100 --show-latency --url tcp://localhost:62316?confirmationWindowSize=20000 --consumer-url tcp://localhost:62316 --producers 3 --consumers 2 --num-destinations 10 --durable --persistent topic://DURABLE_TOPIC
+The clientID must be set on durable subscriptions
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== artemis perf client --warmup 1 --duration 3 --max-pending 100 --show-latency --url tcp://localhost:62316?confirmationWindowSize=20000 --consumer-url tcp://localhost:62316 --producers 3 --consumers 2 --num-destinations 10 --durable --persistent --clientID runbook topic://DURABLE_TOPIC
+Connection brokerURL = tcp://localhost:#?confirmationWindowSize=#
+--- SUMMARY
+--- result: success
+--- total sent: #
+--- total blocked: #
+--- total completed: #
+--- total received: #
+--- aggregated send time: mean: # us - #%: # us - #%: # us - #%: # us - #%: # us - #%: # us - max: # us
+--- aggregated transfer time: mean: # us - #%: # us - #%: # us - #%: # us - #%: # us - #%: # us - max: # us
+received twice what was completed: yes
+=== artemis address delete --name DURABLE_TOPIC<0-9> --force
+10
 === using-cli: artemis (the shell): connect, then queue stat
  BANNER
 
@@ -842,6 +862,46 @@ Connection brokerURL = tcp://localhost:62416
 |fromProperties|fromProperties|   0    |   0   |   0    |    0     |   0    |    0    |ANYCAST| false  |
 === curl read/org.apache.activemq.artemis:broker=%220.0.0.0%22/Status
 {"request":{"mbean":"org.apache.activemq.artemis:broker=\"0.0.0.0\"","attribute":"Status","type":"read"},"value":"{\"configuration\":{\"properties\":{\"c.custom_props\":{\"alder32\":\"2508529072\",\"fileAlder32\":\"3007258042\",\"adler32\":\"2508529072\",\"fileAdler32\":\"3007258042\",\"errors\":[]},\"system-brokerconfig.\":{\"alder32\":\"1\",\"fileAlder32\":\"0\",\"adler32\":\"1\",\"fileAdler32\":\"0\"}}},\"server\":{\"jaas\":{\"properties\":{\"artemis-users.properties\":{\"reloadTime\":\"#\",\"Alder32\":\"#\",\"Adler32\":\"#\"},\"artemis-roles.properties\":{\"reloadTime\":\"#\",\"Alder32\":\"#\",\"Adler32\":\"#\"}}},\"state\":\"STARTED\",\"version\":\"2.57.0\",\"nodeId\":\"UUID\",\"identity\":null,\"uptime\":\"#\"}}","status":200}
+=== artemis stop
+--- exit 0
+stopped
+=== using-server: <acceptor name="artemis">tcp://0.0.0.0:${RUNBOOK_PORT:62416}
+listening on the default port
+=== artemis queue stat --queueName from
+Connection brokerURL = tcp://localhost:62416
+|NAME          |ADDRESS       |CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|              |              | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|fromCustom    |fromCustom    |   0    |   0   |   0    |    0     |   0    |    0    |ANYCAST| false  |
+|fromJson      |fromJson      |   0    |   0   |   0    |    0     |   0    |    0    |ANYCAST| false  |
+|fromProperties|fromProperties|   0    |   0   |   0    |    0     |   0    |    0    |ANYCAST| false  |
+=== artemis stop
+--- exit 0
+stopped
+=== using-server: RUNBOOK_PORT in the environment
+listening on RUNBOOK_PORT's port
+=== artemis queue stat --queueName from
+Connection brokerURL = tcp://localhost:62436
+|NAME          |ADDRESS       |CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|              |              | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+|fromCustom    |fromCustom    |   0    |   0   |   0    |    0     |   0    |    0    |ANYCAST| false  |
+|fromJson      |fromJson      |   0    |   0   |   0    |    0     |   0    |    0    |ANYCAST| false  |
+|fromProperties|fromProperties|   0    |   0   |   0    |    0     |   0    |    0    |ANYCAST| false  |
+=== artemis stop
+--- exit 0
+stopped
+=== using-server: JAVA_ARGS: -DRUNBOOK_PORT=62446, RUNBOOK_PORT still in the environment
+listening on the system property's port
+=== artemis queue stat --queueName from
+Connection brokerURL = tcp://localhost:62436
+Connection failed::AMQ219007: Cannot connect to server(s). Tried with all available servers.
+
+--url:
+Type in the connection URL for a retry (e.g. tcp://localhost:61616)
+No line found
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
 === artemis stop
 --- exit 0
 stopped

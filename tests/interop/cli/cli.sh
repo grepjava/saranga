@@ -39,18 +39,13 @@ run() {
   cli "$@" --url "$URL" --silent </dev/null 2>&1
   echo "--- exit $?"
 }
-# The shell, its lines piped: connect keeps the URL for the commands after
-# it, and nothing after exit runs. Artemis runs piped lines from
-# ShellPiped.java; saranga, alone, takes them from standard input.
+# The shell, its lines piped to the CLI alone (Artemis.run), as bin/artemis
+# runs it: the lines are read at its prompts, connect keeps the URL for the
+# commands after it, and nothing after exit runs.
 shell() {
   echo "=== shell"
   printf 'NO_HISTORY\n' > "$INSTANCE/etc/history-file"
-  printf '%s\n' "$@" | case "${CLI:-artemis}" in
-    artemis)
-      timeout 120 java -cp "$(native "$DIST/lib")/*" -Dartemis.home="$(native "$DIST")" \
-        -Dartemis.instance="$(native "$INSTANCE")" "$(native "$HERE/ShellPiped.java")" ;;
-    saranga) ARTEMIS_INSTANCE="$(native "$INSTANCE")" timeout 120 "$ROOT/target/release/saranga" ;;
-  esac 2>&1
+  printf '%s\n' "$@" | cli 2>&1
   echo "--- exit $?"
 }
 # Commands without --url.
@@ -145,7 +140,9 @@ suite() {
     "disconnect" "exit" "version"
 }
 
-# Timings, generated names and ports differ between runs and brokers.
+# Timings, generated names and ports differ between runs and brokers. The
+# shell's banner and prompt name the broker, and Saranga has no <TAB>
+# completion to offer.
 normalize() {
   local uuid='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
   sed -E \
@@ -161,7 +158,10 @@ normalize() {
     -e 's/"id":"[0-9]+"/"id":"#"/g' \
     -e 's/"id":[0-9]+/"id":#/g' \
     -e "s/$uuid/UUID/g" \
-    -e 's/\r$//'
+    -e 's/\r$//' \
+    -e '/^ *[_/]/d' -e 's/^ (Apache Artemis|Saranga) [0-9.]+$/ BANNER/' \
+    -e 's/(Apache Artemis|Saranga) [0-9.]+ > /CLI > /g' -e 's/ or press <TAB>//' \
+    -e 's/^(Shell history disabled as recorded in) .*/\1 HISTORY/'
 }
 
 OUT="$(mktemp)"

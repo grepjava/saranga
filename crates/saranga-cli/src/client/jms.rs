@@ -109,14 +109,14 @@ impl JmsConnection {
             Ok(s) => s,
             Err(e) => {
                 conn.close().await;
-                bail!(ConnectFailed(message(&e)));
+                bail!(ConnectFailed::from(&e));
             }
         };
         if let Some(id) = &client_id
             && let Err(e) = initial.add_unique_metadata(JMS_CLIENT_ID, id).await
         {
             conn.close().await;
-            bail!(ConnectFailed(message(&e)));
+            bail!(ConnectFailed::from(&e));
         }
         let uid = saranga_client::uuid::to_string(&saranga_client::uuid::time_based());
         Ok(Self {
@@ -200,13 +200,27 @@ impl JmsConnection {
     }
 }
 
-/// The connection could not be made: `Connection failed::<reason>`.
+/// The connection could not be made: `Connection failed::<reason>`. A
+/// `JMSSecurityException` when the broker refused the user
+/// (`SECURITY_EXCEPTION`).
 #[derive(Debug)]
-pub struct ConnectFailed(pub String);
+pub struct ConnectFailed {
+    pub reason: String,
+    pub security: bool,
+}
+
+impl From<&Error> for ConnectFailed {
+    fn from(e: &Error) -> Self {
+        Self {
+            reason: message(e),
+            security: matches!(e, Error::ActiveMq { code: 105, .. }),
+        }
+    }
+}
 
 impl std::fmt::Display for ConnectFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.reason)
     }
 }
 

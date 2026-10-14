@@ -192,7 +192,7 @@ pub async fn run(cmd: CheckCommand) -> anyhow::Result<()> {
                     "--name",
                     "Name is a mandatory property for Queue check",
                     None,
-                );
+                )?;
             }
             let tasks = queue_tasks(&args).map_err(|e| check_failed("QueueCheck", &e))?;
             (args.check, "QueueCheck", tasks)

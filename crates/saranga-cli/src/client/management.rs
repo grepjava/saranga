@@ -167,7 +167,24 @@ pub async fn perform(
     args: &super::ConnectionArgs,
     request: impl AsyncFnOnce(&Requestor) -> anyhow::Result<Reply>,
 ) -> anyhow::Result<Reply> {
-    let (conn, session) = args.core_session().await?;
+    let session = args.core_session().await?;
+    request_on(session, request).await
+}
+
+/// One management request as `SimpleManagement` makes it: a session
+/// without the connection factory's `tryConnect`.
+pub async fn perform_simple(
+    args: &super::ConnectionArgs,
+    request: impl AsyncFnOnce(&Requestor) -> anyhow::Result<Reply>,
+) -> anyhow::Result<Reply> {
+    let session = args.simple_session().await?;
+    request_on(session, request).await
+}
+
+async fn request_on(
+    (conn, session): (saranga_client::Connection, saranga_client::Session),
+    request: impl AsyncFnOnce(&Requestor) -> anyhow::Result<Reply>,
+) -> anyhow::Result<Reply> {
     let requestor = match Requestor::on(session).await {
         Ok(r) => r,
         Err(e) => {

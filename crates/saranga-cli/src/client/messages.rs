@@ -83,6 +83,7 @@ async fn connect(conn: &ConnectionArgs) -> anyhow::Result<JmsConnection> {
         println!("Consumer:: clientID = {id}");
     }
     // The connection factory's `tryConnect`, then the command's own.
+    let mut conn = conn.clone();
     conn.try_connect().await?;
     conn.connect().await
 }

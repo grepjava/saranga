@@ -39,21 +39,23 @@ pub struct Common {
 }
 
 impl Common {
-    /// `isSilentInput`: no prompts with `--silent` or without a terminal.
+    /// `isSilentInput`: no prompts with `--silent`. The `artemis` script
+    /// enables input, with a terminal or without.
     pub fn is_silent_input(&self) -> bool {
-        self.silent || !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        self.silent
     }
 
-    /// `InputAbstract.input`: the default without input, else a non-empty
-    /// line, asked for as `InputReader.inputLoop` asks.
+    /// `InputAbstract.input`: the default with `--silent`, else a
+    /// non-empty line, asked for as `InputReader.inputLoop` asks. Standard
+    /// input ending fails as `Scanner.nextLine` does (`No line found`).
     pub fn input(
         &self,
         property: &str,
         prompt: &str,
         silent_default: Option<&str>,
-    ) -> Option<String> {
+    ) -> anyhow::Result<Option<String>> {
         if self.is_silent_input() {
-            return silent_default.map(str::to_owned);
+            return Ok(silent_default.map(str::to_owned));
         }
         println!();
         loop {
@@ -61,19 +63,24 @@ impl Common {
             println!("{prompt}");
             let mut line = String::new();
             if std::io::stdin().lock().read_line(&mut line).unwrap_or(0) == 0 {
-                return silent_default.map(str::to_owned);
+                bail!(UsageError("No line found".to_owned()));
             }
             let line = line.trim_end_matches(['\r', '\n']);
             if !line.is_empty() {
-                return Some(line.trim().to_owned());
+                return Ok(Some(line.trim().to_owned()));
             }
         }
     }
 
     /// `InputAbstract.inputBoolean`.
-    pub fn input_boolean(&self, property: &str, prompt: &str, silent_default: bool) -> bool {
+    pub fn input_boolean(
+        &self,
+        property: &str,
+        prompt: &str,
+        silent_default: bool,
+    ) -> anyhow::Result<bool> {
         if self.is_silent_input() {
-            return silent_default;
+            return Ok(silent_default);
         }
         loop {
             let value = self
@@ -81,11 +88,11 @@ impl Common {
                     property,
                     &format!("{prompt}, valid values are Y, N, True, False"),
                     Some(&silent_default.to_string()),
-                )
+                )?
                 .unwrap_or_default();
             match value.trim().to_uppercase().as_str() {
-                "TRUE" | "Y" => return true,
-                "FALSE" | "N" => return false,
+                "TRUE" | "Y" => return Ok(true),
+                "FALSE" | "N" => return Ok(false),
                 _ => {}
             }
         }
@@ -302,10 +309,56 @@ impl ConnectionArgs {
         Ok(conn)
     }
 
-    /// `tryConnect`, as making a connection factory does: a connection
-    /// made and closed at once.
-    pub async fn try_connect(&self) -> anyhow::Result<()> {
-        self.connect().await?.close().await;
+    /// `createCoreConnectionFactory`'s `tryConnect`: a connection made and
+    /// closed at once. When it fails, `Connection failed::<reason>`, then
+    /// (unless the broker refused the user) a URL for the retry, and the
+    /// user and password when there are none, are asked for; the retry's
+    /// failure is ignored, and the command goes on with its own URL and
+    /// the user and password given.
+    pub async fn try_connect(&mut self) -> anyhow::Result<()> {
+        crate::shell::recover(self);
+        let failed = match self.connect().await {
+            Ok(conn) => {
+                conn.close().await;
+                return Ok(());
+            }
+            Err(e) => match e.downcast::<jms::ConnectFailed>() {
+                Ok(f) => f,
+                // The transport did not connect (`ActiveMQNotConnectedException`).
+                Err(_) => jms::ConnectFailed {
+                    reason:
+                        "AMQ219007: Cannot connect to server(s). Tried with all available servers."
+                            .to_owned(),
+                    security: false,
+                },
+            },
+        };
+        eprintln!("Connection failed::{failed}");
+        let mut retry = self.clone();
+        if !failed.security {
+            let url = self.common.input(
+                "--url",
+                "Type in the connection URL for a retry (e.g. tcp://localhost:61616)",
+                Some(self.url()),
+            )?;
+            retry.url = url.or(retry.url);
+        }
+        if self.user.is_none() {
+            self.user = self
+                .common
+                .input("--user", "Type the username for a retry", None)?;
+        }
+        if !self.common.is_silent_input() && self.password.is_none() {
+            self.password = Some(
+                self.common
+                    .input_password("--password", "Type the password for a retry")?,
+            );
+        }
+        retry.user = self.user.clone();
+        retry.password = self.password.clone();
+        if let Ok(conn) = retry.connect().await {
+            conn.close().await;
+        }
         Ok(())
     }
 
@@ -313,7 +366,14 @@ impl ConnectionArgs {
     /// session, each with this user and password (after the factory's
     /// `tryConnect`).
     pub async fn core_session(&self) -> anyhow::Result<(Connection, saranga_client::Session)> {
-        self.try_connect().await?;
+        let mut args = self.clone();
+        args.try_connect().await?;
+        args.simple_session().await
+    }
+
+    /// `SimpleManagement.open`'s session factory and session, with this
+    /// user and password or the shell's, and no `tryConnect`.
+    pub async fn simple_session(&self) -> anyhow::Result<(Connection, saranga_client::Session)> {
         let mut args = self.clone();
         crate::shell::recover(&mut args);
         let conn = open(args.url(), args.user.as_deref(), args.password.as_deref()).await?;

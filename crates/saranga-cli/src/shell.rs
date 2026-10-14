@@ -274,7 +274,8 @@ pub async fn run(print_banner_first: bool, history: Option<PathBuf>) {
         if let Some(h) = &mut history {
             h.add(&line);
         }
-        if words.is_empty() {
+        // JLine's registry runs nothing for an empty line or a comment.
+        if words.is_empty() || line.trim_start().starts_with('#') {
             continue;
         }
         tokio::select! {
