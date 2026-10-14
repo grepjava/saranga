@@ -624,6 +624,16 @@ impl Storage {
         (Some(c), Some(p))
     }
 
+    /// The message journal, for replication.
+    pub(crate) fn messages_journal(&self) -> &Journal {
+        &self.messages
+    }
+
+    /// The bindings journal, for replication.
+    pub(crate) fn bindings_journal(&self) -> &Journal {
+        &self.bindings
+    }
+
     // Message journal ------------------------------------------------------
 
     /// `getMaxRecordSize` of the message journal.

@@ -34,6 +34,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak, mpsc};
 
+use saranga_core_protocol::packets::replication::ReplicationPageEventMessage;
 use saranga_journal::Completion;
 use saranga_paging::{PagedBody, PagedMessage};
 use saranga_storage::message::PersistedMessage;
@@ -107,6 +108,10 @@ pub struct PagingManager {
     loaded: AtomicBool,
     /// The disk is past `max-disk-usage` or `min-disk-free` (`diskFull`).
     disk_full: AtomicBool,
+    /// The backup page files are replicated to.
+    replication: crate::replication::Slot,
+    /// No page is deleted while a backup copies them (`disableCleanup`).
+    cleanup_paused: AtomicBool,
     me: Weak<PagingManager>,
 }
 
@@ -133,6 +138,8 @@ impl PagingManager {
             blocked: Mutex::default(),
             syncer: Mutex::new(None),
             loaded: AtomicBool::new(false),
+            replication: crate::replication::Slot::default(),
+            cleanup_paused: AtomicBool::new(false),
             me: me.clone(),
         })
     }
@@ -340,10 +347,92 @@ impl PagingManager {
         lock(&self.transactions).remove(&tx_id);
     }
 
+    /// Starts replicating page files to a backup: every store's page files
+    /// so far are returned, each store writing to a new page from then on,
+    /// and what is written to pages afterwards is replicated. No page is
+    /// deleted until [`PagingManager::sync_finished`].
+    pub(crate) fn start_replication(
+        &self,
+        replicator: Arc<crate::replication::Replicator>,
+    ) -> Vec<(Name, Vec<(i64, PathBuf)>)> {
+        self.cleanup_paused.store(true, Ordering::SeqCst);
+        self.replication.set(Some(replicator));
+        let mut out = Vec::new();
+        for store in self.stores() {
+            let mut st = lock(&store.state);
+            if st.replicated {
+                continue;
+            }
+            st.replicated = true;
+            let Some(folder) = st.folder.clone() else {
+                continue;
+            };
+            // getCurrentIds, then forceAnotherPage.
+            let mut pages: Vec<(i64, PathBuf)> = fs::read_dir(&folder)
+                .map(|d| {
+                    d.flatten()
+                        .filter_map(|e| {
+                            let name = e.file_name();
+                            let id = saranga_paging::page_id_of(name.to_str()?)?;
+                            Some((id, e.path()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            pages.sort();
+            if pages.is_empty() {
+                continue;
+            }
+            if st.current.is_some()
+                && let Err(e) = store.open_new_page(&mut st)
+            {
+                tracing::warn!("opening a new page on {}: {e}", store.address);
+            }
+            out.push((store.address.clone(), pages));
+        }
+        out
+    }
+
+    /// `resumeCleanup`: the backup has its copies.
+    pub(crate) fn sync_finished(&self) {
+        self.cleanup_paused.store(false, Ordering::SeqCst);
+        for store in self.stores() {
+            store.cleanup();
+        }
+    }
+
+    /// Page files are no longer replicated.
+    pub(crate) fn stop_replication(&self) {
+        self.replication.set(None);
+        for store in self.stores() {
+            lock(&store.state).replicated = false;
+        }
+        if self.cleanup_paused.swap(false, Ordering::SeqCst) {
+            for store in self.stores() {
+                store.cleanup();
+            }
+        }
+    }
+
+    fn replicator(&self) -> Option<Arc<crate::replication::Replicator>> {
+        self.replication.get()
+    }
+
+    /// Waits for the backup to have everything replicated so far.
+    fn replicated(&self, r: &crate::replication::Replicator) -> Pending {
+        let (c, p) = Pending::new();
+        r.barrier(c);
+        p
+    }
+
     /// Syncs a page file, batched with the other requests waiting
-    /// (`PageTimedWriter`).
+    /// (`PageTimedWriter`), and waits for the backup, when there is one.
     fn sync_file(&self, file: Arc<File>) -> Pending {
         let (c, p) = Pending::new();
+        let c = match self.replicator() {
+            Some(r) => r.join_barrier(c),
+            None => c,
+        };
         let mut syncer = lock(&self.syncer);
         let tx = syncer.get_or_insert_with(|| {
             let (tx, rx) = mpsc::channel::<SyncRequest>();
@@ -523,6 +612,8 @@ struct StoreState {
     cache: VecDeque<Arc<LoadedPage>>,
     subscriptions: BTreeMap<i64, Arc<PageSubscription>>,
     drop_warned: bool,
+    /// What is written to this store's pages is replicated.
+    replicated: bool,
 }
 
 /// What [`PagingStore::page`] did with a message.
@@ -598,6 +689,7 @@ impl PagingStore {
                 cache: VecDeque::new(),
                 subscriptions: BTreeMap::new(),
                 drop_warned: false,
+                replicated: false,
             }),
             blocked: Mutex::default(),
             blocking: AtomicBool::new(false),
@@ -882,6 +974,20 @@ impl PagingStore {
             .write(true)
             .truncate(true)
             .open(&path)?;
+        if st.replicated
+            && let Some(old) = &st.current
+            && let Some(r) = self.manager.upgrade().and_then(|m| m.replicator())
+        {
+            // `Page.close`: the backup closes its copy.
+            r.send(
+                ReplicationPageEventMessage {
+                    store_name: (&*self.address).into(),
+                    page_number: old.id,
+                    is_delete: false,
+                },
+                None,
+            );
+        }
         if let Some(old) = st.current.take() {
             st.cache.push_back(Arc::new(LoadedPage {
                 id: old.id,
@@ -1231,8 +1337,14 @@ impl PagingStore {
         if let Some(storage) = &manager.storage {
             storage.page_write_history(message, &paged.queue_ids);
         }
+        let replicated = st.replicated;
         let current = st.current.as_mut().expect("a current page");
         (&*current.file).write_all(&record).map_err(io)?;
+        let replicator = manager.replicator().filter(|_| replicated);
+        if let Some(r) = &replicator {
+            replicate_page_write(r, &self.address, current.id, &record);
+        }
+        let current = st.current.as_mut().expect("a current page");
         current.size += record.len() as u64;
         let nr = current.entries.len() as i32;
         current.entries.push(Arc::new(PageEntry {
@@ -1266,7 +1378,13 @@ impl PagingStore {
                         .storage
                         .as_ref()
                         .is_some_and(|s| s.sync_non_transactional());
-                sync.then(|| manager.sync_file(file))
+                if sync {
+                    Some(manager.sync_file(file))
+                } else {
+                    replicator
+                        .filter(|_| message.is_durable())
+                        .map(|r| manager.replicated(&r))
+                }
             }
             Some(tx) => {
                 let (page_tx, _) = manager.install_transaction(tx_id);
@@ -1854,6 +1972,9 @@ impl PagingStore {
         let Some(manager) = self.manager.upgrade() else {
             return;
         };
+        if manager.cleanup_paused.load(Ordering::SeqCst) {
+            return;
+        }
         let Some(storage) = manager.storage.clone() else {
             return;
         };
@@ -1994,6 +2115,18 @@ impl PagingStore {
                 && e.kind() != io::ErrorKind::NotFound
             {
                 tracing::warn!("AMQ222003: Error deleting page {}: {e}", path.display());
+            }
+            if let Some(r) = manager.replicator()
+                && lock(&self.state).replicated
+            {
+                r.send(
+                    ReplicationPageEventMessage {
+                        store_name: (&*self.address).into(),
+                        page_number: page,
+                        is_delete: true,
+                    },
+                    None,
+                );
             }
             for sub in &subs {
                 sub.on_delete_page(page, &storage);
@@ -2542,4 +2675,34 @@ impl TxPaging {
             }
         }
     }
+}
+
+/// `ReplicationManager.pageWrite`: a record just written to a page, for the
+/// backup's copy of it. The address goes with it from 2.24.
+fn replicate_page_write(
+    r: &crate::replication::Replicator,
+    address: &Name,
+    page_number: i64,
+    record: &[u8],
+) {
+    use saranga_buffer::Codec;
+    use saranga_core_protocol::packets::replication::{PagedMessage, ReplicationPageWriteMessage};
+    let body = &record[5..record.len() - 1];
+    let paged_message = match PagedMessage::read(&mut saranga_buffer::Reader::new(body)) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("a paged message on {address} cannot be replicated: {e}");
+            return;
+        }
+    };
+    let address = (r.version() >= saranga_core_protocol::version::ARTEMIS_2_24_0)
+        .then(|| Some((&**address).into()));
+    r.send(
+        ReplicationPageWriteMessage {
+            page_number,
+            paged_message,
+            address,
+        },
+        None,
+    );
 }

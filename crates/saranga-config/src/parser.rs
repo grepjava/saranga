@@ -447,8 +447,8 @@ const NOT_ACTED_ON: &[(&str, &str)] = &[
 
 /// `parseHAPolicyConfiguration`: the first of `live-only`, `primary-only`,
 /// `shared-store` and `replication` found decides, and within it
-/// `colocated`, then `master`, `slave`, `primary` and `backup`. Replication
-/// and colocated backups are refused; a replication primary runs on its own.
+/// `colocated`, then `master`, `slave`, `primary` and `backup`. Colocated
+/// backups and pluggable quorum (`manager`) are refused.
 fn parse_ha_policy(
     core: Node<'_, '_>,
     config: &mut BrokerConfig,
@@ -531,16 +531,30 @@ fn parse_ha_policy(
                 if first(ha, "colocated").is_some() {
                     return Err(refuse("a colocated backup is not supported"));
                 }
-                if first(ha, "master").is_none()
-                    && (first(ha, "slave").is_some()
-                        || (first(ha, "primary").is_none() && first(ha, "backup").is_some()))
-                {
-                    return Err(refuse("a replicating backup is not supported yet"));
+                let (node, backup) = if let Some(n) = first(ha, "master") {
+                    deprecated(warnings, "master", "primary");
+                    (n, false)
+                } else if let Some(n) = first(ha, "slave") {
+                    deprecated(warnings, "slave", "backup");
+                    (n, true)
+                } else if let Some(n) = first(ha, "primary") {
+                    (n, false)
+                } else if let Some(n) = first(ha, "backup") {
+                    (n, true)
+                } else {
+                    return Ok(());
+                };
+                if first(node, "manager").is_some() {
+                    return Err(refuse(
+                        "replication with a pluggable quorum manager is not supported yet",
+                    ));
                 }
-                warnings.push(Warning::Unsupported {
-                    name: "ha-policy".to_owned(),
-                    reason: "replication is not supported yet; the broker runs on its own and no backup takes over from it",
-                });
+                let replication = parse_replication(node, backup, warnings)?;
+                config.ha_policy = if backup {
+                    HaPolicy::ReplicationBackup(replication)
+                } else {
+                    HaPolicy::ReplicationPrimary(replication)
+                };
             }
             _ => {
                 if first(ha, "scale-down").is_some() {
@@ -554,6 +568,56 @@ fn parse_ha_policy(
         return Ok(());
     }
     Ok(())
+}
+
+/// `createReplicationPrimaryHaPolicy` and `createReplicationBackupHaPolicy`.
+fn parse_replication(
+    n: Node<'_, '_>,
+    backup: bool,
+    warnings: &mut Vec<Warning>,
+) -> Result<crate::broker::Replication> {
+    let mut r = crate::broker::Replication::default();
+    let int = |name: &str, default: i32| first(n, name).map_or(Ok(default), node_i32);
+    let long = |name: &str, default: i64| first(n, name).map_or(Ok(default), node_i64);
+    let bool_or = |name: &str, default: bool| first(n, name).map_or(default, node_bool);
+    let string = |name: &str| first(n, name).map(trimmed_text);
+    r.group_name = string("group-name");
+    r.cluster_name = string("cluster-name");
+    r.max_saved_replicated_journals_size = int(
+        "max-saved-replicated-journals-size",
+        r.max_saved_replicated_journals_size,
+    )?;
+    r.initial_replication_sync_timeout = long(
+        "initial-replication-sync-timeout",
+        r.initial_replication_sync_timeout,
+    )?;
+    r.vote_on_replication_failure =
+        bool_or("vote-on-replication-failure", r.vote_on_replication_failure);
+    r.quorum_size = int("quorum-size", r.quorum_size)?;
+    r.vote_retries = int("vote-retries", r.vote_retries)?;
+    r.vote_retry_wait = long("vote-retry-wait", r.vote_retry_wait)?;
+    r.quorum_vote_wait = int("quorum-vote-wait", r.quorum_vote_wait)?;
+    // Artemis defaults it to the vote retry wait's default.
+    r.retry_replication_wait = long("retry-replication-wait", r.vote_retry_wait)?;
+    if backup {
+        r.allow_failback = bool_or("allow-failback", r.allow_failback);
+        r.restart_backup = bool_or("restart-backup", r.restart_backup);
+        if first(n, "scale-down").is_some() {
+            warnings.push(Warning::Unsupported {
+                name: "scale-down".to_owned(),
+                reason: "a backup does not scale down; it becomes active on its copy of the primary's data",
+            });
+        }
+    } else if let Some(c) = first(n, "check-for-live-server") {
+        warnings.push(Warning::Deprecated {
+            name: "check-for-live-server".to_owned(),
+            alternative: "check-for-active-server",
+        });
+        r.check_for_active_server = node_bool(c);
+    } else {
+        r.check_for_active_server = bool_or("check-for-active-server", false);
+    }
+    Ok(r)
 }
 
 /// Refuses what would make the broker something Saranga cannot be (a JDBC

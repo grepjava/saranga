@@ -383,7 +383,7 @@ impl CriticalAnalyzerPolicy {
 
 /// `ha-policy` (`HAPolicyConfiguration`): what the broker is in a primary
 /// and backup pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HaPolicy {
     /// `primary-only` (or `live-only`), or no `ha-policy`.
     PrimaryOnly,
@@ -404,6 +404,64 @@ pub enum HaPolicy {
         /// `restart-backup`: after failing back, it waits as a backup again.
         restart_backup: bool,
     },
+    /// `replication` `primary` (`ReplicatedPolicyConfiguration`).
+    ReplicationPrimary(Replication),
+    /// `replication` `backup` (`ReplicaPolicyConfiguration`).
+    ReplicationBackup(Replication),
+}
+
+/// The options of a replicating primary or backup. Those only one of them
+/// has keep their default in the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replication {
+    /// `group-name`: a backup replicates only a primary of its group.
+    pub group_name: Option<String>,
+    /// `cluster-name`: the cluster connection used to find the primary.
+    pub cluster_name: Option<String>,
+    /// `check-for-active-server` (primary).
+    pub check_for_active_server: bool,
+    /// `allow-failback` (backup).
+    pub allow_failback: bool,
+    /// `restart-backup` (backup).
+    pub restart_backup: bool,
+    /// `max-saved-replicated-journals-size`: how many copies of old data a
+    /// backup keeps (-1 for all).
+    pub max_saved_replicated_journals_size: i32,
+    /// `initial-replication-sync-timeout`, in milliseconds.
+    pub initial_replication_sync_timeout: i64,
+    /// `vote-on-replication-failure`.
+    pub vote_on_replication_failure: bool,
+    /// `quorum-size`: -1 for the cluster's size.
+    pub quorum_size: i32,
+    /// `vote-retries`.
+    pub vote_retries: i32,
+    /// `vote-retry-wait`, in milliseconds.
+    pub vote_retry_wait: i64,
+    /// `quorum-vote-wait`, in seconds.
+    pub quorum_vote_wait: i32,
+    /// `retry-replication-wait`, in milliseconds.
+    pub retry_replication_wait: i64,
+}
+
+impl Default for Replication {
+    fn default() -> Self {
+        Self {
+            group_name: None,
+            cluster_name: None,
+            check_for_active_server: false,
+            // `ReplicaPolicyConfiguration.allowFailBack`.
+            allow_failback: false,
+            restart_backup: true,
+            max_saved_replicated_journals_size: 2,
+            initial_replication_sync_timeout: 30_000,
+            vote_on_replication_failure: false,
+            quorum_size: -1,
+            vote_retries: 12,
+            vote_retry_wait: 5_000,
+            quorum_vote_wait: 30,
+            retry_replication_wait: 2_000,
+        }
+    }
 }
 
 impl HaPolicy {
@@ -413,7 +471,19 @@ impl HaPolicy {
     pub const DEFAULT_RESTART_BACKUP: bool = true;
 
     pub fn is_backup(&self) -> bool {
-        matches!(self, Self::SharedStoreBackup { .. })
+        matches!(
+            self,
+            Self::SharedStoreBackup { .. } | Self::ReplicationBackup(_)
+        )
+    }
+
+    /// `replication`: each broker has its own data and the backup's is a
+    /// copy of the primary's.
+    pub fn replication(&self) -> Option<&Replication> {
+        match self {
+            Self::ReplicationPrimary(r) | Self::ReplicationBackup(r) => Some(r),
+            _ => None,
+        }
     }
 }
 

@@ -411,8 +411,10 @@ impl ConnInner {
             channel.handle_response(packet);
         } else if frame.channel_id == 0 {
             self.handle_channel0(packet);
-        } else if let Some(session) = channel.session() {
-            session.handle_packet(packet, size as i32);
+        } else if let Err(packet) = channel.handle_raw(packet)
+            && let Some(session) = channel.session()
+        {
+            session.handle_packet(*packet, size as i32);
         }
         Ok(())
     }
@@ -1128,6 +1130,8 @@ impl Factory {
 
 /// A Core protocol connection: a `ClientSessionFactory` with its
 /// `ServerLocator`, reconnecting and failing over as its options say.
+/// Clones are handles to the same connection.
+#[derive(Clone)]
 pub struct Connection {
     factory: Arc<Factory>,
 }
@@ -1279,6 +1283,49 @@ impl Connection {
             Packet::ClusterConnectReplyMessage(r) => Ok(r.authorized),
             other => Err(Error::UnexpectedResponse(other.name())),
         }
+    }
+
+    /// A blocking request on the cluster channel (`ClusterControl`'s
+    /// `sendBlocking`), answered by a packet of type `expected`.
+    pub async fn cluster_request(&self, packet: Packet, expected: i8) -> Result<Packet> {
+        let conn = self.factory.latest();
+        let channel = conn.cluster_channel();
+        conn.send_blocking(&channel, packet, expected).await
+    }
+
+    /// Sends a packet on a channel the application handles itself.
+    pub fn send_packet(&self, channel_id: i64, packet: Packet) -> Result<()> {
+        self.factory.latest().send(channel_id, &packet)
+    }
+
+    /// The packets that arrive on a channel from now on, other than the
+    /// responses to blocking requests: the application handles the channel
+    /// itself (as the cluster channel, or replication's).
+    pub fn channel_packets(&self, channel_id: i64) -> tokio::sync::mpsc::UnboundedReceiver<Packet> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let conn = self.factory.latest();
+        let channel = if channel_id == CLUSTER_CHANNEL {
+            conn.cluster_channel()
+        } else {
+            let mut channels = conn.channels.lock().expect("connection");
+            channels
+                .entry(channel_id)
+                .or_insert_with(|| Arc::new(Channel::new(channel_id)))
+                .clone()
+        };
+        channel.set_raw(tx);
+        rx
+    }
+
+    /// The topology the server sent: each node with the connectors of its
+    /// primary and backup.
+    pub fn topology(&self) -> Vec<(String, Option<Connector>, Option<Connector>)> {
+        self.factory
+            .state()
+            .topology
+            .iter()
+            .map(|(id, (p, b))| (id.clone(), p.clone(), b.clone()))
+            .collect()
     }
 
     /// `ClusterControl.sendNodeAnnounce`.

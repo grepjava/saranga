@@ -1016,15 +1016,61 @@ async fn boot(
             .clone()
             .unwrap_or_else(|| storage.messages.directory.clone())
     });
+    // A replicating backup copies its primary until the primary fails, then
+    // starts as a replicating primary on its copy, with the primary's node ID.
+    if let Some(saranga_config::HaPolicy::ReplicationBackup(policy)) =
+        file_config.as_ref().map(|f| &f.ha_policy)
+        && let (Some(storage), Some(dir)) = (&broker_config.storage, &lock_dir)
+    {
+        let Some(cluster) = broker_config.cluster.clone() else {
+            anyhow::bail!("a replicating backup needs a cluster-connection to find its primary");
+        };
+        // The node manager's start: `server.lock` is there before the data
+        // is moved away.
+        let d = dir.clone();
+        tokio::task::spawn_blocking(move || saranga_server::node::NodeManager::open(&d, None))
+            .await?
+            .context("the backup's server.lock")?;
+        let node_id = saranga_server::replication::backup::replicate(
+            saranga_server::replication::backup::BackupConfig {
+                name: broker_config.management.name.clone(),
+                policy: policy.clone(),
+                cluster,
+                messages: storage.messages.clone(),
+                bindings: storage.bindings.clone(),
+                paging: storage.paging.clone(),
+                large_messages: storage.large_messages.clone(),
+            },
+            VERSION,
+        )
+        .await?;
+        let d = dir.clone();
+        let id = node_id.clone();
+        tokio::task::spawn_blocking(move || saranga_server::node::write_node_id(&d, &id))
+            .await?
+            .context("writing the primary's node ID to server.lock")?;
+        tracing::info!(
+            "AMQ221037: Saranga::name={} to become 'active'",
+            broker_config.management.name
+        );
+        broker_config.ha.policy = saranga_config::HaPolicy::ReplicationPrimary(policy.clone());
+    }
     let backup = match (&lock_dir, &file_config) {
-        (Some(dir), Some(file)) if file.ha_policy.is_backup() => Some(
-            await_primary(
-                dir.clone(),
-                broker_config.ha.lock_acquisition_timeout,
-                broker_config.cluster.clone(),
+        (Some(dir), Some(file))
+            if matches!(
+                file.ha_policy,
+                saranga_config::HaPolicy::SharedStoreBackup { .. }
+            ) =>
+        {
+            Some(
+                await_primary(
+                    dir.clone(),
+                    broker_config.ha.lock_acquisition_timeout,
+                    broker_config.cluster.clone(),
+                )
+                .await?,
             )
-            .await?,
-        ),
+        }
         _ => None,
     };
     let broker = Broker::start_activated(broker_config, backup.clone()).await?;
@@ -1111,7 +1157,7 @@ fn announce(instance: Option<&Arc<instance::Instance>>, started: &Started) {
         if let Some(saranga_config::HaPolicy::SharedStoreBackup {
             allow_failback: true,
             ..
-        }) = started.file.as_ref().map(|f| f.ha_policy)
+        }) = started.file.as_ref().map(|f| &f.ha_policy)
         {
             broker.start_failback_checker();
         }
@@ -1279,7 +1325,7 @@ async fn run(
             stop_broker(&s.broker, s.file.as_ref()).await?;
             stopped(&s);
             let restart = matches!(
-                s.file.as_ref().map(|f| f.ha_policy),
+                s.file.as_ref().map(|f| &f.ha_policy),
                 Some(saranga_config::HaPolicy::SharedStoreBackup {
                     restart_backup: true,
                     ..

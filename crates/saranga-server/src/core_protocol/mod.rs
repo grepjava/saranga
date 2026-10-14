@@ -87,6 +87,11 @@ impl ConnShared {
         self.send_raw(packet.into().encode_frame(channel_id, &self.context()));
     }
 
+    /// Closes the connection once what is queued is written.
+    pub(crate) fn close(&self) {
+        let _ = self.out.send(Outgoing::Close);
+    }
+
     pub(crate) fn security_info(&self) -> Arc<ConnectionInfo> {
         self.client.security_info()
     }
@@ -267,8 +272,13 @@ pub async fn serve_stream<S>(
         post_auth_topology_sent: false,
         topology_subscription: None,
         cluster_authorized: false,
+        replication: None,
     };
-    if let Err(e) = conn.read_loop(&mut rd).await {
+    let ended = conn.read_loop(&mut rd).await;
+    if let Some(r) = conn.replication.take() {
+        conn.broker.backup_connection_lost(&r, ended.is_err());
+    }
+    if let Err(e) = ended {
         // RemotingConnectionImpl.killMessage.
         if matches!(e, ConnError::Failed)
             && conn.shared.client.is_killed()
@@ -341,6 +351,8 @@ struct Connection {
     topology_subscription: Option<crate::cluster::Subscription>,
     /// The cluster user logged in on the cluster channel.
     cluster_authorized: bool,
+    /// A backup registered on this connection: its replication channel.
+    replication: Option<Arc<crate::replication::Replicator>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -449,6 +461,21 @@ impl Connection {
             CHANNEL_PING => self.handle_channel0(packet),
             CHANNEL_SESSION => self.handle_channel1(packet).await,
             CHANNEL_CLUSTER => self.handle_cluster(packet).await,
+            crate::replication::CHANNEL_REPLICATION if self.replication.is_some() => {
+                // `ReplicationManager.ResponseHandler`.
+                match packet {
+                    Packet::ReplicationResponseMessage(_)
+                    | Packet::ReplicationResponseMessageV2(_) => {
+                        if let Some(r) = &self.replication {
+                            r.replicated();
+                        }
+                    }
+                    other => {
+                        tracing::debug!("ignoring {} on the replication channel", other.name())
+                    }
+                }
+                Ok(())
+            }
             _ => {
                 if let Packet::PacketsConfirmedMessage(_) = packet {
                     // We keep no resend cache, so there is nothing to clear.
@@ -641,6 +668,19 @@ impl Connection {
                         msg.backup,
                     ),
                     None => tracing::debug!("node announcement without a cluster connection"),
+                }
+            }
+            Packet::BackupRegistrationMessage(msg) => {
+                // `getActivationChannelHandler`: only a replicating primary
+                // takes a backup.
+                if self.replication.is_none() {
+                    self.replication = self.broker.backup_registered(&self.shared, msg);
+                }
+            }
+            Packet::QuorumVoteMessage(msg) => {
+                // `QuorumManager.handleQuorumVote`.
+                if let Some(reply) = crate::replication::quorum::answer(&self.broker, msg) {
+                    self.shared.send(CHANNEL_CLUSTER, reply);
                 }
             }
             other => tracing::debug!("ignoring {} on the cluster channel", other.name()),

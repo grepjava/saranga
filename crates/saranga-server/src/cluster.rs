@@ -159,7 +159,7 @@ fn java_hash_order(keys: Vec<&str>) -> Vec<usize> {
 }
 
 /// The host and port a connector reaches.
-fn socket_address(tc: &TransportConfiguration) -> Option<(String, u16)> {
+pub(crate) fn socket_address(tc: &TransportConfiguration) -> Option<(String, u16)> {
     let param = |name: &str| {
         tc.params.iter().find_map(|(k, v)| {
             (k.to_string_lossy() == name).then(|| match v {

@@ -38,7 +38,7 @@ pub use bootstrap::{
 pub use broker::{
     AddressConfig, BrokerConfig, BrokerPluginConfig, ClusterConnectionConfig,
     CriticalAnalyzerPolicy, DivertConfig, DivertRoutingType, HaPolicy, JaasModuleConfig,
-    JournalConfig, JournalRetention, JournalType, MessageLoadBalancing, QueueConfig,
+    JournalConfig, JournalRetention, JournalType, MessageLoadBalancing, QueueConfig, Replication,
     TransformerConfig, Warning,
 };
 pub use bytes::convert_text_bytes;

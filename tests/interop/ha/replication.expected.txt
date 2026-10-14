@@ -1,0 +1,36 @@
+=== artemis run (primary)
+primary: listening
+primary: AMQ221000: Primary message broker is starting
+primary: AMQ221007: Server is now active
+=== artemis producer (primary) 20, then 2 large
+Produced: 20 messages
+Produced: 2 messages
+=== artemis run (backup)
+backup: synchronized
+backup: AMQ221000: Backup message broker is starting
+backup: AMQ222162: moving data away
+backup: AMQ221109: BACKUP [ID] started; waiting for primary to fail before activating
+backup: AMQ221024: backup synchronized
+backup: AMQ221031: backup announced
+=== Failover.java failover-once (in the background)
+client: sent 10
+=== artemis producer (primary) 10, consumer 5
+Produced: 10 messages
+Consumed: 5 messages
+Consumed: 5 messages
+=== artemis kill (primary)
+primary: down
+backup: listening
+backup: AMQ221037: becoming active
+backup: AMQ221007: Server is now active
+client: sent 10
+client: failover event: FAILURE_DETECTED
+client: failover event: FAILOVER_COMPLETED
+client: received 10
+client: sent 10
+client: received 10
+=== artemis consumer (backup) 27, then 1
+Consumed: 27 messages
+Consumed: 27 messages
+=== artemis stop (backup)
+backup: down

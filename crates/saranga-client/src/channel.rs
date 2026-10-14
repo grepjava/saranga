@@ -34,6 +34,8 @@ pub(crate) struct Channel {
     closed: AtomicBool,
     /// The handler for non-response packets (`ClientSessionPacketHandler`).
     session: Mutex<Option<Weak<SessionInner>>>,
+    /// Or where they go, for a channel the application handles itself.
+    raw: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Packet>>>,
 }
 
 impl Channel {
@@ -45,6 +47,24 @@ impl Channel {
             pending: Mutex::new(None),
             closed: AtomicBool::new(false),
             session: Mutex::new(None),
+            raw: Mutex::new(None),
+        }
+    }
+
+    /// Hands the channel's packets to `tx` from now on.
+    pub(crate) fn set_raw(&self, tx: tokio::sync::mpsc::UnboundedSender<Packet>) {
+        *self.raw.lock().expect("channel") = Some(tx);
+    }
+
+    /// Hands a packet to the application, if it handles the channel;
+    /// otherwise gives it back.
+    pub(crate) fn handle_raw(&self, packet: Packet) -> std::result::Result<(), Box<Packet>> {
+        match self.raw.lock().expect("channel").as_ref() {
+            Some(tx) => {
+                let _ = tx.send(packet);
+                Ok(())
+            }
+            None => Err(Box::new(packet)),
         }
     }
 
@@ -155,6 +175,7 @@ pub(crate) fn is_response(packet_type: i8) -> bool {
             | types::REATTACH_SESSION_RESP
             | types::CONNECT_RESPONSE
             | types::CLUSTER_CONNECT_REPLY
+            | types::QUORUM_VOTE_REPLY
             | types::SESS_QUEUEQUERY_RESP
             | types::SESS_QUEUEQUERY_RESP_V2
             | types::SESS_QUEUEQUERY_RESP_V3

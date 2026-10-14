@@ -508,6 +508,28 @@ pub(crate) struct Inner {
     scratch: Vec<u8>,
     /// `historyPendingFiles`: files waiting for their retention copy.
     pub(crate) history_pending: Vec<FileKey>,
+    /// The backup every append is replicated to (`ReplicatedJournal`).
+    replicator: Option<Arc<dyn Replicator>>,
+    /// The files sent to a backup are being read: none is reclaimed or
+    /// compacted away (`replicationSyncPreserveOldFiles`).
+    preserve: bool,
+    /// Loading a backup's copy (`loadSyncOnly`): transactions not yet
+    /// complete stay open, as the primary may still complete them.
+    sync_only: bool,
+}
+
+/// Where a replicating journal sends what it appends: Artemis's
+/// `ReplicatedJournal`, which writes locally and replicates each record.
+pub trait Replicator: Send + Sync {
+    /// Called for every record appended, in order, under the journal's
+    /// lock. `done` is the caller's completion; what is returned runs when
+    /// the local write is done, and `done` must run only once the backup
+    /// has the record too.
+    fn replicate(&self, record: &Record, done: Option<Completion>) -> Option<Completion>;
+
+    /// As [`Replicator::replicate`] for a barrier: `done` waits for the
+    /// backup to have everything replicated so far.
+    fn barrier(&self, done: Completion) -> Completion;
 }
 
 /// An Artemis journal in one directory.
@@ -552,6 +574,9 @@ impl Journal {
                 auto_reclaim: true,
                 scratch: Vec::new(),
                 history_pending: Vec::new(),
+                replicator: None,
+                preserve: false,
+                sync_only: false,
             }),
             writer,
         })
@@ -575,6 +600,25 @@ impl Journal {
     pub fn load(&self, loader: &mut dyn LoaderCallback) -> Result<LoadInfo> {
         let mut inner = self.lock();
         inner.load(&self.writer, loader)
+    }
+
+    /// `loadSyncOnly`: a replicating backup's copy is loaded to go on
+    /// appending what its primary replicates; nothing is reported, and
+    /// transactions not yet complete stay open.
+    pub fn load_sync_only(&self) -> Result<()> {
+        struct Ignore;
+        impl LoaderCallback for Ignore {
+            fn add_record(&mut self, _: RecordInfo) {}
+            fn update_record(&mut self, _: RecordInfo) {}
+            fn delete_record(&mut self, _: i64) {}
+            fn add_prepared_transaction(&mut self, _: PreparedTransactionInfo) {}
+            fn failed_transaction(&mut self, _: i64, _: Vec<RecordInfo>, _: Vec<RecordInfo>) {}
+        }
+        let mut inner = self.lock();
+        inner.sync_only = true;
+        let r = inner.load(&self.writer, &mut Ignore);
+        inner.sync_only = false;
+        r.map(|_| ())
     }
 
     /// `load(committedRecords, preparedTransactions, failureCallback)`.
@@ -621,6 +665,7 @@ impl Journal {
         let size = record.encode_size();
         inner.check_record_size(size)?;
         let wait = sync && completion.is_none();
+        let completion = inner.replicate(&record, completion);
         let (completion, rx) = completion_or_wait(completion, wait);
         let file = inner.append(&self.writer, record, None, sync, completion)?;
         account(&mut inner.books, file, size as i64);
@@ -733,6 +778,7 @@ impl Journal {
         let size = record.encode_size();
         inner.check_record_size(size)?;
         let wait = sync && completion.is_none();
+        let completion = inner.replicate(&record, completion);
         let (completion, rx) = completion_or_wait(completion, wait);
         let file = inner.append(&self.writer, record, None, sync, completion)?;
         account(&mut inner.books, file, size as i64);
@@ -753,7 +799,8 @@ impl Journal {
         }
         let size = record.encode_size();
         inner.check_record_size(size)?;
-        let file = inner.append(&self.writer, record, None, false, None)?;
+        let completion = inner.replicate(&record, None);
+        let file = inner.append(&self.writer, record, None, false, completion)?;
         account(&mut inner.books, file, size as i64);
         Ok(())
     }
@@ -805,18 +852,14 @@ impl Journal {
             return Err(JournalError::IllegalState(e.clone()));
         }
         let wait = sync && completion.is_none();
+        let record = Record::Prepare {
+            tx,
+            num_records: 0,
+            data,
+        };
+        let completion = inner.replicate(&record, completion);
         let (completion, rx) = completion_or_wait(completion, wait);
-        let file = inner.append(
-            &self.writer,
-            Record::Prepare {
-                tx,
-                num_records: 0,
-                data,
-            },
-            Some(tx),
-            sync,
-            completion,
-        )?;
+        let file = inner.append(&self.writer, record, Some(tx), sync, completion)?;
         inner.books.tx_prepare(tx, file);
         drop(inner);
         wait_for(rx)
@@ -855,12 +898,13 @@ impl Journal {
             return Err(JournalError::IllegalState(e.clone()));
         }
         let wait = sync && completion.is_none();
-        let (completion, rx) = completion_or_wait(completion, wait);
         let record = if commit {
             Record::Commit { tx, num_records: 0 }
         } else {
             Record::Rollback { tx }
         };
+        let completion = inner.replicate(&record, completion);
+        let (completion, rx) = completion_or_wait(completion, wait);
         let file = inner.append(&self.writer, record, Some(tx), sync, completion)?;
         let t = inner.books.transactions.remove(&tx).unwrap_or_default();
         if commit {
@@ -875,7 +919,64 @@ impl Journal {
     /// Runs `completion` once everything appended so far is on disk: an
     /// `OperationContext` with nothing of its own to wait for.
     pub fn on_written(&self, completion: Completion) -> Result<()> {
+        let completion = match &self.lock().replicator {
+            Some(r) => r.barrier(completion),
+            None => completion,
+        };
         self.writer.barrier(false, completion)
+    }
+
+    /// Starts replicating to a backup (`prepareJournalForCopy` and
+    /// `replicationSyncPreserveOldFiles`): the current file is closed, and
+    /// the data files written so far are returned for the backup to copy.
+    /// `start` runs with the journal locked, before anything appended later
+    /// is replicated; it tells the backup which files to expect. Nothing is
+    /// reclaimed or compacted until [`Journal::sync_finished`], and the
+    /// files are on disk when this returns.
+    pub fn start_replication(
+        &self,
+        replicator: Arc<dyn Replicator>,
+        start: impl FnOnce(&[JournalFileInfo]),
+    ) -> Result<Vec<JournalFileInfo>> {
+        let files = {
+            let mut inner = self.lock();
+            inner.check_loaded()?;
+            inner.move_next_file(&self.writer, false)?;
+            let files: Vec<JournalFileInfo> = inner
+                .data_files
+                .iter()
+                .map(|k| {
+                    let f = &inner.books.files[k];
+                    JournalFileInfo {
+                        name: f.name.clone(),
+                        file_id: f.id,
+                    }
+                })
+                .collect();
+            inner.preserve = true;
+            start(&files);
+            inner.replicator = Some(replicator);
+            files
+        };
+        self.writer.wait_idle()?;
+        Ok(files)
+    }
+
+    /// `replicationSyncFinished`: the copied files may go again.
+    pub fn sync_finished(&self) {
+        self.lock().preserve = false;
+    }
+
+    /// `stopReplication`: appends are no longer replicated.
+    pub fn stop_replication(&self) {
+        let mut inner = self.lock();
+        inner.replicator = None;
+        inner.preserve = false;
+    }
+
+    /// The journal's directory.
+    pub fn directory(&self) -> PathBuf {
+        self.lock().cfg.directory.clone()
     }
 
     /// Blocks until every append so far is written and synced.
@@ -889,6 +990,9 @@ impl Journal {
     pub fn compact(&self) -> Result<()> {
         let mut inner = self.lock();
         inner.check_loaded()?;
+        if inner.preserve {
+            return Ok(());
+        }
         inner.compact(&self.writer)
     }
 
@@ -1019,6 +1123,15 @@ struct TxHolder {
 impl Inner {
     pub(crate) fn path(&self, name: &str) -> PathBuf {
         self.cfg.directory.join(name)
+    }
+
+    /// Hands the record to the replicator, if there is one: the completion
+    /// the local write runs.
+    fn replicate(&self, record: &Record, completion: Option<Completion>) -> Option<Completion> {
+        match &self.replicator {
+            Some(r) => r.replicate(record, completion),
+            None => completion,
+        }
     }
 
     pub(crate) fn check_loaded(&self) -> Result<()> {
@@ -1338,6 +1451,9 @@ impl Inner {
             let Some(h) = holders.remove(&tx) else {
                 continue;
             };
+            if self.sync_only && !h.invalid {
+                continue;
+            }
             if !h.prepared || h.invalid {
                 tracing::warn!(
                     "AMQ142021: Uncommitted transaction with id {tx} found and discarded"
@@ -1550,7 +1666,7 @@ impl Inner {
 
     /// `checkReclaimStatus`.
     pub(crate) fn check_reclaim_status(&mut self, writer: &Writer) -> Result<()> {
-        if self.state != State::Loaded || !self.auto_reclaim {
+        if self.state != State::Loaded || !self.auto_reclaim || self.preserve {
             return Ok(());
         }
         let files: Vec<FileKey> = self.data_files.iter().copied().collect();
@@ -1658,7 +1774,7 @@ impl Inner {
 
     /// `checkCompact`.
     fn check_compact(&mut self, writer: &Writer) -> Result<()> {
-        if self.cfg.compact_min_files == 0 || self.state != State::Loaded {
+        if self.cfg.compact_min_files == 0 || self.state != State::Loaded || self.preserve {
             return Ok(());
         }
         if self.needs_compact() {
@@ -1732,7 +1848,7 @@ fn holder<'a>(
 
 /// `NIOSequentialFile.fill`: writes zeros so later appends never extend
 /// the file.
-fn fill(f: &File, size: usize) -> Result<()> {
+pub(crate) fn fill(f: &File, size: usize) -> Result<()> {
     let page = vec![0u8; 64 * 1024];
     let mut off = 0usize;
     while off < size {

@@ -1,4 +1,4 @@
-// The Artemis client against a shared-store primary and backup.
+// The Artemis client against a primary and its backup.
 //   java -cp '<artemis>/lib/*' Failover.java topology <url>
 //       prints the pair of connectors the broker's topology gives, once it
 //       has a backup.
@@ -8,7 +8,11 @@
 //       failover to complete, then receives them; sends <count> more,
 //       waits for <marker>.2 (failing back), for the failover, and receives
 //       them again.
-// tests/interop/ha/failback.sh runs it; it prints what it saw.
+//   java -cp '<artemis>/lib/*' Failover.java failover-once <url> <marker> <count>
+//       the same, but the second round has no failover: it sends and
+//       receives on the server it failed over to.
+// tests/interop/ha/failback.sh and replication.sh run it; it prints what it
+// saw.
 
 import java.nio.file.*;
 import java.util.*;
@@ -24,7 +28,8 @@ public class Failover {
     public static void main(String[] args) throws Exception {
         switch (args[0]) {
             case "topology" -> topology(args[1]);
-            case "failover" -> failover(args[1], args[2], Integer.parseInt(args[3]));
+            case "failover" -> failover(args[1], args[2], Integer.parseInt(args[3]), 2);
+            case "failover-once" -> failover(args[1], args[2], Integer.parseInt(args[3]), 1);
             default -> throw new IllegalArgumentException(args[0]);
         }
         System.exit(0);
@@ -68,7 +73,7 @@ public class Failover {
         }
     }
 
-    static void failover(String url, String marker, int count) throws Exception {
+    static void failover(String url, String marker, int count, int failovers) throws Exception {
         BlockingQueue<String> events = new LinkedBlockingQueue<>();
         ActiveMQConnectionFactory cf = new ActiveMQConnectionFactory(url, "admin", "admin");
         try (Connection connection = cf.createConnection()) {
@@ -84,12 +89,14 @@ public class Failover {
                 }
                 session.commit();
                 System.out.println("sent " + count);
-                await(Paths.get(marker + "." + round));
-                String event;
-                do {
-                    event = events.poll(60, TimeUnit.SECONDS);
-                    System.out.println("failover event: " + event);
-                } while (event != null && !event.equals("FAILOVER_COMPLETED") && !event.equals("FAILOVER_FAILED"));
+                if (round <= failovers) {
+                    await(Paths.get(marker + "." + round));
+                    String event;
+                    do {
+                        event = events.poll(60, TimeUnit.SECONDS);
+                        System.out.println("failover event: " + event);
+                    } while (event != null && !event.equals("FAILOVER_COMPLETED") && !event.equals("FAILOVER_FAILED"));
+                }
                 int received = 0;
                 while (received < count) {
                     TextMessage m = (TextMessage) consumer.receive(10000);

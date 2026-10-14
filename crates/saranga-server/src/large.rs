@@ -15,8 +15,15 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+
+use saranga_core_protocol::packets::replication::{
+    ReplicationLargeMessageBeginMessage, ReplicationLargeMessageEndMessage,
+    ReplicationLargeMessageWriteMessage,
+};
+
+use crate::replication::Replicator;
 
 /// `LargeServerMessageImpl.CHUNK_LM_SIZE`: the chunk size used when a
 /// regular message is turned into a large one.
@@ -38,6 +45,42 @@ pub struct LargeMessageStore {
     live: AtomicBool,
     /// With journal retention, bodies are also recorded in the journal.
     history: std::sync::OnceLock<History>,
+    /// The backup durable bodies are replicated to. Writes hold it shared;
+    /// the start of a synchronization holds it alone, so that each body is
+    /// either copied or replicated.
+    replication: RwLock<Replication>,
+    /// Bodies deleted while the backup copies them, deleted once it has
+    /// (`largeMessagesToDelete`).
+    deferred: Mutex<Vec<(i64, PathBuf)>>,
+}
+
+#[derive(Default)]
+struct Replication {
+    replicator: Option<Arc<Replicator>>,
+    /// The bodies being copied to the backup.
+    syncing: Option<HashSet<i64>>,
+}
+
+impl std::fmt::Debug for Replication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Replication")
+    }
+}
+
+impl Replication {
+    fn replicator(&self) -> Option<&Arc<Replicator>> {
+        self.replicator.as_ref().filter(|r| !r.is_stopped())
+    }
+}
+
+/// `ReplicationLargeMessageEndMessage` for a body complete (`-1`, negated
+/// by Java's constructor) or deleted.
+fn end(message_id: i64, delete: bool) -> ReplicationLargeMessageEndMessage {
+    ReplicationLargeMessageEndMessage {
+        message_id,
+        pending_record_id: Some(if delete { -1 } else { 1 }),
+        is_delete: Some(delete),
+    }
 }
 
 /// The storage a body's bytes are recorded in for journal retention.
@@ -56,6 +99,8 @@ impl LargeMessageStore {
             sync,
             live: AtomicBool::new(true),
             history: std::sync::OnceLock::new(),
+            replication: RwLock::default(),
+            deferred: Mutex::default(),
         })
     }
 
@@ -74,6 +119,8 @@ impl LargeMessageStore {
             sync: false,
             live: AtomicBool::new(true),
             history: std::sync::OnceLock::new(),
+            replication: RwLock::default(),
+            deferred: Mutex::default(),
         })
     }
 
@@ -119,14 +166,111 @@ impl LargeMessageStore {
         for id in ids {
             if let Some(path) = self.path(id, true) {
                 tracing::debug!("Removing pending large message for file={}", path.display());
-                if let Err(e) = fs::remove_file(&path)
-                    && e.kind() != io::ErrorKind::NotFound
-                {
+                self.remove(id, &path, |e| {
                     tracing::warn!(
                         "It was not possible to remove previously stored large message on folder::It will be retried on next startup: {e}"
-                    );
-                }
+                    )
+                });
             }
+        }
+    }
+
+    fn replication(&self) -> RwLockReadGuard<'_, Replication> {
+        self.replication.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Deletes a body's file, and the backup's copy of a durable one; one
+    /// the backup is still copying is deleted once it has.
+    fn remove(&self, id: i64, path: &Path, on_error: impl FnOnce(io::Error)) {
+        let durable = path.extension().is_some_and(|e| e == DURABLE);
+        let replication = self.replication();
+        if durable
+            && replication.replicator().is_some()
+            && replication
+                .syncing
+                .as_ref()
+                .is_some_and(|s| s.contains(&id))
+        {
+            self.deferred
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((id, path.to_path_buf()));
+            return;
+        }
+        if let Err(e) = fs::remove_file(path)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            on_error(e);
+        }
+        if durable && let Some(r) = replication.replicator() {
+            r.send(end(id, true), None);
+        }
+    }
+
+    /// Starts replicating to a backup: `start` is given the durable bodies
+    /// on disk, which the backup is to copy, and from then on every durable
+    /// body written is replicated. Returns each body's file and the size
+    /// copied.
+    pub(crate) fn start_replication(
+        &self,
+        replicator: Arc<Replicator>,
+        start: impl FnOnce(&[i64]),
+    ) -> io::Result<Vec<(i64, PathBuf, u64)>> {
+        let mut replication = self.replication.write().unwrap_or_else(|e| e.into_inner());
+        let mut files = Vec::new();
+        if let Some(dir) = &self.dir
+            && dir.exists()
+        {
+            for entry in fs::read_dir(dir)? {
+                let path = entry?.path();
+                if path.extension().is_none_or(|e| e != DURABLE) {
+                    continue;
+                }
+                let Some(id) = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse().ok())
+                else {
+                    continue;
+                };
+                let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                files.push((id, path, size));
+            }
+        }
+        files.sort();
+        let ids: Vec<i64> = files.iter().map(|f| f.0).collect();
+        start(&ids);
+        replication.syncing = Some(ids.into_iter().collect());
+        replication.replicator = Some(replicator);
+        Ok(files)
+    }
+
+    /// The backup has its copies: what was deleted meanwhile goes now
+    /// (`performCachedLargeMessageDeletes`).
+    pub(crate) fn sync_finished(&self) {
+        self.replication
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .syncing = None;
+        self.delete_deferred();
+    }
+
+    /// Bodies are no longer replicated.
+    pub(crate) fn stop_replication(&self) {
+        *self.replication.write().unwrap_or_else(|e| e.into_inner()) = Replication::default();
+        self.delete_deferred();
+    }
+
+    fn delete_deferred(&self) {
+        let deferred =
+            std::mem::take(&mut *self.deferred.lock().unwrap_or_else(|e| e.into_inner()));
+        for (id, path) in deferred {
+            self.remove(id, &path, |e| {
+                tracing::warn!(
+                    "AMQ222010: Critical IO Error, failed to delete large message file {}: {e}",
+                    path.display()
+                )
+            });
         }
     }
 
@@ -141,6 +285,7 @@ impl LargeMessageStore {
 
     /// Starts a new body (`createCoreLargeMessage` and `LargeBody.createFile`).
     pub fn create(self: &Arc<Self>, id: i64, durable: bool) -> io::Result<LargeWriter> {
+        let replication = self.replication();
         let file = match self.path(id, durable) {
             Some(path) => {
                 if let Some(parent) = path.parent() {
@@ -155,6 +300,10 @@ impl LargeMessageStore {
             }
             None => None,
         };
+        let replicated = durable && file.is_some();
+        if replicated && let Some(r) = replication.replicator() {
+            r.send(ReplicationLargeMessageBeginMessage { message_id: id }, None);
+        }
         Ok(LargeWriter {
             store: self.clone(),
             id,
@@ -162,6 +311,7 @@ impl LargeMessageStore {
             memory: Vec::new(),
             size: 0,
             finished: false,
+            replicated,
         })
     }
 
@@ -194,6 +344,8 @@ pub struct LargeWriter {
     memory: Vec<u8>,
     size: u64,
     finished: bool,
+    /// A durable body on disk: what is written is replicated.
+    replicated: bool,
 }
 
 impl LargeWriter {
@@ -205,9 +357,21 @@ impl LargeWriter {
         if let Some(History(storage)) = self.store.history.get() {
             storage.large_body_history(self.id, bytes);
         }
+        let replication = self.store.replication();
         match &mut self.file {
             Some((f, _)) => f.write_all(bytes)?,
             None => self.memory.extend_from_slice(bytes),
+        }
+        if self.replicated
+            && let Some(r) = replication.replicator()
+        {
+            r.send(
+                ReplicationLargeMessageWriteMessage {
+                    message_id: self.id,
+                    body: bytes.to_vec(),
+                },
+                None,
+            );
         }
         self.size += bytes.len() as u64;
         Ok(())
@@ -221,6 +385,11 @@ impl LargeWriter {
             Some((f, path)) => {
                 if self.store.sync {
                     f.sync_all()?;
+                }
+                if self.replicated
+                    && let Some(r) = self.store.replication().replicator()
+                {
+                    r.send(end(self.id, false), None);
                 }
                 Backing::File(path)
             }
@@ -240,10 +409,11 @@ impl Drop for LargeWriter {
     /// An interrupted upload leaves nothing behind (`clearLargeMessage`).
     fn drop(&mut self) {
         if !self.finished
-            && let Some((_, path)) = self.file.take()
+            && let Some((f, path)) = self.file.take()
             && self.store.is_live()
         {
-            let _ = fs::remove_file(path);
+            drop(f);
+            self.store.remove(self.id, &path, |_| {});
         }
     }
 }
@@ -309,10 +479,33 @@ impl LargeBody {
     pub fn copy(&self, new_id: i64, durable: bool) -> io::Result<Arc<LargeBody>> {
         let backing = match (&self.backing, self.store.path(new_id, durable)) {
             (Backing::File(from), Some(to)) => {
+                let replication = self.store.replication();
                 fs::copy(from, &to)?;
                 if self.store.sync {
                     // Syncing needs write access on Windows.
                     OpenOptions::new().write(true).open(&to)?.sync_all()?;
+                }
+                if durable && let Some(r) = replication.replicator() {
+                    r.send(
+                        ReplicationLargeMessageBeginMessage { message_id: new_id },
+                        None,
+                    );
+                    let mut f = File::open(&to)?;
+                    let mut chunk = vec![0; CHUNK_SIZE];
+                    loop {
+                        let n = f.read(&mut chunk)?;
+                        if n == 0 {
+                            break;
+                        }
+                        r.send(
+                            ReplicationLargeMessageWriteMessage {
+                                message_id: new_id,
+                                body: chunk[..n].to_vec(),
+                            },
+                            None,
+                        );
+                    }
+                    r.send(end(new_id, false), None);
                 }
                 Backing::File(to)
             }
@@ -334,13 +527,13 @@ impl Drop for LargeBody {
         if let Backing::File(p) = &self.backing
             && self.store.is_live()
             && !self.keep.load(Ordering::SeqCst)
-            && let Err(e) = fs::remove_file(p)
-            && e.kind() != io::ErrorKind::NotFound
         {
-            tracing::warn!(
-                "AMQ222010: Critical IO Error, failed to delete large message file {}: {e}",
-                p.display()
-            );
+            self.store.remove(self.id, p, |e| {
+                tracing::warn!(
+                    "AMQ222010: Critical IO Error, failed to delete large message file {}: {e}",
+                    p.display()
+                )
+            });
         }
     }
 }

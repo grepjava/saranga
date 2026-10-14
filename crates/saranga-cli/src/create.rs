@@ -47,6 +47,8 @@ const TEMPLATES: &[(&str, &str)] = &[
     template!("etc/mqtt-acceptor.txt"),
     template!("etc/page-sync-settings.txt"),
     template!("etc/ping-settings.txt"),
+    template!("etc/replicated-backup-settings.txt"),
+    template!("etc/replicated-primary-settings.txt"),
     template!("etc/shared-store-settings.txt"),
     template!("etc/stomp-acceptor.txt"),
     template!("bin/artemis-service"),
@@ -341,6 +343,9 @@ struct Clustering {
     #[arg(long = "message-load-balancing", default_value = "ON_DEMAND",
           value_parser = ["ON_DEMAND", "STRICT", "OFF", "OFF_WITH_REDISTRIBUTION"])]
     message_load_balancing: String,
+    /// Enable broker replication.
+    #[arg(long)]
+    replicated: bool,
     /// Enable broker shared store.
     #[arg(long = "shared-store")]
     shared_store: bool,
@@ -369,14 +374,12 @@ struct Clustering {
 /// `PrintWriter.println`'s line separator.
 const LINE_SEPARATOR: &str = if cfg!(windows) { "\r\n" } else { "\n" };
 
-/// `artemis create` options for what Saranga does not do yet: replication
-/// and discovery (Phases 9 and 10) and JDBC storage.
+/// `artemis create` options for what Saranga does not do yet: discovery
+/// (Phase 10) and JDBC storage.
 #[derive(clap::Args, Debug)]
 struct Unsupported {
     #[arg(long = "discovery-enabled", hide = true)]
     discovery_enabled: bool,
-    #[arg(long, hide = true)]
-    replicated: bool,
     #[arg(long, hide = true)]
     jdbc: bool,
     // The JDBC store's settings, unused without --jdbc.
@@ -404,11 +407,6 @@ struct Unsupported {
 
 impl Unsupported {
     fn check(&self) -> anyhow::Result<()> {
-        if self.replicated {
-            bail!(
-                "saranga create does not support --replicated yet: Saranga has no replication yet"
-            );
-        }
         if self.discovery_enabled {
             bail!(
                 "saranga create does not support --discovery-enabled yet: Saranga has no discovery yet; use --static-cluster"
@@ -528,8 +526,20 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
             f.put("${ping-config.settings}", text);
         }
     }
-    let clustered = cluster.clustered || cluster.static_cluster.is_some() || cluster.shared_store;
-    f.put("${replicated.settings}", "");
+    let clustered = cluster.clustered
+        || cluster.static_cluster.is_some()
+        || cluster.replicated
+        || cluster.shared_store;
+    if cluster.replicated {
+        let text = f.read(if backup {
+            "etc/replicated-backup-settings.txt"
+        } else {
+            "etc/replicated-primary-settings.txt"
+        })?;
+        f.put("${replicated.settings}", text);
+    } else {
+        f.put("${replicated.settings}", "");
+    }
     if cluster.shared_store {
         let text = f.read("etc/shared-store-settings.txt")?;
         f.put("${shared-store.settings}", text);

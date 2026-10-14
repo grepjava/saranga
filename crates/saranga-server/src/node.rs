@@ -108,6 +108,17 @@ fn set_node_id(slot: &Mutex<String>, id: String) {
     *slot.lock().unwrap_or_else(|e| e.into_inner()) = id;
 }
 
+/// `setNodeID` as a replicating backup takes over: `server.lock` in `dir`
+/// is given the node ID of the primary whose data it copied, which it is
+/// from now on.
+pub fn write_node_id(dir: &Path, node_id: &str) -> io::Result<()> {
+    let id = uuid::Uuid::parse_str(node_id).map_err(io::Error::other)?;
+    let n = NodeManager::open(dir, None)?;
+    let f = n.channels[STATE_LOCK_POS].file();
+    write_at(f, id.as_bytes(), 3)?;
+    f.sync_all()
+}
+
 /// The HA policy and the node manager's settings (`ha-policy`,
 /// `node-manager-lock-directory`, `journal-lock-*`).
 #[derive(Debug, Clone)]
@@ -139,7 +150,7 @@ impl HaConfig {
     /// From `broker.xml`, with a relative lock directory under `instance`.
     pub fn from_file(config: &saranga_config::BrokerConfig, instance: &Path) -> Self {
         Self {
-            policy: config.ha_policy,
+            policy: config.ha_policy.clone(),
             lock_directory: config
                 .node_manager_lock_directory
                 .as_deref()
@@ -158,7 +169,11 @@ impl HaConfig {
     /// backup to take over.
     pub fn failover_on_shutdown(&self) -> bool {
         match self.policy {
-            saranga_config::HaPolicy::PrimaryOnly => false,
+            // A replicating primary never sends its backup `FAIL_OVER` on a
+            // clean stop; the backup takes over as from a crash.
+            saranga_config::HaPolicy::PrimaryOnly
+            | saranga_config::HaPolicy::ReplicationPrimary(_)
+            | saranga_config::HaPolicy::ReplicationBackup(_) => false,
             saranga_config::HaPolicy::SharedStorePrimary {
                 failover_on_shutdown,
                 ..

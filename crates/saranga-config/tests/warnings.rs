@@ -33,7 +33,6 @@ fn features_not_acted_on_are_reported() {
               <security-settings><security-setting match="#"><permission type="send" roles="amq"/></security-setting></security-settings>
               <discovery-groups/>
               <critical-analyzer>true</critical-analyzer>
-              <ha-policy><replication><primary/></replication></ha-policy>
            </core></configuration>"##,
     );
     let names: Vec<String> = c
@@ -45,14 +44,14 @@ fn features_not_acted_on_are_reported() {
         })
         .collect();
     // The critical analyzer only watches the broker; nothing to report.
-    assert_eq!(names, ["discovery-groups", "ha-policy"]);
+    assert_eq!(names, ["discovery-groups"]);
 }
 
 #[test]
-fn backups_and_jdbc_are_refused() {
+fn colocated_backups_pluggable_quorum_and_jdbc_are_refused() {
     for xml in [
-        "<ha-policy><replication><backup/></replication></ha-policy>",
-        "<ha-policy><replication><slave/></replication></ha-policy>",
+        "<ha-policy><replication><backup><manager/></backup></replication></ha-policy>",
+        "<ha-policy><replication><colocated/></replication></ha-policy>",
         "<ha-policy><shared-store><colocated/></shared-store></ha-policy>",
         "<store><database-store><jdbc-connection-url>x</jdbc-connection-url></database-store></store>",
     ] {
@@ -266,4 +265,35 @@ fn prefixed_namespaces_match_on_local_name() {
     assert_eq!(c.name, "ns");
     assert!(!c.persistence_enabled);
     assert!(c.warnings.is_empty());
+}
+
+#[test]
+fn replication_policies() {
+    let c = parse(
+        "<configuration><core><ha-policy><replication><primary>           <group-name>g</group-name><vote-on-replication-failure>true</vote-on-replication-failure>           <quorum-size>3</quorum-size><initial-replication-sync-timeout>9000</initial-replication-sync-timeout>         </primary></replication></ha-policy></core></configuration>",
+    );
+    let HaPolicy::ReplicationPrimary(r) = &c.ha_policy else {
+        panic!("{:?}", c.ha_policy)
+    };
+    assert_eq!(r.group_name.as_deref(), Some("g"));
+    assert!(r.vote_on_replication_failure);
+    assert_eq!(
+        (r.quorum_size, r.initial_replication_sync_timeout),
+        (3, 9000)
+    );
+    assert!(!c.ha_policy.is_backup());
+
+    let c = parse(
+        "<configuration><core><ha-policy><replication><slave>           <allow-failback>true</allow-failback><max-saved-replicated-journals-size>0</max-saved-replicated-journals-size>         </slave></replication></ha-policy></core></configuration>",
+    );
+    let HaPolicy::ReplicationBackup(r) = &c.ha_policy else {
+        panic!("{:?}", c.ha_policy)
+    };
+    assert!(r.allow_failback && r.restart_backup);
+    assert_eq!(r.max_saved_replicated_journals_size, 0);
+    assert_eq!(
+        (r.vote_retries, r.vote_retry_wait, r.quorum_vote_wait),
+        (12, 5000, 30)
+    );
+    assert!(c.ha_policy.is_backup());
 }

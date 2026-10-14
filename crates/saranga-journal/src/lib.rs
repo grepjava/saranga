@@ -12,6 +12,7 @@ pub mod format;
 mod io;
 mod journal;
 mod retention;
+mod sync;
 
 pub use retention::{history_file_millis, local_date_millis};
 
@@ -20,8 +21,9 @@ use std::sync::Arc;
 pub use io::Completion;
 pub use journal::{
     Journal, JournalConfig, JournalFileInfo, LoadInfo, LoadResult, LoaderCallback,
-    PreparedTransactionInfo, RecordInfo, Retention,
+    PreparedTransactionInfo, RecordInfo, Replicator, Retention,
 };
+pub use sync::SyncJournal;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum JournalError {

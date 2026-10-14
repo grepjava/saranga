@@ -31,6 +31,7 @@ pub mod recovery;
 pub mod registry;
 pub mod reload;
 pub mod replay;
+pub mod replication;
 pub mod session;
 pub mod settings;
 mod slow_consumers;
@@ -444,6 +445,11 @@ pub struct Broker {
     lock_lost: std::sync::atomic::AtomicBool,
     /// The default cluster connection, started with the broker.
     cluster: Option<Arc<cluster::ClusterConnection>>,
+    /// `replication` `primary`: a backup may register to replicate this
+    /// broker's data.
+    replication_policy: Option<saranga_config::Replication>,
+    /// The backup this broker replicates to.
+    replicating: Mutex<Option<Arc<replication::Replicator>>>,
     /// A restarted primary asked this active backup to give way: it stops
     /// as if it had failed, and waits as a backup again.
     failing_back: std::sync::atomic::AtomicBool,
@@ -506,7 +512,10 @@ impl Broker {
         }
         let internal =
             |what: &str, e: &dyn std::fmt::Display| BrokerError::internal(format!("{what}: {e}"));
-        let started_primary = activated.is_none();
+        // `SharedNothingPrimaryActivation`: each broker of a replicating
+        // pair has its own data, and takes no primary lock on it.
+        let replicating = config.ha.policy.replication().is_some();
+        let started_primary = activated.is_none() && !replicating;
         let (ids, storage, node_manager) = match &config.storage {
             Some(sc) => {
                 let node_manager = match activated {
@@ -528,15 +537,21 @@ impl Broker {
                         // on the data, so this primary announces itself as
                         // its backup, which asks it to fail back.
                         let announcer = match &config.cluster {
-                            Some(cc) if n.is_backup_active().unwrap_or(false) => {
+                            Some(cc) if !replicating && n.is_backup_active().unwrap_or(false) => {
                                 Some(cluster::BackupAnnouncer::start(cc.clone(), n.node_id()))
                             }
                             _ => None,
                         };
                         let n2 = n.clone();
-                        let locked = tokio::task::spawn_blocking(move || n2.start_primary())
-                            .await
-                            .map_err(|e| internal("journal directory lock", &e));
+                        let locked = tokio::task::spawn_blocking(move || {
+                            if replicating {
+                                Ok(())
+                            } else {
+                                n2.start_primary()
+                            }
+                        })
+                        .await
+                        .map_err(|e| internal("journal directory lock", &e));
                         if let Some(a) = announcer {
                             a.close().await;
                         }
@@ -700,6 +715,11 @@ impl Broker {
             node_manager: node_manager.clone(),
             failover_on_shutdown: config.ha.failover_on_shutdown(),
             lock_lost: std::sync::atomic::AtomicBool::new(false),
+            replication_policy: match &config.ha.policy {
+                saranga_config::HaPolicy::ReplicationPrimary(r) => Some(r.clone()),
+                _ => None,
+            },
+            replicating: Mutex::new(None),
             cluster: config
                 .cluster
                 .clone()
