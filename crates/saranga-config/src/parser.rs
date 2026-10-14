@@ -13,7 +13,7 @@ use crate::acceptor::AcceptorConfig;
 use crate::address_settings::AddressSettings;
 use crate::broker::{
     AddressConfig, BrokerConfig, BrokerPluginConfig, CriticalAnalyzerPolicy, DivertConfig,
-    DivertRoutingType, JournalConfig, QueueConfig, TransformerConfig, Warning,
+    DivertRoutingType, HaPolicy, JournalConfig, QueueConfig, TransformerConfig, Warning,
 };
 use crate::bytes::convert_text_bytes;
 use crate::mask::{self, MaskError};
@@ -402,6 +402,7 @@ fn parse_core(
     }
 
     check_unsupported(core, warnings)?;
+    parse_ha_policy(core, config, warnings)?;
     parse_scalars(core, config, warnings)?;
     parse_acceptors(core, config, warnings)?;
     parse_security_settings(core, config, warnings)?;
@@ -440,8 +441,119 @@ const NOT_ACTED_ON: &[(&str, &str)] = &[
     ),
 ];
 
-/// Refuses what would make the broker something Saranga cannot be (an HA
-/// backup, a JDBC store) and warns about features it does not act on.
+/// `parseHAPolicyConfiguration`: the first of `live-only`, `primary-only`,
+/// `shared-store` and `replication` found decides, and within it
+/// `colocated`, then `master`, `slave`, `primary` and `backup`. Replication
+/// and colocated backups are refused; a replication primary runs on its own.
+fn parse_ha_policy(
+    core: Node<'_, '_>,
+    config: &mut BrokerConfig,
+    warnings: &mut Vec<Warning>,
+) -> Result<()> {
+    let Some(ha) = first(core, "ha-policy") else {
+        return Ok(());
+    };
+    let bool_or =
+        |n: Node<'_, '_>, name: &str, default: bool| first(n, name).map_or(default, node_bool);
+    let refuse = |reason: &'static str| ConfigError::Unsupported {
+        element: "ha-policy".to_owned(),
+        reason,
+    };
+    let deprecated = |warnings: &mut Vec<Warning>, name: &str, alternative: &'static str| {
+        warnings.push(Warning::Deprecated {
+            name: name.to_owned(),
+            alternative,
+        });
+    };
+    for kind in ["live-only", "primary-only", "shared-store", "replication"] {
+        if first(ha, kind).is_none() {
+            continue;
+        }
+        match kind {
+            "shared-store" => {
+                if first(ha, "colocated").is_some() {
+                    return Err(refuse("a colocated backup is not supported"));
+                }
+                let primary = |n: Node<'_, '_>| HaPolicy::SharedStorePrimary {
+                    failover_on_shutdown: bool_or(
+                        n,
+                        "failover-on-shutdown",
+                        HaPolicy::DEFAULT_FAILOVER_ON_SHUTDOWN,
+                    ),
+                    wait_for_activation: bool_or(
+                        n,
+                        "wait-for-activation",
+                        HaPolicy::DEFAULT_WAIT_FOR_ACTIVATION,
+                    ),
+                };
+                let backup = |n: Node<'_, '_>, warnings: &mut Vec<Warning>| {
+                    if first(n, "scale-down").is_some() {
+                        warnings.push(Warning::Unsupported {
+                            name: "scale-down".to_owned(),
+                            reason: "a backup does not scale down; it becomes active on the primary's data",
+                        });
+                    }
+                    HaPolicy::SharedStoreBackup {
+                        allow_failback: bool_or(
+                            n,
+                            "allow-failback",
+                            HaPolicy::DEFAULT_ALLOW_FAILBACK,
+                        ),
+                        failover_on_shutdown: bool_or(
+                            n,
+                            "failover-on-shutdown",
+                            HaPolicy::DEFAULT_FAILOVER_ON_SHUTDOWN,
+                        ),
+                        restart_backup: bool_or(
+                            n,
+                            "restart-backup",
+                            HaPolicy::DEFAULT_RESTART_BACKUP,
+                        ),
+                    }
+                };
+                if let Some(n) = first(ha, "master") {
+                    deprecated(warnings, "master", "primary");
+                    config.ha_policy = primary(n);
+                } else if let Some(n) = first(ha, "slave") {
+                    deprecated(warnings, "slave", "backup");
+                    config.ha_policy = backup(n, warnings);
+                } else if let Some(n) = first(ha, "primary") {
+                    config.ha_policy = primary(n);
+                } else if let Some(n) = first(ha, "backup") {
+                    config.ha_policy = backup(n, warnings);
+                }
+            }
+            "replication" => {
+                if first(ha, "colocated").is_some() {
+                    return Err(refuse("a colocated backup is not supported"));
+                }
+                if first(ha, "master").is_none()
+                    && (first(ha, "slave").is_some()
+                        || (first(ha, "primary").is_none() && first(ha, "backup").is_some()))
+                {
+                    return Err(refuse("a replicating backup is not supported yet"));
+                }
+                warnings.push(Warning::Unsupported {
+                    name: "ha-policy".to_owned(),
+                    reason: "replication is not supported yet; the broker runs on its own and no backup takes over from it",
+                });
+            }
+            _ => {
+                if first(ha, "scale-down").is_some() {
+                    warnings.push(Warning::Unsupported {
+                        name: "scale-down".to_owned(),
+                        reason: "a primary does not scale down to another broker when it stops",
+                    });
+                }
+            }
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
+/// Refuses what would make the broker something Saranga cannot be (a JDBC
+/// store) and warns about features it does not act on.
 fn check_unsupported(core: Node<'_, '_>, warnings: &mut Vec<Warning>) -> Result<()> {
     if let Some(store) = first(core, "store")
         && first(store, "database-store").is_some()
@@ -450,24 +562,6 @@ fn check_unsupported(core: Node<'_, '_>, warnings: &mut Vec<Warning>) -> Result<
             element: "database-store".to_owned(),
             reason: "JDBC persistence is not supported; use the file journal",
         });
-    }
-    if let Some(ha) = first(core, "ha-policy") {
-        let role = |names: &[&str]| {
-            ha.descendants()
-                .any(|n| n.is_element() && names.contains(&n.tag_name().name()))
-        };
-        if role(&["backup", "slave", "colocated"]) {
-            return Err(ConfigError::Unsupported {
-                element: "ha-policy".to_owned(),
-                reason: "a backup broker is not supported; Saranga can only run as a primary",
-            });
-        }
-        if role(&["primary", "master", "scale-down"]) {
-            warnings.push(Warning::Unsupported {
-                name: "ha-policy".to_owned(),
-                reason: "high availability is not supported; the broker runs on its own and no backup takes over from it",
-            });
-        }
     }
     for (name, reason) in NOT_ACTED_ON {
         if elements(core).any(|c| c.tag_name().name() == *name) {
@@ -647,6 +741,18 @@ fn parse_scalars(
         config.paging_directory = v;
     }
     parse_journal(&s, &mut config.journal)?;
+    if let Some(v) = s.string("node-manager-lock-directory") {
+        config.node_manager_lock_directory = Some(v);
+    }
+    if let Some(v) = s.i64("journal-lock-acquisition-timeout", Check::MinusOneOrGtZero)? {
+        config.journal_lock_acquisition_timeout = v;
+    }
+    if let Some(v) = s.i64("journal-lock-monitor-timeout", Check::GtZero)? {
+        config.journal_lock_monitor_timeout = v;
+    }
+    if let Some(v) = s.i32("journal-lock-monitor-max-retries", Check::GeZero)? {
+        config.journal_lock_monitor_max_retries = v;
+    }
 
     // Artemis only honours <wild-card-routing-enabled> when <core> also
     // carries an attribute of that name.

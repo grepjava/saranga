@@ -14,6 +14,7 @@ pub mod critical;
 pub mod disk;
 pub mod duplicate;
 pub mod error;
+mod filelock;
 pub mod large;
 pub mod localtime;
 pub mod management;
@@ -245,6 +246,8 @@ pub struct BrokerConfig {
     pub management: management::ManagementConfig,
     /// The critical analyzer.
     pub critical: critical::CriticalConfig,
+    /// The HA policy and the node manager's settings.
+    pub ha: node::HaConfig,
     /// Plugins (`<broker-plugins>`, or the embedding application's own).
     pub plugins: Vec<Arc<dyn plugin::BrokerPlugin>>,
     /// `max-disk-usage` or `min-disk-free` with `disk-scan-period`: producers
@@ -281,6 +284,7 @@ impl BrokerConfig {
             protocols: Vec::new(),
             management: management::ManagementConfig::default(),
             critical: critical::CriticalConfig::default(),
+            ha: node::HaConfig::default(),
             plugins: Vec::new(),
             disk_monitor: None,
         }
@@ -324,6 +328,56 @@ fn spawn_address_queue_reaper(post_office: &Arc<PostOffice>, period_ms: i64) {
 
 /// `ResourceManagerImpl.TxTimeoutHandler`: every period, XA branches past
 /// their timeout are rolled back. It stops with the broker.
+/// `MonitorLock`: every `journal-lock-monitor-timeout`, the primary lock is
+/// checked; lost more than `journal-lock-monitor-max-retries` times in a
+/// row, the broker stops as for a critical IO error.
+fn spawn_lock_monitor(broker: &Arc<Broker>, n: Arc<node::NodeManager>, ha: &node::HaConfig) {
+    let weak = Arc::downgrade(broker);
+    let (period, max_retries) = (ha.lock_monitor_period, ha.lock_monitor_max_retries);
+    tokio::spawn(async move {
+        let mut failures = 0u32;
+        loop {
+            tokio::time::sleep(period).await;
+            let Some(broker) = weak.upgrade() else { break };
+            if broker.is_stopped() {
+                break;
+            }
+            let check = n.clone();
+            let lost = tokio::task::spawn_blocking(move || check.primary_lock_lost())
+                .await
+                .unwrap_or(true);
+            if !lost {
+                if failures > 0 {
+                    tracing::info!(
+                        "Lock check succeeded after {failures} previous failure(s), resetting failure counter"
+                    );
+                }
+                failures = 0;
+                continue;
+            }
+            failures += 1;
+            if failures <= max_retries {
+                tracing::warn!(
+                    "Lock check failed ({failures}/{}), will retry on next check period",
+                    max_retries + 1
+                );
+                continue;
+            }
+            tracing::warn!(
+                "Lost the lock according to the monitor after {failures} failed check(s), notifying listeners"
+            );
+            tracing::error!(
+                "AMQ222010: Critical IO Error, shutting down the server. file=null, message=Lost NodeManager lock"
+            );
+            broker
+                .lock_lost
+                .store(true, std::sync::atomic::Ordering::Release);
+            broker.request_shutdown();
+            break;
+        }
+    });
+}
+
 fn spawn_transaction_reaper(broker: &Arc<Broker>, period_ms: i64) {
     let broker = Arc::downgrade(broker);
     let period = std::time::Duration::from_millis(period_ms.max(1) as u64);
@@ -378,7 +432,12 @@ pub struct Broker {
     storage: Option<Arc<storage::Storage>>,
     /// Where large-message bodies go.
     large_messages: Arc<large::LargeMessageStore>,
-    node_lock: Mutex<Option<node::NodeLock>>,
+    /// The node manager of a persistent broker, holding the primary lock.
+    node_manager: Option<Arc<node::NodeManager>>,
+    /// `failover-on-shutdown`.
+    failover_on_shutdown: bool,
+    /// The lock monitor found the primary lock lost.
+    lock_lost: std::sync::atomic::AtomicBool,
     security: Option<Arc<saranga_security::SecurityStore>>,
     /// For the diverts a reload deploys.
     transformers: HashMap<String, postoffice::TransformerFactory>,
@@ -413,7 +472,19 @@ impl Broker {
     /// lock, recovers addresses and queues from the bindings journal, deploys
     /// the configured ones, then recovers messages and prepared transactions
     /// (`ActiveMQServerImpl.initialisePart2` / `loadJournals`).
+    ///
+    /// The primary lock is waited for first, as `startPrimaryNode` waits
+    /// for it, for `journal-lock-acquisition-timeout`.
     pub async fn start(config: BrokerConfig) -> Result<Arc<Self>> {
+        Self::start_activated(config, None).await
+    }
+
+    /// Starts a broker whose node manager already holds the primary lock:
+    /// a backup that took over from its primary.
+    pub async fn start_activated(
+        config: BrokerConfig,
+        activated: Option<Arc<node::NodeManager>>,
+    ) -> Result<Arc<Self>> {
         // `ServerStatus`: one per process, cleared as a broker starts, and
         // the configuration's status first (`internalStart`).
         saranga_buffer::status::clear();
@@ -425,11 +496,28 @@ impl Broker {
         }
         let internal =
             |what: &str, e: &dyn std::fmt::Display| BrokerError::internal(format!("{what}: {e}"));
-        let (ids, storage, node_lock) = match &config.storage {
+        let started_primary = activated.is_none();
+        let (ids, storage, node_manager) = match &config.storage {
             Some(sc) => {
-                let lock = node::NodeLock::acquire(&sc.messages.directory)
-                    .map_err(|e| internal("journal directory lock", &e))?;
-                tracing::info!("AMQ221035: Primary Server Obtained primary lock");
+                let node_manager = match activated {
+                    Some(n) => n,
+                    None => {
+                        let dir = config
+                            .ha
+                            .lock_directory
+                            .clone()
+                            .unwrap_or_else(|| sc.messages.directory.clone());
+                        let timeout = config.ha.lock_acquisition_timeout;
+                        tokio::task::spawn_blocking(move || {
+                            let n = node::NodeManager::open(&dir, timeout)?;
+                            n.start_primary()?;
+                            std::io::Result::Ok(Arc::new(n))
+                        })
+                        .await
+                        .map_err(|e| internal("journal directory lock", &e))?
+                        .map_err(|e| internal("journal directory lock", &e))?
+                    }
+                };
                 let storage = Arc::new(
                     storage::Storage::open(sc.clone())
                         .map_err(|e| internal("opening the journals", &e))?,
@@ -437,7 +525,7 @@ impl Broker {
                 (
                     Arc::new(IdGenerator::persistent(storage.clone())),
                     Some(storage),
-                    Some(lock),
+                    Some(node_manager),
                 )
             }
             None => (Arc::new(IdGenerator::new(1)), None, None),
@@ -568,8 +656,8 @@ impl Broker {
         if config.address_queue_scan_period > 0 {
             spawn_address_queue_reaper(&post_office, config.address_queue_scan_period);
         }
-        let node_id = match &node_lock {
-            Some(l) => l.node_id().to_owned(),
+        let node_id = match &node_manager {
+            Some(n) => n.node_id(),
             None => uuid::Uuid::new_v4().to_string(),
         };
         let registry = Arc::new(registry::Registry::new(post_office.plugins().clone()));
@@ -582,7 +670,9 @@ impl Broker {
             resource_manager,
             storage,
             large_messages,
-            node_lock: Mutex::new(node_lock),
+            node_manager: node_manager.clone(),
+            failover_on_shutdown: config.ha.failover_on_shutdown(),
+            lock_lost: std::sync::atomic::AtomicBool::new(false),
             security: config.security.clone(),
             transformers: config.transformers,
             populate_validated_user: config.populate_validated_user,
@@ -658,6 +748,17 @@ impl Broker {
             p.start(&broker).await;
         }
         critical::start(&broker, config.critical);
+        if let Some(n) = &node_manager
+            && started_primary
+        {
+            // The activation callback: active, and the lock watched.
+            let n2 = n.clone();
+            tokio::task::spawn_blocking(move || n2.activation_complete())
+                .await
+                .map_err(|e| internal("server.lock", &e))?
+                .map_err(|e| internal("server.lock", &e))?;
+            spawn_lock_monitor(&broker, n.clone(), &config.ha);
+        }
         Ok(broker)
     }
 
@@ -705,14 +806,19 @@ impl Broker {
             s.stop()
                 .map_err(|e| BrokerError::internal(format!("stopping the journals: {e}")))?;
         }
-        let lock = self
-            .node_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(l) = lock {
-            l.pause()
-                .map_err(|e| BrokerError::internal(format!("server.lock: {e}")))?;
+        // The activation's close: the lock let go for a backup to take
+        // over, or the broker marked paused.
+        if let Some(n) = &self.node_manager
+            && n.holds_primary_lock()
+        {
+            if self.failover_on_shutdown
+                || self.lock_lost.load(std::sync::atomic::Ordering::Acquire)
+            {
+                n.crash_primary();
+            } else {
+                n.pause_primary()
+                    .map_err(|e| BrokerError::internal(format!("server.lock: {e}")))?;
+            }
         }
         Ok(())
     }

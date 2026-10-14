@@ -20,6 +20,7 @@ mod upgrade;
 mod web;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use saranga_server::node::NodeManager;
 use saranga_server::postoffice::SelectorFilters;
 use saranga_server::{Acceptor, Broker, BrokerConfig};
 use saranga_transport::{TlsAcceptor, TlsSettings};
@@ -924,6 +925,8 @@ struct Started {
     at: std::time::Instant,
     file: Option<saranga_config::BrokerConfig>,
     reload_period: std::time::Duration,
+    /// A shared-store backup that took over from its primary.
+    backup: bool,
 }
 
 /// `ActiveMQServerImpl.internalStart` as `run` does it: the configuration
@@ -940,7 +943,12 @@ async fn boot(
         Some(instance) => {
             let file = instance.broker_config()?;
             tracing::info!(
-                "AMQ221000: Primary message broker is starting with configuration Broker Configuration (clustered=false,journalDirectory={},bindingsDirectory={},largeMessagesDirectory={},pagingDirectory={})",
+                "AMQ221000: {} message broker is starting with configuration Broker Configuration (clustered=false,journalDirectory={},bindingsDirectory={},largeMessagesDirectory={},pagingDirectory={})",
+                if file.ha_policy.is_backup() {
+                    "Backup"
+                } else {
+                    "Primary"
+                },
                 file.journal_directory,
                 file.bindings_directory,
                 file.large_messages_directory,
@@ -997,7 +1005,18 @@ async fn boot(
             p.name()
         );
     }
-    let broker = Broker::start(broker_config).await?;
+    let backup = match (&broker_config.storage, &file_config) {
+        (Some(storage), Some(file)) if file.ha_policy.is_backup() => {
+            let dir = broker_config
+                .ha
+                .lock_directory
+                .clone()
+                .unwrap_or_else(|| storage.messages.directory.clone());
+            Some(await_primary(dir, broker_config.ha.lock_acquisition_timeout).await?)
+        }
+        _ => None,
+    };
+    let broker = Broker::start_activated(broker_config, backup.clone()).await?;
     for Bind {
         name,
         address,
@@ -1017,17 +1036,58 @@ async fn boot(
             return Err(e);
         }
     }
+    if let Some(n) = &backup {
+        n.release_backup();
+    }
     Ok(Started {
         broker,
         at,
         file: file_config,
         reload_period,
+        backup: backup.is_some(),
     })
 }
 
+/// `SharedStoreBackupActivation.run` up to the activation: the backup lock,
+/// then the primary's, once the primary has failed.
+async fn await_primary(
+    dir: PathBuf,
+    timeout: Option<std::time::Duration>,
+) -> anyhow::Result<Arc<NodeManager>> {
+    let n = tokio::task::spawn_blocking(move || {
+        let n = NodeManager::open(&dir, timeout)?;
+        n.start_backup()?;
+        tracing::info!(
+            "AMQ221109: Saranga Backup Server version {VERSION} [{}] started; waiting for primary to fail before activating",
+            n.node_id()
+        );
+        n.await_primary()?;
+        std::io::Result::Ok(n)
+    })
+    .await?
+    .context("the backup's wait for its primary")?;
+    Ok(Arc::new(n))
+}
+
 /// The broker is active.
-fn announce(instance: Option<&Arc<instance::Instance>>, broker: &Arc<Broker>) {
-    tracing::info!("AMQ221007: Server is now active");
+fn announce(instance: Option<&Arc<instance::Instance>>, started: &Started) {
+    let broker = &started.broker;
+    if started.backup {
+        tracing::info!("AMQ221010: Backup Server is now active");
+        // FailbackChecker: a primary asking for failback is heard through
+        // the cluster connection, which Saranga does not have yet.
+        if let Some(saranga_config::HaPolicy::SharedStoreBackup {
+            allow_failback: true,
+            ..
+        }) = started.file.as_ref().map(|f| f.ha_policy)
+        {
+            tracing::warn!(
+                "AMQ222308: Unable to listen for incoming fail-back request because cluster connection is null. Ensure the broker has the proper cluster-connection configuration."
+            );
+        }
+    } else {
+        tracing::info!("AMQ221007: Server is now active");
+    }
     tracing::info!(
         "AMQ221001: Saranga Message Broker version {VERSION} [{}, nodeID={}] ",
         broker.management().config().name,
@@ -1106,7 +1166,37 @@ async fn run(
 ) -> anyhow::Result<()> {
     tracing::info!("AMQ101000: Starting Saranga Server version {VERSION}");
     let instance = instance.map(Arc::new);
-    let started = boot(instance.as_deref(), bind).await?;
+    let stop_dir = instance
+        .as_ref()
+        .and_then(|i| i.broker_xml.parent().map(Path::to_path_buf));
+    let stop_files = async {
+        match stop_dir {
+            Some(dir) => watch_stop_files(dir, allow_kill).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(stop_files);
+    // A backup waits here for its primary to fail, and a primary for the
+    // lock another broker holds; a stop ends the wait.
+    let started = tokio::select! {
+        s = boot(instance.as_deref(), bind) => s?,
+        _ = tokio::signal::ctrl_c() => {
+            saranga_server::node::interrupt_waits();
+            return Ok(());
+        }
+        _ = terminated() => {
+            saranga_server::node::interrupt_waits();
+            return Ok(());
+        }
+        s = &mut stop_files => {
+            saranga_server::node::interrupt_waits();
+            if matches!(s, Stop::Halt) {
+                eprintln!("Halting by user request");
+                std::process::exit(0);
+            }
+            return Ok(());
+        }
+    };
     let current = saranga_server::Current::new(started.broker.clone());
     let mut web_started = false;
     if let (Some(instance), Some(file)) = (&instance, &started.file)
@@ -1118,7 +1208,7 @@ async fn run(
         web::start(instance, file, &web, &current).await?;
         web_started = true;
     }
-    announce(instance.as_ref(), &started.broker);
+    announce(instance.as_ref(), &started);
     if let Some(instance) = &instance {
         spawn_config_reloader(instance.clone(), current.clone(), started.reload_period);
     }
@@ -1127,16 +1217,6 @@ async fn run(
         None => None,
     };
     let name = started.broker.management().config().name.clone();
-    let stop_dir = instance
-        .as_ref()
-        .and_then(|i| i.broker_xml.parent().map(Path::to_path_buf));
-    let stop_files = async {
-        match stop_dir {
-            Some(dir) => watch_stop_files(dir, allow_kill).await,
-            None => std::future::pending().await,
-        }
-    };
-    tokio::pin!(stop_files);
     let mut running = Some(started);
     let stop = loop {
         let is_running = running.is_some();
@@ -1175,7 +1255,7 @@ async fn run(
                 match boot(instance.as_deref(), bind).await {
                     Ok(s) => {
                         current.set(s.broker.clone());
-                        announce(instance.as_ref(), &s.broker);
+                        announce(instance.as_ref(), &s);
                         running = Some(s);
                     }
                     Err(e) => {

@@ -37,8 +37,8 @@ pub use bootstrap::{
 };
 pub use broker::{
     AddressConfig, BrokerConfig, BrokerPluginConfig, CriticalAnalyzerPolicy, DivertConfig,
-    DivertRoutingType, JaasModuleConfig, JournalConfig, JournalRetention, JournalType, QueueConfig,
-    TransformerConfig, Warning,
+    DivertRoutingType, HaPolicy, JaasModuleConfig, JournalConfig, JournalRetention, JournalType,
+    QueueConfig, TransformerConfig, Warning,
 };
 pub use bytes::convert_text_bytes;
 pub use matcher::Match;

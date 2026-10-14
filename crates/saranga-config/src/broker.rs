@@ -368,6 +368,42 @@ impl CriticalAnalyzerPolicy {
     }
 }
 
+/// `ha-policy` (`HAPolicyConfiguration`): what the broker is in a primary
+/// and backup pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HaPolicy {
+    /// `primary-only` (or `live-only`), or no `ha-policy`.
+    PrimaryOnly,
+    /// `shared-store` `primary` (`SharedStorePrimaryPolicyConfiguration`).
+    SharedStorePrimary {
+        /// `failover-on-shutdown`: a clean stop lets the backup take over.
+        failover_on_shutdown: bool,
+        /// `wait-for-activation`.
+        wait_for_activation: bool,
+    },
+    /// `shared-store` `backup` (`SharedStoreBackupPolicyConfiguration`).
+    SharedStoreBackup {
+        /// `allow-failback`: the active backup gives way to a restarted
+        /// primary.
+        allow_failback: bool,
+        /// `failover-on-shutdown`, once it is active.
+        failover_on_shutdown: bool,
+        /// `restart-backup`: after failing back, it waits as a backup again.
+        restart_backup: bool,
+    },
+}
+
+impl HaPolicy {
+    pub const DEFAULT_FAILOVER_ON_SHUTDOWN: bool = false;
+    pub const DEFAULT_WAIT_FOR_ACTIVATION: bool = true;
+    pub const DEFAULT_ALLOW_FAILBACK: bool = true;
+    pub const DEFAULT_RESTART_BACKUP: bool = true;
+
+    pub fn is_backup(&self) -> bool {
+        matches!(self, Self::SharedStoreBackup { .. })
+    }
+}
+
 /// The broker configuration read from `broker.xml`. Every field the file
 /// leaves out holds the Artemis default.
 #[derive(Debug, Clone, PartialEq)]
@@ -492,6 +528,20 @@ pub struct BrokerConfig {
     /// `amqp-use-core-subscription-naming`: AMQP subscription queues are
     /// named as Core names them.
     pub amqp_use_core_subscription_naming: bool,
+    /// `ha-policy`.
+    pub ha_policy: HaPolicy,
+    /// `node-manager-lock-directory`: where `server.lock` and the lock
+    /// files are; the journal directory when unset.
+    pub node_manager_lock_directory: Option<String>,
+    /// `journal-lock-acquisition-timeout`, in milliseconds; -1 waits for
+    /// ever.
+    pub journal_lock_acquisition_timeout: i64,
+    /// `journal-lock-monitor-timeout`: how often, in milliseconds, an
+    /// active broker checks that it still holds the primary lock.
+    pub journal_lock_monitor_timeout: i64,
+    /// `journal-lock-monitor-max-retries`: failed checks tolerated before
+    /// the lock counts as lost.
+    pub journal_lock_monitor_max_retries: i32,
     /// Match string and roles, in document order; a repeated match
     /// replaces the earlier one.
     pub security_settings: Vec<(String, SecuritySetting)>,
@@ -649,6 +699,11 @@ impl Default for BrokerConfig {
             mqtt_session_state_persistence_timeout: 5000,
             mqtt_subscription_persistence_enabled: true,
             amqp_use_core_subscription_naming: false,
+            ha_policy: HaPolicy::PrimaryOnly,
+            node_manager_lock_directory: None,
+            journal_lock_acquisition_timeout: -1,
+            journal_lock_monitor_timeout: 2000,
+            journal_lock_monitor_max_retries: 0,
             security_settings: Vec::new(),
             security_setting_plugins: Vec::new(),
             broker_plugins: Vec::new(),

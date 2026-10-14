@@ -13,7 +13,7 @@ Saranga is built in twelve phases. Each one ends with something runnable, and it
 | 6 | Config and security | Done |
 | 7 | Protocols (AMQP, MQTT, STOMP, OpenWire, WebSockets) | Done |
 | 8 | Management and operations | Done |
-| 9 | High availability | Not started |
+| 9 | High availability | In progress |
 | 10 | Clustering and federation | Not started |
 | 11 | Hardening and 1.0 | Not started |
 
@@ -368,6 +368,17 @@ The differences from Artemis are listed in COMPAT.md.
 **Exit check**
 - Failover tests lose no committed messages.
 - A Java primary works with a Saranga backup, and a Saranga primary works with a Java backup.
+
+**Stages**, each committed on its own:
+1. **Shared store.** `FileLockNodeManager` in full: the state byte of `server.lock` and the locks on it, `serverlock.1` (primary) and `serverlock.2` (backup), taken as Java takes them (`fcntl` record locks on Unix, `LockFileEx` on Windows), so that a Java broker and a Saranga broker exclude each other on one journal directory; `journal-lock-acquisition-timeout` and the lock monitor. `<ha-policy><shared-store>` with its `primary` and `backup` options: a backup waits for the backup lock, then for the primary to fail, and becomes active on its data; `failover-on-shutdown`.
+2. **Topology, failback and client failover.** The cluster connection a backup uses to announce itself to its primary (`ClusterConnect`, `NodeAnnounce`), so that the topology clients receive pairs each primary with its backup; shared-store failback (`allow-failback`, `restart-backup`: the active backup hears the restarted primary through the cluster connection and gives way), and `artemis create --shared-store`, which makes a clustered instance; `DisconnectMessage` on shutdown; and in `saranga-client`, reconnection and failover to the backup (`reconnectAttempts`, `retryInterval`, `ha=true`, the URL list), with the Artemis JMS client failing over to a Saranga backup.
+3. **Replication.** A backup registers with its primary (`BackupRegistrationMessage`), receives the journals, paging and large messages in the initial synchronization (`ReplicationStartSyncMessage`, `ReplicationSyncFileMessage`), then every journal append, page write and large message as it happens, each acknowledged before the primary's client is answered. The backup becomes active when the primary fails, after a quorum vote among the cluster's primaries (`vote-on-replication-failure`, `quorum-size`), and the primary stops when it loses the vote (`QuorumVoteMessage`).
+4. **Replication failback** (`check-for-active-server`, `allow-failback`, `max-saved-replicated-journals-size`): a restarted primary synchronizes from the active backup and takes over again.
+5. **Pluggable quorum** with ZooKeeper (`<replication><primary><manager>`), activation sequences and the coordination Artemis's `CuratorDistributedPrimitiveManager` does.
+6. **Exit check:** failover tests that lose no committed messages, with Saranga and Java brokers in each role.
+
+**Progress**
+- Stage 1 (shared store) is done. `server.lock`'s states and the locks on `server.lock`, `serverlock.1` and `serverlock.2` are taken as Java takes them, so Java and Saranga brokers exclude each other ([crates/saranga-server/src/filelock.rs](crates/saranga-server/src/filelock.rs), [crates/saranga-server/src/node.rs](crates/saranga-server/src/node.rs)). `<ha-policy><shared-store>` is parsed with its options, and `journal-lock-acquisition-timeout`, `journal-lock-monitor-timeout`, `journal-lock-monitor-max-retries` and `node-manager-lock-directory` are honoured. A primary waits for the lock, a backup for its primary to fail, and an active broker whose lock another takes stops. [tests/interop/ha/shared-store.sh](tests/interop/ha/shared-store.sh) runs a primary and a backup on one journal directory through their instances' `bin/artemis`: a crash failover, a primary waiting for the active backup, failover on shutdown, and a backup kept waiting by paused data. Its output is recorded with Artemis in both roles and compared with Saranga in both, and with each of Artemis and Saranga as the other's backup.
 
 ## Phase 10: Clustering and federation
 

@@ -1,6 +1,6 @@
 //! Unknown or unsupported elements produce warnings, never errors.
 
-use saranga_config::{BrokerConfig, Warning};
+use saranga_config::{BrokerConfig, HaPolicy, Warning};
 
 fn parse(xml: &str) -> BrokerConfig {
     BrokerConfig::parse_with(xml, |_| None).unwrap()
@@ -45,14 +45,14 @@ fn features_not_acted_on_are_reported() {
         })
         .collect();
     // The critical analyzer only watches the broker; nothing to report.
-    assert_eq!(names, ["ha-policy", "cluster-connections"]);
+    assert_eq!(names, ["cluster-connections", "ha-policy"]);
 }
 
 #[test]
 fn backups_and_jdbc_are_refused() {
     for xml in [
         "<ha-policy><replication><backup/></replication></ha-policy>",
-        "<ha-policy><shared-store><slave/></shared-store></ha-policy>",
+        "<ha-policy><replication><slave/></replication></ha-policy>",
         "<ha-policy><shared-store><colocated/></shared-store></ha-policy>",
         "<store><database-store><jdbc-connection-url>x</jdbc-connection-url></database-store></store>",
     ] {
@@ -70,6 +70,48 @@ fn backups_and_jdbc_are_refused() {
         "<configuration><core><ha-policy><live-only/></ha-policy><store><file-store/></store></core></configuration>",
     );
     assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+}
+
+#[test]
+fn shared_store_policies() {
+    let c = parse(
+        "<configuration><core><ha-policy><shared-store><primary><failover-on-shutdown>true</failover-on-shutdown></primary></shared-store></ha-policy></core></configuration>",
+    );
+    assert_eq!(
+        c.ha_policy,
+        HaPolicy::SharedStorePrimary {
+            failover_on_shutdown: true,
+            wait_for_activation: true
+        }
+    );
+    assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+    let c = parse(
+        "<configuration><core><journal-lock-acquisition-timeout>5000</journal-lock-acquisition-timeout><ha-policy><shared-store><slave><allow-failback>false</allow-failback><scale-down/></slave></shared-store></ha-policy></core></configuration>",
+    );
+    assert_eq!(
+        c.ha_policy,
+        HaPolicy::SharedStoreBackup {
+            allow_failback: false,
+            failover_on_shutdown: false,
+            restart_backup: true
+        }
+    );
+    assert_eq!(c.journal_lock_acquisition_timeout, 5000);
+    assert_eq!(
+        c.warnings
+            .iter()
+            .map(|w| match w {
+                Warning::Deprecated { name, .. } | Warning::Unsupported { name, .. } =>
+                    name.as_str(),
+                other => panic!("{other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        ["slave", "scale-down"]
+    );
+    assert_eq!(
+        parse("<configuration><core/></configuration>").ha_policy,
+        HaPolicy::PrimaryOnly
+    );
 }
 
 #[test]

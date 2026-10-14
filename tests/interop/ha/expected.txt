@@ -1,0 +1,57 @@
+=== artemis run (primary)
+primary: listening
+=== artemis run (backup)
+backup: not listening
+=== artemis producer --url tcp://localhost:62616 --destination queue://ha --message-count 10
+Produced: 10 messages
+=== artemis kill (primary)
+primary: down
+backup: listening
+primary: AMQ221034: Waiting indefinitely to obtain primary lock
+primary: AMQ221035: Primary Server Obtained primary lock
+primary: AMQ221007: Server is now active
+backup: AMQ221032: Waiting to become backup node
+backup: AMQ221033: ** got backup lock
+backup: AMQ221109: BACKUP [ID] started; waiting for primary to fail before activating
+backup: AMQ221010: Backup Server is now active
+backup: AMQ222308: Unable to listen for incoming fail-back request because X is null. Ensure the broker has the proper cluster-connection configuration.
+=== artemis consumer --url tcp://localhost:62716 --destination queue://ha --message-count 20
+Consumed: 20 messages
+Consumed: 10 messages
+=== artemis producer --url tcp://localhost:62716 --destination queue://ha --message-count 3
+Produced: 3 messages
+=== artemis run (primary)
+primary: not listening
+primary: AMQ221034: Waiting indefinitely to obtain primary lock
+=== artemis stop (backup)
+backup: down
+primary: listening
+primary: AMQ221034: Waiting indefinitely to obtain primary lock
+primary: AMQ221035: Primary Server Obtained primary lock
+primary: AMQ221007: Server is now active
+=== artemis consumer --url tcp://localhost:62616 --destination queue://ha --message-count 20
+Consumed: 20 messages
+Consumed: 3 messages
+=== artemis run (backup)
+=== artemis producer --url tcp://localhost:62616 --destination queue://ha --message-count 5
+Produced: 5 messages
+=== artemis stop (primary)
+primary: down
+backup: listening
+backup: AMQ221032: Waiting to become backup node
+backup: AMQ221033: ** got backup lock
+backup: AMQ221109: BACKUP [ID] started; waiting for primary to fail before activating
+backup: AMQ221010: Backup Server is now active
+backup: AMQ222308: Unable to listen for incoming fail-back request because X is null. Ensure the broker has the proper cluster-connection configuration.
+=== artemis consumer --url tcp://localhost:62716 --destination queue://ha --message-count 20
+Consumed: 20 messages
+Consumed: 5 messages
+=== artemis stop (backup)
+backup: down
+=== artemis run (backup)
+backup: not listening
+backup: AMQ221032: Waiting to become backup node
+backup: AMQ221033: ** got backup lock
+backup: AMQ221109: BACKUP [ID] started; waiting for primary to fail before activating
+=== artemis stop (backup)
+backup: down
