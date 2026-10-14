@@ -393,6 +393,7 @@ impl BrokerConfig {
             protocols: Vec::new(),
             critical: crate::critical::CriticalConfig::from_file(config),
             ha: crate::node::HaConfig::from_file(config, instance),
+            cluster: crate::cluster::ClusterConfig::from_file(config),
             plugins: plugins(config)?,
             disk_monitor: crate::disk::MonitorConfig::new(
                 config.journal.max_disk_usage.unwrap_or(90),

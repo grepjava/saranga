@@ -160,6 +160,20 @@ impl ProducerCredits {
         self.notify.notify_waiters();
     }
 
+    /// `ClientProducerCreditsImpl.reset`: credits asked for before the
+    /// failover will not arrive, so the balance is dropped and the credits
+    /// asked for again, at least the whole window.
+    fn reset(&self, session: &SessionInner) {
+        let before_failure = {
+            let mut st = self.state();
+            st.balance = 0;
+            let pending = std::mem::take(&mut st.pending_credits);
+            st.arriving = 0;
+            pending
+        };
+        self.check_credits(session, (self.window_size * 2).max(before_failure));
+    }
+
     fn arriving(&self) -> i32 {
         self.state().arriving
     }
@@ -262,6 +276,13 @@ impl CreditManager {
         }
     }
 
+    /// `ClientProducerCreditManagerImpl.reset`, after a failover.
+    pub(crate) fn reset(&self, session: &SessionInner) {
+        for c in self.credits.values() {
+            c.reset(session);
+        }
+    }
+
     pub(crate) fn close(&mut self) {
         self.window_size = -1;
         for c in self.credits.values() {
@@ -305,7 +326,11 @@ impl ProducerShared {
             session.credits.lock().expect("credits").return_credits(a);
         }
         session.remove_producer(self.id);
-        if !session.conn.context().is_before_producer_metrics_changed() {
+        if !session
+            .conn()
+            .context()
+            .is_before_producer_metrics_changed()
+        {
             let _ = session.send(RemoveProducerMessage { id: self.id });
         }
     }
@@ -376,6 +401,7 @@ impl Producer {
         }
         let session = &self.session;
         session.check_closed()?;
+        session.work_done();
         let address = address
             .or_else(|| self.shared.address.clone())
             .ok_or_else(|| Error::InvalidArgument("no address to send to".into()))?;
@@ -459,7 +485,7 @@ impl Producer {
             }
         }
         // sendInitialLargeMessageHeader: the credits are taken after the send.
-        let used = session.send_initial_chunk_on_large_message(message)?;
+        let used = session.send_initial_chunk_on_large_message(message).await?;
         if let Some(credits) = credits {
             credits.acquire(session, used).await?;
         }

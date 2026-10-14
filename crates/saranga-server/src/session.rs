@@ -107,6 +107,8 @@ pub struct ClientConnection {
     fail_notify: tokio::sync::Notify,
     /// The slow-consumer policy killed the connection.
     killed: AtomicBool,
+    /// The broker is stopping (`RemotingServiceImpl.freeze`).
+    disconnecting: AtomicBool,
 }
 
 impl ClientConnection {
@@ -137,6 +139,7 @@ impl ClientConnection {
             sessions: Mutex::default(),
             failed: AtomicBool::new(false),
             killed: AtomicBool::new(false),
+            disconnecting: AtomicBool::new(false),
             fail_notify: tokio::sync::Notify::new(),
         }
     }
@@ -207,6 +210,17 @@ impl ClientConnection {
     pub fn kill(&self) {
         self.killed.store(true, Ordering::SeqCst);
         self.fail();
+    }
+
+    /// `RemotingConnection.disconnect`, as the broker stops: the client is
+    /// told, where its protocol can tell it, and the connection fails.
+    pub fn disconnect(&self) {
+        self.disconnecting.store(true, Ordering::SeqCst);
+        self.fail();
+    }
+
+    pub fn is_disconnecting(&self) -> bool {
+        self.disconnecting.load(Ordering::SeqCst)
     }
 
     pub fn is_killed(&self) -> bool {

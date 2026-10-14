@@ -14,8 +14,16 @@
 //! compressed. Streaming bodies to and from `InputStream`/`OutputStream`
 //! is not supported.
 //!
-//! Not supported: XA, a confirmation window (resend cache), failover and
-//! reconnection, and message handlers (use [`Consumer::receive`]).
+//! A connection reconnects, or fails over to the backup the broker's
+//! topology pairs with its server and then to the other servers it was
+//! given, when its options ask for it (`reconnectAttempts`,
+//! `failoverAttempts`; see [`Connection::connect_to`]); its sessions are
+//! recreated on the new connection with their consumers, as
+//! `ClientSessionImpl.handleFailover` does.
+//!
+//! Not supported: XA, a confirmation window (resend cache, so sessions are
+//! recreated rather than reattached), and message handlers (use
+//! [`Consumer::receive`]).
 //!
 //! ```no_run
 //! # async fn demo() -> saranga_client::Result<()> {
@@ -50,7 +58,7 @@ mod producer;
 mod session;
 pub mod uuid;
 
-pub use connection::{Connection, ConnectionOptions};
+pub use connection::{Connection, ConnectionOptions, Connector, FailoverEvent};
 pub use consumer::{Consumer, ConsumerOptions, Delivery, FORCED_DELIVERY_MESSAGE};
 pub use error::{Error, ErrorType, Result};
 pub use message::MessageExt;

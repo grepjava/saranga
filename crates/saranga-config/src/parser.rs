@@ -405,6 +405,8 @@ fn parse_core(
     parse_ha_policy(core, config, warnings)?;
     parse_scalars(core, config, warnings)?;
     parse_acceptors(core, config, warnings)?;
+    parse_connectors(core, config, warnings)?;
+    parse_cluster_connections(core, config, warnings)?;
     parse_security_settings(core, config, warnings)?;
     parse_broker_plugins(core, config)?;
     parse_address_settings(core, config, warnings)?;
@@ -417,11 +419,13 @@ fn parse_core(
 /// `<core>` children Saranga reads but does not act on yet, and why.
 const NOT_ACTED_ON: &[(&str, &str)] = &[
     (
-        "cluster-connections",
-        "clustering is not supported; the broker runs on its own",
+        "broadcast-groups",
+        "discovery is not supported yet; list the other brokers in static-connectors",
     ),
-    ("broadcast-groups", "clustering is not supported"),
-    ("discovery-groups", "clustering is not supported"),
+    (
+        "discovery-groups",
+        "discovery is not supported yet; list the other brokers in static-connectors",
+    ),
     ("bridges", "core bridges are not supported"),
     ("federations", "federation is not supported"),
     (
@@ -1065,6 +1069,169 @@ fn parse_acceptors(
         config.acceptors.push(acceptor);
     }
     Ok(())
+}
+
+/// `<connectors>`: `ConfigurationUtils.parseConnectorURI` for each.
+fn parse_connectors(
+    core: Node<'_, '_>,
+    config: &mut BrokerConfig,
+    warnings: &mut Vec<Warning>,
+) -> Result<()> {
+    let Some(list) = elements(core).find(|c| c.tag_name().name() == "connectors") else {
+        return Ok(());
+    };
+    warn_unknown_children(warnings, list, &["connector"]);
+    for node in elements(list).filter(|c| c.tag_name().name() == "connector") {
+        let name = node.attribute("name");
+        let uri = node
+            .first_child()
+            .filter(|c| c.is_text())
+            .and_then(|c| c.text())
+            .ok_or_else(|| ConfigError::InvalidUri {
+                uri: String::new(),
+                reason: format!("connector {:?} has no URI", name.unwrap_or("")),
+            })?;
+        config.connectors.push(AcceptorConfig::parse(name, uri)?);
+    }
+    Ok(())
+}
+
+/// `parseClusterConnectionConfiguration` for each `<cluster-connection>`.
+fn parse_cluster_connections(
+    core: Node<'_, '_>,
+    config: &mut BrokerConfig,
+    warnings: &mut Vec<Warning>,
+) -> Result<()> {
+    let Some(list) = elements(core).find(|c| c.tag_name().name() == "cluster-connections") else {
+        return Ok(());
+    };
+    for node in elements(list).filter(|c| c.tag_name().name() == "cluster-connection") {
+        let name = node.attribute("name").unwrap_or_default();
+        let s = Settings { core: node };
+        let connector = s
+            .non_empty_string("connector-ref")?
+            .ok_or_else(|| ConfigError::invalid("connector-ref", "", "must not be empty"))?;
+        if !config
+            .connectors
+            .iter()
+            .any(|c| c.name.as_deref() == Some(connector.as_str()))
+        {
+            warnings.push(Warning::ConnectorRefNotFound {
+                connector,
+                cluster_connection: name.to_owned(),
+            });
+            continue;
+        }
+        let mut c = crate::ClusterConnectionConfig::new(name, &connector);
+        if let Some(v) = s.string("address") {
+            c.address = v;
+        }
+        if let Some(v) = s.bool("use-duplicate-detection") {
+            c.use_duplicate_detection = v;
+        }
+        if let Some(forward) = s.bool("forward-when-no-consumers") {
+            c.message_load_balancing = if forward {
+                crate::MessageLoadBalancing::Strict
+            } else {
+                crate::MessageLoadBalancing::OnDemand
+            };
+        } else if let Some(n) = first(node, "message-load-balancing") {
+            c.message_load_balancing = node_enum(n)?;
+        }
+        set_value(&mut c.max_hops, s.i32("max-hops", Check::GeZero)?);
+        set_value(&mut c.check_period, s.i64("check-period", Check::GtZero)?);
+        set_value(
+            &mut c.connection_ttl,
+            s.i64("connection-ttl", Check::GtZero)?,
+        );
+        set_value(
+            &mut c.retry_interval,
+            s.i64("retry-interval", Check::GtZero)?,
+        );
+        set_value(&mut c.call_timeout, s.i64("call-timeout", Check::GtZero)?);
+        set_value(
+            &mut c.call_failover_timeout,
+            s.i64("call-failover-timeout", Check::MinusOneOrGtZero)?,
+        );
+        if let Some(n) = first(node, "retry-interval-multiplier") {
+            let v = node_f64(n)?;
+            if v <= 0.0 {
+                return Err(ConfigError::invalid(
+                    "retry-interval-multiplier",
+                    v,
+                    "must be greater than 0",
+                ));
+            }
+            c.retry_interval_multiplier = v;
+        }
+        if let Some(v) = s.text_bytes("min-large-message-size", Check::PositiveInt)? {
+            c.min_large_message_size = v as i32;
+        }
+        set_value(
+            &mut c.max_retry_interval,
+            s.i64("max-retry-interval", Check::GtZero)?,
+        );
+        set_value(
+            &mut c.initial_connect_attempts,
+            s.i32("initial-connect-attempts", Check::MinusOneOrGeZero)?,
+        );
+        set_value(
+            &mut c.reconnect_attempts,
+            s.i32("reconnect-attempts", Check::MinusOneOrGeZero)?,
+        );
+        if let Some(v) = s.text_bytes("confirmation-window-size", Check::PositiveInt)? {
+            c.confirmation_window_size = v as i32;
+        }
+        if let Some(v) = s.text_bytes("producer-window-size", Check::MinusOneOrPositiveInt)? {
+            c.producer_window_size = v as i32;
+        }
+        set_value(
+            &mut c.notification_interval,
+            s.i64("notification-interval", Check::GtZero)?,
+        );
+        set_value(
+            &mut c.notification_attempts,
+            s.i32("notification-attempts", Check::GtZero)?,
+        );
+        set_value(
+            &mut c.topology_scanner_attempts,
+            s.i32("topology-scanner-attempts", Check::MinusOneOrGeZero)?,
+        );
+        let mut discovery = None;
+        for child in elements(node) {
+            match child.tag_name().name() {
+                "discovery-group-ref" => {
+                    discovery = child.attribute("discovery-group-name").map(str::to_owned);
+                }
+                "static-connectors" => {
+                    if child
+                        .attribute("allow-direct-connections-only")
+                        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+                    {
+                        c.allow_direct_connections_only = true;
+                    }
+                    // `getStaticConnectors`.
+                    for r in elements(child).filter(|r| r.tag_name().name() == "connector-ref") {
+                        c.static_connectors.push(trimmed_text(r));
+                    }
+                }
+                _ => {}
+            }
+        }
+        c.client_id = s.string("client-id");
+        if discovery.is_some() {
+            c.static_connectors.clear();
+            c.discovery_group = discovery;
+        }
+        config.cluster_connections.push(c);
+    }
+    Ok(())
+}
+
+fn set_value<T>(slot: &mut T, value: Option<T>) {
+    if let Some(v) = value {
+        *slot = v;
+    }
 }
 
 fn mask_error(name: &str, value: &str, e: MaskError) -> ConfigError {

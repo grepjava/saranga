@@ -30,6 +30,8 @@ const TEMPLATES: &[(&str, &str)] = &[
     template!("etc/bootstrap-web-settings.txt"),
     template!("etc/bootstrap.xml"),
     template!("etc/broker.xml"),
+    template!("etc/cluster-security-settings.txt"),
+    template!("etc/cluster-static-settings.txt"),
     template!("etc/commented-ping-settings.txt"),
     template!("etc/global-max-default.txt"),
     template!("etc/global-max-specified.txt"),
@@ -45,6 +47,7 @@ const TEMPLATES: &[(&str, &str)] = &[
     template!("etc/mqtt-acceptor.txt"),
     template!("etc/page-sync-settings.txt"),
     template!("etc/ping-settings.txt"),
+    template!("etc/shared-store-settings.txt"),
     template!("etc/stomp-acceptor.txt"),
     template!("bin/artemis-service"),
     template!("bin/instance.sh"),
@@ -319,37 +322,61 @@ pub struct CreateArgs {
     #[arg(long = "journal-max-io", default_value_t = 4096)]
     journal_max_io: i32,
     #[command(flatten)]
+    cluster: Clustering,
+    #[command(flatten)]
     unsupported: Unsupported,
 }
 
-/// `artemis create` options for what Saranga does not do yet: clustering
-/// and HA (Phases 9 and 10) and JDBC storage.
+/// `artemis create`'s clustering and shared-store options.
 #[derive(clap::Args, Debug)]
-struct Unsupported {
-    #[arg(long, hide = true)]
+struct Clustering {
+    /// Enable clustering.
+    #[arg(long)]
     clustered: bool,
-    #[arg(long = "discovery-enabled", hide = true)]
-    discovery_enabled: bool,
-    #[arg(long = "max-hops", hide = true)]
-    max_hops: Option<i32>,
-    #[arg(long = "message-load-balancing", hide = true)]
-    message_load_balancing: Option<String>,
-    #[arg(long, hide = true)]
-    replicated: bool,
-    #[arg(long = "shared-store", hide = true)]
+    /// Number of hops on the cluster configuration.
+    #[arg(long = "max-hops", default_value_t = 1)]
+    max_hops: i32,
+    /// Message load balancing policy for cluster. Default: ON_DEMAND. Valid
+    /// values: ON_DEMAND, STRICT, OFF, OFF_WITH_REDISTRIBUTION.
+    #[arg(long = "message-load-balancing", default_value = "ON_DEMAND",
+          value_parser = ["ON_DEMAND", "STRICT", "OFF", "OFF_WITH_REDISTRIBUTION"])]
+    message_load_balancing: String,
+    /// Enable broker shared store.
+    #[arg(long = "shared-store")]
     shared_store: bool,
+    /// Deprecated for removal. Use 'backup' instead.
     #[arg(long, hide = true)]
     slave: bool,
-    #[arg(long, hide = true)]
+    /// Be a backup broker. Valid for shared store or replication.
+    #[arg(long)]
     backup: bool,
-    #[arg(long = "failover-on-shutdown", hide = true)]
+    /// Whether broker shutdown will trigger failover for clients using the
+    /// core protocol. Valid only for shared store. Default: false.
+    #[arg(long = "failover-on-shutdown")]
     failover_on_shutdown: bool,
-    #[arg(long = "cluster-user", hide = true)]
+    /// The user to use for clustering. Default: input.
+    #[arg(long = "cluster-user")]
     cluster_user: Option<String>,
-    #[arg(long = "cluster-password", hide = true)]
+    /// The password to use for clustering. Default: input.
+    #[arg(long = "cluster-password")]
     cluster_password: Option<String>,
-    #[arg(long = "static-cluster", alias = "staticCluster", hide = true)]
+    /// Cluster node connectors list separated by comma, e.g.
+    /// "tcp://server:61616,tcp://server2:61616,tcp://server3:61616".
+    #[arg(long = "static-cluster", alias = "staticCluster")]
     static_cluster: Option<String>,
+}
+
+/// `PrintWriter.println`'s line separator.
+const LINE_SEPARATOR: &str = if cfg!(windows) { "\r\n" } else { "\n" };
+
+/// `artemis create` options for what Saranga does not do yet: replication
+/// and discovery (Phases 9 and 10) and JDBC storage.
+#[derive(clap::Args, Debug)]
+struct Unsupported {
+    #[arg(long = "discovery-enabled", hide = true)]
+    discovery_enabled: bool,
+    #[arg(long, hide = true)]
+    replicated: bool,
     #[arg(long, hide = true)]
     jdbc: bool,
     // The JDBC store's settings, unused without --jdbc.
@@ -377,26 +404,14 @@ struct Unsupported {
 
 impl Unsupported {
     fn check(&self) -> anyhow::Result<()> {
-        let ha = [
-            ("--clustered", self.clustered),
-            ("--discovery-enabled", self.discovery_enabled),
-            ("--max-hops", self.max_hops.is_some()),
-            (
-                "--message-load-balancing",
-                self.message_load_balancing.is_some(),
-            ),
-            ("--replicated", self.replicated),
-            ("--shared-store", self.shared_store),
-            ("--slave", self.slave),
-            ("--backup", self.backup),
-            ("--failover-on-shutdown", self.failover_on_shutdown),
-            ("--cluster-user", self.cluster_user.is_some()),
-            ("--cluster-password", self.cluster_password.is_some()),
-            ("--static-cluster", self.static_cluster.is_some()),
-        ];
-        if let Some((option, _)) = ha.iter().find(|(_, set)| *set) {
+        if self.replicated {
             bail!(
-                "saranga create does not support {option} yet: Saranga has no clustering or HA yet"
+                "saranga create does not support --replicated yet: Saranga has no replication yet"
+            );
+        }
+        if self.discovery_enabled {
+            bail!(
+                "saranga create does not support --discovery-enabled yet: Saranga has no discovery yet; use --static-cluster"
             );
         }
         if self.jdbc {
@@ -487,8 +502,16 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
         "${device-block-size}",
         args.journal_device_block_size.to_string(),
     );
-    f.put("${primary-backup}", "primary");
-    f.put("${failover-on-shutdown}", "false");
+    let cluster = &args.cluster;
+    let backup = cluster.slave || cluster.backup;
+    f.put(
+        "${primary-backup}",
+        if backup { "backup" } else { "primary" },
+    );
+    f.put(
+        "${failover-on-shutdown}",
+        cluster.failover_on_shutdown.to_string(),
+    );
     f.put(
         "${persistence-enabled}",
         (!args.disable_persistence).to_string(),
@@ -505,8 +528,14 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
             f.put("${ping-config.settings}", text);
         }
     }
+    let clustered = cluster.clustered || cluster.static_cluster.is_some() || cluster.shared_store;
     f.put("${replicated.settings}", "");
-    f.put("${shared-store.settings}", "");
+    if cluster.shared_store {
+        let text = f.read("etc/shared-store-settings.txt")?;
+        f.put("${shared-store.settings}", text);
+    } else {
+        f.put("${shared-store.settings}", "");
+    }
     f.put("${journal.settings}", journal_type);
     match &args.ssl_key {
         Some(key) => {
@@ -558,8 +587,11 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
     f.put("${http.host}", args.http_host.clone());
     f.put("${http.port}", (args.http_port + offset).to_string());
     f.put("${data.dir}", args.install.data.clone());
-    f.put("${max-hops}", "1");
-    f.put("${message-load-balancing}", "ON_DEMAND");
+    f.put("${max-hops}", cluster.max_hops.to_string());
+    f.put(
+        "${message-load-balancing}",
+        cluster.message_load_balancing.clone(),
+    );
     let user = match args.user.clone() {
         Some(u) => Some(u),
         None => args
@@ -596,14 +628,107 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
         }
     }
     f.put("${jdbc}", "");
-    let host = args.host.clone().unwrap_or_else(|| "0.0.0.0".to_owned());
-    f.put("${name}", args.name.clone().unwrap_or_else(|| host.clone()));
-    f.put("${host}", host);
-    f.put("${connector-config.settings}", "");
-    f.put("${cluster-security.settings}", "");
-    f.put("${cluster.settings}", "");
-    f.put("${cluster-user}", "");
-    f.put("${cluster-password}", "");
+    if clustered {
+        let Some(static_cluster) = cluster.static_cluster.clone() else {
+            bail!(UsageError(
+                "Clustered instances without --static-cluster use discovery groups, which are disabled by default. Supply static configuration, or see the Server Discovery section in the user manual for security requirements and enablement.".to_owned()
+            ));
+        };
+        // `getHostForClustered`.
+        let mut host = args.host.clone().unwrap_or_else(|| "0.0.0.0".to_owned());
+        if host == "0.0.0.0" {
+            host = args
+                .common
+                .input(
+                    "--host",
+                    &format!(
+                        "Host {host} is not valid for clustering. Please provide a valid IP or hostname"
+                    ),
+                    Some("localhost"),
+                )?
+                .unwrap_or_else(|| "localhost".to_owned());
+        }
+        f.put("${host}", host.clone());
+        f.put("${name}", args.name.clone().unwrap_or_else(|| host.clone()));
+        let nodes: Vec<&str> = static_cluster.split(',').collect();
+        // `getConnectors`.
+        let mut connectors = String::new();
+        let mut line = |text: &str| {
+            connectors.push_str(text);
+            connectors.push_str(LINE_SEPARATOR);
+        };
+        line("      <connectors>");
+        line(
+            "            <!-- Connector used to be announced through cluster connections and notifications -->",
+        );
+        line(&f.apply(
+            "            <connector name=\"artemis\">tcp://${host}:${default.port}</connector>",
+        ));
+        for (i, node) in nodes.iter().enumerate() {
+            line(&format!(
+                "            <connector name = \"node{i}\">{node}</connector>"
+            ));
+        }
+        line("      </connectors>");
+        f.put("${connector-config.settings}", connectors);
+        let text = f.read("etc/cluster-security-settings.txt")?;
+        f.put("${cluster-security.settings}", text);
+        let list: String = (0..nodes.len())
+            .map(|i| {
+                format!("               <connector-ref>node{i}</connector-ref>{LINE_SEPARATOR}")
+            })
+            .collect();
+        f.put("${connectors-list}", list);
+        let text = f.read("etc/cluster-static-settings.txt")?;
+        f.put("${cluster.settings}", text);
+        let user = match cluster.cluster_user.clone() {
+            Some(u) => u,
+            None => args
+                .common
+                .input(
+                    "--cluster-user",
+                    "What is the cluster user?",
+                    Some(saranga_config::BrokerConfig::DEFAULT_CLUSTER_USER),
+                )?
+                .unwrap_or_else(|| saranga_config::BrokerConfig::DEFAULT_CLUSTER_USER.to_owned()),
+        };
+        f.put("${cluster-user}", user);
+        let mut password = match cluster.cluster_password.clone() {
+            Some(p) => p,
+            None => args
+                .common
+                .input_password("--cluster-password", "What is the cluster password?")?,
+        };
+        // `getClusterPassword`: stored masked.
+        if !saranga_config::mask::is_enc_masked(&password) {
+            // `getDefaultCodec`: its deprecation warning is logged where
+            // `create` logs nothing.
+            let masked = tracing::subscriber::with_default(
+                tracing::subscriber::NoSubscriber::default(),
+                || saranga_config::mask::Codec::from_desc(None).and_then(|c| c.encode(&password)),
+            );
+            match masked {
+                Ok(masked) => {
+                    password = saranga_config::mask::wrap(&masked);
+                    println!("Using masked cluster-password: {password}");
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to mask password.");
+                    eprintln!("Reason: {e}");
+                }
+            }
+        }
+        f.put("${cluster-password}", password);
+    } else {
+        let host = args.host.clone().unwrap_or_else(|| "0.0.0.0".to_owned());
+        f.put("${name}", args.name.clone().unwrap_or_else(|| host.clone()));
+        f.put("${host}", host);
+        f.put("${connector-config.settings}", "");
+        f.put("${cluster-security.settings}", "");
+        f.put("${cluster.settings}", "");
+        f.put("${cluster-user}", "");
+        f.put("${cluster-password}", "");
+    }
     f.put("${address-queue.settings}", addresses_and_queues(&args));
     let home = match &args.install.home {
         Some(h) => canonical(h)?,

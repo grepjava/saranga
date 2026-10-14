@@ -107,6 +107,12 @@ impl Channel {
     /// `ChannelImpl.close` + `returnBlocking`: fails any call in progress.
     pub(crate) fn close(&self, cause: &Error) {
         self.closed.store(true, Ordering::SeqCst);
+        self.return_blocking(cause);
+    }
+
+    /// `ChannelImpl.returnBlocking`: the call in progress fails with
+    /// `UNBLOCKED`, as its response will never come.
+    pub(crate) fn return_blocking(&self, cause: &Error) {
         if let Some(p) = self.pending.lock().expect("channel").take() {
             let _ = p.tx.send(Err(Error::unblocking_a_call(cause)));
         }
@@ -148,6 +154,7 @@ pub(crate) fn is_response(packet_type: i8) -> bool {
             | types::CREATESESSION_RESP
             | types::REATTACH_SESSION_RESP
             | types::CONNECT_RESPONSE
+            | types::CLUSTER_CONNECT_REPLY
             | types::SESS_QUEUEQUERY_RESP
             | types::SESS_QUEUEQUERY_RESP_V2
             | types::SESS_QUEUEQUERY_RESP_V3

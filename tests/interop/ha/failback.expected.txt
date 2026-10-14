@@ -1,0 +1,57 @@
+=== artemis run (primary)
+primary: listening
+=== artemis run (backup)
+backup: announced
+primary: AMQ221000: Primary message broker is starting
+primary: AMQ221034: Waiting indefinitely to obtain primary lock
+primary: AMQ221035: Primary Server Obtained primary lock
+primary: AMQ221007: Server is now active
+backup: AMQ221000: Backup message broker is starting
+backup: AMQ221032: Waiting to become backup node
+backup: AMQ221033: ** got backup lock
+backup: AMQ221109: BACKUP [ID] started; waiting for primary to fail before activating
+backup: AMQ221031: backup announced
+=== Failover.java topology tcp://localhost:62616
+topology: primary=localhost:62616 backup=localhost:62716
+=== Failover.java failover (in the background)
+client: sent 10
+=== artemis producer (primary)
+Produced: 10 messages
+=== artemis consumer --url tcp://localhost:62616?ha=true;reconnectAttempts=-1 (in the background)
+=== artemis kill (primary)
+primary: down
+backup: listening
+backup: AMQ221010: Backup Server is now active
+client: failover event: FAILURE_DETECTED
+client: failover event: FAILOVER_COMPLETED
+client: received 10
+=== artemis producer (backup)
+Produced: 10 messages
+consumer: Consumed: 20 messages
+consumer: Consumed: 20 messages
+client: sent 10
+=== artemis run (primary)
+backup: failing back
+primary: listening
+backup: announced
+primary: AMQ221000: Primary message broker is starting
+primary: AMQ221034: Waiting indefinitely to obtain primary lock
+primary: AMQ221031: backup announced
+primary: AMQ221035: Primary Server Obtained primary lock
+primary: AMQ221007: Server is now active
+backup: AMQ221008: primary server wants to restart
+backup: AMQ221002: stopped
+backup: AMQ221000: Backup message broker is starting
+backup: AMQ221032: Waiting to become backup node
+backup: AMQ221033: ** got backup lock
+backup: AMQ221109: BACKUP [ID] started; waiting for primary to fail before activating
+backup: AMQ221031: backup announced
+client: failover event: FAILURE_DETECTED
+client: failover event: FAILOVER_COMPLETED
+client: received 10
+=== Failover.java topology tcp://localhost:62616
+topology: primary=localhost:62616 backup=localhost:62716
+=== artemis stop (backup)
+backup: stopped
+=== artemis stop (primary)
+primary: down

@@ -15,16 +15,21 @@ use std::time::Duration;
 
 use saranga_buffer::JString;
 use saranga_core_protocol::packets::cluster::{
-    ClusterTopologyChangeMessage, ClusterTopologyChangeMessageV2, ClusterTopologyChangeMessageV4,
-    ConnectResponseMessage, TopologyUpdate,
+    ClusterConnectReplyMessage, ClusterTopologyChangeMessage, ClusterTopologyChangeMessageV2,
+    ClusterTopologyChangeMessageV3, ClusterTopologyChangeMessageV4, ConnectResponseMessage,
+    TopologyUpdate,
 };
 use saranga_core_protocol::packets::cluster_types::{MapValue, PersistedMap};
 use saranga_core_protocol::packets::connection::{
     ActiveMQExceptionMessage, CreateSessionResponseMessage,
 };
+use saranga_core_protocol::packets::connection::{
+    DisconnectMessage, DisconnectMessageV2, DisconnectMessageV3,
+};
 use saranga_core_protocol::packets::session::{
     ReattachSessionResponseMessage, SessionReceiveMessage1X, legacy_end_of_message_position,
 };
+use saranga_core_protocol::transport::TransportConfiguration;
 use saranga_core_protocol::{
     Context, Direction, Flagged, HANDSHAKE, Packet, encode_frame, read_frame, types, version,
 };
@@ -48,6 +53,7 @@ const DEFAULT_CONNECTION_TTL: i64 = 60_000;
 /// `ChannelImpl.CHANNEL_ID`.
 const CHANNEL_PING: i64 = 0;
 const CHANNEL_SESSION: i64 = 1;
+const CHANNEL_CLUSTER: i64 = 3;
 
 enum Outgoing {
     Frame(Vec<u8>),
@@ -259,6 +265,8 @@ pub async fn serve_stream<S>(
         connect_received: false,
         pre_auth_topology_sent: false,
         post_auth_topology_sent: false,
+        topology_subscription: None,
+        cluster_authorized: false,
     };
     if let Err(e) = conn.read_loop(&mut rd).await {
         // RemotingConnectionImpl.killMessage.
@@ -272,6 +280,8 @@ pub async fn serve_stream<S>(
                     node_id: Some(conn.broker.node_id().into()),
                 },
             );
+        } else if matches!(e, ConnError::Failed) && conn.shared.client.is_disconnecting() {
+            conn.send_disconnect();
         }
         tracing::debug!(
             remote = conn.shared.client.remote_address(),
@@ -327,6 +337,10 @@ struct Connection {
     connect_received: bool,
     pre_auth_topology_sent: bool,
     post_auth_topology_sent: bool,
+    /// The cluster connection's topology, followed for the client.
+    topology_subscription: Option<crate::cluster::Subscription>,
+    /// The cluster user logged in on the cluster channel.
+    cluster_authorized: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -434,6 +448,7 @@ impl Connection {
         match channel_id {
             CHANNEL_PING => self.handle_channel0(packet),
             CHANNEL_SESSION => self.handle_channel1(packet).await,
+            CHANNEL_CLUSTER => self.handle_cluster(packet).await,
             _ => {
                 if let Packet::PacketsConfirmedMessage(_) = packet {
                     // We keep no resend cache, so there is nothing to clear.
@@ -464,12 +479,14 @@ impl Connection {
                 }
                 self.shared.send(CHANNEL_PING, ping);
             }
-            Packet::SubscribeClusterTopologyUpdatesMessage(_) => self.subscribe_topology()?,
+            Packet::SubscribeClusterTopologyUpdatesMessage(p) => {
+                self.subscribe_topology(p.cluster_connection)?
+            }
             Packet::SubscribeClusterTopologyUpdatesMessageV2(p) => {
                 self.shared
                     .version
                     .store(p.client_version, Ordering::SeqCst);
-                self.subscribe_topology()?;
+                self.subscribe_topology(p.cluster_connection)?;
             }
             other => tracing::debug!("ignoring {} on channel 0", other.name()),
         }
@@ -478,7 +495,7 @@ impl Connection {
 
     /// `LocalChannelHandler`: one topology subscription per connection;
     /// before login, only a placeholder topology.
-    fn subscribe_topology(&mut self) -> Result<(), ConnError> {
+    fn subscribe_topology(&mut self, cluster_connection: bool) -> Result<(), ConnError> {
         if self.topology_subscribed {
             tracing::warn!(
                 "AMQ224166: Multiple topology subscriptions to connection from {}. Closing connection.",
@@ -490,6 +507,12 @@ impl Connection {
         }
         self.topology_subscribed = true;
         if self.connection_security && !self.authenticated {
+            if cluster_connection {
+                tracing::warn!(
+                    "AMQ224165: Unauthenticated cluster topology subscription request. Update the remote broker to authenticate the cluster connection from {}.",
+                    self.shared.security_info().remote_address
+                );
+            }
             self.send_pre_auth_topology();
         } else {
             self.send_post_auth_topology();
@@ -528,9 +551,10 @@ impl Connection {
         self.send_topology(PRE_AUTH_NODE_ID.into(), update);
     }
 
-    /// `sendPostAuthTopology` for a broker without a cluster connection: a
-    /// single node with no connectors, so the client learns the node ID.
-    /// The placeholder goes first, if one was sent.
+    /// `sendPostAuthTopology`: the cluster connection's topology, now and
+    /// as it changes; without one, a single node with no connectors, so the
+    /// client learns the node ID. The placeholder goes first, if one was
+    /// sent.
     fn send_post_auth_topology(&mut self) {
         if self.post_auth_topology_sent {
             return;
@@ -555,6 +579,13 @@ impl Connection {
             };
             self.shared.send(CHANNEL_PING, packet);
         }
+        if let Some(cluster) = self.broker.cluster() {
+            let listener = Arc::new(ClientTopologyListener {
+                conn: self.shared.clone(),
+            });
+            self.topology_subscription = Some(crate::cluster::Subscription::new(cluster, listener));
+            return;
+        }
         let update = Some(TopologyUpdate {
             primary: Flagged(None),
             backup: Flagged(None),
@@ -562,6 +593,84 @@ impl Connection {
         });
         let node_id = JString::from(self.broker.node_id());
         self.send_topology(node_id, update);
+    }
+
+    /// `ClusterControllerChannelHandler`: the cluster user logs in with
+    /// `CLUSTER_CONNECT`, then brokers announce themselves.
+    async fn handle_cluster(&mut self, packet: Packet) -> Result<(), ConnError> {
+        if !self.cluster_authorized {
+            let Packet::ClusterConnectMessage(msg) = packet else {
+                return Ok(());
+            };
+            if self.broker.cluster().is_none() && self.broker.security().is_some() {
+                tracing::warn!(
+                    "AMQ222290: Failed to find cluster-connection when handling cluster-connect packet. Ignoring: {}",
+                    Packet::from(msg).name()
+                );
+                return Ok(());
+            }
+            let valid = self
+                .authenticate(
+                    Some(msg.cluster_user.to_string_lossy()),
+                    Some(msg.cluster_password.to_string_lossy()),
+                )
+                .await
+                .is_ok();
+            self.cluster_authorized = valid;
+            self.shared.send(
+                CHANNEL_CLUSTER,
+                ClusterConnectReplyMessage { authorized: valid },
+            );
+            return Ok(());
+        }
+        match packet {
+            Packet::NodeAnnounceMessage(msg) => {
+                let (primary, backup) = if msg.backup {
+                    (None, msg.connector.0)
+                } else {
+                    (msg.connector.0, msg.backup_connector.0)
+                };
+                match self.broker.cluster() {
+                    Some(cluster) => cluster.node_announced(
+                        msg.current_event_id,
+                        &msg.node_id.to_string_lossy(),
+                        msg.backup_group_name.map(|n| n.to_string_lossy()),
+                        msg.scale_down_group_name.map(|n| n.to_string_lossy()),
+                        primary,
+                        backup,
+                        msg.backup,
+                    ),
+                    None => tracing::debug!("node announcement without a cluster connection"),
+                }
+            }
+            other => tracing::debug!("ignoring {} on the cluster channel", other.name()),
+        }
+        Ok(())
+    }
+
+    /// `RemotingConnectionImpl.disconnect` as `freeze` calls it when the
+    /// broker stops: the newest form the client knows, naming this node.
+    fn send_disconnect(&self) {
+        let version = self.shared.version();
+        let node_id = Some(saranga_buffer::SimpleString::from(self.broker.node_id()));
+        let packet: Packet = if version >= version::ARTEMIS_2_18_0 {
+            DisconnectMessageV3 {
+                node_id,
+                reason: DISCONNECT_REASON_SCALE_DOWN,
+                target_node_id: None,
+                target_connector: Flagged(None),
+            }
+            .into()
+        } else if version >= 125 {
+            DisconnectMessageV2 {
+                node_id,
+                scale_down_node_id: None,
+            }
+            .into()
+        } else {
+            DisconnectMessage { node_id }.into()
+        };
+        self.shared.send(CHANNEL_PING, packet);
     }
 
     /// A topology change in the newest form the client understands.
@@ -805,6 +914,103 @@ impl Connection {
     }
 }
 
+/// `DisconnectReason.SCALE_DOWN`: what `freeze` gives as the reason, with
+/// no target, whenever the broker stops.
+const DISCONNECT_REASON_SCALE_DOWN: i8 = 2;
+
+/// `INITIAL_ACTIVEMQ_INCREMENTING_VERSION`: older clients are HornetQ's.
+const INITIAL_ACTIVEMQ_VERSION: i32 = 126;
+
+/// Tells a connection subscribed to topology updates of the cluster
+/// connection's members (`sendPostAuthTopology`'s listener).
+struct ClientTopologyListener {
+    conn: Arc<ConnShared>,
+}
+
+impl ClientTopologyListener {
+    /// `BackwardsCompatibilityUtils.checkTCPPairConversion`: HornetQ
+    /// clients are given HornetQ's factory class.
+    fn convert(&self, tc: &Option<TransportConfiguration>) -> Flagged<TransportConfiguration> {
+        let version = self.conn.version();
+        Flagged(tc.clone().map(|mut tc| {
+            if version < INITIAL_ACTIVEMQ_VERSION {
+                let name = tc
+                    .factory_class_name
+                    .to_string_lossy()
+                    .replace("org.apache.activemq.artemis", "org.hornetq")
+                    .replace("ActiveMQ", "HornetQ");
+                tc.factory_class_name = name.as_str().into();
+            }
+            tc
+        }))
+    }
+}
+
+impl crate::cluster::TopologyListener for ClientTopologyListener {
+    fn node_up(&self, m: &crate::cluster::Member, last: bool) {
+        let version = self.conn.version();
+        let node_id = JString::from(m.node_id.as_str());
+        let update = Some(TopologyUpdate {
+            primary: self.convert(&m.primary),
+            backup: self.convert(&m.backup),
+            last,
+        });
+        let backup_group_name = m.backup_group_name.as_deref().map(JString::from);
+        let scale_down_group_name = m.scale_down_group_name.as_deref().map(JString::from);
+        let packet: Packet = if version >= version::ARTEMIS_2_18_0 {
+            ClusterTopologyChangeMessageV4 {
+                node_id,
+                unique_event_id: m.unique_event_id,
+                update,
+                backup_group_name,
+                scale_down_group_name,
+                server_version: version::CURRENT,
+            }
+            .into()
+        } else if version >= 125 {
+            ClusterTopologyChangeMessageV3 {
+                node_id,
+                unique_event_id: m.unique_event_id,
+                update,
+                backup_group_name,
+                scale_down_group_name,
+            }
+            .into()
+        } else if version >= 122 {
+            ClusterTopologyChangeMessageV2 {
+                node_id,
+                unique_event_id: m.unique_event_id,
+                update,
+                backup_group_name: Some(backup_group_name),
+            }
+            .into()
+        } else {
+            ClusterTopologyChangeMessage { node_id, update }.into()
+        };
+        self.conn.send(CHANNEL_PING, packet);
+    }
+
+    fn node_down(&self, unique_event_id: i64, node_id: &str) {
+        let node_id = JString::from(node_id);
+        let packet: Packet = if self.conn.version() >= 122 {
+            ClusterTopologyChangeMessageV2 {
+                node_id,
+                unique_event_id,
+                update: None,
+                backup_group_name: Some(None),
+            }
+            .into()
+        } else {
+            ClusterTopologyChangeMessage {
+                node_id,
+                update: None,
+            }
+            .into()
+        };
+        self.conn.send(CHANNEL_PING, packet);
+    }
+}
+
 /// `DisconnectConsumerWithKillMessage.VERSION_INTRODUCED`.
 const DISCONNECT_CONSUMER_KILL_VERSION: i32 = 128;
 
@@ -812,8 +1018,7 @@ const DISCONNECT_CONSUMER_KILL_VERSION: i32 = 128;
 const PRE_AUTH_NODE_ID: &str = "00000000-0000-0000-0000-000000000000";
 /// `Topology.PRE_AUTH_CONNECTOR_NAME`.
 const PRE_AUTH_CONNECTOR_NAME: &str = "PRE_AUTH_CONNECTOR";
-const NETTY_CONNECTOR_FACTORY: &str =
-    "org.apache.activemq.artemis.core.remoting.impl.netty.NettyConnectorFactory";
+use crate::cluster::NETTY_CONNECTOR_FACTORY;
 
 /// `ConnectMessage.decodePlainAuthData`: RFC 4616 `authzid NUL authcid NUL
 /// passwd`.

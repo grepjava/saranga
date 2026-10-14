@@ -1939,6 +1939,7 @@ dependencies = [
  "libc",
  "regex",
  "saranga-buffer",
+ "saranga-client",
  "saranga-config",
  "saranga-core-protocol",
  "saranga-filter",

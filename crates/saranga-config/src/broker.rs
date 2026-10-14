@@ -231,6 +231,12 @@ pub enum Warning {
         name: String,
         alternative: &'static str,
     },
+    /// A cluster connection's `connector-ref` names no connector, so it is
+    /// left out (`AMQ222217`).
+    ConnectorRefNotFound {
+        connector: String,
+        cluster_connection: String,
+    },
 }
 
 impl fmt::Display for Warning {
@@ -264,6 +270,13 @@ impl fmt::Display for Warning {
             Self::Deprecated { name, alternative } => write!(
                 f,
                 "AMQ221038: Configuration option '{name}' is deprecated and will be removed in a future version. Use '{alternative}' instead. Consult the manual for details."
+            ),
+            Self::ConnectorRefNotFound {
+                connector,
+                cluster_connection,
+            } => write!(
+                f,
+                "AMQ222217: Cannot find connector-ref {connector}. The cluster-connection {cluster_connection} will not be deployed."
             ),
         }
     }
@@ -404,6 +417,99 @@ impl HaPolicy {
     }
 }
 
+/// `message-load-balancing` (`MessageLoadBalancingType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageLoadBalancing {
+    Off,
+    Strict,
+    OnDemand,
+    OffWithRedistribution,
+}
+
+impl std::str::FromStr for MessageLoadBalancing {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "OFF" => Ok(Self::Off),
+            "STRICT" => Ok(Self::Strict),
+            "ON_DEMAND" => Ok(Self::OnDemand),
+            "OFF_WITH_REDISTRIBUTION" => Ok(Self::OffWithRedistribution),
+            _ => Err(ConfigError::invalid(
+                "message-load-balancing",
+                s,
+                "must be OFF, STRICT, ON_DEMAND or OFF_WITH_REDISTRIBUTION",
+            )),
+        }
+    }
+}
+
+/// `<cluster-connection>` (`ClusterConnectionConfiguration`), with the
+/// `ActiveMQDefaultConfiguration` defaults.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterConnectionConfig {
+    pub name: String,
+    pub address: String,
+    /// `connector-ref`: the connector announced for this broker.
+    pub connector_name: String,
+    pub check_period: i64,
+    pub connection_ttl: i64,
+    pub min_large_message_size: i32,
+    pub call_timeout: i64,
+    pub call_failover_timeout: i64,
+    pub retry_interval: i64,
+    pub retry_interval_multiplier: f64,
+    pub max_retry_interval: i64,
+    pub initial_connect_attempts: i32,
+    pub reconnect_attempts: i32,
+    pub use_duplicate_detection: bool,
+    pub message_load_balancing: MessageLoadBalancing,
+    pub max_hops: i32,
+    pub confirmation_window_size: i32,
+    pub producer_window_size: i32,
+    pub notification_interval: i64,
+    pub notification_attempts: i32,
+    pub topology_scanner_attempts: i32,
+    /// `static-connectors`: connector names, in order.
+    pub static_connectors: Vec<String>,
+    pub allow_direct_connections_only: bool,
+    /// `discovery-group-ref`'s `discovery-group-name`.
+    pub discovery_group: Option<String>,
+    pub client_id: Option<String>,
+}
+
+impl ClusterConnectionConfig {
+    pub fn new(name: &str, connector_name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            address: String::new(),
+            connector_name: connector_name.to_owned(),
+            check_period: 30_000,
+            connection_ttl: 60_000,
+            min_large_message_size: 100 * 1024,
+            call_timeout: 30_000,
+            call_failover_timeout: -1,
+            retry_interval: 500,
+            retry_interval_multiplier: 1.0,
+            max_retry_interval: 2000,
+            initial_connect_attempts: -1,
+            reconnect_attempts: -1,
+            use_duplicate_detection: true,
+            message_load_balancing: MessageLoadBalancing::OnDemand,
+            max_hops: 1,
+            confirmation_window_size: 10 * 1024 * 1024,
+            producer_window_size: 1024 * 1024,
+            notification_interval: 1000,
+            notification_attempts: 2,
+            topology_scanner_attempts: 30,
+            static_connectors: Vec::new(),
+            allow_direct_connections_only: false,
+            discovery_group: None,
+            client_id: None,
+        }
+    }
+}
+
 /// The broker configuration read from `broker.xml`. Every field the file
 /// leaves out holds the Artemis default.
 #[derive(Debug, Clone, PartialEq)]
@@ -424,6 +530,11 @@ pub struct BrokerConfig {
     /// `literal-match-markers`, e.g. `()`.
     pub literal_match_markers: Option<(char, char)>,
     pub acceptors: Vec<AcceptorConfig>,
+    /// `<connectors>`: each named by its `name`.
+    pub connectors: Vec<AcceptorConfig>,
+    /// `<cluster-connections>`, in document order; the first is the
+    /// default one.
+    pub cluster_connections: Vec<ClusterConnectionConfig>,
     /// Match string and settings, in document order.
     pub address_settings: Vec<(String, AddressSettings)>,
     pub addresses: Vec<AddressConfig>,
@@ -651,6 +762,8 @@ impl Default for BrokerConfig {
             wildcard_addresses: WildcardConfiguration::default(),
             literal_match_markers: None,
             acceptors: Vec::new(),
+            connectors: Vec::new(),
+            cluster_connections: Vec::new(),
             address_settings: Vec::new(),
             addresses: Vec::new(),
             diverts: Vec::new(),

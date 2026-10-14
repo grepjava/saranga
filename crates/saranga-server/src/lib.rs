@@ -8,6 +8,7 @@
 
 pub mod acceptors;
 pub mod audit;
+pub mod cluster;
 pub mod config;
 pub mod core_protocol;
 pub mod critical;
@@ -248,6 +249,8 @@ pub struct BrokerConfig {
     pub critical: critical::CriticalConfig,
     /// The HA policy and the node manager's settings.
     pub ha: node::HaConfig,
+    /// The default cluster connection, if there is one.
+    pub cluster: Option<cluster::ClusterConfig>,
     /// Plugins (`<broker-plugins>`, or the embedding application's own).
     pub plugins: Vec<Arc<dyn plugin::BrokerPlugin>>,
     /// `max-disk-usage` or `min-disk-free` with `disk-scan-period`: producers
@@ -285,6 +288,7 @@ impl BrokerConfig {
             management: management::ManagementConfig::default(),
             critical: critical::CriticalConfig::default(),
             ha: node::HaConfig::default(),
+            cluster: None,
             plugins: Vec::new(),
             disk_monitor: None,
         }
@@ -438,6 +442,12 @@ pub struct Broker {
     failover_on_shutdown: bool,
     /// The lock monitor found the primary lock lost.
     lock_lost: std::sync::atomic::AtomicBool,
+    /// The default cluster connection, started with the broker.
+    cluster: Option<Arc<cluster::ClusterConnection>>,
+    /// A restarted primary asked this active backup to give way: it stops
+    /// as if it had failed, and waits as a backup again.
+    failing_back: std::sync::atomic::AtomicBool,
+    failback: tokio::sync::Notify,
     security: Option<Arc<saranga_security::SecurityStore>>,
     /// For the diverts a reload deploys.
     transformers: HashMap<String, postoffice::TransformerFactory>,
@@ -508,14 +518,30 @@ impl Broker {
                             .clone()
                             .unwrap_or_else(|| sc.messages.directory.clone());
                         let timeout = config.ha.lock_acquisition_timeout;
-                        tokio::task::spawn_blocking(move || {
-                            let n = node::NodeManager::open(&dir, timeout)?;
-                            n.start_primary()?;
-                            std::io::Result::Ok(Arc::new(n))
+                        let n = tokio::task::spawn_blocking(move || {
+                            node::NodeManager::open(&dir, timeout).map(Arc::new)
                         })
                         .await
                         .map_err(|e| internal("journal directory lock", &e))?
-                        .map_err(|e| internal("journal directory lock", &e))?
+                        .map_err(|e| internal("journal directory lock", &e))?;
+                        // SharedStorePrimaryActivation: a backup is active
+                        // on the data, so this primary announces itself as
+                        // its backup, which asks it to fail back.
+                        let announcer = match &config.cluster {
+                            Some(cc) if n.is_backup_active().unwrap_or(false) => {
+                                Some(cluster::BackupAnnouncer::start(cc.clone(), n.node_id()))
+                            }
+                            _ => None,
+                        };
+                        let n2 = n.clone();
+                        let locked = tokio::task::spawn_blocking(move || n2.start_primary())
+                            .await
+                            .map_err(|e| internal("journal directory lock", &e));
+                        if let Some(a) = announcer {
+                            a.close().await;
+                        }
+                        locked?.map_err(|e| internal("journal directory lock", &e))?;
+                        n
                     }
                 };
                 let storage = Arc::new(
@@ -658,11 +684,12 @@ impl Broker {
         }
         let node_id = match &node_manager {
             Some(n) => n.node_id(),
-            None => uuid::Uuid::new_v4().to_string(),
+            // `InVMNodeManager`: a time-based ID.
+            None => saranga_storage::java::uuid(&saranga_client::uuid::time_based()),
         };
         let registry = Arc::new(registry::Registry::new(post_office.plugins().clone()));
         let broker = Arc::new(Self {
-            node_id,
+            node_id: node_id.clone(),
             post_office,
             connection_ttl_override: config.connection_ttl_override,
             next_consumer_id: AtomicU64::new(1),
@@ -673,6 +700,12 @@ impl Broker {
             node_manager: node_manager.clone(),
             failover_on_shutdown: config.ha.failover_on_shutdown(),
             lock_lost: std::sync::atomic::AtomicBool::new(false),
+            cluster: config
+                .cluster
+                .clone()
+                .map(|c| cluster::ClusterConnection::new(c, &node_id)),
+            failing_back: std::sync::atomic::AtomicBool::new(false),
+            failback: tokio::sync::Notify::new(),
             security: config.security.clone(),
             transformers: config.transformers,
             populate_validated_user: config.populate_validated_user,
@@ -759,7 +792,73 @@ impl Broker {
                 .map_err(|e| internal("server.lock", &e))?;
             spawn_lock_monitor(&broker, n.clone(), &config.ha);
         }
+        if let Some(c) = &broker.cluster {
+            c.activate();
+        }
         Ok(broker)
+    }
+
+    /// The default cluster connection.
+    pub fn cluster(&self) -> Option<&Arc<cluster::ClusterConnection>> {
+        self.cluster.as_ref()
+    }
+
+    /// `SharedStoreBackupActivation.FailbackChecker`: every second, an
+    /// active backup checks whether its primary has restarted (`server.lock`
+    /// says failing back) and announced itself as this node's backup; then
+    /// it asks to be stopped and restarted as a backup
+    /// ([`Broker::failback_requested`]). Without a cluster connection the
+    /// primary cannot be heard, as Artemis warns (AMQ222308).
+    pub fn start_failback_checker(self: &Arc<Self>) {
+        let Some(n) = self.node_manager.clone() else {
+            return;
+        };
+        let Some(cluster) = self.cluster.clone() else {
+            tracing::warn!(
+                "AMQ222308: Unable to listen for incoming fail-back request because cluster connection is null. Ensure the broker has the proper cluster-connection configuration."
+            );
+            return;
+        };
+        let listener = cluster::FailbackListener::new(&self.node_id, cluster.connector().clone());
+        let subscription = cluster::Subscription::new(&cluster, listener.clone());
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let _subscription = subscription;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                match weak.upgrade() {
+                    Some(b) if !b.is_stopped() => {}
+                    _ => return,
+                }
+                let n2 = n.clone();
+                let awaiting = tokio::task::spawn_blocking(move || n2.is_awaiting_failback())
+                    .await
+                    .ok()
+                    .and_then(std::result::Result::ok)
+                    .unwrap_or(false);
+                // `BackupTopologyListener.waitForBackup`: up to a minute.
+                if !awaiting || !listener.wait(std::time::Duration::from_secs(60)).await {
+                    continue;
+                }
+                let Some(b) = weak.upgrade() else { return };
+                if b.is_stopped() {
+                    return;
+                }
+                tracing::info!(
+                    "AMQ221008: primary server wants to restart, restarting server in backup"
+                );
+                b.failing_back
+                    .store(true, std::sync::atomic::Ordering::Release);
+                b.failback.notify_one();
+                return;
+            }
+        });
+    }
+
+    /// Waits for the failback checker to ask for this broker to stop and
+    /// wait as a backup again.
+    pub async fn failback_requested(&self) {
+        self.failback.notified().await;
     }
 
     /// Whether [`Broker::stop`] has run.
@@ -800,6 +899,9 @@ impl Broker {
                 p.unregistered(self);
             }
         }
+        if let Some(c) = &self.cluster {
+            c.stop();
+        }
         self.large_messages.stop();
         self.post_office.paging().stop();
         if let Some(s) = &self.storage {
@@ -813,6 +915,7 @@ impl Broker {
         {
             if self.failover_on_shutdown
                 || self.lock_lost.load(std::sync::atomic::Ordering::Acquire)
+                || self.failing_back.load(std::sync::atomic::Ordering::Acquire)
             {
                 n.crash_primary();
             } else {

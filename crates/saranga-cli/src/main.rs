@@ -927,6 +927,8 @@ struct Started {
     reload_period: std::time::Duration,
     /// A shared-store backup that took over from its primary.
     backup: bool,
+    /// Where `server.lock` is, with persistence.
+    lock_dir: Option<PathBuf>,
 }
 
 /// `ActiveMQServerImpl.internalStart` as `run` does it: the configuration
@@ -936,6 +938,7 @@ async fn boot(
     bind: Option<SocketAddr>,
 ) -> anyhow::Result<Started> {
     let at = std::time::Instant::now();
+    *BOOT_STARTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(at);
     let filters = Arc::new(SelectorFilters);
     let served = SERVED_PROTOCOLS;
     let mut file_config = None;
@@ -943,12 +946,13 @@ async fn boot(
         Some(instance) => {
             let file = instance.broker_config()?;
             tracing::info!(
-                "AMQ221000: {} message broker is starting with configuration Broker Configuration (clustered=false,journalDirectory={},bindingsDirectory={},largeMessagesDirectory={},pagingDirectory={})",
+                "AMQ221000: {} message broker is starting with configuration Broker Configuration (clustered={},journalDirectory={},bindingsDirectory={},largeMessagesDirectory={},pagingDirectory={})",
                 if file.ha_policy.is_backup() {
                     "Backup"
                 } else {
                     "Primary"
                 },
+                !file.cluster_connections.is_empty(),
                 file.journal_directory,
                 file.bindings_directory,
                 file.large_messages_directory,
@@ -1005,15 +1009,22 @@ async fn boot(
             p.name()
         );
     }
-    let backup = match (&broker_config.storage, &file_config) {
-        (Some(storage), Some(file)) if file.ha_policy.is_backup() => {
-            let dir = broker_config
-                .ha
-                .lock_directory
-                .clone()
-                .unwrap_or_else(|| storage.messages.directory.clone());
-            Some(await_primary(dir, broker_config.ha.lock_acquisition_timeout).await?)
-        }
+    let lock_dir = broker_config.storage.as_ref().map(|storage| {
+        broker_config
+            .ha
+            .lock_directory
+            .clone()
+            .unwrap_or_else(|| storage.messages.directory.clone())
+    });
+    let backup = match (&lock_dir, &file_config) {
+        (Some(dir), Some(file)) if file.ha_policy.is_backup() => Some(
+            await_primary(
+                dir.clone(),
+                broker_config.ha.lock_acquisition_timeout,
+                broker_config.cluster.clone(),
+            )
+            .await?,
+        ),
         _ => None,
     };
     let broker = Broker::start_activated(broker_config, backup.clone()).await?;
@@ -1045,28 +1056,51 @@ async fn boot(
         file: file_config,
         reload_period,
         backup: backup.is_some(),
+        lock_dir,
     })
 }
 
 /// `SharedStoreBackupActivation.run` up to the activation: the backup lock,
-/// then the primary's, once the primary has failed.
+/// then the primary's, once the primary has failed. Meanwhile the backup
+/// announces itself through the cluster connection, if there is one
+/// (`BackupManager`), so the primary's clients know where to fail over.
 async fn await_primary(
     dir: PathBuf,
     timeout: Option<std::time::Duration>,
+    cluster: Option<saranga_server::cluster::ClusterConfig>,
 ) -> anyhow::Result<Arc<NodeManager>> {
     let n = tokio::task::spawn_blocking(move || {
         let n = NodeManager::open(&dir, timeout)?;
         n.start_backup()?;
-        tracing::info!(
-            "AMQ221109: Saranga Backup Server version {VERSION} [{}] started; waiting for primary to fail before activating",
-            n.node_id()
-        );
-        n.await_primary()?;
-        std::io::Result::Ok(n)
+        std::io::Result::Ok(Arc::new(n))
     })
     .await?
     .context("the backup's wait for its primary")?;
-    Ok(Arc::new(n))
+    let announcer =
+        cluster.map(|c| saranga_server::cluster::BackupAnnouncer::start(c, n.node_id()));
+    tracing::info!(
+        "AMQ221109: Saranga Backup Server version {VERSION} [{}] started; waiting for primary to fail before activating",
+        n.node_id()
+    );
+    let n2 = n.clone();
+    let waited = tokio::task::spawn_blocking(move || n2.await_primary()).await;
+    // `BackupManager.activated`: the connectors are no longer needed.
+    if let Some(a) = announcer {
+        a.close().await;
+    }
+    waited?.context("the backup's wait for its primary")?;
+    Ok(n)
+}
+
+/// After failing back: the primary is waited for to be active
+/// (`awaitActiveStatus`) before this broker waits as its backup again.
+async fn await_active_primary(dir: PathBuf) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let n = NodeManager::open(&dir, None)?;
+        n.await_active_status()
+    })
+    .await?
+    .context("waiting for the primary to become active")
 }
 
 /// The broker is active.
@@ -1074,16 +1108,12 @@ fn announce(instance: Option<&Arc<instance::Instance>>, started: &Started) {
     let broker = &started.broker;
     if started.backup {
         tracing::info!("AMQ221010: Backup Server is now active");
-        // FailbackChecker: a primary asking for failback is heard through
-        // the cluster connection, which Saranga does not have yet.
         if let Some(saranga_config::HaPolicy::SharedStoreBackup {
             allow_failback: true,
             ..
         }) = started.file.as_ref().map(|f| f.ha_policy)
         {
-            tracing::warn!(
-                "AMQ222308: Unable to listen for incoming fail-back request because cluster connection is null. Ensure the broker has the proper cluster-connection configuration."
-            );
+            broker.start_failback_checker();
         }
     } else {
         tracing::info!("AMQ221007: Server is now active");
@@ -1181,19 +1211,20 @@ async fn run(
     let started = tokio::select! {
         s = boot(instance.as_deref(), bind) => s?,
         _ = tokio::signal::ctrl_c() => {
-            saranga_server::node::interrupt_waits();
+            stopped_waiting();
             return Ok(());
         }
         _ = terminated() => {
-            saranga_server::node::interrupt_waits();
+            stopped_waiting();
             return Ok(());
         }
         s = &mut stop_files => {
-            saranga_server::node::interrupt_waits();
             if matches!(s, Stop::Halt) {
+                saranga_server::node::interrupt_waits();
                 eprintln!("Halting by user request");
                 std::process::exit(0);
             }
+            stopped_waiting();
             return Ok(());
         }
     };
@@ -1232,13 +1263,65 @@ async fn run(
                 std::future::pending::<()>().await;
             }
         };
-        tokio::select! {
+        let failback = tokio::select! {
             _ = tokio::signal::ctrl_c() => break Stop::Clean,
             _ = terminated() => break Stop::Clean,
             // The critical analyzer's SHUTDOWN policy.
             _ = broker.shutdown_requested(), if is_running => break Stop::Clean,
             s = &mut stop_files => break s,
-            _ = network_changed => {}
+            _ = network_changed => false,
+            _ = broker.failback_requested(), if is_running => true,
+        };
+        if failback {
+            // The FailbackChecker's restart: stopped as if failed, so the
+            // primary takes the lock; once it is active, a backup again.
+            let Some(s) = running.take() else { continue };
+            stop_broker(&s.broker, s.file.as_ref()).await?;
+            stopped(&s);
+            let restart = matches!(
+                s.file.as_ref().map(|f| f.ha_policy),
+                Some(saranga_config::HaPolicy::SharedStoreBackup {
+                    restart_backup: true,
+                    ..
+                })
+            );
+            let Some(dir) = s.lock_dir.clone() else {
+                continue;
+            };
+            let rebooted = tokio::select! {
+                r = async {
+                    await_active_primary(dir).await?;
+                    if !restart {
+                        return Ok(None);
+                    }
+                    boot(instance.as_deref(), bind).await.map(Some)
+                } => r?,
+                _ = tokio::signal::ctrl_c() => {
+                    stopped_waiting();
+                    break Stop::Clean;
+                }
+                _ = terminated() => {
+                    stopped_waiting();
+                    break Stop::Clean;
+                }
+                s = &mut stop_files => {
+                    if matches!(s, Stop::Halt) {
+                        saranga_server::node::interrupt_waits();
+                    } else {
+                        stopped_waiting();
+                    }
+                    break s;
+                }
+            };
+            match rebooted {
+                Some(s) => {
+                    current.set(s.broker.clone());
+                    announce(instance.as_ref(), &s);
+                    running = Some(s);
+                }
+                None => break Stop::Clean,
+            }
+            continue;
         }
         match running.take() {
             Some(s) => {
@@ -1290,6 +1373,24 @@ async fn run(
     Ok(())
 }
 
+/// When the latest start began (`ActiveMQServerImpl.startDate`).
+static BOOT_STARTED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// AMQ221002 for a broker stopped while it waits for a lock: Artemis's
+/// server has started, its activation waiting, so it reports stopping too.
+fn stopped_waiting() {
+    saranga_server::node::interrupt_waits();
+    let at = *BOOT_STARTED.lock().unwrap_or_else(|e| e.into_inner());
+    tracing::info!(
+        "AMQ221002: Saranga Message Broker version {VERSION} [{}] stopped, uptime {}",
+        saranga_server::node::last_node_id().unwrap_or_else(|| "null".to_owned()),
+        at.map_or_else(
+            || "not started".to_owned(),
+            |at| saranga_server::management::print_duration(at.elapsed().as_millis() as i64)
+        )
+    );
+}
+
 /// AMQ221002, with the uptime of this start.
 fn stopped(s: &Started) {
     tracing::info!(
@@ -1303,8 +1404,9 @@ fn stopped(s: &Started) {
 /// rest of the broker stops.
 async fn close_connections(broker: &saranga_server::Broker) {
     broker.close_unestablished();
+    // `freeze`: Core clients are told the node is going.
     for c in broker.registry().connections() {
-        c.fail();
+        c.disconnect();
     }
     let closed = async {
         while !broker.registry().all_closed() {

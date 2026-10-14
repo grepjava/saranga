@@ -91,6 +91,23 @@ pub fn interrupt_waits() {
     WAITS_INTERRUPTED.store(true, Ordering::Release);
 }
 
+static LAST_NODE_ID: Mutex<Option<String>> = Mutex::new(None);
+
+/// The node ID the process's node manager last read, which a broker
+/// stopped while it waits for a lock reports (`ActiveMQServerImpl.stop`'s
+/// `tempNodeID`).
+pub fn last_node_id() -> Option<String> {
+    LAST_NODE_ID
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn set_node_id(slot: &Mutex<String>, id: String) {
+    *LAST_NODE_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = id;
+}
+
 /// The HA policy and the node manager's settings (`ha-policy`,
 /// `node-manager-lock-directory`, `journal-lock-*`).
 #[derive(Debug, Clone)]
@@ -184,7 +201,8 @@ impl NodeManager {
         }
         let mut id = [0u8; 16];
         if read_at(server_lock.file(), &mut id, 3)? != 16 {
-            id = *uuid::Uuid::new_v4().as_bytes();
+            // `UUIDGenerator.generateUUID`: time-based, as Artemis makes it.
+            id = saranga_client::uuid::time_based();
             write_at(server_lock.file(), &id, 3)?;
             server_lock.file().sync_all()?;
         }
@@ -193,10 +211,14 @@ impl NodeManager {
             LockFile::open(&dir.join("serverlock.1"))?,
             LockFile::open(&dir.join("serverlock.2"))?,
         ];
+        let node_id = Mutex::new(String::new());
+        // `new UUID(TYPE_TIME_BASED, bytes)`: the version and variant bits
+        // are forced, so a Java broker on this directory reads the same ID.
+        set_node_id(&node_id, saranga_storage::java::uuid(&id));
         Ok(Self {
             server_lock_path,
             channels,
-            node_id: Mutex::new(uuid::Uuid::from_bytes(id).to_string()),
+            node_id,
             timeout,
             interrupted: AtomicBool::new(false),
             primary_lock: Mutex::new(None),
@@ -219,8 +241,7 @@ impl NodeManager {
         if read_at(self.channels[STATE_LOCK_POS].file(), &mut id, 3)? != 16 {
             return Err(io::Error::other("primary server did not write id to file"));
         }
-        *self.node_id.lock().unwrap_or_else(|e| e.into_inner()) =
-            uuid::Uuid::from_bytes(id).to_string();
+        set_node_id(&self.node_id, saranga_storage::java::uuid(&id));
         Ok(())
     }
 

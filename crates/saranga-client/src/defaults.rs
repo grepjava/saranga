@@ -37,3 +37,20 @@ pub const MAX_QUEUE_CONSUMERS: i32 = -1;
 pub const PURGE_ON_NO_CONSUMERS: bool = false;
 /// `ActiveMQDefaultConfiguration.getDefaultConsumerPriority()`.
 pub const CONSUMER_PRIORITY: i32 = 0;
+/// `DEFAULT_CALL_FAILOVER_TIMEOUT` (30 s): how long a call waits for a
+/// failover in progress.
+pub const CALL_FAILOVER_TIMEOUT: Duration = Duration::from_millis(30_000);
+/// `DEFAULT_HA`.
+pub const HA: bool = false;
+/// `DEFAULT_RECONNECT_ATTEMPTS`: no reconnection.
+pub const RECONNECT_ATTEMPTS: i32 = 0;
+/// `DEFAULT_FAILOVER_ATTEMPTS`.
+pub const FAILOVER_ATTEMPTS: i32 = 0;
+/// `DEFAULT_INITIAL_CONNECT_ATTEMPTS`.
+pub const INITIAL_CONNECT_ATTEMPTS: i32 = 1;
+/// `DEFAULT_RETRY_INTERVAL` (2 s).
+pub const RETRY_INTERVAL: Duration = Duration::from_millis(2_000);
+/// `DEFAULT_RETRY_INTERVAL_MULTIPLIER`.
+pub const RETRY_INTERVAL_MULTIPLIER: f64 = 1.0;
+/// `DEFAULT_MAX_RETRY_INTERVAL` (2 s).
+pub const MAX_RETRY_INTERVAL: Duration = Duration::from_millis(2_000);

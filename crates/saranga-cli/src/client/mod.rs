@@ -11,7 +11,7 @@ use std::io::BufRead;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
-use saranga_client::{Connection, ConnectionOptions};
+use saranga_client::{Connection, ConnectionOptions, Connector};
 
 pub mod address;
 pub mod check;
@@ -450,71 +450,156 @@ pub fn instance_url(name: Option<&str>) -> String {
     }
 }
 
-/// The host and port of a connection URL: `tcp://host:port?params`, the
-/// first of `(tcp://a:1,tcp://b:2)?ha=true`, and `amqp://` taken as
-/// `tcp://`.
-pub fn parse_url(url: &str) -> anyhow::Result<(String, u16)> {
-    let first = url
-        .trim()
-        .trim_start_matches('(')
-        .split([',', ')'])
-        .next()
-        .unwrap_or_default();
-    let (scheme, rest) = first
-        .split_once("://")
-        .with_context(|| format!("invalid URL {url}"))?;
-    if !matches!(scheme, "tcp" | "amqp") {
-        bail!("schema {scheme} not found");
+/// A URL's servers (host and port) and its `ServerLocator` parameters.
+type ParsedUrl = (Vec<(String, u16)>, Vec<(String, String)>);
+
+/// Every server of a connection URL, `tcp://host:port?params` or
+/// `(tcp://a:1,tcp://b:2)?params`, `amqp://` taken as `tcp://`, with the
+/// parameters for the `ServerLocator`: those after the list, or the single
+/// server's.
+pub fn parse_url_list(url: &str) -> anyhow::Result<ParsedUrl> {
+    let url = url.trim();
+    let (list, locator_query) = match url.strip_prefix('(') {
+        Some(rest) => {
+            let (list, after) = rest
+                .split_once(')')
+                .with_context(|| format!("invalid URL {url}"))?;
+            (list, after.strip_prefix('?').unwrap_or(""))
+        }
+        None => (url, url.split_once('?').map_or("", |(_, q)| q)),
+    };
+    let mut servers = Vec::new();
+    for item in list.split(',') {
+        let (scheme, rest) = item
+            .split_once("://")
+            .with_context(|| format!("invalid URL {url}"))?;
+        if !matches!(scheme, "tcp" | "amqp") {
+            bail!("schema {scheme} not found");
+        }
+        let (authority, query) = rest.split_once('?').unwrap_or((rest, ""));
+        for (k, v) in params(query).chain(params(locator_query)) {
+            if k == "sslEnabled" && v.eq_ignore_ascii_case("true") {
+                bail!("saranga's CLI does not support TLS connections (sslEnabled) yet");
+            }
+        }
+        let authority = authority.trim_end_matches('/');
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((h, p)) if !h.ends_with(']') || authority.starts_with('[') => (
+                h.to_owned(),
+                p.parse()
+                    .with_context(|| format!("invalid port in {url}"))?,
+            ),
+            _ => (authority.to_owned(), 61616),
+        };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        servers.push((
+            if host.is_empty() {
+                "localhost".to_owned()
+            } else {
+                host.to_owned()
+            },
+            port,
+        ));
     }
-    let (authority, query) = rest.split_once('?').unwrap_or((rest, ""));
-    let full_query = url.rsplit_once('?').map(|(_, q)| q).unwrap_or(query);
-    for param in full_query.split(['&', ';']) {
-        let (k, v) = param.split_once('=').unwrap_or((param, ""));
-        if k == "sslEnabled" && v.eq_ignore_ascii_case("true") {
-            bail!("saranga's CLI does not support TLS connections (sslEnabled) yet");
+    let locator = params(locator_query)
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+    Ok((servers, locator))
+}
+
+fn params(query: &str) -> impl Iterator<Item = (&str, &str)> {
+    query
+        .split(['&', ';'])
+        .filter(|p| !p.is_empty())
+        .map(|p| p.split_once('=').unwrap_or((p, "")))
+}
+
+/// The `ServerLocator` settings of a URL's parameters, as
+/// `BeanSupport.setData` sets them: `ha`, `reconnectAttempts`,
+/// `failoverAttempts`, `initialConnectAttempts`, `retryInterval`,
+/// `retryIntervalMultiplier`, `maxRetryInterval`, `callTimeout`,
+/// `callFailoverTimeout`, `clientFailureCheckPeriod` and `connectionTTL`.
+/// Others are ignored.
+pub fn locator_options(params: &[(String, String)], options: &mut ConnectionOptions) {
+    use std::time::Duration;
+    let millis = |v: &str| v.parse::<i64>().ok();
+    let optional = |v: &str| millis(v).map(|m| (m >= 0).then(|| Duration::from_millis(m as u64)));
+    for (k, v) in params {
+        match k.as_str() {
+            "ha" => options.ha = v.eq_ignore_ascii_case("true"),
+            "reconnectAttempts" => options.reconnect_attempts = v.parse().unwrap_or(0),
+            "failoverAttempts" => options.failover_attempts = v.parse().unwrap_or(0),
+            "initialConnectAttempts" => options.initial_connect_attempts = v.parse().unwrap_or(1),
+            "retryInterval" => {
+                if let Some(m) = millis(v) {
+                    options.retry_interval = Duration::from_millis(m.max(0) as u64);
+                }
+            }
+            "retryIntervalMultiplier" => {
+                if let Ok(m) = v.parse() {
+                    options.retry_interval_multiplier = m;
+                }
+            }
+            "maxRetryInterval" => {
+                if let Some(m) = millis(v) {
+                    options.max_retry_interval = Duration::from_millis(m.max(0) as u64);
+                }
+            }
+            "callTimeout" => {
+                if let Some(m) = millis(v) {
+                    options.call_timeout = Duration::from_millis(m.max(0) as u64);
+                }
+            }
+            "callFailoverTimeout" => {
+                if let Some(t) = optional(v) {
+                    options.call_failover_timeout = t;
+                }
+            }
+            "clientFailureCheckPeriod" => {
+                if let Some(t) = optional(v) {
+                    options.client_failure_check_period = t;
+                }
+            }
+            "connectionTTL" => {
+                if let Some(t) = optional(v) {
+                    options.connection_ttl = t;
+                }
+            }
+            _ => {}
         }
     }
-    let authority = authority.trim_end_matches('/');
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !h.ends_with(']') || authority.starts_with('[') => (
-            h.to_owned(),
-            p.parse()
-                .with_context(|| format!("invalid port in {url}"))?,
-        ),
-        _ => (authority.to_owned(), 61616),
-    };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    Ok((
-        if host.is_empty() {
-            "localhost".to_owned()
-        } else {
-            host.to_owned()
-        },
-        port,
-    ))
 }
 
 /// Opens a Core connection to a URL, authenticated as `user` if given
-/// (`createSessionFactory(user, password)`).
+/// (`createSessionFactory(user, password)`): to the first of its servers
+/// that answers, reconnecting and failing over as its parameters say.
 pub async fn open(
     url: &str,
     user: Option<&str>,
     password: Option<&str>,
 ) -> anyhow::Result<Connection> {
-    let (host, port) = parse_url(url)?;
-    let options = ConnectionOptions {
+    let (servers, params) = parse_url_list(url)?;
+    let mut options = ConnectionOptions {
         user: user.map(str::to_owned),
         password: password.map(str::to_owned),
         ..ConnectionOptions::default()
     };
-    Connection::connect((host.as_str(), port), options)
+    locator_options(&params, &mut options);
+    let connectors = servers
+        .into_iter()
+        .map(|(host, port)| Connector::new(host, port))
+        .collect();
+    Connection::connect_to(connectors, options)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create session factory; nested exception is {e}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_url;
+    /// The first server of a URL.
+    fn parse_url(url: &str) -> anyhow::Result<(String, u16)> {
+        Ok(super::parse_url_list(url)?.0.remove(0))
+    }
 
     #[test]
     fn urls() {
@@ -531,5 +616,29 @@ mod tests {
         assert_eq!(parse_url("tcp://[::1]:7").unwrap(), ("::1".into(), 7));
         assert!(parse_url("tcp://h:1?sslEnabled=true").is_err());
         assert!(parse_url("vm://0").is_err());
+        assert!(parse_url("(tcp://a:1,tcp://b:2)?sslEnabled=true").is_err());
+    }
+
+    #[test]
+    fn url_lists_and_locator_parameters() {
+        let (servers, params) =
+            super::parse_url_list("(tcp://a:1,tcp://b:2?x=y)?ha=true&reconnectAttempts=-1")
+                .unwrap();
+        assert_eq!(servers, [("a".into(), 1), ("b".into(), 2)]);
+        let mut options = saranga_client::ConnectionOptions::default();
+        super::locator_options(&params, &mut options);
+        assert!(options.ha);
+        assert_eq!(options.reconnect_attempts, -1);
+
+        let (servers, params) =
+            super::parse_url_list("tcp://h:1?retryInterval=500&callFailoverTimeout=-1").unwrap();
+        assert_eq!(servers, [("h".into(), 1)]);
+        let mut options = saranga_client::ConnectionOptions::default();
+        super::locator_options(&params, &mut options);
+        assert_eq!(
+            options.retry_interval,
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(options.call_failover_timeout, None);
     }
 }

@@ -105,6 +105,8 @@ struct ConsumerState {
     /// The large message whose chunks are arriving
     /// (`currentLargeMessageController`).
     current_large: Option<Arc<LargeMessageController>>,
+    /// `failedOver`: the session failed over while `receive` waited.
+    failed_over: bool,
 }
 
 impl ConsumerState {
@@ -123,6 +125,7 @@ pub(crate) struct ConsumerShared {
     queue_name: SimpleString,
     filter: Option<SimpleString>,
     browse_only: bool,
+    priority: i32,
     initial_window: i32,
     client_window_size: i32,
     ack_batch_size: i32,
@@ -138,6 +141,7 @@ impl ConsumerShared {
         queue_name: SimpleString,
         filter: Option<SimpleString>,
         browse_only: bool,
+        priority: i32,
         initial_window: i32,
         client_window_size: i32,
         ack_batch_size: i32,
@@ -148,6 +152,7 @@ impl ConsumerShared {
             queue_name,
             filter,
             browse_only,
+            priority,
             initial_window,
             client_window_size,
             ack_batch_size,
@@ -164,6 +169,7 @@ impl ConsumerShared {
                 ack_individually: false,
                 force_delivery_count: 0,
                 current_large: None,
+                failed_over: false,
             }),
             notify: Notify::new(),
         }
@@ -288,7 +294,7 @@ impl ConsumerShared {
             self.flow_control(&mut self.state(), session, credits, discount);
         }
         d.message.body = controller
-            .wait_completion(session.conn.call_timeout)
+            .wait_completion(session.conn().call_timeout)
             .await?;
         if is_compressed(&d.message) {
             inflate_body(&mut d.message);
@@ -379,7 +385,7 @@ impl ConsumerShared {
         if self.client_window_size == 0 {
             self.start_slow_consumer(session);
         }
-        let deadline = timeout.map(|t| Instant::now() + t);
+        let mut deadline = timeout.map(|t| Instant::now() + t);
         let mut delivery_forced = false;
         loop {
             let mut call_force_delivery = false;
@@ -433,10 +439,23 @@ impl ConsumerShared {
                 continue;
             }
 
+            {
+                let mut st = self.state();
+                if std::mem::take(&mut st.failed_over) && m.is_none() && !st.closed {
+                    // Failed over with nothing received: wait again, the
+                    // whole timeout.
+                    drop(st);
+                    delivery_forced = false;
+                    deadline = timeout.map(|t| Instant::now() + t);
+                    continue;
+                }
+            }
+
             let Some(mut m) = m else {
                 self.reset_if_slow_consumer(session);
                 return Ok(None);
             };
+            session.work_done();
 
             if let Some(seq) = m.forced_delivery_seq {
                 // Only the answer to this call's forced delivery means "empty".
@@ -580,6 +599,59 @@ impl ConsumerShared {
             )
             .await;
         session.remove_consumer(self.id);
+    }
+
+    /// `ClientConsumerImpl.clearAtFailover`: the buffer and the state of
+    /// acks and credits are dropped, and the consumer stays stopped until
+    /// the session starts it on the new connection.
+    pub(crate) fn clear_at_failover(&self) {
+        {
+            let mut st = self.state();
+            for q in st.buffer.iter_mut() {
+                q.clear();
+            }
+            st.stopped = true;
+            if let Some(controller) = st.current_large.take() {
+                controller.cancel();
+            }
+            st.last_acked = None;
+            st.credits_to_send = 0;
+            st.failed_over = true;
+            st.ack_individually = false;
+        }
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.state().closed
+    }
+
+    pub(crate) fn queue_name(&self) -> &SimpleString {
+        &self.queue_name
+    }
+
+    pub(crate) fn filter(&self) -> Option<&SimpleString> {
+        self.filter.as_ref()
+    }
+
+    pub(crate) fn is_browse_only(&self) -> bool {
+        self.browse_only
+    }
+
+    pub(crate) fn priority(&self) -> i32 {
+        self.priority
+    }
+
+    pub(crate) fn client_window_size(&self) -> i32 {
+        self.client_window_size
+    }
+
+    pub(crate) fn queue_info(&self) -> &QueueQuery {
+        &self.queue_info
+    }
+
+    pub(crate) fn force_delivery_count(&self) -> i64 {
+        self.state().force_delivery_count
     }
 
     pub(crate) fn fail(&self, err: &Error) {

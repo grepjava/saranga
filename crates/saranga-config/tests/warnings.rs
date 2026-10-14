@@ -31,7 +31,7 @@ fn features_not_acted_on_are_reported() {
     let c = parse(
         r##"<configuration><core>
               <security-settings><security-setting match="#"><permission type="send" roles="amq"/></security-setting></security-settings>
-              <cluster-connections/>
+              <discovery-groups/>
               <critical-analyzer>true</critical-analyzer>
               <ha-policy><replication><primary/></replication></ha-policy>
            </core></configuration>"##,
@@ -45,7 +45,7 @@ fn features_not_acted_on_are_reported() {
         })
         .collect();
     // The critical analyzer only watches the broker; nothing to report.
-    assert_eq!(names, ["cluster-connections", "ha-policy"]);
+    assert_eq!(names, ["discovery-groups", "ha-policy"]);
 }
 
 #[test]
@@ -111,6 +111,55 @@ fn shared_store_policies() {
     assert_eq!(
         parse("<configuration><core/></configuration>").ha_policy,
         HaPolicy::PrimaryOnly
+    );
+}
+
+#[test]
+fn cluster_connections() {
+    let c = parse(
+        r##"<configuration><core>
+              <connectors>
+                 <connector name="artemis">tcp://localhost:61616</connector>
+                 <connector name="node0">tcp://other:61716?sslEnabled=false</connector>
+              </connectors>
+              <cluster-connections>
+                 <cluster-connection name="my-cluster">
+                    <connector-ref>artemis</connector-ref>
+                    <retry-interval>1000</retry-interval>
+                    <message-load-balancing>OFF</message-load-balancing>
+                    <max-hops>0</max-hops>
+                    <static-connectors allow-direct-connections-only="true">
+                       <connector-ref>node0</connector-ref>
+                    </static-connectors>
+                 </cluster-connection>
+                 <cluster-connection name="lost"><connector-ref>nowhere</connector-ref></cluster-connection>
+              </cluster-connections>
+           </core></configuration>"##,
+    );
+    let names: Vec<_> = c.connectors.iter().map(|c| c.name.as_deref()).collect();
+    assert_eq!(names, [Some("artemis"), Some("node0")]);
+    assert_eq!(c.connectors[1].host.as_deref(), Some("other"));
+    assert_eq!(c.cluster_connections.len(), 1);
+    let cc = &c.cluster_connections[0];
+    assert_eq!(cc.name, "my-cluster");
+    assert_eq!(cc.connector_name, "artemis");
+    assert_eq!(cc.retry_interval, 1000);
+    assert_eq!(cc.max_hops, 0);
+    assert_eq!(
+        cc.message_load_balancing,
+        saranga_config::MessageLoadBalancing::Off
+    );
+    assert_eq!(cc.static_connectors, ["node0"]);
+    assert!(cc.allow_direct_connections_only);
+    assert_eq!(cc.call_timeout, 30_000);
+    assert_eq!(
+        c.warnings
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        [
+            "AMQ222217: Cannot find connector-ref nowhere. The cluster-connection lost will not be deployed."
+        ]
     );
 }
 

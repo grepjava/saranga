@@ -105,6 +105,27 @@ impl Error {
         )
     }
 
+    pub(crate) fn cannot_connect_to_servers() -> Self {
+        Self::amq(
+            ErrorType::NotConnected,
+            "AMQ219007: Cannot connect to server(s). Tried with all available servers.",
+        )
+    }
+
+    pub(crate) fn tx_rolled_back() -> Self {
+        Self::amq(
+            ErrorType::TransactionRolledBack,
+            "AMQ219030: The transaction was rolled back on failover to a backup server",
+        )
+    }
+
+    pub(crate) fn tx_outcome_unknown() -> Self {
+        Self::amq(
+            ErrorType::TransactionOutcomeUnknown,
+            "AMQ219031: The transaction was rolled back on failover however commit may have been successful",
+        )
+    }
+
     pub(crate) fn consumer_closed() -> Self {
         Self::amq(ErrorType::ObjectClosed, "AMQ219017: Consumer is closed")
     }

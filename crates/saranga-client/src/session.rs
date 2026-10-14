@@ -15,7 +15,7 @@ use saranga_core_protocol::{FRAME_HEADER_SIZE, Flagged, Packet, types};
 use saranga_message::CoreMessage;
 
 use crate::channel::{Channel, supports};
-use crate::connection::ConnInner;
+use crate::connection::{ConnInner, Factory};
 use crate::consumer::{Consumer, ConsumerOptions, ConsumerShared};
 use crate::defaults;
 use crate::error::{Error, ErrorType, Result};
@@ -378,13 +378,28 @@ struct SessionState {
     in_close: bool,
     consumers: BTreeMap<i64, Arc<ConsumerShared>>,
     producers: BTreeMap<i32, Arc<ProducerShared>>,
+    /// `workDone`: a message was sent or received since the last commit
+    /// or rollback.
+    work_done: bool,
+    /// `rollbackOnly`: the session failed over with work in its
+    /// transaction, so the next commit rolls back.
+    rollback_only: bool,
+    /// `resetCreditManager`: producer credits are asked for again once the
+    /// failover is done.
+    reset_credit_manager: bool,
 }
 
 pub(crate) struct SessionInner {
-    pub(crate) conn: Arc<ConnInner>,
+    factory: Arc<Factory>,
+    /// `ActiveMQSessionContext.remotingConnection`: replaced on failover.
+    conn: Mutex<Arc<ConnInner>>,
     pub(crate) channel: Arc<Channel>,
     weak_self: Weak<SessionInner>,
-    name: String,
+    /// Renamed on failover, so the server cannot close the recreated
+    /// session under the old name.
+    name: Mutex<String>,
+    /// `ClientSessionImpl.metadata`: sent again after a failover.
+    metadata: Mutex<Vec<(String, String)>>,
     pub(crate) options: SessionOptions,
     server_version: i32,
     state: Mutex<SessionState>,
@@ -397,6 +412,7 @@ pub(crate) struct SessionInner {
 
 impl SessionInner {
     pub(crate) fn new(
+        factory: Arc<Factory>,
         conn: Arc<ConnInner>,
         channel: Arc<Channel>,
         name: String,
@@ -405,10 +421,12 @@ impl SessionInner {
     ) -> Arc<Self> {
         let window = options.producer_window_size;
         Arc::new_cyclic(|weak_self| Self {
-            conn,
+            factory,
+            conn: Mutex::new(conn),
             channel,
             weak_self: weak_self.clone(),
-            name,
+            name: Mutex::new(name),
+            metadata: Mutex::new(Vec::new()),
             options,
             server_version,
             state: Mutex::new(SessionState::default()),
@@ -422,10 +440,17 @@ impl SessionInner {
         self.state.lock().expect("session")
     }
 
+    /// The connection the session is on.
+    pub(crate) fn conn(&self) -> Arc<ConnInner> {
+        self.conn.lock().expect("session").clone()
+    }
+
     /// `ClientSessionImpl.checkClosed`, reporting a connection failure as
-    /// its own error.
+    /// its own error when the session cannot fail over.
     pub(crate) fn check_closed(&self) -> Result<()> {
-        if let Some(e) = self.conn.failure() {
+        if !self.factory.can_failover()
+            && let Some(e) = self.conn().failure()
+        {
             return Err(e);
         }
         let st = self.state();
@@ -435,18 +460,33 @@ impl SessionInner {
         Ok(())
     }
 
+    /// `ChannelImpl.send` without waiting: on a connection that failed, the
+    /// failure.
     pub(crate) fn send(&self, packet: impl Into<Packet>) -> Result<()> {
-        self.conn.send(self.channel.id, &packet.into())
+        self.conn().send(self.channel.id, &packet.into())
     }
 
+    /// `ChannelImpl.send`: after a failover in progress.
+    pub(crate) async fn send_async(&self, packet: impl Into<Packet>) -> Result<()> {
+        self.factory.wait_failover().await;
+        self.send(packet)
+    }
+
+    /// `ChannelImpl.sendBlocking`: after a failover in progress.
     pub(crate) async fn send_blocking(
         &self,
         packet: impl Into<Packet>,
         expected: i8,
     ) -> Result<Packet> {
-        self.conn
+        self.factory.wait_failover().await;
+        self.conn()
             .send_blocking(&self.channel, packet.into(), expected)
             .await
+    }
+
+    /// `ClientSessionImpl.workDone`.
+    pub(crate) fn work_done(&self) {
+        self.state().work_done = true;
     }
 
     fn consumers(&self) -> Vec<Arc<ConsumerShared>> {
@@ -485,7 +525,7 @@ impl SessionInner {
             self.send_blocking(packet, types::NULL_RESPONSE).await?;
             Ok(())
         } else {
-            self.send(packet)
+            self.send_async(packet).await
         }
     }
 
@@ -509,7 +549,7 @@ impl SessionInner {
             self.send_blocking(packet, types::NULL_RESPONSE).await?;
             Ok(())
         } else {
-            self.send(packet)
+            self.send_async(packet).await
         }
     }
 
@@ -533,7 +573,7 @@ impl SessionInner {
         send_blocking: bool,
         sender_id: i32,
     ) -> Result<()> {
-        let ctx = self.conn.context();
+        let ctx = self.conn().context();
         // confirmationWindow is -1, so a response is required only when blocking.
         let packet: Packet = if ctx.is_version_before_address_change() {
             let end_of_message_position = legacy_end_of_message_position(&message);
@@ -569,16 +609,19 @@ impl SessionInner {
             self.send_blocking(packet, types::NULL_RESPONSE).await?;
             Ok(())
         } else {
-            self.send(packet)
+            self.send_async(packet).await
         }
     }
 
     /// `ActiveMQSessionContext.sendInitialChunkOnLargeMessage`: the headers
     /// and properties (`SessionSendLargeMessage`, not blocking). Returns
     /// their encode size, the credits the header takes.
-    pub(crate) fn send_initial_chunk_on_large_message(&self, message: CoreMessage) -> Result<i32> {
+    pub(crate) async fn send_initial_chunk_on_large_message(
+        &self,
+        message: CoreMessage,
+    ) -> Result<i32> {
         let size = message::headers_and_properties_encode_size(&message);
-        self.send(SessionSendLargeMessage { message })?;
+        self.send_async(SessionSendLargeMessage { message }).await?;
         Ok(size)
     }
 
@@ -594,7 +637,7 @@ impl SessionInner {
         chunk: Vec<u8>,
         sender_id: i32,
     ) -> Result<i32> {
-        let ctx = self.conn.context();
+        let ctx = self.conn().context();
         let requires_response = last_chunk && send_blocking;
         // The frame header, the chunk with its length, `continues`, the body
         // size on the last chunk and `requiresResponse`
@@ -637,7 +680,7 @@ impl SessionInner {
         if requires_response {
             self.send_blocking(packet, types::NULL_RESPONSE).await?;
         } else {
-            self.send(packet)?;
+            self.send_async(packet).await?;
         }
         Ok(size as i32)
     }
@@ -657,7 +700,7 @@ impl SessionInner {
         for c in self.consumers() {
             c.start();
         }
-        self.send(SessionStart::default())?;
+        self.send_async(SessionStart::default()).await?;
         self.state().started = true;
         Ok(())
     }
@@ -702,7 +745,7 @@ impl SessionInner {
             .await;
         self.state().closed = true;
         self.channel.close(&Error::session_closed());
-        self.conn.remove_channel(self.channel.id);
+        self.conn().remove_channel(self.channel.id);
     }
 
     /// The connection failed: everything waiting on this session wakes up
@@ -713,10 +756,170 @@ impl SessionInner {
             st.closed = true;
             std::mem::take(&mut st.consumers)
         };
+        self.channel.close(err);
         for c in consumers.values() {
             c.fail(err);
         }
         self.credits.lock().expect("credits").close();
+    }
+
+    /// `ActiveMQSessionContext.transferConnection`: the session's channel
+    /// moves to a new connection.
+    pub(crate) fn transfer_connection(&self, conn: &Arc<ConnInner>) {
+        conn.add_channel(self.channel.clone());
+        *self.conn.lock().expect("session") = conn.clone();
+    }
+
+    /// `ClientSessionImpl.handleFailover`: the session is recreated on the
+    /// new connection under a new name, with its consumers (and their
+    /// non-durable or auto-created queues), and started again if it was;
+    /// a transaction with work in it can now only roll back.
+    pub(crate) async fn handle_failover(&self, conn: &Arc<ConnInner>, cause: &Error) -> Result<()> {
+        let (in_close, started) = {
+            let st = self.state();
+            if st.closed {
+                return Ok(());
+            }
+            (st.in_close, st.started)
+        };
+        self.transfer_connection(conn);
+        let name = crate::uuid::to_string(&crate::uuid::time_based());
+        *self.name.lock().expect("session") = name.clone();
+        let consumers = self.consumers();
+        for c in &consumers {
+            c.clear_at_failover();
+        }
+        if !in_close {
+            self.recreate_session(conn, &name).await?;
+            for c in &consumers {
+                if !c.is_closed() {
+                    self.recreate_consumer_on_server(c, started)?;
+                }
+            }
+            {
+                let mut st = self.state();
+                if (!self.options.auto_commit_acks || !self.options.auto_commit_sends)
+                    && st.work_done
+                {
+                    st.rollback_only = true;
+                }
+            }
+            if started {
+                for c in &consumers {
+                    c.clear_at_failover();
+                    c.start();
+                }
+                self.send(SessionStart::default())?;
+            }
+            self.state().reset_credit_manager = true;
+        }
+        self.channel.return_blocking(cause);
+        Ok(())
+    }
+
+    /// `ActiveMQSessionContext.recreateSession`: retried while the server is
+    /// still starting.
+    async fn recreate_session(&self, conn: &ConnInner, name: &str) -> Result<()> {
+        loop {
+            match self
+                .factory
+                .send_create_session(conn, name, self.channel.id, &self.options)
+                .await
+            {
+                Err(e) if e.kind() == Some(ErrorType::SessionCreationRejected) => {
+                    tracing::warn!(
+                        "AMQ212075: Session {name} was rejected while the server was starting, retrying"
+                    );
+                    if self.state().in_close {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                other => return other.map(|_| ()),
+            }
+        }
+    }
+
+    /// `ActiveMQSessionContext.recreateConsumerOnServer`.
+    fn recreate_consumer_on_server(&self, c: &ConsumerShared, started: bool) -> Result<()> {
+        let q = c.queue_info();
+        // Non-durable and auto-created queues may be gone after the failover.
+        if !q.durable || q.auto_created {
+            self.send(CreateQueueMessageV2 {
+                address: q.address.as_deref().unwrap_or_default().into(),
+                queue_name: q.name.as_deref().unwrap_or_default().into(),
+                filter_string: ss(&q.filter_string),
+                durable: q.durable,
+                temporary: q.temporary,
+                requires_response: false,
+                auto_created: q.auto_created,
+                routing_type: wire_routing(q.routing_type),
+                max_consumers: q.max_consumers,
+                purge_on_no_consumers: q.purge_on_no_consumers,
+                exclusive: Flagged(q.exclusive),
+                last_value: Flagged(q.last_value),
+                last_value_key: None,
+                non_destructive: Flagged(q.non_destructive),
+                consumers_before_dispatch: Flagged(None),
+                delay_before_dispatch: Flagged(None),
+                group_rebalance: Flagged(None),
+                group_buckets: Flagged(None),
+                auto_delete: Flagged(None),
+                auto_delete_delay: Flagged(None),
+                auto_delete_message_count: Flagged(None),
+                group_first_key: None,
+                ring_size: Flagged(q.ring_size),
+                enabled: Flagged(q.enabled),
+                group_rebalance_pause_dispatch: Flagged(None),
+                sections: CreateQueueMessageV2::SECTIONS,
+            })?;
+        }
+        self.send(SessionCreateConsumerMessage {
+            id: c.id,
+            queue_name: c.queue_name().clone(),
+            filter_string: c.filter().cloned(),
+            browse_only: c.is_browse_only(),
+            requires_response: false,
+            priority: c.priority(),
+        })?;
+        let window = c.client_window_size();
+        self.send(SessionConsumerFlowCreditMessage {
+            consumer_id: c.id,
+            credits: if window != 0 { window } else { 1 },
+        })?;
+        // A forced delivery the old server never answered would leave
+        // `receive` waiting.
+        let forced = c.force_delivery_count();
+        if started && forced > 0 {
+            self.send(SessionForceConsumerDelivery {
+                consumer_id: c.id,
+                sequence: forced - 1,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// `ClientSessionImpl.postHandleFailover` after a successful failover:
+    /// producer credits are asked for again and the metadata sent again.
+    pub(crate) fn post_handle_failover(&self) {
+        let reset = {
+            let mut st = self.state();
+            if st.closed {
+                return;
+            }
+            std::mem::take(&mut st.reset_credit_manager)
+        };
+        if reset {
+            self.credits.lock().expect("credits").reset(self);
+        }
+        let metadata = self.metadata.lock().expect("session").clone();
+        for (key, data) in metadata {
+            let _ = self.send(SessionAddMetaDataMessageV2 {
+                key: key.as_str().into(),
+                data: data.as_str().into(),
+                requires_confirmation: false,
+            });
+        }
     }
 
     /// `ClientSessionPacketHandler.handlePacket`.
@@ -780,9 +983,9 @@ impl Session {
         Self { inner }
     }
 
-    /// The session name (a time-based UUID).
-    pub fn name(&self) -> &str {
-        &self.inner.name
+    /// The session name (a time-based UUID, a new one after a failover).
+    pub fn name(&self) -> String {
+        self.inner.name.lock().expect("session").clone()
     }
 
     /// The version from `CreateSessionResponseMessage`.
@@ -812,9 +1015,15 @@ impl Session {
         self.inner.close().await
     }
 
-    /// `SessionAddMetaDataMessageV2` (blocking).
+    /// `SessionAddMetaDataMessageV2` (blocking). Kept, to be sent again
+    /// after a failover.
     pub async fn add_metadata(&self, key: &str, data: &str) -> Result<()> {
         self.inner.check_closed()?;
+        {
+            let mut metadata = self.inner.metadata.lock().expect("session");
+            metadata.retain(|(k, _)| k != key);
+            metadata.push((key.to_owned(), data.to_owned()));
+        }
         self.inner
             .send_blocking(
                 SessionAddMetaDataMessageV2 {
@@ -854,7 +1063,12 @@ impl Session {
         auto_created: bool,
     ) -> Result<()> {
         self.inner.check_closed()?;
-        if self.inner.conn.context().is_version_before_address_change() {
+        if self
+            .inner
+            .conn()
+            .context()
+            .is_version_before_address_change()
+        {
             return Ok(());
         }
         let mut types_set = routing_types.to_vec();
@@ -892,7 +1106,12 @@ impl Session {
         let purge_on_no_consumers = config
             .purge_on_no_consumers
             .unwrap_or(defaults::PURGE_ON_NO_CONSUMERS);
-        let packet: Packet = if self.inner.conn.context().is_version_before_address_change() {
+        let packet: Packet = if self
+            .inner
+            .conn()
+            .context()
+            .is_version_before_address_change()
+        {
             CreateQueueMessage {
                 address: config.address_or_name(),
                 queue_name: config.name.as_str().into(),
@@ -992,7 +1211,12 @@ impl Session {
     }
 
     fn queue_query_response_type(&self) -> i8 {
-        if self.inner.conn.context().is_version_before_address_change() {
+        if self
+            .inner
+            .conn()
+            .context()
+            .is_version_before_address_change()
+        {
             types::SESS_QUEUEQUERY_RESP_V2
         } else {
             types::SESS_QUEUEQUERY_RESP_V3
@@ -1065,8 +1289,10 @@ impl Session {
         ));
         inner.state().producers.insert(id, shared.clone());
         // ActiveMQSessionContext.createProducer
-        if !inner.conn.context().is_before_producer_metrics_changed() {
-            inner.send(CreateProducerMessage { id, address })?;
+        if !inner.conn().context().is_before_producer_metrics_changed() {
+            inner
+                .send_async(CreateProducerMessage { id, address })
+                .await?;
         }
         Ok(Producer::new(inner.clone(), shared))
     }
@@ -1132,6 +1358,7 @@ impl Session {
             queue.into(),
             filter,
             options.browse_only,
+            options.priority,
             initial_window,
             client_window_size,
             inner.options.ack_batch_size,
@@ -1146,18 +1373,50 @@ impl Session {
     }
 
     /// `ClientSessionImpl.commit`: flushes pending acks, then
-    /// `SessionCommitMessage_V2` (blocking).
+    /// `SessionCommitMessage_V2` (blocking). After a failover with work in
+    /// the transaction, it rolls back instead and fails with
+    /// `TRANSACTION_ROLLED_BACK`; when the failover interrupted the commit
+    /// itself, with `TRANSACTION_OUTCOME_UNKNOWN`.
     pub async fn commit(&self) -> Result<()> {
         let inner = &self.inner;
         inner.check_closed()?;
+        if inner.state().rollback_only {
+            return self.rollback_on_failover(true).await;
+        }
         inner.flush_acks().await?;
-        let packet: Packet = if inner.conn.context().is_version_support_commit_v2() {
+        if inner.state().rollback_only {
+            return self.rollback_on_failover(true).await;
+        }
+        let packet: Packet = if inner.conn().context().is_version_support_commit_v2() {
             SessionCommitMessageV2::default().into()
         } else {
             SessionCommitMessage::default().into()
         };
-        inner.send_blocking(packet, types::NULL_RESPONSE).await?;
+        if let Err(e) = inner.send_blocking(packet, types::NULL_RESPONSE).await {
+            let interrupted = matches!(
+                e.kind(),
+                Some(ErrorType::Unblocked | ErrorType::ConnectionTimedOut)
+            );
+            if interrupted || inner.state().rollback_only {
+                return self.rollback_on_failover(false).await;
+            }
+            return Err(e);
+        }
+        if inner.state().rollback_only {
+            return self.rollback_on_failover(false).await;
+        }
+        inner.state().work_done = false;
         Ok(())
+    }
+
+    /// `ClientSessionImpl.rollbackOnFailover`.
+    async fn rollback_on_failover(&self, outcome_known: bool) -> Result<()> {
+        self.rollback(false).await?;
+        Err(if outcome_known {
+            Error::tx_rolled_back()
+        } else {
+            Error::tx_outcome_unknown()
+        })
     }
 
     /// `ClientSessionImpl.rollback`: stops the session, returns the credits
@@ -1188,7 +1447,9 @@ impl Session {
         if was_started {
             inner.start().await?;
         }
-        result.map(|_| ())
+        result?;
+        inner.state().rollback_only = false;
+        Ok(())
     }
 }
 
