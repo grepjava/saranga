@@ -31,9 +31,10 @@ pub struct ClusterConfig {
     pub connector: TransportConfiguration,
     /// `static-connectors`, in order.
     pub static_connectors: Vec<TransportConfiguration>,
-    /// `discovery-group-ref`: Saranga has no discovery yet, so a cluster
-    /// connection using it reaches no other broker.
+    /// `discovery-group-ref`: the discovery group the other brokers are
+    /// found through, in place of `static-connectors`.
     pub discovery_group: Option<String>,
+    pub discovery: Option<saranga_client::discovery::DiscoveryConfig>,
     pub retry_interval: Duration,
     pub call_timeout: Duration,
     pub check_period: Duration,
@@ -73,11 +74,25 @@ impl ClusterConfig {
             })
             .collect();
         let millis = |v: i64| Duration::from_millis(v.max(0) as u64);
+        let discovery = match &cc.discovery_group {
+            Some(name) => match crate::discovery::discovery_config(config, name) {
+                Some(d) => Some(d),
+                None => {
+                    // `ClusterConnectionConfiguration.getDiscoveryGroupConfiguration`.
+                    tracing::warn!(
+                        "AMQ222131: No discovery group with name {name}. The cluster connection will not be deployed."
+                    );
+                    return None;
+                }
+            },
+            None => None,
+        };
         Some(Self {
             name: cc.name.clone(),
             connector: connector(&cc.connector_name)?,
             static_connectors,
             discovery_group: cc.discovery_group.clone(),
+            discovery,
             retry_interval: millis(cc.retry_interval),
             call_timeout: millis(cc.call_timeout),
             check_period: millis(cc.check_period),
@@ -524,6 +539,68 @@ impl TopologyListener for FailbackListener {
     fn node_down(&self, _unique_event_id: i64, _node_id: &str) {}
 }
 
+/// The brokers a cluster connection reaches (its `ClusterController`
+/// locator): its static connectors, or those its discovery group hears,
+/// less this broker's own connector (`clusterTransportConfiguration`).
+pub struct Peers {
+    config: ClusterConfig,
+    group: Option<Arc<saranga_client::discovery::DiscoveryGroup>>,
+}
+
+impl Peers {
+    pub fn new(config: &ClusterConfig) -> Self {
+        Self {
+            config: config.clone(),
+            group: None,
+        }
+    }
+
+    /// The brokers to try now. With discovery, joins the group on first
+    /// use, and waits up to `wait` for a broadcast while none was heard.
+    pub async fn targets(&mut self, wait: Duration) -> Vec<TransportConfiguration> {
+        let Some(discovery) = &self.config.discovery else {
+            return self.config.static_connectors.clone();
+        };
+        if self.group.is_none() {
+            // The locator's own random node ID: every broker is heard.
+            let id = saranga_client::uuid::to_string(&saranga_client::uuid::time_based());
+            match saranga_client::discovery::DiscoveryGroup::start(discovery, &id) {
+                Ok(g) => self.group = Some(g),
+                Err(e) => {
+                    tracing::warn!(
+                        "AMQ212065: discovery group {} getting exception when receiving broadcasting: {e}",
+                        discovery.name
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+        let group = self.group.as_ref().expect("started");
+        let entries =
+            |g: &saranga_client::discovery::DiscoveryGroup| -> Vec<TransportConfiguration> {
+                g.entries()
+                    .into_iter()
+                    .map(|e| e.connector)
+                    .filter(|c| !same_connector(c, &self.config.connector))
+                    .collect()
+            };
+        let found = entries(group);
+        if !found.is_empty() {
+            return found;
+        }
+        group.wait_for_broadcast(Some(wait)).await;
+        entries(group)
+    }
+}
+
+impl Drop for Peers {
+    fn drop(&mut self) {
+        if let Some(g) = &self.group {
+            g.stop();
+        }
+    }
+}
+
 /// `BackupManager.BackupConnector`: connects to the cluster through its
 /// static connectors and announces this broker as the backup of
 /// `node_id`, again whenever the connection is lost, until stopped.
@@ -562,14 +639,21 @@ async fn announce_loop(
     node_id: String,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
-    if config.static_connectors.is_empty() {
-        // A discovery group (not supported yet) or no connectors: there
-        // is no one to announce to.
+    if config.static_connectors.is_empty() && config.discovery.is_none() {
+        // No one to announce to.
         return;
     }
+    let mut peers = Peers::new(&config);
     let mut next = 0usize;
     loop {
-        let target = &config.static_connectors[next % config.static_connectors.len()];
+        let targets = tokio::select! {
+            t = peers.targets(config.retry_interval.max(Duration::from_millis(100))) => t,
+            _ = stopped(&mut stop) => return,
+        };
+        if targets.is_empty() {
+            continue;
+        }
+        let target = &targets[next % targets.len()];
         next += 1;
         let attempt = async {
             let (host, port) = socket_address(target)
@@ -695,6 +779,7 @@ mod tests {
             connector: connector("artemis", port),
             static_connectors: Vec::new(),
             discovery_group: None,
+            discovery: None,
             retry_interval: Duration::from_millis(500),
             call_timeout: Duration::from_secs(30),
             check_period: Duration::from_secs(30),

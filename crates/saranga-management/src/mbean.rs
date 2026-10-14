@@ -326,6 +326,7 @@ pub enum Bean {
     Divert(String),
     /// An acceptor: its name and URI parameters.
     Acceptor(String, Vec<(String, String)>),
+    BroadcastGroup(String),
 }
 
 impl Bean {
@@ -336,6 +337,7 @@ impl Bean {
             Self::Queue(_) => &crate::catalog::QUEUE,
             Self::Divert(_) => &crate::catalog::DIVERT,
             Self::Acceptor(..) => &crate::catalog::ACCEPTOR,
+            Self::BroadcastGroup(_) => &crate::catalog::BROADCAST_GROUP,
         }
     }
 
@@ -347,6 +349,7 @@ impl Bean {
             Self::Queue(q) => format!("queue.{q}"),
             Self::Divert(d) => format!("divert.{d}"),
             Self::Acceptor(a, _) => format!("acceptor.{a}"),
+            Self::BroadcastGroup(g) => format!("broadcastgroup.{g}"),
         }
     }
 
@@ -363,6 +366,9 @@ impl Bean {
             Self::Divert(_) => "org.apache.activemq.artemis.core.management.impl.DivertControlImpl",
             Self::Acceptor(..) => {
                 "org.apache.activemq.artemis.core.management.impl.AcceptorControlImpl"
+            }
+            Self::BroadcastGroup(_) => {
+                "org.apache.activemq.artemis.core.management.impl.BroadcastGroupControlImpl"
             }
         }
     }
@@ -385,6 +391,15 @@ pub fn registered(
     for (a, params) in acceptors {
         if let Some(n) = name(format!("{base},component=acceptors,name={}", quote(a))) {
             out.push((n, Bean::Acceptor(a.clone(), params.clone())));
+        }
+    }
+    for g in broker.broadcast_groups() {
+        let g = &g.config().name;
+        if let Some(n) = name(format!(
+            "{base},component=broadcast-groups,name={}",
+            quote(g)
+        )) {
+            out.push((n, Bean::BroadcastGroup(g.clone())));
         }
     }
     let po = broker.post_office();

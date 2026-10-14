@@ -12,6 +12,7 @@ pub mod cluster;
 pub mod config;
 pub mod core_protocol;
 pub mod critical;
+pub mod discovery;
 pub mod disk;
 pub mod duplicate;
 pub mod error;
@@ -251,6 +252,8 @@ pub struct BrokerConfig {
     pub ha: node::HaConfig,
     /// The default cluster connection, if there is one.
     pub cluster: Option<cluster::ClusterConfig>,
+    /// `<broadcast-groups>`, started once the broker is active.
+    pub broadcast_groups: Vec<discovery::BroadcastGroupConfig>,
     /// Plugins (`<broker-plugins>`, or the embedding application's own).
     pub plugins: Vec<Arc<dyn plugin::BrokerPlugin>>,
     /// `max-disk-usage` or `min-disk-free` with `disk-scan-period`: producers
@@ -289,6 +292,7 @@ impl BrokerConfig {
             critical: critical::CriticalConfig::default(),
             ha: node::HaConfig::default(),
             cluster: None,
+            broadcast_groups: Vec::new(),
             plugins: Vec::new(),
             disk_monitor: None,
         }
@@ -444,6 +448,8 @@ pub struct Broker {
     lock_lost: std::sync::atomic::AtomicBool,
     /// The default cluster connection, started with the broker.
     cluster: Option<Arc<cluster::ClusterConnection>>,
+    /// `ClusterManager.broadcastGroups`.
+    broadcast_groups: Vec<Arc<discovery::BroadcastGroup>>,
     /// `replication` `primary`: a backup may register to replicate this
     /// broker's data.
     replication_policy: Option<saranga_config::Replication>,
@@ -707,7 +713,13 @@ impl Broker {
             (None, None) => saranga_storage::java::uuid(&saranga_client::uuid::time_based()),
         };
         let registry = Arc::new(registry::Registry::new(post_office.plugins().clone()));
+        let broadcast_groups = config
+            .broadcast_groups
+            .iter()
+            .map(|g| discovery::BroadcastGroup::new(g.clone(), &node_id, &post_office))
+            .collect();
         let broker = Arc::new(Self {
+            broadcast_groups,
             node_id: node_id.clone(),
             post_office,
             connection_ttl_override: config.connection_ttl_override,
@@ -823,12 +835,32 @@ impl Broker {
         if let Some(c) = &broker.cluster {
             c.activate();
         }
+        // `ClusterManager.start`.
+        for g in &broker.broadcast_groups {
+            if let Err(e) = g.start() {
+                tracing::warn!(
+                    "AMQ222116: unable to start broadcast group {}: {e}",
+                    g.config().name
+                );
+            }
+        }
         Ok(broker)
     }
 
     /// The default cluster connection.
     pub fn cluster(&self) -> Option<&Arc<cluster::ClusterConnection>> {
         self.cluster.as_ref()
+    }
+
+    /// The broadcast groups, in the configuration's order.
+    pub fn broadcast_groups(&self) -> &[Arc<discovery::BroadcastGroup>] {
+        &self.broadcast_groups
+    }
+
+    pub fn broadcast_group(&self, name: &str) -> Option<&Arc<discovery::BroadcastGroup>> {
+        self.broadcast_groups
+            .iter()
+            .find(|g| g.config().name == name)
     }
 
     /// `SharedStoreBackupActivation.FailbackChecker`: every second, an
@@ -929,6 +961,9 @@ impl Broker {
         }
         if let Some(c) = &self.cluster {
             c.stop();
+        }
+        for g in &self.broadcast_groups {
+            g.stop();
         }
         self.stop_replicating();
         self.large_messages.stop();

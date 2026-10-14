@@ -351,6 +351,7 @@ impl BrokerConfig {
         filters: Arc<dyn FilterFactory>,
         instance: &Path,
     ) -> cfg::Result<Self> {
+        crate::discovery::validate_startup(config).map_err(cfg::ConfigError::IllegalState)?;
         let w = &config.wildcard_addresses;
         Ok(Self {
             settings: Arc::new(ConfiguredSettings::new(
@@ -394,6 +395,7 @@ impl BrokerConfig {
             critical: crate::critical::CriticalConfig::from_file(config),
             ha: crate::node::HaConfig::from_file(config, instance),
             cluster: crate::cluster::ClusterConfig::from_file(config),
+            broadcast_groups: crate::discovery::broadcast_groups(config),
             plugins: plugins(config)?,
             disk_monitor: crate::disk::MonitorConfig::new(
                 config.journal.max_disk_usage.unwrap_or(90),

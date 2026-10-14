@@ -428,3 +428,82 @@ fn malformed_xml_is_an_error() {
         Err(ConfigError::Xml(_))
     ));
 }
+
+#[test]
+fn broadcast_and_discovery_groups() {
+    let c = parse(
+        r#"<connectors>
+             <connector name="a">tcp://localhost:61616</connector>
+             <connector name="b">tcp://localhost:61617</connector>
+           </connectors>
+           <broadcast-groups>
+             <broadcast-group name="bg">
+               <local-bind-address>127.0.0.1</local-bind-address>
+               <local-bind-port>5432</local-bind-port>
+               <group-address>231.7.7.7</group-address>
+               <group-port>9876</group-port>
+               <broadcast-period>1500</broadcast-period>
+               <connector-ref>a</connector-ref>
+               <connector-ref>b</connector-ref>
+             </broadcast-group>
+           </broadcast-groups>
+           <discovery-groups>
+             <discovery-group name="dg">
+               <group-address>231.7.7.7</group-address>
+               <group-port>9876</group-port>
+               <refresh-timeout>5000</refresh-timeout>
+             </discovery-group>
+             <discovery-group name="dg">
+               <group-address>231.7.7.8</group-address>
+               <group-port>9877</group-port>
+             </discovery-group>
+           </discovery-groups>"#,
+    );
+    let bg = &c.broadcast_groups[0];
+    assert_eq!(bg.name, "bg");
+    assert_eq!(bg.broadcast_period, 1500);
+    // As parseBroadcastGroupConfiguration reads connector-refs: the first,
+    // once for each.
+    assert_eq!(bg.connectors, ["a", "a"]);
+    assert_eq!(bg.endpoint.group_address.as_deref(), Some("231.7.7.7"));
+    assert_eq!(bg.endpoint.group_port, 9876);
+    assert_eq!(bg.endpoint.local_bind_address.as_deref(), Some("127.0.0.1"));
+    assert_eq!(bg.endpoint.local_bind_port, 5432);
+    // The second "dg" is not deployed.
+    assert_eq!(c.discovery_groups.len(), 1);
+    let dg = &c.discovery_groups[0];
+    assert_eq!(dg.refresh_timeout, 5000);
+    assert_eq!(dg.initial_wait_timeout, 10_000);
+    assert_eq!(dg.endpoint.group_port, 9876);
+    assert_eq!(dg.endpoint.local_bind_port, -1);
+    assert!(c.warnings.iter().any(|w| matches!(
+        w,
+        Warning::DiscoveryGroupAlreadyDeployed { name } if name == "dg"
+    )));
+}
+
+#[test]
+fn broadcast_group_defaults_and_jgroups() {
+    let c = parse(
+        r#"<broadcast-groups><broadcast-group name="bg">
+             <group-address>231.7.7.7</group-address><group-port>9876</group-port>
+           </broadcast-group></broadcast-groups>"#,
+    );
+    assert_eq!(c.broadcast_groups[0].broadcast_period, 2000);
+    assert!(c.broadcast_groups[0].connectors.is_empty());
+    let e = parse_err(
+        r#"<discovery-groups><discovery-group name="dg">
+             <jgroups-file>test-jgroups-file_ping.xml</jgroups-file>
+             <jgroups-channel>dg</jgroups-channel>
+           </discovery-group></discovery-groups>"#,
+    );
+    assert!(
+        matches!(e, ConfigError::Unsupported { ref element, .. } if element == "discovery-group")
+    );
+    let e = parse_err(
+        r#"<broadcast-groups><broadcast-group name="bg">
+             <broadcast-period>0</broadcast-period>
+           </broadcast-group></broadcast-groups>"#,
+    );
+    assert!(matches!(e, ConfigError::InvalidValue { ref name, .. } if name == "broadcast-period"));
+}

@@ -30,6 +30,7 @@ pub(crate) enum Control {
     Queue,
     Divert,
     Acceptor,
+    BroadcastGroup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,6 +328,11 @@ fn source(broker: &Broker, control: Control, name: &str) -> String {
         Control::Acceptor => format!(
             "org.apache.activemq.artemis.core.remoting.impl.netty.NettyAcceptor@{:x}",
             identity(("acceptor", name))
+        ),
+        // BroadcastGroupImpl has no toString either.
+        Control::BroadcastGroup => format!(
+            "org.apache.activemq.artemis.core.server.cluster.impl.BroadcastGroupImpl@{:x}",
+            identity(("broadcast-group", name))
         ),
     }
 }

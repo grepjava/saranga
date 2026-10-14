@@ -36,10 +36,10 @@ pub use bootstrap::{
     BootstrapConfig, BootstrapSecurity, WebApp, WebBinding, WebConfig, file_uri_path,
 };
 pub use broker::{
-    AddressConfig, BrokerConfig, BrokerPluginConfig, ClusterConnectionConfig,
-    CriticalAnalyzerPolicy, DivertConfig, DivertRoutingType, HaPolicy, JaasModuleConfig,
-    JournalConfig, JournalRetention, JournalType, LockManagerConfig, MessageLoadBalancing,
-    QueueConfig, Replication, TransformerConfig, Warning,
+    AddressConfig, BroadcastGroupConfig, BrokerConfig, BrokerPluginConfig, ClusterConnectionConfig,
+    CriticalAnalyzerPolicy, DiscoveryGroupConfig, DivertConfig, DivertRoutingType, HaPolicy,
+    JaasModuleConfig, JournalConfig, JournalRetention, JournalType, LockManagerConfig,
+    MessageLoadBalancing, QueueConfig, Replication, TransformerConfig, UdpEndpointConfig, Warning,
 };
 pub use bytes::convert_text_bytes;
 pub use matcher::Match;
@@ -81,6 +81,10 @@ pub enum ConfigError {
         element: String,
         reason: &'static str,
     },
+    /// A configuration the broker refuses to start with
+    /// (`ActiveMQIllegalStateException`), its message given whole.
+    #[error("{0}")]
+    IllegalState(String),
 }
 
 impl ConfigError {

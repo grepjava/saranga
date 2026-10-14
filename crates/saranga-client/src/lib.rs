@@ -51,6 +51,7 @@ mod channel;
 mod connection;
 mod consumer;
 pub mod defaults;
+pub mod discovery;
 mod error;
 mod large;
 pub mod message;

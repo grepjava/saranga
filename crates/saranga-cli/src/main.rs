@@ -307,6 +307,10 @@ async fn main() -> std::process::ExitCode {
 /// Runs a command and reports its failure as `Artemis.execute` does; false
 /// when it failed.
 async fn execute(command: Command) -> bool {
+    // `run` adds its own -D options.
+    if !matches!(command, Command::Run { .. }) {
+        apply_discovery_switch(&java_args_system_properties());
+    }
     if let Command::Help { args } = &command {
         let mode = if client::instance_dir().is_some() {
             help::Mode::Instance
@@ -532,6 +536,20 @@ fn control_file(
     Ok(())
 }
 
+/// `ServerLocatorConfig.isDiscoveryEnabled`: the `artemis.discovery.enabled`
+/// system property, when given, over `ARTEMIS_DISCOVERY_ENABLED`.
+fn apply_discovery_switch(system: &[(String, String)]) {
+    use saranga_client::discovery::{DISCOVERY_ENABLED_PROPERTY, set_discovery_enabled};
+    if let Some((_, v)) = system
+        .iter()
+        .rev()
+        .find(|(k, _)| k == DISCOVERY_ENABLED_PROPERTY)
+    {
+        // `Boolean.parseBoolean`.
+        set_discovery_enabled(v.eq_ignore_ascii_case("true"));
+    }
+}
+
 async fn run_command(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Run {
@@ -547,6 +565,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
         } => {
             let mut system = java_args_system_properties();
             system.extend(system_properties);
+            apply_discovery_switch(&system);
             let options = instance::Options {
                 system,
                 broker_properties: properties,

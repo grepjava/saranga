@@ -134,6 +134,7 @@ enum Resource {
     Queue(crate::queue::Queue),
     Divert(Arc<crate::postoffice::Divert>),
     Acceptor(String),
+    BroadcastGroup(Arc<crate::discovery::BroadcastGroup>),
 }
 
 impl Resource {
@@ -146,6 +147,7 @@ impl Resource {
             Resource::Queue(q) => (Control::Queue, q.name().to_string()),
             Resource::Divert(d) => (Control::Divert, d.name.to_string()),
             Resource::Acceptor(a) => (Control::Acceptor, a.clone()),
+            Resource::BroadcastGroup(g) => (Control::BroadcastGroup, g.config().name.clone()),
         }
     }
 }
@@ -233,6 +235,12 @@ impl Management {
         if let Some(a) = name.strip_prefix("acceptor.") {
             return broker.acceptor(a).map(|_| Resource::Acceptor(a.to_owned()));
         }
+        if let Some(g) = name.strip_prefix("broadcastgroup.") {
+            return broker
+                .broadcast_group(g)
+                .cloned()
+                .map(Resource::BroadcastGroup);
+        }
         None
     }
 
@@ -260,6 +268,7 @@ impl Management {
             Resource::Queue(q) => queue::attribute(broker, q, &upper).await,
             Resource::Divert(d) => Ok(divert_attribute(d, &upper)),
             Resource::Acceptor(a) => Ok(acceptor_attribute(broker, a, &upper)),
+            Resource::BroadcastGroup(g) => Ok(broadcast_group_attribute(g, &upper)),
         };
         match found {
             // A boolean attribute is read through its `is` method.
@@ -365,6 +374,7 @@ impl Management {
             Resource::Queue(q) => queue::invoke(broker, q, &call).await,
             Resource::Divert(_) => None,
             Resource::Acceptor(a) => invoke_acceptor(broker, a, &call).await,
+            Resource::BroadcastGroup(g) => invoke_broadcast_group(g, &call),
         };
         if let Some(outcome) = found {
             return outcome;
@@ -381,6 +391,7 @@ impl Management {
                         Resource::Queue(q) => queue::attribute(broker, q, attr).await,
                         Resource::Divert(d) => Ok(divert_attribute(d, attr)),
                         Resource::Acceptor(a) => Ok(acceptor_attribute(broker, a, attr)),
+                        Resource::BroadcastGroup(g) => Ok(broadcast_group_attribute(g, attr)),
                     };
                     match value {
                         Ok(Some(v)) => return Ok(v),
@@ -524,6 +535,53 @@ async fn invoke_acceptor(
         "start" => done(broker.start_acceptor(name).await),
         "stop" => done(broker.stop_acceptor(name).await),
         "reload" => done(broker.reload_acceptor(name).await),
+        _ => return None,
+    })
+}
+
+/// `BroadcastGroupControl`'s attributes.
+fn broadcast_group_attribute(g: &crate::discovery::BroadcastGroup, attr: &str) -> Option<Json> {
+    let c = g.config();
+    Some(match attr {
+        "Name" => Json::from(c.name.as_str()),
+        "BroadcastPeriod" => Json::from(c.broadcast_period.as_millis() as i64),
+        "ConnectorPairs" => Json::Array(
+            c.connector_names
+                .iter()
+                .map(|n| Json::from(n.as_str()))
+                .collect(),
+        ),
+        "ConnectorPairsAsJSON" => Json::from(
+            Json::Array(
+                c.connector_names
+                    .iter()
+                    .map(|n| Json::from(n.as_str()))
+                    .collect(),
+            )
+            .to_string(),
+        ),
+        "GroupAddress" => Json::from(c.endpoint.group_address.clone()),
+        "GroupPort" => Json::from(c.endpoint.group_port),
+        "LocalBindPort" => Json::from(c.endpoint.local_bind_port),
+        "Started" => Json::from(g.is_started()),
+        _ => return None,
+    })
+}
+
+/// `BroadcastGroupControl`'s operations.
+fn invoke_broadcast_group(
+    g: &crate::discovery::BroadcastGroup,
+    call: &args::Call<'_>,
+) -> Option<Outcome> {
+    if !call.params.is_empty() {
+        return None;
+    }
+    Some(match call.op {
+        "start" => g.start().map(|()| Json::Null).map_err(|e| e.to_string()),
+        "stop" => {
+            g.stop();
+            Ok(Json::Null)
+        }
         _ => return None,
     })
 }

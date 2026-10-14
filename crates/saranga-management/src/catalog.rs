@@ -6591,3 +6591,90 @@ pub static ACCEPTOR: Control = Control {
         },
     ],
 };
+
+/// `BroadcastGroupControl`.
+pub static BROADCAST_GROUP: Control = Control {
+    interface: "BroadcastGroupControl",
+    attrs: &[
+        Attr {
+            name: "LocalBindPort",
+            type_name: "int",
+            desc: "local port this broadcast group is bound to",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "GroupAddress",
+            type_name: "java.lang.String",
+            desc: "address this broadcast group is broadcasting to",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "GroupPort",
+            type_name: "int",
+            desc: "port this broadcast group is broadcasting to",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "Name",
+            type_name: "java.lang.String",
+            desc: "name of this broadcast group",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "BroadcastPeriod",
+            type_name: "long",
+            desc: "period used by this broadcast group",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "ConnectorPairs",
+            type_name: "[Ljava.lang.Object;",
+            desc: "pairs of live-backup connectors that are broadcasted by this broadcast group",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "ConnectorPairsAsJSON",
+            type_name: "java.lang.String",
+            desc: "pairs of live-backup connectors that are broadcasted by this broadcast group using JSON serialization",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "Started",
+            type_name: "boolean",
+            desc: "whether this component is started",
+            readable: true,
+            writable: false,
+            is: true,
+        },
+    ],
+    ops: &[
+        Op {
+            name: "start",
+            desc: "starts this component",
+            impact: 3,
+            ret: "void",
+            params: &[],
+        },
+        Op {
+            name: "stop",
+            desc: "stops this component",
+            impact: 3,
+            ret: "void",
+            params: &[],
+        },
+    ],
+};

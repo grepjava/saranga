@@ -237,6 +237,9 @@ pub enum Warning {
         connector: String,
         cluster_connection: String,
     },
+    /// A discovery group's name was used before, so it is left out
+    /// (`AMQ222019`).
+    DiscoveryGroupAlreadyDeployed { name: String },
 }
 
 impl fmt::Display for Warning {
@@ -277,6 +280,10 @@ impl fmt::Display for Warning {
             } => write!(
                 f,
                 "AMQ222217: Cannot find connector-ref {connector}. The cluster-connection {cluster_connection} will not be deployed."
+            ),
+            Self::DiscoveryGroupAlreadyDeployed { name } => write!(
+                f,
+                "AMQ222019: There is already a discovery group with name {name} deployed. This one will not be deployed."
             ),
         }
     }
@@ -534,6 +541,45 @@ impl std::str::FromStr for MessageLoadBalancing {
     }
 }
 
+/// Where a broadcast or discovery group sends or listens: a UDP multicast
+/// group (`UDPBroadcastEndpointFactory`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UdpEndpointConfig {
+    /// `group-address`.
+    pub group_address: Option<String>,
+    /// `group-port`; -1 when unset.
+    pub group_port: i32,
+    /// `local-bind-address`.
+    pub local_bind_address: Option<String>,
+    /// `local-bind-port`; -1 when unset.
+    pub local_bind_port: i32,
+}
+
+/// `<broadcast-group>` (`BroadcastGroupConfiguration`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastGroupConfig {
+    pub name: String,
+    /// `broadcast-period` in milliseconds.
+    pub broadcast_period: i64,
+    /// `connector-ref`s. As `parseBroadcastGroupConfiguration` reads them,
+    /// each is the first `connector-ref` of the group.
+    pub connectors: Vec<String>,
+    pub endpoint: UdpEndpointConfig,
+}
+
+/// `<discovery-group>` (`DiscoveryGroupConfiguration`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryGroupConfig {
+    pub name: String,
+    /// `refresh-timeout` in milliseconds: how long a broker's broadcast is
+    /// kept without another.
+    pub refresh_timeout: i64,
+    /// `initial-wait-timeout` in milliseconds: how long a client waits for
+    /// the first broadcast.
+    pub initial_wait_timeout: i64,
+    pub endpoint: UdpEndpointConfig,
+}
+
 /// `<cluster-connection>` (`ClusterConnectionConfiguration`), with the
 /// `ActiveMQDefaultConfiguration` defaults.
 #[derive(Debug, Clone, PartialEq)]
@@ -625,6 +671,11 @@ pub struct BrokerConfig {
     /// `<cluster-connections>`, in document order; the first is the
     /// default one.
     pub cluster_connections: Vec<ClusterConnectionConfig>,
+    /// `<broadcast-groups>`, in document order.
+    pub broadcast_groups: Vec<BroadcastGroupConfig>,
+    /// `<discovery-groups>`, in document order; a name used again is
+    /// skipped (`AMQ222019`).
+    pub discovery_groups: Vec<DiscoveryGroupConfig>,
     /// Match string and settings, in document order.
     pub address_settings: Vec<(String, AddressSettings)>,
     pub addresses: Vec<AddressConfig>,
@@ -854,6 +905,8 @@ impl Default for BrokerConfig {
             acceptors: Vec::new(),
             connectors: Vec::new(),
             cluster_connections: Vec::new(),
+            broadcast_groups: Vec::new(),
+            discovery_groups: Vec::new(),
             address_settings: Vec::new(),
             addresses: Vec::new(),
             diverts: Vec::new(),

@@ -36,6 +36,7 @@ impl Caller {
             Bean::Queue(n) => ("QueueControlImpl", n.as_str()),
             Bean::Divert(n) => ("DivertControlImpl", n.as_str()),
             Bean::Acceptor(n, _) => ("AcceptorControlImpl", n.as_str()),
+            Bean::BroadcastGroup(n) => ("BroadcastGroupControlImpl", n.as_str()),
         };
         saranga_server::audit::mbean_info(
             class,

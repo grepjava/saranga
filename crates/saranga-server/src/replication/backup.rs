@@ -131,16 +131,19 @@ fn options(cluster: &ClusterConfig) -> ConnectionOptions {
 /// cluster user. Tried until one answers.
 async fn locate(cfg: &BackupConfig) -> (Connection, String) {
     let cluster = &cfg.cluster;
+    let mut peers = crate::cluster::Peers::new(cluster);
+    let retry = cluster.retry_interval.max(Duration::from_millis(100));
     let mut next = 0usize;
     loop {
-        if !cluster.static_connectors.is_empty() {
-            let target = &cluster.static_connectors[next % cluster.static_connectors.len()];
+        let targets = peers.targets(retry).await;
+        if !targets.is_empty() {
+            let target = &targets[next % targets.len()];
             next += 1;
             if let Some(found) = try_locate(cfg, target).await {
                 return found;
             }
         }
-        tokio::time::sleep(cluster.retry_interval.max(Duration::from_millis(100))).await;
+        tokio::time::sleep(retry).await;
     }
 }
 
@@ -203,7 +206,14 @@ pub async fn is_node_id_used(cluster: &ClusterConfig, node_id: &str) -> bool {
         reconnect_attempts: 0,
         ..options(cluster)
     };
-    for target in &cluster.static_connectors {
+    // With discovery, a broadcast is waited for as long as the discovery
+    // group's initial-wait-timeout (`executeDiscovery`).
+    let mut peers = crate::cluster::Peers::new(cluster);
+    let wait = cluster
+        .discovery
+        .as_ref()
+        .map_or(Duration::ZERO, |d| d.initial_wait_timeout);
+    for target in &peers.targets(wait).await {
         let Some((host, port)) = crate::cluster::socket_address(target) else {
             continue;
         };

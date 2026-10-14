@@ -406,6 +406,8 @@ fn parse_core(
     parse_scalars(core, config, warnings)?;
     parse_acceptors(core, config, warnings)?;
     parse_connectors(core, config, warnings)?;
+    parse_broadcast_groups(core, config)?;
+    parse_discovery_groups(core, config, warnings)?;
     parse_cluster_connections(core, config, warnings)?;
     parse_security_settings(core, config, warnings)?;
     parse_broker_plugins(core, config)?;
@@ -418,14 +420,6 @@ fn parse_core(
 
 /// `<core>` children Saranga reads but does not act on yet, and why.
 const NOT_ACTED_ON: &[(&str, &str)] = &[
-    (
-        "broadcast-groups",
-        "discovery is not supported yet; list the other brokers in static-connectors",
-    ),
-    (
-        "discovery-groups",
-        "discovery is not supported yet; list the other brokers in static-connectors",
-    ),
     ("bridges", "core bridges are not supported"),
     ("federations", "federation is not supported"),
     (
@@ -1232,6 +1226,85 @@ fn parse_connectors(
 }
 
 /// `parseClusterConnectionConfiguration` for each `<cluster-connection>`.
+/// The UDP endpoint of a broadcast or discovery group. A JGroups one
+/// (`jgroups-file`) is refused: Saranga only has UDP.
+fn parse_udp_endpoint(group: Node<'_, '_>, element: &str) -> Result<crate::UdpEndpointConfig> {
+    let s = Settings { core: group };
+    if s.string("jgroups-file").is_some() {
+        return Err(ConfigError::Unsupported {
+            element: element.to_owned(),
+            reason: "JGroups (jgroups-file) is not supported; broadcast over UDP with group-address and group-port",
+        });
+    }
+    Ok(crate::UdpEndpointConfig {
+        group_address: s.string("group-address"),
+        group_port: s.i32("group-port", Check::MinusOneOrGtZero)?.unwrap_or(-1),
+        local_bind_address: s.string("local-bind-address"),
+        local_bind_port: s
+            .i32("local-bind-port", Check::MinusOneOrGtZero)?
+            .unwrap_or(-1),
+    })
+}
+
+/// `parseBroadcastGroupConfiguration`.
+fn parse_broadcast_groups(core: Node<'_, '_>, config: &mut BrokerConfig) -> Result<()> {
+    let Some(list) = first(core, "broadcast-groups") else {
+        return Ok(());
+    };
+    for group in elements(list).filter(|c| c.tag_name().name() == "broadcast-group") {
+        let s = Settings { core: group };
+        // `getString(e, "connector-ref", ...)` once per connector-ref: the
+        // first one each time.
+        let mut connectors = Vec::new();
+        for _ in elements(group).filter(|c| c.tag_name().name() == "connector-ref") {
+            let name = s
+                .non_empty_string("connector-ref")?
+                .ok_or_else(|| ConfigError::invalid("connector-ref", "", "must not be empty"))?;
+            connectors.push(name);
+        }
+        config.broadcast_groups.push(crate::BroadcastGroupConfig {
+            name: group.attribute("name").unwrap_or_default().to_owned(),
+            broadcast_period: s.i64("broadcast-period", Check::GtZero)?.unwrap_or(2000),
+            connectors,
+            endpoint: parse_udp_endpoint(group, "broadcast-group")?,
+        });
+    }
+    Ok(())
+}
+
+/// `parseDiscoveryGroupConfiguration`.
+fn parse_discovery_groups(
+    core: Node<'_, '_>,
+    config: &mut BrokerConfig,
+    warnings: &mut Vec<Warning>,
+) -> Result<()> {
+    let Some(list) = first(core, "discovery-groups") else {
+        return Ok(());
+    };
+    for group in elements(list).filter(|c| c.tag_name().name() == "discovery-group") {
+        let s = Settings { core: group };
+        let name = group.attribute("name").unwrap_or_default().to_owned();
+        let parsed = crate::DiscoveryGroupConfig {
+            initial_wait_timeout: s
+                .i64("initial-wait-timeout", Check::GtZero)?
+                .unwrap_or(10_000),
+            refresh_timeout: s.i64("refresh-timeout", Check::GtZero)?.unwrap_or(10_000),
+            endpoint: parse_udp_endpoint(group, "discovery-group")?,
+            name,
+        };
+        if config
+            .discovery_groups
+            .iter()
+            .any(|g| g.name == parsed.name)
+        {
+            warnings.push(Warning::DiscoveryGroupAlreadyDeployed { name: parsed.name });
+        } else {
+            config.discovery_groups.push(parsed);
+        }
+    }
+    Ok(())
+}
+
 fn parse_cluster_connections(
     core: Node<'_, '_>,
     config: &mut BrokerConfig,

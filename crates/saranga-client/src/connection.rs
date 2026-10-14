@@ -122,6 +122,28 @@ impl Default for ConnectionOptions {
     }
 }
 
+/// A host's addresses, IPv4 ones first, as `InetAddress.getByName` prefers
+/// them (`localhost` is 127.0.0.1 before `::1`): otherwise, on Windows, a
+/// connector to `localhost` waits seconds for `::1` to be refused.
+async fn resolve(addr: impl ToSocketAddrs) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    let mut addrs: Vec<_> = tokio::net::lookup_host(addr).await?.collect();
+    addrs.sort_by_key(|a| !a.is_ipv4());
+    Ok(addrs)
+}
+
+/// `NettyConnector.createConnection`: a TCP connection to the host's
+/// addresses in that order.
+async fn connect_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let mut last = None;
+    for addr in resolve((host, port)).await? {
+        match TcpStream::connect(addr).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other(format!("{host} resolves to no address"))))
+}
+
 /// Where to connect: the host and port of a `TransportConfiguration`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Connector {
@@ -480,8 +502,14 @@ impl ConnInner {
 /// `ClientSessionFactoryImpl` with its `ServerLocatorImpl`.
 pub(crate) struct Factory {
     options: ConnectionOptions,
-    /// `ServerLocatorImpl.initialConnectors`.
+    /// `ServerLocatorImpl.initialConnectors`, when given.
     initial: Vec<Connector>,
+    /// `ServerLocatorImpl.discoveryGroup`: with one, the initial connectors
+    /// are the nodes it heard, until the topology arrives.
+    discovery: Option<(
+        Arc<crate::discovery::DiscoveryGroup>,
+        crate::discovery::DiscoveryConfig,
+    )>,
     /// The current transport connection; `None` while failing over.
     conn: Mutex<Option<Arc<ConnInner>>>,
     /// The latest transport connection, failed or not.
@@ -519,13 +547,28 @@ struct FactoryState {
     received_topology: bool,
     /// `RoundRobinConnectionLoadBalancingPolicy.pos`.
     position: Option<usize>,
+    /// The discovery group's connectors as last taken
+    /// (`connectorsChanged`, ignored once the topology arrived).
+    discovered: Vec<Connector>,
 }
 
 impl Factory {
     fn new(options: ConnectionOptions, initial: Vec<Connector>) -> Arc<Self> {
+        Self::with_discovery(options, initial, None)
+    }
+
+    fn with_discovery(
+        options: ConnectionOptions,
+        initial: Vec<Connector>,
+        discovery: Option<(
+            Arc<crate::discovery::DiscoveryGroup>,
+            crate::discovery::DiscoveryConfig,
+        )>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             options,
             initial,
+            discovery,
             conn: Mutex::new(None),
             latest: Mutex::new(None),
             st: Mutex::new(FactoryState::default()),
@@ -634,26 +677,82 @@ impl Factory {
         pos
     }
 
+    /// `initialConnectors`: those given, or those discovered.
+    fn initial_connectors(&self, st: &mut FactoryState) -> Vec<Connector> {
+        let Some((group, _)) = &self.discovery else {
+            return self.initial.clone();
+        };
+        if !st.received_topology {
+            st.discovered = group
+                .entries()
+                .iter()
+                .filter_map(|e| Connector::from_transport(&e.connector))
+                .collect();
+        }
+        st.discovered.clone()
+    }
+
     /// `ServerLocatorImpl.selectConnector`.
     fn select_connector(&self, use_init: bool) -> Option<(Connector, Option<Connector>)> {
         let mut st = self.state();
         let pairs = Self::topology_pairs(&st);
+        let initial = self.initial_connectors(&mut st);
         if !use_init && !pairs.is_empty() {
             let pos = Self::select(&mut st, pairs.len());
             Some(pairs[pos].clone())
-        } else if self.initial.is_empty() {
+        } else if initial.is_empty() {
             None
         } else {
-            let pos = Self::select(&mut st, self.initial.len());
-            Some((self.initial[pos].clone(), None))
+            let pos = Self::select(&mut st, initial.len());
+            Some((initial[pos].clone(), None))
         }
     }
 
     /// `ServerLocatorImpl.getConnectorsSize`.
     fn connectors_size(&self) -> usize {
-        let st = self.state();
+        let mut st = self.state();
         let pairs = Self::topology_pairs(&st).len();
-        if pairs > 0 { pairs } else { self.initial.len() }
+        if pairs > 0 {
+            pairs
+        } else {
+            self.initial_connectors(&mut st).len()
+        }
+    }
+
+    /// `executeDiscovery`: with a discovery group and no node heard yet,
+    /// waits `initialWaitTimeout` for a broadcast, again for each of the
+    /// `initialConnectAttempts`, and fails with `AMQ219012`.
+    async fn execute_discovery(&self) -> Result<()> {
+        let Some((group, config)) = &self.discovery else {
+            return Ok(());
+        };
+        let mut try_number = 0;
+        loop {
+            {
+                let mut st = self.state();
+                if !self.initial_connectors(&mut st).is_empty() {
+                    return Ok(());
+                }
+            }
+            if group
+                .wait_for_broadcast(Some(config.initial_wait_timeout))
+                .await
+            {
+                return Ok(());
+            }
+            let attempts = self.options.initial_connect_attempts;
+            let retry = attempts > 0 && try_number < attempts;
+            try_number += 1;
+            if !retry {
+                return Err(Error::amq(
+                    ErrorType::ConnectionTimedOut,
+                    "AMQ219012: Timed out waiting to receive initial broadcast from cluster",
+                ));
+            }
+            tracing::warn!(
+                "AMQ212077: Timed out waiting to receive initial broadcast from cluster. Retry {try_number} of {attempts}"
+            );
+        }
     }
 
     /// `SessionFactoryTopologyHandler.notifyNodeUp` +
@@ -721,7 +820,7 @@ impl Factory {
             c
         };
         for connector in candidates {
-            let connecting = TcpStream::connect((connector.host.as_str(), connector.port));
+            let connecting = connect_tcp(&connector.host, connector.port);
             if let Ok(Ok(stream)) = tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
                 let _ = stream.set_nodelay(true);
                 let mut st = self.state();
@@ -861,6 +960,7 @@ impl Factory {
     /// connectors in turn, each `initialConnectAttempts` times, then waits
     /// for the topology.
     async fn connect_initial(self: &Arc<Self>) -> Result<()> {
+        self.execute_discovery().await?;
         let max_attempts = if self.options.initial_connect_attempts == 0 {
             1
         } else {
@@ -889,7 +989,7 @@ impl Factory {
             }
             attempts += 1;
             if self.options.initial_connect_attempts >= 0
-                && attempts >= max_attempts * self.initial.len() as i32
+                && attempts >= max_attempts * self.connectors_size().max(1) as i32
             {
                 return Err(Error::cannot_connect_to_servers());
             }
@@ -1140,7 +1240,7 @@ impl Connection {
     /// Connects over TCP to one address, the factory's only connector.
     pub async fn connect(addr: impl ToSocketAddrs, options: ConnectionOptions) -> Result<Self> {
         let mut last = None;
-        for addr in tokio::net::lookup_host(addr).await? {
+        for addr in resolve(addr).await? {
             match TcpStream::connect(addr).await {
                 Ok(stream) => {
                     stream.set_nodelay(true)?;
@@ -1171,6 +1271,27 @@ impl Connection {
     ) -> Result<Self> {
         let factory = Factory::new(options, connectors);
         factory.connect_initial().await?;
+        Ok(Self { factory })
+    }
+
+    /// Connects through a discovery group (a `udp://` URL): to the nodes
+    /// it hears, as `ServerLocatorImpl` with a `DiscoveryGroupConfiguration`
+    /// does, waiting `initial_wait_timeout` for the first broadcast. Fails
+    /// with `AMQ219070` while discovery is disabled
+    /// ([`crate::discovery::discovery_enabled`]).
+    pub async fn connect_discovery(
+        config: crate::discovery::DiscoveryConfig,
+        options: ConnectionOptions,
+    ) -> Result<Self> {
+        crate::discovery::ensure_discovery_enabled()?;
+        let group = crate::discovery::DiscoveryGroup::start(&config, "")?;
+        let factory = Factory::with_discovery(options, Vec::new(), Some((group, config)));
+        if let Err(e) = factory.connect_initial().await {
+            if let Some((group, _)) = &factory.discovery {
+                group.stop();
+            }
+            return Err(e);
+        }
         Ok(Self { factory })
     }
 
@@ -1339,6 +1460,9 @@ impl Connection {
     /// no `DisconnectMessage` is sent. A failover in progress stops.
     pub async fn close(&self) {
         self.factory.closed.send_replace(true);
+        if let Some((group, _)) = &self.factory.discovery {
+            group.stop();
+        }
         let sessions: Vec<_> = self
             .factory
             .sessions

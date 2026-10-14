@@ -1749,6 +1749,7 @@ dependencies = [
  "saranga-ha",
  "saranga-message",
  "saranga-server",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",

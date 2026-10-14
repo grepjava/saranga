@@ -33,6 +33,8 @@ pub enum NotificationType {
     AddressRemoved,
     MessageDelivered,
     MessageExpired,
+    BroadcastGroupStarted,
+    BroadcastGroupStopped,
 }
 
 impl NotificationType {
@@ -56,6 +58,8 @@ impl NotificationType {
             Self::AddressRemoved => "ADDRESS_REMOVED",
             Self::MessageDelivered => "MESSAGE_DELIVERED",
             Self::MessageExpired => "MESSAGE_EXPIRED",
+            Self::BroadcastGroupStarted => "BROADCAST_GROUP_STARTED",
+            Self::BroadcastGroupStopped => "BROADCAST_GROUP_STOPPED",
         }
     }
 }

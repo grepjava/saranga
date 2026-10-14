@@ -570,6 +570,56 @@ pub fn locator_options(params: &[(String, String)], options: &mut ConnectionOpti
     }
 }
 
+/// A `udp://group:port?params` URL's discovery group
+/// (`UDPServerLocatorSchema`): `localBindAddress`, `localBindPort`,
+/// `refreshTimeout` and `discoveryInitialWaitTimeout` among its parameters.
+pub fn discovery_url(
+    url: &str,
+) -> anyhow::Result<Option<saranga_client::discovery::DiscoveryConfig>> {
+    use saranga_client::discovery::{DiscoveryConfig, EndpointConfig};
+    use std::time::Duration;
+    let Some(rest) = url.trim().strip_prefix("udp://") else {
+        return Ok(None);
+    };
+    let (authority, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let authority = authority.trim_end_matches('/');
+    let (host, port) = authority
+        .rsplit_once(':')
+        .with_context(|| format!("invalid URL {url}: no group port"))?;
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("invalid port in {url}"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let mut config = DiscoveryConfig::new(EndpointConfig::new(host, port));
+    for (k, v) in params(query) {
+        let millis = || {
+            v.parse::<i64>()
+                .ok()
+                .map(|m| Duration::from_millis(m.max(0) as u64))
+        };
+        match k {
+            "localBindAddress" => config.endpoint.local_bind_address = Some(v.to_owned()),
+            "localBindPort" => {
+                if let Ok(p) = v.parse() {
+                    config.endpoint.local_bind_port = p;
+                }
+            }
+            "refreshTimeout" => {
+                if let Some(t) = millis() {
+                    config.refresh_timeout = t;
+                }
+            }
+            "discoveryInitialWaitTimeout" => {
+                if let Some(t) = millis() {
+                    config.initial_wait_timeout = t;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(Some(config))
+}
+
 /// Opens a Core connection to a URL, authenticated as `user` if given
 /// (`createSessionFactory(user, password)`): to the first of its servers
 /// that answers, reconnecting and failing over as its parameters say.
@@ -578,12 +628,24 @@ pub async fn open(
     user: Option<&str>,
     password: Option<&str>,
 ) -> anyhow::Result<Connection> {
-    let (servers, params) = parse_url_list(url)?;
     let mut options = ConnectionOptions {
         user: user.map(str::to_owned),
         password: password.map(str::to_owned),
         ..ConnectionOptions::default()
     };
+    if let Some(config) = discovery_url(url)? {
+        let (_, query) = url.split_once('?').unwrap_or((url, ""));
+        let params: Vec<(String, String)> = params(query)
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        locator_options(&params, &mut options);
+        return Connection::connect_discovery(config, options)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to create session factory; nested exception is {e}")
+            });
+    }
+    let (servers, params) = parse_url_list(url)?;
     locator_options(&params, &mut options);
     let connectors = servers
         .into_iter()

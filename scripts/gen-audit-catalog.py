@@ -30,6 +30,8 @@ CONTROLS = {
     "QueueControlImpl.java": "Queue",
     "DivertControlImpl.java": "Divert",
     "AcceptorControlImpl.java": "Acceptor",
+    "BaseBroadcastGroupControlImpl.java": "BroadcastGroup",
+    "BroadcastGroupControlImpl.java": "BroadcastGroup",
 }
 
 

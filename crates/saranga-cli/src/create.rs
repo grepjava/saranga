@@ -31,6 +31,7 @@ const TEMPLATES: &[(&str, &str)] = &[
     template!("etc/bootstrap.xml"),
     template!("etc/broker.xml"),
     template!("etc/cluster-security-settings.txt"),
+    template!("etc/cluster-settings.txt"),
     template!("etc/cluster-static-settings.txt"),
     template!("etc/commented-ping-settings.txt"),
     template!("etc/global-max-default.txt"),
@@ -369,17 +370,17 @@ struct Clustering {
     /// "tcp://server:61616,tcp://server2:61616,tcp://server3:61616".
     #[arg(long = "static-cluster", alias = "staticCluster")]
     static_cluster: Option<String>,
+    /// Enable server discovery.
+    #[arg(long = "discovery-enabled", hide = true)]
+    discovery_enabled: bool,
 }
 
 /// `PrintWriter.println`'s line separator.
 const LINE_SEPARATOR: &str = if cfg!(windows) { "\r\n" } else { "\n" };
 
-/// `artemis create` options for what Saranga does not do yet: discovery
-/// (Phase 10) and JDBC storage.
+/// `artemis create` options for what Saranga does not do: JDBC storage.
 #[derive(clap::Args, Debug)]
 struct Unsupported {
-    #[arg(long = "discovery-enabled", hide = true)]
-    discovery_enabled: bool,
     #[arg(long, hide = true)]
     jdbc: bool,
     // The JDBC store's settings, unused without --jdbc.
@@ -407,11 +408,6 @@ struct Unsupported {
 
 impl Unsupported {
     fn check(&self) -> anyhow::Result<()> {
-        if self.discovery_enabled {
-            bail!(
-                "saranga create does not support --discovery-enabled yet: Saranga has no discovery yet; use --static-cluster"
-            );
-        }
         if self.jdbc {
             bail!(
                 "saranga create does not support --jdbc: Saranga does not store messages in a database"
@@ -424,6 +420,15 @@ impl Unsupported {
 /// `Create.run`.
 pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
     args.unsupported.check()?;
+    // `-Dartemis.discovery.enabled=true` first in both profiles' options.
+    if args.cluster.discovery_enabled {
+        let flag = format!(
+            "-D{}=true",
+            saranga_client::discovery::DISCOVERY_ENABLED_PROPERTY
+        );
+        args.install.java_options.insert(0, flag.clone());
+        args.install.java_utility_options.insert(0, flag);
+    }
     if !args.install.encoding.eq_ignore_ascii_case("UTF-8") {
         bail!("saranga create writes UTF-8 files only");
     }
@@ -639,7 +644,7 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
     }
     f.put("${jdbc}", "");
     if clustered {
-        let Some(static_cluster) = cluster.static_cluster.clone() else {
+        if cluster.static_cluster.is_none() && !cluster.discovery_enabled {
             bail!(UsageError(
                 "Clustered instances without --static-cluster use discovery groups, which are disabled by default. Supply static configuration, or see the Server Discovery section in the user manual for security requirements and enablement.".to_owned()
             ));
@@ -660,7 +665,11 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
         }
         f.put("${host}", host.clone());
         f.put("${name}", args.name.clone().unwrap_or_else(|| host.clone()));
-        let nodes: Vec<&str> = static_cluster.split(',').collect();
+        let nodes: Vec<&str> = cluster
+            .static_cluster
+            .as_deref()
+            .map(|s| s.split(',').collect())
+            .unwrap_or_default();
         // `getConnectors`.
         let mut connectors = String::new();
         let mut line = |text: &str| {
@@ -683,14 +692,19 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
         f.put("${connector-config.settings}", connectors);
         let text = f.read("etc/cluster-security-settings.txt")?;
         f.put("${cluster-security.settings}", text);
-        let list: String = (0..nodes.len())
-            .map(|i| {
-                format!("               <connector-ref>node{i}</connector-ref>{LINE_SEPARATOR}")
-            })
-            .collect();
-        f.put("${connectors-list}", list);
-        let text = f.read("etc/cluster-static-settings.txt")?;
-        f.put("${cluster.settings}", text);
+        if cluster.static_cluster.is_some() {
+            let list: String = (0..nodes.len())
+                .map(|i| {
+                    format!("               <connector-ref>node{i}</connector-ref>{LINE_SEPARATOR}")
+                })
+                .collect();
+            f.put("${connectors-list}", list);
+            let text = f.read("etc/cluster-static-settings.txt")?;
+            f.put("${cluster.settings}", text);
+        } else {
+            let text = f.read("etc/cluster-settings.txt")?;
+            f.put("${cluster.settings}", text);
+        }
         let user = match cluster.cluster_user.clone() {
             Some(u) => u,
             None => args
