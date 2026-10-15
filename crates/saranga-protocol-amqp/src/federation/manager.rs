@@ -21,7 +21,7 @@ use super::constants::*;
 use super::policy::{AddressPolicy, QueuePolicy, address_filter, java_hash_order};
 use super::{Connection, FedLink, Federation, lock};
 use crate::composite::Fields;
-use crate::connection::{LinkOp, LocalLink, LocalLinkKind};
+use crate::connection::{LinkOp, LocalLink, LocalLinkKind, ManagedReceiver};
 use crate::messaging::{
     DeliveryState, Modified, Source, Target, TargetKind, TerminusDurability, TerminusExpiryPolicy,
 };
@@ -73,38 +73,76 @@ pub struct Consumer {
     closed: AtomicBool,
 }
 
-impl Consumer {
-    /// The peer answered the attach, taking the link or not.
-    pub fn attached(&self, opened: bool) {
+impl ManagedReceiver for Consumer {
+    fn link_name(&self) -> &str {
+        &self.link_name
+    }
+
+    fn destination(&self) -> &str {
+        match &self.kind {
+            ConsumerKind::Address { target } => target,
+            ConsumerKind::Queue { fqqn } => fqqn,
+        }
+    }
+
+    fn adds_hop(&self) -> bool {
+        matches!(self.kind, ConsumerKind::Address { .. })
+    }
+
+    fn credits(&self) -> i32 {
+        self.credits
+    }
+
+    fn credits_low(&self) -> i32 {
+        self.credits_low
+    }
+
+    fn use_modified(&self) -> bool {
+        self.use_modified
+    }
+
+    fn large_threshold(&self) -> i32 {
+        self.large_threshold
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    fn attached(&self, opened: bool) {
         self.attached.store(true, Ordering::SeqCst);
         if opened && let Some(o) = self.owner.upgrade() {
             o.opened(&self.key, &self.link_name);
         }
     }
 
-    /// The peer closed the link: whether that was for a reason the
-    /// connection survives (the interceptor's answer). The manager forgets
-    /// the receiver either way.
-    pub fn remote_closed(&self, error: Option<&Error>) -> bool {
+    /// The manager forgets the receiver either way.
+    fn remote_closed(&self, error: Option<&Error>) -> bool {
         self.closed.store(true, Ordering::SeqCst);
         if let Some(o) = self.owner.upgrade() {
             o.remote_closed(&self.key, &self.link_name);
         }
-        error.is_some_and(|e| {
-            matches!(
-                e.condition.as_str(),
-                RESOURCE_DELETED | NOT_FOUND | DETACH_FORCED
-            )
-        })
+        is_intercepted(error)
     }
 
-    /// A stop asked for completed (its credit drained).
-    pub fn stopped(&self, ok: bool) {
+    fn stopped(&self, ok: bool) {
         if let Some(o) = self.owner.upgrade() {
             o.stopped(&self.key, &self.link_name, ok);
         }
     }
+}
 
+/// `remoteLinkClosedInterceptor`: a remote close the connection survives.
+pub(crate) fn is_intercepted(error: Option<&Error>) -> bool {
+    error.is_some_and(|e| {
+        matches!(
+            e.condition.as_str(),
+            RESOURCE_DELETED | NOT_FOUND | DETACH_FORCED
+        )
+    })
+}
+
+impl Consumer {
     /// A start asked for found the link gone.
     pub fn start_failed(&self) {
         if let Some(o) = self.owner.upgrade() {
@@ -114,10 +152,6 @@ impl Consumer {
 
     pub fn federation(&self) -> Option<Arc<Federation>> {
         self.federation.upgrade()
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
     }
 
     /// `close`: the link is detached, unless the peer did it already.

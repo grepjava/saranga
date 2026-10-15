@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 
 use crate::composite::{Composite, Fields};
 use crate::federation::constants as fed;
-use crate::federation::manager::{Consumer, ConsumerKind};
+use crate::federation::manager::ConsumerKind;
 use crate::federation::{FedLink, Federation};
 use crate::frame::{self, AMQP_HEADER, FrameBody, SASL_HEADER};
 use crate::link::{self, LinkError, ReceiverTarget, SenderSource, capability};
@@ -282,6 +282,9 @@ impl ConnectionHandle {
     }
 }
 
+/// Told when the peer's Open comes, with the capabilities it offers.
+pub type OnOpen = Box<dyn FnOnce(&[Symbol]) + Send + Sync>;
+
 /// What a connection the broker opens says and does
 /// (`createOutgoingConnectionEntry`).
 pub struct Outgoing {
@@ -292,8 +295,8 @@ pub struct Outgoing {
     /// Added to the Open's properties.
     pub properties: Fields,
     pub desired_capabilities: Option<Vec<Symbol>>,
-    /// Told when the peer's Open comes.
-    pub on_open: Option<Box<dyn FnOnce() + Send + Sync>>,
+    /// Told when the peer's Open comes, with its offered capabilities.
+    pub on_open: Option<OnOpen>,
 }
 
 /// How a connection the broker opened ended.
@@ -476,9 +479,38 @@ enum ReceiveMode {
     Commands(Arc<Federation>),
     /// A federation events link's event (`AMQPFederationEventProcessor`).
     Events(Arc<Federation>),
-    /// A federation receiver's message (`AMQPFederatedAddressDeliveryHandler`,
-    /// `AMQPFederatedQueueDeliveryReceiver`).
-    Federated(Arc<Consumer>),
+    /// A federation or bridge receiver's message
+    /// (`AMQPFederatedAddressDeliveryHandler`,
+    /// `AMQPFederatedQueueDeliveryReceiver`,
+    /// `AMQPBridgeAddressDeliveryReceiver`,
+    /// `AMQPBridgeQueueDeliveryReceiver`).
+    Managed(Arc<dyn ManagedReceiver>),
+}
+
+/// A receiver a broker connection's policy keeps attached to the peer: a
+/// federation's or a bridge's. Its manager stops, starts and closes it by
+/// name ([`LinkOp`]).
+pub trait ManagedReceiver: Send + Sync {
+    fn link_name(&self) -> &str;
+    /// Where its messages go: an address, or a queue's FQQN.
+    fn destination(&self) -> &str;
+    /// Whether each message gets one more hop (address federation).
+    fn adds_hop(&self) -> bool {
+        false
+    }
+    /// Its credit window and low mark.
+    fn credits(&self) -> i32;
+    fn credits_low(&self) -> i32;
+    fn use_modified(&self) -> bool;
+    fn large_threshold(&self) -> i32;
+    fn is_closed(&self) -> bool;
+    /// The peer answered the attach, taking the link or not.
+    fn attached(&self, opened: bool);
+    /// The peer closed the link: whether for a reason the connection
+    /// survives (the link closed interceptor's answer).
+    fn remote_closed(&self, error: Option<&Error>) -> bool;
+    /// A stop asked for completed (its credit drained), or not.
+    fn stopped(&self, ok: bool);
 }
 
 /// `ProtonAbstractReceiver`'s states as a stop sees them.
@@ -526,6 +558,8 @@ struct SenderLink {
     presettled: bool,
     draining: bool,
     fed: Option<FedSender>,
+    /// A bridge's sender (`AMQPBridgeToSenderController`).
+    bridge: Option<Arc<crate::bridge::Sender>>,
 }
 
 /// The transaction coordinator link (`ProtonTransactionHandler`).
@@ -604,6 +638,8 @@ pub enum LocalLinkKind {
     },
     /// A federation's link.
     Federation(FedLink),
+    /// A bridge's link.
+    Bridge(crate::bridge::BridgeLink),
 }
 
 /// A declared transaction (`ProtonTransactionImpl`).
@@ -1336,7 +1372,7 @@ impl Conn {
             self.opened = true;
             self.client.set_client_id(Some(open.container_id));
             if let Some(f) = o.on_open.take() {
-                f();
+                f(open.offered_capabilities.as_deref().unwrap_or_default());
             }
             return Ok(());
         }
@@ -2328,6 +2364,7 @@ impl Conn {
                 presettled,
                 draining: false,
                 fed: None,
+                bridge: None,
             }),
         );
         let mut reply = reply;
@@ -2372,7 +2409,7 @@ impl Conn {
             match l {
                 Link::Receiver(rl) => {
                     link_name = rl.name.clone();
-                    if let ReceiveMode::Federated(c) = &rl.mode {
+                    if let ReceiveMode::Managed(c) = &rl.mode {
                         intercepted = c.remote_closed(detach.error.as_ref());
                     }
                 }
@@ -2384,6 +2421,9 @@ impl Conn {
                     }) = &sl.fed
                     {
                         intercepted = detach.error.is_none();
+                    }
+                    if let Some(b) = &sl.bridge {
+                        intercepted = b.remote_closed(detach.error.as_ref());
                     }
                 }
                 Link::Coordinator(_) => {}
@@ -2458,6 +2498,12 @@ impl Conn {
                     .federation_link_attached(channel, handle, link, f, remote)
                     .await;
             }
+            LocalLinkKind::Bridge(b) => {
+                let b = b.clone();
+                return self
+                    .bridge_link_attached(channel, handle, link, b, remote)
+                    .await;
+            }
         };
         if refused {
             self.link_failed(refused_message(&link));
@@ -2527,7 +2573,9 @@ impl Conn {
                 let flow = self.link_flow(s, handle, delivery_count, credits, false);
                 self.send(channel, Performative::Flow(flow));
             }
-            LocalLinkKind::Federation(_) => unreachable!("handled above"),
+            LocalLinkKind::Federation(_) | LocalLinkKind::Bridge(_) => {
+                unreachable!("handled above")
+            }
         }
         Ok(())
     }
@@ -2629,6 +2677,7 @@ impl Conn {
                 presettled: false,
                 draining: false,
                 fed,
+                bridge: None,
             }),
         );
         Ok(())
@@ -2817,42 +2866,211 @@ impl Conn {
                     ));
                     return Ok(());
                 }
-                let opened = remote.source.is_some();
-                let address = match &c.kind {
-                    ConsumerKind::Address { target } => target.clone(),
-                    ConsumerKind::Queue { fqqn } => fqqn.clone(),
-                };
-                let delivery_count = remote.initial_delivery_count.unwrap_or(0);
-                let credits = if opened { c.credits.max(0) as u32 } else { 0 };
-                let s = self.sessions.get_mut(&channel).expect("checked");
-                let implicit = link::implicit_routing_type(&s.server, &address);
-                s.server.add_producer(&name, "AMQP", Some(&address));
-                s.links.insert(
-                    handle,
-                    Link::Receiver(ReceiverLink {
-                        name,
-                        target: ReceiverTarget {
-                            address: Some(address),
-                            explicit: None,
-                            implicit,
-                            dynamic: false,
-                        },
-                        source: link.attach.source.clone(),
-                        credit: credits,
-                        delivery_count,
-                        incoming: None,
-                        dynamic_expiry: TerminusExpiryPolicy::SessionEnd,
-                        mode: ReceiveMode::Federated(c.clone()),
-                        window: Some((c.credits, c.credits_low)),
-                        state: ReceiverState::Started,
-                    }),
-                );
-                if opened {
-                    let s = &self.sessions[&channel];
-                    let flow = self.link_flow(s, handle, delivery_count, credits, false);
-                    self.send(channel, Performative::Flow(flow));
+                self.attach_managed_receiver(channel, handle, &link, c, &remote);
+            }
+        }
+        Ok(())
+    }
+
+    /// A federation or bridge receiver the peer answered: kept with its
+    /// own credit window, granted once the peer took it. One the peer
+    /// refused waits for its detach.
+    fn attach_managed_receiver(
+        &mut self,
+        channel: u16,
+        handle: u32,
+        link: &LocalLink,
+        c: Arc<dyn ManagedReceiver>,
+        remote: &Attach,
+    ) {
+        let opened = remote.source.is_some();
+        let address = c.destination().to_owned();
+        let delivery_count = remote.initial_delivery_count.unwrap_or(0);
+        let credits = if opened { c.credits().max(0) as u32 } else { 0 };
+        let s = self.sessions.get_mut(&channel).expect("checked");
+        let implicit = link::implicit_routing_type(&s.server, &address);
+        s.server
+            .add_producer(&link.attach.name, "AMQP", Some(&address));
+        s.links.insert(
+            handle,
+            Link::Receiver(ReceiverLink {
+                name: link.attach.name.clone(),
+                target: ReceiverTarget {
+                    address: Some(address),
+                    explicit: None,
+                    implicit,
+                    dynamic: false,
+                },
+                source: link.attach.source.clone(),
+                credit: credits,
+                delivery_count,
+                incoming: None,
+                dynamic_expiry: TerminusExpiryPolicy::SessionEnd,
+                mode: ReceiveMode::Managed(c.clone()),
+                window: Some((c.credits(), c.credits_low())),
+                state: ReceiverState::Started,
+            }),
+        );
+        if opened {
+            let s = &self.sessions[&channel];
+            let flow = self.link_flow(s, handle, delivery_count, credits, false);
+            self.send(channel, Performative::Flow(flow));
+        }
+        c.attached(opened);
+    }
+
+    /// The peer's answer to a bridge's link (the `AMQP_LINK_INITIALIZER_KEY`
+    /// runnables of the bridge receivers and senders). A link the peer
+    /// refused is kept until its detach, which recovery answers.
+    async fn bridge_link_attached(
+        &mut self,
+        channel: u16,
+        handle: u32,
+        link: LocalLink,
+        kind: crate::bridge::BridgeLink,
+        remote: Attach,
+    ) -> Handled {
+        use crate::bridge::{BridgeLink, SenderKind};
+        let name = link.attach.name.clone();
+        let not_found = |what: &str| format!("AMQ119002: target address {what} does not exist");
+        match kind {
+            BridgeLink::Receiver(r) => {
+                if r.is_closed() {
+                    // Closed before the peer answered.
+                    self.close_local(channel, handle);
+                    return Ok(());
                 }
-                c.attached(opened);
+                // initialize: the local address or queue must still be there.
+                let missing = match &r.queue {
+                    Some(q) => (!self.broker.post_office().queue_query(q).exists).then_some(q),
+                    None => self
+                        .broker
+                        .post_office()
+                        .address_info(&r.destination)
+                        .is_none()
+                        .then_some(&r.destination),
+                };
+                if let Some(what) = missing {
+                    let message = not_found(what);
+                    self.refuse_local(channel, handle, condition::NOT_FOUND, message);
+                    return Ok(());
+                }
+                self.attach_managed_receiver(channel, handle, &link, r, &remote);
+            }
+            BridgeLink::Sender(b) => {
+                if b.is_closed() {
+                    self.close_local(channel, handle);
+                    return Ok(());
+                }
+                // createServerConsumer
+                let made = match &b.kind {
+                    SenderKind::Address {
+                        address,
+                        queue,
+                        routing,
+                        durable,
+                        filter,
+                        auto_delete,
+                        auto_delete_delay,
+                        auto_delete_message_count,
+                    } => {
+                        let po = self.broker.post_office();
+                        if po.address_info(address).is_none() {
+                            Err((condition::NOT_FOUND, not_found(address)))
+                        } else {
+                            let s = self.sessions.get_mut(&channel).expect("checked");
+                            let mut spec =
+                                saranga_server::postoffice::QueueSpec::new(queue.as_str(), address.as_str());
+                            spec.routing_type = Some(*routing);
+                            spec.filter_string = filter.clone().filter(|f| !f.is_empty());
+                            spec.max_consumers = Some(1);
+                            if *durable {
+                                // The subscription is recovered, else made.
+                                let q = s.server.queue_query(queue);
+                                if q.exists {
+                                    if q.address.to_string() != *address {
+                                        Err((
+                                            condition::ILLEGAL_STATE,
+                                            format!(
+                                                "Requested queue: {queue} for bridge to address: {address}, but it is already mapped to a different address: {}",
+                                                q.address
+                                            ),
+                                        ))
+                                    } else {
+                                        Ok(())
+                                    }
+                                } else {
+                                    spec.durable = true;
+                                    spec.auto_create_address = Some(false);
+                                    spec.purge_on_no_consumers = Some(false);
+                                    spec.auto_delete = Some(*auto_delete);
+                                    spec.auto_delete_delay = Some(*auto_delete_delay);
+                                    spec.auto_delete_message_count =
+                                        Some(*auto_delete_message_count);
+                                    s.server.create_queue(spec).map(|_| ()).map_err(|e| {
+                                        (condition::INTERNAL_ERROR, e.message)
+                                    })
+                                }
+                            } else {
+                                // createTemporaryQueue(address, queue, routing,
+                                // filter, 1, true)
+                                spec.durable = false;
+                                spec.temporary = true;
+                                spec.auto_delete = Some(true);
+                                s.server.create_queue(spec).map(|_| ()).map_err(|e| {
+                                    (
+                                        condition::INTERNAL_ERROR,
+                                        format!(
+                                            "AMQ119001: error creating temporary queue, {}",
+                                            e.message
+                                        ),
+                                    )
+                                })
+                            }
+                        }
+                        .map(|()| (queue.clone(), None))
+                    }
+                    SenderKind::Queue {
+                        address,
+                        queue,
+                        filter,
+                    } => {
+                        let po = self.broker.post_office();
+                        if po.address_info(address).is_none() {
+                            Err((condition::NOT_FOUND, not_found(address)))
+                        } else if !po.queue_query(queue).exists {
+                            Err((condition::NOT_FOUND, not_found(queue)))
+                        } else {
+                            Ok((queue.clone(), filter.clone().filter(|f| !f.is_empty())))
+                        }
+                    }
+                };
+                let (queue, filter) = match made {
+                    Ok(x) => x,
+                    Err((cond, message)) => {
+                        self.refuse_local(channel, handle, cond, message);
+                        return Ok(());
+                    }
+                };
+                let source = link.attach.source.clone();
+                if let Err(e) = self
+                    .queue_sender(
+                        channel, handle, name, &queue, filter, b.priority, source, None,
+                    )
+                    .await
+                {
+                    self.refuse_local(channel, handle, condition::INTERNAL_ERROR, e);
+                    return Ok(());
+                }
+                if let Some(Link::Sender(sl)) = self
+                    .sessions
+                    .get_mut(&channel)
+                    .and_then(|s| s.links.get_mut(&handle))
+                {
+                    sl.presettled = b.presettled;
+                    sl.bridge = Some(b.clone());
+                }
+                b.attached(remote.target.is_some());
             }
         }
         Ok(())
@@ -2891,6 +3109,19 @@ impl Conn {
                         }
                     }
                     Some(FedSenderKind::Queue { .. }) => {}
+                    // tryDeleteTemporarySubscriptionQueue: a bridge's
+                    // temporary subscription goes with its link.
+                    None if sl.bridge.is_some() => {
+                        if let Some(crate::bridge::SenderKind::Address {
+                            queue,
+                            durable: false,
+                            ..
+                        }) = sl.bridge.as_ref().map(|b| &b.kind)
+                            && s.server.queue_query(queue).exists
+                        {
+                            let _ = s.server.delete_queue_with(queue, false);
+                        }
+                    }
                     None => {
                         if remote_close {
                             self.close_subscription(s, &sl);
@@ -3171,26 +3402,22 @@ impl Conn {
                 }
                 return Ok(());
             }
-            ReceiveMode::Federated(c) => {
-                large_at = c.large_threshold.max(0) as usize;
-                match &c.kind {
-                    // incrementAMQPMessageHops, then the address.
-                    ConsumerKind::Address { target: address } => {
-                        if let Ok(mut m) =
-                            AmqpMessage::new(i64::from(incoming.format), payload.clone(), now)
-                        {
-                            let hops = m
-                                .annotation(fed::MESSAGE_HOPS_ANNOTATION)
-                                .and_then(Value::as_i64)
-                                .map_or(1, |h| h as i32 + 1);
-                            m.set_annotation(fed::MESSAGE_HOPS_ANNOTATION, Value::Int(hops));
-                            m.reencode(now);
-                            payload = m.data().to_vec();
-                        }
-                        target.address = Some(address.clone());
-                    }
-                    ConsumerKind::Queue { fqqn } => target.address = Some(fqqn.clone()),
+            ReceiveMode::Managed(c) => {
+                large_at = c.large_threshold().max(0) as usize;
+                // incrementAMQPMessageHops
+                if c.adds_hop()
+                    && let Ok(mut m) =
+                        AmqpMessage::new(i64::from(incoming.format), payload.clone(), now)
+                {
+                    let hops = m
+                        .annotation(fed::MESSAGE_HOPS_ANNOTATION)
+                        .and_then(Value::as_i64)
+                        .map_or(1, |h| h as i32 + 1);
+                    m.set_annotation(fed::MESSAGE_HOPS_ANNOTATION, Value::Int(hops));
+                    m.reencode(now);
+                    payload = m.data().to_vec();
                 }
+                target.address = Some(c.destination().to_owned());
             }
         }
         s.server.set_sender(Some(rl.name.clone()));
@@ -3238,7 +3465,7 @@ impl Conn {
                     source.as_ref(),
                     &e,
                     match &mode {
-                        ReceiveMode::Federated(c) => c.use_modified,
+                        ReceiveMode::Managed(c) => c.use_modified(),
                         _ => self.settings.use_modified_for_transient_delivery_errors,
                     },
                 )
@@ -3639,7 +3866,7 @@ impl Conn {
         };
         if rl.state == ReceiverState::Stopping && rl.credit == 0 && rl.incoming.is_none() {
             rl.state = ReceiverState::Stopped;
-            if let ReceiveMode::Federated(c) = &rl.mode {
+            if let ReceiveMode::Managed(c) = &rl.mode {
                 c.stopped(true);
             }
         }
@@ -4176,7 +4403,7 @@ fn refused_message(link: &LocalLink) -> String {
         LocalLinkKind::Receiver { address, .. } => {
             format!("AMQ119029: Receiver link refused for address {address}")
         }
-        LocalLinkKind::Federation(_) => format!(
+        LocalLinkKind::Federation(_) | LocalLinkKind::Bridge(_) => format!(
             "AMQ119021: The broker connection had a remote link closed unexpectedly: {}",
             link.attach.name
         ),

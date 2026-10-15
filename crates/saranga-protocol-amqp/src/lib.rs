@@ -11,6 +11,7 @@
 //!   [`native`], how the broker holds them.
 //! - [`convert`]: conversion to and from Core.
 
+pub mod bridge;
 pub mod broker_connection;
 pub mod codec;
 pub mod composite;

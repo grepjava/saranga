@@ -1,0 +1,49 @@
+=== artemis run (node 2, node 1)
+node 2: listening
+node 1: listening
+node 1: connected to node 2
+=== AmqpBridge.java topic news (subscriber on node 2, published on node 1)
+published 10
+received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+=== AmqpBridge.java queue outbox inbox (sent on node 1, consumed on node 2)
+sent 10
+received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+no more
+none left
+=== AmqpBridge.java topic alerts (subscriber on node 1, published on node 2)
+published 10
+received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+=== AmqpBridge.java queue orders (sent on node 2, consumed on node 1)
+sent 10
+received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+no more
+none left
+=== AmqpBridge.java late late (consumed on node 1, made and sent on node 2)
+created late
+sent 10
+received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+=== artemis stop (node 2)
+node 2: down
+node 1: retrying
+=== artemis run (node 2)
+node 2: listening
+node 1: connected to node 2
+=== AmqpBridge.java topic news (subscriber on node 2, published on node 1)
+published 10
+received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+=== AmqpBridge.java queue outbox inbox (sent on node 1, consumed on node 2)
+sent 10
+received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+no more
+none left
+=== AmqpBridge.java topic alerts (subscriber on node 1, published on node 2)
+published 10
+received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+=== AmqpBridge.java queue orders (sent on node 2, consumed on node 1)
+sent 10
+received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+no more
+none left
+=== artemis stop (node 1, node 2)
+node 1: down
+node 2: down

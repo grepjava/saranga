@@ -25,20 +25,20 @@ fn finds(m: &Match, name: &str) -> bool {
 /// An address or queue name pattern; empty matches anything
 /// (`AddressMatcher`, `QueueMatcher`).
 #[derive(Debug, Clone)]
-struct Pattern {
+pub(crate) struct Pattern {
     text: String,
     matcher: Option<Match>,
 }
 
 impl Pattern {
-    fn new(text: &str, wildcards: &WildcardConfiguration) -> Self {
+    pub(crate) fn new(text: &str, wildcards: &WildcardConfiguration) -> Self {
         Self {
             text: text.to_owned(),
             matcher: (!text.is_empty()).then(|| Match::new(text, wildcards)),
         }
     }
 
-    fn test(&self, name: &str) -> bool {
+    pub(crate) fn test(&self, name: &str) -> bool {
         self.matcher.as_ref().is_none_or(|m| finds(m, name))
     }
 }

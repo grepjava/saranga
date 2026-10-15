@@ -17,6 +17,7 @@ use saranga_server::plugin::BrokerPlugin;
 use saranga_server::queue::Queue;
 use tokio::net::TcpStream;
 
+use crate::bridge::BridgeManager;
 use crate::composite::Fields;
 use crate::connection::{
     self, ConnectionHandle, ContainerIds, Ended, LocalLink, LocalLinkKind, Outgoing,
@@ -133,21 +134,22 @@ impl BrokerConnectionManager {
                 }
             };
             let mut federation = None;
+            let mut bridges = Vec::new();
             for e in &c.elements {
-                if let AmqpConnectionElement::Federation(f) = e {
+                match e {
                     // installFederation: the last one is the connection's.
-                    federation = Some(Federation::source(broker, f));
-                }
-                let unsupported = match e {
-                    AmqpConnectionElement::Mirror(_) => Some("mirror"),
-                    AmqpConnectionElement::Bridge(_) => Some("bridge"),
-                    _ => None,
-                };
-                if let Some(what) = unsupported {
-                    tracing::warn!(
-                        "broker connection {}: <{what}> is not supported yet and is ignored",
+                    AmqpConnectionElement::Federation(f) => {
+                        federation = Some(Federation::source(broker, f));
+                    }
+                    // installBridgeManager
+                    AmqpConnectionElement::Bridge(b) => {
+                        bridges.push(BridgeManager::new(broker, b));
+                    }
+                    AmqpConnectionElement::Mirror(_) => tracing::warn!(
+                        "broker connection {}: <mirror> is not supported yet and is ignored",
                         c.name
-                    );
+                    ),
+                    _ => {}
                 }
             }
             let connection = Arc::new(AmqpBrokerConnection {
@@ -160,6 +162,7 @@ impl BrokerConnectionManager {
                 plugin: Mutex::new(None),
                 me: Mutex::new(Weak::new()),
                 federation,
+                bridges,
             });
             *lock(&connection.me) = Arc::downgrade(&connection);
             // initialize: registered, with management.
@@ -179,6 +182,9 @@ impl BrokerConnectionManager {
             c.stop_inner();
             if let Some(f) = &c.federation {
                 f.shutdown();
+            }
+            for b in &c.bridges {
+                b.shutdown();
             }
             broker
                 .broker_connection_registry()
@@ -214,6 +220,8 @@ pub struct AmqpBrokerConnection {
     plugin: Mutex<Option<Arc<dyn BrokerPlugin>>>,
     /// The `<federation>`, if any (`brokerFederation`).
     federation: Option<Arc<Federation>>,
+    /// The `<bridge>`s (`bridgeManagers`).
+    bridges: Vec<Arc<BridgeManager>>,
     me: Mutex<Weak<AmqpBrokerConnection>>,
 }
 
@@ -241,6 +249,9 @@ impl AmqpBrokerConnection {
         if let Some(f) = &self.federation {
             f.start();
         }
+        for b in &self.bridges {
+            b.start();
+        }
         st.task = Some(tokio::spawn(me.clone().run()));
     }
 
@@ -261,6 +272,9 @@ impl AmqpBrokerConnection {
         }
         if let Some(f) = &self.federation {
             f.stop();
+        }
+        for b in &self.bridges {
+            b.stop();
         }
         if let Some(h) = handle {
             h.fail("Stopping Broker Connection");
@@ -363,6 +377,29 @@ impl AmqpBrokerConnection {
                     .collect(),
             ),
         );
+        // Bridges are restored once the peer's Open is in, knowing what it
+        // offers (addRemoteOpenedListener).
+        let handle_slot: Arc<Mutex<Option<ConnectionHandle>>> = Arc::default();
+        let on_open: Option<connection::OnOpen> = (!self.bridges.is_empty()).then(|| {
+            let bridges = self.bridges.clone();
+            let slot = handle_slot.clone();
+            let params = endpoint.params.clone();
+            Box::new(move |offered: &[Symbol]| {
+                let Some(handle) = lock(&slot).clone() else {
+                    return;
+                };
+                let shared_subs = offered
+                    .iter()
+                    .any(|s| s.as_str() == crate::link::capability::SHARED_SUBS);
+                for b in &bridges {
+                    b.connection_restored(
+                        handle.clone(),
+                        Settings::from_params(&params),
+                        shared_subs,
+                    );
+                }
+            }) as connection::OnOpen
+        });
         let outgoing = Outgoing {
             user: self.config.user.clone(),
             password: self.config.password.clone(),
@@ -371,8 +408,9 @@ impl AmqpBrokerConnection {
                 .contains_key("saslMechanisms")
                 .then(|| settings.sasl_mechanisms.clone()),
             properties,
-            desired_capabilities: None,
-            on_open: None,
+            desired_capabilities: (!self.bridges.is_empty())
+                .then(|| vec![Symbol::from(crate::link::capability::SHARED_SUBS)]),
+            on_open,
         };
         let (handle, task) = connection::connect_out(
             broker.clone(),
@@ -395,6 +433,7 @@ impl AmqpBrokerConnection {
             st.senders.clear();
             st.receivers.clear();
         }
+        *lock(&handle_slot) = Some(handle.clone());
         let task = tokio::spawn(task);
         if let Some(f) = &self.federation {
             f.connection_restored(handle.clone(), Settings::from_params(&endpoint.params));
@@ -411,6 +450,9 @@ impl AmqpBrokerConnection {
         let ended = task.await.unwrap_or(Ended::Closed);
         if let Some(f) = &self.federation {
             f.connection_interrupted();
+        }
+        for b in &self.bridges {
+            b.connection_interrupted();
         }
         let mut st = lock(&self.state);
         st.connected = false;
