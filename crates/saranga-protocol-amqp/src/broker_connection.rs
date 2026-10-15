@@ -24,6 +24,7 @@ use crate::connection::{
 };
 use crate::federation::Federation;
 use crate::messaging::{Source, Target, TargetKind};
+use crate::mirror::source::MirrorSource;
 use crate::transport::{Attach, ReceiverSettleMode, Role, SenderSettleMode};
 use crate::types::{Symbol, Value};
 use crate::{AmqpConfig, Settings};
@@ -145,10 +146,6 @@ impl BrokerConnectionManager {
                     AmqpConnectionElement::Bridge(b) => {
                         bridges.push(BridgeManager::new(broker, b));
                     }
-                    AmqpConnectionElement::Mirror(_) => tracing::warn!(
-                        "broker connection {}: <mirror> is not supported yet and is ignored",
-                        c.name
-                    ),
                     _ => {}
                 }
             }
@@ -163,6 +160,7 @@ impl BrokerConnectionManager {
                 me: Mutex::new(Weak::new()),
                 federation,
                 bridges,
+                mirrors: Mutex::new(None),
             });
             *lock(&connection.me) = Arc::downgrade(&connection);
             // initialize: registered, with management.
@@ -222,6 +220,9 @@ pub struct AmqpBrokerConnection {
     federation: Option<Arc<Federation>>,
     /// The `<bridge>`s (`bridgeManagers`).
     bridges: Vec<Arc<BridgeManager>>,
+    /// The `<mirror>`s' sources, installed the first time the connection
+    /// starts and kept from then on, the connection stopped or not.
+    mirrors: Mutex<Option<Vec<Arc<MirrorSource>>>>,
     me: Mutex<Weak<AmqpBrokerConnection>>,
 }
 
@@ -243,6 +244,22 @@ impl AmqpBrokerConnection {
             return;
         }
         st.started = true;
+        // installMirrorController, the first time only.
+        {
+            let mut mirrors = lock(&self.mirrors);
+            if mirrors.is_none() {
+                let mut installed = Vec::new();
+                for e in &self.config.elements {
+                    if let AmqpConnectionElement::Mirror(m) = e {
+                        match MirrorSource::install(&broker, &self.config.name, m) {
+                            Ok(source) => installed.push(source),
+                            Err(e) => tracing::warn!("{}", e.message),
+                        }
+                    }
+                }
+                *mirrors = Some(installed);
+            }
+        }
         let plugin: Arc<dyn BrokerPlugin> = Arc::new(QueuePlugin(Arc::downgrade(&me)));
         broker.register_plugin(plugin.clone());
         *lock(&self.plugin) = Some(plugin);
@@ -441,6 +458,10 @@ impl AmqpBrokerConnection {
         for q in broker.post_office().queues() {
             self.validate_matching(&broker, &q);
         }
+        let mirrors = lock(&self.mirrors).clone().unwrap_or_default();
+        for m in mirrors {
+            self.connect_mirror(&handle, &broker, m);
+        }
         tracing::info!(
             "AMQ111003: \n*******************************************************************************************************************************\nConnected on Server AMQP Connection {} on {} after {} retries\n*******************************************************************************************************************************\n",
             self.config.name,
@@ -517,6 +538,43 @@ impl AmqpBrokerConnection {
             kind: LocalLinkKind::Sender {
                 queue: queue.name().to_string(),
             },
+        });
+    }
+
+    /// `connectSender` for a `<mirror>`: a link sending the
+    /// store-and-forward queue to the peer's address of the same name,
+    /// naming this broker and desiring `amq.mirror`.
+    fn connect_mirror(
+        &self,
+        handle: &ConnectionHandle,
+        broker: &Broker,
+        source: Arc<MirrorSource>,
+    ) {
+        let queue = source.snf().name().to_string();
+        let mut properties = Fields::default();
+        properties.insert(crate::mirror::BROKER_ID, Value::string(broker.node_id()));
+        let attach = Attach {
+            name: format!("{queue}:{}", uuid::Uuid::new_v4()),
+            handle: 0,
+            role: Role::Sender,
+            snd_settle_mode: SenderSettleMode::Unsettled,
+            rcv_settle_mode: ReceiverSettleMode::First,
+            source: Some(Source {
+                address: Some(source.snf_address().to_owned()),
+                ..Default::default()
+            }),
+            target: Some(TargetKind::Target(Target {
+                address: Some(queue),
+                ..Default::default()
+            })),
+            initial_delivery_count: Some(0),
+            desired_capabilities: Some(vec![Symbol::from(crate::mirror::MIRROR_CAPABILITY)]),
+            properties: Some(properties),
+            ..Default::default()
+        };
+        handle.open(LocalLink {
+            attach,
+            kind: LocalLinkKind::Mirror(source),
         });
     }
 

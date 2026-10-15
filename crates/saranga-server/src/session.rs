@@ -353,11 +353,23 @@ pub struct Completion {
     /// Queue updates that must follow the journal writes
     /// (`afterCompleteOperations`): routed references, committed outcomes.
     actions: Vec<Box<dyn FnOnce() + Send>>,
+    /// What `sync` mirrors' peers complete once they have what the queue
+    /// updates sent them (`replicationLineUp`), waited for after those.
+    replicated: Vec<Replicated>,
 }
+
+/// Mirror waits a request lines up, some of them as its queue updates are
+/// made.
+pub type Replicated = Arc<Mutex<Vec<Pending>>>;
 
 impl Completion {
     pub fn is_empty(&self) -> bool {
-        self.waits.is_empty() && self.actions.is_empty()
+        self.waits.is_empty()
+            && self.actions.is_empty()
+            && self
+                .replicated
+                .iter()
+                .all(|r| lock_replicated(r).is_empty())
     }
 
     /// Adds a journal write to wait for.
@@ -369,6 +381,7 @@ impl Completion {
     pub fn merge(&mut self, other: Completion) {
         self.waits.extend(other.waits);
         self.actions.extend(other.actions);
+        self.replicated.extend(other.replicated);
     }
 
     /// Waits for the journal writes, then makes the queue updates; after a
@@ -386,10 +399,22 @@ impl Completion {
                 for action in self.actions {
                     action();
                 }
+                for r in self.replicated {
+                    let waits = std::mem::take(&mut *lock_replicated(&r));
+                    for w in waits {
+                        // A peer that never answers keeps the client
+                        // waiting, as Artemis does; one gone is no error.
+                        let _ = w.wait().await;
+                    }
+                }
                 Ok(())
             }
         }
     }
+}
+
+fn lock_replicated(r: &Replicated) -> std::sync::MutexGuard<'_, Vec<Pending>> {
+    r.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub struct ServerSession {
@@ -433,6 +458,10 @@ pub struct ServerSession {
     entry: Arc<SessionEntry>,
     /// The producer the next sends are counted against.
     sender: Option<String>,
+    /// How its routes are mirrored: by a mirror target, as from its peer.
+    mirroring: crate::mirror::Mirroring,
+    /// The `sync` mirror waits the request so far lined up.
+    replicated: Replicated,
 }
 
 /// What [`ServerSession::send_message`] sends besides the message.
@@ -523,6 +552,8 @@ impl ServerSession {
             unchecked: false,
             direct: false,
             internal: false,
+            mirroring: crate::mirror::Mirroring::Enabled,
+            replicated: Replicated::default(),
         }
     }
 
@@ -574,6 +605,8 @@ impl ServerSession {
             unchecked: false,
             direct: false,
             internal: false,
+            mirroring: crate::mirror::Mirroring::Enabled,
+            replicated: Replicated::default(),
         }
     }
 
@@ -594,6 +627,76 @@ impl ServerSession {
         self.unchecked = false;
         self.direct = false;
         r
+    }
+
+    /// `AMQPMirrorControllerTarget.sendMessage`: a message the peer `origin`
+    /// mirrored, kept as it came (its ID there as `x-opt-amq-mr-id`, its
+    /// broker as `x-opt-amq-bkr-id`), routed to `address` without
+    /// auto-creation, diverts or remote bindings (or to `target_queues`
+    /// only), in a transaction of its own (`MirrorTransaction`) with its
+    /// duplicate ID `duplicate` added to the mirror's cache. Returns false
+    /// for one the cache already has (not routed again).
+    #[allow(clippy::too_many_arguments)] // the parts of a mirrored message
+    pub fn send_mirrored(
+        &mut self,
+        native: Arc<dyn NativeMessage>,
+        body: Option<Arc<LargeBody>>,
+        address: Option<&str>,
+        target_queues: Option<&[String]>,
+        origin: crate::mirror::Origin,
+        cache: &crate::duplicate::CacheRef,
+        duplicate: Vec<u8>,
+    ) -> Result<bool> {
+        let po = self.broker.post_office().clone();
+        if crate::duplicate::lock(cache).contains(&duplicate) {
+            return Ok(false);
+        }
+        let view = native.view();
+        let mut message = view.clone();
+        if message.message_id == 0 {
+            message.message_id = po.ids().next();
+        }
+        if let Some(a) = address {
+            message.address = Some(SimpleString::from(a));
+        }
+        let Some(address) = message.address.as_ref().map(|a| a.to_string_lossy()) else {
+            return Err(BrokerError::no_address());
+        };
+        let settings = po.settings(crate::postoffice::split_fqqn(&address).0);
+        crate::message::apply_expiry_delay(&mut message, &settings, crate::message::now_millis());
+        let scheduled_time = crate::message::scheduled_delivery_time(&message);
+        let n = native.updated(&view, &message);
+        let mut r = MessageRef::new(match body {
+            Some(b) => ServerMessage::new_native_large(n, b),
+            None => ServerMessage::new_native(n),
+        });
+        r.scheduled_time = scheduled_time;
+        let tx = self.new_tx(None);
+        {
+            let record = po.ids().next();
+            let mut t = transaction::lock(&tx);
+            let c = crate::duplicate::lock(cache);
+            c.store_tx(t.id, &duplicate, record).map_err(io_error)?;
+            t.persistent |= c.is_persistent();
+            t.duplicates.push(crate::duplicate::PendingId {
+                cache: cache.clone(),
+                id: duplicate,
+                record,
+            });
+        }
+        let routed = po.route_mirrored(&r, &address, target_queues)?;
+        self.mirroring = crate::mirror::Mirroring::From(origin);
+        self.unchecked = true;
+        let sent = self
+            .page_routed(routed, Some(&tx))
+            .and_then(|routed| self.deliver_routed(routed, Some(tx.clone()), None));
+        self.mirroring = crate::mirror::Mirroring::Enabled;
+        self.unchecked = false;
+        if let Err(e) = sent {
+            transaction::lock(&tx).mark_rollback_only(&e);
+        }
+        self.commit_tx(&tx)?;
+        Ok(true)
     }
 
     pub fn name(&self) -> &str {
@@ -682,6 +785,7 @@ impl ServerSession {
         Completion {
             waits: std::mem::take(&mut self.ops),
             actions: std::mem::take(&mut self.actions),
+            replicated: vec![std::mem::take(&mut self.replicated)],
         }
     }
 
@@ -780,9 +884,14 @@ impl ServerSession {
             self.ops.push(p);
         }
         if defer && storage.is_some() {
-            self.actions.push(Box::new(move || outcome.apply()));
+            let replicated = self.replicated.clone();
+            self.actions.push(Box::new(move || {
+                let waits = outcome.apply();
+                lock_replicated(&replicated).extend(waits);
+            }));
         } else {
-            outcome.apply();
+            let waits = outcome.apply();
+            lock_replicated(&self.replicated).extend(waits);
         }
         Ok(())
     }
@@ -796,9 +905,17 @@ impl ServerSession {
         routed: crate::postoffice::Routed,
         tx: Option<&TxRef>,
     ) -> Result<crate::postoffice::Routed> {
-        let (routed, pending) = self.broker.post_office().page_routed(routed, tx)?;
-        self.ops.extend(pending);
-        Ok(routed)
+        let paged = self
+            .broker
+            .post_office()
+            .page_routed_mirrored(routed, tx, &self.mirroring)?;
+        self.ops.extend(paged.pending);
+        // A transaction's messages reach the mirror once it commits.
+        match tx {
+            Some(tx) => transaction::lock(tx).replicated.extend(paged.replicated),
+            None => lock_replicated(&self.replicated).extend(paged.replicated),
+        }
+        Ok(paged.routed)
     }
 
     /// `LargeServerMessageImpl.checkLargeMessage`: a message too big for a
@@ -1556,7 +1673,9 @@ impl ServerSession {
                             if let Some(p) = queue.store_ack(r).map_err(io_error)? {
                                 self.ops.push(p);
                             }
-                            queue.post_acknowledge(r);
+                            if let Some(p) = queue.post_acknowledge(r) {
+                                lock_replicated(&self.replicated).push(p);
+                            }
                         }
                     }
                 }

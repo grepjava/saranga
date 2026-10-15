@@ -866,14 +866,47 @@ impl AmqpMessage {
 }
 
 impl AmqpMessage {
+    /// `getSendBuffer(deliveryCount, reference)` for a reference carrying
+    /// delivery annotations (a mirror's): they replace the message's own.
+    pub fn send_buffer_with(&self, delivery_count: i32, da: Option<&Annotations>) -> Vec<u8> {
+        let Some(da) = da else {
+            return self.send_buffer(delivery_count);
+        };
+        if self.large {
+            return self.large_send_buffer_with(Some(da));
+        }
+        // createDeliveryCopy
+        let mut out = Vec::with_capacity(self.data.len() + 64);
+        if delivery_count > 1 {
+            let mut h = self.header.clone().unwrap_or_default();
+            h.delivery_count = Some((delivery_count - 1) as u32);
+            h.encode(&mut out);
+        } else {
+            out.extend(&self.data[..self.encoded_header_size.min(self.data.len())]);
+        }
+        encode_annotations(section::DELIVERY_ANNOTATIONS, da, &mut out);
+        let skip = self.encoded_header_size + self.encoded_delivery_annotations_size;
+        out.extend(&self.data[skip.min(self.data.len())..]);
+        out
+    }
+
     /// `AMQPLargeMessageWriter`: the header as stored (its delivery count
     /// is not updated), then the file after the header and delivery
     /// annotations; a re-encoded message's annotations, properties and
     /// application properties come from the record.
     fn large_send_buffer(&self) -> Vec<u8> {
+        self.large_send_buffer_with(None)
+    }
+
+    /// [`AmqpMessage::large_send_buffer`], with the reference's delivery
+    /// annotations after the header.
+    fn large_send_buffer_with(&self, da: Option<&Annotations>) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.data.len() + 64);
         if let Some(h) = &self.header {
             h.encode(&mut out);
+        }
+        if let Some(da) = da {
+            encode_annotations(section::DELIVERY_ANNOTATIONS, da, &mut out);
         }
         let mut position = self.encoded_header_size + self.encoded_delivery_annotations_size;
         if self.reencoded

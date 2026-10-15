@@ -114,6 +114,9 @@ pub struct Transaction {
     pub timeout_seconds: i32,
     /// What it did with pages.
     pub paging: crate::paging::TxPaging,
+    /// What `sync` mirrors complete once their peers have its messages,
+    /// waited for once it commits.
+    pub replicated: Vec<Pending>,
 }
 
 pub type TxRef = Arc<Mutex<Transaction>>;
@@ -141,6 +144,8 @@ pub struct Outcome {
     /// The transaction's paging, committed or rolled back with it.
     pub paging: crate::paging::TxPaging,
     pub committed: bool,
+    /// Commit: the `sync` mirror waits of its messages.
+    pub replicated: Vec<Pending>,
 }
 
 impl Outcome {
@@ -167,8 +172,8 @@ impl Outcome {
     /// Applies the outcome to the queues (`afterCommit` / `afterRollback`):
     /// committed sends join their queues, committed acknowledgements are
     /// final, rolled-back references return to their queues, which check
-    /// them for redelivery.
-    pub fn apply(self) {
+    /// them for redelivery. Returns the `sync` mirror waits.
+    pub fn apply(self) -> Vec<Pending> {
         for d in self.duplicates {
             d.apply();
         }
@@ -180,10 +185,12 @@ impl Outcome {
         } else {
             self.paging.after_rollback();
         }
+        let mut replicated = self.replicated;
         for (q, r) in self.acked {
-            q.post_acknowledge(&r);
+            replicated.extend(q.post_acknowledge(&r));
         }
         return_refs(self.cancel);
+        replicated
     }
 }
 
@@ -236,6 +243,7 @@ impl Transaction {
             created: crate::message::now_millis(),
             timeout_seconds: -1,
             paging: crate::paging::TxPaging::default(),
+            replicated: Vec::new(),
         }
     }
 
@@ -266,6 +274,7 @@ impl Transaction {
         self.state = TxState::RolledBack;
         self.sends.clear();
         self.duplicates.clear();
+        self.replicated.clear();
         Outcome {
             record: journaled.then_some(TxRecord::Rollback(self.id)),
             cancel: std::mem::take(&mut self.acks),
@@ -313,6 +322,7 @@ impl Transaction {
             duplicates: std::mem::take(&mut self.duplicates),
             paging: std::mem::take(&mut self.paging),
             committed: true,
+            replicated: std::mem::take(&mut self.replicated),
         })
     }
 

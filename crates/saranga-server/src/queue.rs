@@ -611,12 +611,15 @@ impl Queue {
     /// durable queue refers to the message, its record is deleted (not
     /// synced; recovery deletes what a crash missed). A paged message is
     /// acknowledged on its page instead.
-    pub fn post_acknowledge(&self, r: &MessageRef) {
-        self.post_acknowledge_for(r, AckReason::Normal);
+    pub fn post_acknowledge(&self, r: &MessageRef) -> Option<Pending> {
+        self.post_acknowledge_for(r, AckReason::Normal)
     }
 
-    /// [`Queue::post_acknowledge`], counted under `reason`.
-    pub fn post_acknowledge_for(&self, r: &MessageRef, reason: AckReason) {
+    /// [`Queue::post_acknowledge`], counted under `reason`. The mirrors are
+    /// told (`preAcknowledge`, `postAcknowledge`) of all but a replaced
+    /// last value; with a `sync` mirror, what completes once its peer has
+    /// the acknowledgement.
+    pub fn post_acknowledge_for(&self, r: &MessageRef, reason: AckReason) -> Option<Pending> {
         let counter = match reason {
             AckReason::Normal => &self.0.messages_acknowledged,
             AckReason::Killed => &self.0.messages_killed,
@@ -625,9 +628,18 @@ impl Queue {
         };
         counter.fetch_add(1, Ordering::SeqCst);
         self.0.used.store(true, Ordering::SeqCst);
+        let mut mirrored = None;
         if let Some(po) = self.0.post_office.upgrade() {
             po.plugins()
                 .each(|p| p.message_acknowledged(r, self, reason));
+            if reason != AckReason::Replaced {
+                let origin = crate::mirror::origin();
+                for m in po.mirrors().all() {
+                    if let Some(p) = m.acknowledged(self, r, reason, origin.as_ref()) {
+                        mirrored = Some(p);
+                    }
+                }
+            }
         }
         if let Some(position) = &r.paged {
             if let Some(sub) = &self.0.paging
@@ -635,7 +647,7 @@ impl Queue {
             {
                 store.acknowledged(sub, position);
             }
-            return;
+            return mirrored;
         }
         self.0.message_count.fetch_sub(1, Ordering::SeqCst);
         self.ref_down(r);
@@ -649,6 +661,7 @@ impl Queue {
                 r.message_id()
             );
         }
+        mirrored
     }
 
     /// `refUp`: the message's memory counts against its address while
@@ -1695,9 +1708,14 @@ impl Actor {
         reason: AckReason,
         address: &str,
     ) {
-        // A paging address takes the copy in its pages.
-        let routed = match po.page_routed(routed.clone(), None) {
-            Ok((routed, _)) => routed,
+        // A paging address takes the copy in its pages. An expired
+        // message's copy is not mirrored: the peer expires it too.
+        let mirroring = match reason {
+            AckReason::Expired => crate::mirror::Mirroring::Disabled,
+            _ => crate::mirror::Mirroring::Enabled,
+        };
+        let routed = match po.page_routed_mirrored(routed.clone(), None, &mirroring) {
+            Ok(paged) => paged.routed,
             Err(e) => {
                 tracing::warn!("moving message {} to {address}: {e}", r.message_id());
                 routed

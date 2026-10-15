@@ -485,6 +485,8 @@ enum ReceiveMode {
     /// `AMQPBridgeAddressDeliveryReceiver`,
     /// `AMQPBridgeQueueDeliveryReceiver`).
     Managed(Arc<dyn ManagedReceiver>),
+    /// A peer's mirror link (`AMQPMirrorControllerTarget`).
+    Mirror(Arc<crate::mirror::target::MirrorTarget>),
 }
 
 /// A receiver a broker connection's policy keeps attached to the peer: a
@@ -560,6 +562,9 @@ struct SenderLink {
     fed: Option<FedSender>,
     /// A bridge's sender (`AMQPBridgeToSenderController`).
     bridge: Option<Arc<crate::bridge::Sender>>,
+    /// A mirror's link: its store-and-forward address, whose other
+    /// messages carry delivery annotations (`setProtocolData`).
+    mirror: Option<String>,
 }
 
 /// The transaction coordinator link (`ProtonTransactionHandler`).
@@ -640,6 +645,9 @@ pub enum LocalLinkKind {
     Federation(FedLink),
     /// A bridge's link.
     Bridge(crate::bridge::BridgeLink),
+    /// A mirror's link, sending its store-and-forward queue
+    /// (`connectSender` for a `<mirror>`).
+    Mirror(Arc<crate::mirror::source::MirrorSource>),
 }
 
 /// A declared transaction (`ProtonTransactionImpl`).
@@ -1608,6 +1616,14 @@ impl Conn {
             // The client sends: the broker receives.
             Role::Sender => match &attach.target {
                 Some(TargetKind::Coordinator(_)) => self.attach_coordinator(channel, attach),
+                // isReplicaTarget
+                Some(TargetKind::Target(t))
+                    if t.address
+                        .as_deref()
+                        .is_some_and(|a| a.starts_with(saranga_server::mirror::MIRROR_ADDRESS)) =>
+                {
+                    self.attach_mirror_target(channel, attach)
+                }
                 _ if link::has(
                     attach.desired_capabilities.as_ref(),
                     fed::FEDERATION_CONTROL_LINK,
@@ -1640,6 +1656,107 @@ impl Conn {
                 }
             }
         }
+    }
+
+    // -------------------------------------------------------- mirror links
+
+    /// `handleReplicaTargetLinkOpened` and `addReplicaTarget`: the peer's
+    /// mirror link, which must be allowed to send to its address and desire
+    /// `amq.mirror`, makes this end its target. The answer offers
+    /// `amq.mirror` and names this broker (`x-opt-amq-bkr-id`).
+    fn attach_mirror_target(&mut self, channel: u16, attach: Attach) -> Handled {
+        let mut reply = Attach {
+            name: attach.name.clone(),
+            handle: attach.handle,
+            role: Role::Receiver,
+            snd_settle_mode: attach.snd_settle_mode,
+            rcv_settle_mode: ReceiverSettleMode::First,
+            source: attach.source.clone(),
+            target: attach.target.clone(),
+            ..Default::default()
+        };
+        let address = match &attach.target {
+            Some(TargetKind::Target(t)) => t.address.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+        let s = self.sessions.get_mut(&channel).expect("checked");
+        if let Err(e) = s
+            .server
+            .security_check(&address, None, saranga_config::CheckType::Send)
+        {
+            let e = LinkError::new(
+                condition::UNAUTHORIZED_ACCESS,
+                format!(
+                    "AMQ119017: not authorized to create producer, {}",
+                    e.message
+                ),
+            );
+            tracing::warn!("{}", e.description);
+            self.refuse_link(channel, reply, e);
+            return Ok(());
+        }
+        if !link::has(
+            attach.desired_capabilities.as_ref(),
+            crate::mirror::MIRROR_CAPABILITY,
+        ) {
+            let e = LinkError::new(
+                condition::ILLEGAL_STATE,
+                format!(
+                    "AMQ119024: link is missing a desired capability declaration {}",
+                    crate::mirror::MIRROR_CAPABILITY
+                ),
+            );
+            tracing::warn!("{}", e.description);
+            self.refuse_link(channel, reply, e);
+            return Ok(());
+        }
+        let remote_id = attach
+            .properties
+            .as_ref()
+            .and_then(|p| p.get(crate::mirror::BROKER_ID))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let credits = self.settings.credits;
+        let target = Arc::new(crate::mirror::target::MirrorTarget::new(
+            self.broker.clone(),
+            remote_id,
+            credits,
+        ));
+        let mut properties = Fields::default();
+        properties.insert(
+            crate::mirror::BROKER_ID,
+            Value::string(self.broker.node_id()),
+        );
+        reply.properties = Some(properties);
+        reply.offered_capabilities = Some(vec![Symbol::from(crate::mirror::MIRROR_CAPABILITY)]);
+        self.send(channel, Performative::Attach(reply));
+        let credits = credits.max(0) as u32;
+        let delivery_count = attach.initial_delivery_count.unwrap_or(0);
+        let s = self.sessions.get_mut(&channel).expect("checked");
+        s.links.insert(
+            attach.handle,
+            Link::Receiver(ReceiverLink {
+                name: attach.name.clone(),
+                target: ReceiverTarget {
+                    address: Some(address),
+                    explicit: None,
+                    implicit: None,
+                    dynamic: false,
+                },
+                source: attach.source.clone(),
+                credit: credits,
+                delivery_count,
+                incoming: None,
+                dynamic_expiry: TerminusExpiryPolicy::SessionEnd,
+                mode: ReceiveMode::Mirror(target),
+                window: None,
+                state: ReceiverState::Started,
+            }),
+        );
+        let s = &self.sessions[&channel];
+        let flow = self.link_flow(s, attach.handle, delivery_count, credits, false);
+        self.send(channel, Performative::Flow(flow));
+        Ok(())
     }
 
     // -------------------------------------------------------- federation links
@@ -2365,6 +2482,7 @@ impl Conn {
                 draining: false,
                 fed: None,
                 bridge: None,
+                mirror: None,
             }),
         );
         let mut reply = reply;
@@ -2490,7 +2608,7 @@ impl Conn {
         remote: Attach,
     ) -> Handled {
         let refused = match &link.kind {
-            LocalLinkKind::Sender { .. } => remote.target.is_none(),
+            LocalLinkKind::Sender { .. } | LocalLinkKind::Mirror(_) => remote.target.is_none(),
             LocalLinkKind::Receiver { .. } => remote.source.is_none(),
             LocalLinkKind::Federation(f) => {
                 let f = f.clone();
@@ -2511,6 +2629,54 @@ impl Conn {
         }
         let name = link.attach.name.clone();
         match link.kind {
+            LocalLinkKind::Mirror(source) => {
+                // The peer must offer amq.mirror and name itself, not as
+                // this broker.
+                if !link::has(
+                    remote.offered_capabilities.as_ref(),
+                    crate::mirror::MIRROR_CAPABILITY,
+                ) {
+                    self.link_failed(format!(
+                        "AMQ119018: link is missing an offered capability declaration [{}]",
+                        crate::mirror::MIRROR_CAPABILITY
+                    ));
+                    return Ok(());
+                }
+                let remote_id = remote
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.get(crate::mirror::BROKER_ID))
+                    .map(|v| v.as_str().map(str::to_owned).unwrap_or_default());
+                let Some(remote_id) = remote_id else {
+                    self.link_failed(
+                        "AMQ119019: There is no brokerID defined on the target connection. Connection will be closed."
+                            .into(),
+                    );
+                    return Ok(());
+                };
+                if remote_id == self.broker.node_id() {
+                    self.link_failed(
+                        "AMQ119022: The broker connection is trying to connect to itself. Check your configuration."
+                            .into(),
+                    );
+                    return Ok(());
+                }
+                source.set_remote_id(Some(remote_id));
+                let queue = source.snf().name().to_string();
+                let attach_source = link.attach.source.clone();
+                match self
+                    .queue_sender(channel, handle, name, &queue, None, 0, attach_source, None)
+                    .await
+                {
+                    Ok(()) => {
+                        let s = self.sessions.get_mut(&channel).expect("checked");
+                        if let Some(Link::Sender(sl)) = s.links.get_mut(&handle) {
+                            sl.mirror = Some(source.snf_address().to_owned());
+                        }
+                    }
+                    Err(e) => self.refuse_local(channel, handle, condition::INTERNAL_ERROR, e),
+                }
+            }
             LocalLinkKind::Sender { queue } => {
                 // AMQPOutgoingController.init: createSender(queue).
                 let source = link.attach.source.clone();
@@ -2678,6 +2844,7 @@ impl Conn {
                 draining: false,
                 fed,
                 bridge: None,
+                mirror: None,
             }),
         );
         Ok(())
@@ -3419,20 +3586,34 @@ impl Conn {
                 }
                 target.address = Some(c.destination().to_owned());
             }
+            ReceiveMode::Mirror(_) => {}
         }
-        s.server.set_sender(Some(rl.name.clone()));
-        let result = server_send(
-            &mut s.server,
-            &target,
-            incoming.format,
-            payload,
-            container,
-            tx.clone(),
-            now,
-            large_at,
-        )
-        .await;
-        s.server.set_sender(None);
+        let result = match &mode {
+            // A mirrored message that fails is logged and accepted all the
+            // same (`actualDelivery`).
+            ReceiveMode::Mirror(t) => {
+                let _ = t
+                    .receive(&mut s.server, incoming.format, payload, now, large_at)
+                    .await;
+                Ok(())
+            }
+            _ => {
+                s.server.set_sender(Some(rl.name.clone()));
+                let r = server_send(
+                    &mut s.server,
+                    &target,
+                    incoming.format,
+                    payload,
+                    container,
+                    tx.clone(),
+                    now,
+                    large_at,
+                )
+                .await;
+                s.server.set_sender(None);
+                r
+            }
+        };
         let wait = s.server.take_completion();
         rl_topup(
             s,
@@ -3887,18 +4068,22 @@ impl Conn {
         let Some(Link::Sender(sl)) = s.links.get_mut(&handle) else {
             return Ok(());
         };
+        let da = sl
+            .mirror
+            .as_deref()
+            .and_then(|snf| crate::mirror::delivery_annotations(&message, snf));
         let (format, payload) = match message
             .native()
             .and_then(|n| n.as_any().downcast_ref::<AmqpNative>())
         {
             Some(n) => (
                 n.message.message_format as u32,
-                n.message.send_buffer(delivery_count),
+                n.message.send_buffer_with(delivery_count, da.as_ref()),
             ),
             None => (
                 0,
                 crate::convert::from_core(message.delivery_core(), now_millis())
-                    .send_buffer(delivery_count),
+                    .send_buffer_with(delivery_count, da.as_ref()),
             ),
         };
         sl.link_credit = sl.link_credit.saturating_sub(1);
@@ -4393,7 +4578,7 @@ fn failure_state(source: Option<&Source>, e: &BrokerError, use_modified: bool) -
 /// `receiverLinkRefused`).
 fn refused_message(link: &LocalLink) -> String {
     match &link.kind {
-        LocalLinkKind::Sender { .. } => {
+        LocalLinkKind::Sender { .. } | LocalLinkKind::Mirror(_) => {
             let address = match &link.attach.target {
                 Some(TargetKind::Target(t)) => t.address.clone().unwrap_or_default(),
                 _ => String::new(),

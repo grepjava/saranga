@@ -442,6 +442,8 @@ pub struct PostOffice {
     positions: Mutex<HashMap<(Name, Name), usize>>,
     /// The broker's grouping handler, when it has one.
     grouping: std::sync::OnceLock<Arc<crate::grouping::GroupingHandler>>,
+    /// The mirror sources installed.
+    mirrors: crate::mirror::Mirrors,
 }
 
 #[derive(Default)]
@@ -473,6 +475,7 @@ impl PostOffice {
             plugins: Arc::default(),
             positions: Mutex::default(),
             grouping: std::sync::OnceLock::new(),
+            mirrors: crate::mirror::Mirrors::default(),
         })
     }
 
@@ -778,9 +781,31 @@ impl PostOffice {
         routed: Routed,
         tx: Option<&crate::transaction::TxRef>,
     ) -> Result<(Routed, Vec<crate::storage::Pending>)> {
-        let mut out = Vec::with_capacity(routed.len());
-        let mut pending = Vec::new();
+        self.page_routed_mirrored(routed, tx, &crate::mirror::Mirroring::Enabled)
+            .map(|p| (p.routed, p.pending))
+    }
+
+    /// [`PostOffice::page_routed`], each message then handed to the mirrors
+    /// as `processRoute` does (`sendMessage`): a mirror taking it gets a
+    /// reference in its store-and-forward queue, or a copy of its own
+    /// (`copyMessageForPaging`) when the message was paged here or the
+    /// queue pages. With `sync`, the waits for its peer are `replicated`.
+    pub fn page_routed_mirrored(
+        &self,
+        routed: Routed,
+        tx: Option<&crate::transaction::TxRef>,
+        mirroring: &crate::mirror::Mirroring,
+    ) -> Result<PageRouted> {
+        let mirrors = match mirroring {
+            crate::mirror::Mirroring::Disabled => Vec::new(),
+            _ => self.mirrors.all(),
+        };
+        let mut out = PageRouted {
+            routed: Vec::with_capacity(routed.len()),
+            ..PageRouted::default()
+        };
         for (r, queues) in routed {
+            let routed_here = !queues.is_empty();
             let mut by_address: Vec<(Name, Vec<Queue>)> = Vec::new();
             for q in queues {
                 let a = q.config().address.clone();
@@ -790,21 +815,101 @@ impl PostOffice {
                 }
             }
             let mut keep = Vec::new();
+            let (mut paged, mut dropped) = (false, false);
             for (address, group) in by_address {
                 match self.paging_store(&address).page(&r.message, tx, &group)? {
                     crate::paging::Paged::No => keep.extend(group),
                     crate::paging::Paged::Yes(p) => {
                         group.iter().for_each(Queue::paged_added);
-                        pending.extend(p);
+                        out.pending.extend(p);
+                        paged = true;
                     }
-                    crate::paging::Paged::Dropped => {}
+                    crate::paging::Paged::Dropped => dropped = true,
+                }
+            }
+            let mut copies = Vec::new();
+            if routed_here && !dropped {
+                for m in &mirrors {
+                    let Some(snf) = m.send_message(&r, mirroring.origin()) else {
+                        continue;
+                    };
+                    let store = self.paging_store(&snf.config().address);
+                    let id = if paged || store.is_paging() {
+                        let copy = self.copy_for_mirror(&r);
+                        let id = copy.message_id();
+                        match store.page(&copy.message, tx, std::slice::from_ref(&snf))? {
+                            crate::paging::Paged::No => copies.push((copy, vec![snf])),
+                            crate::paging::Paged::Yes(p) => {
+                                snf.paged_added();
+                                out.pending.extend(p);
+                            }
+                            crate::paging::Paged::Dropped => continue,
+                        }
+                        id
+                    } else {
+                        keep.push(snf);
+                        r.message_id()
+                    };
+                    out.replicated.extend(m.sync_wait(id));
                 }
             }
             if !keep.is_empty() {
-                out.push((r, keep));
+                out.routed.push((r, keep));
+            }
+            out.routed.extend(copies);
+        }
+        Ok(out)
+    }
+
+    /// `AMQPMirrorControllerSource.routeMirrorCommand`: a message the
+    /// broker makes goes to this one queue, unmirrored: in its pages when
+    /// its address pages, else journaled (when durable) and added.
+    pub fn route_to_queue(&self, r: MessageRef, queue: &Queue) {
+        let paged = self.page_routed_mirrored(
+            vec![(r, vec![queue.clone()])],
+            None,
+            &crate::mirror::Mirroring::Disabled,
+        );
+        let routed = match paged {
+            Ok(p) => p.routed,
+            Err(e) => {
+                tracing::warn!("routing to {}: {e}", queue.name());
+                return;
+            }
+        };
+        for (m, queues) in routed {
+            for q in queues {
+                if q.is_durable_ref(&m)
+                    && let Some(s) = self.ids.storage()
+                {
+                    let stored = (|| {
+                        if m.message.durable_up() == 1 {
+                            s.store_message(&m.message)?;
+                        }
+                        s.store_reference(q.id(), m.message_id(), true)
+                    })();
+                    if let Err(e) = stored {
+                        tracing::warn!("routing to {}: {e}", q.name());
+                    }
+                }
+                q.add(m.clone());
             }
         }
-        Ok((out, pending))
+    }
+
+    /// `AMQPMirrorControllerSource.copyMessageForPaging`: a copy with an ID
+    /// of its own, the original's kept as `x-opt-amq-mr-id`.
+    fn copy_for_mirror(&self, r: &MessageRef) -> MessageRef {
+        let original = r.message.core();
+        let mut core = original.clone();
+        core.message_id = self.ids.next();
+        core.properties.insert(
+            saranga_buffer::SimpleString::from(crate::mirror::INTERNAL_ID),
+            saranga_buffer::PropertyValue::Long(original.message_id),
+        );
+        let mut copy = MessageRef::new(r.message.copy(core));
+        copy.scheduled_time = r.scheduled_time;
+        copy
     }
 
     /// A new queue's cursor on its address's pages.
@@ -1024,34 +1129,45 @@ impl PostOffice {
         drop(state);
         crate::audit::registered("AddressControlImpl", info.name.as_ref());
         self.plugins.each(|p| p.after_add_address(&info, false));
+        self.mirror_add_address(&info);
         Ok(info)
     }
 
     /// The auto-created address of an internal queue
     /// (`AddressInfo.setInternal`).
     fn add_internal_address(&self, name: &str, routing_type: RoutingType) -> Result<AddressInfo> {
-        let mut state = self.write();
-        if let Some(entry) = state.addresses.get(name) {
-            return Ok(entry.info.clone());
-        }
-        let mut info = AddressInfo {
+        self.add_address_info(AddressInfo {
             id: 0,
             name: name.into(),
             routing_types: RoutingTypes::of(routing_type),
             auto_created: true,
             temporary: false,
             internal: true,
-        };
+        })
+        .map(|(info, _)| info)
+    }
+
+    /// `ActiveMQServerImpl.addAddressInfo`: adds the address as given
+    /// (its ID aside) unless there is one of that name. Returns the
+    /// address, and whether it was added.
+    pub fn add_address_info(&self, mut info: AddressInfo) -> Result<(AddressInfo, bool)> {
+        let name = info.name.clone();
+        let mut state = self.write();
+        if let Some(entry) = state.addresses.get(&*name) {
+            return Ok((entry.info.clone(), false));
+        }
         if !self.plugins.is_empty() {
             drop(state);
             self.plugins.check(|p| p.before_add_address(&info, false))?;
             state = self.write();
-            if let Some(entry) = state.addresses.get(name) {
-                return Ok(entry.info.clone());
+            if let Some(entry) = state.addresses.get(&*name) {
+                return Ok((entry.info.clone(), false));
             }
         }
         info.id = self.ids.next();
-        if let Some(s) = self.ids.storage() {
+        if !info.temporary
+            && let Some(s) = self.ids.storage()
+        {
             crate::recovery::store_address(s, &info).map_err(Self::io)?;
         }
         state
@@ -1060,7 +1176,19 @@ impl PostOffice {
         drop(state);
         crate::audit::registered("AddressControlImpl", info.name.as_ref());
         self.plugins.each(|p| p.after_add_address(&info, false));
-        Ok(info)
+        self.mirror_add_address(&info);
+        Ok((info, true))
+    }
+
+    /// The mirror sources installed (`getMirrorControlSource`).
+    pub fn mirrors(&self) -> &crate::mirror::Mirrors {
+        &self.mirrors
+    }
+
+    fn mirror_add_address(&self, info: &AddressInfo) {
+        for m in self.mirrors.all() {
+            m.add_address(info);
+        }
     }
 
     /// Adds a routing type to an address, creating it if needed (the
@@ -1094,6 +1222,11 @@ impl PostOffice {
                 drop(state);
                 self.plugins
                     .each(|p| p.after_remove_address(name, info.as_ref()));
+                if let Some(info) = &info {
+                    for m in self.mirrors.all() {
+                        m.delete_address(info);
+                    }
+                }
                 true
             }
             _ => false,
@@ -1203,6 +1336,9 @@ impl PostOffice {
             p.after_add_binding(&c.name, &c.address);
             p.after_create_queue(&queue);
         });
+        for m in self.mirrors.all() {
+            m.create_queue(&queue);
+        }
         Ok(queue)
     }
 
@@ -1328,6 +1464,9 @@ impl PostOffice {
             ));
         }
         self.plugins.check(|p| p.before_destroy_queue(name))?;
+        for m in self.mirrors.all() {
+            m.delete_queue(&queue);
+        }
         let address = queue.config().address.clone();
         self.plugins
             .each(|p| p.before_remove_binding(name, &address));
@@ -1755,6 +1894,63 @@ impl PostOffice {
         out
     }
 
+    /// `route` as a mirror target routes its peer's message
+    /// (`AMQPMirrorControllerTarget.sendMessage`): no auto-creation, only
+    /// local bindings (`LOCAL_ONLY`) and no diverts (`disableDivert`); with
+    /// `target_queues`, only to those of the address's queues
+    /// (`targetQueuesRouting`).
+    pub fn route_mirrored(
+        &self,
+        message: &MessageRef,
+        address: &str,
+        target_queues: Option<&[String]>,
+    ) -> Result<Routed> {
+        if let Some(names) = target_queues {
+            let (real, _) = split_fqqn(address);
+            let state = self.read();
+            let bound: &[Queue] = state
+                .addresses
+                .get(real)
+                .map_or(&[], |e| e.queues.as_slice());
+            let queues: Vec<Queue> = names
+                .iter()
+                .filter_map(|n| bound.iter().find(|q| &**q.name() == n.as_str()))
+                .filter(|q| q.filter().is_none_or(|f| f.matches(&*message.message)))
+                .cloned()
+                .collect();
+            drop(state);
+            return Ok(match queues.is_empty() {
+                true => Vec::new(),
+                false => vec![(message.clone(), queues)],
+            });
+        }
+        let mut out = Vec::new();
+        let routing_type = routing_type(message.message.core());
+        let plugins = &self.plugins;
+        plugins.check(|p| p.before_message_route(&message.message))?;
+        let routed = self.route_into(
+            message,
+            address,
+            routing_type,
+            Hop {
+                mirror: true,
+                ..Hop::internal()
+            },
+            &mut out,
+        );
+        match routed {
+            Ok(()) => {
+                let status = crate::plugin::RoutingStatus::of(&out);
+                plugins.each(|p| p.after_message_route(&message.message, status));
+                Ok(out)
+            }
+            Err(e) => {
+                plugins.each(|p| p.on_message_route_exception(&message.message, &e));
+                Err(e)
+            }
+        }
+    }
+
     fn route_into(
         &self,
         message: &MessageRef,
@@ -1768,6 +1964,7 @@ impl PostOffice {
             depth,
             to_dla,
             creator,
+            mirror,
         } = hop;
         let (real, _) = split_fqqn(address);
         // checkAddress
@@ -1799,7 +1996,7 @@ impl PostOffice {
         {
             return Err(BrokerError::address_does_not_exist(real));
         }
-        let bindings = self.bindings_route(message, address);
+        let bindings = self.bindings_route(message, address, mirror);
         self.count_route(
             real,
             bindings.as_ref().is_some_and(|r| !r.queues.is_empty()),
@@ -1814,6 +2011,11 @@ impl PostOffice {
         };
         if !queues.is_empty() {
             out.push((with_route_context(message, &remote), queues));
+        }
+        // `disableDivert`: a mirror target's message is not diverted (the
+        // peer sends the diverted copies on their own).
+        if mirror {
+            return Ok(());
         }
         if depth >= MAX_DIVERT_DEPTH {
             if !diverts.is_empty() {
@@ -2290,11 +2492,20 @@ impl PostOffice {
     /// the bindings sharing a routing name are one group, of which one
     /// binding takes the message (`getNextBinding`). `None` when there are
     /// no bindings at all.
-    fn bindings_route(&self, message: &MessageRef, address: &str) -> Option<Routes> {
+    fn bindings_route(
+        &self,
+        message: &MessageRef,
+        address: &str,
+        local_only: bool,
+    ) -> Option<Routes> {
         let (real, fqqn_queue) = split_fqqn(address);
         let state = self.read();
         let entries = self.routing_entries(&state, real);
-        let remote: &[Arc<RemoteBinding>] = state.remote.get(real).map_or(&[], Vec::as_slice);
+        // `MessageLoadBalancingType.LOCAL_ONLY`: no remote binding.
+        let remote: &[Arc<RemoteBinding>] = match local_only {
+            true => &[],
+            false => state.remote.get(real).map_or(&[], Vec::as_slice),
+        };
         let has_local = entries
             .iter()
             .any(|e| !e.queues.is_empty() || !e.diverts.is_empty());
@@ -2694,6 +2905,8 @@ struct Hop<'a> {
     depth: usize,
     to_dla: bool,
     creator: Creator<'a>,
+    /// Routed by a mirror target: local bindings only, no diverts.
+    mirror: bool,
 }
 
 impl<'a> Hop<'a> {
@@ -2703,6 +2916,7 @@ impl<'a> Hop<'a> {
             depth: 0,
             to_dla: false,
             creator,
+            mirror: false,
         }
     }
 
@@ -2719,6 +2933,18 @@ const MAX_DIVERT_DEPTH: usize = 16;
 
 /// Where a send went: each message with its queues.
 pub type Routed = Vec<(MessageRef, Vec<Queue>)>;
+
+/// [`PostOffice::page_routed_mirrored`]'s outcome.
+#[derive(Default)]
+pub struct PageRouted {
+    /// What is left to route as references.
+    pub routed: Routed,
+    /// The page writes to wait for.
+    pub pending: Vec<crate::storage::Pending>,
+    /// What completes once `sync` mirrors' peers have the messages, to
+    /// wait for once the references are in their queues.
+    pub replicated: Vec<crate::storage::Pending>,
+}
 
 fn routing_type_of(message: &saranga_message::CoreMessage) -> Option<RoutingType> {
     routing_type(message)

@@ -650,6 +650,9 @@ pub struct PagingStore {
     page_full: AtomicBool,
     /// `blockedViaAddressControl`.
     blocked_via_management: AtomicBool,
+    /// `enforceAddressFullMessagePolicy`: the policy whatever the settings
+    /// say (a mirror's store-and-forward queue's).
+    enforced: Mutex<Option<AddressFullPolicy>>,
     me: Weak<PagingStore>,
 }
 
@@ -695,6 +698,7 @@ impl PagingStore {
             blocking: AtomicBool::new(false),
             blocked_via_management: AtomicBool::new(false),
             page_full: AtomicBool::new(false),
+            enforced: Mutex::new(None),
             me: me.clone(),
         });
         store.check_page_settings(&settings);
@@ -811,7 +815,21 @@ impl PagingStore {
     }
 
     fn settings(&self) -> Arc<AddressSettings> {
-        lock(&self.settings).clone()
+        let s = lock(&self.settings).clone();
+        match *lock(&self.enforced) {
+            Some(p) if s.address_full_policy != p => {
+                let mut enforced = (*s).clone();
+                enforced.address_full_policy = p;
+                Arc::new(enforced)
+            }
+            _ => s,
+        }
+    }
+
+    /// `enforceAddressFullMessagePolicy`: `policy` from now on, whatever
+    /// the address settings say.
+    pub fn enforce_policy(&self, policy: AddressFullPolicy) {
+        *lock(&self.enforced) = Some(policy);
     }
 
     /// `applySetting`.

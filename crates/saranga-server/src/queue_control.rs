@@ -378,6 +378,39 @@ impl Queue {
         self.prompt_delivery();
         n.unwrap_or(0)
     }
+
+    /// `removeWithSuppliedID` then `acknowledge` (or `expire`), as a mirror
+    /// target's `AckManager` does: the queued messages with these node and
+    /// message IDs (`ReferenceIDSupplier`'s: the broker the message came
+    /// from, `local_node` for one sent here, and its ID there) leave the
+    /// queue for their reasons, with `origin` the target in use; with
+    /// `pages`, those still in pages too. Returns the IDs found.
+    pub async fn ack_supplied(
+        &self,
+        wanted: Vec<((String, i64), AckReason)>,
+        local_node: String,
+        pages: bool,
+        origin: crate::mirror::Origin,
+    ) -> Vec<(String, i64)> {
+        let found = self
+            .manage(move |a| {
+                crate::mirror::with_origin(Some(origin), || {
+                    a.ack_supplied(wanted.into_iter().collect(), &local_node, pages)
+                })
+            })
+            .await;
+        self.prompt_delivery();
+        found.unwrap_or_default()
+    }
+}
+
+/// `ReferenceNodeStore`'s key of a reference: the broker the message came
+/// from (`local_node` for this one's) and its ID there.
+fn supplied_key(r: &MessageRef, local_node: &str) -> (String, i64) {
+    (
+        crate::mirror::server_id(&r.message).unwrap_or_else(|| local_node.to_owned()),
+        crate::mirror::internal_id(&r.message),
+    )
 }
 
 fn consumer_info(c: &Consumer) -> ConsumerInfo {
@@ -397,6 +430,104 @@ fn consumer_info(c: &Consumer) -> ConsumerInfo {
 }
 
 impl Actor {
+    /// [`Queue::ack_supplied`] in the actor.
+    fn ack_supplied(
+        &mut self,
+        mut wanted: HashMap<(String, i64), AckReason>,
+        local_node: &str,
+        pages: bool,
+    ) -> Vec<(String, i64)> {
+        let mut found = Vec::new();
+        let mut taken = Vec::new();
+        if wanted.len() == 1 {
+            if let Some(at) = self
+                .messages
+                .find(|r| wanted.contains_key(&supplied_key(r, local_node)))
+            {
+                taken.push(self.messages.remove(at));
+            }
+        } else {
+            taken = self
+                .messages
+                .take_where(|r| wanted.contains_key(&supplied_key(r, local_node)));
+        }
+        if taken.len() < wanted.len() {
+            let keys: Vec<_> = self
+                .scheduled
+                .iter()
+                .filter(|(_, r)| wanted.contains_key(&supplied_key(r, local_node)))
+                .map(|(k, _)| *k)
+                .collect();
+            for k in keys {
+                if let Some(mut r) = self.scheduled.remove(&k) {
+                    r.scheduled_time = 0;
+                    taken.push(r);
+                }
+            }
+        }
+        for r in taken {
+            let key = supplied_key(&r, local_node);
+            let Some(reason) = wanted.remove(&key) else {
+                // A second reference to the same message: left alone.
+                self.messages.insert_sorted(r);
+                continue;
+            };
+            self.ack_with(r, reason);
+            found.push(key);
+        }
+        if !pages || wanted.is_empty() {
+            return found;
+        }
+        // Messages still in pages (`AckManager.retryPage`).
+        let Some(sub) = self.shared.paging.clone() else {
+            return found;
+        };
+        let Some(store) = sub.store() else {
+            return found;
+        };
+        let in_memory: HashSet<(i64, i32)> = self
+            .messages
+            .iter()
+            .chain(self.scheduled.values())
+            .chain(self.consumers.iter().flat_map(|c| c.delivering.iter()))
+            .filter_map(|r| r.paged.as_ref().map(|p| (p.page, p.message_nr)))
+            .collect();
+        let mut it = PageIterator::default();
+        let mut paged = Vec::new();
+        while !wanted.is_empty() {
+            let Some(p) = store.scan(&sub, &mut it) else {
+                break;
+            };
+            if in_memory.contains(&(p.position.page, p.position.message_nr)) {
+                continue;
+            }
+            let mut r = MessageRef::new(p.message);
+            r.paged = Some(p.position);
+            let key = supplied_key(&r, local_node);
+            if let Some(reason) = wanted.remove(&key) {
+                paged.push((r, reason));
+                found.push(key);
+            }
+        }
+        for (r, reason) in paged {
+            // Counted as read in, so its acknowledgement balances.
+            if let Some(p) = &r.paged {
+                sub.read_in(p.size);
+            }
+            self.ack_with(r, reason);
+        }
+        found
+    }
+
+    /// `AckManager.doACK`: an expired message is expired, any other
+    /// acknowledged for its reason.
+    fn ack_with(&mut self, r: MessageRef, reason: AckReason) {
+        match reason {
+            AckReason::Expired => self.expire(r),
+            reason => self.kill_for(r, reason),
+        }
+    }
+
     pub(super) fn is_paused(&self) -> bool {
         self.queue().is_paused()
     }

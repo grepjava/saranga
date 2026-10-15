@@ -24,6 +24,7 @@ pub mod javamap;
 pub mod link;
 pub mod message;
 pub mod messaging;
+pub mod mirror;
 pub mod native;
 pub mod sasl;
 pub mod transaction;

@@ -759,6 +759,21 @@ fn parse_scalars(
     if let Some(v) = s.bool("suppress-session-notifications") {
         config.suppress_session_notifications = v;
     }
+    if let Some(v) = s.bool("mirror-page-transaction") {
+        config.mirror_page_transaction = v;
+    }
+    if let Some(v) = s.i32("mirror-ack-manager-page-attempts", Check::GtZero)? {
+        config.mirror_ack_manager_page_attempts = v;
+    }
+    if let Some(v) = s.i32("mirror-ack-manager-queue-attempts", Check::GtZero)? {
+        config.mirror_ack_manager_queue_attempts = v;
+    }
+    if let Some(v) = s.i32("mirror-ack-manager-retry-delay", Check::GtZero)? {
+        config.mirror_ack_manager_retry_delay = v;
+    }
+    if let Some(v) = s.bool("mirror-ack-manager-warn-unacked") {
+        config.mirror_ack_manager_warn_unacked = v;
+    }
     if let Some(v) = s.bool("graceful-shutdown-enabled") {
         config.graceful_shutdown_enabled = v;
     }

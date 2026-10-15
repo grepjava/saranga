@@ -294,7 +294,7 @@ fn queue_text(q: &crate::queue::Queue) -> String {
 }
 
 /// `QueueConfiguration.toJSON` of a queue's configuration.
-fn queue_config_json(q: &crate::queue::Queue) -> Json {
+pub fn queue_config_json(q: &crate::queue::Queue) -> Json {
     let c = q.config();
     let mut o = Json::object()
         .with("id", q.id())
@@ -362,7 +362,7 @@ fn routing_types(list: Option<&str>) -> Result<RoutingTypes, String> {
 }
 
 /// `QueueConfiguration.fromJSON`: every member as text, `name` required.
-fn queue_spec_from_json(text: &str) -> Result<QueueSpec, String> {
+pub fn queue_spec_from_json(text: &str) -> Result<QueueSpec, String> {
     let json = Json::parse(text)
         .map_err(|e| format!("AMQ229228: Failed to parse JSON queue configuration: {text}: {e}"))?;
     let Json::Object(members) = &json else {

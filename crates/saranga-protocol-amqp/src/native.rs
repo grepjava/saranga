@@ -22,6 +22,8 @@ const HDR_VALIDATED_USER: &str = "_AMQ_VALIDATED_USER";
 const HDR_INGRESS_TIMESTAMP: &str = "_AMQ_INGRESS_TIMESTAMP";
 const HDR_ROUTE_TO_IDS: &str = "_AMQ_ROUTE_TO";
 const ORIG_PREFIX: &str = "_AMQ_ORIG_";
+const MIRROR_INTERNAL_ID: &str = saranga_server::mirror::INTERNAL_ID;
+const MIRROR_BROKER_ID: &str = saranga_server::mirror::BROKER_ID;
 
 /// An AMQP message held by the broker.
 #[derive(Debug, Clone)]
@@ -367,6 +369,11 @@ impl NativeMessage for AmqpNative {
                 k if k.starts_with("_AMQ_") => {
                     m.set_broker_property(k, v.clone());
                     reencode = true;
+                }
+                // A mirror's (`setBrokerProperty`), kept with the message
+                // but not in its encoding.
+                MIRROR_INTERNAL_ID | MIRROR_BROKER_ID => {
+                    m.set_broker_property(&key, v.clone());
                 }
                 k => {
                     m.put_property(k, amqp_value(v));

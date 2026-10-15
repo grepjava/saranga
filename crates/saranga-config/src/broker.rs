@@ -864,6 +864,18 @@ pub struct BrokerConfig {
     /// `suppress-session-notifications`: no `SESSION_CREATED` and
     /// `SESSION_CLOSED` notifications.
     pub suppress_session_notifications: bool,
+    /// `mirror-ack-manager-queue-attempts`: how often a mirror target looks
+    /// for an acknowledged message among its queue's messages in memory
+    /// before looking in its pages too.
+    pub mirror_ack_manager_queue_attempts: i32,
+    /// `mirror-ack-manager-page-attempts`: page scans before giving up.
+    pub mirror_ack_manager_page_attempts: i32,
+    /// `mirror-ack-manager-retry-delay`, in milliseconds.
+    pub mirror_ack_manager_retry_delay: i32,
+    /// `mirror-ack-manager-warn-unacked`.
+    pub mirror_ack_manager_warn_unacked: bool,
+    /// `mirror-page-transaction`.
+    pub mirror_page_transaction: bool,
     /// `graceful-shutdown-enabled`: a stopping broker waits for its clients
     /// to disconnect.
     pub graceful_shutdown_enabled: bool,
@@ -1077,6 +1089,11 @@ impl Default for BrokerConfig {
             jmx_domain: "org.apache.activemq.artemis".to_owned(),
             management_notification_address: "activemq.notifications".to_owned(),
             suppress_session_notifications: false,
+            mirror_ack_manager_queue_attempts: 5,
+            mirror_ack_manager_page_attempts: 2,
+            mirror_ack_manager_retry_delay: 100,
+            mirror_ack_manager_warn_unacked: false,
+            mirror_page_transaction: false,
             graceful_shutdown_enabled: false,
             graceful_shutdown_timeout: -1,
             network_check_list: None,

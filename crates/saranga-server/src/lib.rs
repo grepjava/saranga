@@ -25,6 +25,7 @@ pub mod large;
 pub mod localtime;
 pub mod management;
 pub mod message;
+pub mod mirror;
 pub mod node;
 pub mod notifications;
 pub mod paging;
@@ -241,6 +242,8 @@ pub struct BrokerConfig {
     /// `reject-empty-validated-user`: messages without a validated user are
     /// refused.
     pub reject_empty_validated_user: bool,
+    /// `mirror-ack-manager-*`.
+    pub mirror_ack_manager: mirror::AckManagerSettings,
     /// The basic security manager's users, loaded from and stored in the
     /// bindings journal; `None` when JAAS does security.
     pub users: Option<Arc<users::Users>>,
@@ -301,6 +304,7 @@ impl BrokerConfig {
             security: None,
             populate_validated_user: false,
             reject_empty_validated_user: false,
+            mirror_ack_manager: mirror::AckManagerSettings::default(),
             users: None,
             bootstrap_users: Vec::new(),
             protocols: Vec::new(),
@@ -512,6 +516,9 @@ pub struct Broker {
     /// The critical analyzer asked for the broker to stop.
     shutdown: tokio::sync::Notify,
     acceptors: acceptors::Acceptors,
+    /// The mirror targets' `AckManager`, once there is one.
+    ack_manager: std::sync::OnceLock<Arc<mirror::AckManager>>,
+    ack_manager_settings: mirror::AckManagerSettings,
 }
 
 /// Reads the configuration files again (`ReloadManager`).
@@ -796,6 +803,8 @@ impl Broker {
             stopped: Default::default(),
             shutdown: tokio::sync::Notify::new(),
             acceptors: Default::default(),
+            ack_manager: std::sync::OnceLock::new(),
+            ack_manager_settings: config.mirror_ack_manager,
         });
         for p in broker.post_office.plugins().all() {
             p.registered(&broker);
@@ -815,6 +824,12 @@ impl Broker {
             broker.security_records().insert(address_match, *id);
         }
         spawn_transaction_reaper(&broker, config.transaction_timeout_scan_period);
+        // The mirror targets' acknowledgements still to retry
+        // (`AckManager.reload`).
+        let retries = broker.take_records(saranga_storage::ids::ACK_RETRY);
+        if !retries.is_empty() {
+            broker.ack_manager().reload(retries);
+        }
         slow_consumers::spawn(&broker);
         if broker.management.counters().enabled() {
             broker.management.counters().start(&broker);
@@ -1277,6 +1292,20 @@ impl Broker {
         mine.into_iter()
             .map(|r: storage::ExtraRecord| (r.id, r.data))
             .collect()
+    }
+
+    /// The mirror targets' `AckManager` (`AckManagerProvider.getManager`),
+    /// made and started when first needed.
+    pub fn ack_manager(&self) -> &Arc<mirror::AckManager> {
+        self.ack_manager.get_or_init(|| {
+            let m = mirror::AckManager::new(
+                &self.post_office,
+                &self.node_id,
+                self.ack_manager_settings,
+            );
+            m.start();
+            m
+        })
     }
 
     /// The broker's journals; `None` without persistence.

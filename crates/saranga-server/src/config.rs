@@ -388,6 +388,12 @@ impl BrokerConfig {
             security: None,
             populate_validated_user: config.populate_validated_user,
             reject_empty_validated_user: config.reject_empty_validated_user,
+            mirror_ack_manager: crate::mirror::AckManagerSettings {
+                queue_attempts: config.mirror_ack_manager_queue_attempts,
+                page_attempts: config.mirror_ack_manager_page_attempts,
+                retry_delay: i64::from(config.mirror_ack_manager_retry_delay),
+                warn_unacked: config.mirror_ack_manager_warn_unacked,
+            },
             users: None,
             bootstrap_users: Vec::new(),
             // Protocol crates register themselves: whoever starts the
