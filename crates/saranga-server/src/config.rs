@@ -185,6 +185,7 @@ fn resolve(s: &cfg::AddressSettings) -> AddressSettings {
         slow_consumer_check_period: s.slow_consumer_check_period(),
         slow_consumer_policy: s.slow_consumer_policy(),
         enable_metrics: s.enable_metrics(),
+        redistribution_delay: s.redistribution_delay(),
         management_message_attribute_size_limit: s.management_message_attribute_size_limit(),
     }
 }
@@ -397,6 +398,7 @@ impl BrokerConfig {
             cluster: crate::cluster::ClusterConfig::from_file(config),
             broadcast_groups: crate::discovery::broadcast_groups(config),
             bridges: config.bridges.clone(),
+            grouping_handler: config.grouping_handler.clone(),
             bridge_targets: crate::bridge::Targets::from_file(config),
             plugins: plugins(config)?,
             disk_monitor: crate::disk::MonitorConfig::new(

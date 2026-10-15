@@ -289,6 +289,12 @@ enum Cmd {
     },
     /// `promptDelivery`: try delivering again.
     Prompt,
+    /// `addRedistributor`.
+    AddRedistributor {
+        delay: i64,
+    },
+    /// `cancelRedistributor`.
+    CancelRedistributor,
     /// `deleteMatchingReferences`: queued messages the filter accepts (all
     /// with none) are acknowledged.
     DeleteMatching {
@@ -474,6 +480,8 @@ impl Queue {
             dispatch_start: None,
             page_iter: PageIterator::default(),
             removing: None,
+            redistributor: false,
+            redistribute_at: None,
         };
         tokio::spawn(actor.run(rx));
         queue
@@ -950,6 +958,32 @@ impl Queue {
         self.send(Cmd::ExpireScan);
     }
 
+    /// `addRedistributor`: once `delay` has passed (at once when it is 0),
+    /// if the queue has no consumers or messages none of them takes, its
+    /// messages go to other nodes of the cluster that have consumers for
+    /// them. Neither an internal queue nor one of the management address is
+    /// redistributed.
+    pub fn add_redistributor(&self, delay: i64, management_address: &str) {
+        let c = self.config();
+        if c.internal {
+            tracing::debug!("Queue {} is internal, can't be redistributed!", c.name);
+            return;
+        }
+        if c.address.starts_with(management_address) {
+            tracing::debug!(
+                "Queue {} is a management address, ignoring it for redistribution",
+                c.address
+            );
+            return;
+        }
+        self.send(Cmd::AddRedistributor { delay });
+    }
+
+    /// `cancelRedistributor`.
+    pub fn cancel_redistributor(&self) {
+        self.send(Cmd::CancelRedistributor);
+    }
+
     /// Stops the actor. Its messages are dropped.
     pub fn shutdown(&self) {
         self.0.deleted.store(true, Ordering::SeqCst);
@@ -1213,6 +1247,11 @@ struct Actor {
     /// While management removes messages with the message audit log on:
     /// those removed, logged when the removal ends.
     removing: Option<Vec<Arc<ServerMessage>>>,
+    /// `redistributor`: the queue's messages go to other nodes of the
+    /// cluster that have consumers for them.
+    redistributor: bool,
+    /// `redistributorFuture`: when a delayed redistributor is added.
+    redistribute_at: Option<i64>,
 }
 
 /// A message group as `MessageGroups` keys it: by group ID, or by bucket
@@ -1233,6 +1272,7 @@ impl Actor {
                 .map(|k| k.0)
                 .into_iter()
                 .chain(self.dispatch_start.filter(|_| !self.dispatching))
+                .chain(self.redistribute_at)
                 .min();
             let cmd = match wake {
                 None => rx.recv().await,
@@ -1243,6 +1283,7 @@ impl Actor {
                         _ = tokio::time::sleep(wait) => {
                             let shared = self.shared.clone();
                             let _critical = shared.critical.enter();
+                            self.redistributor_due();
                             self.deliver_scheduled();
                             self.deliver();
                             continue;
@@ -1268,6 +1309,7 @@ impl Actor {
             if !running {
                 break;
             }
+            self.redistributor_due();
             self.deliver_scheduled();
             self.deliver();
         }
@@ -1617,13 +1659,7 @@ impl Actor {
     /// `move`: a copy of the message goes to `address` (to the queue
     /// `target` only, when given) and the reference is acknowledged under
     /// `reason`, in one transaction.
-    fn move_to(
-        &mut self,
-        address: &str,
-        mut r: MessageRef,
-        reason: AckReason,
-        target: Option<Queue>,
-    ) {
+    fn move_to(&mut self, address: &str, r: MessageRef, reason: AckReason, target: Option<Queue>) {
         let expiry = reason == AckReason::Expired;
         let Some(po) = self.shared.post_office.upgrade() else {
             self.kill_for(r, reason);
@@ -1645,7 +1681,21 @@ impl Actor {
             Some(q) => vec![(copy.clone(), vec![q])],
             None => po.route_internal(&copy, address),
         };
-        // A paging dead-letter or expiry address takes the copy in its pages.
+        self.commit_move(&po, r, routed, reason, address);
+    }
+
+    /// The end of `move` and of a redistribution: the routed copy is
+    /// journaled with the reference's acknowledgement in one transaction,
+    /// then joins its queues.
+    fn commit_move(
+        &mut self,
+        po: &PostOffice,
+        mut r: MessageRef,
+        routed: crate::postoffice::Routed,
+        reason: AckReason,
+        address: &str,
+    ) {
+        // A paging address takes the copy in its pages.
         let routed = match po.page_routed(routed.clone(), None) {
             Ok((routed, _)) => routed,
             Err(e) => {
@@ -1699,6 +1749,7 @@ impl Actor {
                 if consumer.reg.browse_only {
                     self.browsers.push(consumer);
                 } else {
+                    self.cancel_redistributor();
                     let c = self.shared.config();
                     if c.group_rebalance {
                         if c.group_rebalance_pause_dispatch {
@@ -1787,6 +1838,8 @@ impl Actor {
                 self.force_delivery(id, sequence);
             }
             Cmd::ResumeLarge | Cmd::Depage | Cmd::Prompt => {}
+            Cmd::AddRedistributor { delay } => self.add_redistributor(delay),
+            Cmd::CancelRedistributor => self.cancel_redistributor(),
             Cmd::DeleteMatching { filter, reply } => {
                 let refs = self
                     .messages
@@ -1960,6 +2013,103 @@ impl Actor {
         Ok(refs)
     }
 
+    /// `hasUnMatchedPending`: a queued message no consumer's filter takes.
+    fn has_unmatched_pending(&self) -> bool {
+        !self.consumers.is_empty()
+            && self
+                .messages
+                .find(|r| !self.consumers.iter().any(|c| c.accepts(r)))
+                .is_some()
+    }
+
+    /// `addRedistributor`.
+    fn add_redistributor(&mut self, delay: i64) {
+        self.redistribute_at = None;
+        if self.redistributor {
+            // Delivery is prompted once the command is handled.
+            return;
+        }
+        if delay > 0 {
+            if self.consumers.is_empty() || self.has_unmatched_pending() {
+                self.redistribute_at = Some(now_millis() + delay);
+            }
+        } else {
+            self.internal_add_redistributor();
+        }
+    }
+
+    /// `internalAddRedistributor`.
+    fn internal_add_redistributor(&mut self) {
+        if !self.redistributor && (self.consumers.is_empty() || self.has_unmatched_pending()) {
+            tracing::trace!(
+                "QueueImpl::Adding redistributor on queue {}",
+                self.shared.name
+            );
+            self.redistributor = true;
+        }
+    }
+
+    /// `DelayedAddRedistributor`, when its time has come.
+    fn redistributor_due(&mut self) {
+        if self.redistribute_at.is_some_and(|at| at <= now_millis()) {
+            self.redistribute_at = None;
+            self.internal_add_redistributor();
+        }
+    }
+
+    /// `cancelRedistributor`.
+    fn cancel_redistributor(&mut self) {
+        self.redistribute_at = None;
+        self.redistributor = false;
+    }
+
+    /// `Redistributor.handle`: each message without a group the post office
+    /// finds another binding for (`PostOfficeImpl.redistribute`) goes there
+    /// as a copy, acknowledged here in the same transaction. The first it
+    /// finds none for leaves the redistributor busy until prompted again.
+    fn redistribute(&mut self) {
+        if !self.redistributor {
+            return;
+        }
+        let Some(po) = self.shared.post_office.upgrade() else {
+            return;
+        };
+        let queue = self.queue();
+        // Messages with a group are not redistributed.
+        while let Some(at) = self
+            .messages
+            .find(|r| message::group_id(r.message.core()).is_none())
+        {
+            let r = self.messages.get(at);
+            if r.message.is_expired(now_millis()) {
+                let r = self.messages.remove(at);
+                self.expire(r);
+                continue;
+            }
+            tracing::debug!(
+                "Redistributing message {}, originatingQueue={}",
+                r.message_id(),
+                self.shared.name
+            );
+            let Some(routed) = po.redistribute(r, &queue) else {
+                tracing::debug!(
+                    "postOffice.redistribute return null for message {}",
+                    r.message_id()
+                );
+                break;
+            };
+            let r = self.messages.remove(at);
+            let address = r
+                .message
+                .core()
+                .address
+                .as_ref()
+                .map(|a| a.to_string_lossy())
+                .unwrap_or_default();
+            self.commit_move(&po, r, routed, AckReason::Normal, &address);
+        }
+    }
+
     /// `QueueImpl.deliver`: hands messages to consumers until none can take
     /// another. Each message goes to the next consumer, round robin, in the
     /// highest priority group that has one able to take it.
@@ -2014,6 +2164,7 @@ impl Actor {
                 break;
             }
         }
+        self.redistribute();
         self.deliver_to_browsers();
     }
 

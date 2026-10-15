@@ -39,6 +39,9 @@ pub enum NotificationType {
     BridgeStopped,
     ClusterConnectionStarted,
     ClusterConnectionStopped,
+    Proposal,
+    ProposalResponse,
+    Unproposal,
 }
 
 impl NotificationType {
@@ -68,6 +71,9 @@ impl NotificationType {
             Self::BridgeStopped => "BRIDGE_STOPPED",
             Self::ClusterConnectionStarted => "CLUSTER_CONNECTION_STARTED",
             Self::ClusterConnectionStopped => "CLUSTER_CONNECTION_STOPPED",
+            Self::Proposal => "PROPOSAL",
+            Self::ProposalResponse => "PROPOSAL_RESPONSE",
+            Self::Unproposal => "UNPROPOSAL",
         }
     }
 }
@@ -96,6 +102,9 @@ pub mod hdr {
     pub const CLIENT_ID: &str = "_AMQ_Client_ID";
     pub const ROUTING_TYPE: &str = "_AMQ_Routing_Type";
     pub const MESSAGE_ID: &str = "_AMQ_Message_ID";
+    pub const PROPOSAL_GROUP_ID: &str = "_JBM_ProposalGroupId";
+    pub const PROPOSAL_VALUE: &str = "_JBM_ProposalValue";
+    pub const PROPOSAL_ALT_VALUE: &str = "_JBM_ProposalAltValue";
 }
 
 /// A string property, or null (`SimpleString.of(null)`).
@@ -129,7 +138,12 @@ impl Notifier {
     /// what they told of the queues of this broker and of the cluster
     /// (`PostOfficeImpl.queueInfos`), so that what `sendQueueInfoToQueue`
     /// sends and the notifications after it follow on without a gap.
-    pub fn start(post_office: &Arc<PostOffice>, address: String, node_id: String) -> Self {
+    pub fn start(
+        post_office: &Arc<PostOffice>,
+        address: String,
+        node_id: String,
+        management_address: String,
+    ) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
         let po: Weak<PostOffice> = Arc::downgrade(post_office);
         // The queues bound before the broker was active: the post office
@@ -154,7 +168,7 @@ impl Notifier {
                 let Some(po) = po.upgrade() else { break };
                 match job {
                     Job::Notify(m) => {
-                        infos.on_notification(&m);
+                        infos.on_notification(&po, &management_address, &m);
                         po.send_internal(m).await;
                     }
                     Job::QueueInfo {
@@ -192,6 +206,10 @@ impl Notifier {
         &self.address
     }
 
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
     /// `LocalQueueBinding.clusterName`: the queue's name and the node ID.
     pub fn cluster_name(&self, queue: &str) -> String {
         format!("{queue}{}", self.node_id)
@@ -221,6 +239,17 @@ impl Notifier {
             PropertyValue::Long(now),
         );
         let _ = self.tx.send(Job::Notify(m));
+    }
+}
+
+/// `queue.addRedistributor(redistributionDelay)` for the queue bound as
+/// `name`, unless its address does not redistribute.
+fn redistribute(po: &PostOffice, name: &str, management_address: &str) {
+    if let Some(q) = po.queue(name) {
+        let delay = po.settings(&q.config().address).redistribution_delay;
+        if delay != -1 {
+            q.add_redistributor(delay, management_address);
+        }
     }
 }
 
@@ -271,12 +300,20 @@ impl QueueInfos {
         self.0.iter_mut().find(|i| i.cluster_name == *cluster_name)
     }
 
-    /// `PostOfficeImpl.onNotification`, as far as the queue infos go.
-    fn on_notification(&mut self, m: &CoreMessage) {
+    /// `PostOfficeImpl.onNotification`: the queue infos, and the
+    /// redistributors a binding or a consumer here or in the cluster calls
+    /// for.
+    fn on_notification(&mut self, po: &PostOffice, management_address: &str, m: &CoreMessage) {
         let Some(kind) = prop_string(m, hdr::NOTIFICATION_TYPE) else {
             return;
         };
-        match kind.to_string_lossy().as_str() {
+        let kind = kind.to_string_lossy();
+        // The grouping handler listens too.
+        if let Some(g) = po.grouping() {
+            let cluster = prop_string(m, hdr::CLUSTER_NAME).map(|c| c.to_string_lossy());
+            g.on_notification(&kind, cluster.as_deref());
+        }
+        match kind.as_str() {
             "BINDING_ADDED" => {
                 // Diverts are not propagated.
                 if prop_int(m, hdr::BINDING_TYPE) == Some(2) {
@@ -304,6 +341,25 @@ impl QueueInfos {
                     Some(slot) => *slot = info,
                     None => self.0.push(info),
                 }
+                // Bound here: a remote binding of the address with
+                // consumers calls for a redistributor.
+                if distance < 1
+                    && let Some(name) = prop_string(m, hdr::ROUTING_NAME)
+                    && let Some(q) = po.queue(&name.to_string_lossy())
+                {
+                    let delay = po.settings(&q.config().address).redistribution_delay;
+                    let address = prop_string(m, hdr::ADDRESS)
+                        .map(|a| a.to_string_lossy())
+                        .unwrap_or_default();
+                    if delay != -1
+                        && po
+                            .remote_bindings(&address)
+                            .iter()
+                            .any(|b| b.is_connected() && b.consumer_count() > 0)
+                    {
+                        q.add_redistributor(delay, management_address);
+                    }
+                }
             }
             "BINDING_REMOVED" => {
                 if let Some(c) = prop_string(m, hdr::CLUSTER_NAME) {
@@ -315,11 +371,25 @@ impl QueueInfos {
                     return;
                 };
                 let filter = prop_string(m, hdr::FILTERSTRING);
-                if let Some(info) = self.get_mut(&c) {
-                    info.consumers += 1;
-                    if let Some(f) = filter {
-                        info.filter_strings.get_or_insert_with(Vec::new).push(f);
-                    }
+                let Some(info) = self.get_mut(&c) else {
+                    return;
+                };
+                info.consumers += 1;
+                if let Some(f) = filter {
+                    info.filter_strings.get_or_insert_with(Vec::new).push(f);
+                }
+                // A consumer in the cluster: the queue here bound as its
+                // routing name (or its fully qualified address) may
+                // redistribute.
+                if prop_int(m, hdr::DISTANCE).is_some_and(|d| d > 0)
+                    && let Some(name) = prop_string(m, hdr::ROUTING_NAME)
+                {
+                    let address = prop_string(m, hdr::ADDRESS).map(|a| a.to_string_lossy());
+                    let name = match address.as_deref().map(crate::postoffice::split_fqqn) {
+                        Some((_, Some(q))) => q.to_owned(),
+                        _ => name.to_string_lossy(),
+                    };
+                    redistribute(po, &name, management_address);
                 }
             }
             "CONSUMER_CLOSED" => {
@@ -327,13 +397,21 @@ impl QueueInfos {
                     return;
                 };
                 let filter = prop_string(m, hdr::FILTERSTRING);
-                if let Some(info) = self.get_mut(&c) {
-                    info.consumers -= 1;
-                    if let (Some(f), Some(fs)) = (filter, info.filter_strings.as_mut())
-                        && let Some(i) = fs.iter().position(|x| *x == f)
-                    {
-                        fs.remove(i);
-                    }
+                let Some(info) = self.get_mut(&c) else {
+                    return;
+                };
+                info.consumers -= 1;
+                if let (Some(f), Some(fs)) = (filter, info.filter_strings.as_mut())
+                    && let Some(i) = fs.iter().position(|x| *x == f)
+                {
+                    fs.remove(i);
+                }
+                // The last consumer here closed: the queue may redistribute.
+                if info.consumers <= 0
+                    && prop_int(m, hdr::DISTANCE) == Some(0)
+                    && let Some(name) = prop_string(m, hdr::ROUTING_NAME)
+                {
+                    redistribute(po, &name.to_string_lossy(), management_address);
                 }
             }
             _ => {}
@@ -554,6 +632,12 @@ impl PostOffice {
             }
         };
         wait.await
-            .unwrap_or_else(|_| Err("the broker is stopping".to_owned()))
+            .unwrap_or_else(|_| Err("the broker is stopping".to_owned()))?;
+        // The grouping handler would miss the answers to proposals sent
+        // before the other node's reset: they go again.
+        if let Some(g) = self.grouping() {
+            g.resend_pending();
+        }
+        Ok(())
     }
 }

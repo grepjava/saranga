@@ -104,6 +104,9 @@ pub struct AddressSettings {
     pub slow_consumer_policy: saranga_config::SlowConsumerPolicy,
     /// `enable-metrics`: the address's and its queues' meters.
     pub enable_metrics: bool,
+    /// `redistribution-delay`: -1 never redistributes a queue's messages to
+    /// other nodes of the cluster.
+    pub redistribution_delay: i64,
 }
 
 /// `PageFullMessagePolicy`.
@@ -217,6 +220,7 @@ impl Default for AddressSettings {
                 saranga_config::AddressSettings::DEFAULT_SLOW_CONSUMER_CHECK_PERIOD,
             slow_consumer_policy: saranga_config::AddressSettings::DEFAULT_SLOW_CONSUMER_POLICY,
             enable_metrics: saranga_config::AddressSettings::DEFAULT_ENABLE_METRICS,
+            redistribution_delay: saranga_config::AddressSettings::DEFAULT_REDISTRIBUTION_DELAY,
             management_message_attribute_size_limit: 256,
         }
     }

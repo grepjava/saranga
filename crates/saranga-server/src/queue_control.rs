@@ -340,11 +340,34 @@ impl Queue {
         self.manage(move |a| match group {
             None => a.groups.clear(),
             Some(g) => {
-                a.groups.remove(&GroupKey::Id(g.into_bytes()));
+                a.groups.remove(&group_key(&g));
             }
         })
         .await;
         self.prompt_delivery();
+    }
+
+    /// `unproposed`: a cluster grouping of this queue (`<group>.<queue>`)
+    /// was given up, and the queue forgets the group's consumer.
+    pub fn unproposed(&self, group_id: &str) {
+        let Some(group) = group_id
+            .strip_suffix(&*self.name().to_string())
+            .and_then(|g| g.strip_suffix('.'))
+        else {
+            return;
+        };
+        let key = group_key(group);
+        let name = self.name().clone();
+        let full = group_id.to_owned();
+        self.send(Cmd::Manage(Box::new(move |a| {
+            if a.groups.remove(&key).is_some() {
+                tracing::debug!("Removing group after unproposal {full} from queue {name}");
+            } else {
+                tracing::debug!(
+                    "Couldn't remove Removing group {full} after unproposal on queue {name}"
+                );
+            }
+        })));
     }
 
     /// Acts on the messages `sel` selects: the queued ones, the scheduled
@@ -666,4 +689,13 @@ fn retry_target(po: Option<&PostOffice>, r: &MessageRef) -> Option<(String, Opti
     let queue = po.queue(&queue_name)?;
     let target = (queue_name != address).then_some(queue);
     Some((address, target))
+}
+
+/// A group as the queue keys it: its ID's `SimpleString` bytes.
+fn group_key(group: &str) -> GroupKey {
+    GroupKey::Id(
+        saranga_buffer::SimpleString::from(group)
+            .as_bytes()
+            .to_vec(),
+    )
 }

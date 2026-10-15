@@ -440,6 +440,8 @@ pub struct PostOffice {
     /// `CopyOnWriteBindings.BindingIndex`: the next binding to try of each
     /// routing name of each address.
     positions: Mutex<HashMap<(Name, Name), usize>>,
+    /// The broker's grouping handler, when it has one.
+    grouping: std::sync::OnceLock<Arc<crate::grouping::GroupingHandler>>,
 }
 
 #[derive(Default)]
@@ -470,7 +472,26 @@ impl PostOffice {
             notifier: RwLock::default(),
             plugins: Arc::default(),
             positions: Mutex::default(),
+            grouping: std::sync::OnceLock::new(),
         })
+    }
+
+    /// `setGroupingHandler`.
+    pub fn set_grouping(&self, handler: Arc<crate::grouping::GroupingHandler>) {
+        let _ = self.grouping.set(handler);
+    }
+
+    /// `getGroupingHandler`.
+    pub fn grouping(&self) -> Option<&Arc<crate::grouping::GroupingHandler>> {
+        self.grouping.get()
+    }
+
+    /// The node ID local cluster names end with, once the broker is
+    /// active.
+    fn node_id(&self) -> Option<String> {
+        self.notifier_guard()
+            .as_ref()
+            .map(|n| n.node_id().to_owned())
     }
 
     /// The broker's plugins (`getBrokerPlugins`).
@@ -2295,22 +2316,34 @@ impl PostOffice {
         // The groups, by routing name: an anycast queue's is its address,
         // a multicast queue's its name, a remote queue's what its broker
         // said; each in the order its bindings were added.
-        let mut groups: Vec<(Name, Vec<Bound<'_>>)> = Vec::new();
+        let mut groups: Vec<(Name, Vec<Bound>)> = Vec::new();
         for e in &entries {
             for q in &e.queues {
-                let c = q.config();
-                let name = if c.routing_type == RoutingType::Anycast {
-                    c.address.clone()
-                } else {
-                    q.name().clone()
-                };
-                add_to_group(&mut groups, name, Bound::Local(q));
+                add_to_group(&mut groups, routing_name(q), Bound::Local(q.clone()));
             }
         }
         for b in remote {
-            add_to_group(&mut groups, b.routing_name().clone(), Bound::Remote(b));
+            add_to_group(
+                &mut groups,
+                b.routing_name().clone(),
+                Bound::Remote(Arc::clone(b)),
+            );
         }
-        let matches = |b: &Bound<'_>| {
+        // Non-exclusive diverts route a copy as well.
+        let diverts = if fqqn_queue.is_none() {
+            entries
+                .iter()
+                .flat_map(|e| e.diverts.iter())
+                .filter(|d| !d.exclusive && divert_matches(d))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // A proposal may wait for another node: nothing stays locked.
+        drop(entries);
+        drop(state);
+        let matches = |b: &Bound| {
             // matchBinding
             if matches!(
                 lb,
@@ -2336,52 +2369,35 @@ impl PostOffice {
             let c = q.config();
             c.enabled && !(c.purge_on_no_consumers && q.consumer_count() == 0)
         };
-        let mut routes = Routes::default();
-        let mut positions = self.positions.lock().unwrap_or_else(|e| e.into_inner());
+        // routeUsingStrictOrdering: with a grouping handler, a message of a
+        // group goes where its group goes.
+        let grouped = self
+            .grouping()
+            .zip(crate::message::string_property(
+                target.core(),
+                crate::message::HDR_GROUP_ID,
+            ))
+            .zip(self.node_id());
+        let mut routes = Routes {
+            diverts,
+            ..Routes::default()
+        };
         for (name, mut group) in groups {
             group.sort_by_key(Bound::id);
-            let count = group.len();
             let key = (Name::from(real), name);
-            let mut position = positions.get(&key).copied().unwrap_or(0);
-            if position >= count {
-                position = 0;
-            }
-            // getNextBinding
-            let mut chosen = None;
-            let mut low_priority: Option<usize> = None;
-            for _ in 0..count {
-                let b = &group[position];
-                if matches(b) {
-                    if count == 1
-                        || (b.is_connected()
-                            && (lb == MessageLoadBalancing::Strict
-                                || b.is_high_accept_priority(target)))
-                    {
-                        chosen = Some(position);
-                        position = (position + 1) % count;
-                        break;
-                    }
-                    // A local queue has the priority over remote ones.
-                    if low_priority.is_none()
-                        || (lb == MessageLoadBalancing::OnDemand && matches!(b, Bound::Local(_)))
-                    {
-                        low_priority = Some(position);
-                    }
+            let next = || self.next_binding(&key, &group, lb, &matches, target);
+            let chosen = match &grouped {
+                Some(((h, gid), node_id)) => {
+                    let full = format!("{gid}.{}", key.1);
+                    self.grouped_binding(h, &full, &group, node_id, next)
                 }
-                position = (position + 1) % count;
-            }
-            if chosen.is_none()
-                && let Some(low) = low_priority
-            {
-                chosen = Some(low);
-                position = (low + 1) % count;
-            }
+                None => next(),
+            };
             let Some(i) = chosen else { continue };
-            positions.insert(key, position);
             match &group[i] {
                 Bound::Local(q) => {
                     if accepts(q) {
-                        routes.queues.push((*q).clone());
+                        routes.queues.push(q.clone());
                     }
                 }
                 Bound::Remote(r) => {
@@ -2394,17 +2410,219 @@ impl PostOffice {
                 }
             }
         }
-        drop(positions);
-        // Non-exclusive diverts route a copy as well.
-        if fqqn_queue.is_none() {
-            routes.diverts = entries
-                .iter()
-                .flat_map(|e| e.diverts.iter())
-                .filter(|d| !d.exclusive && divert_matches(d))
-                .cloned()
-                .collect();
-        }
         Some(routes)
+    }
+
+    /// `getNextBinding`: of the group's bindings that match, from where the
+    /// group's round robin is, the first that is connected and, unless the
+    /// balancing is `STRICT`, has a consumer for the message; else the
+    /// first that matches (a local one first with `ON_DEMAND`).
+    fn next_binding(
+        &self,
+        key: &(Name, Name),
+        group: &[Bound],
+        lb: MessageLoadBalancing,
+        matches: &dyn Fn(&Bound) -> bool,
+        target: &crate::message::ServerMessage,
+    ) -> Option<usize> {
+        let count = group.len();
+        let mut positions = self.positions.lock().unwrap_or_else(|e| e.into_inner());
+        let mut position = positions.get(key).copied().unwrap_or(0);
+        if position >= count {
+            position = 0;
+        }
+        let mut chosen = None;
+        let mut low_priority: Option<usize> = None;
+        for _ in 0..count {
+            let b = &group[position];
+            if matches(b) {
+                if count == 1
+                    || (b.is_connected()
+                        && (lb == MessageLoadBalancing::Strict
+                            || b.is_high_accept_priority(target)))
+                {
+                    chosen = Some(position);
+                    position = (position + 1) % count;
+                    break;
+                }
+                // A local queue has the priority over remote ones.
+                if low_priority.is_none()
+                    || (lb == MessageLoadBalancing::OnDemand && matches!(b, Bound::Local(_)))
+                {
+                    low_priority = Some(position);
+                }
+            }
+            position = (position + 1) % count;
+        }
+        if chosen.is_none()
+            && let Some(low) = low_priority
+        {
+            chosen = Some(low);
+            position = (low + 1) % count;
+        }
+        let i = chosen?;
+        positions.insert(key.clone(), position);
+        Some(i)
+    }
+
+    /// `routeUsingStrictOrdering` for one routing name: the binding the
+    /// group (`full`: the group ID, a dot and the routing name) has, or the
+    /// next one, proposed to the grouping handler. When the binding the
+    /// handler names is not here, the group is removed everywhere and tried
+    /// again; after `MAX_GROUP_RETRY` tries the message goes as if it had
+    /// no group (`AMQ222209`). Unlike Artemis, only this routing name is
+    /// tried again, so the others do not get the message twice.
+    fn grouped_binding(
+        &self,
+        handler: &crate::grouping::GroupingHandler,
+        full: &str,
+        group: &[Bound],
+        node_id: &str,
+        next: impl Fn() -> Option<usize>,
+    ) -> Option<usize> {
+        let cluster_name = |b: &Bound| match b {
+            Bound::Local(q) => format!("{}{node_id}", q.name()),
+            Bound::Remote(r) => r.unique_name().to_string(),
+        };
+        let locate = |name: &str| group.iter().position(|b| cluster_name(b) == name);
+        for tries in 0..=crate::grouping::MAX_GROUP_RETRY {
+            let (response, chosen) = match handler.get_proposal(full, true) {
+                Some(r) => {
+                    let chosen = locate(r.chosen());
+                    (Some(r), chosen)
+                }
+                None => {
+                    let i = next()?;
+                    match handler.propose(full, &cluster_name(&group[i])) {
+                        Err(e) => {
+                            tracing::warn!("{e}");
+                            return Some(i);
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                "it got a timeout on propose, trying again, number of retries: {tries}"
+                            );
+                            (None, None)
+                        }
+                        Ok(Some(r)) => {
+                            let chosen = match &r.alternative {
+                                Some(alt) => locate(alt),
+                                None => Some(i),
+                            };
+                            (Some(r), chosen)
+                        }
+                    }
+                }
+            };
+            if chosen.is_some() {
+                return chosen;
+            }
+            // The binding may have left the post office before the
+            // grouping handler heard of it.
+            if let Some(r) = response {
+                handler.force_remove(&r.group_id, &r.cluster_name);
+            }
+        }
+        tracing::warn!(
+            "AMQ222209: Could not contact group handler coordinator after 10 retries, message being routed without grouping information"
+        );
+        next()
+    }
+
+    /// `PostOfficeImpl.redistribute` and `BindingsImpl.redistribute`: when
+    /// the address's cluster connection redistributes (`ON_DEMAND`,
+    /// `OFF_WITH_REDISTRIBUTION`), the next binding of the originating
+    /// queue's routing name, other than the queue, that has a consumer for
+    /// the message takes a copy of it with a new ID. `None` when none does.
+    pub fn redistribute(&self, message: &MessageRef, originating: &Queue) -> Option<Routed> {
+        let full = message.message.core().address.as_ref()?.to_string_lossy();
+        let (real, fqqn_queue) = split_fqqn(&full);
+        let state = self.read();
+        let lb = state
+            .load_balancing
+            .get(real)
+            .copied()
+            .unwrap_or(MessageLoadBalancing::Off);
+        if !matches!(
+            lb,
+            MessageLoadBalancing::OnDemand | MessageLoadBalancing::OffWithRedistribution
+        ) {
+            tracing::debug!(
+                "Rejecting redistribution of message={} as the loadBalancingType is {lb:?}",
+                message.message_id()
+            );
+            return None;
+        }
+        let routing_name: Name =
+            if fqqn_queue.is_some() && originating.config().routing_type == RoutingType::Anycast {
+                real.into()
+            } else {
+                originating.name().clone()
+            };
+        let mut group: Vec<Bound> = Vec::new();
+        if let Some(e) = state.addresses.get(real) {
+            group.extend(
+                e.queues
+                    .iter()
+                    .filter(|q| self::routing_name(q) == routing_name)
+                    .map(|q| Bound::Local(q.clone())),
+            );
+        }
+        if let Some(remote) = state.remote.get(real) {
+            group.extend(
+                remote
+                    .iter()
+                    .filter(|b| *b.routing_name() == routing_name)
+                    .map(|b| Bound::Remote(Arc::clone(b))),
+            );
+        }
+        if group.is_empty() {
+            return None;
+        }
+        group.sort_by_key(Bound::id);
+        let target: &crate::message::ServerMessage = &message.message;
+        let count = group.len();
+        let key = (Name::from(real), routing_name);
+        let mut positions = self.positions.lock().unwrap_or_else(|e| e.into_inner());
+        let mut position = positions.get(&key).copied().unwrap_or(0);
+        if position >= count {
+            position = 0;
+        }
+        let mut chosen = None;
+        for _ in 0..count {
+            let b = &group[position];
+            position = (position + 1) % count;
+            let (filter, own) = match b {
+                Bound::Local(q) => (q.filter(), q == originating),
+                Bound::Remote(r) => (r.filter(), false),
+            };
+            if b.is_high_accept_priority(target) && !own && filter.is_none_or(|f| f.matches(target))
+            {
+                chosen = Some(b);
+                break;
+            }
+        }
+        let Some(chosen) = chosen else {
+            tracing::debug!(
+                "there was no nextBinding, returning null while redistributing message={}",
+                message.message_id()
+            );
+            return None;
+        };
+        // The message needs a new ID; its internal properties go.
+        let mut core = message.message.core().clone();
+        core.message_id = self.ids.next();
+        let mut copy = MessageRef::new(message.message.copy(core));
+        copy.scheduled_time = message.scheduled_time;
+        let copy = clear_internal_properties(&copy).unwrap_or(copy);
+        positions.insert(key, position);
+        Some(match chosen {
+            Bound::Local(q) => vec![(copy, vec![q.clone()])],
+            Bound::Remote(r) => vec![(
+                with_route_context(&copy, std::slice::from_ref(r)),
+                vec![r.sf_queue().clone()],
+            )],
+        })
     }
 }
 
@@ -2418,7 +2636,7 @@ struct Routes {
 }
 
 /// Adds a binding to the group of its routing name.
-fn add_to_group<'a>(groups: &mut Vec<(Name, Vec<Bound<'a>>)>, name: Name, b: Bound<'a>) {
+fn add_to_group(groups: &mut Vec<(Name, Vec<Bound>)>, name: Name, b: Bound) {
     match groups.iter_mut().find(|(n, _)| *n == name) {
         Some((_, g)) => g.push(b),
         None => groups.push((name, vec![b])),
@@ -2426,12 +2644,12 @@ fn add_to_group<'a>(groups: &mut Vec<(Name, Vec<Bound<'a>>)>, name: Name, b: Bou
 }
 
 /// A binding in a routing group.
-enum Bound<'a> {
-    Local(&'a Queue),
-    Remote(&'a Arc<RemoteBinding>),
+enum Bound {
+    Local(Queue),
+    Remote(Arc<RemoteBinding>),
 }
 
-impl Bound<'_> {
+impl Bound {
     fn id(&self) -> i64 {
         match self {
             Self::Local(q) => q.id(),

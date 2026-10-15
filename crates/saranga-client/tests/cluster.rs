@@ -21,7 +21,7 @@ struct Node {
     acceptor: JoinHandle<std::io::Result<()>>,
 }
 
-fn cluster_config(me: u16, other: u16, balancing: &str, addresses: &str) -> String {
+fn cluster_config(me: u16, other: u16, balancing: &str, addresses: &str, extra: &str) -> String {
     format!(
         r#"<connectors>
              <connector name="me">tcp://127.0.0.1:{me}</connector>
@@ -38,7 +38,8 @@ fn cluster_config(me: u16, other: u16, balancing: &str, addresses: &str) -> Stri
                <static-connectors><connector-ref>other</connector-ref></static-connectors>
              </cluster-connection>
            </cluster-connections>
-           <addresses>{addresses}</addresses>"#
+           <addresses>{addresses}</addresses>
+           {extra}"#
     )
 }
 
@@ -81,6 +82,16 @@ async fn pair(
     balancing: &str,
     addresses: &str,
 ) -> (Node, Node) {
+    pair_with(dirs, balancing, addresses, ("", "")).await
+}
+
+/// Two nodes with more configuration each.
+async fn pair_with(
+    dirs: &(tempfile::TempDir, tempfile::TempDir),
+    balancing: &str,
+    addresses: &str,
+    extra: (&str, &str),
+) -> (Node, Node) {
     let la = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let lb = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let (pa, pb) = (
@@ -90,13 +101,13 @@ async fn pair(
     let a = start(
         dirs.0.path(),
         la,
-        &cluster_config(pa, pb, balancing, addresses),
+        &cluster_config(pa, pb, balancing, addresses, extra.0),
     )
     .await;
     let b = start(
         dirs.1.path(),
         lb,
-        &cluster_config(pb, pa, balancing, addresses),
+        &cluster_config(pb, pa, balancing, addresses, extra.1),
     )
     .await;
     (a, b)
@@ -339,4 +350,238 @@ async fn a_locator_balances_its_connections_across_the_topology() {
     first.close().await;
     stop(a).await;
     stop(b).await;
+}
+
+const REDISTRIBUTE: &str = r##"<address-settings>
+     <address-setting match="#"><redistribution-delay>0</redistribution-delay></address-setting>
+   </address-settings>"##;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn messages_without_consumers_go_to_a_node_that_has_them() {
+    let d = dirs();
+    let (a, b) = pair_with(&d, "ON_DEMAND", ORDERS, (REDISTRIBUTE, REDISTRIBUTE)).await;
+    wait_until("both nodes bind the other's queue", || {
+        remote(&a, "orders").len() == 1 && remote(&b, "orders").len() == 1
+    })
+    .await;
+    // Nobody consumes yet: the messages stay where they were sent.
+    let (_ca, sa) = session(a.port).await;
+    send(&sa, "orders", 10, None).await;
+    let qa = a.broker.post_office().queue("orders").unwrap();
+    wait_until("A holds the messages", || qa.message_count() == 10).await;
+    // A consumer on B: A's queue redistributes them all.
+    let (_cb, sb) = session(b.port).await;
+    let consumer = sb.create_consumer("orders", None, false).await.unwrap();
+    let got = drain(&consumer, 10).await;
+    let texts: Vec<String> = got.iter().map(|m| m.text().unwrap().unwrap()).collect();
+    assert_eq!(texts, (0..10).map(|i| format!("m{i}")).collect::<Vec<_>>());
+    assert!(got.iter().all(|m| {
+        !m.properties
+            .entries()
+            .iter()
+            .any(|(k, _)| k.to_string_lossy().starts_with("_AMQ_ROUTE_TO"))
+    }));
+    wait_until("A's queue is empty", || qa.message_count() == 0).await;
+    consumer.close().await;
+    stop(a).await;
+    stop(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queue_whose_last_consumer_closes_redistributes_after_the_delay() {
+    let d = dirs();
+    let delayed = r##"<address-settings>
+         <address-setting match="#"><redistribution-delay>500</redistribution-delay></address-setting>
+       </address-settings>"##;
+    let (a, b) = pair_with(&d, "OFF_WITH_REDISTRIBUTION", ORDERS, (delayed, delayed)).await;
+    wait_until("both nodes bind the other's queue", || {
+        remote(&a, "orders").len() == 1 && remote(&b, "orders").len() == 1
+    })
+    .await;
+    let (_cb, sb) = session(b.port).await;
+    let on_b = sb.create_consumer("orders", None, false).await.unwrap();
+    let (_ca, sa) = session(a.port).await;
+    let on_a = sa.create_consumer("orders", None, false).await.unwrap();
+    wait_until("A hears of B's consumer", || {
+        remote(&a, "orders")[0].consumer_count() == 1
+    })
+    .await;
+    // OFF_WITH_REDISTRIBUTION keeps what is sent to A on A, while A has a
+    // consumer.
+    on_a.close().await;
+    send(&sa, "orders", 5, None).await;
+    let qa = a.broker.post_office().queue("orders").unwrap();
+    wait_until("A holds the messages", || qa.message_count() == 5).await;
+    let started = tokio::time::Instant::now();
+    let got = drain(&on_b, 5).await;
+    assert_eq!(got.len(), 5);
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    on_b.close().await;
+    stop(a).await;
+    stop(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_never_redistributes() {
+    let d = dirs();
+    let (a, b) = pair_with(&d, "STRICT", ORDERS, (REDISTRIBUTE, REDISTRIBUTE)).await;
+    wait_until("A binds B's queue", || remote(&a, "orders").len() == 1).await;
+    let qa = a.broker.post_office().queue("orders").unwrap();
+    let (_ca, sa) = session(a.port).await;
+    send(&sa, "orders", 4, None).await;
+    wait_until("half stay on A", || qa.message_count() == 2).await;
+    let (_cb, sb) = session(b.port).await;
+    let consumer = sb.create_consumer("orders", None, false).await.unwrap();
+    drain(&consumer, 2).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(consumer.receive_immediate().await.unwrap().is_none());
+    assert_eq!(qa.message_count(), 2);
+    consumer.close().await;
+    stop(a).await;
+    stop(b).await;
+}
+
+fn grouping_handler(kind: &str) -> String {
+    format!(
+        r#"<grouping-handler name="my-grouping-handler">
+             <type>{kind}</type>
+             <address>orders</address>
+             <timeout>5000</timeout>
+           </grouping-handler>"#
+    )
+}
+
+/// Sends `n` messages to `address`, each of group `g<i % groups>`.
+async fn send_grouped(session: &Session, address: &str, n: u32, groups: u32) {
+    let producer = session.create_producer(Some(address)).await.unwrap();
+    for i in 0..n {
+        let mut m = message::text_message(&format!("m{i}"));
+        m.put_property(
+            "_AMQ_GROUP_ID",
+            PropertyValue::String(format!("g{}", i % groups).as_str().into()),
+        );
+        producer.send(m).await.unwrap();
+    }
+    producer.close();
+}
+
+/// The group of each message the consumers get, by consumer, until `n`
+/// came.
+async fn groups_received(consumers: &[&Consumer], n: usize) -> Vec<Vec<String>> {
+    let mut out = vec![Vec::new(); consumers.len()];
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while out.iter().map(Vec::len).sum::<usize>() < n {
+        assert!(tokio::time::Instant::now() < deadline, "only {out:?}");
+        for (i, c) in consumers.iter().enumerate() {
+            if let Some(d) = c.receive(Duration::from_millis(50)).await.unwrap() {
+                c.acknowledge(&d).await.unwrap();
+                let g = match d.message.properties.get(&"_AMQ_GROUP_ID".into()) {
+                    Some(PropertyValue::String(s)) => s.to_string_lossy(),
+                    other => panic!("no group: {other:?}"),
+                };
+                out[i].push(g);
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_goes_to_one_node_whichever_node_it_is_sent_to() {
+    let d = dirs();
+    let (local, remote_handler) = (grouping_handler("LOCAL"), grouping_handler("REMOTE"));
+    let (a, b) = pair_with(&d, "ON_DEMAND", ORDERS, (&local, &remote_handler)).await;
+    wait_until("both nodes bind the other's queue", || {
+        remote(&a, "orders").len() == 1 && remote(&b, "orders").len() == 1
+    })
+    .await;
+    let (_ca, sa) = session(a.port).await;
+    let (_cb, sb) = session(b.port).await;
+    let on_a = sa.create_consumer("orders", None, false).await.unwrap();
+    let on_b = sb.create_consumer("orders", None, false).await.unwrap();
+    wait_until("each node hears of the other's consumer", || {
+        remote(&a, "orders")[0].consumer_count() == 1
+            && remote(&b, "orders")[0].consumer_count() == 1
+    })
+    .await;
+    // Sent to B, which asks A where each group goes; then to A.
+    send_grouped(&sb, "orders", 20, 4).await;
+    send_grouped(&sa, "orders", 20, 4).await;
+    let got = groups_received(&[&on_a, &on_b], 40).await;
+    let mut seen = std::collections::HashMap::new();
+    for (consumer, groups) in got.iter().enumerate() {
+        for g in groups {
+            assert_eq!(
+                *seen.entry(g.clone()).or_insert(consumer),
+                consumer,
+                "group {g} went to both consumers: {got:?}"
+            );
+        }
+    }
+    assert_eq!(seen.len(), 4);
+    assert!(
+        got.iter().all(|g| !g.is_empty()),
+        "one consumer got nothing: {got:?}"
+    );
+    let handler = a.broker.post_office().grouping().unwrap().clone();
+    assert!(handler.is_local());
+    for g in 0..4 {
+        assert!(
+            handler
+                .get_proposal(&format!("g{g}.orders"), false)
+                .is_some()
+        );
+    }
+    on_a.close().await;
+    on_b.close().await;
+    stop(a).await;
+    stop(b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn groups_are_journaled_and_reaped_when_unused() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = format!(
+        r#"<grouping-handler name="h">
+             <type>LOCAL</type>
+             <address>orders</address>
+             <group-timeout>600</group-timeout>
+             <reaper-period>200</reaper-period>
+           </grouping-handler>
+           <addresses>{ORDERS}</addresses>"#
+    );
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let n = start(dir.path(), listener, &core).await;
+    let (conn, s) = session(n.port).await;
+    send_grouped(&s, "orders", 2, 2).await;
+    conn.close().await;
+    let handler = n.broker.post_office().grouping().unwrap().clone();
+    let cluster = format!("orders{}", n.broker.node_id());
+    assert_eq!(
+        handler
+            .get_proposal("g0.orders", false)
+            .unwrap()
+            .cluster_name,
+        cluster
+    );
+    stop(n).await;
+
+    // Recovered from the journal, then reaped once unused.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let n = start(dir.path(), listener, &core).await;
+    let handler = n.broker.post_office().grouping().unwrap().clone();
+    assert!(handler.get_proposal("g1.orders", false).is_some());
+    wait_until("the groups are reaped", || {
+        handler.get_proposal("g0.orders", false).is_none()
+            && handler.get_proposal("g1.orders", false).is_none()
+    })
+    .await;
+    stop(n).await;
+
+    // And their records are gone.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let n = start(dir.path(), listener, &core).await;
+    let handler = n.broker.post_office().grouping().unwrap().clone();
+    assert!(handler.get_proposal("g0.orders", false).is_none());
+    stop(n).await;
 }

@@ -1068,6 +1068,30 @@ impl Storage {
         Ok(id)
     }
 
+    /// Adds a bindings record with this ID outside a transaction, synced
+    /// (`addGrouping`).
+    pub fn add_binding_record_with_id(
+        &self,
+        id: i64,
+        user_type: u8,
+        body: Vec<u8>,
+    ) -> StoreResult<()> {
+        self.bindings.append_add(id, user_type, body, true, None)
+    }
+
+    /// Deletes bindings records in one transaction and commits it
+    /// (`deleteGrouping` for each, then `commitBindings`).
+    pub fn delete_bindings(&self, ids: &[i64]) -> StoreResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let tx = self.generate_id();
+        for &id in ids {
+            self.bindings.append_delete_tx(tx, id, Vec::new())?;
+        }
+        self.bindings.append_commit(tx, true, None)
+    }
+
     /// Deletes a bindings record outside a transaction, if it is there
     /// (`tryAppendDeleteRecord`).
     pub fn delete_binding_record(&self, id: i64) -> StoreResult<()> {

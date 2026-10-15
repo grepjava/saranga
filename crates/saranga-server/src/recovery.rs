@@ -179,6 +179,14 @@ pub fn load_bindings(
                     .map_err(|e| corrupt("bridge", e))?;
                 out.bridges.push((r.id, crate::bridge::from_record(&b)));
             }
+            ids::GROUP_RECORD => {
+                let g = saranga_storage::codec::GroupingEncoding::decode(&r.data)
+                    .map_err(|e| corrupt("grouping", e))?;
+                // handleGroupingBindings
+                if let Some(h) = post_office.grouping() {
+                    h.add_group_binding(r.id, &text(&g.group_id), &text(&g.cluster_name));
+                }
+            }
             ids::QUEUE_STATUS_RECORD => {
                 let s = saranga_storage::codec::QueueStatusEncoding::decode(&r.data)
                     .map_err(|e| corrupt("queue status", e))?;

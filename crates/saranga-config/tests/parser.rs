@@ -618,3 +618,45 @@ fn bridges() {
     );
     assert!(matches!(e, ConfigError::InvalidValue { ref name, .. } if name == "concurrency"));
 }
+
+#[test]
+fn grouping_handler() {
+    let c = parse(
+        r#"<grouping-handler name="gh1">
+             <type>LOCAL</type>
+             <address>jms</address>
+             <timeout>3000</timeout>
+             <group-timeout>60000</group-timeout>
+             <reaper-period>15000</reaper-period>
+           </grouping-handler>"#,
+    );
+    assert_eq!(
+        c.grouping_handler,
+        Some(saranga_config::GroupingHandlerConfig {
+            name: "gh1".into(),
+            local: true,
+            address: "jms".into(),
+            timeout: 3000,
+            group_timeout: 60_000,
+            reaper_period: 15_000,
+        })
+    );
+    // Defaults; any type but LOCAL is REMOTE.
+    let c = parse(r#"<grouping-handler name="gh2"><type>REMOTE</type></grouping-handler>"#);
+    let g = c.grouping_handler.unwrap();
+    assert!(!g.local);
+    assert_eq!(g.address, "");
+    assert_eq!(
+        (g.timeout, g.group_timeout, g.reaper_period),
+        (5000, -1, 30_000)
+    );
+    assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+    // The type is required, and the timeouts checked.
+    parse_err(r#"<grouping-handler name="g"><address>a</address></grouping-handler>"#);
+    parse_err(
+        r#"<grouping-handler name="g"><type>LOCAL</type><timeout>0</timeout></grouping-handler>"#,
+    );
+    parse_err(
+        r#"<grouping-handler name="g"><type>LOCAL</type><group-timeout>0</group-timeout></grouping-handler>"#,
+    );
+}

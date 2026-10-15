@@ -462,13 +462,38 @@ impl Record {
                     .notify(NotificationType::SessionCreated, move |_| props);
                 Ok(())
             }
-            // Grouping proposals come with grouping handlers.
-            "PROPOSAL" | "PROPOSAL_RESPONSE" | "UNPROPOSAL" => {
-                tracing::debug!("ignoring a {kind} notification: no grouping handler");
-                Ok(())
-            }
+            "PROPOSAL" | "PROPOSAL_RESPONSE" | "UNPROPOSAL" => self.proposal(&kind, m),
             other => Err(format!("AMQ229045: Invalid type: {other}")),
         }
+    }
+
+    /// `doProposalReceived`, `doProposalResponseReceived` and
+    /// `doUnProposalReceived`: the grouping handler hears of them.
+    fn proposal(&self, kind: &str, m: &CoreMessage) -> Result<(), String> {
+        let group_id = string_prop(m, hdr::PROPOSAL_GROUP_ID).ok_or("proposal type is null")?;
+        let value = string_prop(m, hdr::PROPOSAL_VALUE).unwrap_or_default();
+        let hops = int_prop(m, hdr::DISTANCE).unwrap_or(0);
+        let broker = self.broker().ok_or("the broker is gone")?;
+        let handler = broker
+            .post_office()
+            .grouping()
+            .cloned()
+            .ok_or("grouping handler is null")?;
+        match kind {
+            "PROPOSAL" => {
+                if let Some(r) = handler.receive(&group_id, &value, hops + 1) {
+                    handler.send_proposal_response(&r, 0);
+                }
+            }
+            "UNPROPOSAL" => handler.remove_at(&group_id, &value, hops + 1),
+            _ => {
+                let alt = string_prop(m, hdr::PROPOSAL_ALT_VALUE);
+                let r = crate::grouping::Response::new(&group_id, &value, alt.as_deref());
+                handler.proposed(r.clone());
+                handler.send_proposal_response(&r, hops + 1);
+            }
+        }
+        Ok(())
     }
 
     /// `doBindingAdded`.

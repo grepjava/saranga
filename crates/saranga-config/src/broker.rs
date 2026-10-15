@@ -749,6 +749,32 @@ impl ClusterConnectionConfig {
     }
 }
 
+/// `<grouping-handler>` (`GroupingHandlerConfiguration`): which node of a
+/// cluster decides where each message group goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupingHandlerConfig {
+    pub name: String,
+    /// `LOCAL`: this node decides; `REMOTE`: it asks the node that does.
+    pub local: bool,
+    /// The cluster address its proposals concern.
+    pub address: String,
+    /// `timeout` in milliseconds: how long a proposal waits for its answer,
+    /// and a `LOCAL` handler at startup for the groups' bindings.
+    pub timeout: i64,
+    /// `group-timeout` in milliseconds: a group unused this long is
+    /// forgotten; -1 keeps groups.
+    pub group_timeout: i64,
+    /// `reaper-period` in milliseconds: how often unused groups are looked
+    /// for.
+    pub reaper_period: i64,
+}
+
+impl GroupingHandlerConfig {
+    pub const DEFAULT_TIMEOUT: i64 = 5000;
+    pub const DEFAULT_GROUP_TIMEOUT: i64 = -1;
+    pub const DEFAULT_REAPER_PERIOD: i64 = 30_000;
+}
+
 /// The broker configuration read from `broker.xml`. Every field the file
 /// leaves out holds the Artemis default.
 #[derive(Debug, Clone, PartialEq)]
@@ -785,6 +811,8 @@ pub struct BrokerConfig {
     pub diverts: Vec<DivertConfig>,
     /// `<bridges>`, in document order.
     pub bridges: Vec<BridgeConfig>,
+    /// `<grouping-handler>`: the last one given.
+    pub grouping_handler: Option<GroupingHandlerConfig>,
     /// `message-expiry-scan-period` in milliseconds; `-1` turns the expiry
     /// reaper off.
     pub message_expiry_scan_period: i64,
@@ -1016,6 +1044,7 @@ impl Default for BrokerConfig {
             addresses: Vec::new(),
             diverts: Vec::new(),
             bridges: Vec::new(),
+            grouping_handler: None,
             message_expiry_scan_period: Self::DEFAULT_MESSAGE_EXPIRY_SCAN_PERIOD,
             transaction_timeout: Self::DEFAULT_TRANSACTION_TIMEOUT,
             transaction_timeout_scan_period: Self::DEFAULT_TRANSACTION_TIMEOUT_SCAN_PERIOD,

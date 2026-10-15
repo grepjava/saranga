@@ -1,0 +1,38 @@
+=== artemis run (node 1, node 2)
+node 1: listening
+node 2: listening
+node 1: bridged to node 2
+node 2: bridged to node 1
+=== Grouping.java redistribute orders 10
+sent 10 to node 1
+node 2 received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+no more
+=== Grouping.java grouped orders 40 4 (to node 2)
+sent 40 in 4 groups to node 2
+received 40
+groups: 4
+each group to one node: true
+each group in order: true
+=== Grouping.java grouped orders 40 4 (to node 1)
+sent 40 in 4 groups to node 1
+received 40
+groups: 4
+each group to one node: true
+each group in order: true
+same nodes as before: true
+=== artemis stop (node 1)
+node 1: down
+=== artemis run (node 1)
+node 1: listening
+node 1: bridged to node 2
+node 2: bridged to node 1
+=== Grouping.java grouped orders 40 4 (to node 1)
+sent 40 in 4 groups to node 1
+received 40
+groups: 4
+each group to one node: true
+each group in order: true
+same nodes as before: true
+=== artemis stop (node 1, node 2)
+node 1: down
+node 2: down

@@ -18,6 +18,7 @@ pub mod discovery;
 pub mod disk;
 pub mod duplicate;
 pub mod error;
+pub mod grouping;
 pub mod large;
 pub mod localtime;
 pub mod management;
@@ -259,6 +260,8 @@ pub struct BrokerConfig {
     pub broadcast_groups: Vec<discovery::BroadcastGroupConfig>,
     /// `<bridges>`, deployed once the broker is active.
     pub bridges: Vec<saranga_config::BridgeConfig>,
+    /// `<grouping-handler>`.
+    pub grouping_handler: Option<saranga_config::GroupingHandlerConfig>,
     /// The connectors and discovery groups bridges name.
     pub bridge_targets: bridge::Targets,
     /// Plugins (`<broker-plugins>`, or the embedding application's own).
@@ -301,6 +304,7 @@ impl BrokerConfig {
             cluster: None,
             broadcast_groups: Vec::new(),
             bridges: Vec::new(),
+            grouping_handler: None,
             bridge_targets: bridge::Targets::default(),
             plugins: Vec::new(),
             disk_monitor: None,
@@ -637,6 +641,11 @@ impl Broker {
         for p in &config.plugins {
             post_office.plugins().register(p.clone());
         }
+        // deployGroupingHandlerConfiguration: before the journal's groups
+        // are loaded into it.
+        if let Some(g) = &config.grouping_handler {
+            post_office.set_grouping(grouping::GroupingHandler::new(g.clone(), &post_office));
+        }
         let recovered = match &storage {
             Some(s) => recovery::load_bindings(s, &post_office, config.users.as_deref())?,
             None => Default::default(),
@@ -818,6 +827,7 @@ impl Broker {
                 &broker.post_office,
                 broker.management.config().notification_address.clone(),
                 broker.node_id.clone(),
+                broker.management.address().to_owned(),
             ));
         if let Some(store) = &broker.security {
             let po = Arc::downgrade(&broker.post_office);
@@ -844,9 +854,24 @@ impl Broker {
                 .map_err(|e| internal("server.lock", &e))?;
             spawn_lock_monitor(&broker, n.clone(), &config.ha);
         }
+        let grouping = broker.post_office.grouping().cloned();
+        if let Some(g) = &grouping {
+            g.start();
+        }
         if let Some(c) = &broker.cluster {
             c.activate();
             c.start_bridging(&broker);
+        }
+        // A LOCAL grouping handler waits for its groups' bindings before
+        // clients come.
+        if let Some(g) = grouping.filter(|g| g.is_local()) {
+            let bound: Vec<String> = broker
+                .post_office
+                .queues()
+                .iter()
+                .map(|q| format!("{}{}", q.name(), broker.node_id))
+                .collect();
+            g.await_bindings(bound).await;
         }
         // `ClusterManager.start`.
         for g in &broker.broadcast_groups {
@@ -980,6 +1005,11 @@ impl Broker {
             for p in self.post_office.plugins().all() {
                 p.unregistered(self);
             }
+        }
+        // The grouping handler stops before the cluster, so its groups
+        // outlive the bindings the cluster takes away.
+        if let Some(g) = self.post_office.grouping() {
+            g.stop();
         }
         if let Some(c) = &self.cluster {
             c.stop();

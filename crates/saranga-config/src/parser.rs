@@ -409,6 +409,7 @@ fn parse_core(
     parse_broadcast_groups(core, config)?;
     parse_discovery_groups(core, config, warnings)?;
     parse_cluster_connections(core, config, warnings)?;
+    parse_grouping_handler(core, config)?;
     parse_security_settings(core, config, warnings)?;
     parse_broker_plugins(core, config)?;
     parse_address_settings(core, config, warnings)?;
@@ -427,10 +428,6 @@ const NOT_ACTED_ON: &[(&str, &str)] = &[
         "AMQP broker connections are not supported",
     ),
     ("connection-routers", "connection routers are not supported"),
-    (
-        "grouping-handler",
-        "clustered message grouping is not supported",
-    ),
     ("metrics", "metrics are not supported yet"),
     ("metrics-plugin", "metrics are not supported yet"),
     (
@@ -1432,6 +1429,32 @@ fn parse_cluster_connections(
             c.discovery_group = discovery;
         }
         config.cluster_connections.push(c);
+    }
+    Ok(())
+}
+
+/// `parseGroupingHandlerConfiguration`, for each `<grouping-handler>`:
+/// the last one stays.
+fn parse_grouping_handler(core: Node<'_, '_>, config: &mut BrokerConfig) -> Result<()> {
+    for node in all(core, "grouping-handler") {
+        let s = Settings { core: node };
+        let kind = s
+            .non_empty_string("type")?
+            .ok_or_else(|| ConfigError::invalid("type", "", "must not be empty"))?;
+        config.grouping_handler = Some(crate::GroupingHandlerConfig {
+            name: node.attribute("name").unwrap_or_default().to_owned(),
+            local: kind == "LOCAL",
+            address: s.string("address").unwrap_or_default(),
+            timeout: s
+                .i32("timeout", Check::GtZero)?
+                .map_or(crate::GroupingHandlerConfig::DEFAULT_TIMEOUT, i64::from),
+            group_timeout: s
+                .i64("group-timeout", Check::MinusOneOrGtZero)?
+                .unwrap_or(crate::GroupingHandlerConfig::DEFAULT_GROUP_TIMEOUT),
+            reaper_period: s
+                .i64("reaper-period", Check::GtZero)?
+                .unwrap_or(crate::GroupingHandlerConfig::DEFAULT_REAPER_PERIOD),
+        });
     }
     Ok(())
 }
