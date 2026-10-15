@@ -140,6 +140,14 @@ pub trait ProtocolManager: Send + Sync + 'static {
     fn start(&self, _broker: &Arc<Broker>) -> ServeFuture {
         Box::pin(async {})
     }
+
+    /// Called once the broker is active, after federation
+    /// (`startProtocolServices`): the protocol starts its services, such
+    /// as connections to other brokers.
+    fn start_services(&self, _broker: &Arc<Broker>) {}
+
+    /// Called as the broker stops, after the cluster: the services stop.
+    fn stop_services(&self, _broker: &Broker) {}
 }
 
 /// The Core protocol (`CoreProtocolManager`).

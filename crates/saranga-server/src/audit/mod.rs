@@ -32,6 +32,7 @@ pub(crate) enum Control {
     Acceptor,
     BroadcastGroup,
     Bridge,
+    BrokerConnection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,6 +340,11 @@ fn source(broker: &Broker, control: Control, name: &str) -> String {
             .bridges()
             .get(name)
             .map_or_else(|| "null".to_owned(), |b| b.describe()),
+        // AMQPBrokerConnection has no toString either.
+        Control::BrokerConnection => format!(
+            "org.apache.activemq.artemis.protocol.amqp.connect.AMQPBrokerConnection@{:x}",
+            identity(("broker-connection", name))
+        ),
     }
 }
 
@@ -637,7 +643,12 @@ pub(crate) fn management_call(
     } else {
         who.caller()
     };
-    let source = source(broker, control, name);
+    // BrokerConnectionControl's start and stop log the connection's name.
+    let source = if control == Control::BrokerConnection && matches!(method, "start" | "stop") {
+        name.to_owned()
+    } else {
+        source(broker, control, name)
+    };
     let mut args = vec![caller, source];
     if let Some(p) = entry.params {
         args.push(parameters(broker, entry, p, params));

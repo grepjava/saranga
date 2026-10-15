@@ -656,6 +656,9 @@ fn protocol_managers(
     });
     let amqp = saranga_protocol_amqp::AmqpConfig {
         use_core_subscription_naming: file.is_some_and(|f| f.amqp_use_core_subscription_naming),
+        broker_connections: file
+            .map(|f| f.broker_connections.clone())
+            .unwrap_or_default(),
     };
     vec![
         Arc::new(saranga_protocol_stomp::StompProtocol),

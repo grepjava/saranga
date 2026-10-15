@@ -9,6 +9,7 @@
 pub mod acceptors;
 pub mod audit;
 pub mod bridge;
+pub mod broker_connection;
 pub mod cluster;
 pub mod cluster_bridge;
 pub mod config;
@@ -474,6 +475,8 @@ pub struct Broker {
     bridges: bridge::Bridges,
     /// `FederationManager`.
     federation: federation::FederationManager,
+    /// Connections to other brokers that protocols made (`brokerConnectionMap`).
+    broker_connections: broker_connection::BrokerConnections,
     /// `replication` `primary`: a backup may register to replicate this
     /// broker's data.
     replication_policy: Option<saranga_config::Replication>,
@@ -751,6 +754,7 @@ impl Broker {
             broadcast_groups,
             bridges: bridge::Bridges::new(config.bridge_targets.clone()),
             federation: federation::FederationManager::default(),
+            broker_connections: broker_connection::BrokerConnections::default(),
             node_id: node_id.clone(),
             post_office,
             connection_ttl_override: config.connection_ttl_override,
@@ -902,6 +906,10 @@ impl Broker {
             &config.federations,
             &config.federation_downstream_authorization,
         );
+        // startProtocolServices: AMQP's broker connections.
+        for p in broker.protocols.clone() {
+            p.start_services(&broker);
+        }
         Ok(broker)
     }
 
@@ -1031,6 +1039,9 @@ impl Broker {
         if let Some(c) = &self.cluster {
             c.stop();
         }
+        for p in &self.protocols {
+            p.stop_services(self);
+        }
         for g in &self.broadcast_groups {
             g.stop();
         }
@@ -1080,6 +1091,16 @@ impl Broker {
     }
 
     /// `getFederationManager`.
+    /// The connections to other brokers, as registered.
+    pub fn broker_connections(&self) -> Vec<Arc<dyn broker_connection::BrokerConnection>> {
+        self.broker_connections.all()
+    }
+
+    /// Where protocols register their connections to other brokers.
+    pub fn broker_connection_registry(&self) -> &broker_connection::BrokerConnections {
+        &self.broker_connections
+    }
+
     pub fn federation(&self) -> &federation::FederationManager {
         &self.federation
     }

@@ -328,6 +328,7 @@ pub enum Bean {
     Acceptor(String, Vec<(String, String)>),
     BroadcastGroup(String),
     Bridge(String),
+    BrokerConnection(String),
 }
 
 impl Bean {
@@ -340,6 +341,7 @@ impl Bean {
             Self::Acceptor(..) => &crate::catalog::ACCEPTOR,
             Self::BroadcastGroup(_) => &crate::catalog::BROADCAST_GROUP,
             Self::Bridge(_) => &crate::catalog::BRIDGE,
+            Self::BrokerConnection(_) => &crate::catalog::BROKER_CONNECTION,
         }
     }
 
@@ -353,6 +355,7 @@ impl Bean {
             Self::Acceptor(a, _) => format!("acceptor.{a}"),
             Self::BroadcastGroup(g) => format!("broadcastgroup.{g}"),
             Self::Bridge(b) => format!("bridge.{b}"),
+            Self::BrokerConnection(c) => format!("brokerconnection.{c}"),
         }
     }
 
@@ -374,6 +377,9 @@ impl Bean {
                 "org.apache.activemq.artemis.core.management.impl.BroadcastGroupControlImpl"
             }
             Self::Bridge(_) => "org.apache.activemq.artemis.core.management.impl.BridgeControlImpl",
+            Self::BrokerConnection(_) => {
+                "org.apache.activemq.artemis.core.management.impl.BrokerConnectionControlImpl"
+            }
         }
     }
 }
@@ -409,6 +415,15 @@ pub fn registered(
     for b in broker.bridges().names() {
         if let Some(n) = name(format!("{base},component=bridges,name={}", quote(&b))) {
             out.push((n, Bean::Bridge(b)));
+        }
+    }
+    for c in broker.broker_connections() {
+        let c = c.name().to_owned();
+        if let Some(n) = name(format!(
+            "{base},component=broker-connections,name={}",
+            quote(&c)
+        )) {
+            out.push((n, Bean::BrokerConnection(c)));
         }
     }
     let po = broker.post_office();

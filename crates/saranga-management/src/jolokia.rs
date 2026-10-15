@@ -38,6 +38,7 @@ impl Caller {
             Bean::Acceptor(n, _) => ("AcceptorControlImpl", n.as_str()),
             Bean::BroadcastGroup(n) => ("BroadcastGroupControlImpl", n.as_str()),
             Bean::Bridge(n) => ("BridgeControlImpl", n.as_str()),
+            Bean::BrokerConnection(n) => ("BrokerConnectionControlImpl", n.as_str()),
         };
         saranga_server::audit::mbean_info(
             class,

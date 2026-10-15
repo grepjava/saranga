@@ -11,6 +11,7 @@
 //!   [`native`], how the broker holds them.
 //! - [`convert`]: conversion to and from Core.
 
+pub mod broker_connection;
 pub mod codec;
 pub mod composite;
 pub mod connection;
@@ -70,7 +71,13 @@ pub struct Settings {
 
 impl Settings {
     pub fn from(acceptor: &Acceptor) -> Self {
-        let p = |k: &str| acceptor.params.get(k).map(|v| v.trim());
+        Self::from_params(&acceptor.params)
+    }
+
+    /// The settings of a URI's parameters: an acceptor's, or a broker
+    /// connection's (`createProtocolManager(server, extraParams)`).
+    pub fn from_params(params: &std::collections::HashMap<String, String>) -> Self {
+        let p = |k: &str| params.get(k).map(|v| v.trim());
         let int =
             |k: &str, default: i64| p(k).and_then(|v| v.parse::<i64>().ok()).unwrap_or(default);
         let flag = |k: &str, default: bool| {
@@ -112,6 +119,8 @@ impl Settings {
 pub struct AmqpConfig {
     /// `amqp-use-core-subscription-naming`.
     pub use_core_subscription_naming: bool,
+    /// `<broker-connections>`.
+    pub broker_connections: Vec<saranga_config::AmqpBrokerConnectConfig>,
 }
 
 /// The AMQP protocol (`ProtonProtocolManagerFactory` and
@@ -121,6 +130,8 @@ pub struct AmqpProtocol {
     config: AmqpConfig,
     /// The container IDs of the open connections.
     containers: Arc<connection::ContainerIds>,
+    /// The broker connections, once started.
+    broker_connections: broker_connection::BrokerConnectionManager,
 }
 
 impl AmqpProtocol {
@@ -128,6 +139,7 @@ impl AmqpProtocol {
         Self {
             config,
             containers: Arc::default(),
+            broker_connections: Default::default(),
         }
     }
 }
@@ -159,5 +171,19 @@ impl ProtocolManager for AmqpProtocol {
     /// `AMQPMessagePersister`, `V2` and `V3` records.
     fn message_decoder(&self) -> Option<Arc<NativeDecoder>> {
         Some(native::decoder())
+    }
+
+    /// `loadProtocolServices`: the broker connections start.
+    fn start_services(&self, broker: &Arc<Broker>) {
+        self.broker_connections.start(
+            broker,
+            &self.config.broker_connections,
+            &self.config,
+            &self.containers,
+        );
+    }
+
+    fn stop_services(&self, broker: &Broker) {
+        self.broker_connections.stop(broker);
     }
 }

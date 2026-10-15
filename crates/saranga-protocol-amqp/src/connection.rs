@@ -218,6 +218,58 @@ enum Event {
         handle: u32,
         reason: String,
     },
+    /// A broker connection attaches a link on its session.
+    Open(Box<LocalLink>),
+    /// A broker connection is done with the connection: it closes.
+    Fail(String),
+}
+
+/// How a broker connection reaches its connection's task.
+#[derive(Clone)]
+pub struct ConnectionHandle(mpsc::UnboundedSender<Event>);
+
+impl ConnectionHandle {
+    /// Attaches a link on the connection's session.
+    pub fn open(&self, link: LocalLink) {
+        let _ = self.0.send(Event::Open(Box::new(link)));
+    }
+
+    /// Closes the connection (`fail`).
+    pub fn fail(&self, reason: impl Into<String>) {
+        let _ = self.0.send(Event::Fail(reason.into()));
+    }
+
+    /// Whether the connection's task is gone.
+    pub fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+}
+
+/// What a connection the broker opens says and does
+/// (`createOutgoingConnectionEntry`).
+pub struct Outgoing {
+    pub user: Option<String>,
+    pub password: Option<String>,
+    /// The URI's `saslMechanisms`, when given: the only ones chosen.
+    pub sasl_mechanisms: Option<Vec<String>>,
+    /// Added to the Open's properties.
+    pub properties: Fields,
+    pub desired_capabilities: Option<Vec<Symbol>>,
+    /// Told when the peer's Open comes.
+    pub on_open: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+/// How a connection the broker opened ended.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ended {
+    /// The peer closed it, or the socket went.
+    Closed,
+    /// It never opened: the handshake failed.
+    Refused(String),
+    /// A link of the broker connection failed (`error(e, lastRetryCounter)`).
+    LinkFailed(String),
+    /// The broker connection closed it.
+    Stopped,
 }
 
 /// A sender link's credit as the queue sees it: what the client gave less
@@ -400,6 +452,9 @@ enum Link {
     Coordinator(CoordinatorLink),
 }
 
+/// A session, on this end's channel. Its links are kept by this end's
+/// handles: the peer's are mapped to them as its frames come
+/// (`TransportSession`).
 struct Session {
     server: ServerSession,
     next_outgoing_id: u32,
@@ -412,6 +467,52 @@ struct Session {
     tags: Tags,
     /// Transfer frames waiting for the client's incoming window.
     blocked: std::collections::VecDeque<Vec<u8>>,
+    /// The peer's handles, and this end's for them.
+    handles: HashMap<u32, u32>,
+    /// Links this end detached, waiting for the peer's detach.
+    detaching: std::collections::HashSet<u32>,
+    /// Links this end attached, waiting for the peer's attach.
+    pending: HashMap<u32, LocalLink>,
+}
+
+impl Session {
+    /// `allocateLocalHandle`: the lowest handle not in use.
+    fn allocate_handle(&self) -> u32 {
+        (0..=HANDLE_MAX)
+            .find(|h| {
+                !self.links.contains_key(h)
+                    && !self.detaching.contains(h)
+                    && !self.pending.contains_key(h)
+            })
+            .unwrap_or(HANDLE_MAX)
+    }
+
+    /// This end's handle for the peer's.
+    fn local_handle(&self, remote: u32) -> u32 {
+        self.handles.get(&remote).copied().unwrap_or(u32::MAX)
+    }
+}
+
+/// A link this end attaches (a broker connection's), waiting for the
+/// peer's attach.
+pub struct LocalLink {
+    /// The attach sent; its handle is given when it is.
+    pub attach: Attach,
+    pub kind: LocalLinkKind,
+}
+
+/// What a link this end attaches is for.
+#[derive(Debug, Clone)]
+pub enum LocalLinkKind {
+    /// Sends a queue's messages (`AMQPOutgoingController`).
+    Sender { queue: String },
+    /// Takes the peer's messages to a queue's address, with its routing
+    /// type (`connectReceiver`).
+    Receiver {
+        queue: String,
+        address: String,
+        routing: RoutingType,
+    },
 }
 
 /// A declared transaction (`ProtonTransactionImpl`).
@@ -454,11 +555,20 @@ struct Conn {
     ttl: Option<Duration>,
     last_read: Instant,
     last_write: Instant,
+    /// Sessions by this end's channel.
     sessions: HashMap<u16, Session>,
+    /// The peer's channels, and this end's for them.
+    channels: HashMap<u16, u16>,
     txns: HashMap<Vec<u8>, Txn>,
     /// Temporary addresses of dynamic targets, removed with their links.
     temp_addresses: Vec<String>,
     closed: bool,
+    /// Set when the broker opened the connection.
+    outgoing: Option<Outgoing>,
+    /// A broker connection's session.
+    main_channel: Option<u16>,
+    /// Why a connection the broker opened ended, when not by the peer.
+    ended: Option<Ended>,
 }
 
 /// Serves one connection until it closes.
@@ -477,11 +587,80 @@ pub async fn serve(
         )
         .with_acceptor(&c.acceptor.name),
     );
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
+    drive(
+        broker, client, c.stream, settings, config, registry, None, events_tx, events_rx,
+    )
+    .await;
+}
+
+/// Opens a connection to another broker over `stream`, as the client
+/// (`createOutgoingConnectionEntry`): the handle the broker connection
+/// reaches it by, and its task, which ends with the connection.
+#[allow(clippy::too_many_arguments)] // the parts of a connection entry
+pub fn connect_out<S>(
+    broker: Arc<Broker>,
+    stream: S,
+    peer: Option<std::net::SocketAddr>,
+    local: Option<std::net::SocketAddr>,
+    settings: Settings,
+    config: AmqpConfig,
+    registry: Arc<ContainerIds>,
+    outgoing: Outgoing,
+) -> (
+    ConnectionHandle,
+    impl std::future::Future<Output = Ended> + Send + 'static,
+)
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let info = saranga_security::ConnectionInfo {
+        remote_address: peer.map(|p| p.to_string()).unwrap_or_default(),
+        certificates: None,
+        security_domain: None,
+        connection_id: None,
+    };
+    let client = Arc::new(ClientConnection::new(
+        Transport::socket("AMQP", "ActiveMQProtonRemotingConnection", peer, local),
+        Arc::new(info),
+        Vec::new(),
+    ));
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
+    let handle = ConnectionHandle(events_tx.clone());
+    let task = drive(
+        broker,
+        client,
+        stream,
+        settings,
+        config,
+        registry,
+        Some(outgoing),
+        events_tx,
+        events_rx,
+    );
+    (handle, task)
+}
+
+/// Runs a connection, either way, until it ends.
+#[allow(clippy::too_many_arguments)]
+async fn drive<S>(
+    broker: Arc<Broker>,
+    client: Arc<ClientConnection>,
+    stream: S,
+    settings: Settings,
+    config: AmqpConfig,
+    registry: Arc<ContainerIds>,
+    outgoing: Option<Outgoing>,
+    events_tx: mpsc::UnboundedSender<Event>,
+    mut events_rx: mpsc::UnboundedReceiver<Event>,
+) -> Ended
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
     let _registered = broker.registry().add(&client);
-    let (rd, wr) = tokio::io::split(c.stream);
+    let (rd, wr) = tokio::io::split(stream);
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     let writer = tokio::spawn(write_loop(wr, out_rx));
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let ttl = match settings.idle_timeout {
         Some(t) => t,
         None if broker.connection_ttl_override() != -1 => broker.connection_ttl_override(),
@@ -507,20 +686,33 @@ pub async fn serve(
         last_read: Instant::now(),
         last_write: Instant::now(),
         sessions: HashMap::new(),
+        channels: HashMap::new(),
         txns: HashMap::new(),
         temp_addresses: Vec::new(),
         closed: false,
+        outgoing,
+        main_channel: None,
+        ended: None,
     };
     let mut reader = Reader {
         rd,
         buf: Vec::new(),
     };
-    if conn.handshake(&mut reader).await {
+    let shaken = if conn.outgoing.is_some() {
+        conn.client_handshake(&mut reader).await
+    } else {
+        conn.handshake(&mut reader).await
+    };
+    if shaken {
+        if conn.outgoing.is_some() {
+            conn.open_out().await;
+        }
         conn.run(&mut reader, &mut events_rx).await;
     }
     conn.shutdown().await;
     conn.out.close();
     let _ = writer.await;
+    conn.ended.take().unwrap_or(Ended::Closed)
 }
 
 impl Conn {
@@ -613,6 +805,155 @@ impl Conn {
                 false
             }
         }
+    }
+
+    /// The client's side of the protocol headers and SASL, for a
+    /// connection the broker opens. False, with why, when it fails.
+    async fn client_handshake<R: AsyncRead + Unpin>(&mut self, r: &mut Reader<R>) -> bool {
+        let refused = |conn: &mut Self, why: String| {
+            conn.ended = Some(Ended::Refused(why));
+            false
+        };
+        self.out.now(SASL_HEADER.to_vec());
+        match r.header().await {
+            Ok(h) if h == SASL_HEADER => {}
+            Ok(_) => return refused(self, "the peer does not offer SASL".into()),
+            Err(_) => return refused(self, "the connection closed".into()),
+        }
+        let max = self.settings.initial_remote_max_frame_size.max(512);
+        let offered = match r.frame(max).await.map(|b| frame::decode(&b)) {
+            Ok(Ok(frame::Frame {
+                body: FrameBody::Sasl(SaslFrame::Mechanisms(m)),
+                ..
+            })) => m
+                .sasl_server_mechanisms
+                .into_iter()
+                .map(|s| s.0)
+                .collect::<Vec<_>>(),
+            _ => return refused(self, "no SASL mechanisms came".into()),
+        };
+        let Some((mechanism, response)) = self.choose_mechanism(&offered) else {
+            return refused(
+                self,
+                format!("no SASL mechanism to use among {}", offered.join(", ")),
+            );
+        };
+        let mut out = Vec::new();
+        frame::encode_sasl(
+            &mut out,
+            &SaslFrame::Init(SaslInit {
+                mechanism: Symbol::from(mechanism),
+                initial_response: Some(response),
+                hostname: None,
+            }),
+        );
+        self.out.now(out);
+        let outcome = loop {
+            match r.frame(max).await.map(|b| frame::decode(&b)) {
+                Ok(Ok(frame::Frame {
+                    body: FrameBody::Sasl(SaslFrame::Outcome(o)),
+                    ..
+                })) => break o,
+                // The mechanisms chosen answer a challenge with nothing.
+                Ok(Ok(frame::Frame {
+                    body: FrameBody::Sasl(SaslFrame::Challenge(_)),
+                    ..
+                })) => {
+                    let mut out = Vec::new();
+                    frame::encode_sasl(
+                        &mut out,
+                        &SaslFrame::Response(sasl::SaslResponse {
+                            response: Vec::new(),
+                        }),
+                    );
+                    self.out.now(out);
+                }
+                _ => return refused(self, "no SASL outcome came".into()),
+            }
+        };
+        if outcome.code != sasl::code::OK {
+            return refused(
+                self,
+                format!("SASL {mechanism} failed with code {}", outcome.code),
+            );
+        }
+        self.out.now(AMQP_HEADER.to_vec());
+        match r.header().await {
+            Ok(h) if h == AMQP_HEADER => true,
+            _ => refused(self, "the peer did not answer the AMQP header".into()),
+        }
+    }
+
+    /// `SaslFactory.chooseMechanism`: among those offered (and allowed by
+    /// the URI's `saslMechanisms`), PLAIN with a user and password, then
+    /// XOAUTH2, then ANONYMOUS. EXTERNAL needs a client certificate and
+    /// SCRAM is not supported, so neither is chosen.
+    fn choose_mechanism(&self, offered: &[String]) -> Option<(&'static str, Vec<u8>)> {
+        let o = self.outgoing.as_ref()?;
+        let allowed = |m: &str| {
+            offered.iter().any(|x| x == m)
+                && o.sasl_mechanisms
+                    .as_ref()
+                    .filter(|e| !e.is_empty())
+                    .is_none_or(|e| e.iter().any(|x| x == m))
+        };
+        let creds = match (&o.user, &o.password) {
+            (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => Some((u, p)),
+            _ => None,
+        };
+        if let Some((u, p)) = creds {
+            if allowed("PLAIN") {
+                let mut r = vec![0u8];
+                r.extend_from_slice(u.as_bytes());
+                r.push(0);
+                r.extend_from_slice(p.as_bytes());
+                return Some(("PLAIN", r));
+            }
+            if allowed("XOAUTH2") {
+                let r = format!("user={u}\u{1}auth=Bearer {p}\u{1}\u{1}");
+                return Some(("XOAUTH2", r.into_bytes()));
+            }
+        }
+        allowed("ANONYMOUS").then(|| ("ANONYMOUS", Vec::new()))
+    }
+
+    /// A broker connection's Open and its session's Begin
+    /// (`AMQPConnectionContext.open`, `session.open`).
+    async fn open_out(&mut self) {
+        let Some(o) = &self.outgoing else { return };
+        let mut open = self.local_open();
+        open.offered_capabilities = None;
+        open.desired_capabilities = o.desired_capabilities.clone();
+        let mut properties = open.properties.take().unwrap_or_default();
+        for (k, v) in &o.properties.0 {
+            properties.insert(k.clone(), v.clone());
+        }
+        open.properties = Some(properties);
+        self.send(0, Performative::Open(open));
+        let channel = self.begin_local().await;
+        self.main_channel = Some(channel);
+    }
+
+    /// Begins a session from this end, on the lowest free channel.
+    async fn begin_local(&mut self) -> u16 {
+        let channel = (0..=CHANNEL_MAX)
+            .find(|c| !self.sessions.contains_key(c))
+            .unwrap_or(CHANNEL_MAX);
+        let mut session = self.new_session(0, WINDOW);
+        session.server.set_started(true).await;
+        self.sessions.insert(channel, session);
+        self.send(
+            channel,
+            Performative::Begin(Begin {
+                remote_channel: None,
+                next_outgoing_id: 1,
+                incoming_window: WINDOW,
+                outgoing_window: WINDOW,
+                handle_max: HANDLE_MAX,
+                ..Default::default()
+            }),
+        );
+        channel
     }
 
     /// One `sasl-init`: the outcome code.
@@ -813,17 +1154,65 @@ impl Conn {
                 format!("{} before open", perf.name()),
             ));
         }
-        let ch = f.channel;
+        // The peer's channel, and this end's for it.
+        let remote = f.channel;
+        let local = self.channels.get(&remote).copied();
+        let unknown = |what: &str| {
+            Fatal::new(
+                condition::ILLEGAL_STATE,
+                format!("{what} on an unknown channel {remote}"),
+            )
+        };
         match perf {
             Performative::Open(o) => self.on_open(o).await,
-            Performative::Begin(b) => self.on_begin(ch, b).await,
-            Performative::Attach(a) => self.on_attach(ch, a).await,
-            Performative::Flow(fl) => self.on_flow(ch, fl),
-            Performative::Transfer(t) => self.on_transfer(ch, t, payload).await,
-            Performative::Disposition(d) => self.on_disposition(ch, d).await,
-            Performative::Detach(d) => self.on_detach(ch, d).await,
-            Performative::End(e) => self.on_end(ch, e).await,
-            Performative::Close(_) => {
+            Performative::Begin(b) => self.on_begin(remote, b).await,
+            Performative::Attach(a) => match local {
+                Some(ch) => self.on_attach(ch, a).await,
+                None => Err(unknown("attach")),
+            },
+            Performative::Flow(mut fl) => match local {
+                Some(ch) => {
+                    if let (Some(h), Some(s)) = (fl.handle, self.sessions.get(&ch)) {
+                        fl.handle = Some(s.local_handle(h));
+                    }
+                    self.on_flow(ch, fl)
+                }
+                None => Ok(()),
+            },
+            Performative::Transfer(mut t) => match local {
+                Some(ch) => {
+                    if let Some(s) = self.sessions.get(&ch) {
+                        t.handle = s.local_handle(t.handle);
+                    }
+                    self.on_transfer(ch, t, payload).await
+                }
+                None => Err(unknown("transfer")),
+            },
+            Performative::Disposition(d) => match local {
+                Some(ch) => self.on_disposition(ch, d).await,
+                None => Ok(()),
+            },
+            Performative::Detach(d) => match local {
+                Some(ch) => self.on_detach(ch, d).await,
+                None => Ok(()),
+            },
+            Performative::End(e) => match local {
+                Some(ch) => {
+                    self.channels.remove(&remote);
+                    self.on_end(ch, e).await
+                }
+                None => Ok(()),
+            },
+            Performative::Close(c) => {
+                if self.outgoing.is_some()
+                    && let Some(e) = &c.error
+                {
+                    tracing::warn!(
+                        "the peer closed the broker connection: {} {}",
+                        e.condition.as_str(),
+                        e.description.as_deref().unwrap_or_default()
+                    );
+                }
                 self.send(0, Performative::Close(Close::default()));
                 self.closed = true;
                 Ok(())
@@ -844,6 +1233,15 @@ impl Conn {
             .idle_time_out
             .filter(|&t| t > 0)
             .map(|t| Duration::from_millis(u64::from(t)));
+        if let Some(o) = &mut self.outgoing {
+            // This end opened already, and its user is the broker.
+            self.opened = true;
+            self.client.set_client_id(Some(open.container_id));
+            if let Some(f) = o.on_open.take() {
+                f();
+            }
+            return Ok(());
+        }
         // validateUser
         if let Some(store) = self.broker.security().cloned() {
             let info = self.client.security_info();
@@ -904,13 +1302,10 @@ impl Conn {
         Fatal(error)
     }
 
-    async fn on_begin(&mut self, channel: u16, begin: Begin) -> Handled {
-        if self.sessions.contains_key(&channel) {
-            return Err(Fatal::new(
-                condition::ILLEGAL_STATE,
-                format!("channel {channel} in use"),
-            ));
-        }
+    /// A session's state, its server session not started yet. A broker
+    /// connection's sessions are internal: nothing they do is checked
+    /// (`createInternalSession`).
+    fn new_session(&self, next_incoming_id: u32, remote_incoming_window: u32) -> Session {
         let mut server = ServerSession::new(
             self.broker.clone(),
             self.client.clone(),
@@ -926,27 +1321,59 @@ impl Conn {
             },
             self.auth.clone(),
         );
+        if self.outgoing.is_some() {
+            server.set_internal();
+        }
+        Session {
+            server,
+            next_outgoing_id: 1,
+            next_incoming_id,
+            remote_incoming_window,
+            next_delivery_id: 0,
+            next_consumer: 0,
+            links: HashMap::new(),
+            out: BTreeMap::new(),
+            tags: Tags::default(),
+            blocked: std::collections::VecDeque::new(),
+            handles: HashMap::new(),
+            detaching: std::collections::HashSet::new(),
+            pending: HashMap::new(),
+        }
+    }
+
+    /// The peer's Begin: the answer to one this end sent, or a session it
+    /// begins, given the lowest free channel here.
+    async fn on_begin(&mut self, remote: u16, begin: Begin) -> Handled {
+        if self.channels.contains_key(&remote) {
+            return Err(Fatal::new(
+                condition::ILLEGAL_STATE,
+                format!("channel {remote} in use"),
+            ));
+        }
+        if let Some(local) = begin.remote_channel {
+            let Some(s) = self.sessions.get_mut(&local) else {
+                return Err(Fatal::new(
+                    condition::ILLEGAL_STATE,
+                    format!("a begin answering channel {local}, which has no session"),
+                ));
+            };
+            s.next_incoming_id = begin.next_outgoing_id;
+            s.remote_incoming_window = begin.incoming_window;
+            self.channels.insert(remote, local);
+            return Ok(());
+        }
+        let channel = (0..=CHANNEL_MAX)
+            .find(|c| !self.sessions.contains_key(c))
+            .unwrap_or(CHANNEL_MAX);
+        let mut session = self.new_session(begin.next_outgoing_id, begin.incoming_window);
         // AMQPSessionCallback.init starts the session.
-        server.set_started(true).await;
-        self.sessions.insert(
-            channel,
-            Session {
-                server,
-                next_outgoing_id: 1,
-                next_incoming_id: begin.next_outgoing_id,
-                remote_incoming_window: begin.incoming_window,
-                next_delivery_id: 0,
-                next_consumer: 0,
-                links: HashMap::new(),
-                out: BTreeMap::new(),
-                tags: Tags::default(),
-                blocked: std::collections::VecDeque::new(),
-            },
-        );
+        session.server.set_started(true).await;
+        self.sessions.insert(channel, session);
+        self.channels.insert(remote, channel);
         self.send(
             channel,
             Performative::Begin(Begin {
-                remote_channel: Some(channel),
+                remote_channel: Some(remote),
                 next_outgoing_id: 1,
                 incoming_window: WINDOW,
                 outgoing_window: WINDOW,
@@ -1005,13 +1432,34 @@ impl Conn {
 
     // -------------------------------------------------------- links
 
-    async fn on_attach(&mut self, channel: u16, attach: Attach) -> Handled {
-        if !self.sessions.contains_key(&channel) {
+    async fn on_attach(&mut self, channel: u16, mut attach: Attach) -> Handled {
+        let Some(s) = self.sessions.get_mut(&channel) else {
             return Err(Fatal::new(
                 condition::ILLEGAL_STATE,
                 "attach on an unknown channel",
             ));
+        };
+        if s.handles.contains_key(&attach.handle) {
+            return Err(Fatal::new(
+                condition::HANDLE_IN_USE,
+                format!("handle {} is in use", attach.handle),
+            ));
         }
+        // The answer to a link this end attached: the same name, the other
+        // role.
+        let answering = s
+            .pending
+            .iter()
+            .find(|(_, p)| p.attach.name == attach.name && p.attach.role != attach.role)
+            .map(|(h, _)| *h);
+        if let Some(local) = answering {
+            let link = s.pending.remove(&local).expect("found");
+            s.handles.insert(attach.handle, local);
+            return self.local_link_attached(channel, local, link, attach).await;
+        }
+        let local = s.allocate_handle();
+        s.handles.insert(attach.handle, local);
+        attach.handle = local;
         match attach.role {
             // The client sends: the broker receives.
             Role::Sender => match &attach.target {
@@ -1039,6 +1487,9 @@ impl Conn {
                 error: Some(Error::new(e.condition, Some(e.description))),
             }),
         );
+        if let Some(s) = self.sessions.get_mut(&channel) {
+            s.detaching.insert(handle);
+        }
     }
 
     fn link_flow(
@@ -1278,27 +1729,223 @@ impl Conn {
         let Some(s) = self.sessions.get_mut(&channel) else {
             return Ok(());
         };
-        let link = s.links.remove(&detach.handle);
+        let Some(handle) = s.handles.remove(&detach.handle) else {
+            return Ok(());
+        };
+        // The answer to a detach this end sent.
+        if s.detaching.remove(&handle) {
+            return Ok(());
+        }
+        // A link this end attached that the peer refused.
+        if let Some(p) = s.pending.remove(&handle) {
+            self.send(
+                channel,
+                Performative::Detach(Detach {
+                    handle,
+                    closed: detach.closed,
+                    error: None,
+                }),
+            );
+            self.link_failed(refused_message(&p));
+            return Ok(());
+        }
+        let link = s.links.remove(&handle);
         let mut s = self.sessions.remove(&channel).expect("checked");
+        let mut closed = detach.closed;
+        let was_open = link.is_some();
         if let Some(l) = link {
             let link_detach_expiry = match &l {
                 Link::Sender(sl) => sl.source.as_ref().map(|x| x.expiry_policy),
                 Link::Receiver(rl) => rl.source.as_ref().map(|x| x.expiry_policy),
                 Link::Coordinator(_) => None,
             } == Some(TerminusExpiryPolicy::LinkDetach);
-            self.close_link(&mut s, l, detach.closed || link_detach_expiry)
-                .await;
+            closed |= link_detach_expiry;
+            self.close_link(&mut s, l, closed).await;
         }
         self.sessions.insert(channel, s);
         self.send(
             channel,
             Performative::Detach(Detach {
-                handle: detach.handle,
+                handle,
                 closed: detach.closed,
                 error: None,
             }),
         );
+        // AMQPBrokerConnection.linkClosed: a broker connection whose link
+        // the peer closes is made again.
+        if self.outgoing.is_some() && closed && was_open {
+            self.link_failed(
+                "AMQ119021: The broker connection had a remote link closed unexpectedly".into(),
+            );
+        }
         Ok(())
+    }
+
+    /// Attaches a broker connection's link on its session, with the lowest
+    /// free handle.
+    fn open_local(&mut self, mut link: LocalLink) {
+        let Some(channel) = self.main_channel else {
+            return;
+        };
+        let Some(s) = self.sessions.get_mut(&channel) else {
+            return;
+        };
+        let handle = s.allocate_handle();
+        link.attach.handle = handle;
+        let attach = link.attach.clone();
+        s.pending.insert(handle, link);
+        self.send(channel, Performative::Attach(attach));
+    }
+
+    /// The peer's attach answering a link this end attached (the
+    /// `AMQP_LINK_INITIALIZER_KEY` runnable of `connectSender` and
+    /// `connectReceiver`).
+    async fn local_link_attached(
+        &mut self,
+        channel: u16,
+        handle: u32,
+        link: LocalLink,
+        remote: Attach,
+    ) -> Handled {
+        let refused = match &link.kind {
+            LocalLinkKind::Sender { .. } => remote.target.is_none(),
+            LocalLinkKind::Receiver { .. } => remote.source.is_none(),
+        };
+        if refused {
+            self.link_failed(refused_message(&link));
+            return Ok(());
+        }
+        let name = link.attach.name.clone();
+        match link.kind {
+            LocalLinkKind::Sender { queue } => {
+                let consumer = {
+                    let s = self.sessions.get_mut(&channel).expect("checked");
+                    let c = s.next_consumer;
+                    s.next_consumer += 1;
+                    c
+                };
+                let credit = Arc::new(Mutex::new(Credit::default()));
+                let sink = Arc::new(Sink {
+                    events: self.events.clone(),
+                    channel,
+                    handle,
+                    credit: credit.clone(),
+                });
+                let s = self.sessions.get_mut(&channel).expect("checked");
+                // AMQPOutgoingController.init: createSender(queue).
+                let created = s
+                    .server
+                    .create_consumer(consumer, &queue, None, 0, false, move |_: &Queue| {
+                        sink as Arc<dyn DeliverySink>
+                    })
+                    .await;
+                if let Err(e) = created {
+                    let error = Error::new(
+                        condition::INTERNAL_ERROR,
+                        Some(format!("AMQ119005: error creating consumer, {}", e.message)),
+                    );
+                    self.send(
+                        channel,
+                        Performative::Detach(Detach {
+                            handle,
+                            closed: true,
+                            error: Some(error),
+                        }),
+                    );
+                    if let Some(s) = self.sessions.get_mut(&channel) {
+                        s.detaching.insert(handle);
+                    }
+                    return Ok(());
+                }
+                s.server.consumer_credits(consumer, -1);
+                let routing_type = s.server.queue_query(&queue).routing_type;
+                s.links.insert(
+                    handle,
+                    Link::Sender(SenderLink {
+                        name,
+                        consumer,
+                        resolved: SenderSource {
+                            queue,
+                            multicast: false,
+                            selector: None,
+                            browse: false,
+                            priority: 0,
+                            temp_queue: None,
+                            shared: false,
+                            global: false,
+                            is_volatile: false,
+                            routing_type: Some(routing_type),
+                        },
+                        source: link.attach.source.clone(),
+                        credit,
+                        link_credit: 0,
+                        delivery_count: 0,
+                        presettled: false,
+                        draining: false,
+                    }),
+                );
+            }
+            LocalLinkKind::Receiver {
+                queue,
+                address,
+                routing,
+            } => {
+                let s = self.sessions.get_mut(&channel).expect("checked");
+                // The queue that asked for the link may have gone meanwhile.
+                if !s.server.queue_query(&queue).exists {
+                    let error = Error::new(
+                        condition::NOT_FOUND,
+                        Some(format!(
+                            "AMQ119002: target address {address} does not exist"
+                        )),
+                    );
+                    s.detaching.insert(handle);
+                    self.send(
+                        channel,
+                        Performative::Detach(Detach {
+                            handle,
+                            closed: true,
+                            error: Some(error),
+                        }),
+                    );
+                    return Ok(());
+                }
+                let credits = self.settings.credits.max(0) as u32;
+                let delivery_count = remote.initial_delivery_count.unwrap_or(0);
+                s.server.add_producer(&name, "AMQP", Some(&address));
+                s.links.insert(
+                    handle,
+                    Link::Receiver(ReceiverLink {
+                        name,
+                        target: ReceiverTarget {
+                            address: Some(address),
+                            explicit: Some(routing),
+                            implicit: Some(routing),
+                            dynamic: false,
+                        },
+                        source: link.attach.source.clone(),
+                        credit: credits,
+                        delivery_count,
+                        incoming: None,
+                        dynamic_expiry: TerminusExpiryPolicy::SessionEnd,
+                    }),
+                );
+                let s = &self.sessions[&channel];
+                let flow = self.link_flow(s, handle, delivery_count, credits, false);
+                self.send(channel, Performative::Flow(flow));
+            }
+        }
+        Ok(())
+    }
+
+    /// A broker connection's link failed: the connection closes, to be
+    /// made again (`error(e, lastRetryCounter)`).
+    fn link_failed(&mut self, message: String) {
+        if self.ended.is_none() {
+            tracing::warn!("{message}");
+            self.ended = Some(Ended::LinkFailed(message.clone()));
+        }
+        self.close_with(Error::new(condition::INTERNAL_ERROR, Some(message)));
     }
 
     /// `close(remoteClose)` of a link: its consumer closes; a closed
@@ -1787,8 +2434,20 @@ impl Conn {
                             error: Some(Error::new(condition::RESOURCE_DELETED, Some(reason))),
                         }),
                     );
+                    s.detaching.insert(handle);
                 }
                 self.sessions.insert(channel, s);
+                Ok(())
+            }
+            Event::Open(link) => {
+                self.open_local(*link);
+                Ok(())
+            }
+            Event::Fail(reason) => {
+                if self.ended.is_none() {
+                    self.ended = Some(Ended::Stopped);
+                }
+                self.close_with(Error::new(condition::INTERNAL_ERROR, Some(reason)));
                 Ok(())
             }
         }
@@ -2303,5 +2962,22 @@ fn failure_state(source: Option<&Source>, e: &BrokerError, use_modified: bool) -
     match default {
         Some(d) => d,
         None => rejected,
+    }
+}
+
+/// Why the peer refused a broker connection's link (`senderLinkRefused`,
+/// `receiverLinkRefused`).
+fn refused_message(link: &LocalLink) -> String {
+    match &link.kind {
+        LocalLinkKind::Sender { .. } => {
+            let address = match &link.attach.target {
+                Some(TargetKind::Target(t)) => t.address.clone().unwrap_or_default(),
+                _ => String::new(),
+            };
+            format!("AMQ119023: Sender link refused for address {address}")
+        }
+        LocalLinkKind::Receiver { address, .. } => {
+            format!("AMQ119029: Receiver link refused for address {address}")
+        }
     }
 }

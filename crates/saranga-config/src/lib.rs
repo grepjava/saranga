@@ -15,6 +15,7 @@ mod acceptor;
 mod address_settings;
 mod bootstrap;
 mod broker;
+mod broker_connection;
 pub mod broker_properties;
 mod bytes;
 mod federation;
@@ -43,6 +44,11 @@ pub use broker::{
     DivertRoutingType, GroupingHandlerConfig, HaPolicy, JaasModuleConfig, JournalConfig,
     JournalRetention, JournalType, LockManagerConfig, MessageLoadBalancing, QueueConfig,
     Replication, TransformerConfig, UdpEndpointConfig, Warning,
+};
+pub use broker_connection::{
+    AmqpBridgeAddressPolicy, AmqpBridgeElement, AmqpBridgeQueuePolicy, AmqpBrokerConnectConfig,
+    AmqpConnectionElement, AmqpFederationAddressPolicy, AmqpFederationElement,
+    AmqpFederationQueuePolicy, AmqpMatchElement, AmqpMirrorElement, AmqpQueueMatch,
 };
 pub use bytes::convert_text_bytes;
 pub use federation::{

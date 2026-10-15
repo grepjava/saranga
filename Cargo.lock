@@ -1860,6 +1860,7 @@ name = "saranga-protocol-amqp"
 version = "0.0.1"
 dependencies = [
  "saranga-buffer",
+ "saranga-client",
  "saranga-config",
  "saranga-core-protocol",
  "saranga-filter",
@@ -1867,9 +1868,11 @@ dependencies = [
  "saranga-security",
  "saranga-server",
  "saranga-storage",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

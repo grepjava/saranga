@@ -1,0 +1,54 @@
+=== artemis run (node 2, node 1)
+node 2: listening
+node 1: listening
+node 1: connected to node 2
+inbox has 1 consumers
+=== BrokerConnection.java send outbox (node 1), receive outbox (node 2)
+sent 10 to outbox
+received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+property n kept
+none left
+received []
+property n kept
+none left
+=== BrokerConnection.java send inbox (node 2), receive inbox (node 1)
+sent 10 to inbox
+received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+property n kept
+none left
+=== management (node 1)
+[{"name":"to-node2","protocol":"AMQP","started":true,"uri":"tcp://localhost:65496","connected":true}]
+tcp://localhost:65496
+AMQP
+500
+-1
+null
+inbox has 0 consumers
+false
+FAILED broker connection nothing not found
+null
+inbox has 1 consumers
+true
+=== artemis stop (node 2)
+node 2: down
+node 1: retrying
+=== artemis run (node 2)
+node 2: listening
+node 1: connected to node 2
+inbox has 1 consumers
+=== BrokerConnection.java send outbox (node 1), receive outbox (node 2)
+sent 10 to outbox
+received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+property n kept
+none left
+received []
+property n kept
+none left
+=== BrokerConnection.java send inbox (node 2), receive inbox (node 1)
+sent 10 to inbox
+received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+property n kept
+none left
+=== artemis stop (node 1, node 2)
+node 1: down
+node 2: down

@@ -792,3 +792,117 @@ fn federations() {
         r##"<federations><federation name="f"><address-policy name="ap" auto-delete-delay="-1"/></federation></federations>"##,
     );
 }
+
+#[test]
+fn broker_connections() {
+    use saranga_config::{AmqpConnectionElement as E, AmqpQueueMatch};
+    let c = parse(
+        r##"<broker-connections>
+             <amqp-connection uri="tcp://a:5672?amqpCredits=10" name="c1" user="u" password="p" retry-interval="100" reconnect-attempts="3" auto-start="false">
+               <sender address-match="out.#"/>
+               <receiver queue-name="in"/>
+               <peer address-match="both"/>
+               <mirror durable="false" sync="true" address-filter="x,!y">
+                 <property key="tunnel-core-messages" value="false"/>
+               </mirror>
+               <federation>
+                 <local-address-policy name="lap" max-hops="2" auto-delete="true" auto-delete-delay="10" enable-divert-bindings="true">
+                   <include address-match="news.#"/>
+                   <include address-match="news.#"/>
+                   <exclude address-match="news.x"/>
+                   <transformer-class-name>org.foo.T</transformer-class-name>
+                 </local-address-policy>
+                 <remote-queue-policy name="rqp" include-federated="true" priority-adjustment="-2">
+                   <include address-match="#" queue-match="q.#"/>
+                   <property key="k" value="v"/>
+                 </remote-queue-policy>
+                 <property key="receiverCredits" value="5"/>
+               </federation>
+               <bridge>
+                 <bridge-to-address name="bta" remote-address="there" remote-terminus-capabilities="topic,shared" use-durable-subscriptions="true">
+                   <include address-match="a"/>
+                 </bridge-to-address>
+                 <bridge-from-queue name="bfq" priority-adjustment="1" filter="x = 1">
+                   <include address-match="b" queue-match="b"/>
+                 </bridge-from-queue>
+               </bridge>
+             </amqp-connection>
+             <amqp-connection uri="tcp://b:5672" name="c2"/>
+           </broker-connections>"##,
+    );
+    assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+    let [c1, c2] = &c.broker_connections[..] else {
+        panic!("{:?}", c.broker_connections)
+    };
+    assert_eq!(c1.name, "c1");
+    assert_eq!(c1.uri, "tcp://a:5672?amqpCredits=10");
+    assert_eq!((c1.retry_interval, c1.reconnect_attempts), (100, 3));
+    assert_eq!(
+        (c1.user.as_deref(), c1.password.as_deref()),
+        (Some("u"), Some("p"))
+    );
+    assert!(!c1.auto_start);
+    assert_eq!(c1.elements.len(), 6);
+    assert!(
+        matches!(&c1.elements[0], E::Sender(m) if m.address_match.as_deref() == Some("out.#") && m.queue_name.is_none())
+    );
+    assert!(matches!(&c1.elements[1], E::Receiver(m) if m.queue_name.as_deref() == Some("in")));
+    assert!(matches!(&c1.elements[2], E::Peer(_)));
+    let E::Mirror(m) = &c1.elements[3] else {
+        panic!()
+    };
+    assert!(!m.durable && m.sync && m.message_acknowledgements);
+    assert_eq!(m.address_filter.as_deref(), Some("x,!y"));
+    assert_eq!(
+        m.properties,
+        [("tunnel-core-messages".into(), "false".into())]
+    );
+    let E::Federation(f) = &c1.elements[4] else {
+        panic!()
+    };
+    assert_eq!(f.name, "c1");
+    let lap = &f.local_address_policies[0];
+    assert_eq!(lap.max_hops, 2);
+    assert_eq!(lap.includes, ["news.#"]);
+    assert_eq!(lap.excludes, ["news.x"]);
+    assert_eq!(lap.auto_delete, Some(true));
+    assert_eq!(lap.enable_divert_bindings, Some(true));
+    assert_eq!(
+        lap.transformer.as_ref().map(|t| t.class_name.as_str()),
+        Some("org.foo.T")
+    );
+    let rqp = &f.remote_queue_policies[0];
+    assert!(rqp.include_federated);
+    assert_eq!(rqp.priority_adjustment, Some(-2));
+    assert_eq!(
+        rqp.includes,
+        [AmqpQueueMatch {
+            address_match: "#".into(),
+            queue_match: "q.#".into()
+        }]
+    );
+    assert_eq!(rqp.properties, [("k".into(), "v".into())]);
+    assert_eq!(f.properties, [("receiverCredits".into(), "5".into())]);
+    let E::Bridge(b) = &c1.elements[5] else {
+        panic!()
+    };
+    assert_eq!(b.name, "c1");
+    let bta = &b.to_address_policies[0];
+    assert_eq!(bta.remote_address.as_deref(), Some("there"));
+    assert_eq!(
+        bta.remote_terminus_capabilities.as_deref(),
+        Some(&["topic".to_owned(), "shared".to_owned()][..])
+    );
+    assert!(bta.use_durable_subscriptions);
+    let bfq = &b.from_queue_policies[0];
+    assert_eq!(bfq.priority_adjustment, Some(1));
+    assert_eq!(bfq.filter.as_deref(), Some("x = 1"));
+    // The defaults.
+    assert_eq!((c2.retry_interval, c2.reconnect_attempts), (5000, -1));
+    assert!(c2.auto_start && c2.user.is_none() && c2.elements.is_empty());
+
+    let e = parse_err(
+        r#"<broker-connections><amqp-connection uri="tcp://a" name="x" retry-interval="0"/></broker-connections>"#,
+    );
+    assert!(e.to_string().contains("retry-interval"), "{e}");
+}

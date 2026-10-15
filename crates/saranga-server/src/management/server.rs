@@ -1073,6 +1073,43 @@ pub(super) async fn invoke(
             Err(e) => Err(e),
         });
     }
+    // Broker connections (`listBrokerConnections`, `startBrokerConnection`,
+    // `stopBrokerConnection`).
+    if call.is("listBrokerConnections", &[]).is_some() {
+        let list: Vec<Json> = broker
+            .broker_connections()
+            .iter()
+            .map(|c| {
+                let mut o = Json::object();
+                o.put("name", c.name());
+                o.put("protocol", c.protocol());
+                o.put("started", c.is_started());
+                o.put("uri", c.uri());
+                o.put("connected", c.is_connected());
+                o
+            })
+            .collect();
+        return Some(Ok(Json::from(Json::Array(list).to_string())));
+    }
+    for (op, start) in [
+        ("startBrokerConnection", true),
+        ("stopBrokerConnection", false),
+    ] {
+        if let Some(a) = call.is(op, &[S]) {
+            let name = a.s_or_empty(0);
+            return Some(match broker.broker_connection_registry().get(&name) {
+                Some(c) => {
+                    if start {
+                        c.start();
+                    } else {
+                        c.stop();
+                    }
+                    Ok(Json::Null)
+                }
+                None => Err(format!("broker connection {name} not found")),
+            });
+        }
+    }
     if let Some(a) = call.is("destroyBridge", &[S]) {
         broker.destroy_bridge(&a.s_or_empty(0)).await;
         return Some(Ok(Json::Null));

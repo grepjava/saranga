@@ -819,6 +819,8 @@ pub struct BrokerConfig {
     /// broker to federate from another (a downstream) must have one of
     /// these roles.
     pub federation_downstream_authorization: Vec<String>,
+    /// `<broker-connections>`: the `<amqp-connection>`s, in document order.
+    pub broker_connections: Vec<crate::AmqpBrokerConnectConfig>,
     /// `message-expiry-scan-period` in milliseconds; `-1` turns the expiry
     /// reaper off.
     pub message_expiry_scan_period: i64,
@@ -1053,6 +1055,7 @@ impl Default for BrokerConfig {
             grouping_handler: None,
             federations: Vec::new(),
             federation_downstream_authorization: Vec::new(),
+            broker_connections: Vec::new(),
             message_expiry_scan_period: Self::DEFAULT_MESSAGE_EXPIRY_SCAN_PERIOD,
             transaction_timeout: Self::DEFAULT_TRANSACTION_TIMEOUT,
             transaction_timeout_scan_period: Self::DEFAULT_TRANSACTION_TIMEOUT_SCAN_PERIOD,

@@ -426,6 +426,9 @@ pub struct ServerSession {
     /// ([`ServerSession::route_direct`]): no auto-creation permission or
     /// validated-user checks either.
     direct: bool,
+    /// A broker connection's session (`createInternalSession`): nothing it
+    /// does is checked.
+    internal: bool,
     /// What management sees of the session.
     entry: Arc<SessionEntry>,
     /// The producer the next sends are counted against.
@@ -519,6 +522,7 @@ impl ServerSession {
             actions: Vec::new(),
             unchecked: false,
             direct: false,
+            internal: false,
         }
     }
 
@@ -569,6 +573,7 @@ impl ServerSession {
             actions: Vec::new(),
             unchecked: false,
             direct: false,
+            internal: false,
         }
     }
 
@@ -680,10 +685,16 @@ impl ServerSession {
         }
     }
 
+    /// Makes this a broker connection's session (`createInternalSession`):
+    /// its permissions are not checked.
+    pub fn set_internal(&mut self) {
+        self.internal = true;
+    }
+
     /// Routing on behalf of this session: its security checks and user.
     pub fn creator(&self) -> Creator<'_> {
         Creator {
-            security: (!self.direct)
+            security: (!self.direct && !self.internal)
                 .then(|| self.broker.security())
                 .flatten()
                 .map(|s| (&**s, &self.auth)),
@@ -698,7 +709,7 @@ impl ServerSession {
         queue: Option<&str>,
         check: CheckType,
     ) -> Result<()> {
-        if self.unchecked {
+        if self.unchecked || self.internal {
             return Ok(());
         }
         self.creator().check(address, queue, check)
@@ -1047,6 +1058,7 @@ impl ServerSession {
             );
         }
         if !self.direct
+            && !self.internal
             && self.broker.reject_empty_validated_user()
             && message
                 .properties

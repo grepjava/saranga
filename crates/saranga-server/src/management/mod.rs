@@ -137,6 +137,7 @@ enum Resource {
     Acceptor(String),
     BroadcastGroup(Arc<crate::discovery::BroadcastGroup>),
     Bridge(Arc<crate::bridge::Bridge>),
+    BrokerConnection(Arc<dyn crate::broker_connection::BrokerConnection>),
 }
 
 impl Resource {
@@ -151,6 +152,7 @@ impl Resource {
             Resource::Acceptor(a) => (Control::Acceptor, a.clone()),
             Resource::BroadcastGroup(g) => (Control::BroadcastGroup, g.config().name.clone()),
             Resource::Bridge(b) => (Control::Bridge, b.name().to_owned()),
+            Resource::BrokerConnection(c) => (Control::BrokerConnection, c.name().to_owned()),
         }
     }
 }
@@ -247,6 +249,12 @@ impl Management {
         if let Some(b) = name.strip_prefix("bridge.") {
             return broker.bridges().get(b).map(Resource::Bridge);
         }
+        if let Some(c) = name.strip_prefix("brokerconnection.") {
+            return broker
+                .broker_connection_registry()
+                .get(c)
+                .map(Resource::BrokerConnection);
+        }
         None
     }
 
@@ -276,6 +284,7 @@ impl Management {
             Resource::Acceptor(a) => Ok(acceptor_attribute(broker, a, &upper)),
             Resource::BroadcastGroup(g) => Ok(broadcast_group_attribute(g, &upper)),
             Resource::Bridge(b) => bridge_attribute(b, &upper),
+            Resource::BrokerConnection(c) => Ok(broker_connection_attribute(c.as_ref(), &upper)),
         };
         match found {
             // A boolean attribute is read through its `is` method.
@@ -383,6 +392,7 @@ impl Management {
             Resource::Acceptor(a) => invoke_acceptor(broker, a, &call).await,
             Resource::BroadcastGroup(g) => invoke_broadcast_group(g, &call),
             Resource::Bridge(b) => invoke_bridge(b, &call).await,
+            Resource::BrokerConnection(c) => invoke_broker_connection(c.as_ref(), &call),
         };
         if let Some(outcome) = found {
             return outcome;
@@ -401,6 +411,9 @@ impl Management {
                         Resource::Acceptor(a) => Ok(acceptor_attribute(broker, a, attr)),
                         Resource::BroadcastGroup(g) => Ok(broadcast_group_attribute(g, attr)),
                         Resource::Bridge(b) => bridge_attribute(b, attr),
+                        Resource::BrokerConnection(c) => {
+                            Ok(broker_connection_attribute(c.as_ref(), attr))
+                        }
                     };
                     match value {
                         Ok(Some(v)) => return Ok(v),
@@ -675,6 +688,40 @@ async fn invoke_bridge(b: &Arc<crate::bridge::Bridge>, call: &args::Call<'_>) ->
         "stop" => b.stop().await.map(|()| Json::Null).map_err(|e| e.message),
         _ => return None,
     })
+}
+
+/// `BrokerConnectionControl`'s attributes.
+fn broker_connection_attribute(
+    c: &dyn crate::broker_connection::BrokerConnection,
+    attr: &str,
+) -> Option<Json> {
+    Some(match attr {
+        "Connected" => Json::from(c.is_connected()),
+        "Name" => Json::from(c.name()),
+        "Uri" => Json::from(c.uri()),
+        "User" => Json::from(c.user()),
+        "Protocol" => Json::from(c.protocol()),
+        "RetryInterval" => Json::from(c.retry_interval()),
+        "ReconnectAttempts" => Json::from(c.reconnect_attempts()),
+        "Started" => Json::from(c.is_started()),
+        _ => return None,
+    })
+}
+
+/// `BrokerConnectionControl`'s operations: `start` and `stop`.
+fn invoke_broker_connection(
+    c: &dyn crate::broker_connection::BrokerConnection,
+    call: &args::Call<'_>,
+) -> Option<Outcome> {
+    if !call.params.is_empty() {
+        return None;
+    }
+    match call.op {
+        "start" => c.start(),
+        "stop" => c.stop(),
+        _ => return None,
+    }
+    Some(Ok(Json::Null))
 }
 
 fn divert_attribute(d: &crate::postoffice::Divert, name: &str) -> Option<Json> {

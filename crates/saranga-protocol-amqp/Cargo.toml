@@ -18,3 +18,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+saranga-client = { path = "../saranga-client" }
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

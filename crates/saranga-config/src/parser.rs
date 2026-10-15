@@ -416,6 +416,7 @@ fn parse_core(
     parse_addresses(core, config, warnings)?;
     parse_bridges(core, config)?;
     parse_federations(core, config)?;
+    parse_broker_connections(core, config)?;
     parse_diverts(core, config, warnings)?;
     parse_wildcards(core, config, warnings)?;
     Ok(())
@@ -423,10 +424,6 @@ fn parse_core(
 
 /// `<core>` children Saranga reads but does not act on yet, and why.
 const NOT_ACTED_ON: &[(&str, &str)] = &[
-    (
-        "broker-connections",
-        "AMQP broker connections are not supported",
-    ),
     ("connection-routers", "connection routers are not supported"),
     ("metrics", "metrics are not supported yet"),
     ("metrics-plugin", "metrics are not supported yet"),
@@ -2035,6 +2032,374 @@ fn parse_federations(core: Node<'_, '_>, config: &mut BrokerConfig) -> Result<()
         }
     }
     Ok(())
+}
+
+/// `<broker-connections>`: each `<amqp-connection>` below it, as
+/// `parseAMQPBrokerConnections` reads them.
+fn parse_broker_connections(core: Node<'_, '_>, config: &mut BrokerConfig) -> Result<()> {
+    if first(core, "broker-connections").is_none() {
+        return Ok(());
+    }
+    let nodes: Vec<_> = all(core, "amqp-connection").collect();
+    for node in nodes {
+        let c = parse_amqp_connection(node, config)?;
+        config.broker_connections.push(c);
+    }
+    Ok(())
+}
+
+/// An attribute that may be masked (`ENC(...)`), resolved as
+/// `PasswordMaskingUtil.resolveMask` resolves it.
+fn enc_attribute(node: Node<'_, '_>, name: &str, config: &BrokerConfig) -> Result<Option<String>> {
+    match node.attribute(name) {
+        Some(text) if mask::is_enc_masked(text) => Ok(Some(
+            mask::resolve_mask(config.mask_password, text, Some(&config.password_codec))
+                .map_err(|e| mask_error(name, text, e))?,
+        )),
+        v => Ok(v.map(str::to_owned)),
+    }
+}
+
+/// `getAttributeInteger`: an empty or absent attribute is the default.
+fn int_attribute_or(node: Node<'_, '_>, name: &str, default: i32, check: Check) -> Result<i32> {
+    match node.attribute(name).filter(|v| !v.is_empty()) {
+        Some(v) => Ok(check.apply(name, i64::from(int_attribute(name, java_trim(v))?))? as i32),
+        None => Ok(default),
+    }
+}
+
+/// `getBooleanAttribute`.
+fn bool_attribute_or(node: Node<'_, '_>, name: &str, default: bool) -> bool {
+    match node.attribute(name).filter(|v| !v.is_empty()) {
+        Some(v) => java_parse_bool(v),
+        None => default,
+    }
+}
+
+/// `parseAMQPBrokerConnections`.
+fn parse_amqp_connection(
+    node: Node<'_, '_>,
+    config: &BrokerConfig,
+) -> Result<crate::AmqpBrokerConnectConfig> {
+    use crate::broker_connection::{add_property, add_unique};
+    use crate::{AmqpConnectionElement as E, AmqpMatchElement};
+    let name = node.attribute("name").unwrap_or_default().to_owned();
+    let mut c = crate::AmqpBrokerConnectConfig::new(
+        name.clone(),
+        node.attribute("uri").unwrap_or_default(),
+    );
+    c.lock_coordinator = node.attribute("lock-coordinator").map(str::to_owned);
+    c.retry_interval = int_attribute_or(node, "retry-interval", 5000, Check::GtZero)?;
+    c.reconnect_attempts =
+        int_attribute_or(node, "reconnect-attempts", -1, Check::MinusOneOrGtZero)?;
+    c.user = enc_attribute(node, "user", config)?;
+    c.password = enc_attribute(node, "password", config)?;
+    c.auto_start = bool_attribute_or(node, "auto-start", true);
+    // getInteger(e, "local-bind-port", -1, MINUS_ONE_OR_GT_ZERO): checked,
+    // then not used.
+    if let Some(n) = first(node, "local-bind-port") {
+        Check::MinusOneOrGtZero.apply("local-bind-port", i64::from(node_i32(n)?))?;
+    }
+    let properties = |n: Node<'_, '_>, into: &mut Vec<(String, String)>| {
+        for p in elements(n).filter(|p| p.tag_name().name() == "property") {
+            add_property(
+                into,
+                p.attribute("key").unwrap_or_default().to_owned(),
+                p.attribute("value").unwrap_or_default().to_owned(),
+            );
+        }
+    };
+    for e in elements(node) {
+        let tag = e.tag_name().name();
+        let element = match tag.to_ascii_uppercase().as_str() {
+            "MIRROR" => {
+                let mut m = crate::AmqpMirrorElement {
+                    message_acknowledgements: bool_attribute_or(
+                        e,
+                        "message-acknowledgements",
+                        true,
+                    ),
+                    queue_creation: bool_attribute_or(e, "queue-creation", true),
+                    durable: bool_attribute_or(e, "durable", true),
+                    queue_removal: bool_attribute_or(e, "queue-removal", true),
+                    sync: bool_attribute_or(e, "sync", false),
+                    address_filter: e.attribute("address-filter").map(str::to_owned),
+                    properties: Vec::new(),
+                };
+                properties(e, &mut m.properties);
+                E::Mirror(m)
+            }
+            "FEDERATION" => {
+                let mut f = crate::AmqpFederationElement {
+                    name: name.clone(),
+                    ..Default::default()
+                };
+                for p in elements(e) {
+                    match p.tag_name().name() {
+                        "remote-queue-policy" => add_unique(
+                            &mut f.remote_queue_policies,
+                            parse_amqp_federation_queue_policy(p)?,
+                        ),
+                        "local-queue-policy" => add_unique(
+                            &mut f.local_queue_policies,
+                            parse_amqp_federation_queue_policy(p)?,
+                        ),
+                        "remote-address-policy" => add_unique(
+                            &mut f.remote_address_policies,
+                            parse_amqp_federation_address_policy(p)?,
+                        ),
+                        "local-address-policy" => add_unique(
+                            &mut f.local_address_policies,
+                            parse_amqp_federation_address_policy(p)?,
+                        ),
+                        "property" => add_property(
+                            &mut f.properties,
+                            p.attribute("key").unwrap_or_default().to_owned(),
+                            p.attribute("value").unwrap_or_default().to_owned(),
+                        ),
+                        _ => {}
+                    }
+                }
+                E::Federation(f)
+            }
+            "BRIDGE" => {
+                let mut b = crate::AmqpBridgeElement {
+                    name: e.attribute("name").unwrap_or(&name).to_owned(),
+                    ..Default::default()
+                };
+                for p in elements(e) {
+                    match p.tag_name().name() {
+                        "bridge-from-address" => add_unique(
+                            &mut b.from_address_policies,
+                            parse_amqp_bridge_address_policy(p)?,
+                        ),
+                        "bridge-to-address" => add_unique(
+                            &mut b.to_address_policies,
+                            parse_amqp_bridge_address_policy(p)?,
+                        ),
+                        "bridge-from-queue" => add_unique(
+                            &mut b.from_queue_policies,
+                            parse_amqp_bridge_queue_policy(p)?,
+                        ),
+                        "bridge-to-queue" => {
+                            add_unique(&mut b.to_queue_policies, parse_amqp_bridge_queue_policy(p)?)
+                        }
+                        "property" => add_property(
+                            &mut b.properties,
+                            p.attribute("key").unwrap_or_default().to_owned(),
+                            p.attribute("value").unwrap_or_default().to_owned(),
+                        ),
+                        _ => {}
+                    }
+                }
+                E::Bridge(b)
+            }
+            t @ ("SENDER" | "RECEIVER" | "PEER") => {
+                let m = AmqpMatchElement {
+                    address_match: e.attribute("address-match").map(str::to_owned),
+                    queue_name: e.attribute("queue-name").map(str::to_owned),
+                };
+                match t {
+                    "SENDER" => E::Sender(m),
+                    "RECEIVER" => E::Receiver(m),
+                    _ => E::Peer(m),
+                }
+            }
+            // AMQPBrokerConnectionAddressType.valueOf.
+            _ => {
+                return Err(ConfigError::invalid(
+                    "amqp-connection",
+                    tag,
+                    "No enum constant org.apache.activemq.artemis.core.config.amqpBrokerConnectivity.AMQPBrokerConnectionAddressType",
+                ));
+            }
+        };
+        c.elements.push(element);
+    }
+    Ok(c)
+}
+
+/// A policy's transformer: `transformer-class-name`, then a
+/// `<transformer>` child in its place.
+fn policy_transformer(node: Node<'_, '_>) -> Option<TransformerConfig> {
+    let mut t = first(node, "transformer-class-name")
+        .map(trimmed_text)
+        .filter(|c| !c.is_empty())
+        .map(|class_name| TransformerConfig {
+            class_name,
+            properties: Vec::new(),
+        });
+    for child in elements(node).filter(|c| c.tag_name().name() == "transformer") {
+        t = Some(transformer(child));
+    }
+    t
+}
+
+/// A policy's `<property>` children.
+fn policy_properties(node: Node<'_, '_>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for p in elements(node).filter(|p| p.tag_name().name() == "property") {
+        crate::broker_connection::add_property(
+            &mut out,
+            p.attribute("key").unwrap_or_default().to_owned(),
+            p.attribute("value").unwrap_or_default().to_owned(),
+        );
+    }
+    out
+}
+
+/// A policy's `include`s or `exclude`s of `address-match`es.
+fn address_matches(node: Node<'_, '_>, tag: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in elements(node).filter(|c| c.tag_name().name() == tag) {
+        crate::broker_connection::add_unique(
+            &mut out,
+            c.attribute("address-match").unwrap_or_default().to_owned(),
+        );
+    }
+    out
+}
+
+/// A policy's `include`s or `exclude`s of address and queue matches.
+fn queue_matches(node: Node<'_, '_>, tag: &str) -> Vec<crate::AmqpQueueMatch> {
+    let mut out = Vec::new();
+    for c in elements(node).filter(|c| c.tag_name().name() == tag) {
+        crate::broker_connection::add_unique(
+            &mut out,
+            crate::AmqpQueueMatch {
+                address_match: c.attribute("address-match").unwrap_or_default().to_owned(),
+                queue_match: c.attribute("queue-match").unwrap_or_default().to_owned(),
+            },
+        );
+    }
+    out
+}
+
+/// `parseAMQPFederatedFromAddressPolicy`.
+fn parse_amqp_federation_address_policy(
+    node: Node<'_, '_>,
+) -> Result<crate::AmqpFederationAddressPolicy> {
+    let mut p = crate::AmqpFederationAddressPolicy {
+        name: node.attribute("name").unwrap_or_default().to_owned(),
+        ..Default::default()
+    };
+    for a in node.attributes() {
+        let (name, value) = (a.name(), a.value());
+        match name {
+            "max-hops" => {
+                let v = int_attribute(name, value)?;
+                p.max_hops = Check::MinusOneOrGeZero.apply(name, v.into())? as i32;
+            }
+            "auto-delete" => p.auto_delete = Some(java_parse_bool(value)),
+            "auto-delete-delay" => {
+                p.auto_delete_delay = Some(long_attribute(name, value, Check::GeZero)?);
+            }
+            "auto-delete-message-count" => {
+                p.auto_delete_message_count =
+                    Some(long_attribute(name, value, Check::MinusOneOrGeZero)?);
+            }
+            "enable-divert-bindings" => p.enable_divert_bindings = Some(java_parse_bool(value)),
+            "allow-wildcard-groupings" => {
+                p.allow_wildcard_groupings = Some(java_parse_bool(value));
+            }
+            _ => {}
+        }
+    }
+    p.transformer = policy_transformer(node);
+    p.includes = address_matches(node, "include");
+    p.excludes = address_matches(node, "exclude");
+    p.properties = policy_properties(node);
+    Ok(p)
+}
+
+/// `parseAMQPFederatedFromQueuePolicy`.
+fn parse_amqp_federation_queue_policy(
+    node: Node<'_, '_>,
+) -> Result<crate::AmqpFederationQueuePolicy> {
+    let mut p = crate::AmqpFederationQueuePolicy {
+        name: node.attribute("name").unwrap_or_default().to_owned(),
+        ..Default::default()
+    };
+    for a in node.attributes() {
+        match a.name() {
+            "include-federated" => p.include_federated = java_parse_bool(a.value()),
+            "priority-adjustment" => {
+                p.priority_adjustment = Some(int_attribute(a.name(), a.value())?);
+            }
+            _ => {}
+        }
+    }
+    p.transformer = policy_transformer(node);
+    p.includes = queue_matches(node, "include");
+    p.excludes = queue_matches(node, "exclude");
+    p.properties = policy_properties(node);
+    Ok(p)
+}
+
+/// `remote-terminus-capabilities`: split on commas, when not blank.
+fn capabilities_attribute(value: &str) -> Option<Vec<String>> {
+    (!value.trim().is_empty()).then(|| value.split(',').map(str::to_owned).collect())
+}
+
+/// `parseAMQPBridgeAddressPolicy`.
+fn parse_amqp_bridge_address_policy(node: Node<'_, '_>) -> Result<crate::AmqpBridgeAddressPolicy> {
+    let mut p = crate::AmqpBridgeAddressPolicy {
+        name: node.attribute("name").unwrap_or_default().to_owned(),
+        ..Default::default()
+    };
+    for a in node.attributes() {
+        let (name, value) = (a.name(), a.value());
+        match name {
+            "filter" => p.filter = Some(value.to_owned()),
+            "priority" => p.priority = Some(int_attribute(name, value)?),
+            "enable-divert-bindings" => p.include_divert_bindings = java_parse_bool(value),
+            "use-durable-subscriptions" => p.use_durable_subscriptions = java_parse_bool(value),
+            "remote-address" => p.remote_address = Some(value.to_owned()),
+            "remote-address-prefix" => p.remote_address_prefix = Some(value.to_owned()),
+            "remote-address-suffix" => p.remote_address_suffix = Some(value.to_owned()),
+            "remote-terminus-capabilities" => {
+                if let Some(c) = capabilities_attribute(value) {
+                    p.remote_terminus_capabilities = Some(c);
+                }
+            }
+            _ => {}
+        }
+    }
+    p.transformer = policy_transformer(node);
+    p.includes = address_matches(node, "include");
+    p.excludes = address_matches(node, "exclude");
+    p.properties = policy_properties(node);
+    Ok(p)
+}
+
+/// `parseAMQPBridgeQueuePolicy`.
+fn parse_amqp_bridge_queue_policy(node: Node<'_, '_>) -> Result<crate::AmqpBridgeQueuePolicy> {
+    let mut p = crate::AmqpBridgeQueuePolicy {
+        name: node.attribute("name").unwrap_or_default().to_owned(),
+        ..Default::default()
+    };
+    for a in node.attributes() {
+        let (name, value) = (a.name(), a.value());
+        match name {
+            "filter" => p.filter = Some(value.to_owned()),
+            "priority" => p.priority = Some(int_attribute(name, value)?),
+            "priority-adjustment" => p.priority_adjustment = Some(int_attribute(name, value)?),
+            "remote-address" => p.remote_address = Some(value.to_owned()),
+            "remote-address-prefix" => p.remote_address_prefix = Some(value.to_owned()),
+            "remote-address-suffix" => p.remote_address_suffix = Some(value.to_owned()),
+            "remote-terminus-capabilities" => {
+                if let Some(c) = capabilities_attribute(value) {
+                    p.remote_terminus_capabilities = Some(c);
+                }
+            }
+            _ => {}
+        }
+    }
+    p.transformer = policy_transformer(node);
+    p.includes = queue_matches(node, "include");
+    p.excludes = queue_matches(node, "exclude");
+    p.properties = policy_properties(node);
+    Ok(p)
 }
 
 /// A password attribute, resolved as `PasswordMaskingUtil.resolveMask`
