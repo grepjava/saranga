@@ -520,6 +520,24 @@ The differences from Artemis are listed in COMPAT.md.
   - **The full-disk soak** ([scripts/disk-soak.sh](scripts/disk-soak.sh), [disk_soak.rs](crates/saranga-client/tests/disk_soak.rs), in CI): producers of small, paged and large messages fill a 64 MiB tmpfs, cycle after cycle. In odd cycles `max-disk-usage` holds them back, and in even cycles the disk runs out: `ENOSPC`, a critical stop, and a restart that keeps every answered send. After each cycle no file is left open and the space is back.
   - **Fixed along the way.** The soak found that a stopped broker was never freed. Each queue's actor held its queue, its paging store and the storage, so a broker stopped in-process (as the network check and failback stop one) kept its queues, its pages and the bindings journal open. The actors now end with the broker, leaving their messages as stored. The lock monitor holds the node manager weakly, so `server.lock` closes with the broker rather than at its next check, and both journals are closed even when the first fails to stop.
   - **Fixed in the suites.** The failback suite with an Artemis backup failed about one run in six, `backup: stopped` missing. The backup does stop, but Artemis's `Run` stops the broker from its daemon `STOP_ME` timer thread. The broker shuts its own non-daemon threads down before it logs AMQ221002, so the JVM can begin exiting by itself, and the shutdown hooks (log4j's closing the appenders) race the end of the stop: the line is lost from the log file, or from both log and console, and "Server stopped!" is never printed. A backup restarted by failback has the fewest such threads and stops fastest, so it is the one that loses the race. A non-daemon thread kept alive with an agent made every stop go through the timer (15 runs of 15). The failback and discovery suites now wait for the `artemis run` process to end rather than for the log line. `KEEP=1` on the failback suite keeps its work directory.
+- Stage 2 (network chaos) is done.
+  - **The proxy** ([tools/saranga-chaos](tools/saranga-chaos)) forwards named routes (`name=listen,target`), each in one mode at a time:
+    - `heal`;
+    - `delay MS [JITTER]`, which holds each chunk and keeps their order;
+    - `blackhole`, a partition: nothing passes, nothing is closed, new connections are held, and what was held goes on when it heals;
+    - `refuse`, which resets open and new connections;
+    - `drop P`, which resets new connections and each chunk's connection with probability P.
+
+    `cut` resets a route's open connections once. Commands come from a control port (`saranga-chaos ctl ADDR COMMAND`), a schedule file (`TIME COMMAND`) or the random chaos, which applies a fault to a route at random every `--every`, holds it for `--hold` and heals it, from a logged seed. Every command applied is logged. Its tests put it in front of an echo server and check each mode, the control port, a schedule and the random chaos.
+  - **The soak** ([scripts/chaos-soak.sh](scripts/chaos-soak.sh), [Chaos.java](tests/interop/chaos/Chaos.java)) runs two instances made by `artemis create` with their links through the proxy:
+    - a core bridge;
+    - a static cluster (ON_DEMAND, redistribution), each node announcing its proxy route so both cluster bridges go through it;
+    - a queue federation;
+    - an AMQP mirror;
+    - a shared-store pair and a replicated pair, the clients connecting through the proxy with `ha=true` and, for replication, the backup's link to the primary too.
+
+    A transacted producer with duplicate IDs (every 25th message large) and a transacted consumer run while the proxy applies random faults for `DURATION` seconds. Then the proxy heals, the producer stops and the consumer receives the rest. Every message whose commit succeeded must be received, intact and once. `scripts/chaos-soak.sh all` runs the six scenarios in the four Artemis/Saranga pairings. At 60 s each, all 24 pass with 2,350 to 44,500 messages a run and no loss or duplicate. The backup never became active from network faults alone. A CI job runs five mixed pairings.
+  - **Found in Artemis.** Core queue federation into an Artemis downstream stalls for good once a consumer window of large messages has passed. `LargeMessageControllerImpl.take`, which only federation calls, never returns the credits of the chunks it takes. With the default 1 MiB window the downstream stopped at the fourth 307 KB message and the upstream queue grew, with no fault applied. With a 4 MiB window it stopped at the fourteenth (docs/upstream/artemis-issues.md, issue 18). Saranga's federation does not stall. The soak sends no large messages when the downstream is Artemis.
 
 ---
 

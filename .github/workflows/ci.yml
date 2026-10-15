@@ -60,6 +60,40 @@ jobs:
       - name: Saranga primary, Java backup
         run: PRIMARY=saranga BACKUP=artemis tests/interop/ha/no-loss.sh
 
+  # Phase 11: the chaos proxy delays, black-holes, cuts, refuses and drops
+  # the links of a bridge, a cluster, a federation, a mirror and a
+  # replicated pair under load, Java and Saranga on each side, with nothing
+  # committed lost and nothing received twice.
+  chaos:
+    runs-on: ubuntu-latest
+    env:
+      ARTEMIS_VERSION: 2.57.0
+      DURATION: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+      - id: artemis
+        uses: actions/cache@v4
+        with:
+          path: reference/activemq-artemis/artemis-distribution/target/apache-artemis-2.57.0-bin
+          key: artemis-dist-2.57.0
+      - name: Build the Artemis distribution
+        if: steps.artemis.outputs.cache-hit != 'true'
+        run: |
+          git clone -c core.autocrlf=false --depth 1 --branch "$ARTEMIS_VERSION" https://github.com/apache/activemq-artemis.git reference/activemq-artemis
+          cd reference/activemq-artemis
+          mvn -B -ntp install -pl artemis-distribution -am -DskipTests -Dcheckstyle.skip -Drat.skip -Denforcer.skip -Dmaven.javadoc.skip
+      - run: scripts/chaos-soak.sh bridge artemis saranga
+      - run: scripts/chaos-soak.sh cluster saranga artemis
+      - run: scripts/chaos-soak.sh federation artemis saranga
+      - run: scripts/chaos-soak.sh mirror saranga artemis
+      - run: scripts/chaos-soak.sh replication saranga artemis
+
   # Phase 11: producers fill a 64 MiB tmpfs, held back by max-disk-usage
   # and run out of space, with nothing acknowledged lost.
   disk-soak:

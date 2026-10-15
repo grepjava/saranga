@@ -1707,6 +1707,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "saranga-chaos"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "tokio",
+]
+
+[[package]]
 name = "saranga-cli"
 version = "0.0.1"
 dependencies = [
