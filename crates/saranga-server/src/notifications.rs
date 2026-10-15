@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 
 use saranga_buffer::{PropertyValue, SimpleString};
 use saranga_message::CoreMessage;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::message::{MessageRef, ServerMessage, now_millis};
 use crate::postoffice::PostOffice;
@@ -37,6 +37,8 @@ pub enum NotificationType {
     BroadcastGroupStopped,
     BridgeStarted,
     BridgeStopped,
+    ClusterConnectionStarted,
+    ClusterConnectionStopped,
 }
 
 impl NotificationType {
@@ -64,6 +66,8 @@ impl NotificationType {
             Self::BroadcastGroupStopped => "BROADCAST_GROUP_STOPPED",
             Self::BridgeStarted => "BRIDGE_STARTED",
             Self::BridgeStopped => "BRIDGE_STOPPED",
+            Self::ClusterConnectionStarted => "CLUSTER_CONNECTION_STARTED",
+            Self::ClusterConnectionStopped => "CLUSTER_CONNECTION_STOPPED",
         }
     }
 }
@@ -102,22 +106,65 @@ pub fn string(v: Option<&str>) -> PropertyValue {
     }
 }
 
+/// What the notification task does, in order.
+enum Job {
+    Notify(CoreMessage),
+    /// `sendQueueInfoToQueue`.
+    QueueInfo {
+        queue: String,
+        address: String,
+        done: oneshot::Sender<Result<(), String>>,
+    },
+}
+
 /// Where notifications go once the broker is active.
 pub struct Notifier {
     address: String,
     node_id: String,
-    tx: mpsc::UnboundedSender<CoreMessage>,
+    tx: mpsc::UnboundedSender<Job>,
 }
 
 impl Notifier {
-    /// Starts the task that routes notifications to `address`.
+    /// Starts the task that routes notifications to `address`. It keeps
+    /// what they told of the queues of this broker and of the cluster
+    /// (`PostOfficeImpl.queueInfos`), so that what `sendQueueInfoToQueue`
+    /// sends and the notifications after it follow on without a gap.
     pub fn start(post_office: &Arc<PostOffice>, address: String, node_id: String) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<CoreMessage>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
         let po: Weak<PostOffice> = Arc::downgrade(post_office);
+        // The queues bound before the broker was active: the post office
+        // heard of them as a notification listener then.
+        let mut infos = QueueInfos::default();
+        for q in post_office.queues() {
+            let c = q.config();
+            infos.0.push(QueueInfo {
+                routing_name: Some(SimpleString::from(&*crate::postoffice::routing_name(&q))),
+                cluster_name: SimpleString::from(format!("{}{node_id}", q.name()).as_str()),
+                address: Some(SimpleString::from(&*c.address)),
+                filter_string: q.filter_string().map(|f| SimpleString::from(f.as_str())),
+                id: q.id(),
+                distance: 0,
+                consumers: 0,
+                filter_strings: None,
+            });
+        }
         tokio::spawn(async move {
-            while let Some(m) = rx.recv().await {
+            let mut infos = infos;
+            while let Some(job) = rx.recv().await {
                 let Some(po) = po.upgrade() else { break };
-                po.send_internal(m).await;
+                match job {
+                    Job::Notify(m) => {
+                        infos.on_notification(&m);
+                        po.send_internal(m).await;
+                    }
+                    Job::QueueInfo {
+                        queue,
+                        address,
+                        done,
+                    } => {
+                        let _ = done.send(infos.send_to_queue(&po, &queue, &address));
+                    }
+                }
             }
         });
         Self {
@@ -125,6 +172,20 @@ impl Notifier {
             node_id,
             tx,
         }
+    }
+
+    /// `PostOfficeImpl.sendQueueInfoToQueue`: what is known of the queues
+    /// goes to `queue`, between a reset and its completion, as
+    /// `BINDING_ADDED` and `CONSUMER_CREATED` messages its filter accepts.
+    /// The receiver hears when it is done.
+    fn send_queue_info(&self, queue: &str, address: &str) -> oneshot::Receiver<Result<(), String>> {
+        let (done, wait) = oneshot::channel();
+        let _ = self.tx.send(Job::QueueInfo {
+            queue: queue.to_owned(),
+            address: address.to_owned(),
+            done,
+        });
+        wait
     }
 
     pub fn address(&self) -> &str {
@@ -159,7 +220,239 @@ impl Notifier {
             SimpleString::from(hdr::NOTIFICATION_TIMESTAMP),
             PropertyValue::Long(now),
         );
-        let _ = self.tx.send(m);
+        let _ = self.tx.send(Job::Notify(m));
+    }
+}
+
+/// `PostOfficeImpl.HDR_RESET_QUEUE_DATA`.
+pub const HDR_RESET_QUEUE_DATA: &str = "_AMQ_RESET_QUEUE_DATA";
+
+/// `PostOfficeImpl.HDR_RESET_QUEUE_DATA_COMPLETE`.
+pub const HDR_RESET_QUEUE_DATA_COMPLETE: &str = "_AMQ_RESET_QUEUE_DATA_COMPLETE";
+
+/// `QueueInfo`: a queue bound here or in the cluster, as notifications
+/// told of it.
+#[derive(Debug, Clone)]
+struct QueueInfo {
+    routing_name: Option<SimpleString>,
+    cluster_name: SimpleString,
+    address: Option<SimpleString>,
+    filter_string: Option<SimpleString>,
+    id: i64,
+    distance: i32,
+    consumers: i32,
+    filter_strings: Option<Vec<SimpleString>>,
+}
+
+/// `PostOfficeImpl.queueInfos`, keyed by cluster name in insertion order.
+#[derive(Default)]
+struct QueueInfos(Vec<QueueInfo>);
+
+fn prop<'a>(m: &'a CoreMessage, name: &str) -> Option<&'a PropertyValue> {
+    m.properties.get(&SimpleString::from(name))
+}
+
+fn prop_string(m: &CoreMessage, name: &str) -> Option<SimpleString> {
+    match prop(m, name)? {
+        PropertyValue::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn prop_int(m: &CoreMessage, name: &str) -> Option<i32> {
+    match prop(m, name)? {
+        PropertyValue::Int(i) => Some(*i),
+        _ => None,
+    }
+}
+
+impl QueueInfos {
+    fn get_mut(&mut self, cluster_name: &SimpleString) -> Option<&mut QueueInfo> {
+        self.0.iter_mut().find(|i| i.cluster_name == *cluster_name)
+    }
+
+    /// `PostOfficeImpl.onNotification`, as far as the queue infos go.
+    fn on_notification(&mut self, m: &CoreMessage) {
+        let Some(kind) = prop_string(m, hdr::NOTIFICATION_TYPE) else {
+            return;
+        };
+        match kind.to_string_lossy().as_str() {
+            "BINDING_ADDED" => {
+                // Diverts are not propagated.
+                if prop_int(m, hdr::BINDING_TYPE) == Some(2) {
+                    return;
+                }
+                let (Some(cluster_name), Some(PropertyValue::Long(id)), Some(distance)) = (
+                    prop_string(m, hdr::CLUSTER_NAME),
+                    prop(m, hdr::BINDING_ID),
+                    prop_int(m, hdr::DISTANCE),
+                ) else {
+                    return;
+                };
+                let info = QueueInfo {
+                    routing_name: prop_string(m, hdr::ROUTING_NAME),
+                    address: prop_string(m, hdr::ADDRESS),
+                    filter_string: prop_string(m, hdr::FILTERSTRING),
+                    id: *id,
+                    distance,
+                    consumers: 0,
+                    filter_strings: None,
+                    cluster_name: cluster_name.clone(),
+                };
+                // `queueInfos.put`: a key put again keeps its place.
+                match self.get_mut(&cluster_name) {
+                    Some(slot) => *slot = info,
+                    None => self.0.push(info),
+                }
+            }
+            "BINDING_REMOVED" => {
+                if let Some(c) = prop_string(m, hdr::CLUSTER_NAME) {
+                    self.0.retain(|i| i.cluster_name != c);
+                }
+            }
+            "CONSUMER_CREATED" => {
+                let Some(c) = prop_string(m, hdr::CLUSTER_NAME) else {
+                    return;
+                };
+                let filter = prop_string(m, hdr::FILTERSTRING);
+                if let Some(info) = self.get_mut(&c) {
+                    info.consumers += 1;
+                    if let Some(f) = filter {
+                        info.filter_strings.get_or_insert_with(Vec::new).push(f);
+                    }
+                }
+            }
+            "CONSUMER_CLOSED" => {
+                let Some(c) = prop_string(m, hdr::CLUSTER_NAME) else {
+                    return;
+                };
+                let filter = prop_string(m, hdr::FILTERSTRING);
+                if let Some(info) = self.get_mut(&c) {
+                    info.consumers -= 1;
+                    if let (Some(f), Some(fs)) = (filter, info.filter_strings.as_mut())
+                        && let Some(i) = fs.iter().position(|x| *x == f)
+                    {
+                        fs.remove(i);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `sendQueueInfoToQueue`, in the order of the `ConcurrentHashMap`
+    /// holding the infos.
+    fn send_to_queue(
+        &self,
+        po: &PostOffice,
+        queue_name: &str,
+        _address: &str,
+    ) -> Result<(), String> {
+        let Some(queue) = po.queue(queue_name) else {
+            return Err(format!("Cannot find queue {queue_name}"));
+        };
+        let route = |m: CoreMessage, filtered: bool| {
+            let m = ServerMessage::new(m);
+            if filtered && queue.filter().is_some_and(|f| !f.matches(&*m)) {
+                return;
+            }
+            queue.add(MessageRef::new(m));
+        };
+        let reset = |key: &str| {
+            let mut m = CoreMessage {
+                message_id: po.ids().next(),
+                address: Some(SimpleString::from(queue_name)),
+                ..Default::default()
+            };
+            m.properties
+                .insert(SimpleString::from(key), PropertyValue::Bool(true));
+            m
+        };
+        let info_message = |kind: &str| {
+            let now = now_millis();
+            let mut m = CoreMessage {
+                message_id: po.ids().next(),
+                address: Some(SimpleString::from(queue_name)),
+                timestamp: now,
+                ..Default::default()
+            };
+            m.properties.insert(
+                SimpleString::from(hdr::NOTIFICATION_TYPE),
+                PropertyValue::String(SimpleString::from(kind)),
+            );
+            m.properties.insert(
+                SimpleString::from(hdr::NOTIFICATION_TIMESTAMP),
+                PropertyValue::Long(now),
+            );
+            m
+        };
+        let opt = |s: &Option<SimpleString>| match s {
+            Some(s) => PropertyValue::String(s.clone()),
+            None => PropertyValue::Null,
+        };
+        route(reset(HDR_RESET_QUEUE_DATA), false);
+        let hashes: Vec<i32> = self
+            .0
+            .iter()
+            .map(|i| saranga_buffer::java_hash::string_hash(&i.cluster_name.to_string_lossy()))
+            .collect();
+        // `QueueInfo.matchesAddress` compares the address with its own
+        // parts: any address matches.
+        for i in saranga_buffer::java_hash::hash_map_order(&hashes, None) {
+            let info = &self.0[i];
+            let common = |m: &mut CoreMessage| {
+                let p = &mut m.properties;
+                p.insert(SimpleString::from(hdr::ADDRESS), opt(&info.address));
+                p.insert(
+                    SimpleString::from(hdr::CLUSTER_NAME),
+                    PropertyValue::String(info.cluster_name.clone()),
+                );
+                p.insert(
+                    SimpleString::from(hdr::ROUTING_NAME),
+                    opt(&info.routing_name),
+                );
+            };
+            let mut m = info_message("BINDING_ADDED");
+            common(&mut m);
+            m.properties.insert(
+                SimpleString::from(hdr::BINDING_ID),
+                PropertyValue::Long(info.id),
+            );
+            m.properties.insert(
+                SimpleString::from(hdr::FILTERSTRING),
+                opt(&info.filter_string),
+            );
+            m.properties.insert(
+                SimpleString::from(hdr::DISTANCE),
+                PropertyValue::Int(info.distance),
+            );
+            route(m, true);
+            let with_filters = info.filter_strings.as_ref().map_or(0, Vec::len) as i32;
+            for _ in 0..info.consumers - with_filters {
+                let mut m = info_message("CONSUMER_CREATED");
+                common(&mut m);
+                m.properties.insert(
+                    SimpleString::from(hdr::DISTANCE),
+                    PropertyValue::Int(info.distance),
+                );
+                route(m, true);
+            }
+            for f in info.filter_strings.iter().flatten() {
+                let mut m = info_message("CONSUMER_CREATED");
+                common(&mut m);
+                m.properties.insert(
+                    SimpleString::from(hdr::FILTERSTRING),
+                    PropertyValue::String(f.clone()),
+                );
+                m.properties.insert(
+                    SimpleString::from(hdr::DISTANCE),
+                    PropertyValue::Int(info.distance),
+                );
+                route(m, true);
+            }
+        }
+        route(reset(HDR_RESET_QUEUE_DATA_COMPLETE), false);
+        Ok(())
     }
 }
 
@@ -247,5 +540,20 @@ impl PostOffice {
                 q.add(m.clone());
             }
         }
+    }
+}
+
+impl PostOffice {
+    /// `ActiveMQServerControl.sendQueueInfoToQueue`.
+    pub async fn send_queue_info_to_queue(&self, queue: &str, address: &str) -> Result<(), String> {
+        let wait = {
+            let guard = self.notifier_guard();
+            match guard.as_ref() {
+                Some(n) => n.send_queue_info(queue, address),
+                None => return Err("the broker is not active".to_owned()),
+            }
+        };
+        wait.await
+            .unwrap_or_else(|_| Err("the broker is stopping".to_owned()))
     }
 }

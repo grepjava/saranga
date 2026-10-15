@@ -2634,6 +2634,7 @@ impl ServerSession {
     ) -> ConsumerProps {
         ConsumerProps {
             queue: queue.name().to_string(),
+            routing_name: crate::postoffice::routing_name(queue).to_string(),
             consumer_count: queue.consumer_count(),
             user: string(self.username()),
             remote: self.conn.remote_address().to_owned(),
@@ -2648,6 +2649,8 @@ impl ServerSession {
 /// The parts of a consumer notification.
 struct ConsumerProps {
     queue: String,
+    /// `binding.getRoutingName()`.
+    routing_name: String,
     consumer_count: i32,
     user: saranga_buffer::PropertyValue,
     remote: String,
@@ -2669,7 +2672,7 @@ impl ConsumerProps {
                 hdr::CLUSTER_NAME,
                 string(Some(&n.cluster_name(&self.queue))),
             ),
-            (hdr::ROUTING_NAME, string(Some(&self.queue))),
+            (hdr::ROUTING_NAME, string(Some(&self.routing_name))),
             (hdr::DISTANCE, V::Int(0)),
             (hdr::CONSUMER_COUNT, V::Int(self.consumer_count)),
         ]

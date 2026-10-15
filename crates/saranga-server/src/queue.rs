@@ -357,6 +357,8 @@ struct Shared {
     /// The queue's cursor on its address's pages (`pageSubscription`).
     paging: Option<Arc<PageSubscription>>,
     consumer_count: AtomicI32,
+    /// Each consumer's filter, for routing (`hasMatchingConsumer`).
+    consumer_filters: RwLock<Vec<(ConsumerId, Option<FilterRef>)>>,
     deleted: AtomicBool,
     /// When the queue was created, in epoch milliseconds.
     created_at: i64,
@@ -440,6 +442,7 @@ impl Queue {
             message_count: AtomicI64::new(0),
             paging,
             consumer_count: AtomicI32::new(0),
+            consumer_filters: RwLock::default(),
             deleted: AtomicBool::new(false),
             created_at: crate::message::now_millis(),
             consumer_removed_at: AtomicI64::new(-1),
@@ -772,12 +775,33 @@ impl Queue {
 
     pub fn add_consumer(&self, reg: ConsumerRegistration) {
         self.0.consumer_count.fetch_add(1, Ordering::SeqCst);
+        self.0
+            .consumer_filters
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((reg.id, reg.filter.clone()));
         self.send(Cmd::AddConsumer(Box::new(reg)));
+    }
+
+    /// `hasMatchingConsumer`: a consumer without a filter, or whose filter
+    /// accepts the message.
+    pub fn has_matching_consumer(&self, message: &dyn saranga_filter::Filterable) -> bool {
+        self.0
+            .consumer_filters
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|(_, f)| f.as_ref().is_none_or(|f| f.matches(message)))
     }
 
     /// Removes a consumer and returns its delivering messages to the queue
     /// (`ServerConsumerImpl.close`).
     pub async fn remove_consumer(&self, id: ConsumerId, failed: bool) {
+        self.0
+            .consumer_filters
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(c, _)| *c != id);
         let (done, wait) = oneshot::channel();
         self.send(Cmd::RemoveConsumer { id, failed, done });
         let _ = wait.await;

@@ -41,7 +41,7 @@ pub const HDR_LARGE_BODY_SIZE: &str = "_AMQ_LARGE_SIZE";
 /// The default JMS and Core priority.
 pub const DEFAULT_PRIORITY: u8 = 4;
 
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

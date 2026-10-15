@@ -20,4 +20,5 @@ saranga-config = { path = "../saranga-config" }
 saranga-server = { path = "../saranga-server" }
 saranga-ha = { path = "../saranga-ha" }
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }

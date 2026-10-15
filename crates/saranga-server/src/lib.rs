@@ -10,6 +10,7 @@ pub mod acceptors;
 pub mod audit;
 pub mod bridge;
 pub mod cluster;
+pub mod cluster_bridge;
 pub mod config;
 pub mod core_protocol;
 pub mod critical;
@@ -31,6 +32,7 @@ pub mod queue;
 pub mod recovery;
 pub mod registry;
 pub mod reload;
+pub mod remote_binding;
 pub mod replay;
 pub mod replication;
 pub mod session;
@@ -844,6 +846,7 @@ impl Broker {
         }
         if let Some(c) = &broker.cluster {
             c.activate();
+            c.start_bridging(&broker);
         }
         // `ClusterManager.start`.
         for g in &broker.broadcast_groups {
@@ -859,6 +862,11 @@ impl Broker {
         }
         broker.deploy_bridges(&config.bridges);
         Ok(broker)
+    }
+
+    /// Whether a protocol of this name is loaded.
+    pub fn has_protocol(&self, name: &str) -> bool {
+        self.protocols.iter().any(|p| p.name() == name)
     }
 
     /// The default cluster connection.

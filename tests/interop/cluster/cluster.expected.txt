@@ -1,0 +1,34 @@
+=== artemis run (node 1, node 2)
+node 1: listening
+node 2: listening
+node 1: bridged to node 2
+node 2: bridged to node 1
+=== Cluster.java topology (node 1)
+topology: 2 nodes, 2 with a primary
+=== Cluster.java on-demand orders 10
+node 2 received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+no more
+=== Cluster.java balance orders 10
+node 1 received 5, node 2 received 5
+=== Cluster.java topic news 5
+node 1 subscriber received [m0, m1, m2, m3, m4]
+node 2 subscriber received [m0, m1, m2, m3, m4]
+=== artemis stop (node 2)
+node 2: down
+=== Cluster.java send orders 3 (node 1)
+sent 3
+=== Cluster.java receive orders 3 (node 1)
+received [m0, m1, m2]
+no more
+=== artemis run (node 2)
+node 2: listening
+node 1: bridged to node 2
+node 2: bridged to node 1
+=== Cluster.java on-demand orders 4
+node 2 received [m0, m1, m2, m3]
+no more
+=== Cluster.java topology (node 1)
+topology: 2 nodes, 2 with a primary
+=== artemis stop (node 1, node 2)
+node 1: down
+node 2: down

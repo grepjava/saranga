@@ -44,6 +44,7 @@ use tokio::time::Instant;
 use crate::channel::{Channel, correlation_id, is_response, set_correlation_id};
 use crate::defaults;
 use crate::error::{Error, ErrorType, Result};
+use crate::message::now_millis;
 use crate::session::{Session, SessionInner, SessionOptions};
 use crate::uuid;
 
@@ -99,6 +100,41 @@ pub struct ConnectionOptions {
     pub retry_interval: Duration,
     pub retry_interval_multiplier: f64,
     pub max_retry_interval: Duration,
+    /// Hears each topology change the server tells of, as a locator
+    /// sharing its `Topology` with a cluster connection does.
+    pub topology_listener: Option<TopologyHook>,
+}
+
+/// A change of the topology a server told of (`notifyNodeUp` and
+/// `notifyNodeDown` of `ClientSessionFactoryImpl`'s topology handler).
+#[derive(Debug, Clone)]
+pub enum TopologyEvent {
+    Up {
+        node_id: String,
+        unique_event_id: i64,
+        primary: Option<TransportConfiguration>,
+        backup: Option<TransportConfiguration>,
+        backup_group_name: Option<String>,
+        scale_down_group_name: Option<String>,
+        last: bool,
+    },
+    /// The node left the topology; `disconnect` when its server said it
+    /// was going (a disconnect packet) rather than in a topology update.
+    Down {
+        node_id: String,
+        unique_event_id: i64,
+        disconnect: bool,
+    },
+}
+
+/// Where [`TopologyEvent`]s go.
+#[derive(Clone)]
+pub struct TopologyHook(pub Arc<dyn Fn(TopologyEvent) + Send + Sync>);
+
+impl std::fmt::Debug for TopologyHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TopologyHook")
+    }
 }
 
 impl Default for ConnectionOptions {
@@ -118,6 +154,7 @@ impl Default for ConnectionOptions {
             retry_interval: defaults::RETRY_INTERVAL,
             retry_interval_multiplier: defaults::RETRY_INTERVAL_MULTIPLIER,
             max_retry_interval: defaults::MAX_RETRY_INTERVAL,
+            topology_listener: None,
         }
     }
 }
@@ -456,17 +493,39 @@ impl ConnInner {
             Packet::DisconnectMessage(p) => self.node_disconnected(node_id(p.node_id)),
             Packet::DisconnectMessageV2(p) => self.node_disconnected(node_id(p.node_id)),
             Packet::DisconnectMessageV3(p) => self.node_disconnected(node_id(p.node_id)),
-            Packet::ClusterTopologyChangeMessage(p) => {
-                self.topology_changed(&p.node_id.to_string_lossy(), p.update.as_ref())
-            }
-            Packet::ClusterTopologyChangeMessageV2(p) => {
-                self.topology_changed(&p.node_id.to_string_lossy(), p.update.as_ref())
-            }
-            Packet::ClusterTopologyChangeMessageV3(p) => {
-                self.topology_changed(&p.node_id.to_string_lossy(), p.update.as_ref())
-            }
+            Packet::ClusterTopologyChangeMessage(p) => self.topology_changed(
+                &p.node_id.to_string_lossy(),
+                p.update.as_ref(),
+                (now_millis(), None, None),
+            ),
+            Packet::ClusterTopologyChangeMessageV2(p) => self.topology_changed(
+                &p.node_id.to_string_lossy(),
+                p.update.as_ref(),
+                (
+                    p.unique_event_id,
+                    p.backup_group_name.flatten().map(|n| n.to_string_lossy()),
+                    None,
+                ),
+            ),
+            Packet::ClusterTopologyChangeMessageV3(p) => self.topology_changed(
+                &p.node_id.to_string_lossy(),
+                p.update.as_ref(),
+                (
+                    p.unique_event_id,
+                    p.backup_group_name.map(|n| n.to_string_lossy()),
+                    p.scale_down_group_name.map(|n| n.to_string_lossy()),
+                ),
+            ),
             Packet::ClusterTopologyChangeMessageV4(p) => {
-                self.topology_changed(&p.node_id.to_string_lossy(), p.update.as_ref());
+                self.topology_changed(
+                    &p.node_id.to_string_lossy(),
+                    p.update.as_ref(),
+                    (
+                        p.unique_event_id,
+                        p.backup_group_name.map(|n| n.to_string_lossy()),
+                        p.scale_down_group_name.map(|n| n.to_string_lossy()),
+                    ),
+                );
                 self.version.store(p.server_version, Ordering::SeqCst);
             }
             _ => {}
@@ -477,12 +536,22 @@ impl ConnInner {
     /// topology, then `CloseRunnable` fails the connection.
     fn node_disconnected(&self, node_id: Option<String>) {
         if let (Some(factory), Some(id)) = (self.factory.upgrade(), node_id) {
-            factory.notify_node_down(&id);
+            factory.notify_node_down(&id, now_millis(), true);
         }
         self.fail(Error::disconnected());
     }
 
-    fn topology_changed(&self, node_id: &str, update: Option<&TopologyUpdate>) {
+    /// `notifyTopologyChange`, with the event's ID and group names.
+    fn topology_changed(
+        &self,
+        node_id: &str,
+        update: Option<&TopologyUpdate>,
+        (unique_event_id, backup_group_name, scale_down_group_name): (
+            i64,
+            Option<String>,
+            Option<String>,
+        ),
+    ) {
         let factory = self.factory.upgrade();
         match update {
             Some(u) => {
@@ -492,6 +561,19 @@ impl ConnInner {
                         u.primary.0.as_ref().and_then(Connector::from_transport),
                         u.backup.0.as_ref().and_then(Connector::from_transport),
                     );
+                    if node_id != PRE_AUTH_NODE_ID
+                        && let Some(hook) = &factory.options.topology_listener
+                    {
+                        (hook.0)(TopologyEvent::Up {
+                            node_id: node_id.to_owned(),
+                            unique_event_id,
+                            primary: u.primary.0.clone(),
+                            backup: u.backup.0.clone(),
+                            backup_group_name,
+                            scale_down_group_name,
+                            last: u.last,
+                        });
+                    }
                 }
                 // notifyNodeUp: `if (isLast) topologyReady = true`.
                 if u.last {
@@ -500,7 +582,7 @@ impl ConnInner {
             }
             None => {
                 if let Some(factory) = &factory {
-                    factory.notify_node_down(node_id);
+                    factory.notify_node_down(node_id, unique_event_id, false);
                 }
             }
         }
@@ -523,6 +605,9 @@ pub(crate) struct Factory {
     /// The latest transport connection, failed or not.
     latest: Mutex<Option<Arc<ConnInner>>>,
     st: Mutex<FactoryState>,
+    /// Its locator's topology, shared with the other factories a
+    /// [`Locator`] makes.
+    locator: Arc<Mutex<LocatorState>>,
     sessions: Mutex<Vec<Weak<SessionInner>>>,
     /// `RemotingConnectionImpl.idGenerator` for session channels, carried
     /// over to each new connection (`syncIDGeneratorSequence`).
@@ -549,6 +634,12 @@ struct FactoryState {
     /// `primaryNodeID`: the node of the connector in use, once the topology
     /// named it.
     primary_node_id: Option<String>,
+}
+
+/// What a `ServerLocatorImpl` keeps for all the session factories it makes:
+/// the topology and where its load balancing stands.
+#[derive(Default)]
+pub(crate) struct LocatorState {
     /// `ServerLocatorImpl.topology`: each node's primary and backup.
     topology: BTreeMap<String, (Option<Connector>, Option<Connector>)>,
     /// `receivedTopology`.
@@ -562,7 +653,7 @@ struct FactoryState {
 
 impl Factory {
     fn new(options: ConnectionOptions, initial: Vec<Connector>) -> Arc<Self> {
-        Self::with_discovery(options, initial, None)
+        Self::with_discovery(options, initial, None, Arc::default())
     }
 
     fn with_discovery(
@@ -572,6 +663,7 @@ impl Factory {
             Arc<crate::discovery::DiscoveryGroup>,
             crate::discovery::DiscoveryConfig,
         )>,
+        locator: Arc<Mutex<LocatorState>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             options,
@@ -580,6 +672,7 @@ impl Factory {
             conn: Mutex::new(None),
             latest: Mutex::new(None),
             st: Mutex::new(FactoryState::default()),
+            locator,
             sessions: Mutex::new(Vec::new()),
             next_channel_id: AtomicI64::new(FIRST_USER_CHANNEL),
             failing_over: watch::channel(false).0,
@@ -591,6 +684,10 @@ impl Factory {
 
     fn state(&self) -> std::sync::MutexGuard<'_, FactoryState> {
         self.st.lock().expect("factory")
+    }
+
+    fn loc(&self) -> std::sync::MutexGuard<'_, LocatorState> {
+        self.locator.lock().expect("locator")
     }
 
     fn is_closed(&self) -> bool {
@@ -661,13 +758,13 @@ impl Factory {
     }
 
     /// `ServerLocatorImpl.useInitConnector`.
-    fn use_init_connector(st: &FactoryState) -> bool {
-        !st.received_topology || Self::topology_pairs(st).is_empty()
+    fn use_init_connector(loc: &LocatorState) -> bool {
+        !loc.received_topology || Self::topology_pairs(loc).is_empty()
     }
 
     /// `topologyArray`: each node's primary and backup.
-    fn topology_pairs(st: &FactoryState) -> Vec<(Connector, Option<Connector>)> {
-        st.topology
+    fn topology_pairs(loc: &LocatorState) -> Vec<(Connector, Option<Connector>)> {
+        loc.topology
             .values()
             .filter_map(|(p, b)| p.clone().map(|p| (p, b.clone())))
             .collect()
@@ -675,55 +772,57 @@ impl Factory {
 
     /// `RoundRobinConnectionLoadBalancingPolicy.select`: a random start,
     /// then each in turn.
-    fn select(st: &mut FactoryState, max: usize) -> usize {
-        let pos = match st.position {
+    fn select(loc: &mut LocatorState, max: usize) -> usize {
+        let pos = match loc.position {
             None => random_below(max),
             Some(p) if p + 1 >= max => 0,
             Some(p) => p + 1,
         };
-        st.position = Some(pos);
+        loc.position = Some(pos);
         pos
     }
 
     /// `initialConnectors`: those given, or those discovered.
-    fn initial_connectors(&self, st: &mut FactoryState) -> Vec<Connector> {
+    fn initial_connectors(&self, loc: &mut LocatorState) -> Vec<Connector> {
         let Some((group, _)) = &self.discovery else {
             return self.initial.clone();
         };
-        if !st.received_topology {
-            st.discovered = group
+        if !loc.received_topology {
+            loc.discovered = group
                 .entries()
                 .iter()
                 .filter_map(|e| Connector::from_transport(&e.connector))
                 .collect();
         }
-        st.discovered.clone()
+        loc.discovered.clone()
     }
 
-    /// `ServerLocatorImpl.selectConnector`.
-    fn select_connector(&self, use_init: bool) -> Option<(Connector, Option<Connector>)> {
-        let mut st = self.state();
-        let pairs = Self::topology_pairs(&st);
-        let initial = self.initial_connectors(&mut st);
+    /// `ServerLocatorImpl.selectConnector`, from the topology unless
+    /// `useInitConnector` says otherwise.
+    fn select_connector(&self) -> Option<(Connector, Option<Connector>)> {
+        let mut loc = self.loc();
+        let use_init = Self::use_init_connector(&loc);
+        let pairs = Self::topology_pairs(&loc);
+        let initial = self.initial_connectors(&mut loc);
         if !use_init && !pairs.is_empty() {
-            let pos = Self::select(&mut st, pairs.len());
+            let pos = Self::select(&mut loc, pairs.len());
             Some(pairs[pos].clone())
         } else if initial.is_empty() {
             None
         } else {
-            let pos = Self::select(&mut st, initial.len());
+            let pos = Self::select(&mut loc, initial.len());
             Some((initial[pos].clone(), None))
         }
     }
 
     /// `ServerLocatorImpl.getConnectorsSize`.
     fn connectors_size(&self) -> usize {
-        let mut st = self.state();
-        let pairs = Self::topology_pairs(&st).len();
+        let mut loc = self.loc();
+        let pairs = Self::topology_pairs(&loc).len();
         if pairs > 0 {
             pairs
         } else {
-            self.initial_connectors(&mut st).len()
+            self.initial_connectors(&mut loc).len()
         }
     }
 
@@ -737,8 +836,8 @@ impl Factory {
         let mut try_number = 0;
         loop {
             {
-                let mut st = self.state();
-                if !self.initial_connectors(&mut st).is_empty() {
+                let mut loc = self.loc();
+                if !self.initial_connectors(&mut loc).is_empty() {
                     return Ok(());
                 }
             }
@@ -775,7 +874,8 @@ impl Factory {
         {
             st.primary_node_id = Some(node_id.to_owned());
         }
-        st.topology
+        self.loc()
+            .topology
             .insert(node_id.to_owned(), (primary.clone(), backup.clone()));
         if let (Some(p), Some(b)) = (primary, backup) {
             Self::set_backup_connector(&mut st, &p, b);
@@ -795,14 +895,21 @@ impl Factory {
     }
 
     /// `ServerLocatorImpl.notifyNodeDown`.
-    fn notify_node_down(&self, node_id: &str) {
+    fn notify_node_down(&self, node_id: &str, unique_event_id: i64, disconnect: bool) {
         if !self.options.ha {
             return;
         }
-        let mut st = self.state();
-        st.topology.remove(node_id);
-        if st.topology.is_empty() {
-            st.received_topology = false;
+        if let Some(hook) = &self.options.topology_listener {
+            (hook.0)(TopologyEvent::Down {
+                node_id: node_id.to_owned(),
+                unique_event_id,
+                disconnect,
+            });
+        }
+        let mut loc = self.loc();
+        loc.topology.remove(node_id);
+        if loc.topology.is_empty() {
+            loc.received_topology = false;
         }
     }
 
@@ -977,7 +1084,7 @@ impl Factory {
         let mut attempts = 0;
         let mut interval = self.options.retry_interval;
         loop {
-            let Some((connector, _)) = self.select_connector(true) else {
+            let Some((connector, _)) = self.select_connector() else {
                 return Err(Error::amq(
                     ErrorType::IllegalState,
                     "AMQ219003: Cannot create session factory, no connectors",
@@ -1022,7 +1129,7 @@ impl Factory {
             inner.fail(Error::topology_timed_out());
             return Err(Error::topology_timed_out());
         }
-        self.state().received_topology = true;
+        self.loc().received_topology = true;
         Ok(())
     }
 
@@ -1113,8 +1220,7 @@ impl Factory {
             self.is_closed(),
         ) {
             connectors_count += 1;
-            let use_init = Self::use_init_connector(&self.state());
-            if let Some((primary, backup)) = self.select_connector(use_init) {
+            if let Some((primary, backup)) = self.select_connector() {
                 {
                     let mut st = self.state();
                     st.connector = Some(primary.clone());
@@ -1285,6 +1391,18 @@ impl Connection {
         Ok(Self { factory })
     }
 
+    /// As [`Connection::connect_to`], for a [`Locator`]: its topology is
+    /// shared with the locator's other connections.
+    async fn connect_located(
+        connectors: Vec<Connector>,
+        options: ConnectionOptions,
+        locator: Arc<Mutex<LocatorState>>,
+    ) -> Result<Self> {
+        let factory = Factory::with_discovery(options, connectors, None, locator);
+        factory.connect_initial().await?;
+        Ok(Self { factory })
+    }
+
     /// Connects through a discovery group (a `udp://` URL): to the nodes
     /// it hears, as `ServerLocatorImpl` with a `DiscoveryGroupConfiguration`
     /// does, waiting `initial_wait_timeout` for the first broadcast. Fails
@@ -1296,7 +1414,8 @@ impl Connection {
     ) -> Result<Self> {
         crate::discovery::ensure_discovery_enabled()?;
         let group = crate::discovery::DiscoveryGroup::start(&config, "")?;
-        let factory = Factory::with_discovery(options, Vec::new(), Some((group, config)));
+        let factory =
+            Factory::with_discovery(options, Vec::new(), Some((group, config)), Arc::default());
         if let Err(e) = factory.connect_initial().await {
             if let Some((group, _)) = &factory.discovery {
                 group.stop();
@@ -1453,7 +1572,7 @@ impl Connection {
     /// primary and backup.
     pub fn topology(&self) -> Vec<(String, Option<Connector>, Option<Connector>)> {
         self.factory
-            .state()
+            .loc()
             .topology
             .iter()
             .map(|(id, (p, b))| (id.clone(), p.clone(), b.clone()))
@@ -1644,6 +1763,48 @@ async fn ping_loop(
     }
 }
 
+/// A `ServerLocator`: the connections it makes share one topology, so that
+/// once a server has told it of the cluster, each new connection goes to
+/// the next node in turn (`RoundRobinConnectionLoadBalancingPolicy`),
+/// before that to the initial connectors.
+pub struct Locator {
+    initial: Vec<Connector>,
+    options: ConnectionOptions,
+    state: Arc<Mutex<LocatorState>>,
+}
+
+impl Locator {
+    pub fn new(initial: Vec<Connector>, options: ConnectionOptions) -> Self {
+        Self {
+            initial,
+            options,
+            state: Arc::default(),
+        }
+    }
+
+    /// `createSessionFactory`.
+    pub async fn connect(&self) -> Result<Connection> {
+        Connection::connect_located(
+            self.initial.clone(),
+            self.options.clone(),
+            self.state.clone(),
+        )
+        .await
+    }
+
+    /// The topology as the locator's connections heard it: each node with
+    /// the connectors of its primary and backup.
+    pub fn topology(&self) -> Vec<(String, Option<Connector>, Option<Connector>)> {
+        self.state
+            .lock()
+            .expect("locator")
+            .topology
+            .iter()
+            .map(|(id, (p, b))| (id.clone(), p.clone(), b.clone()))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1659,7 +1820,7 @@ mod tests {
 
     #[test]
     fn round_robin_starts_anywhere_then_goes_in_turn() {
-        let mut st = FactoryState::default();
+        let mut st = LocatorState::default();
         let first = Factory::select(&mut st, 3);
         assert!(first < 3);
         assert_eq!(Factory::select(&mut st, 3), (first + 1) % 3);

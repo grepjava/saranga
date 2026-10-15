@@ -1077,6 +1077,14 @@ pub(super) async fn invoke(
         broker.destroy_bridge(&a.s_or_empty(0)).await;
         return Some(Ok(Json::Null));
     }
+    // A cluster bridge asking for the queues it learns of.
+    if let Some(a) = call.is("sendQueueInfoToQueue", &[S, S]) {
+        return Some(
+            po.send_queue_info_to_queue(&a.s_or_empty(0), &a.s_or_empty(1))
+                .await
+                .map(|()| Json::Null),
+        );
+    }
     if let Some(a) = call.is("destroyDivert", &[S]) {
         let name = a.s_or_empty(0);
         return Some(if po.destroy_divert(&name) {

@@ -4,15 +4,17 @@
 //! `ServerSessionImpl` (`createQueue`, `checkAutoCreate`, the queries).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::error::{BrokerError, Result};
 use crate::message::{MessageRef, routing_type};
 use crate::queue::{FilterRef, Queue, QueueConfig};
+use crate::remote_binding::RemoteBinding;
 use crate::settings::{AddressSettings, SettingsRepository};
 use crate::wildcard::WildcardConfig;
 use crate::{IdGenerator, Name, RoutingType};
+use saranga_config::MessageLoadBalancing;
 
 /// `CompositeAddress.SEPARATOR`: `address::queue` is a fully qualified
 /// queue name (FQQN).
@@ -365,9 +367,6 @@ struct AddressEntry {
     swept: bool,
     /// Bound queues, in binding order.
     queues: Vec<Queue>,
-    /// Round-robin position over the anycast queues (they share one routing
-    /// name, the address, in `LocalQueueBinding`).
-    anycast_next: AtomicUsize,
     diverts: Vec<Arc<Divert>>,
     /// `routedMessageCount` and `unRoutedMessageCount`.
     routed: AtomicI64,
@@ -386,7 +385,6 @@ impl AddressEntry {
             binding_removed_at: -1,
             swept: false,
             queues: Vec::new(),
-            anycast_next: AtomicUsize::new(0),
             diverts: Vec::new(),
             routed: AtomicI64::new(0),
             unrouted: AtomicI64::new(0),
@@ -413,6 +411,12 @@ pub struct AddressStatus {
 struct State {
     addresses: HashMap<Name, AddressEntry>,
     queues: HashMap<Name, Queue>,
+    /// Remote queue bindings by address, in the order they came; an
+    /// address need not exist here for the other broker's queues to.
+    remote: HashMap<Name, Vec<Arc<crate::remote_binding::RemoteBinding>>>,
+    /// `BindingsImpl.messageLoadBalancingType` by address: `OFF` until a
+    /// remote binding brings its cluster connection's.
+    load_balancing: HashMap<Name, saranga_config::MessageLoadBalancing>,
 }
 
 pub struct PostOffice {
@@ -433,6 +437,9 @@ pub struct PostOffice {
     notifier: RwLock<Option<crate::notifications::Notifier>>,
     /// The broker's plugins.
     plugins: Arc<crate::plugin::Plugins>,
+    /// `CopyOnWriteBindings.BindingIndex`: the next binding to try of each
+    /// routing name of each address.
+    positions: Mutex<HashMap<(Name, Name), usize>>,
 }
 
 #[derive(Default)]
@@ -462,6 +469,7 @@ impl PostOffice {
             persisted: Mutex::default(),
             notifier: RwLock::default(),
             plugins: Arc::default(),
+            positions: Mutex::default(),
         })
     }
 
@@ -491,6 +499,12 @@ impl PostOffice {
         }
     }
 
+    pub(crate) fn notifier_guard(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, Option<crate::notifications::Notifier>> {
+        self.notifier.read().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// `BINDING_ADDED`, `BINDING_REMOVED` and `BINDING_UPDATED` of a queue.
     fn notify_queue_binding(&self, kind: crate::notifications::NotificationType, q: &Queue) {
         use crate::notifications::{NotificationType as T, hdr, string};
@@ -498,6 +512,7 @@ impl PostOffice {
         let c = q.config();
         let filter = q.filter_string();
         let (name, address, id) = (c.name.to_string(), c.address.to_string(), q.id());
+        let routing_name = routing_name(q);
         self.notify(kind, move |n| {
             let cluster = n.cluster_name(&name);
             match kind {
@@ -506,7 +521,7 @@ impl PostOffice {
                         (hdr::BINDING_TYPE, V::Int(0)),
                         (hdr::ADDRESS, string(Some(&address))),
                         (hdr::CLUSTER_NAME, string(Some(&cluster))),
-                        (hdr::ROUTING_NAME, string(Some(&name))),
+                        (hdr::ROUTING_NAME, string(Some(&routing_name))),
                         (hdr::BINDING_ID, V::Long(id)),
                         (hdr::DISTANCE, V::Int(0)),
                     ];
@@ -518,7 +533,7 @@ impl PostOffice {
                 T::BindingRemoved => vec![
                     (hdr::ADDRESS, string(Some(&address))),
                     (hdr::CLUSTER_NAME, string(Some(&cluster))),
-                    (hdr::ROUTING_NAME, string(Some(&name))),
+                    (hdr::ROUTING_NAME, string(Some(&routing_name))),
                     (hdr::DISTANCE, V::Int(0)),
                     (hdr::BINDING_ID, V::Long(id)),
                     (hdr::FILTERSTRING, string(filter.as_deref())),
@@ -534,6 +549,96 @@ impl PostOffice {
                 }
             }
         });
+    }
+
+    /// `PostOfficeImpl.addBinding` of a remote queue: routed to from now
+    /// on, and told as `BINDING_ADDED`. Its address balances messages as
+    /// its cluster connection says.
+    pub fn add_remote_binding(&self, binding: Arc<RemoteBinding>) {
+        {
+            let mut state = self.write();
+            state
+                .load_balancing
+                .insert(binding.address().clone(), binding.load_balancing());
+            state
+                .remote
+                .entry(binding.address().clone())
+                .or_default()
+                .push(binding.clone());
+        }
+        use crate::notifications::{NotificationType as T, hdr, string};
+        use saranga_buffer::PropertyValue as V;
+        self.notify(T::BindingAdded, move |_| {
+            let mut p = vec![
+                (
+                    hdr::BINDING_TYPE,
+                    V::Int(crate::remote_binding::BINDING_TYPE_REMOTE_QUEUE),
+                ),
+                (hdr::ADDRESS, string(Some(binding.address()))),
+                (hdr::CLUSTER_NAME, string(Some(binding.unique_name()))),
+                (hdr::ROUTING_NAME, string(Some(binding.routing_name()))),
+                (hdr::BINDING_ID, V::Long(binding.id())),
+                (hdr::DISTANCE, V::Int(binding.distance())),
+            ];
+            if let Some(f) = binding.filter() {
+                p.push((hdr::FILTERSTRING, string(Some(f.text()))));
+            }
+            p
+        });
+    }
+
+    /// `PostOfficeImpl.removeBinding` of a remote queue, told as
+    /// `BINDING_REMOVED`.
+    pub fn remove_remote_binding(&self, unique_name: &str) -> Option<Arc<RemoteBinding>> {
+        let binding = {
+            let mut state = self.write();
+            let (address, i) = state.remote.iter().find_map(|(a, bs)| {
+                bs.iter()
+                    .position(|b| &**b.unique_name() == unique_name)
+                    .map(|i| (a.clone(), i))
+            })?;
+            let bindings = state.remote.get_mut(&address).expect("found");
+            let b = bindings.remove(i);
+            if bindings.is_empty() {
+                state.remote.remove(&address);
+            }
+            b
+        };
+        if let Some(e) = self.write().addresses.get_mut(binding.address()) {
+            e.binding_removed_at = crate::message::now_millis();
+        }
+        use crate::notifications::{NotificationType as T, hdr, string};
+        use saranga_buffer::PropertyValue as V;
+        let b = binding.clone();
+        self.notify(T::BindingRemoved, move |_| {
+            vec![
+                (hdr::ADDRESS, string(Some(b.address()))),
+                (hdr::CLUSTER_NAME, string(Some(b.unique_name()))),
+                (hdr::ROUTING_NAME, string(Some(b.routing_name()))),
+                (hdr::DISTANCE, V::Int(b.distance())),
+                (hdr::BINDING_ID, V::Long(b.id())),
+                (
+                    hdr::FILTERSTRING,
+                    string(b.filter().as_ref().map(|f| f.text())),
+                ),
+            ]
+        });
+        Some(binding)
+    }
+
+    /// The remote binding with this unique (cluster) name.
+    pub fn remote_binding(&self, unique_name: &str) -> Option<Arc<RemoteBinding>> {
+        self.read()
+            .remote
+            .values()
+            .flatten()
+            .find(|b| &**b.unique_name() == unique_name)
+            .cloned()
+    }
+
+    /// Every remote binding, by address.
+    pub fn remote_bindings(&self, address: &str) -> Vec<Arc<RemoteBinding>> {
+        self.read().remote.get(address).cloned().unwrap_or_default()
     }
 
     fn persisted(&self) -> std::sync::MutexGuard<'_, Persisted> {
@@ -1428,6 +1533,16 @@ impl PostOffice {
         } else if let Some(e) = entry {
             e.queues.iter().for_each(&mut push);
         }
+        // Remote queues are bindings of the address too.
+        if !self.wildcard.is_wild(real) {
+            for b in state.remote.get(real).into_iter().flatten() {
+                queue_names.push(if !new_fqqn && fqqn_queue.is_some() {
+                    format!("{real}{FQQN_SEPARATOR}{}", b.unique_name()).into()
+                } else {
+                    b.unique_name().clone()
+                });
+            }
+        }
         BindingQueryResult {
             exists: entry.is_some(),
             routing_types: entry.map(|e| e.info.routing_types),
@@ -1568,6 +1683,8 @@ impl PostOffice {
         let mut out = Vec::new();
         let plugins = &self.plugins;
         plugins.check(|p| p.before_message_route(&message.message))?;
+        let cleared = clear_internal_properties(message);
+        let message = cleared.as_ref().unwrap_or(message);
         match self.route_into(
             message,
             address,
@@ -1593,6 +1710,8 @@ impl PostOffice {
     pub fn route_internal(&self, message: &MessageRef, address: &str) -> Routed {
         let mut out = Vec::new();
         let routing_type = routing_type(message.message.core());
+        let cleared = clear_internal_properties(message);
+        let message = cleared.as_ref().unwrap_or(message);
         let plugins = &self.plugins;
         let routed = plugins
             .check(|p| p.before_message_route(&message.message))
@@ -1649,20 +1768,29 @@ impl PostOffice {
             }
             return Ok(());
         }
-        // simpleRoute
-        let mut bindings = self.bindings_route(message, address);
-        if bindings.is_none() && auto_create {
-            if self.check_auto_create(address, routing_type, creator)? == AutoCreate::NotFound {
-                return Err(BrokerError::address_does_not_exist(real));
-            }
-            bindings = self.bindings_route(message, address);
+        // simpleRoute: without a local binding, the address and its queue
+        // may be created first.
+        if auto_create
+            && !self.has_local_bindings(address)
+            && self.check_auto_create(address, routing_type, creator)? == AutoCreate::NotFound
+        {
+            return Err(BrokerError::address_does_not_exist(real));
         }
-        self.count_route(real, bindings.as_ref().is_some_and(|(q, _)| !q.is_empty()));
-        let Some((queues, diverts)) = bindings else {
+        let bindings = self.bindings_route(message, address);
+        self.count_route(
+            real,
+            bindings.as_ref().is_some_and(|r| !r.queues.is_empty()),
+        );
+        let Some(Routes {
+            queues,
+            diverts,
+            remote,
+        }) = bindings
+        else {
             return self.maybe_send_to_dla(message, real, to_dla, out);
         };
         if !queues.is_empty() {
-            out.push((message.clone(), queues));
+            out.push((with_route_context(message, &remote), queues));
         }
         if depth >= MAX_DIVERT_DEPTH {
             if !diverts.is_empty() {
@@ -2103,26 +2231,42 @@ impl PostOffice {
         })
     }
 
-    /// Routes through the bindings of `address` and of every wildcard
-    /// address that matches it (`BindingsImpl.route`): the queues, and the
-    /// diverts to follow. `None` when there are no local bindings at all.
-    fn bindings_route(
-        &self,
-        message: &MessageRef,
-        address: &str,
-    ) -> Option<(Vec<Queue>, Vec<Arc<Divert>>)> {
-        let (real, fqqn_queue) = split_fqqn(address);
-        let state = self.read();
+    /// The local bindings of `address` and of every wildcard address
+    /// matching it.
+    fn routing_entries<'s>(&self, state: &'s State, real: &str) -> Vec<&'s AddressEntry> {
         let mut entries: Vec<&AddressEntry> = state.addresses.get(real).into_iter().collect();
         if self.wildcard.routing_enabled && !self.wildcard.is_wild(real) {
             entries.extend(state.addresses.values().filter(|e| {
                 self.wildcard.is_wild(&e.info.name) && self.wildcard.matches(real, &e.info.name)
             }));
         }
-        if entries
+        entries
+    }
+
+    /// `Bindings.hasLocalBinding`: a queue (or a divert) of this broker is
+    /// bound to `address`.
+    fn has_local_bindings(&self, address: &str) -> bool {
+        let (real, _) = split_fqqn(address);
+        let state = self.read();
+        self.routing_entries(&state, real)
             .iter()
-            .all(|e| e.queues.is_empty() && e.diverts.is_empty())
-        {
+            .any(|e| !e.queues.is_empty() || !e.diverts.is_empty())
+    }
+
+    /// Routes through the bindings of `address`, those of every wildcard
+    /// address that matches it and its remote bindings (`BindingsImpl.route`):
+    /// the bindings sharing a routing name are one group, of which one
+    /// binding takes the message (`getNextBinding`). `None` when there are
+    /// no bindings at all.
+    fn bindings_route(&self, message: &MessageRef, address: &str) -> Option<Routes> {
+        let (real, fqqn_queue) = split_fqqn(address);
+        let state = self.read();
+        let entries = self.routing_entries(&state, real);
+        let remote: &[Arc<RemoteBinding>] = state.remote.get(real).map_or(&[], Vec::as_slice);
+        let has_local = entries
+            .iter()
+            .any(|e| !e.queues.is_empty() || !e.diverts.is_empty());
+        if !has_local && remote.is_empty() {
             return None;
         }
         let target: &crate::message::ServerMessage = &message.message;
@@ -2136,59 +2280,179 @@ impl PostOffice {
                 .cloned()
                 .collect();
             if !exclusive.is_empty() {
-                return Some((Vec::new(), exclusive));
+                return Some(Routes {
+                    diverts: exclusive,
+                    ..Routes::default()
+                });
             }
         }
-        let matches = |q: &Queue| {
-            fqqn_queue.is_none_or(|n| &**q.name() == n)
-                && q.filter().is_none_or(|f| f.matches(target))
+        let lb = state
+            .load_balancing
+            .get(real)
+            .copied()
+            .unwrap_or(MessageLoadBalancing::Off);
+        let message_routing_type = routing_type_of(target.core());
+        // The groups, by routing name: an anycast queue's is its address,
+        // a multicast queue's its name, a remote queue's what its broker
+        // said; each in the order its bindings were added.
+        let mut groups: Vec<(Name, Vec<Bound<'_>>)> = Vec::new();
+        for e in &entries {
+            for q in &e.queues {
+                let c = q.config();
+                let name = if c.routing_type == RoutingType::Anycast {
+                    c.address.clone()
+                } else {
+                    q.name().clone()
+                };
+                add_to_group(&mut groups, name, Bound::Local(q));
+            }
+        }
+        for b in remote {
+            add_to_group(&mut groups, b.routing_name().clone(), Bound::Remote(b));
+        }
+        let matches = |b: &Bound<'_>| {
+            // matchBinding
+            if matches!(
+                lb,
+                MessageLoadBalancing::Off | MessageLoadBalancing::OffWithRedistribution
+            ) && message_routing_type != Some(RoutingType::Multicast)
+                && matches!(b, Bound::Remote(_))
+            {
+                return false;
+            }
+            match b {
+                Bound::Local(q) => {
+                    fqqn_queue.is_none_or(|n| &**q.name() == n)
+                        && q.filter().is_none_or(|f| f.matches(target))
+                }
+                Bound::Remote(r) => {
+                    fqqn_queue.is_none_or(|n| {
+                        crate::remote_binding::strip_trailing_uuid(r.unique_name()) == n
+                    }) && r.filter().is_none_or(|f| f.matches(target))
+                }
+            }
         };
         let accepts = |q: &Queue| {
             let c = q.config();
             c.enabled && !(c.purge_on_no_consumers && q.consumer_count() == 0)
         };
-        let mut targets = Vec::new();
-        let mut diverts = Vec::new();
-        for entry in entries {
-            // Every multicast queue is its own routing group.
-            for q in &entry.queues {
-                if q.config().routing_type == RoutingType::Multicast && matches(q) && accepts(q) {
-                    targets.push(q.clone());
-                }
+        let mut routes = Routes::default();
+        let mut positions = self.positions.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, mut group) in groups {
+            group.sort_by_key(Bound::id);
+            let count = group.len();
+            let key = (Name::from(real), name);
+            let mut position = positions.get(&key).copied().unwrap_or(0);
+            if position >= count {
+                position = 0;
             }
-            // The anycast queues form one group: the next one, round robin,
-            // whose filter matches (`getNextBinding`).
-            let anycast: Vec<&Queue> = entry
-                .queues
-                .iter()
-                .filter(|q| q.config().routing_type == RoutingType::Anycast)
-                .collect();
-            if !anycast.is_empty() {
-                let start = entry.anycast_next.load(Ordering::Relaxed) % anycast.len();
-                let chosen = (0..anycast.len())
-                    .map(|i| (start + i) % anycast.len())
-                    .find(|&i| matches(anycast[i]));
-                if let Some(i) = chosen {
-                    entry
-                        .anycast_next
-                        .store((i + 1) % anycast.len(), Ordering::Relaxed);
-                    if accepts(anycast[i]) {
-                        targets.push(anycast[i].clone());
+            // getNextBinding
+            let mut chosen = None;
+            let mut low_priority: Option<usize> = None;
+            for _ in 0..count {
+                let b = &group[position];
+                if matches(b) {
+                    if count == 1
+                        || (b.is_connected()
+                            && (lb == MessageLoadBalancing::Strict
+                                || b.is_high_accept_priority(target)))
+                    {
+                        chosen = Some(position);
+                        position = (position + 1) % count;
+                        break;
+                    }
+                    // A local queue has the priority over remote ones.
+                    if low_priority.is_none()
+                        || (lb == MessageLoadBalancing::OnDemand && matches!(b, Bound::Local(_)))
+                    {
+                        low_priority = Some(position);
                     }
                 }
+                position = (position + 1) % count;
             }
-            // Non-exclusive diverts route a copy as well.
-            if fqqn_queue.is_none() {
-                diverts.extend(
-                    entry
-                        .diverts
-                        .iter()
-                        .filter(|d| !d.exclusive && divert_matches(d))
-                        .cloned(),
-                );
+            if chosen.is_none()
+                && let Some(low) = low_priority
+            {
+                chosen = Some(low);
+                position = (low + 1) % count;
+            }
+            let Some(i) = chosen else { continue };
+            positions.insert(key, position);
+            match &group[i] {
+                Bound::Local(q) => {
+                    if accepts(q) {
+                        routes.queues.push((*q).clone());
+                    }
+                }
+                Bound::Remote(r) => {
+                    // RemoteQueueBindingImpl.route: the message goes once
+                    // to the store-and-forward queue of each broker.
+                    if !routes.queues.iter().any(|q| q == r.sf_queue()) {
+                        routes.queues.push(r.sf_queue().clone());
+                    }
+                    routes.remote.push(Arc::clone(r));
+                }
             }
         }
-        Some((targets, diverts))
+        drop(positions);
+        // Non-exclusive diverts route a copy as well.
+        if fqqn_queue.is_none() {
+            routes.diverts = entries
+                .iter()
+                .flat_map(|e| e.diverts.iter())
+                .filter(|d| !d.exclusive && divert_matches(d))
+                .cloned()
+                .collect();
+        }
+        Some(routes)
+    }
+}
+
+/// Where a message goes through the bindings of an address.
+#[derive(Default)]
+struct Routes {
+    queues: Vec<Queue>,
+    diverts: Vec<Arc<Divert>>,
+    /// The remote bindings chosen, whose queue IDs the message carries.
+    remote: Vec<Arc<RemoteBinding>>,
+}
+
+/// Adds a binding to the group of its routing name.
+fn add_to_group<'a>(groups: &mut Vec<(Name, Vec<Bound<'a>>)>, name: Name, b: Bound<'a>) {
+    match groups.iter_mut().find(|(n, _)| *n == name) {
+        Some((_, g)) => g.push(b),
+        None => groups.push((name, vec![b])),
+    }
+}
+
+/// A binding in a routing group.
+enum Bound<'a> {
+    Local(&'a Queue),
+    Remote(&'a Arc<RemoteBinding>),
+}
+
+impl Bound<'_> {
+    fn id(&self) -> i64 {
+        match self {
+            Self::Local(q) => q.id(),
+            Self::Remote(r) => r.id(),
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        match self {
+            Self::Local(_) => true,
+            Self::Remote(r) => r.is_connected(),
+        }
+    }
+
+    /// `isHighAcceptPriority`: a local queue with a consumer for the
+    /// message, or a remote one whose broker has one.
+    fn is_high_accept_priority(&self, message: &crate::message::ServerMessage) -> bool {
+        match self {
+            Self::Local(q) => q.has_matching_consumer(message),
+            Self::Remote(r) => r.is_high_accept_priority(message),
+        }
     }
 }
 
@@ -2229,6 +2493,17 @@ pub type Routed = Vec<(MessageRef, Vec<Queue>)>;
 
 fn routing_type_of(message: &saranga_message::CoreMessage) -> Option<RoutingType> {
     routing_type(message)
+}
+
+/// `LocalQueueBinding.getRoutingName`: an anycast queue's address, a
+/// multicast queue's name.
+pub fn routing_name(q: &Queue) -> Name {
+    let c = q.config();
+    if c.routing_type == RoutingType::Anycast {
+        c.address.clone()
+    } else {
+        q.name().clone()
+    }
 }
 
 /// A divert (`DivertImpl`): a binding on `address` that sends a copy of
@@ -2439,6 +2714,61 @@ impl FilterFactory for SelectorFilters {
 /// `Message.HDR_ROUTE_TO_IDS` and `HDR_ROUTE_TO_ACK_IDS`.
 const HDR_ROUTE_TO_IDS: &str = "_AMQ_ROUTE_TO";
 const HDR_ROUTE_TO_ACK_IDS: &str = "_AMQ_ACK_ROUTE_TO";
+
+/// The message with each remote binding's queue ID added to its bridge's
+/// `_AMQ_ROUTE_TO<bridge>` (`addRouteContextToMessage`), the same message
+/// when it goes to no remote queue.
+fn with_route_context(message: &MessageRef, remote: &[Arc<RemoteBinding>]) -> MessageRef {
+    use saranga_buffer::{PropertyValue, SimpleString};
+    if remote.is_empty() {
+        return message.clone();
+    }
+    let mut core = message.message.core().clone();
+    for b in remote {
+        let key = SimpleString::from(b.ids_header());
+        let ids = match core.properties.get(&key) {
+            Some(PropertyValue::Bytes(ids)) => Some(ids.clone()),
+            _ => None,
+        };
+        core.properties.insert(
+            key,
+            PropertyValue::Bytes(b.add_route_context(ids.as_deref())),
+        );
+    }
+    let mut r = MessageRef::new(message.message.with_core(core));
+    r.scheduled_time = message.scheduled_time;
+    r
+}
+
+/// `Message.INTERNAL_PROPERTY_NAMES_PREDICATE`: the routing context a
+/// cluster adds for its bridges, which a message must not carry into a
+/// route.
+fn is_internal_property(name: &str) -> bool {
+    (name.starts_with(HDR_ROUTE_TO_IDS) && name != HDR_ROUTE_TO_IDS)
+        || (name.starts_with(HDR_ROUTE_TO_ACK_IDS) && name != HDR_ROUTE_TO_ACK_IDS)
+}
+
+/// `clearInternalProperties`: the message without them, if it had any.
+fn clear_internal_properties(message: &MessageRef) -> Option<MessageRef> {
+    let core = message.message.core();
+    let internal: Vec<_> = core
+        .properties
+        .entries()
+        .iter()
+        .map(|(k, _)| k.clone())
+        .filter(|k| is_internal_property(&k.to_string_lossy()))
+        .collect();
+    if internal.is_empty() {
+        return None;
+    }
+    let mut stripped = core.clone();
+    for k in &internal {
+        stripped.properties.remove(k);
+    }
+    let mut r = MessageRef::new(message.message.with_core(stripped));
+    r.scheduled_time = message.scheduled_time;
+    Some(r)
+}
 
 /// The queue IDs a message's `_AMQ_ROUTE_TO` names (big-endian longs),
 /// and the message without that header or `_AMQ_ACK_ROUTE_TO`.

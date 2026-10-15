@@ -162,10 +162,16 @@ struct Link {
     session: Session,
     session_consumer: Session,
     producer: Producer,
+    /// A cluster bridge's notification consumer, handing what it receives
+    /// to the flow record.
+    notifications: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Link {
     async fn close(self) {
+        if let Some(t) = &self.notifications {
+            t.abort();
+        }
         self.producer.close();
         self.session.close().await;
         self.session_consumer.close().await;
@@ -388,6 +394,9 @@ pub struct Bridge {
     /// Asks the forwarding loop to drop the connection (`disconnect`).
     disconnect: watch::Sender<Option<ClientError>>,
     acker: tokio::task::JoinHandle<()>,
+    /// A cluster connection's bridge to another node
+    /// (`ClusterConnectionBridge`).
+    cluster: Option<crate::cluster_bridge::ClusterLink>,
 }
 
 impl Drop for Bridge {
@@ -421,6 +430,29 @@ impl Bridge {
                 }
             },
         };
+        Self::build(broker, config, target, queue, transformer, None)
+    }
+
+    /// `new ClusterConnectionBridge`: a bridge of a cluster connection to
+    /// the node of `link`, consuming its store-and-forward queue.
+    pub(crate) fn new_cluster(
+        broker: &Arc<Broker>,
+        config: BridgeConfig,
+        queue: Queue,
+        link: crate::cluster_bridge::ClusterLink,
+    ) -> Result<Arc<Self>, BrokerError> {
+        let target = Target::Static(vec![link.connector.clone()]);
+        Self::build(broker, config, target, queue, None, Some(link))
+    }
+
+    fn build(
+        broker: &Arc<Broker>,
+        config: BridgeConfig,
+        target: Target,
+        queue: Queue,
+        transformer: Option<Arc<dyn Transformer>>,
+        cluster: Option<crate::cluster_bridge::ClusterLink>,
+    ) -> Result<Arc<Self>, BrokerError> {
         let filter = broker
             .post_office()
             .filters()
@@ -468,6 +500,7 @@ impl Bridge {
             run: Mutex::new(None),
             disconnect: watch::channel(None).0,
             acker,
+            cluster,
         }))
     }
 
@@ -508,7 +541,12 @@ impl Bridge {
             None => format!("QueueImpl[name={}]", self.inner.queue.name()),
         };
         format!(
-            "BridgeImpl@{:x} [name={}, queue={queue} targetConnector={}]",
+            "{}@{:x} [name={}, queue={queue} targetConnector={}]",
+            if self.cluster.is_some() {
+                "ClusterConnectionBridge"
+            } else {
+                "BridgeImpl"
+            },
             crate::audit::identity(("bridge", &self.config.name)),
             self.config.name,
             self.target.describe(&self.config.name)
@@ -744,6 +782,8 @@ impl Bridge {
             retry_interval: self.retry_interval(),
             retry_interval_multiplier: c.retry_interval_multiplier,
             max_retry_interval: Duration::from_millis(c.max_retry_interval.max(0) as u64),
+            // A cluster bridge's locator shares the cluster's topology.
+            topology_listener: self.cluster.as_ref().and_then(|l| l.topology_hook()),
             ..ConnectionOptions::default()
         }
     }
@@ -756,6 +796,13 @@ impl Bridge {
         target_node: Option<&(Connector, Option<Connector>)>,
         retry_count: i32,
     ) -> Result<Connection, ClientError> {
+        // ClusterConnectionBridge.createSessionFactory: the node as the
+        // topology has it now, else the connector it was first found at.
+        if let Some(link) = &self.cluster {
+            let connector = link.target_connector();
+            let connectors = Connector::from_transport(&connector).into_iter().collect();
+            return Connection::connect_to(connectors, self.connection_options()).await;
+        }
         let same_node = self.config.reconnect_attempts_on_same_node;
         if let Some((primary, backup)) = target_node
             && (same_node < 0 || retry_count <= same_node)
@@ -859,11 +906,29 @@ impl Bridge {
         {
             tracing::debug!("bridge {}: {e}", c.name);
         }
+        // A cluster bridge announces this node over its connection
+        // (`onConnection`) and learns of the other node's queues
+        // (`afterConnect`).
+        let notifications = match &self.cluster {
+            None => None,
+            Some(link) => {
+                link.on_connection(&conn).await;
+                match link.setup_notification_consumer(&session_consumer).await {
+                    Ok(task) => Some(task),
+                    Err(e) => {
+                        producer.close();
+                        conn.close().await;
+                        return Err(failed(e));
+                    }
+                }
+            }
+        };
         Ok(Link {
             conn,
             session,
             session_consumer,
             producer,
+            notifications,
         })
     }
 
@@ -926,10 +991,8 @@ impl Bridge {
                 self.finish_stop(link).await;
                 Some(())
             }
-            Ended::Failed(e) => {
-                self.connection_failed(link, &e).await;
-                None
-            }
+            // A cluster bridge whose node went away for good stops here.
+            Ended::Failed(e) => self.connection_failed(link, &e).await.then_some(()),
         }
     }
 
@@ -994,6 +1057,33 @@ impl Bridge {
     /// protocol's message embedded in a Core one.
     fn before_forward(&self, out: Outgoing, dest: &str) -> CoreMessage {
         let mut core = out.core.clone();
+        // ClusterConnectionBridge.beforeForward: of the queue IDs each
+        // bridge's binding added, only this bridge's go on, as the IDs the
+        // other node routes to.
+        if self.cluster.is_some() {
+            let route_to = crate::remote_binding::HDR_ROUTE_TO_IDS;
+            let mine = SimpleString::from(format!("{route_to}{}", self.config.name).as_str());
+            let ids = core.properties.get(&mine).cloned();
+            let names: Vec<SimpleString> = core
+                .properties
+                .entries()
+                .iter()
+                .map(|(k, _)| k.clone())
+                .filter(|k| k.to_string_lossy().starts_with(route_to))
+                .collect();
+            for k in &names {
+                core.properties.remove(k);
+            }
+            match ids {
+                Some(ids @ PropertyValue::Bytes(_)) => {
+                    core.properties.insert(SimpleString::from(route_to), ids);
+                }
+                _ => tracing::warn!(
+                    "AMQ229258: Invalid cluster bridge message! No queue IDs defined in the property {}",
+                    mine.to_string_lossy()
+                ),
+            }
+        }
         if self.config.use_duplicate_detection {
             core.properties.insert(
                 message::HDR_BRIDGE_DUPLICATE_ID.into(),
@@ -1064,8 +1154,9 @@ impl Bridge {
     }
 
     /// `connectionFailed` and `fail`: the bridge stops consuming, the
-    /// connection is cleaned up, and a retry follows.
-    async fn connection_failed(&self, link: Link, e: &ClientError) {
+    /// connection is cleaned up, and a retry follows, unless a cluster
+    /// bridge's node said it was going (true).
+    async fn connection_failed(&self, link: Link, e: &ClientError) -> bool {
         if self.broker.upgrade().is_some_and(|b| !b.is_stopped()) {
             if e.kind() == Some(ErrorType::Disconnected) {
                 tracing::info!("AMQ224134: Connection closed with failedOver=false");
@@ -1073,9 +1164,17 @@ impl Bridge {
                 tracing::warn!("AMQ222095: Connection failed with failedOver=false");
             }
         }
+        if let Some(t) = &link.notifications {
+            t.abort();
+        }
         link.producer.close();
         link.conn.close().await;
         self.remove_consumer().await;
+        // ClusterConnectionBridge.fail and tryScheduleRetryReconnect.
+        match &self.cluster {
+            None => false,
+            Some(l) => l.fail(e.kind() == Some(ErrorType::Disconnected)),
+        }
     }
 
     /// `StopRunnable` while connected: the bridge stops consuming, waits for

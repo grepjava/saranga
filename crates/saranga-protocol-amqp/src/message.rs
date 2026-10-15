@@ -659,6 +659,11 @@ impl AmqpMessage {
         self.extra_mut().insert(SimpleString::from(key), value);
     }
 
+    /// `putExtraBytesProperty`: kept with the message, not in its encoding.
+    pub fn set_extra_property(&mut self, key: &str, value: PropertyValue) {
+        self.extra_mut().insert(SimpleString::from(key), value);
+    }
+
     /// `removeExtraBytesProperty` and the like.
     pub fn remove_extra_property(&mut self, key: &str) -> Option<PropertyValue> {
         self.extra.as_mut()?.remove(&SimpleString::from(key))

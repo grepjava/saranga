@@ -63,7 +63,9 @@ mod producer;
 mod session;
 pub mod uuid;
 
-pub use connection::{Connection, ConnectionOptions, Connector, FailoverEvent};
+pub use connection::{
+    Connection, ConnectionOptions, Connector, FailoverEvent, Locator, TopologyEvent, TopologyHook,
+};
 pub use consumer::{Consumer, ConsumerOptions, Delivery, FORCED_DELIVERY_MESSAGE};
 pub use error::{Error, ErrorType, Result};
 pub use message::MessageExt;

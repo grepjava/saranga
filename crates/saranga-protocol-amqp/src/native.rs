@@ -360,6 +360,10 @@ impl NativeMessage for AmqpNative {
                         reencode = true;
                     }
                 }
+                // RemoteQueueBindingImpl and ClusterConnectionBridge.
+                k if k.starts_with(HDR_ROUTE_TO_IDS) => {
+                    m.set_extra_property(k, v.clone());
+                }
                 k if k.starts_with("_AMQ_") => {
                     m.set_broker_property(k, v.clone());
                     reencode = true;

@@ -46,3 +46,9 @@ pub fn hash_map_order(hashes: &[i32], capacity: Option<(usize, f32)>) -> Vec<usi
 fn table_size_for(n: usize) -> usize {
     n.max(1).next_power_of_two().min(1 << 30)
 }
+
+/// `String.hashCode`: over the UTF-16 code units.
+pub fn string_hash(s: &str) -> i32 {
+    s.encode_utf16()
+        .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(i32::from(c)))
+}

@@ -1,14 +1,14 @@
 //! Cluster connections, as far as a primary and its backup need them: the
 //! topology clients are given, the cluster channel a backup announces
 //! itself on, and the connector a backup announces itself through.
-//! Bridges between primaries (message load balancing) are not done yet.
+//! The bridges between primaries are in [`crate::cluster_bridge`].
 //!
 //! Ported from `ClusterConnectionImpl`, `Topology`, `TopologyMemberImpl`,
 //! `ClusterController.ClusterControllerChannelHandler`, `BackupManager` and
 //! `ConfigurationUtils.parseConnectorURI`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -45,6 +45,9 @@ pub struct ClusterConfig {
     pub notification_attempts: u32,
     pub cluster_user: String,
     pub cluster_password: String,
+    /// The rest of its `<cluster-connection>`: what its bridges are made
+    /// with and how messages are balanced.
+    pub settings: saranga_config::ClusterConnectionConfig,
 }
 
 impl ClusterConfig {
@@ -101,6 +104,7 @@ impl ClusterConfig {
             notification_attempts: cc.notification_attempts.max(0) as u32,
             cluster_user: config.cluster_user.clone(),
             cluster_password: config.cluster_password.clone(),
+            settings: cc.clone(),
         })
     }
 }
@@ -223,6 +227,9 @@ struct Topology {
     /// end, as `remove` then `put` does).
     members: Vec<Member>,
     listeners: Vec<(u64, Arc<dyn TopologyListener>)>,
+    /// `mapDelete`: when each node was last removed, so that older news of
+    /// it is not taken.
+    deleted: HashMap<String, i64>,
 }
 
 impl Topology {
@@ -248,9 +255,16 @@ pub struct ClusterConnection {
     node_id: String,
     topology: Mutex<Topology>,
     next_listener: AtomicU64,
-    stopping: AtomicBool,
-    /// Another primary was announced: told once that no bridge is made.
-    bridges_warned: AtomicBool,
+    stopping: tokio::sync::watch::Sender<bool>,
+    /// The broker, once bridging started.
+    broker: std::sync::OnceLock<Weak<crate::Broker>>,
+    /// `records`: the flow record of each node bridged to.
+    records: Mutex<HashMap<String, Arc<crate::cluster_bridge::Record>>>,
+    /// The cluster's locator and its topology scanner, while running.
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    scanner: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The listener that bridges each primary the topology brings.
+    bridging_listener: Mutex<Option<u64>>,
 }
 
 impl ClusterConnection {
@@ -260,9 +274,125 @@ impl ClusterConnection {
             node_id: node_id.to_owned(),
             topology: Mutex::default(),
             next_listener: AtomicU64::new(1),
-            stopping: AtomicBool::new(false),
-            bridges_warned: AtomicBool::new(false),
+            stopping: tokio::sync::watch::channel(false).0,
+            broker: std::sync::OnceLock::new(),
+            records: Mutex::default(),
+            tasks: Mutex::default(),
+            scanner: Mutex::default(),
+            bridging_listener: Mutex::default(),
         })
+    }
+
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    pub(crate) fn set_broker(&self, broker: &Arc<crate::Broker>) {
+        let _ = self.broker.set(Arc::downgrade(broker));
+    }
+
+    pub(crate) fn broker(&self) -> Option<Arc<crate::Broker>> {
+        self.broker.get()?.upgrade()
+    }
+
+    pub(crate) fn records_mutex(
+        &self,
+    ) -> &Mutex<HashMap<String, Arc<crate::cluster_bridge::Record>>> {
+        &self.records
+    }
+
+    pub(crate) fn set_locator_task(&self, task: tokio::task::JoinHandle<()>) {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(task);
+    }
+
+    /// A scanner started again replaces the one running.
+    pub(crate) fn set_scanner_task(&self, task: tokio::task::JoinHandle<()>) {
+        if let Some(old) = self
+            .scanner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(task)
+        {
+            old.abort();
+        }
+    }
+
+    pub(crate) fn set_bridging_listener(&self, id: u64) {
+        *self
+            .bridging_listener
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(id);
+    }
+
+    pub(crate) fn is_stopping(&self) -> bool {
+        *self.stopping.borrow()
+    }
+
+    pub(crate) fn stopping_rx(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.stopping.subscribe()
+    }
+
+    /// The topology's member for a node.
+    pub fn member(&self, node_id: &str) -> Option<Member> {
+        self.topology().get(node_id).cloned()
+    }
+
+    /// The node's member, or one made of the connector it was found at.
+    pub(crate) fn member_or_known(
+        &self,
+        node_id: &str,
+        connector: &TransportConfiguration,
+    ) -> Option<Member> {
+        Some(self.member(node_id).unwrap_or_else(|| Member {
+            node_id: node_id.to_owned(),
+            backup_group_name: None,
+            scale_down_group_name: None,
+            primary: Some(connector.clone()),
+            backup: None,
+            unique_event_id: 0,
+        }))
+    }
+
+    /// `ServerLocatorImpl.notifyNodeUp` on the shared topology.
+    pub(crate) fn update_from_locator(&self, unique_event_id: i64, member: Member) {
+        self.update_member(unique_event_id, member);
+    }
+
+    /// `Topology.removeMember`, after `ClusterConnectionImpl.removeMember`:
+    /// this node never leaves its own topology.
+    pub fn remove_member(&self, unique_event_id: i64, node_id: &str, disconnect: bool) -> bool {
+        if node_id == self.node_id {
+            if disconnect {
+                tracing::info!("AMQ224135: nodeID {node_id} is closing. Topology update ignored");
+            } else {
+                tracing::warn!(
+                    "AMQ222295: There is a possible split brain on nodeID {node_id}. Topology update ignored"
+                );
+            }
+            return false;
+        }
+        let listeners = {
+            let mut t = self.topology();
+            let Some(m) = t.get(node_id) else {
+                return false;
+            };
+            if m.unique_event_id > unique_event_id {
+                tracing::debug!(
+                    "The removeMember was issued before the node {node_id} was started, ignoring call"
+                );
+                return false;
+            }
+            t.deleted.insert(node_id.to_owned(), unique_event_id);
+            t.members.retain(|m| m.node_id != node_id);
+            t.listeners()
+        };
+        for l in listeners {
+            l.node_down(unique_event_id, node_id);
+        }
+        true
     }
 
     pub fn config(&self) -> &ClusterConfig {
@@ -292,7 +422,7 @@ impl ClusterConnection {
             for _ in 0..attempts {
                 tokio::time::sleep(interval).await;
                 let Some(this) = weak.upgrade() else { return };
-                if this.stopping.load(Ordering::Acquire) {
+                if this.is_stopping() {
                     return;
                 }
                 this.resend_node();
@@ -300,8 +430,38 @@ impl ClusterConnection {
         });
     }
 
-    pub fn stop(&self) {
-        self.stopping.store(true, Ordering::Release);
+    /// `stop`: no more announcements, no more bridges; the records close
+    /// on a task of their own.
+    pub fn stop(self: &Arc<Self>) {
+        if self.stopping.send_replace(true) {
+            return;
+        }
+        for t in self
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            t.abort();
+        }
+        if let Some(t) = self
+            .scanner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            t.abort();
+        }
+        let listener = self
+            .bridging_listener
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(id) = listener {
+            self.remove_listener(id);
+            let this = self.clone();
+            tokio::spawn(async move { this.stop_bridging().await });
+        }
     }
 
     /// `Topology.updateAsPrimary`.
@@ -415,6 +575,17 @@ impl ClusterConnection {
     /// `Topology.updateMember`, after the split-brain check of
     /// `ClusterConnectionImpl.updateMember`.
     fn update_member(&self, unique_event_id: i64, mut input: Member) {
+        // News from before the node was last removed.
+        if unique_event_id != 0
+            && let Some(deleted) = self.topology().deleted.get(&input.node_id)
+            && unique_event_id < *deleted
+        {
+            tracing::debug!(
+                "Update uniqueEvent={unique_event_id}, nodeId={} being rejected as there was a delete done after that",
+                input.node_id
+            );
+            return;
+        }
         if input.node_id == self.node_id {
             match &input.primary {
                 Some(p) if !same_params(p, &self.config.connector) => {
@@ -428,12 +599,6 @@ impl ClusterConnection {
                 Some(_) => {}
                 None => input.primary = Some(self.config.connector.clone()),
             }
-        } else if input.primary.is_some() && !self.bridges_warned.swap(true, Ordering::AcqRel) {
-            tracing::warn!(
-                "Cluster connection {} learned of primary {}; Saranga does not create cluster bridges yet, so messages are not load-balanced to it",
-                self.config.name,
-                input.node_id
-            );
         }
         let (member, listeners) = {
             let mut t = self.topology();
@@ -788,6 +953,7 @@ mod tests {
             notification_attempts: 0,
             cluster_user: "u".into(),
             cluster_password: "p".into(),
+            settings: saranga_config::ClusterConnectionConfig::new("my-cluster", "artemis"),
         }
     }
 

@@ -121,7 +121,7 @@ async fn first_timestamp(q: &Queue) -> Option<i64> {
     q.peek_first().await.map(|r| r.message.core().timestamp)
 }
 
-pub(super) fn internal_prefix(broker: &Broker) -> String {
+pub(crate) fn internal_prefix(broker: &Broker) -> String {
     broker.management().config().file.as_ref().map_or_else(
         || "$.artemis.internal.".to_owned(),
         |f| f.internal_naming_prefix.clone(),
