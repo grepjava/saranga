@@ -17,6 +17,7 @@ pub mod composite;
 pub mod connection;
 pub mod convert;
 pub mod describe;
+pub mod federation;
 pub mod frame;
 pub mod javamap;
 pub mod link;

@@ -21,6 +21,7 @@ use crate::composite::Fields;
 use crate::connection::{
     self, ConnectionHandle, ContainerIds, Ended, LocalLink, LocalLinkKind, Outgoing,
 };
+use crate::federation::Federation;
 use crate::messaging::{Source, Target, TargetKind};
 use crate::transport::{Attach, ReceiverSettleMode, Role, SenderSettleMode};
 use crate::types::{Symbol, Value};
@@ -131,10 +132,14 @@ impl BrokerConnectionManager {
                     continue;
                 }
             };
+            let mut federation = None;
             for e in &c.elements {
+                if let AmqpConnectionElement::Federation(f) = e {
+                    // installFederation: the last one is the connection's.
+                    federation = Some(Federation::source(broker, f));
+                }
                 let unsupported = match e {
                     AmqpConnectionElement::Mirror(_) => Some("mirror"),
-                    AmqpConnectionElement::Federation(_) => Some("federation"),
                     AmqpConnectionElement::Bridge(_) => Some("bridge"),
                     _ => None,
                 };
@@ -154,6 +159,7 @@ impl BrokerConnectionManager {
                 state: Mutex::new(State::default()),
                 plugin: Mutex::new(None),
                 me: Mutex::new(Weak::new()),
+                federation,
             });
             *lock(&connection.me) = Arc::downgrade(&connection);
             // initialize: registered, with management.
@@ -171,6 +177,9 @@ impl BrokerConnectionManager {
     pub fn stop(&self, broker: &Broker) {
         for c in lock(&self.connections).drain(..) {
             c.stop_inner();
+            if let Some(f) = &c.federation {
+                f.shutdown();
+            }
             broker
                 .broker_connection_registry()
                 .unregister(&c.config.name);
@@ -203,6 +212,8 @@ pub struct AmqpBrokerConnection {
     state: Mutex<State>,
     /// The plugin that makes links for new queues while started.
     plugin: Mutex<Option<Arc<dyn BrokerPlugin>>>,
+    /// The `<federation>`, if any (`brokerFederation`).
+    federation: Option<Arc<Federation>>,
     me: Mutex<Weak<AmqpBrokerConnection>>,
 }
 
@@ -227,6 +238,9 @@ impl AmqpBrokerConnection {
         let plugin: Arc<dyn BrokerPlugin> = Arc::new(QueuePlugin(Arc::downgrade(&me)));
         broker.register_plugin(plugin.clone());
         *lock(&self.plugin) = Some(plugin);
+        if let Some(f) = &self.federation {
+            f.start();
+        }
         st.task = Some(tokio::spawn(me.clone().run()));
     }
 
@@ -244,6 +258,9 @@ impl AmqpBrokerConnection {
         };
         if let (Some(p), Some(b)) = (lock(&self.plugin).take(), self.broker.upgrade()) {
             b.unregister_plugin(&p);
+        }
+        if let Some(f) = &self.federation {
+            f.stop();
         }
         if let Some(h) = handle {
             h.fail("Stopping Broker Connection");
@@ -379,6 +396,9 @@ impl AmqpBrokerConnection {
             st.receivers.clear();
         }
         let task = tokio::spawn(task);
+        if let Some(f) = &self.federation {
+            f.connection_restored(handle.clone(), Settings::from_params(&endpoint.params));
+        }
         for q in broker.post_office().queues() {
             self.validate_matching(&broker, &q);
         }
@@ -389,6 +409,9 @@ impl AmqpBrokerConnection {
             retries
         );
         let ended = task.await.unwrap_or(Ended::Closed);
+        if let Some(f) = &self.federation {
+            f.connection_interrupted();
+        }
         let mut st = lock(&self.state);
         st.connected = false;
         st.handle = None;

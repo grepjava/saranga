@@ -307,9 +307,9 @@ fn described_code(v: &Value) -> Option<(&Descriptor, &Value)> {
 
 /// The selector and no-local entries of a filter set; the selector's text.
 /// A filter set's entry: its key and described value.
-type FilterEntry = (Symbol, Value);
+pub(crate) type FilterEntry = (Symbol, Value);
 
-fn find_filters(filter: Option<&Fields>) -> (Option<FilterEntry>, Option<FilterEntry>) {
+pub(crate) fn find_filters(filter: Option<&Fields>) -> (Option<FilterEntry>, Option<FilterEntry>) {
     let mut selector = None;
     let mut no_local = None;
     for (k, v) in filter.map(|f| f.0.as_slice()).unwrap_or_default() {
@@ -325,7 +325,7 @@ fn find_filters(filter: Option<&Fields>) -> (Option<FilterEntry>, Option<FilterE
 }
 
 /// `described.toString()` of a selector filter: its string.
-fn selector_text(v: &Value) -> Option<String> {
+pub(crate) fn selector_text(v: &Value) -> Option<String> {
     match described_code(v)?.1 {
         Value::String(s) => Some(s.clone()),
         Value::Symbol(s) => Some(s.0.clone()),
@@ -744,7 +744,7 @@ pub fn resolve_source(
     Ok(result)
 }
 
-fn no_local_value() -> Value {
+pub(crate) fn no_local_value() -> Value {
     Value::described(
         Descriptor::Code(NO_LOCAL_CODE),
         Value::String("NoLocalFilter{}".into()),

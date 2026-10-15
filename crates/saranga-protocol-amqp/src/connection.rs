@@ -26,6 +26,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::composite::{Composite, Fields};
+use crate::federation::constants as fed;
+use crate::federation::manager::{Consumer, ConsumerKind};
+use crate::federation::{FedLink, Federation};
 use crate::frame::{self, AMQP_HEADER, FrameBody, SASL_HEADER};
 use crate::link::{self, LinkError, ReceiverTarget, SenderSource, capability};
 use crate::message::AmqpMessage;
@@ -222,6 +225,25 @@ enum Event {
     Open(Box<LocalLink>),
     /// A broker connection is done with the connection: it closes.
     Fail(String),
+    /// A federation routes a message to an address here (a control or
+    /// events link's queue).
+    Route { address: String, payload: Vec<u8> },
+    /// A federation acts on one of its links, by name.
+    LinkOp { name: String, op: LinkOp },
+    /// A federation failed: a broker connection's is made again, a
+    /// target's connection closes (`signalError`).
+    LinkFailed(String),
+}
+
+/// What a federation asks of one of its receivers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkOp {
+    /// Drain its credit and grant no more (`ProtonAbstractReceiver.stop`).
+    Stop,
+    /// Grant credit again (`start`).
+    Start,
+    /// Detach it (`close`).
+    Close,
 }
 
 /// How a broker connection reaches its connection's task.
@@ -237,6 +259,21 @@ impl ConnectionHandle {
     /// Closes the connection (`fail`).
     pub fn fail(&self, reason: impl Into<String>) {
         let _ = self.0.send(Event::Fail(reason.into()));
+    }
+
+    /// Routes a message (its encoded sections) to an address.
+    pub fn route(&self, address: String, payload: Vec<u8>) {
+        let _ = self.0.send(Event::Route { address, payload });
+    }
+
+    /// Acts on a link this end attached, by name.
+    pub fn link_op(&self, name: String, op: LinkOp) {
+        let _ = self.0.send(Event::LinkOp { name, op });
+    }
+
+    /// Fails the connection for a federation's error.
+    pub fn link_failed(&self, message: String) {
+        let _ = self.0.send(Event::LinkFailed(message));
     }
 
     /// Whether the connection's task is gone.
@@ -423,6 +460,57 @@ struct ReceiverLink {
     delivery_count: u32,
     incoming: Option<Incoming>,
     dynamic_expiry: TerminusExpiryPolicy,
+    /// What its messages are for.
+    mode: ReceiveMode,
+    /// Its credit window and low mark, when not the acceptor's.
+    window: Option<(i32, i32)>,
+    state: ReceiverState,
+}
+
+/// What a receiving link does with a message.
+#[derive(Clone)]
+enum ReceiveMode {
+    /// Sends it on (`ProtonServerReceiverContext`).
+    Route,
+    /// A federation control link's command (`AMQPFederationCommandProcessor`).
+    Commands(Arc<Federation>),
+    /// A federation events link's event (`AMQPFederationEventProcessor`).
+    Events(Arc<Federation>),
+    /// A federation receiver's message (`AMQPFederatedAddressDeliveryHandler`,
+    /// `AMQPFederatedQueueDeliveryReceiver`).
+    Federated(Arc<Consumer>),
+}
+
+/// `ProtonAbstractReceiver`'s states as a stop sees them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiverState {
+    Started,
+    Stopping,
+    Stopped,
+}
+
+/// A federation's sending link (`AMQPFederationSenderController` and the
+/// event dispatcher).
+#[derive(Clone)]
+struct FedSender {
+    federation: Arc<Federation>,
+    kind: FedSenderKind,
+}
+
+#[derive(Clone)]
+enum FedSenderKind {
+    /// Its queue is removed with it.
+    Control,
+    Events,
+    /// The federation binding it consumes, removed when the peer closes the
+    /// link.
+    Address {
+        address: String,
+        queue: String,
+    },
+    Queue {
+        queue: String,
+    },
 }
 
 /// A link the client receives on (`ProtonServerSenderContext`).
@@ -437,6 +525,7 @@ struct SenderLink {
     delivery_count: u32,
     presettled: bool,
     draining: bool,
+    fed: Option<FedSender>,
 }
 
 /// The transaction coordinator link (`ProtonTransactionHandler`).
@@ -513,6 +602,8 @@ pub enum LocalLinkKind {
         address: String,
         routing: RoutingType,
     },
+    /// A federation's link.
+    Federation(FedLink),
 }
 
 /// A declared transaction (`ProtonTransactionImpl`).
@@ -569,6 +660,11 @@ struct Conn {
     main_channel: Option<u16>,
     /// Why a connection the broker opened ended, when not by the peer.
     ended: Option<Ended>,
+    /// The federation on this connection, either end
+    /// (`FEDERATION_INSTANCE_RECORD`).
+    federation: Option<Arc<Federation>>,
+    /// The internal session federation messages are routed through.
+    fed_session: Option<ServerSession>,
 }
 
 /// Serves one connection until it closes.
@@ -693,6 +789,8 @@ where
         outgoing,
         main_channel: None,
         ended: None,
+        federation: None,
+        fed_session: None,
     };
     let mut reader = Reader {
         rd,
@@ -1401,6 +1499,16 @@ impl Conn {
     /// The connection is gone: transactions roll back, sessions close,
     /// temporary destinations go.
     async fn shutdown(&mut self) {
+        // A target goes with its connection (handleConnectionShutdown); a
+        // source is told by its broker connection.
+        if let Some(f) = self.federation.take()
+            && !f.is_source()
+        {
+            f.shutdown();
+        }
+        if let Some(mut s) = self.fed_session.take() {
+            s.close(false).await;
+        }
         let txns: Vec<Txn> = self.txns.drain().map(|(_, t)| t).collect();
         for t in txns {
             if let Some(s) = self.sessions.get_mut(&t.channel) {
@@ -1464,10 +1572,509 @@ impl Conn {
             // The client sends: the broker receives.
             Role::Sender => match &attach.target {
                 Some(TargetKind::Coordinator(_)) => self.attach_coordinator(channel, attach),
+                _ if link::has(
+                    attach.desired_capabilities.as_ref(),
+                    fed::FEDERATION_CONTROL_LINK,
+                ) =>
+                {
+                    self.attach_control_processor(channel, attach).await
+                }
+                _ if link::has(
+                    attach.desired_capabilities.as_ref(),
+                    fed::FEDERATION_EVENT_LINK,
+                ) =>
+                {
+                    self.attach_events_processor(channel, attach)
+                }
                 _ => self.attach_receiver(channel, attach).await,
             },
-            Role::Receiver => self.attach_sender(channel, attach).await,
+            Role::Receiver => {
+                let desired = attach.desired_capabilities.as_ref();
+                if link::has(desired, fed::FEDERATION_ADDRESS_RECEIVER) {
+                    self.attach_federation_sender(channel, attach, FedSenderRole::Address)
+                        .await
+                } else if link::has(desired, fed::FEDERATION_QUEUE_RECEIVER) {
+                    self.attach_federation_sender(channel, attach, FedSenderRole::Queue)
+                        .await
+                } else if link::has(desired, fed::FEDERATION_EVENT_LINK) {
+                    self.attach_federation_sender(channel, attach, FedSenderRole::Events)
+                        .await
+                } else {
+                    self.attach_sender(channel, attach).await
+                }
+            }
         }
+    }
+
+    // -------------------------------------------------------- federation links
+
+    /// `handleFederationControlLinkOpened` and
+    /// `addFederationCommandProcessor`: the peer's federation control
+    /// link makes this end its target.
+    async fn attach_control_processor(&mut self, channel: u16, attach: Attach) -> Handled {
+        let mut reply = Attach {
+            name: attach.name.clone(),
+            handle: attach.handle,
+            role: Role::Receiver,
+            snd_settle_mode: attach.snd_settle_mode,
+            rcv_settle_mode: ReceiverSettleMode::First,
+            source: attach.source.clone(),
+            target: attach.target.clone(),
+            ..Default::default()
+        };
+        let s = self.sessions.get_mut(&channel).expect("checked");
+        if s.server
+            .security_check(
+                fed::FEDERATION_BASE_VALIDATION_ADDRESS,
+                None,
+                saranga_config::CheckType::Send,
+            )
+            .is_err()
+        {
+            let e = LinkError::new(
+                condition::UNAUTHORIZED_ACCESS,
+                "User does not have permission to attach to the federation control address",
+            );
+            tracing::warn!("{}", e.description);
+            self.refuse_link(channel, reply, e);
+            return Ok(());
+        }
+        if self.federation.is_some() {
+            self.refuse_link(
+                channel,
+                reply,
+                LinkError::new(
+                    condition::ILLEGAL_STATE,
+                    "Unexpected federation instance found on connection when creating control link processor",
+                ),
+            );
+            return Ok(());
+        }
+        let mut target = match &attach.target {
+            Some(TargetKind::Target(t)) if t.dynamic => t.clone(),
+            other => {
+                self.refuse_link(
+                    channel,
+                    reply,
+                    LinkError::new(
+                        condition::INTERNAL_ERROR,
+                        format!("Remote Target did not arrive as dynamic node: {other:?}"),
+                    ),
+                );
+                return Ok(());
+            }
+        };
+        let props = attach.properties.clone().unwrap_or_default();
+        let configuration: Vec<(String, Value)> = match props.get(fed::FEDERATION_CONFIGURATION) {
+            Some(Value::Map(m)) => m
+                .iter()
+                .filter_map(|(k, v)| k.as_str().map(|k| (k.to_owned(), v.clone())))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let name = props
+            .get(fed::FEDERATION_NAME)
+            .and_then(Value::as_str)
+            .map_or_else(|| attach.name.clone(), str::to_owned);
+        let version = props
+            .get(fed::FEDERATION_VERSION)
+            .and_then(Value::as_i64)
+            .map_or(fed::FEDERATION_V1, |v| v as i32);
+        let federation = Federation::target(
+            &self.broker,
+            name,
+            crate::federation::Connection {
+                handle: ConnectionHandle(self.events.clone()),
+                remote_container: self.remote_container.clone().unwrap_or_default(),
+                configuration: crate::federation::config::Configuration::new(
+                    configuration,
+                    self.settings.clone(),
+                ),
+                remote_version: version,
+            },
+        );
+        // initialize: the session is tagged; the target's receivers are
+        // attached on it.
+        self.tag_federation_session(channel, &federation.name);
+        self.main_channel.get_or_insert(channel);
+        self.federation = Some(federation.clone());
+        target.address = Some(attach.name.clone());
+        reply.target = Some(TargetKind::Target(target));
+        let mut properties = Fields::default();
+        properties.insert(fed::FEDERATION_VERSION, Value::Int(fed::FEDERATION_V2));
+        reply.properties = Some(properties);
+        reply.offered_capabilities = Some(vec![Symbol::from(fed::FEDERATION_CONTROL_LINK)]);
+        self.send(channel, Performative::Attach(reply));
+        self.insert_processor(channel, &attach, ReceiveMode::Commands(federation));
+        Ok(())
+    }
+
+    /// A receiving link for the federation's control or events messages,
+    /// with ten credits topped up at three.
+    fn insert_processor(&mut self, channel: u16, attach: &Attach, mode: ReceiveMode) {
+        let delivery_count = attach.initial_delivery_count.unwrap_or(0);
+        let s = self.sessions.get_mut(&channel).expect("checked");
+        s.links.insert(
+            attach.handle,
+            Link::Receiver(ReceiverLink {
+                name: attach.name.clone(),
+                target: ReceiverTarget {
+                    address: None,
+                    explicit: None,
+                    implicit: None,
+                    dynamic: false,
+                },
+                source: attach.source.clone(),
+                credit: 10,
+                delivery_count,
+                incoming: None,
+                dynamic_expiry: TerminusExpiryPolicy::SessionEnd,
+                mode,
+                window: Some((10, 3)),
+                state: ReceiverState::Started,
+            }),
+        );
+        let s = &self.sessions[&channel];
+        let flow = self.link_flow(s, attach.handle, delivery_count, 10, false);
+        self.send(channel, Performative::Flow(flow));
+    }
+
+    /// `addFederationEventProcessor`: the peer's events link.
+    fn attach_events_processor(&mut self, channel: u16, attach: Attach) -> Handled {
+        let mut reply = Attach {
+            name: attach.name.clone(),
+            handle: attach.handle,
+            role: Role::Receiver,
+            snd_settle_mode: attach.snd_settle_mode,
+            rcv_settle_mode: ReceiverSettleMode::First,
+            source: attach.source.clone(),
+            target: attach.target.clone(),
+            ..Default::default()
+        };
+        let Some(federation) = self.federation.clone() else {
+            self.refuse_link(
+                channel,
+                reply,
+                LinkError::new(
+                    condition::ILLEGAL_STATE,
+                    "Unexpected federation event processor opened on connection without a federation instance active",
+                ),
+            );
+            return Ok(());
+        };
+        let mut target = match &attach.target {
+            Some(TargetKind::Target(t)) if t.dynamic => t.clone(),
+            other => {
+                self.refuse_link(
+                    channel,
+                    reply,
+                    LinkError::new(
+                        condition::INTERNAL_ERROR,
+                        format!("Remote Terminus did not arrive as dynamic node: {other:?}"),
+                    ),
+                );
+                return Ok(());
+            }
+        };
+        target.address = Some(attach.name.clone());
+        reply.target = Some(TargetKind::Target(target));
+        reply.offered_capabilities = Some(vec![Symbol::from(fed::FEDERATION_EVENT_LINK)]);
+        self.send(channel, Performative::Attach(reply));
+        self.insert_processor(channel, &attach, ReceiveMode::Events(federation));
+        Ok(())
+    }
+
+    /// The peer's federation receiver or events receiver: a sender
+    /// (`AMQPFederationAddressSenderController`,
+    /// `AMQPFederationQueueSenderController`,
+    /// `AMQPFederationEventDispatcher`).
+    async fn attach_federation_sender(
+        &mut self,
+        channel: u16,
+        attach: Attach,
+        role: FedSenderRole,
+    ) -> Handled {
+        let mut reply = Attach {
+            name: attach.name.clone(),
+            handle: attach.handle,
+            role: Role::Sender,
+            snd_settle_mode: attach.snd_settle_mode,
+            rcv_settle_mode: ReceiverSettleMode::First,
+            source: None,
+            target: attach.target.clone(),
+            initial_delivery_count: Some(0),
+            ..Default::default()
+        };
+        let what = match role {
+            FedSenderRole::Address => "federation Address sender",
+            FedSenderRole::Queue => "federation Queue sender",
+            FedSenderRole::Events => "federation event processor",
+        };
+        let Some(federation) = self.federation.clone() else {
+            self.refuse_link(
+                channel,
+                reply,
+                LinkError::new(
+                    condition::ILLEGAL_STATE,
+                    format!(
+                        "Unexpected {what} opened on connection without a federation instance active"
+                    ),
+                ),
+            );
+            return Ok(());
+        };
+        let Some(mut source) = attach.source.clone() else {
+            self.refuse_link(
+                channel,
+                reply,
+                LinkError::new(
+                    condition::NOT_IMPLEMENTED,
+                    "Null source lookup not supported on federation links.",
+                ),
+            );
+            return Ok(());
+        };
+        let priority = attach
+            .properties
+            .as_ref()
+            .and_then(|p| p.get(fed::FEDERATION_RECEIVER_PRIORITY))
+            .and_then(Value::as_i64)
+            .map_or(0, |p| p as i32);
+        let resolved = match role {
+            FedSenderRole::Events => {
+                if !source.dynamic {
+                    Err(LinkError::new(
+                        condition::INTERNAL_ERROR,
+                        format!("Remote Terminus did not arrive as dynamic node: {source:?}"),
+                    ))
+                } else {
+                    let queue = federation.events_queue_name(&attach.name);
+                    source.address = Some(queue.clone());
+                    self.federation_queue(channel, &queue)
+                        .map(|()| (queue, None, FedSenderKind::Events))
+                        .map_err(|e| LinkError::new(condition::INTERNAL_ERROR, e))
+                }
+            }
+            FedSenderRole::Address => {
+                self.resolve_address_sender(channel, &attach, &source, &federation)
+            }
+            FedSenderRole::Queue => self.resolve_queue_sender(channel, &source, &federation),
+        };
+        let (queue, filter, kind) = match resolved {
+            Ok(r) => r,
+            Err(e) => {
+                self.refuse_link(channel, reply, e);
+                return Ok(());
+            }
+        };
+        let offered = match role {
+            FedSenderRole::Address => fed::FEDERATION_ADDRESS_RECEIVER,
+            FedSenderRole::Queue => fed::FEDERATION_QUEUE_RECEIVER,
+            FedSenderRole::Events => fed::FEDERATION_EVENT_LINK,
+        };
+        let is_events = matches!(kind, FedSenderKind::Events);
+        let fs = FedSender {
+            federation: federation.clone(),
+            kind,
+        };
+        let presettled = attach.snd_settle_mode == SenderSettleMode::Settled;
+        if let Err(e) = self
+            .queue_sender(
+                channel,
+                attach.handle,
+                attach.name.clone(),
+                &queue,
+                filter,
+                priority,
+                Some(source.clone()),
+                Some(fs),
+            )
+            .await
+        {
+            self.refuse_link(channel, reply, LinkError::new(condition::INTERNAL_ERROR, e));
+            return Ok(());
+        }
+        if let Some(Link::Sender(sl)) = self
+            .sessions
+            .get_mut(&channel)
+            .and_then(|s| s.links.get_mut(&attach.handle))
+        {
+            sl.presettled = presettled;
+        }
+        if is_events {
+            federation.register_events_sender(queue);
+        }
+        reply.source = Some(source);
+        reply.offered_capabilities = Some(vec![Symbol::from(offered)]);
+        self.send(channel, Performative::Attach(reply));
+        Ok(())
+    }
+
+    /// `AMQPFederationAddressSenderController.createServerConsumer`: the
+    /// federation binding of the address, made if missing.
+    fn resolve_address_sender(
+        &mut self,
+        channel: u16,
+        attach: &Attach,
+        source: &Source,
+        federation: &Federation,
+    ) -> Result<(String, Option<String>, FedSenderKind), LinkError> {
+        let source_address = source.address.clone().unwrap_or_default();
+        let props = attach
+            .properties
+            .as_ref()
+            .and_then(|p| p.get(fed::FEDERATED_ADDRESS_SOURCE_PROPERTIES))
+            .cloned();
+        let prop = |key: &str| props.as_ref().and_then(|m| m.map_get(&Value::string(key)));
+        let auto_delete = prop(fed::ADDRESS_AUTO_DELETE)
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let auto_delete_delay = prop(fed::ADDRESS_AUTO_DELETE_DELAY)
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let auto_delete_count = prop(fed::ADDRESS_AUTO_DELETE_MSG_COUNT)
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        // The receiver's filters: its selector, and no-local.
+        let (selector_entry, no_local) = link::find_filters(source.filter.as_ref());
+        let jms = selector_entry
+            .as_ref()
+            .and_then(|(_, v)| link::selector_text(v));
+        if let Some(sel) = &jms
+            && saranga_filter::Filter::parse(sel).is_err()
+        {
+            return Err(LinkError::new(condition::INVALID_FIELD, "Invalid filter"));
+        }
+        let selector = match no_local {
+            Some(_) => {
+                let no_local = format!(
+                    "{}<>'{}'",
+                    link::CONNECTION_ID_PROPERTY,
+                    self.remote_container.as_deref().unwrap_or_default()
+                );
+                Some(match jms {
+                    Some(j) => format!("{j} AND {no_local}"),
+                    None => no_local,
+                })
+            }
+            None => jms,
+        };
+        let (address, queue) = match source_address.split_once("::") {
+            Some((a, q)) => (a.to_owned(), q.to_owned()),
+            None => (source_address.clone(), attach.name.clone()),
+        };
+        let s = self.sessions.get_mut(&channel).expect("checked");
+        let created = s
+            .server
+            .check_auto_create(&address, Some(RoutingType::Multicast))
+            .map_err(|e| {
+                if e.kind == ErrorType::SecurityException {
+                    LinkError::new(
+                        condition::UNAUTHORIZED_ACCESS,
+                        format!(
+                            "AMQ119015: not authorized to create consumer, {}",
+                            e.message
+                        ),
+                    )
+                } else {
+                    LinkError::new(condition::INTERNAL_ERROR, e.message)
+                }
+            })?;
+        let info = self.broker.post_office().address_info(&address);
+        if created == saranga_server::postoffice::AutoCreate::NotFound || info.is_none() {
+            federation.register_missing_address(&address);
+            return Err(LinkError::new(
+                condition::NOT_FOUND,
+                "AMQ119010: source address does not exist",
+            ));
+        }
+        if !info.is_some_and(|i| i.routing_types.multicast) {
+            return Err(LinkError::new(
+                condition::ILLEGAL_STATE,
+                format!("Address {address} is not configured for MULTICAST support"),
+            ));
+        }
+        let routing = source_routing_type(source);
+        let mut q = s.server.queue_query(&queue);
+        if !q.exists {
+            let mut spec =
+                saranga_server::postoffice::QueueSpec::new(queue.as_str(), address.as_str());
+            spec.routing_type = Some(routing);
+            spec.auto_create_address = Some(false);
+            spec.max_consumers = Some(-1);
+            spec.purge_on_no_consumers = Some(false);
+            spec.filter_string = selector.clone();
+            spec.durable = true;
+            spec.auto_created = false;
+            spec.auto_delete = Some(auto_delete);
+            spec.auto_delete_delay = Some(auto_delete_delay);
+            spec.auto_delete_message_count = Some(auto_delete_count);
+            match s.server.create_queue(spec) {
+                Ok(_) => {}
+                Err(e) if e.kind == ErrorType::QueueExists => {}
+                Err(e) => return Err(LinkError::new(condition::INTERNAL_ERROR, e.message)),
+            }
+            q = s.server.queue_query(&queue);
+        }
+        if *q.address != *address {
+            return Err(LinkError::new(
+                condition::ILLEGAL_STATE,
+                format!(
+                    "Requested queue: {queue} for federation of address: {address}, but it is already mapped to a different address: {}",
+                    q.address
+                ),
+            ));
+        }
+        Ok((
+            queue.clone(),
+            None,
+            FedSenderKind::Address { address, queue },
+        ))
+    }
+
+    /// `AMQPFederationQueueSenderController.createServerConsumer`: the
+    /// queue, which must be there.
+    fn resolve_queue_sender(
+        &mut self,
+        channel: u16,
+        source: &Source,
+        federation: &Federation,
+    ) -> Result<(String, Option<String>, FedSenderKind), LinkError> {
+        let source_address = source.address.clone().unwrap_or_default();
+        let (address, queue) = match source_address.split_once("::") {
+            Some((a, q)) => (Some(a.to_owned()), q.to_owned()),
+            None => (None, source_address.clone()),
+        };
+        let s = self.sessions.get_mut(&channel).expect("checked");
+        let q = s.server.queue_query(&queue);
+        if !q.exists {
+            federation.register_missing_queue(&queue);
+            return Err(LinkError::new(
+                condition::NOT_FOUND,
+                format!("Queue: '{queue}' does not exist"),
+            ));
+        }
+        if let Some(a) = &address
+            && *q.address != **a
+        {
+            federation.register_missing_queue(&queue);
+            return Err(LinkError::new(
+                condition::NOT_FOUND,
+                format!("Queue: '{queue}' is not mapped to specified address: {a}"),
+            ));
+        }
+        let (selector_entry, _) = link::find_filters(source.filter.as_ref());
+        let filter = selector_entry
+            .as_ref()
+            .and_then(|(_, v)| link::selector_text(v));
+        if let Some(f) = &filter
+            && saranga_filter::Filter::parse(f).is_err()
+        {
+            return Err(LinkError::new(condition::INVALID_FIELD, "Invalid filter"));
+        }
+        // No need for the queue's own filter again.
+        let filter = filter.filter(|f| q.filter_string.as_deref() != Some(f.as_str()));
+        Ok((queue.clone(), filter, FedSenderKind::Queue { queue }))
     }
 
     /// Refuses a link: an Attach without the terminus, then a closing
@@ -1613,6 +2220,9 @@ impl Conn {
                 delivery_count,
                 incoming: None,
                 dynamic_expiry: expiry,
+                mode: ReceiveMode::Route,
+                window: None,
+                state: ReceiverState::Started,
             }),
         );
         let s = &self.sessions[&channel];
@@ -1717,6 +2327,7 @@ impl Conn {
                 delivery_count: 0,
                 presettled,
                 draining: false,
+                fed: None,
             }),
         );
         let mut reply = reply;
@@ -1753,6 +2364,31 @@ impl Conn {
         let mut s = self.sessions.remove(&channel).expect("checked");
         let mut closed = detach.closed;
         let was_open = link.is_some();
+        // The federation's interceptors: a remote close it expects is not
+        // the connection's failure.
+        let mut intercepted = false;
+        let mut link_name = String::new();
+        if let Some(l) = &link {
+            match l {
+                Link::Receiver(rl) => {
+                    link_name = rl.name.clone();
+                    if let ReceiveMode::Federated(c) = &rl.mode {
+                        intercepted = c.remote_closed(detach.error.as_ref());
+                    }
+                }
+                Link::Sender(sl) => {
+                    link_name = sl.name.clone();
+                    if let Some(FedSender {
+                        kind: FedSenderKind::Address { .. } | FedSenderKind::Queue { .. },
+                        ..
+                    }) = &sl.fed
+                    {
+                        intercepted = detach.error.is_none();
+                    }
+                }
+                Link::Coordinator(_) => {}
+            }
+        }
         if let Some(l) = link {
             let link_detach_expiry = match &l {
                 Link::Sender(sl) => sl.source.as_ref().map(|x| x.expiry_policy),
@@ -1771,12 +2407,18 @@ impl Conn {
                 error: None,
             }),
         );
+        if intercepted || !was_open {
+            return Ok(());
+        }
         // AMQPBrokerConnection.linkClosed: a broker connection whose link
         // the peer closes is made again.
-        if self.outgoing.is_some() && closed && was_open {
+        if self.outgoing.is_some() && closed {
             self.link_failed(
                 "AMQ119021: The broker connection had a remote link closed unexpectedly".into(),
             );
+        } else if self.outgoing.is_none() && self.federation.is_some() {
+            // AMQPFederationTarget.handleLinkRemoteClose
+            self.federation_failed(format!("Federation link closed unexpectedly: {link_name}"));
         }
         Ok(())
     }
@@ -1810,6 +2452,12 @@ impl Conn {
         let refused = match &link.kind {
             LocalLinkKind::Sender { .. } => remote.target.is_none(),
             LocalLinkKind::Receiver { .. } => remote.source.is_none(),
+            LocalLinkKind::Federation(f) => {
+                let f = f.clone();
+                return self
+                    .federation_link_attached(channel, handle, link, f, remote)
+                    .await;
+            }
         };
         if refused {
             self.link_failed(refused_message(&link));
@@ -1818,72 +2466,14 @@ impl Conn {
         let name = link.attach.name.clone();
         match link.kind {
             LocalLinkKind::Sender { queue } => {
-                let consumer = {
-                    let s = self.sessions.get_mut(&channel).expect("checked");
-                    let c = s.next_consumer;
-                    s.next_consumer += 1;
-                    c
-                };
-                let credit = Arc::new(Mutex::new(Credit::default()));
-                let sink = Arc::new(Sink {
-                    events: self.events.clone(),
-                    channel,
-                    handle,
-                    credit: credit.clone(),
-                });
-                let s = self.sessions.get_mut(&channel).expect("checked");
                 // AMQPOutgoingController.init: createSender(queue).
-                let created = s
-                    .server
-                    .create_consumer(consumer, &queue, None, 0, false, move |_: &Queue| {
-                        sink as Arc<dyn DeliverySink>
-                    })
-                    .await;
-                if let Err(e) = created {
-                    let error = Error::new(
-                        condition::INTERNAL_ERROR,
-                        Some(format!("AMQ119005: error creating consumer, {}", e.message)),
-                    );
-                    self.send(
-                        channel,
-                        Performative::Detach(Detach {
-                            handle,
-                            closed: true,
-                            error: Some(error),
-                        }),
-                    );
-                    if let Some(s) = self.sessions.get_mut(&channel) {
-                        s.detaching.insert(handle);
-                    }
-                    return Ok(());
+                let source = link.attach.source.clone();
+                if let Err(e) = self
+                    .queue_sender(channel, handle, name, &queue, None, 0, source, None)
+                    .await
+                {
+                    self.refuse_local(channel, handle, condition::INTERNAL_ERROR, e);
                 }
-                s.server.consumer_credits(consumer, -1);
-                let routing_type = s.server.queue_query(&queue).routing_type;
-                s.links.insert(
-                    handle,
-                    Link::Sender(SenderLink {
-                        name,
-                        consumer,
-                        resolved: SenderSource {
-                            queue,
-                            multicast: false,
-                            selector: None,
-                            browse: false,
-                            priority: 0,
-                            temp_queue: None,
-                            shared: false,
-                            global: false,
-                            is_volatile: false,
-                            routing_type: Some(routing_type),
-                        },
-                        source: link.attach.source.clone(),
-                        credit,
-                        link_credit: 0,
-                        delivery_count: 0,
-                        presettled: false,
-                        draining: false,
-                    }),
-                );
             }
             LocalLinkKind::Receiver {
                 queue,
@@ -1928,11 +2518,341 @@ impl Conn {
                         delivery_count,
                         incoming: None,
                         dynamic_expiry: TerminusExpiryPolicy::SessionEnd,
+                        mode: ReceiveMode::Route,
+                        window: None,
+                        state: ReceiverState::Started,
                     }),
                 );
                 let s = &self.sessions[&channel];
                 let flow = self.link_flow(s, handle, delivery_count, credits, false);
                 self.send(channel, Performative::Flow(flow));
+            }
+            LocalLinkKind::Federation(_) => unreachable!("handled above"),
+        }
+        Ok(())
+    }
+
+    /// Detaches a link this end attached, with an error.
+    fn refuse_local(&mut self, channel: u16, handle: u32, condition: &str, message: String) {
+        self.send(
+            channel,
+            Performative::Detach(Detach {
+                handle,
+                closed: true,
+                error: Some(Error::new(condition, Some(message))),
+            }),
+        );
+        if let Some(s) = self.sessions.get_mut(&channel) {
+            s.detaching.insert(handle);
+        }
+    }
+
+    /// Detaches a link this end attached, with no error (`link.close()`).
+    fn close_local(&mut self, channel: u16, handle: u32) {
+        self.send(
+            channel,
+            Performative::Detach(Detach {
+                handle,
+                closed: true,
+                error: None,
+            }),
+        );
+        if let Some(s) = self.sessions.get_mut(&channel) {
+            s.detaching.insert(handle);
+        }
+    }
+
+    /// A sending link consuming a queue (`createSender`): the consumer
+    /// and the link. The error is `AMQ119005`'s text.
+    #[allow(clippy::too_many_arguments)] // the parts of a sender
+    async fn queue_sender(
+        &mut self,
+        channel: u16,
+        handle: u32,
+        name: String,
+        queue: &str,
+        filter: Option<String>,
+        priority: i32,
+        source: Option<Source>,
+        fed: Option<FedSender>,
+    ) -> Result<(), String> {
+        let credit = Arc::new(Mutex::new(Credit::default()));
+        let sink = Arc::new(Sink {
+            events: self.events.clone(),
+            channel,
+            handle,
+            credit: credit.clone(),
+        });
+        let s = self.sessions.get_mut(&channel).expect("checked");
+        let consumer = s.next_consumer;
+        s.next_consumer += 1;
+        let filter = filter
+            .as_deref()
+            .map(saranga_filter::translate::convert_to_activemq_filter_string);
+        let created = s
+            .server
+            .create_consumer(
+                consumer,
+                queue,
+                filter,
+                priority,
+                false,
+                move |_: &Queue| sink as Arc<dyn DeliverySink>,
+            )
+            .await;
+        if let Err(e) = created {
+            return Err(format!("AMQ119005: error creating consumer, {}", e.message));
+        }
+        s.server.consumer_credits(consumer, -1);
+        let routing_type = s.server.queue_query(queue).routing_type;
+        s.links.insert(
+            handle,
+            Link::Sender(SenderLink {
+                name,
+                consumer,
+                resolved: SenderSource {
+                    queue: queue.to_owned(),
+                    multicast: false,
+                    selector: None,
+                    browse: false,
+                    priority,
+                    temp_queue: None,
+                    shared: false,
+                    global: false,
+                    is_volatile: false,
+                    routing_type: Some(routing_type),
+                },
+                source,
+                credit,
+                link_credit: 0,
+                delivery_count: 0,
+                presettled: false,
+                draining: false,
+                fed,
+            }),
+        );
+        Ok(())
+    }
+
+    /// `createTemporaryQueue(name, ANYCAST, 1, true)` for a federation
+    /// link's messages.
+    fn federation_queue(&mut self, channel: u16, queue: &str) -> Result<(), String> {
+        let s = self.sessions.get_mut(&channel).expect("checked");
+        let mut spec = saranga_server::postoffice::QueueSpec::new(queue, queue);
+        spec.routing_type = Some(RoutingType::Anycast);
+        spec.durable = false;
+        spec.temporary = true;
+        spec.max_consumers = Some(1);
+        spec.auto_delete = Some(true);
+        match s.server.create_queue(spec) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind == ErrorType::QueueExists => Ok(()),
+            Err(e) => Err(format!(
+                "AMQ119001: error creating temporary queue, {}",
+                e.message
+            )),
+        }
+    }
+
+    /// Marks this end's session on the connection as a federation's
+    /// (`addMetaData(FEDERATION_NAME, name)`): its consumers are
+    /// federation consumers.
+    fn tag_federation_session(&self, channel: u16, name: &str) {
+        if let Some(s) = self.sessions.get(&channel) {
+            self.broker
+                .add_session_metadata(s.server.name(), fed::FEDERATION_NAME_METADATA, name);
+        }
+    }
+
+    /// The peer's answer to a federation's link (the
+    /// `AMQP_LINK_INITIALIZER_KEY` runnables of `AMQPFederationSource` and
+    /// `AMQPFederationConsumer`).
+    async fn federation_link_attached(
+        &mut self,
+        channel: u16,
+        handle: u32,
+        link: LocalLink,
+        kind: FedLink,
+        remote: Attach,
+    ) -> Handled {
+        let name = link.attach.name.clone();
+        let offered = |cap: &str| link::has(remote.offered_capabilities.as_ref(), cap);
+        match kind {
+            FedLink::Control(f) => {
+                let Some(TargetKind::Target(t)) = &remote.target else {
+                    self.link_failed(format!(
+                        "AMQ119025: Federation control link refused: address = {name}"
+                    ));
+                    return Ok(());
+                };
+                if !offered(fed::FEDERATION_CONTROL_LINK) {
+                    self.link_failed(format!(
+                        "AMQ119018: link is missing an offered capability declaration {}",
+                        fed::FEDERATION_CONTROL_LINK
+                    ));
+                    return Ok(());
+                }
+                self.tag_federation_session(channel, &f.name);
+                // AMQPFederationCommandDispatcher.init
+                let queue = f.control_queue_name(t.address.as_deref().unwrap_or_default());
+                let made = match self.federation_queue(channel, &queue) {
+                    Ok(()) => {
+                        let fs = FedSender {
+                            federation: f.clone(),
+                            kind: FedSenderKind::Control,
+                        };
+                        self.queue_sender(
+                            channel,
+                            handle,
+                            name,
+                            &queue,
+                            None,
+                            0,
+                            link.attach.source.clone(),
+                            Some(fs),
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = made {
+                    self.link_failed(e);
+                    return Ok(());
+                }
+                self.federation = Some(f.clone());
+                let version = remote
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.get(fed::FEDERATION_VERSION))
+                    .and_then(Value::as_i64)
+                    .map_or(fed::FEDERATION_V1, |v| v as i32);
+                let container = self.remote_container.clone().unwrap_or_default();
+                f.control_attached(container, version, queue);
+            }
+            FedLink::EventsSender(f) => {
+                let ok = remote.target.is_some() && offered(fed::FEDERATION_EVENT_LINK);
+                let mut queue = None;
+                if ok {
+                    // AMQPFederationEventDispatcher.init
+                    let q = f.events_queue_name(&name);
+                    let made = match self.federation_queue(channel, &q) {
+                        Ok(()) => {
+                            let fs = FedSender {
+                                federation: f.clone(),
+                                kind: FedSenderKind::Events,
+                            };
+                            self.queue_sender(
+                                channel,
+                                handle,
+                                name,
+                                &q,
+                                None,
+                                0,
+                                link.attach.source.clone(),
+                                Some(fs),
+                            )
+                            .await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match made {
+                        Ok(()) => queue = Some(q),
+                        Err(e) => {
+                            self.link_failed(e);
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    // Events are not sent to this peer.
+                    self.close_local(channel, handle);
+                }
+                f.events_sender_attached(queue);
+            }
+            FedLink::EventsReceiver(f) => {
+                let ok = remote.source.is_some() && offered(fed::FEDERATION_EVENT_LINK);
+                if ok {
+                    let delivery_count = remote.initial_delivery_count.unwrap_or(0);
+                    let s = self.sessions.get_mut(&channel).expect("checked");
+                    s.links.insert(
+                        handle,
+                        Link::Receiver(ReceiverLink {
+                            name,
+                            target: ReceiverTarget {
+                                address: None,
+                                explicit: None,
+                                implicit: None,
+                                dynamic: false,
+                            },
+                            source: remote.source.clone(),
+                            credit: 10,
+                            delivery_count,
+                            incoming: None,
+                            dynamic_expiry: TerminusExpiryPolicy::SessionEnd,
+                            mode: ReceiveMode::Events(f.clone()),
+                            window: Some((10, 3)),
+                            state: ReceiverState::Started,
+                        }),
+                    );
+                    let s = &self.sessions[&channel];
+                    let flow = self.link_flow(s, handle, delivery_count, 10, false);
+                    self.send(channel, Performative::Flow(flow));
+                } else {
+                    self.close_local(channel, handle);
+                }
+                f.events_receiver_attached();
+            }
+            FedLink::Consumer(c) => {
+                if c.is_closed() {
+                    // Closed before the peer answered.
+                    self.close_local(channel, handle);
+                    return Ok(());
+                }
+                let cap = match &c.kind {
+                    ConsumerKind::Address { .. } => fed::FEDERATION_ADDRESS_RECEIVER,
+                    ConsumerKind::Queue { .. } => fed::FEDERATION_QUEUE_RECEIVER,
+                };
+                if remote.source.is_some() && !offered(cap) {
+                    self.federation_failed(format!(
+                        "AMQ119018: link is missing an offered capability declaration {cap}"
+                    ));
+                    return Ok(());
+                }
+                let opened = remote.source.is_some();
+                let address = match &c.kind {
+                    ConsumerKind::Address { target } => target.clone(),
+                    ConsumerKind::Queue { fqqn } => fqqn.clone(),
+                };
+                let delivery_count = remote.initial_delivery_count.unwrap_or(0);
+                let credits = if opened { c.credits.max(0) as u32 } else { 0 };
+                let s = self.sessions.get_mut(&channel).expect("checked");
+                let implicit = link::implicit_routing_type(&s.server, &address);
+                s.server.add_producer(&name, "AMQP", Some(&address));
+                s.links.insert(
+                    handle,
+                    Link::Receiver(ReceiverLink {
+                        name,
+                        target: ReceiverTarget {
+                            address: Some(address),
+                            explicit: None,
+                            implicit,
+                            dynamic: false,
+                        },
+                        source: link.attach.source.clone(),
+                        credit: credits,
+                        delivery_count,
+                        incoming: None,
+                        dynamic_expiry: TerminusExpiryPolicy::SessionEnd,
+                        mode: ReceiveMode::Federated(c.clone()),
+                        window: Some((c.credits, c.credits_low)),
+                        state: ReceiverState::Started,
+                    }),
+                );
+                if opened {
+                    let s = &self.sessions[&channel];
+                    let flow = self.link_flow(s, handle, delivery_count, credits, false);
+                    self.send(channel, Performative::Flow(flow));
+                }
+                c.attached(opened);
             }
         }
         Ok(())
@@ -1957,8 +2877,25 @@ impl Conn {
                 s.server.close_consumer(sl.consumer, false).await;
                 // Deliveries of this link not yet settled are gone with it.
                 s.out.retain(|_, d| d.consumer != sl.consumer);
-                if remote_close {
-                    self.close_subscription(s, &sl);
+                match sl.fed.as_ref().map(|f| &f.kind) {
+                    // The command dispatcher's and event dispatcher's
+                    // temporary queues go with their links.
+                    Some(FedSenderKind::Control | FedSenderKind::Events) => {
+                        let _ = s.server.delete_queue_with(&sl.resolved.queue, false);
+                    }
+                    // handleLinkRemotelyClosed: no more demand, so the
+                    // federation binding goes.
+                    Some(FedSenderKind::Address { queue, .. }) => {
+                        if remote_close && s.server.queue_query(queue).exists {
+                            let _ = s.server.delete_queue_with(queue, false);
+                        }
+                    }
+                    Some(FedSenderKind::Queue { .. }) => {}
+                    None => {
+                        if remote_close {
+                            self.close_subscription(s, &sl);
+                        }
+                    }
                 }
             }
             Link::Receiver(rl) => {
@@ -2035,6 +2972,7 @@ impl Conn {
             self.last_write = Instant::now();
             send_transfers(s, Vec::new(), &self.out);
         }
+        let mut stopped = None;
         let mut reply = None;
         let session_flow = |s: &Session| Flow {
             next_incoming_id: Some(s.next_incoming_id),
@@ -2080,8 +3018,22 @@ impl Conn {
                         // Delivers what it can, then says it is done.
                         s.server.force_delivery(consumer, 0);
                     }
+                } else if let Some(Link::Receiver(rl)) = s.links.get_mut(&handle) {
+                    // The sender's count: credit it used up without sending
+                    // (a drain) is gone.
+                    if let Some(count) = flow.delivery_count {
+                        let advanced = count.wrapping_sub(rl.delivery_count);
+                        if (advanced as i32) > 0 {
+                            rl.credit = rl.credit.saturating_sub(advanced);
+                            rl.delivery_count = count;
+                        }
+                    }
+                    stopped = Some(handle);
                 }
             }
+        }
+        if let Some(h) = stopped {
+            self.check_stopped(channel, h);
         }
         if let Some(f) = reply {
             self.send(channel, Performative::Flow(f));
@@ -2166,15 +3118,87 @@ impl Conn {
         let Some(Link::Receiver(rl)) = s.links.get_mut(&handle) else {
             return Ok(());
         };
-        let target = rl.target.clone();
+        let mode = rl.mode.clone();
+        let mut target = rl.target.clone();
         let source = rl.source.clone();
-        let large_at = self.settings.min_large_message_size;
+        let mut large_at = self.settings.min_large_message_size;
+        let mut payload = incoming.payload;
+        match &mode {
+            ReceiveMode::Route => {}
+            ReceiveMode::Commands(f) | ReceiveMode::Events(f) => {
+                let f = f.clone();
+                let decoded = AmqpMessage::new(i64::from(incoming.format), payload, now)
+                    .map_err(|e| e.to_string())
+                    .and_then(|m| {
+                        if matches!(mode, ReceiveMode::Commands(_)) {
+                            crate::federation::policy::decode_command(&m, &f.wildcards)
+                        } else {
+                            crate::federation::policy::decode_event(&m)
+                        }
+                    });
+                match decoded {
+                    Ok(r) => f.received(r),
+                    Err(e) => {
+                        let what = if matches!(mode, ReceiveMode::Commands(_)) {
+                            "control"
+                        } else {
+                            "event"
+                        };
+                        self.federation_failed(if e.starts_with("Remote sent") {
+                            e
+                        } else {
+                            format!("Error while processing incoming {what} message: {e}")
+                        });
+                        return Ok(());
+                    }
+                }
+                let s = self.sessions.get_mut(&channel).expect("checked");
+                rl_topup(s, handle, 10, 3, &self.out, channel);
+                if !incoming.settled
+                    && let Some(id) = incoming.delivery_id
+                {
+                    self.send(
+                        channel,
+                        Performative::Disposition(Disposition {
+                            role: Role::Receiver,
+                            first: id,
+                            last: None,
+                            settled: true,
+                            state: Some(DeliveryState::Accepted),
+                            batchable: false,
+                        }),
+                    );
+                }
+                return Ok(());
+            }
+            ReceiveMode::Federated(c) => {
+                large_at = c.large_threshold.max(0) as usize;
+                match &c.kind {
+                    // incrementAMQPMessageHops, then the address.
+                    ConsumerKind::Address { target: address } => {
+                        if let Ok(mut m) =
+                            AmqpMessage::new(i64::from(incoming.format), payload.clone(), now)
+                        {
+                            let hops = m
+                                .annotation(fed::MESSAGE_HOPS_ANNOTATION)
+                                .and_then(Value::as_i64)
+                                .map_or(1, |h| h as i32 + 1);
+                            m.set_annotation(fed::MESSAGE_HOPS_ANNOTATION, Value::Int(hops));
+                            m.reencode(now);
+                            payload = m.data().to_vec();
+                        }
+                        target.address = Some(address.clone());
+                    }
+                    ConsumerKind::Queue { fqqn } => target.address = Some(fqqn.clone()),
+                }
+            }
+        }
         s.server.set_sender(Some(rl.name.clone()));
         let result = server_send(
             &mut s.server,
             &target,
             incoming.format,
-            incoming.payload,
+            payload,
             container,
             tx.clone(),
             now,
@@ -2191,6 +3215,7 @@ impl Conn {
             &self.out,
             channel,
         );
+        self.check_stopped(channel, handle);
         if incoming.settled {
             return Ok(());
         }
@@ -2212,7 +3237,10 @@ impl Conn {
                 failure_state(
                     source.as_ref(),
                     &e,
-                    self.settings.use_modified_for_transient_delivery_errors,
+                    match &mode {
+                        ReceiveMode::Federated(c) => c.use_modified,
+                        _ => self.settings.use_modified_for_transient_delivery_errors,
+                    },
                 )
             }
         };
@@ -2425,6 +3453,18 @@ impl Conn {
                     return Ok(());
                 };
                 if let Some(l) = s.links.remove(&handle) {
+                    // resourceDeletedAction: the peer hears when it is back.
+                    if let Link::Sender(SenderLink { fed: Some(fs), .. }) = &l {
+                        match &fs.kind {
+                            FedSenderKind::Address { address, .. } => {
+                                fs.federation.register_missing_address(address);
+                            }
+                            FedSenderKind::Queue { queue } => {
+                                fs.federation.register_missing_queue(queue);
+                            }
+                            _ => {}
+                        }
+                    }
                     self.close_link(&mut s, l, false).await;
                     self.send(
                         channel,
@@ -2449,6 +3489,158 @@ impl Conn {
                 }
                 self.close_with(Error::new(condition::INTERNAL_ERROR, Some(reason)));
                 Ok(())
+            }
+            Event::Route { address, payload } => {
+                self.route_internal(&address, payload).await;
+                Ok(())
+            }
+            Event::LinkOp { name, op } => {
+                self.link_op(&name, op).await;
+                Ok(())
+            }
+            Event::LinkFailed(message) => {
+                self.federation_failed(message);
+                Ok(())
+            }
+        }
+    }
+
+    // -------------------------------------------------------- federation
+
+    /// A federation's error: a broker connection is made again
+    /// (`brokerConnection.error`), a target's connection closes
+    /// (`AMQPFederationTarget.signalError`).
+    fn federation_failed(&mut self, message: String) {
+        if self.outgoing.is_some() {
+            self.link_failed(message);
+        } else {
+            tracing::warn!("{message}");
+            self.close_with(Error::new(condition::INTERNAL_ERROR, Some(message)));
+        }
+    }
+
+    /// `postOffice.route(message, true)` of a federation's command or
+    /// event, through an internal session.
+    async fn route_internal(&mut self, address: &str, payload: Vec<u8>) {
+        if self.fed_session.is_none() {
+            let mut s = self.new_session(0, 0).server;
+            s.set_internal();
+            s.set_started(true).await;
+            self.fed_session = Some(s);
+        }
+        let s = self.fed_session.as_mut().expect("made above");
+        let msg = match AmqpMessage::new(0, payload, now_millis()) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("federation message to {address}: {e}");
+                return;
+            }
+        };
+        let r = s
+            .send_native_large_to(
+                AmqpNative::arc(msg),
+                None,
+                None,
+                Some(address),
+                Some(RoutingType::Anycast),
+            )
+            .await;
+        // The queue takes it once the session's writes are done.
+        let wait = s.take_completion();
+        self.out.send(wait, Vec::new());
+        if let Err(e) = r {
+            tracing::warn!("federation message to {address}: {}", e.message);
+        }
+    }
+
+    /// Where a link of this end is, by name.
+    fn find_link(&self, name: &str) -> Option<(u16, u32)> {
+        self.sessions.iter().find_map(|(ch, s)| {
+            s.links.iter().find_map(|(h, l)| {
+                let n = match l {
+                    Link::Receiver(rl) => &rl.name,
+                    Link::Sender(sl) => &sl.name,
+                    Link::Coordinator(_) => return None,
+                };
+                (n == name).then_some((*ch, *h))
+            })
+        })
+    }
+
+    /// Stops, starts or closes a federation receiver.
+    async fn link_op(&mut self, name: &str, op: LinkOp) {
+        let Some((channel, handle)) = self.find_link(name) else {
+            return;
+        };
+        match op {
+            LinkOp::Stop => {
+                let s = self.sessions.get_mut(&channel).expect("found");
+                let Some(Link::Receiver(rl)) = s.links.get_mut(&handle) else {
+                    return;
+                };
+                if rl.state != ReceiverState::Started {
+                    return;
+                }
+                rl.state = ReceiverState::Stopping;
+                // receiver.drain(0): what credit there is, drained.
+                if rl.credit > 0 {
+                    let (count, credit) = (rl.delivery_count, rl.credit);
+                    let s = &self.sessions[&channel];
+                    let flow = self.link_flow(s, handle, count, credit, true);
+                    self.send(channel, Performative::Flow(flow));
+                }
+                self.check_stopped(channel, handle);
+            }
+            LinkOp::Start => {
+                let s = self.sessions.get_mut(&channel).expect("found");
+                let Some(Link::Receiver(rl)) = s.links.get_mut(&handle) else {
+                    return;
+                };
+                if rl.state != ReceiverState::Stopped {
+                    return;
+                }
+                rl.state = ReceiverState::Started;
+                rl_topup(
+                    s,
+                    handle,
+                    self.settings.credits,
+                    self.settings.low_credits,
+                    &self.out,
+                    channel,
+                );
+            }
+            LinkOp::Close => {
+                let mut s = self.sessions.remove(&channel).expect("found");
+                if let Some(l) = s.links.remove(&handle) {
+                    self.close_link(&mut s, l, false).await;
+                    s.detaching.insert(handle);
+                    self.send(
+                        channel,
+                        Performative::Detach(Detach {
+                            handle,
+                            closed: true,
+                            error: None,
+                        }),
+                    );
+                }
+                self.sessions.insert(channel, s);
+            }
+        }
+    }
+
+    /// `tryCompletePendingQuiesce`: a stopping receiver whose credit is
+    /// all used or drained has stopped.
+    fn check_stopped(&mut self, channel: u16, handle: u32) {
+        let Some(s) = self.sessions.get_mut(&channel) else {
+            return;
+        };
+        let Some(Link::Receiver(rl)) = s.links.get_mut(&handle) else {
+            return;
+        };
+        if rl.state == ReceiverState::Stopping && rl.credit == 0 && rl.incoming.is_none() {
+            rl.state = ReceiverState::Stopped;
+            if let ReceiveMode::Federated(c) = &rl.mode {
+                c.stopped(true);
             }
         }
     }
@@ -2822,6 +4014,11 @@ fn rl_topup(s: &mut Session, handle: u32, credits: i32, low: i32, out: &Outbound
     let Some(Link::Receiver(rl)) = s.links.get_mut(&handle) else {
         return;
     };
+    // A stopping or stopped receiver grants no credit.
+    if rl.state != ReceiverState::Started {
+        return;
+    }
+    let (credits, low) = rl.window.unwrap_or((credits, low));
     let (credits, low) = (credits.max(0) as u32, low.max(0) as u32);
     if rl.credit <= low && credits > rl.credit {
         rl.credit = credits;
@@ -2979,5 +4176,30 @@ fn refused_message(link: &LocalLink) -> String {
         LocalLinkKind::Receiver { address, .. } => {
             format!("AMQ119029: Receiver link refused for address {address}")
         }
+        LocalLinkKind::Federation(_) => format!(
+            "AMQ119021: The broker connection had a remote link closed unexpectedly: {}",
+            link.attach.name
+        ),
     }
+}
+
+/// Which of the federation's senders the peer's receiver asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FedSenderRole {
+    Address,
+    Queue,
+    Events,
+}
+
+/// `AMQPFederationSenderController.getRoutingType`: the source's first
+/// topic or queue capability, else the default (multicast).
+fn source_routing_type(source: &Source) -> RoutingType {
+    for c in source.capabilities.iter().flatten() {
+        match c.as_str() {
+            capability::TOPIC => return RoutingType::Multicast,
+            capability::QUEUE => return RoutingType::Anycast,
+            _ => {}
+        }
+    }
+    RoutingType::Multicast
 }

@@ -90,7 +90,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// `Match.getPattern().asPredicate()`: the pattern is anchored at the end
 /// only, and `find` takes any match, so a name matches when one of its
 /// suffixes does.
-fn finds(m: &Match, name: &str) -> bool {
+pub fn pattern_finds(m: &Match, name: &str) -> bool {
     name.char_indices()
         .map(|(i, _)| i)
         .chain(std::iter::once(name.len()))
@@ -1351,10 +1351,10 @@ impl FederatedAddress {
             );
             return false;
         }
-        if self.excludes.iter().any(|m| finds(m, address)) {
+        if self.excludes.iter().any(|m| pattern_finds(m, address)) {
             return false;
         }
-        self.includes.is_empty() || self.includes.iter().any(|m| finds(m, address))
+        self.includes.is_empty() || self.includes.iter().any(|m| pattern_finds(m, address))
     }
 
     /// `match(AddressInfo)`: the address's first routing type.
@@ -1581,8 +1581,11 @@ struct QueueMatcher {
 
 impl QueueMatcher {
     fn test(&self, queue: &str, address: &str) -> bool {
-        self.queue.as_ref().is_none_or(|m| finds(m, queue))
-            && self.address.as_ref().is_none_or(|m| finds(m, address))
+        self.queue.as_ref().is_none_or(|m| pattern_finds(m, queue))
+            && self
+                .address
+                .as_ref()
+                .is_none_or(|m| pattern_finds(m, address))
     }
 }
 
