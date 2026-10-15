@@ -1329,6 +1329,8 @@ impl PostOffice {
         }
         self.plugins.check(|p| p.before_destroy_queue(name))?;
         let address = queue.config().address.clone();
+        self.plugins
+            .each(|p| p.before_remove_binding(name, &address));
         {
             let mut state = self.write();
             state.queues.remove(name);
@@ -2044,6 +2046,11 @@ impl PostOffice {
 
     /// `destroyDivert`: unbinds a divert. False if there is none.
     pub fn destroy_divert(&self, name: &str) -> bool {
+        let address = self.divert(name).map(|d| d.address.to_string());
+        if let Some(address) = &address {
+            self.plugins
+                .each(|p| p.before_remove_binding(name, address));
+        }
         let found = {
             let mut state = self.write();
             let mut found = false;
@@ -2063,6 +2070,9 @@ impl PostOffice {
             && let Err(e) = s.delete_binding_record(old)
         {
             tracing::warn!("deleting the record of divert {name}: {e}");
+        }
+        if found && let Some(address) = &address {
+            self.plugins.each(|p| p.after_remove_binding(name, address));
         }
         found
     }
@@ -2186,6 +2196,7 @@ impl PostOffice {
         entry.diverts.push(Arc::new(divert));
         drop(state);
         crate::audit::registered("DivertControlImpl", &name);
+        self.plugins.each(|p| p.after_add_binding(&name, &address));
         // BINDING_ADDED of the DivertBinding: its cluster name is its
         // unique name.
         let id = self.ids.next();

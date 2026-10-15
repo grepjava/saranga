@@ -399,6 +399,8 @@ impl BrokerConfig {
             broadcast_groups: crate::discovery::broadcast_groups(config),
             bridges: config.bridges.clone(),
             grouping_handler: config.grouping_handler.clone(),
+            federations: config.federations.clone(),
+            federation_downstream_authorization: config.federation_downstream_authorization.clone(),
             bridge_targets: crate::bridge::Targets::from_file(config),
             plugins: plugins(config)?,
             disk_monitor: crate::disk::MonitorConfig::new(

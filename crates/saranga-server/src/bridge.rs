@@ -1363,6 +1363,21 @@ impl Bridges {
         *self.targets.lock().unwrap_or_else(|e| e.into_inner()) = targets;
     }
 
+    /// `addConnectorConfiguration`: a connector of that name is replaced.
+    pub fn add_connector(&self, connector: TransportConfiguration) {
+        let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
+        targets.connectors.retain(|c| c.name != connector.name);
+        targets.connectors.push(connector);
+    }
+
+    /// The connectors and discovery groups that can be named.
+    pub fn targets(&self) -> Targets {
+        self.targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn all(&self) -> Vec<Arc<Bridge>> {
         self.deployed().clone()
     }

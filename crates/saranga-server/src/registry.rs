@@ -341,6 +341,8 @@ pub struct ConsumerEntry {
     pub queue: Queue,
     pub filter: Option<String>,
     pub browse_only: bool,
+    /// `getPriority`.
+    pub priority: i32,
     pub created: i64,
     pub metrics: Arc<ConsumerMetrics>,
     pub(crate) sink: Arc<dyn DeliverySink>,

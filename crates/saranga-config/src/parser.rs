@@ -415,6 +415,7 @@ fn parse_core(
     parse_address_settings(core, config, warnings)?;
     parse_addresses(core, config, warnings)?;
     parse_bridges(core, config)?;
+    parse_federations(core, config)?;
     parse_diverts(core, config, warnings)?;
     parse_wildcards(core, config, warnings)?;
     Ok(())
@@ -422,7 +423,6 @@ fn parse_core(
 
 /// `<core>` children Saranga reads but does not act on yet, and why.
 const NOT_ACTED_ON: &[(&str, &str)] = &[
-    ("federations", "federation is not supported"),
     (
         "broker-connections",
         "AMQP broker connections are not supported",
@@ -2010,6 +2010,292 @@ fn parse_bridge(node: Node<'_, '_>, config: &BrokerConfig) -> Result<crate::Brid
         b.discovery_group = None;
     }
     Ok(b)
+}
+
+/// `<federations>`: `parseFederationsConfiguration` (its
+/// `downstream-authorization`) and each `<federation>` child
+/// (`parseFederationConfiguration`).
+fn parse_federations(core: Node<'_, '_>, config: &mut BrokerConfig) -> Result<()> {
+    let lists: Vec<_> = all(core, "federations").collect();
+    for list in lists {
+        if let Some(roles) = list.attribute("downstream-authorization") {
+            config.federation_downstream_authorization.extend(
+                roles
+                    .split(',')
+                    .map(java_trim)
+                    .filter(|r| !r.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+        for node in
+            elements(list).filter(|c| c.tag_name().name().eq_ignore_ascii_case("federation"))
+        {
+            let federation = parse_federation(node, config)?;
+            config.federations.push(federation);
+        }
+    }
+    Ok(())
+}
+
+/// A password attribute, resolved as `PasswordMaskingUtil.resolveMask`
+/// resolves it; an empty one is none.
+fn password_attribute(node: Node<'_, '_>, config: &BrokerConfig) -> Result<Option<String>> {
+    match node.attribute("password") {
+        Some(text) if !text.is_empty() => Ok(Some(
+            mask::resolve_mask(config.mask_password, text, Some(&config.password_codec))
+                .map_err(|e| mask_error("password", text, e))?,
+        )),
+        _ => Ok(None),
+    }
+}
+
+/// `Integer.parseInt` of an attribute.
+fn int_attribute(name: &str, text: &str) -> Result<i32> {
+    parse_num(name, text)
+}
+
+fn long_attribute(name: &str, text: &str, check: Check) -> Result<i64> {
+    parse_num::<i64>(name, text).and_then(|v| check.apply(name, v))
+}
+
+/// `parseFederationConfiguration`.
+fn parse_federation(node: Node<'_, '_>, config: &BrokerConfig) -> Result<crate::FederationConfig> {
+    let mut f = crate::FederationConfig {
+        name: node.attribute("name").unwrap_or_default().to_owned(),
+        user: Some(node.attribute("user").unwrap_or_default().to_owned()),
+        password: password_attribute(node, config)?,
+        ..Default::default()
+    };
+    for child in elements(node) {
+        match child.tag_name().name() {
+            "upstream" => f.upstreams.push(parse_federation_stream(child, config)?),
+            "downstream" => {
+                let stream = parse_federation_stream(child, config)?;
+                // getString(..., NOT_NULL_OR_EMPTY).
+                let upstream_connector_ref =
+                    match first(child, "upstream-connector-ref").map(trimmed_text) {
+                        Some(v) if !v.is_empty() => v,
+                        v => {
+                            return Err(ConfigError::invalid(
+                                "upstream-connector-ref",
+                                v.unwrap_or_default(),
+                                "must not be null or empty",
+                            ));
+                        }
+                    };
+                f.downstreams.push(crate::FederationDownstreamConfig {
+                    stream,
+                    upstream_connector_ref,
+                });
+            }
+            "policy-set" => {
+                let mut policy_refs = Vec::new();
+                for p in elements(child).filter(|p| p.tag_name().name() == "policy") {
+                    let r = p.attribute("ref").unwrap_or_default().to_owned();
+                    if !policy_refs.contains(&r) {
+                        policy_refs.push(r);
+                    }
+                }
+                f.add_policy(crate::FederationPolicyConfig::Set {
+                    name: child.attribute("name").unwrap_or_default().to_owned(),
+                    policy_refs,
+                });
+            }
+            "queue-policy" => f.add_policy(crate::FederationPolicyConfig::Queue(
+                parse_queue_policy(child)?,
+            )),
+            "address-policy" => f.add_policy(crate::FederationPolicyConfig::Address(
+                parse_address_policy(child)?,
+            )),
+            "transformer" => f.add_transformer(
+                child.attribute("name").unwrap_or_default().to_owned(),
+                transformer(child),
+            ),
+            _ => {}
+        }
+    }
+    Ok(f)
+}
+
+/// `getQueuePolicy`.
+fn parse_queue_policy(node: Node<'_, '_>) -> Result<crate::FederationQueuePolicyConfig> {
+    let mut p = crate::FederationQueuePolicyConfig {
+        name: node.attribute("name").unwrap_or_default().to_owned(),
+        ..Default::default()
+    };
+    for a in node.attributes() {
+        match a.name() {
+            "include-federated" => p.include_federated = java_parse_bool(a.value()),
+            "priority-adjustment" => {
+                p.priority_adjustment = Some(int_attribute(a.name(), a.value())?);
+            }
+            "transformer-ref" => p.transformer_ref = Some(a.value().to_owned()),
+            _ => {}
+        }
+    }
+    for child in elements(node) {
+        let matcher = || crate::FederationQueueMatcher {
+            queue_match: Some(
+                child
+                    .attribute("queue-match")
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+            address_match: Some(
+                child
+                    .attribute("address-match")
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+        };
+        let list = match child.tag_name().name() {
+            "include" => &mut p.includes,
+            "exclude" => &mut p.excludes,
+            _ => continue,
+        };
+        let m = matcher();
+        if !list.contains(&m) {
+            list.push(m);
+        }
+    }
+    Ok(p)
+}
+
+/// `getAddressPolicy`. As in Artemis 2.57, the hops are read from a
+/// `max-consumers` attribute, which the schema does not have, and the
+/// schema's `max-hops` is not read: `max_hops` stays 0.
+fn parse_address_policy(node: Node<'_, '_>) -> Result<crate::FederationAddressPolicyConfig> {
+    let mut p = crate::FederationAddressPolicyConfig {
+        name: node.attribute("name").unwrap_or_default().to_owned(),
+        ..Default::default()
+    };
+    for a in node.attributes() {
+        let (name, value) = (a.name(), a.value());
+        match name {
+            "max-consumers" => {
+                let v = int_attribute(name, value)?;
+                p.max_hops = Check::MinusOneOrGeZero.apply(name, v.into())? as i32;
+            }
+            "auto-delete" => p.auto_delete = Some(java_parse_bool(value)),
+            "auto-delete-delay" => {
+                p.auto_delete_delay = Some(long_attribute(name, value, Check::GeZero)?);
+            }
+            "auto-delete-message-count" => {
+                p.auto_delete_message_count =
+                    Some(long_attribute(name, value, Check::MinusOneOrGeZero)?);
+            }
+            "transformer-ref" => p.transformer_ref = Some(value.to_owned()),
+            "enable-divert-bindings" => p.enable_divert_bindings = java_parse_bool(value),
+            _ => {}
+        }
+    }
+    for child in elements(node) {
+        let list = match child.tag_name().name() {
+            "include" => &mut p.includes,
+            "exclude" => &mut p.excludes,
+            _ => continue,
+        };
+        let m = child
+            .attribute("address-match")
+            .unwrap_or_default()
+            .to_owned();
+        if !list.contains(&m) {
+            list.push(m);
+        }
+    }
+    Ok(p)
+}
+
+/// `getFederationStream`: an `<upstream>` or `<downstream>`. As in Artemis
+/// 2.57, `share-connection` is not read.
+fn parse_federation_stream(
+    node: Node<'_, '_>,
+    config: &BrokerConfig,
+) -> Result<crate::FederationStreamConfig> {
+    use crate::FederationConnectionConfig as C;
+    let s = Settings { core: node };
+    let mut c = C {
+        password: password_attribute(node, config)?,
+        username: Some(node.attribute("user").unwrap_or_default().to_owned()),
+        ..C::default()
+    };
+    if let Some(v) = node.attribute("priority-adjustment") {
+        c.priority_adjustment = int_attribute("priority-adjustment", v)?;
+    }
+    c.ha = s.bool("ha").unwrap_or(false);
+    set_value(
+        &mut c.circuit_breaker_timeout,
+        s.i64("circuit-breaker-timeout", Check::MinusOneOrGeZero)?,
+    );
+    set_value(
+        &mut c.client_failure_check_period,
+        s.i64("check-period", Check::GtZero)?,
+    );
+    set_value(
+        &mut c.connection_ttl,
+        s.i64("connection-ttl", Check::GtZero)?,
+    );
+    set_value(
+        &mut c.retry_interval,
+        s.i64("retry-interval", Check::GtZero)?,
+    );
+    set_value(&mut c.call_timeout, s.i64("call-timeout", Check::GtZero)?);
+    // ActiveMQClient.DEFAULT_CALL_FAILOVER_TIMEOUT, not the class's -1.
+    c.call_failover_timeout = s
+        .i64("call-failover-timeout", Check::MinusOneOrGtZero)?
+        .unwrap_or(30_000);
+    if let Some(n) = first(node, "retry-interval-multiplier") {
+        let v = node_f64(n)?;
+        if v <= 0.0 {
+            return Err(ConfigError::invalid(
+                "retry-interval-multiplier",
+                v,
+                "must be greater than 0",
+            ));
+        }
+        c.retry_interval_multiplier = v;
+    }
+    set_value(
+        &mut c.max_retry_interval,
+        s.i64("max-retry-interval", Check::GtZero)?,
+    );
+    set_value(
+        &mut c.initial_connect_attempts,
+        s.i32("initial-connect-attempts", Check::MinusOneOrGeZero)?,
+    );
+    set_value(
+        &mut c.reconnect_attempts,
+        s.i32("reconnect-attempts", Check::MinusOneOrGeZero)?,
+    );
+    let mut stream = crate::FederationStreamConfig {
+        name: node.attribute("name").unwrap_or_default().to_owned(),
+        ..Default::default()
+    };
+    let mut static_connectors = Vec::new();
+    let mut discovery_group = None;
+    for child in elements(node) {
+        match child.tag_name().name() {
+            "discovery-group-ref" => {
+                discovery_group = child.attribute("discovery-group-name").map(str::to_owned);
+            }
+            "static-connectors" => {
+                for r in all(child, "connector-ref") {
+                    static_connectors.push(trimmed_text(r));
+                }
+            }
+            "policy" => {
+                stream.add_policy_ref(child.attribute("ref").unwrap_or_default().to_owned())
+            }
+            _ => {}
+        }
+    }
+    if static_connectors.is_empty() {
+        c.discovery_group = discovery_group;
+    } else {
+        c.static_connectors = Some(static_connectors);
+    }
+    stream.connection = c;
+    Ok(stream)
 }
 
 /// `getTransformerConfiguration`: `<class-name>` and the `<property>`

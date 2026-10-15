@@ -813,6 +813,12 @@ pub struct BrokerConfig {
     pub bridges: Vec<BridgeConfig>,
     /// `<grouping-handler>`: the last one given.
     pub grouping_handler: Option<GroupingHandlerConfig>,
+    /// The `<federation>`s of `<federations>`, in document order.
+    pub federations: Vec<crate::FederationConfig>,
+    /// `downstream-authorization`: with security on, a user asking this
+    /// broker to federate from another (a downstream) must have one of
+    /// these roles.
+    pub federation_downstream_authorization: Vec<String>,
     /// `message-expiry-scan-period` in milliseconds; `-1` turns the expiry
     /// reaper off.
     pub message_expiry_scan_period: i64,
@@ -1045,6 +1051,8 @@ impl Default for BrokerConfig {
             diverts: Vec::new(),
             bridges: Vec::new(),
             grouping_handler: None,
+            federations: Vec::new(),
+            federation_downstream_authorization: Vec::new(),
             message_expiry_scan_period: Self::DEFAULT_MESSAGE_EXPIRY_SCAN_PERIOD,
             transaction_timeout: Self::DEFAULT_TRANSACTION_TIMEOUT,
             transaction_timeout_scan_period: Self::DEFAULT_TRANSACTION_TIMEOUT_SCAN_PERIOD,

@@ -18,6 +18,7 @@ pub mod discovery;
 pub mod disk;
 pub mod duplicate;
 pub mod error;
+pub mod federation;
 pub mod grouping;
 pub mod large;
 pub mod localtime;
@@ -262,6 +263,10 @@ pub struct BrokerConfig {
     pub bridges: Vec<saranga_config::BridgeConfig>,
     /// `<grouping-handler>`.
     pub grouping_handler: Option<saranga_config::GroupingHandlerConfig>,
+    /// `<federations>`, deployed once the broker is active.
+    pub federations: Vec<saranga_config::FederationConfig>,
+    /// `downstream-authorization`.
+    pub federation_downstream_authorization: Vec<String>,
     /// The connectors and discovery groups bridges name.
     pub bridge_targets: bridge::Targets,
     /// Plugins (`<broker-plugins>`, or the embedding application's own).
@@ -305,6 +310,8 @@ impl BrokerConfig {
             broadcast_groups: Vec::new(),
             bridges: Vec::new(),
             grouping_handler: None,
+            federations: Vec::new(),
+            federation_downstream_authorization: Vec::new(),
             bridge_targets: bridge::Targets::default(),
             plugins: Vec::new(),
             disk_monitor: None,
@@ -465,6 +472,8 @@ pub struct Broker {
     broadcast_groups: Vec<Arc<discovery::BroadcastGroup>>,
     /// `ClusterManager.bridges`.
     bridges: bridge::Bridges,
+    /// `FederationManager`.
+    federation: federation::FederationManager,
     /// `replication` `primary`: a backup may register to replicate this
     /// broker's data.
     replication_policy: Option<saranga_config::Replication>,
@@ -741,6 +750,7 @@ impl Broker {
         let broker = Arc::new(Self {
             broadcast_groups,
             bridges: bridge::Bridges::new(config.bridge_targets.clone()),
+            federation: federation::FederationManager::default(),
             node_id: node_id.clone(),
             post_office,
             connection_ttl_override: config.connection_ttl_override,
@@ -886,6 +896,12 @@ impl Broker {
             broker.bridges.reload_record(record, b);
         }
         broker.deploy_bridges(&config.bridges);
+        // `FederationManager.start`, after the cluster's.
+        broker.federation.start(
+            &broker,
+            &config.federations,
+            &config.federation_downstream_authorization,
+        );
         Ok(broker)
     }
 
@@ -1011,6 +1027,7 @@ impl Broker {
         if let Some(g) = self.post_office.grouping() {
             g.stop();
         }
+        self.federation.stop();
         if let Some(c) = &self.cluster {
             c.stop();
         }
@@ -1060,6 +1077,11 @@ impl Broker {
     /// The connections and their sessions, consumers and producers.
     pub fn registry(&self) -> &Arc<registry::Registry> {
         &self.registry
+    }
+
+    /// `getFederationManager`.
+    pub fn federation(&self) -> &federation::FederationManager {
+        &self.federation
     }
 
     /// Divert transformers by class name.

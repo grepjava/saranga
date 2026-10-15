@@ -15,6 +15,7 @@
 //! (see [`crate::large`]).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -73,9 +74,16 @@ pub struct Delivery {
     forced_delivery_seq: Option<i64>,
     /// The body of a large message, until `receive` has read it.
     large: Option<Arc<LargeMessageController>>,
+    /// It came as a large message (`ClientLargeMessageInternal`).
+    was_large: bool,
 }
 
 impl Delivery {
+    /// Whether it came as a large message, its body streamed in chunks.
+    pub fn is_large(&self) -> bool {
+        self.was_large
+    }
+
     pub fn message_id(&self) -> i64 {
         self.message.message_id
     }
@@ -132,6 +140,8 @@ pub(crate) struct ConsumerShared {
     queue_info: QueueQuery,
     state: Mutex<ConsumerState>,
     notify: Notify,
+    /// `manualFlowManagement`: the owner sends the credits.
+    manual_flow: AtomicBool,
 }
 
 impl ConsumerShared {
@@ -172,6 +182,7 @@ impl ConsumerShared {
                 failed_over: false,
             }),
             notify: Notify::new(),
+            manual_flow: AtomicBool::new(false),
         }
     }
 
@@ -276,6 +287,7 @@ impl ConsumerShared {
             flow_control_size: size,
             encode_size,
             forced_delivery_seq,
+            was_large: large.is_some(),
             large,
         });
         self.notify.notify_waiters();
@@ -344,6 +356,9 @@ impl ConsumerShared {
         session: &SessionInner,
         d: &Delivery,
     ) {
+        if self.manual_flow.load(AtomicOrdering::Acquire) {
+            return;
+        }
         // A large message's chunks follow, so its header is not discounted.
         if d.flow_control_size != 0 {
             self.flow_control(st, session, d.flow_control_size, d.large.is_none());
@@ -352,12 +367,15 @@ impl ConsumerShared {
 
     /// `startSlowConsumer`: one credit to get one message.
     fn start_slow_consumer(&self, session: &SessionInner) {
+        if self.manual_flow.load(AtomicOrdering::Acquire) {
+            return;
+        }
         session.send_consumer_credits(self.id, 1);
     }
 
     /// `resetIfSlowConsumer`.
     fn reset_if_slow_consumer(&self, session: &SessionInner) {
-        if self.client_window_size == 0 {
+        if self.client_window_size == 0 && !self.manual_flow.load(AtomicOrdering::Acquire) {
             session.send_consumer_credits(self.id, 0);
         }
     }
@@ -710,6 +728,26 @@ impl Consumer {
     /// The credit threshold (`getClientWindowSize`).
     pub fn client_window_size(&self) -> i32 {
         self.shared.client_window_size
+    }
+
+    /// `setManualFlowMessageHandler`: the consumer sends no credits as it
+    /// consumes; [`Consumer::flow_control`] sends them. For a consumer of
+    /// window 0.
+    pub fn set_manual_flow(&self) {
+        self.shared.manual_flow.store(true, AtomicOrdering::Release);
+    }
+
+    /// `flowControl(credits, false)`: credits for the broker to send more.
+    pub fn flow_control(&self, credits: i32) {
+        self.session.send_consumer_credits(self.shared.id, credits);
+    }
+
+    /// `resetIfSlowConsumer` of a consumer of window 0: the broker stops
+    /// sending.
+    pub fn reset_if_slow_consumer(&self) {
+        if self.shared.client_window_size == 0 {
+            self.session.send_consumer_credits(self.shared.id, 0);
+        }
     }
 
     /// Messages buffered and not yet received.

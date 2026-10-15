@@ -273,6 +273,7 @@ pub async fn serve_stream<S>(
         topology_subscription: None,
         cluster_authorized: false,
         replication: None,
+        federations: Vec::new(),
     };
     let ended = conn.read_loop(&mut rd).await;
     if let Some(r) = conn.replication.take() {
@@ -353,6 +354,9 @@ struct Connection {
     cluster_authorized: bool,
     /// A backup registered on this connection: its replication channel.
     replication: Option<Arc<crate::replication::Replicator>>,
+    /// The federations downstreams asked for on this connection, undeployed
+    /// when it goes.
+    federations: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -461,6 +465,7 @@ impl Connection {
             CHANNEL_PING => self.handle_channel0(packet),
             CHANNEL_SESSION => self.handle_channel1(packet).await,
             CHANNEL_CLUSTER => self.handle_cluster(packet).await,
+            crate::federation::CHANNEL_FEDERATION => self.handle_federation(packet),
             crate::replication::CHANNEL_REPLICATION if self.replication.is_some() => {
                 // `ReplicationManager.ResponseHandler`.
                 match packet {
@@ -940,9 +945,73 @@ impl Connection {
         .unwrap_or_else(|e| Err(SecurityError(format!("login failed: {e}"))))
     }
 
+    /// `FederationChannelHandler.handlePacket`: a downstream asks this broker
+    /// to federate from the broker that sent it, which must have logged in
+    /// as a user with a `downstream-authorization` role when security is
+    /// on. The federation goes with the connection.
+    fn handle_federation(&mut self, packet: Packet) -> Result<(), ConnError> {
+        let Packet::FederationDownstreamConnectMessage(m) = packet else {
+            tracing::debug!("ignoring {} on the federation channel", packet.name());
+            return Ok(());
+        };
+        let remote = self.shared.client.remote_address().to_owned();
+        let subject = self.shared.client.subject();
+        let security = self.broker.security().is_some();
+        if security {
+            if !self.authenticated {
+                tracing::warn!(
+                    "AMQ224158: Unable to process Core federation downstream request from {remote}. User is not authenticated. Closing connection."
+                );
+                return Err(ConnError::Protocol(
+                    "federation downstream unauthenticated".into(),
+                ));
+            }
+            if !self
+                .broker
+                .federation()
+                .authorize_downstream(true, subject.as_deref())
+            {
+                let user = subject
+                    .as_deref()
+                    .and_then(|s| s.users().next().map(str::to_owned))
+                    .unwrap_or_default();
+                tracing::warn!(
+                    "AMQ224159: Unable to process Core federation downstream request from {remote}. User {user} is not authorized. Closing connection."
+                );
+                return Err(ConnError::Protocol(
+                    "federation downstream unauthorized".into(),
+                ));
+            }
+        }
+        let acceptor = (Some(self.acceptor.host.clone()), Some(self.acceptor.port));
+        let (config, connector) = crate::federation::downstream_request(&m.0, acceptor);
+        let name = config.name.clone();
+        self.broker.bridges().add_connector(connector);
+        self.broker.federation().deploy(config);
+        if !self.federations.contains(&name) {
+            self.federations.push(name.clone());
+        }
+        let user = subject
+            .as_deref()
+            .and_then(|s| s.users().next().map(str::to_owned))
+            .unwrap_or_else(|| "anonymous".to_owned());
+        tracing::info!(
+            "AMQ224160: Core federation downstream {name} has been deployed. Request sent by user {user} from {remote}."
+        );
+        Ok(())
+    }
+
     /// The connection is gone: fail the sessions still open, then remove the
     /// temporary queues (`TempResourceCleanerUpper`).
     async fn destroy(&mut self) {
+        let remote = self.shared.client.remote_address().to_owned();
+        for name in self.federations.drain(..) {
+            if self.broker.federation().undeploy(&name) {
+                tracing::info!(
+                    "AMQ224161: Connection from {remote} closed. Undeployed Core federation {name}."
+                );
+            }
+        }
         for (_, session) in self.sessions.drain() {
             let _ = session.send(SessionInput::ConnectionFailed);
         }

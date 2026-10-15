@@ -660,3 +660,135 @@ fn grouping_handler() {
         r#"<grouping-handler name="g"><type>LOCAL</type><group-timeout>0</group-timeout></grouping-handler>"#,
     );
 }
+
+#[test]
+fn federations() {
+    use saranga_config::{FederationPolicyConfig, FederationQueueMatcher};
+    let c = parse(
+        r##"<federations downstream-authorization="a, b,,c">
+             <federation name="f1" user="globaluser" password="secret">
+               <upstream name="up1" user="westuser" priority-adjustment="2">
+                 <static-connectors><connector-ref>c1</connector-ref></static-connectors>
+                 <retry-interval>100</retry-interval>
+                 <retry-interval-multiplier>2</retry-interval-multiplier>
+                 <share-connection>true</share-connection>
+                 <policy ref="set"/>
+                 <policy ref="set"/>
+               </upstream>
+               <downstream name="down1">
+                 <ha>true</ha>
+                 <discovery-group-ref discovery-group-name="dg1"/>
+                 <policy ref="qp"/>
+                 <upstream-connector-ref>c2</upstream-connector-ref>
+               </downstream>
+               <policy-set name="set"><policy ref="ap"/><policy ref="qp"/></policy-set>
+               <queue-policy name="qp" include-federated="true" priority-adjustment="-3" transformer-ref="t">
+                 <include queue-match="q.#" address-match="#"/>
+                 <exclude queue-match="q.x" address-match="#"/>
+               </queue-policy>
+               <address-policy name="ap" max-hops="2" auto-delete="true" auto-delete-delay="10" auto-delete-message-count="-1" enable-divert-bindings="true">
+                 <include address-match="news.#"/>
+                 <include address-match="news.#"/>
+               </address-policy>
+               <transformer name="t">
+                 <class-name>org.foo.T</class-name>
+                 <property key="k" value="v"/>
+               </transformer>
+             </federation>
+           </federations>"##,
+    );
+    assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+    assert_eq!(c.federation_downstream_authorization, ["a", "b", "c"]);
+    let f = &c.federations[0];
+    assert_eq!(f.name, "f1");
+    assert_eq!(f.user.as_deref(), Some("globaluser"));
+    assert_eq!(f.password.as_deref(), Some("secret"));
+    let up = &f.upstreams[0];
+    assert_eq!(up.name, "up1");
+    assert_eq!(up.policy_refs, ["set"]);
+    let uc = &up.connection;
+    assert_eq!(uc.username.as_deref(), Some("westuser"));
+    assert_eq!(uc.password, None);
+    assert_eq!(uc.priority_adjustment, 2);
+    assert_eq!(
+        uc.static_connectors.as_deref(),
+        Some(&["c1".to_owned()][..])
+    );
+    assert_eq!(uc.retry_interval, 100);
+    assert_eq!(uc.retry_interval_multiplier, 2.0);
+    // Artemis 2.57 does not read share-connection.
+    assert!(!uc.share_connection);
+    assert_eq!(
+        (
+            uc.connection_ttl,
+            uc.client_failure_check_period,
+            uc.max_retry_interval
+        ),
+        (60_000, 30_000, 2000)
+    );
+    assert_eq!(
+        (uc.call_timeout, uc.call_failover_timeout),
+        (30_000, 30_000)
+    );
+    assert_eq!(
+        (
+            uc.initial_connect_attempts,
+            uc.reconnect_attempts,
+            uc.circuit_breaker_timeout
+        ),
+        (-1, -1, 30_000)
+    );
+    let down = &f.downstreams[0];
+    assert_eq!(down.upstream_connector_ref, "c2");
+    assert!(down.stream.connection.ha);
+    assert_eq!(
+        down.stream.connection.discovery_group.as_deref(),
+        Some("dg1")
+    );
+    assert_eq!(down.stream.connection.username.as_deref(), Some(""));
+    assert!(
+        matches!(f.policy("set"), Some(FederationPolicyConfig::Set { policy_refs, .. }) if policy_refs == &["ap", "qp"])
+    );
+    let Some(FederationPolicyConfig::Queue(q)) = f.policy("qp") else {
+        panic!()
+    };
+    assert!(q.include_federated);
+    assert_eq!(q.priority_adjustment, Some(-3));
+    assert_eq!(q.transformer_ref.as_deref(), Some("t"));
+    assert_eq!(
+        q.includes,
+        [FederationQueueMatcher {
+            queue_match: Some("q.#".into()),
+            address_match: Some("#".into())
+        }]
+    );
+    let Some(FederationPolicyConfig::Address(a)) = f.policy("ap") else {
+        panic!()
+    };
+    // max-hops is not read; Artemis reads max-consumers in its place.
+    assert_eq!(a.max_hops, 0);
+    assert_eq!(a.includes, ["news.#"]);
+    assert_eq!(a.auto_delete, Some(true));
+    assert_eq!(a.auto_delete_delay, Some(10));
+    assert_eq!(a.auto_delete_message_count, Some(-1));
+    assert!(a.enable_divert_bindings);
+    assert_eq!(f.transformer("t").unwrap().class_name, "org.foo.T");
+
+    let c = parse(
+        r##"<federations><federation name="f"><address-policy name="ap" max-consumers="3"/></federation></federations>"##,
+    );
+    let Some(FederationPolicyConfig::Address(a)) = c.federations[0].policy("ap") else {
+        panic!()
+    };
+    assert_eq!(a.max_hops, 3);
+    // A downstream needs its upstream connector.
+    parse_err(
+        r##"<federations><federation name="f"><downstream name="d"/></federation></federations>"##,
+    );
+    parse_err(
+        r##"<federations><federation name="f"><upstream name="u"><check-period>0</check-period></upstream></federation></federations>"##,
+    );
+    parse_err(
+        r##"<federations><federation name="f"><address-policy name="ap" auto-delete-delay="-1"/></federation></federations>"##,
+    );
+}

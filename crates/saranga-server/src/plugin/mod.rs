@@ -102,8 +102,10 @@ pub trait BrokerPlugin: Send + Sync {
     fn after_destroy_queue(&self, queue: &Queue, check_consumers: bool, auto_delete_address: bool) {
     }
 
-    /// A queue was bound to its address.
+    /// A queue or a divert was bound to its address.
     fn after_add_binding(&self, name: &str, address: &str) {}
+    /// `beforeRemoveBinding`: a queue's or a divert's binding is about to go.
+    fn before_remove_binding(&self, name: &str, address: &str) {}
     fn after_remove_binding(&self, name: &str, address: &str) {}
 
     /// A session is about to send a message.

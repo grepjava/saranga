@@ -17,6 +17,7 @@ mod bootstrap;
 mod broker;
 pub mod broker_properties;
 mod bytes;
+mod federation;
 pub mod mask;
 mod matcher;
 mod parser;
@@ -44,6 +45,11 @@ pub use broker::{
     Replication, TransformerConfig, UdpEndpointConfig, Warning,
 };
 pub use bytes::convert_text_bytes;
+pub use federation::{
+    FederationAddressPolicyConfig, FederationConfig, FederationConnectionConfig,
+    FederationDownstreamConfig, FederationPolicyConfig, FederationQueueMatcher,
+    FederationQueuePolicyConfig, FederationStreamConfig,
+};
 pub use matcher::Match;
 pub use repository::{HierarchicalRepository, Mergeable, extract_address_name};
 pub use security::{CheckType, Role, SecuritySetting, SecuritySettingPluginConfig};

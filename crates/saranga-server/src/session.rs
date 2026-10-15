@@ -422,6 +422,10 @@ pub struct ServerSession {
     actions: Vec<Box<dyn FnOnce() + Send>>,
     /// Permission checks are off (a send the broker makes).
     unchecked: bool,
+    /// Routing a message the broker took from elsewhere
+    /// ([`ServerSession::route_direct`]): no auto-creation permission or
+    /// validated-user checks either.
+    direct: bool,
     /// What management sees of the session.
     entry: Arc<SessionEntry>,
     /// The producer the next sends are counted against.
@@ -514,7 +518,77 @@ impl ServerSession {
             ops: Vec::new(),
             actions: Vec::new(),
             unchecked: false,
+            direct: false,
         }
+    }
+
+    /// A session through which the broker routes messages it took from
+    /// elsewhere (`PostOfficeImpl.route(message, direct)`, as a federated
+    /// consumer does): no client, so it is neither listed nor told of, and
+    /// its sends ([`ServerSession::route_direct`]) are not checked.
+    pub fn internal(broker: Arc<Broker>, name: &str) -> Self {
+        let info = Arc::new(saranga_security::ConnectionInfo {
+            remote_address: name.to_owned(),
+            certificates: None,
+            security_domain: None,
+            connection_id: None,
+        });
+        let conn = Arc::new(ClientConnection::new(
+            Transport::internal(name),
+            info.clone(),
+            Vec::new(),
+        ));
+        let entry = Arc::new(SessionEntry::new(name.to_owned(), None, None, &conn, None));
+        let tx = Transaction::new_ref(broker.post_office().ids().next(), None);
+        Self {
+            broker,
+            conn,
+            entry,
+            sender: None,
+            name: name.to_owned(),
+            auth: SecurityAuth {
+                username: None,
+                password: None,
+                connection: info,
+                subject: None,
+                management: false,
+            },
+            validated_user: None,
+            xa: false,
+            auto_commit_sends: true,
+            auto_commit_acks: true,
+            pre_acknowledge: false,
+            default_address: None,
+            started: false,
+            closed: true,
+            consumers: BTreeMap::new(),
+            tx: Some(tx),
+            pending_tx: None,
+            timeout_seconds: -1,
+            ops: Vec::new(),
+            actions: Vec::new(),
+            unchecked: false,
+            direct: false,
+        }
+    }
+
+    /// `PostOfficeImpl.route(message, true)` for an internal session: the
+    /// message, with the ID it has (and its large body, if any), is routed
+    /// with duplicate detection, paged and journaled as a send is, without
+    /// permission checks or send hooks.
+    pub async fn route_direct(
+        &mut self,
+        message: CoreMessage,
+        large: Option<Arc<LargeBody>>,
+    ) -> Result<()> {
+        self.unchecked = true;
+        self.direct = true;
+        let r = self
+            .send_message(message, Outgoing::Core(large), None)
+            .await;
+        self.unchecked = false;
+        self.direct = false;
+        r
     }
 
     pub fn name(&self) -> &str {
@@ -609,7 +683,10 @@ impl ServerSession {
     /// Routing on behalf of this session: its security checks and user.
     pub fn creator(&self) -> Creator<'_> {
         Creator {
-            security: self.broker.security().map(|s| (&**s, &self.auth)),
+            security: (!self.direct)
+                .then(|| self.broker.security())
+                .flatten()
+                .map(|s| (&**s, &self.auth)),
             user: self.validated_user.as_deref(),
         }
     }
@@ -969,7 +1046,8 @@ impl ServerSession {
                 saranga_buffer::PropertyValue::String(user.as_str().into()),
             );
         }
-        if self.broker.reject_empty_validated_user()
+        if !self.direct
+            && self.broker.reject_empty_validated_user()
             && message
                 .properties
                 .get(&SimpleString::from(crate::message::HDR_VALIDATED_USER))
@@ -2090,6 +2168,7 @@ impl ServerSession {
             queue: queue.clone(),
             filter: filter_string.clone(),
             browse_only,
+            priority,
             created: crate::message::now_millis(),
             metrics: metrics.clone(),
             sink: sink.clone(),

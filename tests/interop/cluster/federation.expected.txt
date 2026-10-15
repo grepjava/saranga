@@ -1,0 +1,41 @@
+=== artemis run (node 2, node 1)
+node 2: listening
+node 1: listening
+node 1: downstream deployed
+node 2: deployed the downstream's federation
+=== Federation.java topic news 10
+published 10 on node 1
+node 2 received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+hops [[0, 0, 0, 1]]
+=== Federation.java topic alerts 10
+published 10 on node 1
+node 2 received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+hops [[0, 0, 0, 1]]
+=== Federation.java queue orders 10
+sent 10 to node 1
+node 2 received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+no more
+node 1 has none left
+=== artemis stop (node 1)
+node 1: down
+node 2: undeployed the downstream's federation
+=== artemis run (node 1)
+node 1: listening
+node 2: deployed the downstream's federation
+=== Federation.java topic news 10
+published 10 on node 1
+node 2 received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+hops [[0, 0, 0, 1]]
+=== Federation.java topic alerts 10
+published 10 on node 1
+node 2 received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+hops [[0, 0, 0, 1]]
+=== Federation.java queue orders 10
+sent 10 to node 1
+node 2 received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+no more
+node 1 has none left
+=== artemis stop (node 1, node 2)
+node 1: down
+node 2: undeployed the downstream's federation
+node 2: down
