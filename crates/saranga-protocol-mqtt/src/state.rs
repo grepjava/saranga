@@ -632,6 +632,10 @@ pub enum Control {
     /// Another connection took the client ID (`handleLinkStealing`): the
     /// connection stops its session, then answers.
     TakeOver { done: oneshot::Sender<()> },
+    /// A client with the same ID connected to another node of the cluster
+    /// (`MQTTConnection.destroy`): the connection is closed as if it
+    /// failed.
+    Destroy,
 }
 
 /// A connected client, as `connectedClients` holds it.

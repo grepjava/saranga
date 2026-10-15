@@ -1,0 +1,84 @@
+=== artemis run (node 1, node 2, node 3)
+node 1: listening
+node 2: listening
+node 3: listening
+node 1: bridged to the others
+node 2: bridged to the others
+node 3: bridged to the others
+=== Mixed.java topology
+topology: 3 nodes, 3 with a primary
+=== Mixed.java network-topology (node 1, node 3)
+node 1 network topology: [localhost:63016, localhost:63116, localhost:63216]
+node 3 network topology: [localhost:63016, localhost:63116, localhost:63216]
+=== Mixed.java balance jobs 30
+node 1 received 10, node 2 received 10, node 3 received 10
+=== Mixed.java topic news 20
+node 1 subscriber received 20, in order
+node 2 subscriber received 20, in order
+node 3 subscriber received 20, in order
+=== Mixed.java redistribute jobs 10 (node 1 to node 2)
+sent 10 to node 1
+node 2 received [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+no more
+=== Mixed.java redistribute jobs 10 (node 2 to node 3)
+sent 10 to node 2
+node 3 received [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+no more
+=== Mixed.java redistribute jobs 10 (node 3 to node 1)
+sent 10 to node 3
+node 1 received [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+no more
+=== Mixed.java grouped orders 60 6 (to node 1)
+sent 60 in 6 groups to node 1
+received 60
+groups: 6
+each group to one node: true
+each group in order: true
+=== Mixed.java grouped orders 60 6 (to node 2)
+sent 60 in 6 groups to node 2
+received 60
+groups: 6
+each group to one node: true
+each group in order: true
+same nodes as before: true
+=== Mixed.java grouped orders 60 6 (to node 3)
+sent 60 in 6 groups to node 3
+received 60
+groups: 6
+each group to one node: true
+each group in order: true
+same nodes as before: true
+=== Mixed.java load work 300
+sent 900 on 3 nodes, received 900, missing 0, duplicates 0
+=== Mixed.java mqtt-takeover device-1 (node 1 to node 2)
+connected device-1 to node 1
+connected device-1 to node 2
+node 1 closed the first connection: true
+=== Mixed.java mqtt-takeover device-2 (node 3 to node 1)
+connected device-2 to node 3
+connected device-2 to node 1
+node 3 closed the first connection: true
+=== artemis stop (node 3)
+node 3: down
+=== Mixed.java load work 200 (node 1, node 2)
+sent 400 on 2 nodes, received 400, missing 0, duplicates 0
+=== artemis run (node 3)
+node 3: listening
+node 1: bridged to the others
+node 2: bridged to the others
+node 3: bridged to the others
+=== Mixed.java topology
+topology: 3 nodes, 3 with a primary
+=== Mixed.java load work 300
+sent 900 on 3 nodes, received 900, missing 0, duplicates 0
+=== Mixed.java grouped orders 60 6 (to node 3)
+sent 60 in 6 groups to node 3
+received 60
+groups: 6
+each group to one node: true
+each group in order: true
+same nodes as before, but node 3's groups: true
+=== artemis stop (node 1, node 2, node 3)
+node 1: down
+node 2: down
+node 3: down

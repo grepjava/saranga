@@ -419,6 +419,13 @@ struct State {
     load_balancing: HashMap<Name, saranga_config::MessageLoadBalancing>,
 }
 
+/// A notification listener: the notification's type and properties.
+pub type NotificationListener = Arc<
+    dyn Fn(crate::notifications::NotificationType, &[(&'static str, saranga_buffer::PropertyValue)])
+        + Send
+        + Sync,
+>;
+
 pub struct PostOffice {
     /// Handed to queues, which route through the post office when they
     /// move messages.
@@ -435,6 +442,9 @@ pub struct PostOffice {
     persisted: Mutex<Persisted>,
     /// Management notifications, once the broker is active.
     notifier: RwLock<Option<crate::notifications::Notifier>>,
+    /// `ManagementService.addNotificationListener`: told of each
+    /// notification as it is sent.
+    listeners: RwLock<Vec<NotificationListener>>,
     /// The broker's plugins.
     plugins: Arc<crate::plugin::Plugins>,
     /// `CopyOnWriteBindings.BindingIndex`: the next binding to try of each
@@ -472,6 +482,7 @@ impl PostOffice {
             paging,
             persisted: Mutex::default(),
             notifier: RwLock::default(),
+            listeners: RwLock::default(),
             plugins: Arc::default(),
             positions: Mutex::default(),
             grouping: std::sync::OnceLock::new(),
@@ -519,8 +530,25 @@ impl PostOffice {
     ) {
         let guard = self.notifier.read().unwrap_or_else(|e| e.into_inner());
         if let Some(n) = guard.as_ref() {
-            n.send(kind, props(n), self.ids.next());
+            let props = props(n);
+            for l in self
+                .listeners
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+            {
+                l(kind, &props);
+            }
+            n.send(kind, props, self.ids.next());
         }
+    }
+
+    /// `ManagementService.addNotificationListener`.
+    pub fn add_notification_listener(&self, listener: NotificationListener) {
+        self.listeners
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(listener);
     }
 
     pub(crate) fn notifier_guard(

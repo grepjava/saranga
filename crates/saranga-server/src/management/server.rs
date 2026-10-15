@@ -339,6 +339,27 @@ pub fn queue_config_json(q: &crate::queue::Queue) -> Json {
     o
 }
 
+/// `getParams().get("host") + ":" + getParams().get("port")`, a missing
+/// parameter being "null".
+fn host_port(t: &saranga_core_protocol::transport::TransportConfiguration) -> String {
+    use saranga_core_protocol::transport::ParamValue;
+    let param = |k: &str| {
+        t.params
+            .iter()
+            .find(|(n, _)| n.to_string() == k)
+            .map_or_else(
+                || "null".to_owned(),
+                |(_, v)| match v {
+                    ParamValue::Bool(b) => b.to_string(),
+                    ParamValue::Int(i) => i.to_string(),
+                    ParamValue::Long(l) => l.to_string(),
+                    ParamValue::String(s) => s.to_string(),
+                },
+            )
+    };
+    format!("{}:{}", param("host"), param("port"))
+}
+
 fn routing_type(name: &str) -> Result<RoutingType, String> {
     match name.to_uppercase().as_str() {
         "MULTICAST" => Ok(RoutingType::Multicast),
@@ -948,10 +969,30 @@ pub(super) async fn invoke(
             .collect();
         return Some(Ok(Json::from(names)));
     }
-    // The members of the cluster connections' topologies: none until
-    // clustering.
+    // The members of the cluster connection's topology with a primary, in
+    // the order of its ConcurrentHashMap: "live" is kept beside "primary".
     if call.is("listNetworkTopology", &[]).is_some() {
-        return Some(Ok(Json::from("[]")));
+        let members = broker.cluster().map(|c| c.members()).unwrap_or_default();
+        let hashes: Vec<i32> = members
+            .iter()
+            .map(|m| saranga_buffer::java_hash::string_hash(&m.node_id))
+            .collect();
+        let list: Vec<Json> = saranga_buffer::java_hash::hash_map_order(&hashes, None)
+            .into_iter()
+            .map(|i| &members[i])
+            .filter_map(|m| {
+                let primary = m.primary.as_ref()?;
+                let mut o = Json::object();
+                o.put("nodeID", m.node_id.as_str());
+                o.put("live", host_port(primary));
+                o.put("primary", host_port(primary));
+                if let Some(b) = &m.backup {
+                    o.put("backup", host_port(b));
+                }
+                Some(o)
+            })
+            .collect();
+        return Some(Ok(Json::from(Json::Array(list).to_string())));
     }
     if let Some(a) = call.is("listQueues", &[S, I, I]) {
         return Some(super::views::list_queues(broker, a.s(0).as_deref(), a.i(1), a.i(2)).await);

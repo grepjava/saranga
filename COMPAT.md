@@ -113,7 +113,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **A second CONNECT** on a connection closes it, after a DISCONNECT 0x8E (session taken over) for MQTT 5. That is what Artemis's link stealing ends up doing when the client ID is the same. Artemis would instead start a second session if the client ID differed.
 - **The connection TTL** closes a silent connection when it runs out. Artemis notices at its next `connection-ttl-check-interval`, up to that much later.
 - **`mqtt-session-state-persistence-timeout`** is accepted and reported as deprecated (`AMQ221038`), as in Artemis, but as a warning rather than at INFO level.
-- **Interceptors** (Java classes) and connection routers (redirects) are not supported. The cluster-wide `SESSION_CREATED` notification that disconnects a client connected to another node waits for clustering (Phase 10).
+- **Interceptors** (Java classes) and connection routers (redirects) are not supported.
 - **A large message** (over the journal's record size) published as a retained message stays a regular message in the retained-message queue. Artemis converts it to a large message there.
 
 ## AMQP differences
@@ -174,7 +174,6 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **A STOMP consumer closed by management** is removed from its session after the `ERROR` frame. Artemis drops the subscription but leaves the server consumer in place.
 - **`getRoles` and `getRolesAsJSON`** list roles in the order the setting gives them. Artemis lists them in `HashSet` order.
 - **`listUser`** lists users and each user's roles in the order Java's `HashMap` and `HashSet` iterate them, as Artemis does. For a basic security manager the users are first put in name order; Artemis puts them in the order of its own map of the journal's users, so a long list can come out in a different order.
-- **`listNetworkTopology`** returns `[]` until clustering (Phase 10): the topology of a broker without cluster connections.
 - **Notifications** not sent yet: those of `NotificationActiveMQServerPlugin` (`CONNECTION_CREATED`, `CONNECTION_DESTROYED`, `ADDRESS_ADDED`, `ADDRESS_REMOVED`, `MESSAGE_DELIVERED`, `MESSAGE_EXPIRED`; plugins come in stage 5); `BROADCAST_GROUP_STARTED`, `BROADCAST_GROUP_STOPPED`, `BRIDGE_STARTED`, `BRIDGE_STOPPED`, `CLUSTER_CONNECTION_STARTED`, `CLUSTER_CONNECTION_STOPPED`, `PROPOSAL`, `PROPOSAL_RESPONSE` and `UNPROPOSAL` are sent. A divert's `BINDING_ADDED` carries a new ID in `_AMQ_Binding_ID`, as Saranga's diverts have none of their own.
 - **`management-message-rbac`** checks the permission before it looks for the operation. For an operation that does not exist, a caller without the permission gets the permission error; Artemis looks for the operation's method first and answers `AMQ229069: no operation`.
 - **Message counter dates** are in UTC, as the other dates are, and so are the hours of a counter's history.

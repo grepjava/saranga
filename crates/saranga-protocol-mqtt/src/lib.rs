@@ -8,6 +8,8 @@ pub mod util;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use saranga_buffer::PropertyValue;
+use saranga_server::notifications::{NotificationType, hdr};
 use saranga_server::protocol::{Connection, ProtocolManager, ServeFuture};
 use saranga_server::{Acceptor, Broker};
 
@@ -194,6 +196,34 @@ impl ProtocolManager for MqttProtocol {
         if self.state.set(manager.clone()).is_err() {
             return Box::pin(async {});
         }
+        // `onNotification`: a client of this node whose ID connected to
+        // another node of the cluster is disconnected.
+        let weak = Arc::downgrade(&manager);
+        broker
+            .post_office()
+            .add_notification_listener(Arc::new(move |kind, props| {
+                if kind != NotificationType::SessionCreated {
+                    return;
+                }
+                let prop = |k: &str| props.iter().find(|(n, _)| *n == k).map(|(_, v)| v);
+                let text = |k: &str| match prop(k) {
+                    Some(PropertyValue::String(s)) => Some(s.to_string()),
+                    _ => None,
+                };
+                if !text(hdr::PROTOCOL_NAME).is_some_and(|p| p.starts_with("MQTT")) {
+                    return;
+                }
+                let distance = match prop(hdr::DISTANCE) {
+                    Some(PropertyValue::Int(d)) => *d,
+                    _ => 0,
+                };
+                if distance > 0
+                    && let (Some(manager), Some(id)) = (weak.upgrade(), text(hdr::CLIENT_ID))
+                    && let Some(client) = manager.connected_client(&id)
+                {
+                    let _ = client.control.send(state::Control::Destroy);
+                }
+            }));
         let served = self.config.served;
         let period = Duration::from_millis(self.config.session_scan_interval.max(1) as u64);
         Box::pin(async move {

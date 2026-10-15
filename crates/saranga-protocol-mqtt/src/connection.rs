@@ -1456,6 +1456,10 @@ pub async fn serve(
                     let _ = done.send(());
                     break;
                 }
+                Control::Destroy => {
+                    conn.disconnect(true).await;
+                    break;
+                }
             },
             read = tokio::time::timeout(ttl, rd.read_buf(&mut buf)), if !conn.closing => match read {
                 Err(_) => {
