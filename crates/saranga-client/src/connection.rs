@@ -327,8 +327,11 @@ impl ConnInner {
             return Err(Error::connection_destroyed());
         }
         let _guard = channel.blocking.lock().await;
-        let id = channel.next_correlation_id();
-        set_correlation_id(&mut packet, id);
+        // A send in the async response cache keeps the cache's ID.
+        if correlation_id(&packet) <= 0 {
+            let id = channel.next_correlation_id();
+            set_correlation_id(&mut packet, id);
+        }
         let rx = channel.begin(expected, correlation_id(&packet));
         if channel.is_closed() {
             channel.abandon();
@@ -428,8 +431,13 @@ impl ConnInner {
             return Ok(());
         };
         if packet.packet_type() == types::PACKETS_CONFIRMED {
-            // No resend cache with a confirmation window of -1.
-        } else if is_response(packet.packet_type()) {
+            // No resend cache: a send is acknowledged by its response.
+            return Ok(());
+        }
+        if let Some(confirmed) = channel.confirm(size) {
+            let _ = self.send(channel.id, &confirmed);
+        }
+        if is_response(packet.packet_type()) {
             channel.handle_response(packet);
         } else if frame.channel_id == 0 {
             self.handle_channel0(packet);
@@ -1192,7 +1200,7 @@ impl Factory {
                 xa: options.xa,
                 auto_commit_sends: options.auto_commit_sends,
                 auto_commit_acks: options.auto_commit_acks,
-                window_size: defaults::CONFIRMATION_WINDOW_SIZE,
+                window_size: options.confirmation_window_size,
                 pre_acknowledge: options.pre_acknowledge,
                 default_address: None,
                 client_id: options.client_id.as_deref().map(Into::into),
@@ -1209,7 +1217,7 @@ impl Factory {
                 xa: options.xa,
                 auto_commit_sends: options.auto_commit_sends,
                 auto_commit_acks: options.auto_commit_acks,
-                window_size: defaults::CONFIRMATION_WINDOW_SIZE,
+                window_size: options.confirmation_window_size,
                 pre_acknowledge: options.pre_acknowledge,
                 default_address: None,
             }
@@ -1221,6 +1229,9 @@ impl Factory {
         {
             Packet::CreateSessionResponseMessage(r) => {
                 conn.version.store(r.server_version, Ordering::SeqCst);
+                if let Some(channel) = conn.channel(channel_id) {
+                    channel.set_confirmation_window(options.confirmation_window_size);
+                }
                 Ok(r.server_version)
             }
             other => Err(Error::UnexpectedResponse(other.name())),

@@ -809,6 +809,22 @@ impl ServerSession {
         self.send_native_in(native, tx).await
     }
 
+    /// As [`ServerSession::send_native`] for a large message whose file is
+    /// `body`.
+    pub async fn send_native_large(
+        &mut self,
+        native: Arc<dyn NativeMessage>,
+        body: Arc<LargeBody>,
+    ) -> Result<()> {
+        let tx = if self.auto_commit_sends {
+            None
+        } else {
+            self.tx.clone()
+        };
+        self.send_native_large_to(native, Some(body), tx, None, None)
+            .await
+    }
+
     /// As [`ServerSession::send_native`] in the given transaction, or none.
     pub async fn send_native_in(
         &mut self,
@@ -973,7 +989,20 @@ impl ServerSession {
             .settings(crate::postoffice::split_fqqn(&address).0);
         crate::message::apply_expiry_delay(&mut message, &settings, crate::message::now_millis());
         let scheduled_time = crate::message::scheduled_delivery_time(&message);
-        let duplicate_id = crate::duplicate::duplicate_id_bytes(&message);
+        // checkDuplicateID: a bridge's duplicate ID comes off the message and
+        // is checked, in place of the message's own, in the bridge cache of
+        // the address (BRIDGE.<address>).
+        let bridge_dup = match message
+            .properties
+            .remove(&SimpleString::from(crate::message::HDR_BRIDGE_DUPLICATE_ID))
+        {
+            Some(saranga_buffer::PropertyValue::Bytes(b)) => Some(b),
+            _ => None,
+        };
+        let duplicate_id = match bridge_dup {
+            Some(b) => Some((b, true)),
+            None => crate::duplicate::duplicate_id_bytes(&message).map(|d| (d, false)),
+        };
         let mut r = MessageRef::new(match outgoing {
             Outgoing::Core(Some(body)) => ServerMessage::new_large(message, body),
             Outgoing::Core(None) => ServerMessage::new(message),
@@ -1009,16 +1038,25 @@ impl ServerSession {
         // checkDuplicateID: a send outside a transaction gets one of its own
         // so the ID is journaled with the message.
         let mut own_tx: Option<(i64, bool)> = None;
-        if let Some(id) = duplicate_id {
+        if let Some((id, bridge)) = duplicate_id {
             let po = self.broker.post_office();
-            let cache = po.duplicate_cache(crate::postoffice::split_fqqn(&address).0);
+            let name = crate::postoffice::split_fqqn(&address).0;
+            let cache = if bridge {
+                po.duplicate_cache(&format!("BRIDGE.{name}"))
+            } else {
+                po.duplicate_cache(name)
+            };
             let mut c = crate::duplicate::lock(&cache);
             if c.contains(&id) {
-                tracing::warn!(
-                    "AMQ222059: Duplicate message detected - message will not be routed. Message information:\n{}",
-                    r.message.message_id()
-                );
-                if let Some(tx) = &tx {
+                if bridge {
+                    tracing::trace!("Message {} hit a bridge duplicate", r.message.message_id());
+                } else {
+                    tracing::warn!(
+                        "AMQ222059: Duplicate message detected - message will not be routed. Message information:\n{}",
+                        r.message.message_id()
+                    );
+                }
+                if !bridge && let Some(tx) = &tx {
                     transaction::lock(tx).mark_rollback_only(&BrokerError::new(
                         ErrorType::DuplicateIdRejected,
                         format!(
@@ -2316,11 +2354,19 @@ impl ServerSession {
     }
 
     /// `ServerSessionImpl.executeQueueQuery`, without the acceptor's
-    /// prefix.
+    /// prefix. The management address is a queue that exists, with no
+    /// consumer or message count (-1), as `ActiveMQServerImpl.queueQuery`
+    /// has it: the JMS client sending to it then creates nothing.
     pub fn queue_query(&self, name: &str) -> QueueQueryResult {
-        self.broker
-            .post_office()
-            .queue_query(self.remove_prefix(name))
+        let name = self.remove_prefix(name);
+        let mut r = self.broker.post_office().queue_query(name);
+        if !r.exists && crate::postoffice::queue_name_of(name) == self.broker.management().address()
+        {
+            r.exists = true;
+            r.consumer_count = -1;
+            r.message_count = -1;
+        }
+        r
     }
 
     /// `ServerSessionImpl.executeBindingQuery`, without the acceptor's

@@ -153,6 +153,20 @@ pub trait BrokerPlugin: Send + Sync {
 
     /// The critical analyzer found `component` unresponsive.
     fn critical_failure(&self, component: &str) {}
+
+    /// `ActiveMQServerBridgePlugin`: a bridge is about to be deployed, or
+    /// was; it is about to send the message with this ID, or has; the other
+    /// broker has the message, now acknowledged.
+    fn before_deploy_bridge(
+        &self,
+        config: &saranga_config::BridgeConfig,
+    ) -> Result<(), BrokerError> {
+        Ok(())
+    }
+    fn after_deploy_bridge(&self, bridge: &crate::bridge::Bridge) {}
+    fn before_deliver_bridge(&self, bridge: &str, message_id: i64) {}
+    fn after_deliver_bridge(&self, bridge: &str, message_id: i64) {}
+    fn after_acknowledge_bridge(&self, bridge: &str, message_id: i64) {}
 }
 
 /// A broker's plugins (`getBrokerPlugins`).

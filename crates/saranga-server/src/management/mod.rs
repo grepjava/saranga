@@ -135,6 +135,7 @@ enum Resource {
     Divert(Arc<crate::postoffice::Divert>),
     Acceptor(String),
     BroadcastGroup(Arc<crate::discovery::BroadcastGroup>),
+    Bridge(Arc<crate::bridge::Bridge>),
 }
 
 impl Resource {
@@ -148,6 +149,7 @@ impl Resource {
             Resource::Divert(d) => (Control::Divert, d.name.to_string()),
             Resource::Acceptor(a) => (Control::Acceptor, a.clone()),
             Resource::BroadcastGroup(g) => (Control::BroadcastGroup, g.config().name.clone()),
+            Resource::Bridge(b) => (Control::Bridge, b.name().to_owned()),
         }
     }
 }
@@ -241,6 +243,9 @@ impl Management {
                 .cloned()
                 .map(Resource::BroadcastGroup);
         }
+        if let Some(b) = name.strip_prefix("bridge.") {
+            return broker.bridges().get(b).map(Resource::Bridge);
+        }
         None
     }
 
@@ -269,6 +274,7 @@ impl Management {
             Resource::Divert(d) => Ok(divert_attribute(d, &upper)),
             Resource::Acceptor(a) => Ok(acceptor_attribute(broker, a, &upper)),
             Resource::BroadcastGroup(g) => Ok(broadcast_group_attribute(g, &upper)),
+            Resource::Bridge(b) => bridge_attribute(b, &upper),
         };
         match found {
             // A boolean attribute is read through its `is` method.
@@ -375,6 +381,7 @@ impl Management {
             Resource::Divert(_) => None,
             Resource::Acceptor(a) => invoke_acceptor(broker, a, &call).await,
             Resource::BroadcastGroup(g) => invoke_broadcast_group(g, &call),
+            Resource::Bridge(b) => invoke_bridge(b, &call).await,
         };
         if let Some(outcome) = found {
             return outcome;
@@ -392,6 +399,7 @@ impl Management {
                         Resource::Divert(d) => Ok(divert_attribute(d, attr)),
                         Resource::Acceptor(a) => Ok(acceptor_attribute(broker, a, attr)),
                         Resource::BroadcastGroup(g) => Ok(broadcast_group_attribute(g, attr)),
+                        Resource::Bridge(b) => bridge_attribute(b, attr),
                     };
                     match value {
                         Ok(Some(v)) => return Ok(v),
@@ -582,6 +590,88 @@ fn invoke_broadcast_group(
             g.stop();
             Ok(Json::Null)
         }
+        _ => return None,
+    })
+}
+
+/// `BridgeControl`'s attributes.
+fn bridge_attribute(b: &crate::bridge::Bridge, attr: &str) -> Result<Option<Json>, String> {
+    let c = b.config();
+    let transformer = c.transformer.as_ref();
+    let properties = || {
+        let mut o = Json::object();
+        for (k, v) in transformer
+            .map(|t| t.properties.as_slice())
+            .unwrap_or_default()
+        {
+            o.put(k, v.as_str());
+        }
+        o
+    };
+    Ok(Some(match attr {
+        "Name" => Json::from(c.name.as_str()),
+        "QueueName" => Json::from(c.queue_name.clone()),
+        "ForwardingAddress" => Json::from(c.forwarding_address.clone()),
+        "FilterString" => Json::from(c.filter.clone()),
+        "TransformerClassName" => Json::from(transformer.map(|t| t.class_name.clone())),
+        "TransformerPropertiesAsJSON" => Json::from(properties().to_string()),
+        "TransformerProperties" => match transformer {
+            Some(_) => properties(),
+            None => Json::Null,
+        },
+        // `staticConnectors.toArray`: none at all is a NullPointerException.
+        "StaticConnectors" => match &c.static_connectors {
+            Some(names) => Json::Array(names.iter().map(|n| Json::from(n.as_str())).collect()),
+            None => return Err("java.lang.NullPointerException".to_owned()),
+        },
+        "DiscoveryGroupName" => Json::from(c.discovery_group.clone()),
+        "RetryInterval" => Json::from(c.retry_interval),
+        "RetryIntervalMultiplier" => Json::from(c.retry_interval_multiplier),
+        "MaxRetryInterval" => Json::from(c.max_retry_interval),
+        "ReconnectAttempts" => Json::from(c.reconnect_attempts),
+        "UseDuplicateDetection" => Json::from(c.use_duplicate_detection),
+        "HA" => Json::from(c.ha),
+        "MessagesPendingAcknowledgement" => {
+            Json::from(b.metrics().messages_pending_acknowledgement())
+        }
+        "MessagesAcknowledged" => Json::from(b.metrics().messages_acknowledged()),
+        // `BridgeMetrics.convertToMap`: a `HashMap` of the two.
+        "Metrics" => {
+            let entries = [
+                (
+                    "messagesPendingAcknowledgement",
+                    b.metrics().messages_pending_acknowledgement(),
+                ),
+                ("messagesAcknowledged", b.metrics().messages_acknowledged()),
+            ];
+            let hashes: Vec<i32> = entries
+                .iter()
+                .map(|(k, _)| {
+                    k.encode_utf16()
+                        .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(i32::from(c)))
+                })
+                .collect();
+            let mut o = Json::object();
+            for i in saranga_buffer::java_hash::hash_map_order(&hashes, None) {
+                o.put(entries[i].0, entries[i].1);
+            }
+            o
+        }
+        "Connected" => Json::from(b.is_connected()),
+        "Started" => Json::from(b.is_started()),
+        _ => return Ok(None),
+    }))
+}
+
+/// `BridgeControl`'s operations: `start`, and `stop`, which waits for the
+/// bridge to stop (`flushExecutor`).
+async fn invoke_bridge(b: &Arc<crate::bridge::Bridge>, call: &args::Call<'_>) -> Option<Outcome> {
+    if !call.params.is_empty() {
+        return None;
+    }
+    Some(match call.op {
+        "start" => b.start().map(|()| Json::Null).map_err(|e| e.message),
+        "stop" => b.stop().await.map(|()| Json::Null).map_err(|e| e.message),
         _ => return None,
     })
 }

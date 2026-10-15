@@ -396,6 +396,8 @@ impl BrokerConfig {
             ha: crate::node::HaConfig::from_file(config, instance),
             cluster: crate::cluster::ClusterConfig::from_file(config),
             broadcast_groups: crate::discovery::broadcast_groups(config),
+            bridges: config.bridges.clone(),
+            bridge_targets: crate::bridge::Targets::from_file(config),
             plugins: plugins(config)?,
             disk_monitor: crate::disk::MonitorConfig::new(
                 config.journal.max_disk_usage.unwrap_or(90),

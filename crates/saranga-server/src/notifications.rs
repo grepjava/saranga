@@ -35,6 +35,8 @@ pub enum NotificationType {
     MessageExpired,
     BroadcastGroupStarted,
     BroadcastGroupStopped,
+    BridgeStarted,
+    BridgeStopped,
 }
 
 impl NotificationType {
@@ -60,6 +62,8 @@ impl NotificationType {
             Self::MessageExpired => "MESSAGE_EXPIRED",
             Self::BroadcastGroupStarted => "BROADCAST_GROUP_STARTED",
             Self::BroadcastGroupStopped => "BROADCAST_GROUP_STOPPED",
+            Self::BridgeStarted => "BRIDGE_STARTED",
+            Self::BridgeStopped => "BRIDGE_STOPPED",
         }
     }
 }

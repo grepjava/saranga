@@ -413,6 +413,7 @@ fn parse_core(
     parse_broker_plugins(core, config)?;
     parse_address_settings(core, config, warnings)?;
     parse_addresses(core, config, warnings)?;
+    parse_bridges(core, config)?;
     parse_diverts(core, config, warnings)?;
     parse_wildcards(core, config, warnings)?;
     Ok(())
@@ -420,7 +421,6 @@ fn parse_core(
 
 /// `<core>` children Saranga reads but does not act on yet, and why.
 const NOT_ACTED_ON: &[(&str, &str)] = &[
-    ("bridges", "core bridges are not supported"),
     ("federations", "federation is not supported"),
     (
         "broker-connections",
@@ -1864,6 +1864,145 @@ fn parse_diverts(
         config.diverts.push(parse_divert(node, warnings)?);
     }
     Ok(())
+}
+
+/// `<bridges>`: the `bridge` children of every `bridges` element.
+fn parse_bridges(core: Node<'_, '_>, config: &mut BrokerConfig) -> Result<()> {
+    let lists: Vec<_> = all(core, "bridges").collect();
+    for list in lists {
+        for node in elements(list).filter(|c| c.tag_name().name().eq_ignore_ascii_case("bridge")) {
+            let bridge = parse_bridge(node, config)?;
+            config.bridges.push(bridge);
+        }
+    }
+    Ok(())
+}
+
+/// `parseBridgeConfiguration`.
+fn parse_bridge(node: Node<'_, '_>, config: &BrokerConfig) -> Result<crate::BridgeConfig> {
+    let s = Settings { core: node };
+    let mut b = crate::BridgeConfig::new(node.attribute("name").unwrap_or_default());
+    b.queue_name = s.non_empty_string("queue-name")?;
+    b.forwarding_address = s.string("forwarding-address");
+    let transformer_class_name = s.string("transformer-class-name");
+    if let Some(v) = s.text_bytes("confirmation-window-size", Check::MinusOneOrPositiveInt)? {
+        b.confirmation_window_size = v as i32;
+    }
+    if let Some(v) = s.text_bytes("producer-window-size", Check::MinusOneOrPositiveInt)? {
+        b.producer_window_size = v as i32;
+    }
+    set_value(
+        &mut b.retry_interval,
+        s.i64("retry-interval", Check::GtZero)?,
+    );
+    set_value(
+        &mut b.client_failure_check_period,
+        s.i64("check-period", Check::GtZero)?,
+    );
+    set_value(
+        &mut b.connection_ttl,
+        s.i64("connection-ttl", Check::GtZero)?,
+    );
+    if let Some(v) = s.text_bytes("min-large-message-size", Check::PositiveInt)? {
+        b.min_large_message_size = v as i32;
+    }
+    set_value(
+        &mut b.max_retry_interval,
+        s.i64("max-retry-interval", Check::GtZero)?,
+    );
+    if let Some(n) = first(node, "retry-interval-multiplier") {
+        let v = node_f64(n)?;
+        if v <= 0.0 {
+            return Err(ConfigError::invalid(
+                "retry-interval-multiplier",
+                v,
+                "must be greater than 0",
+            ));
+        }
+        b.retry_interval_multiplier = v;
+    }
+    set_value(
+        &mut b.initial_connect_attempts,
+        s.i32("initial-connect-attempts", Check::MinusOneOrGeZero)?,
+    );
+    set_value(
+        &mut b.reconnect_attempts,
+        s.i32("reconnect-attempts", Check::MinusOneOrGeZero)?,
+    );
+    set_value(
+        &mut b.reconnect_attempts_on_same_node,
+        s.i32("reconnect-attempts-same-node", Check::MinusOneOrGeZero)?,
+    );
+    set_value(
+        &mut b.use_duplicate_detection,
+        s.bool("use-duplicate-detection"),
+    );
+    if let Some(user) = s.string("user") {
+        b.user = Some(user);
+    }
+    if let Some(n) = first(node, "routing-type") {
+        b.routing_type = node_enum(n)?;
+    }
+    set_value(&mut b.concurrency, s.i32("concurrency", Check::GtZero)?);
+    set_value(
+        &mut b.pending_ack_timeout,
+        s.i64("pending-ack-timeout", Check::GtZero)?,
+    );
+    b.client_id = s.string("client-id");
+    // The first password element, untrimmed.
+    if let Some(n) = first(node, "password") {
+        let text = text_content(n);
+        b.password = Some(
+            mask::resolve_mask(config.mask_password, &text, Some(&config.password_codec))
+                .map_err(|e| mask_error("password", &text, e))?,
+        );
+    }
+    set_value(&mut b.ha, s.bool("ha"));
+    let mut static_connectors = Vec::new();
+    for child in elements(node) {
+        match child.tag_name().name() {
+            "filter" => b.filter = child.attribute("string").map(str::to_owned),
+            "discovery-group-ref" => {
+                b.discovery_group = child.attribute("discovery-group-name").map(str::to_owned);
+            }
+            "static-connectors" => {
+                for r in elements(child).filter(|r| r.tag_name().name() == "connector-ref") {
+                    static_connectors.push(trimmed_text(r));
+                }
+            }
+            "transformer" => b.transformer = Some(transformer(child)),
+            _ => {}
+        }
+    }
+    if b.transformer.is_none()
+        && let Some(class_name) = transformer_class_name
+    {
+        b.transformer = Some(TransformerConfig {
+            class_name,
+            properties: Vec::new(),
+        });
+    }
+    if !static_connectors.is_empty() {
+        b.static_connectors = Some(static_connectors);
+        b.discovery_group = None;
+    }
+    Ok(b)
+}
+
+/// `getTransformerConfiguration`: `<class-name>` and the `<property>`
+/// children.
+fn transformer(t: Node<'_, '_>) -> TransformerConfig {
+    TransformerConfig {
+        class_name: first(t, "class-name").map(trimmed_text).unwrap_or_default(),
+        properties: all(t, "property")
+            .map(|p| {
+                (
+                    p.attribute("key").unwrap_or_default().to_owned(),
+                    p.attribute("value").unwrap_or_default().to_owned(),
+                )
+            })
+            .collect(),
+    }
 }
 
 /// `parseDivertConfiguration`.

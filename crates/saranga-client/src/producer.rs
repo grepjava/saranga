@@ -485,6 +485,7 @@ impl Producer {
             }
         }
         // sendInitialLargeMessageHeader: the credits are taken after the send.
+        let header = message.clone();
         let used = session.send_initial_chunk_on_large_message(message).await?;
         if let Some(credits) = credits {
             credits.acquire(session, used).await?;
@@ -493,6 +494,7 @@ impl Producer {
         for chunk in &mut chunks {
             let used = session
                 .send_large_message_chunk(
+                    &header,
                     message_body_size,
                     send_blocking,
                     false,
@@ -506,6 +508,7 @@ impl Producer {
         }
         let used = session
             .send_large_message_chunk(
+                &header,
                 message_body_size,
                 send_blocking,
                 true,

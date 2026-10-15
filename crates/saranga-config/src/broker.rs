@@ -347,6 +347,109 @@ pub struct DivertConfig {
     pub transformer: Option<TransformerConfig>,
 }
 
+/// `ComponentConfigurationRoutingType`, as bridges use it.
+pub type ComponentRoutingType = DivertRoutingType;
+
+/// `ActiveMQDefaultConfiguration.DEFAULT_CLUSTER_USER`, a bridge's user
+/// unless it names one.
+pub const DEFAULT_CLUSTER_USER: &str = "ACTIVEMQ.CLUSTER.ADMIN.USER";
+
+/// `DEFAULT_CLUSTER_PASSWORD`.
+pub const DEFAULT_CLUSTER_PASSWORD: &str = "CHANGE ME!!";
+
+/// One `<bridge>` (`BridgeConfiguration`), with the defaults a new
+/// `BridgeConfiguration` has.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BridgeConfig {
+    pub name: String,
+    /// The name it was deployed under; a bridge with `concurrency` above 1
+    /// is deployed as `<name>-0`, `<name>-1`, ... with this parent name.
+    pub parent_name: String,
+    /// `None` when `<queue-name>` is missing: the bridge is not deployed
+    /// (`AMQ222122`).
+    pub queue_name: Option<String>,
+    /// `None`: each message goes to its own address.
+    pub forwarding_address: Option<String>,
+    pub filter: Option<String>,
+    /// `None` when none was given (`null`), unlike an empty list.
+    pub static_connectors: Option<Vec<String>>,
+    pub discovery_group: Option<String>,
+    pub ha: bool,
+    pub transformer: Option<TransformerConfig>,
+    pub retry_interval: i64,
+    pub retry_interval_multiplier: f64,
+    pub initial_connect_attempts: i32,
+    pub reconnect_attempts: i32,
+    pub reconnect_attempts_on_same_node: i32,
+    pub use_duplicate_detection: bool,
+    pub confirmation_window_size: i32,
+    pub producer_window_size: i32,
+    pub client_failure_check_period: i64,
+    pub user: Option<String>,
+    /// Resolved: an `ENC(...)` value is decoded.
+    pub password: Option<String>,
+    pub connection_ttl: i64,
+    pub max_retry_interval: i64,
+    pub min_large_message_size: i32,
+    pub call_timeout: i64,
+    pub routing_type: ComponentRoutingType,
+    pub concurrency: i32,
+    pub pending_ack_timeout: i64,
+    /// Deployed from the configuration file (true) rather than by
+    /// management (false); only these follow a reload.
+    pub configuration_managed: bool,
+    pub client_id: Option<String>,
+}
+
+impl BridgeConfig {
+    /// `new BridgeConfiguration().setName(name)`.
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            parent_name: name.to_owned(),
+            queue_name: None,
+            forwarding_address: None,
+            filter: None,
+            static_connectors: None,
+            discovery_group: None,
+            ha: false,
+            transformer: None,
+            retry_interval: 2000,
+            retry_interval_multiplier: 1.0,
+            initial_connect_attempts: -1,
+            reconnect_attempts: -1,
+            reconnect_attempts_on_same_node: 10,
+            use_duplicate_detection: true,
+            confirmation_window_size: 10 * 1024 * 1024,
+            producer_window_size: 1024 * 1024,
+            client_failure_check_period: 30_000,
+            user: Some(DEFAULT_CLUSTER_USER.to_owned()),
+            password: Some(DEFAULT_CLUSTER_PASSWORD.to_owned()),
+            connection_ttl: 60_000,
+            max_retry_interval: 2000,
+            min_large_message_size: 100 * 1024,
+            call_timeout: 30_000,
+            routing_type: ComponentRoutingType::Pass,
+            concurrency: 1,
+            pending_ack_timeout: 60_000,
+            configuration_managed: true,
+            client_id: None,
+        }
+    }
+
+    /// `BridgeConfiguration.equals`, which leaves out
+    /// `reconnect-attempts-on-same-node` and the routing type: whether a
+    /// reload redeploys the bridge.
+    pub fn same_as(&self, other: &Self) -> bool {
+        let mut a = self.clone();
+        a.reconnect_attempts_on_same_node = other.reconnect_attempts_on_same_node;
+        a.routing_type = other.routing_type;
+        a.retry_interval_multiplier = other.retry_interval_multiplier;
+        a == *other
+            && self.retry_interval_multiplier.to_bits() == other.retry_interval_multiplier.to_bits()
+    }
+}
+
 /// `TransformerConfiguration`: a transformer by class name, with its
 /// properties. Saranga looks the name up among the transformers the
 /// embedding application registered.
@@ -680,6 +783,8 @@ pub struct BrokerConfig {
     pub address_settings: Vec<(String, AddressSettings)>,
     pub addresses: Vec<AddressConfig>,
     pub diverts: Vec<DivertConfig>,
+    /// `<bridges>`, in document order.
+    pub bridges: Vec<BridgeConfig>,
     /// `message-expiry-scan-period` in milliseconds; `-1` turns the expiry
     /// reaper off.
     pub message_expiry_scan_period: i64,
@@ -910,6 +1015,7 @@ impl Default for BrokerConfig {
             address_settings: Vec::new(),
             addresses: Vec::new(),
             diverts: Vec::new(),
+            bridges: Vec::new(),
             message_expiry_scan_period: Self::DEFAULT_MESSAGE_EXPIRY_SCAN_PERIOD,
             transaction_timeout: Self::DEFAULT_TRANSACTION_TIMEOUT,
             transaction_timeout_scan_period: Self::DEFAULT_TRANSACTION_TIMEOUT_SCAN_PERIOD,

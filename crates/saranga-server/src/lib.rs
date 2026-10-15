@@ -8,6 +8,7 @@
 
 pub mod acceptors;
 pub mod audit;
+pub mod bridge;
 pub mod cluster;
 pub mod config;
 pub mod core_protocol;
@@ -254,6 +255,10 @@ pub struct BrokerConfig {
     pub cluster: Option<cluster::ClusterConfig>,
     /// `<broadcast-groups>`, started once the broker is active.
     pub broadcast_groups: Vec<discovery::BroadcastGroupConfig>,
+    /// `<bridges>`, deployed once the broker is active.
+    pub bridges: Vec<saranga_config::BridgeConfig>,
+    /// The connectors and discovery groups bridges name.
+    pub bridge_targets: bridge::Targets,
     /// Plugins (`<broker-plugins>`, or the embedding application's own).
     pub plugins: Vec<Arc<dyn plugin::BrokerPlugin>>,
     /// `max-disk-usage` or `min-disk-free` with `disk-scan-period`: producers
@@ -293,6 +298,8 @@ impl BrokerConfig {
             ha: node::HaConfig::default(),
             cluster: None,
             broadcast_groups: Vec::new(),
+            bridges: Vec::new(),
+            bridge_targets: bridge::Targets::default(),
             plugins: Vec::new(),
             disk_monitor: None,
         }
@@ -450,6 +457,8 @@ pub struct Broker {
     cluster: Option<Arc<cluster::ClusterConnection>>,
     /// `ClusterManager.broadcastGroups`.
     broadcast_groups: Vec<Arc<discovery::BroadcastGroup>>,
+    /// `ClusterManager.bridges`.
+    bridges: bridge::Bridges,
     /// `replication` `primary`: a backup may register to replicate this
     /// broker's data.
     replication_policy: Option<saranga_config::Replication>,
@@ -720,6 +729,7 @@ impl Broker {
             .collect();
         let broker = Arc::new(Self {
             broadcast_groups,
+            bridges: bridge::Bridges::new(config.bridge_targets.clone()),
             node_id: node_id.clone(),
             post_office,
             connection_ttl_override: config.connection_ttl_override,
@@ -844,6 +854,10 @@ impl Broker {
                 );
             }
         }
+        for (record, b) in recovered.bridges {
+            broker.bridges.reload_record(record, b);
+        }
+        broker.deploy_bridges(&config.bridges);
         Ok(broker)
     }
 
@@ -965,6 +979,7 @@ impl Broker {
         for g in &self.broadcast_groups {
             g.stop();
         }
+        self.stop_bridges();
         self.stop_replicating();
         self.large_messages.stop();
         self.post_office.paging().stop();
@@ -1021,14 +1036,14 @@ impl Broker {
 
     /// `reloadConfigurationFile`: the configuration is read again and
     /// reloaded now.
-    pub async fn reload_configuration_file(&self) -> std::result::Result<(), String> {
+    pub async fn reload_configuration_file(self: &Arc<Self>) -> std::result::Result<(), String> {
         let loader = self
             .config_loader
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if let Some(load) = loader {
-            self.reload(load()?);
+            self.reload(load()?).await;
         }
         Ok(())
     }

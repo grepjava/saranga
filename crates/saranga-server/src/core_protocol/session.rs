@@ -34,6 +34,12 @@ use crate::session::{Completion, ServerSession, SessionOptions};
 use crate::transaction::{TxError, xa_code};
 use crate::{Broker, BrokerError, Result, RoutingType};
 
+/// An embedded message and its large message's file.
+type Embedded = (
+    Arc<dyn crate::message::NativeMessage>,
+    Option<Arc<crate::large::LargeBody>>,
+);
+
 /// What the connection hands a session task.
 pub(crate) enum SessionInput {
     /// A packet and its size on the wire, for confirmations.
@@ -340,7 +346,88 @@ impl CoreSession {
         message: CoreMessage,
         large: Option<Arc<crate::large::LargeBody>>,
     ) -> Result<Option<Packet>> {
-        self.session.send(message, large).await.map(|()| None)
+        // `EmbedMessageUtil.extractEmbedded`: another protocol's message a
+        // bridge carried.
+        match self.extract_embedded(&message, large.as_ref()) {
+            Some((native, None)) => self.session.send_native(native).await.map(|()| None),
+            Some((native, Some(body))) => self
+                .session
+                .send_native_large(native, body)
+                .await
+                .map(|()| None),
+            None => self.session.send(message, large).await.map(|()| None),
+        }
+    }
+
+    /// The message embedded in an `EMBEDDED_TYPE` message's body or a
+    /// `LARGE_EMBEDDED_TYPE` message's `_AMQP_EMBED_LARGE`, with the large
+    /// message's file; `None` for any other message, or one that does not
+    /// decode (it goes on as it is).
+    fn extract_embedded(
+        &self,
+        message: &CoreMessage,
+        large: Option<&Arc<crate::large::LargeBody>>,
+    ) -> Option<Embedded> {
+        use crate::bridge::{
+            AMQP_EMBED_LARGE, EMBED_SIGNATURE, EMBEDDED_TYPE, LARGE_EMBEDDED_TYPE,
+        };
+        use saranga_storage::message::PersistedMessage;
+        let decoders = self.broker.post_office().paging().decoders();
+        let decode = |bytes: &[u8], id: i64| -> Option<PersistedMessage> {
+            match <PersistedMessage as saranga_storage::RecordCodec>::decode(bytes) {
+                Ok(mut record) => {
+                    match &mut record {
+                        PersistedMessage::Core(m) => m.message_id = id,
+                        PersistedMessage::Amqp(m) => m.message_id = id,
+                        PersistedMessage::AmqpLarge(m) => m.message_id = id,
+                    }
+                    Some(record)
+                }
+                Err(e) => {
+                    tracing::warn!("{e}");
+                    None
+                }
+            }
+        };
+        match message.message_type {
+            EMBEDDED_TYPE => {
+                let Some(encoded) = message.body.strip_prefix(EMBED_SIGNATURE) else {
+                    tracing::trace!(
+                        "Message type {EMBEDDED_TYPE} was used for something other than embed messages, ignoring content and treating as a regular message"
+                    );
+                    return None;
+                };
+                // A new ID comes with the send.
+                let record = decode(encoded, 0)?;
+                match decoders.decode(&record) {
+                    Ok(m) => m.native().cloned().map(|n| (n, None)),
+                    Err(e) => {
+                        tracing::warn!("{e}");
+                        None
+                    }
+                }
+            }
+            LARGE_EMBEDDED_TYPE => {
+                let body = large?.clone();
+                let encoded = match message
+                    .properties
+                    .get(&saranga_buffer::SimpleString::from(AMQP_EMBED_LARGE))
+                {
+                    Some(saranga_buffer::PropertyValue::Bytes(b)) => b.clone(),
+                    _ => return None,
+                };
+                // The message is its file's.
+                let record = decode(&encoded, message.message_id)?;
+                match decoders.decode_large(&record, body.clone()) {
+                    Ok(m) => m.native().cloned().map(|n| (n, Some(body))),
+                    Err(e) => {
+                        tracing::warn!("{e}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
     }
 
     async fn acknowledge(

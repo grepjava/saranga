@@ -1,0 +1,99 @@
+=== artemis run (target, source)
+target: listening
+source: listening
+source: AMQ221027: Bridge br is connected
+=== Bridge.java send src 0..10 (source)
+sent 10
+=== Bridge.java receive dst 10 (target)
+received m0 seq=0 duplicate-id=null
+received m1 seq=1 duplicate-id=null
+received m2 seq=2 duplicate-id=null
+received m3 seq=3 duplicate-id=null
+received m4 seq=4 duplicate-id=null
+received m5 seq=5 duplicate-id=null
+received m6 seq=6 duplicate-id=null
+received m7 seq=7 duplicate-id=null
+received m8 seq=8 duplicate-id=null
+received m9 seq=9 duplicate-id=null
+no more
+=== Bridge.java send-amqp src 2 (source)
+sent 2 over AMQP
+=== Bridge.java receive-amqp dst 2 (target)
+received over AMQP a0 type=amqp-type color=red correlation=corr-0
+received over AMQP a1 type=amqp-type color=blue correlation=corr-1
+no more
+=== Bridge.java send-large src 300000 (source)
+sent a large message of 300000 bytes
+=== Bridge.java receive dst 1 (target)
+received bytes(300000, intact) duplicate-id=null
+no more
+=== artemis kill (target)
+target: down
+source: AMQ222095: Connection failed with failedOver=false
+=== Bridge.java send src 10..15 (source)
+sent 5
+=== artemis run (target)
+target: listening
+source: AMQ221027: Bridge br is connected
+=== Bridge.java receive dst 5 (target)
+received m10 seq=10 duplicate-id=null
+received m11 seq=11 duplicate-id=null
+received m12 seq=12 duplicate-id=null
+received m13 seq=13 duplicate-id=null
+received m14 seq=14 duplicate-id=null
+no more
+=== Bridge.java attributes br (source)
+name = br
+queueName = src
+forwardingAddress = dst
+filterString = null
+staticConnectors = [target]
+discoveryGroupName = null
+retryInterval = 500
+retryIntervalMultiplier = 1.0
+maxRetryInterval = 2000
+reconnectAttempts = -1
+useDuplicateDetection = true
+HA = false
+transformerClassName = null
+started = true
+connected = true
+messagesAcknowledged = 18
+messagesPendingAcknowledgement = 18
+=== Bridge.java create mb (source)
+createBridge done
+source: AMQ221027: Bridge mb is connected
+=== Bridge.java names (source)
+bridges [br, mb]
+=== Bridge.java send src2 20..22 (source)
+sent 2
+=== Bridge.java receive dst 2 (target)
+received m20 seq=20 duplicate-id=null
+received m21 seq=21 duplicate-id=null
+no more
+=== artemis stop (source)
+source: down
+source: AMQ221029: Stopped bridge br
+source: AMQ221029: Stopped bridge mb
+=== artemis run (source)
+source: listening
+source: AMQ221027: Bridge br is connected
+source: AMQ221027: Bridge mb is connected
+=== Bridge.java names (source)
+bridges [br, mb]
+=== Bridge.java destroy mb (source)
+destroyBridge done
+source: AMQ221029: Stopped bridge mb
+=== Bridge.java names (source)
+bridges [br]
+=== artemis stop (source)
+source: down
+source: AMQ221029: Stopped bridge br
+=== artemis run (source)
+source: listening
+source: AMQ221027: Bridge br is connected
+=== Bridge.java names (source)
+bridges [br]
+=== artemis stop (source, target)
+source: down
+target: down

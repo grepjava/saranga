@@ -217,6 +217,12 @@ impl BrokerPlugin for Logging {
         }
     }
 
+    fn after_deploy_bridge(&self, bridge: &crate::bridge::Bridge) {
+        if self.all || self.internal {
+            tracing::info!("AMQ841015: deployed bridge: {}", bridge.describe());
+        }
+    }
+
     fn after_destroy_queue(&self, queue: &Queue, check_consumers: bool, auto_delete_address: bool) {
         if self.all || self.internal {
             // The session that destroyed it is not known.

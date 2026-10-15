@@ -13,7 +13,8 @@
 //! element (`journalFileSize` for `<journal-file-size>`) and go through the
 //! same parsing; so do address settings. Saranga supports the collections
 //! `addressSettings`, `securityRoles`, `addressConfigurations`,
-//! `acceptorConfigurations`, `divertConfigurations` and `jaasConfigs`.
+//! `acceptorConfigurations`, `divertConfigurations`, `bridgeConfigurations`
+//! and `jaasConfigs`.
 //! Anything else is reported as a [`Warning`], as Artemis reports what it
 //! cannot apply in its status instead of failing.
 
@@ -440,6 +441,11 @@ fn apply_one(
             Ok(())
         }
         ["divertConfigurations", name, field] => divert_property(config, name, field, value),
+        ["bridgeConfigurations", name] if remove => {
+            config.bridges.retain(|b| b.name != *name);
+            Ok(())
+        }
+        ["bridgeConfigurations", name, field] => bridge_property(config, name, field, value),
         ["jaasConfigs", realm] if remove => {
             config.jaas_configs.retain(|(r, _)| r != realm);
             Ok(())
@@ -630,6 +636,56 @@ fn divert_property(
         "filterString" => d.filter = Some(v.to_owned()),
         "routingType" => d.routing_type = v.parse().map_err(err_text)?,
         other => return Err(format!("{other} is not a divert property")),
+    }
+    Ok(())
+}
+
+/// `bridgeConfigurations.<name>.<property>`: `BridgeConfiguration`'s bean
+/// properties.
+fn bridge_property(
+    config: &mut BrokerConfig,
+    name: &str,
+    field: &str,
+    v: &str,
+) -> std::result::Result<(), String> {
+    let i = match config.bridges.iter().position(|b| b.name == name) {
+        Some(i) => i,
+        None => {
+            config.bridges.push(crate::BridgeConfig::new(name));
+            config.bridges.len() - 1
+        }
+    };
+    let b = &mut config.bridges[i];
+    match field {
+        "parentName" => b.parent_name = v.to_owned(),
+        "queueName" => b.queue_name = Some(v.to_owned()),
+        "forwardingAddress" => b.forwarding_address = Some(v.to_owned()),
+        "filterString" => b.filter = Some(v.to_owned()),
+        "staticConnectors" => {
+            b.static_connectors = Some(v.split(',').map(|c| c.trim().to_owned()).collect())
+        }
+        "discoveryGroupName" => b.discovery_group = Some(v.to_owned()),
+        "HA" | "ha" => b.ha = parse_bool(v)?,
+        "retryInterval" => b.retry_interval = parse_num(v)?,
+        "retryIntervalMultiplier" => b.retry_interval_multiplier = parse_num(v)?,
+        "initialConnectAttempts" => b.initial_connect_attempts = parse_num(v)?,
+        "reconnectAttempts" => b.reconnect_attempts = parse_num(v)?,
+        "reconnectAttemptsOnSameNode" => b.reconnect_attempts_on_same_node = parse_num(v)?,
+        "useDuplicateDetection" => b.use_duplicate_detection = parse_bool(v)?,
+        "confirmationWindowSize" => b.confirmation_window_size = parse_num(v)?,
+        "producerWindowSize" => b.producer_window_size = parse_num(v)?,
+        "clientFailureCheckPeriod" => b.client_failure_check_period = parse_num(v)?,
+        "user" => b.user = Some(v.to_owned()),
+        "password" => b.password = Some(v.to_owned()),
+        "connectionTTL" => b.connection_ttl = parse_num(v)?,
+        "maxRetryInterval" => b.max_retry_interval = parse_num(v)?,
+        "minLargeMessageSize" => b.min_large_message_size = parse_num(v)?,
+        "callTimeout" => b.call_timeout = parse_num(v)?,
+        "routingType" => b.routing_type = v.parse().map_err(err_text)?,
+        "concurrency" => b.concurrency = parse_num(v)?,
+        "pendingAckTimeout" => b.pending_ack_timeout = parse_num(v)?,
+        "clientId" => b.client_id = Some(v.to_owned()),
+        other => return Err(format!("{other} is not a bridge property")),
     }
     Ok(())
 }

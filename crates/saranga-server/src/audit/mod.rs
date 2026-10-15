@@ -31,6 +31,7 @@ pub(crate) enum Control {
     Divert,
     Acceptor,
     BroadcastGroup,
+    Bridge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,7 +240,7 @@ fn concurrent_hash_map_order(keys: Vec<String>) -> Vec<String> {
 // Java's toString of the objects audit messages show
 
 /// A stand-in for `System.identityHashCode`, the same for the same key.
-fn identity(key: impl std::hash::Hash) -> u32 {
+pub(crate) fn identity(key: impl std::hash::Hash) -> u32 {
     use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
     let h = BuildHasherDefault::<DefaultHasher>::default().hash_one(key);
     (h as u32) & 0x7fff_ffff
@@ -334,6 +335,10 @@ fn source(broker: &Broker, control: Control, name: &str) -> String {
             "org.apache.activemq.artemis.core.server.cluster.impl.BroadcastGroupImpl@{:x}",
             identity(("broadcast-group", name))
         ),
+        Control::Bridge => broker
+            .bridges()
+            .get(name)
+            .map_or_else(|| "null".to_owned(), |b| b.describe()),
     }
 }
 

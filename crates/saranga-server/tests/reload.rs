@@ -76,7 +76,9 @@ async fn reload_reconciles() {
     let po = broker.post_office();
     assert_eq!(po.settings("orders").max_delivery_attempts, 5);
 
-    broker.reload(Reload::from_file_config(&xml(false, AFTER)).unwrap());
+    broker
+        .reload(Reload::from_file_config(&xml(false, AFTER)).unwrap())
+        .await;
 
     assert_eq!(
         po.settings("orders").max_delivery_attempts,
@@ -123,7 +125,9 @@ async fn reload_reconciles() {
 async fn queue_update_is_recovered() {
     let dir = tempfile::tempdir().unwrap();
     let broker = start(&xml(true, BEFORE), dir.path()).await;
-    broker.reload(Reload::from_file_config(&xml(true, AFTER)).unwrap());
+    broker
+        .reload(Reload::from_file_config(&xml(true, AFTER)).unwrap())
+        .await;
     broker.stop().unwrap();
     drop(broker);
 

@@ -53,6 +53,25 @@ pub struct SessionOptions {
     /// The `Deflater` level for compressed bodies: 0 to 9, or -1 for the
     /// default.
     pub compression_level: i32,
+    /// `confirmationWindowSize`: -1 (the default) for none. With one,
+    /// every send asks for a response, which the session's
+    /// [`SendAcknowledgementHandler`] is told of, and the session confirms
+    /// what it receives whenever this many bytes have arrived.
+    pub confirmation_window_size: i32,
+}
+
+/// `SendAcknowledgementHandler`: told when the broker has a message a
+/// session sent, with a confirmation window
+/// ([`SessionOptions::confirmation_window_size`]).
+pub trait SendAcknowledgementHandler: Send + Sync {
+    /// The broker received the message (its response arrived).
+    fn send_acknowledged(&self, message: &CoreMessage);
+
+    /// The broker answered the send with an exception, or the connection
+    /// failed before it answered. Ignored by default.
+    fn send_failed(&self, message: &CoreMessage, error: &Error) {
+        let _ = (message, error);
+    }
 }
 
 impl Default for SessionOptions {
@@ -74,6 +93,7 @@ impl Default for SessionOptions {
             min_large_message_size: defaults::MIN_LARGE_MESSAGE_SIZE,
             compress_large_messages: defaults::COMPRESS_LARGE_MESSAGES,
             compression_level: defaults::COMPRESSION_LEVEL,
+            confirmation_window_size: defaults::CONFIRMATION_WINDOW_SIZE,
         }
     }
 }
@@ -408,6 +428,8 @@ pub(crate) struct SessionInner {
     /// `ClientSessionImpl.producerIDs` (incrementAndGet, so from 1).
     next_producer_id: AtomicI32,
     pub(crate) credits: Mutex<CreditManager>,
+    /// `ActiveMQSessionContext.sendAckHandler`.
+    send_ack_handler: Mutex<Option<Arc<dyn SendAcknowledgementHandler>>>,
 }
 
 impl SessionInner {
@@ -433,6 +455,7 @@ impl SessionInner {
             next_consumer_id: AtomicI64::new(0),
             next_producer_id: AtomicI32::new(0),
             credits: Mutex::new(CreditManager::new(window)),
+            send_ack_handler: Mutex::new(None),
         })
     }
 
@@ -574,7 +597,16 @@ impl SessionInner {
         sender_id: i32,
     ) -> Result<()> {
         let ctx = self.conn().context();
-        // confirmationWindow is -1, so a response is required only when blocking.
+        // From the async response change on, a confirmation window makes
+        // every send ask for its response.
+        let cached = !ctx.is_version_before_async_response_change() && self.windowed();
+        let requires_response = send_blocking || cached;
+        let correlation_id = if cached {
+            let message = self.send_ack_handler().map(|h| (h, message.clone()));
+            self.async_send(message)
+        } else {
+            0
+        };
         let packet: Packet = if ctx.is_version_before_address_change() {
             let end_of_message_position = legacy_end_of_message_position(&message);
             SessionSendMessage1X {
@@ -592,25 +624,65 @@ impl SessionInner {
         } else if ctx.is_before_producer_metrics_changed() {
             saranga_core_protocol::packets::message::SessionSendMessageV2 {
                 message,
-                requires_response: send_blocking,
-                correlation_id: 0,
+                requires_response,
+                correlation_id,
             }
             .into()
         } else {
             saranga_core_protocol::packets::message::SessionSendMessageV3 {
                 message,
-                requires_response: send_blocking,
-                correlation_id: 0,
+                requires_response,
+                correlation_id,
                 sender_id,
             }
             .into()
         };
-        if send_blocking {
-            self.send_blocking(packet, types::NULL_RESPONSE).await?;
-            Ok(())
+        self.send_maybe_blocking(packet, send_blocking, correlation_id)
+            .await
+    }
+
+    /// Whether the session has a confirmation window.
+    fn windowed(&self) -> bool {
+        self.options.confirmation_window_size != -1
+    }
+
+    pub(crate) fn send_ack_handler(&self) -> Option<Arc<dyn SendAcknowledgementHandler>> {
+        self.send_ack_handler.lock().expect("session").clone()
+    }
+
+    /// Puts a send in the channel's async response cache, with its handler
+    /// and message when there is a handler. Returns its correlation ID.
+    fn async_send(
+        &self,
+        message: Option<(Arc<dyn SendAcknowledgementHandler>, CoreMessage)>,
+    ) -> i64 {
+        let (handler, message) = match message {
+            Some((h, m)) => (Some(h), Some(m)),
+            None => (None, None),
+        };
+        self.channel
+            .add_async_send(crate::channel::AsyncSend { message, handler })
+    }
+
+    /// `ChannelImpl.sendBlocking` or `send`; a send that was never written
+    /// leaves the async response cache.
+    async fn send_maybe_blocking(
+        &self,
+        packet: Packet,
+        blocking: bool,
+        correlation_id: i64,
+    ) -> Result<()> {
+        let result = if blocking {
+            self.send_blocking(packet, types::NULL_RESPONSE)
+                .await
+                .map(|_| ())
         } else {
             self.send_async(packet).await
+        };
+        if result.is_err() && correlation_id > 0 {
+            self.channel.remove_async_send(correlation_id);
         }
+        result
     }
 
     /// `ActiveMQSessionContext.sendInitialChunkOnLargeMessage`: the headers
@@ -627,10 +699,13 @@ impl SessionInner {
 
     /// `ActiveMQSessionContext.sendLargeMessageChunk`: a body chunk in the
     /// continuation packet for the negotiated version. Only the last chunk
-    /// of a blocking send waits for the broker. Returns the packet size
-    /// (`getPacketSize`), the credits the chunk takes.
+    /// of a blocking send waits for the broker; with a confirmation window
+    /// every chunk asks for a response, and the handler is told of
+    /// `message` (the headers) when the last one's arrives. Returns the
+    /// packet size (`getPacketSize`), the credits the chunk takes.
     pub(crate) async fn send_large_message_chunk(
         &self,
+        message: &CoreMessage,
         message_body_size: i64,
         send_blocking: bool,
         last_chunk: bool,
@@ -639,6 +714,16 @@ impl SessionInner {
     ) -> Result<i32> {
         let ctx = self.conn().context();
         let requires_response = last_chunk && send_blocking;
+        let cached = !ctx.is_version_before_async_response_change() && self.windowed();
+        let correlation_id = if cached {
+            let message = self
+                .send_ack_handler()
+                .filter(|_| last_chunk)
+                .map(|h| (h, message.clone()));
+            Some(self.async_send(message))
+        } else {
+            None
+        };
         // The frame header, the chunk with its length, `continues`, the body
         // size on the last chunk and `requiresResponse`
         // (`SessionSendContinuationMessage.expectedEncodeSize`).
@@ -646,7 +731,6 @@ impl SessionInner {
         if last_chunk {
             size += 8;
         }
-        // confirmationWindow is -1, so a response is required only when blocking.
         let packet: Packet = if ctx.is_version_before_async_response_change() {
             SessionSendContinuationMessage {
                 body: chunk,
@@ -661,8 +745,8 @@ impl SessionInner {
                 body: chunk,
                 continues: !last_chunk,
                 message_body_size,
-                requires_response,
-                correlation_id: Some(0),
+                requires_response: requires_response || cached,
+                correlation_id: Some(correlation_id.unwrap_or(0)),
             }
             .into()
         } else {
@@ -671,17 +755,14 @@ impl SessionInner {
                 body: chunk,
                 continues: !last_chunk,
                 message_body_size,
-                requires_response,
-                correlation_id: Some(0),
+                requires_response: requires_response || cached,
+                correlation_id: Some(correlation_id.unwrap_or(0)),
                 sender_id,
             }
             .into()
         };
-        if requires_response {
-            self.send_blocking(packet, types::NULL_RESPONSE).await?;
-        } else {
-            self.send_async(packet).await?;
-        }
+        self.send_maybe_blocking(packet, requires_response, correlation_id.unwrap_or(0))
+            .await?;
         Ok(size as i32)
     }
 
@@ -999,6 +1080,21 @@ impl Session {
 
     pub fn is_closed(&self) -> bool {
         self.inner.state().closed
+    }
+
+    /// `setSendAcknowledgementHandler`: told of each message sent from now
+    /// on once the broker has it. Only with a confirmation window.
+    pub fn set_send_acknowledgement_handler(
+        &self,
+        handler: Arc<dyn SendAcknowledgementHandler>,
+    ) -> Result<()> {
+        if !self.inner.windowed() {
+            return Err(Error::InvalidArgument(
+                "You can't set confirmationHandler on a connection with confirmation-window-size < 0. Look at the documentation for more information.".to_owned(),
+            ));
+        }
+        *self.inner.send_ack_handler.lock().expect("session") = Some(handler);
+        Ok(())
     }
 
     /// `SESS_START` (not blocking); starts message delivery.

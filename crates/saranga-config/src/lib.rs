@@ -36,10 +36,12 @@ pub use bootstrap::{
     BootstrapConfig, BootstrapSecurity, WebApp, WebBinding, WebConfig, file_uri_path,
 };
 pub use broker::{
-    AddressConfig, BroadcastGroupConfig, BrokerConfig, BrokerPluginConfig, ClusterConnectionConfig,
-    CriticalAnalyzerPolicy, DiscoveryGroupConfig, DivertConfig, DivertRoutingType, HaPolicy,
-    JaasModuleConfig, JournalConfig, JournalRetention, JournalType, LockManagerConfig,
-    MessageLoadBalancing, QueueConfig, Replication, TransformerConfig, UdpEndpointConfig, Warning,
+    AddressConfig, BridgeConfig, BroadcastGroupConfig, BrokerConfig, BrokerPluginConfig,
+    ClusterConnectionConfig, ComponentRoutingType, CriticalAnalyzerPolicy,
+    DEFAULT_CLUSTER_PASSWORD, DEFAULT_CLUSTER_USER, DiscoveryGroupConfig, DivertConfig,
+    DivertRoutingType, HaPolicy, JaasModuleConfig, JournalConfig, JournalRetention, JournalType,
+    LockManagerConfig, MessageLoadBalancing, QueueConfig, Replication, TransformerConfig,
+    UdpEndpointConfig, Warning,
 };
 pub use bytes::convert_text_bytes;
 pub use matcher::Match;

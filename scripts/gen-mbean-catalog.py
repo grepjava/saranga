@@ -32,6 +32,7 @@ CONTROLS = [
     ("DIVERT", "DivertControl"),
     ("ACCEPTOR", "AcceptorControl"),
     ("BROADCAST_GROUP", "BroadcastGroupControl"),
+    ("BRIDGE", "BridgeControl"),
 ]
 
 IMPACT = {"MBeanOperationInfo.INFO": 0, "MBeanOperationInfo.ACTION": 1,

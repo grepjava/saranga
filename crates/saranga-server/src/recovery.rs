@@ -174,6 +174,11 @@ pub fn load_bindings(
                 post_office.reload_divert_record(r.id, &d.name);
                 out.diverts.push(d);
             }
+            ids::BRIDGE_RECORD => {
+                let b = saranga_storage::codec::PersistedBridgeConfiguration::decode(&r.data)
+                    .map_err(|e| corrupt("bridge", e))?;
+                out.bridges.push((r.id, crate::bridge::from_record(&b)));
+            }
             ids::QUEUE_STATUS_RECORD => {
                 let s = saranga_storage::codec::QueueStatusEncoding::decode(&r.data)
                     .map_err(|e| corrupt("queue status", e))?;
@@ -248,6 +253,8 @@ pub fn load_bindings(
 pub struct RecoveredBindings {
     /// Diverts journaled by `storeDivertConfiguration`.
     pub diverts: Vec<crate::postoffice::DivertDeployment>,
+    /// Bridges journaled by `storeBridgeConfiguration`, with their records.
+    pub bridges: Vec<(i64, saranga_config::BridgeConfig)>,
     /// Security settings journaled by `storeSecuritySetting`, with their
     /// records.
     pub security_settings: Vec<(i64, saranga_storage::codec::PersistedSecuritySetting)>,

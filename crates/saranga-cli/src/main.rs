@@ -840,7 +840,7 @@ fn spawn_config_reloader(
                 saranga_server::reload::Reload::from_file_config(&c).map_err(anyhow::Error::from)
             });
             match reload {
-                Ok(reload) => current.get().reload(reload),
+                Ok(reload) => current.get().reload(reload).await,
                 Err(e) => tracing::warn!("configuration not reloaded: {e:#}"),
             }
         }

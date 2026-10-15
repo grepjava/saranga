@@ -1,6 +1,14 @@
-//! Channels and blocking calls. Ported from `ChannelImpl` (with a
-//! confirmation window of -1, the client default: no resend cache and no
-//! async response cache).
+//! Channels and blocking calls. Ported from `ChannelImpl`.
+//!
+//! With a confirmation window (`confirmationWindowSize` other than -1, the
+//! client default), a session's channel keeps the async response cache
+//! (`ResponseCache`): a send that wants a response takes the cache's next
+//! correlation ID (from 1), and its handler is told when the response
+//! arrives. The channel also confirms what it receives, with a
+//! `PACKETS_CONFIRMED` each time the packets add up to the window. There is
+//! no resend cache: after a failover a session is recreated, not
+//! reattached, and the sends still awaiting their response fail
+//! (`ResponseCache.errorAll`).
 //!
 //! A blocking call (`ChannelImpl.sendBlocking`) takes the next correlation ID
 //! from a per-channel counter that starts at -1 and decrements before use, so
@@ -10,14 +18,32 @@
 //! call when it is an `EXCEPTION`, or when its type is the expected one and
 //! its correlation ID equals the request's. Anything else is dropped.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
+use saranga_core_protocol::packets::connection::PacketsConfirmedMessage;
 use saranga_core_protocol::{Packet, types};
+use saranga_message::CoreMessage;
 use tokio::sync::oneshot;
 
 use crate::error::{Error, Result};
-use crate::session::SessionInner;
+use crate::session::{SendAcknowledgementHandler, SessionInner};
+
+/// A send in the async response cache, and the message its handler is
+/// told of (none for a large message's chunks before the last).
+pub(crate) struct AsyncSend {
+    pub(crate) message: Option<CoreMessage>,
+    pub(crate) handler: Option<Arc<dyn SendAcknowledgementHandler>>,
+}
+
+/// `ChannelImpl.confWindowSize`, `lastConfirmedCommandID` and
+/// `receivedBytes`.
+struct Confirmations {
+    window: i32,
+    last_confirmed: i32,
+    received_bytes: i64,
+}
 
 struct Pending {
     expected: i8,
@@ -36,6 +62,12 @@ pub(crate) struct Channel {
     session: Mutex<Option<Weak<SessionInner>>>,
     /// Or where they go, for a channel the application handles itself.
     raw: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Packet>>>,
+    /// The confirmation window, when there is one.
+    confirmations: Mutex<Option<Confirmations>>,
+    /// `ResponseCache`: the sends awaiting their response.
+    async_sends: Mutex<HashMap<i64, AsyncSend>>,
+    /// `ResponseCache.sequence`.
+    async_sequence: AtomicI64,
 }
 
 impl Channel {
@@ -48,6 +80,88 @@ impl Channel {
             closed: AtomicBool::new(false),
             session: Mutex::new(None),
             raw: Mutex::new(None),
+            confirmations: Mutex::new(None),
+            async_sends: Mutex::new(HashMap::new()),
+            async_sequence: AtomicI64::new(0),
+        }
+    }
+
+    /// Gives the channel a confirmation window (-1 for none), its count
+    /// starting again as for a new session (`clearCommands`).
+    pub(crate) fn set_confirmation_window(&self, window: i32) {
+        *self.confirmations.lock().expect("channel") = (window != -1).then_some(Confirmations {
+            window,
+            last_confirmed: -1,
+            received_bytes: 0,
+        });
+    }
+
+    /// `ResponseCache.nextCorrelationID` and `add`: the send is kept under
+    /// its new correlation ID until its response arrives.
+    pub(crate) fn add_async_send(&self, send: AsyncSend) -> i64 {
+        let id = self.async_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        self.async_sends.lock().expect("channel").insert(id, send);
+        id
+    }
+
+    /// `ResponseCache.remove`: the send was never written.
+    pub(crate) fn remove_async_send(&self, correlation_id: i64) {
+        self.async_sends
+            .lock()
+            .expect("channel")
+            .remove(&correlation_id);
+    }
+
+    /// `ChannelImpl.confirm`: one more packet received. Returns the
+    /// `PACKETS_CONFIRMED` to send when the window is full.
+    pub(crate) fn confirm(&self, packet_size: usize) -> Option<Packet> {
+        let mut c = self.confirmations.lock().expect("channel");
+        let c = c.as_mut()?;
+        c.last_confirmed += 1;
+        c.received_bytes += packet_size as i64;
+        if c.received_bytes < i64::from(c.window) {
+            return None;
+        }
+        c.received_bytes = 0;
+        Some(
+            PacketsConfirmedMessage {
+                command_id: c.last_confirmed,
+            }
+            .into(),
+        )
+    }
+
+    /// `ResponseCache.handleResponse`: the response of an async send tells
+    /// its handler that the send was acknowledged, or that it failed.
+    fn handle_async_response(&self, packet: &Packet) {
+        let correlation_id = match packet {
+            Packet::NullResponseMessageV2(p) => p.correlation_id,
+            Packet::ActiveMQExceptionMessageV2(p) => p.correlation_id,
+            _ => None,
+        };
+        let Some(id) = correlation_id else {
+            return;
+        };
+        let Some(send) = self.async_sends.lock().expect("channel").remove(&id) else {
+            return;
+        };
+        let result = match packet {
+            Packet::ActiveMQExceptionMessageV2(_) => Err(exception_to_error(packet)),
+            _ => Ok(()),
+        };
+        call_send_ack(send, result);
+    }
+
+    /// `ResponseCache.errorAll`: no response will come.
+    fn error_all(&self, cause: &Error) {
+        let sends: Vec<AsyncSend> = {
+            let mut all = self.async_sends.lock().expect("channel");
+            let mut ids: Vec<i64> = all.keys().copied().collect();
+            ids.sort_unstable();
+            ids.into_iter().filter_map(|id| all.remove(&id)).collect()
+        };
+        for send in sends {
+            call_send_ack(send, Err(cause.clone()));
         }
     }
 
@@ -110,6 +224,7 @@ impl Channel {
 
     /// `ChannelImpl.handlePacket` for a response packet.
     pub(crate) fn handle_response(&self, packet: Packet) {
+        self.handle_async_response(&packet);
         let mut pending = self.pending.lock().expect("channel");
         let Some(p) = pending.as_ref() else {
             return;
@@ -133,8 +248,19 @@ impl Channel {
     /// `ChannelImpl.returnBlocking`: the call in progress fails with
     /// `UNBLOCKED`, as its response will never come.
     pub(crate) fn return_blocking(&self, cause: &Error) {
+        self.error_all(cause);
         if let Some(p) = self.pending.lock().expect("channel").take() {
             let _ = p.tx.send(Err(Error::unblocking_a_call(cause)));
+        }
+    }
+}
+
+/// `ActiveMQSessionContext.responseHandler`'s `callSendAck`.
+fn call_send_ack(send: AsyncSend, result: Result<()>) {
+    if let (Some(handler), Some(message)) = (send.handler, send.message) {
+        match result {
+            Ok(()) => handler.send_acknowledged(&message),
+            Err(e) => handler.send_failed(&message, &e),
         }
     }
 }

@@ -194,10 +194,17 @@ pub(super) async fn attribute(
         | "OutgoingInterceptorClassNames"
         | "InterceptorClassNames"
         | "BrokerPluginClassNames"
-        | "BridgeNames"
         | "ClusterConnectionNames"
         | "ConnectorServices"
         | "Connectors" => Json::Array(Vec::new()),
+        "BridgeNames" => Json::Array(
+            broker
+                .bridges()
+                .names()
+                .into_iter()
+                .map(Json::from)
+                .collect(),
+        ),
         "ConnectorsAsJSON" => Json::from("[]"),
         "Acceptors" | "AcceptorsAsJSON" => {
             let acceptors: Vec<Json> = file
@@ -420,6 +427,66 @@ fn json_text(v: &Json) -> String {
         Json::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+/// The `createBridge` overloads with parameters: the transformer's
+/// properties when given, and its parameters from `at` on (the retry
+/// interval), with or without the producer window size.
+fn create_bridge(
+    broker: &Arc<Broker>,
+    a: &Args,
+    properties: Option<Vec<(String, String)>>,
+    at: usize,
+    producer_window: bool,
+) -> Outcome {
+    let mut c = saranga_config::BridgeConfig::new(&a.s_or_empty(0));
+    c.queue_name = a.s(1);
+    c.forwarding_address = a.s(2);
+    c.filter = a.s(3);
+    c.transformer =
+        a.s(4)
+            .filter(|t| !t.is_empty())
+            .map(|class_name| saranga_config::TransformerConfig {
+                class_name,
+                properties: properties.unwrap_or_default(),
+            });
+    c.retry_interval = a.l(at);
+    c.retry_interval_multiplier = a.d(at + 1);
+    c.initial_connect_attempts = a.i(at + 2);
+    c.reconnect_attempts = a.i(at + 3);
+    c.use_duplicate_detection = a.b(at + 4);
+    c.confirmation_window_size = a.i(at + 5);
+    let mut i = at + 6;
+    if producer_window {
+        c.producer_window_size = a.i(i);
+        i += 1;
+    }
+    c.client_failure_check_period = a.l(i);
+    let target = a.s(i + 1);
+    if a.b(i + 2) {
+        c.discovery_group = target;
+    } else {
+        // ListUtil.toList.
+        c.static_connectors = Some(
+            target
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| t.split(',').map(|n| n.trim().to_owned()).collect())
+                .unwrap_or_default(),
+        );
+    }
+    c.ha = a.b(i + 3);
+    c.user = a.s(i + 4);
+    c.password = a.s(i + 5);
+    c.configuration_managed = false;
+    deploy_bridge(broker, &c)
+}
+
+/// `ActiveMQServerImpl.deployBridge`.
+fn deploy_bridge(broker: &Arc<Broker>, c: &saranga_config::BridgeConfig) -> Outcome {
+    broker
+        .deploy_bridge_persisted(c)
+        .map(|_| Json::Null)
+        .map_err(|e| e.message)
 }
 
 /// `DivertConfiguration.fromJSON`.
@@ -951,6 +1018,64 @@ pub(super) async fn invoke(
                 .map(|c| (c, a.string_map(4).unwrap_or_default().into_iter().collect())),
         };
         return Some(update_divert(broker, d));
+    }
+    // Bridges.
+    if let Some(a) = call.is(
+        "createBridge",
+        &[S, S, S, S, S, L, D, I, I, B, I, I, L, S, B, B, S, S],
+    ) {
+        return Some(create_bridge(broker, &a, None, 5, true));
+    }
+    if let Some(a) = call.is(
+        "createBridge",
+        &[S, S, S, S, S, M, L, D, I, I, B, I, I, L, S, B, B, S, S],
+    ) {
+        let props = a.string_map(5).unwrap_or_default();
+        return Some(create_bridge(broker, &a, Some(props), 6, true));
+    }
+    if let Some(a) = call.is(
+        "createBridge",
+        &[S, S, S, S, S, S, L, D, I, I, B, I, I, L, S, B, B, S, S],
+    ) {
+        // JsonUtil.readJsonProperties.
+        let props = match a.s(5).map(|t| Json::parse(&t)) {
+            Some(Ok(Json::Object(members))) => members
+                .into_iter()
+                .map(|(k, v)| {
+                    let v = match v {
+                        Json::String(s) => s,
+                        other => other.to_string(),
+                    };
+                    (k, v)
+                })
+                .collect(),
+            Some(Err(e)) => return Some(Err(e)),
+            _ => Vec::new(),
+        };
+        return Some(create_bridge(broker, &a, Some(props), 6, true));
+    }
+    if let Some(a) = call.is(
+        "createBridge",
+        &[S, S, S, S, S, L, D, I, I, B, I, L, S, B, B, S, S],
+    ) {
+        return Some(create_bridge(broker, &a, None, 5, false));
+    }
+    if let Some(a) = call.is("createBridge", &[S]) {
+        let text = a.s_or_empty(0);
+        return Some(match crate::bridge::from_json(&text) {
+            Ok(Some(mut c)) => {
+                c.configuration_managed = false;
+                deploy_bridge(broker, &c)
+            }
+            Ok(None) => Err(format!(
+                "AMQ229229: Failed to parse JSON queue configuration: {text}"
+            )),
+            Err(e) => Err(e),
+        });
+    }
+    if let Some(a) = call.is("destroyBridge", &[S]) {
+        broker.destroy_bridge(&a.s_or_empty(0)).await;
+        return Some(Ok(Json::Null));
     }
     if let Some(a) = call.is("destroyDivert", &[S]) {
         let name = a.s_or_empty(0);

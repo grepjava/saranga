@@ -21,6 +21,9 @@ pub struct Reload {
     pub security_settings: cfg::HierarchicalRepository<cfg::SecuritySetting>,
     pub addresses: Vec<AddressDeployment>,
     pub diverts: Vec<DivertDeployment>,
+    pub bridges: Vec<cfg::BridgeConfig>,
+    /// The connectors (and discovery groups) bridges may name.
+    pub bridge_targets: crate::bridge::Targets,
     /// What the broker properties read reported (`setStatus`).
     pub status: saranga_buffer::json::Json,
 }
@@ -38,6 +41,8 @@ impl Reload {
                 .map(crate::config::deployment)
                 .collect(),
             diverts: config.diverts.iter().map(crate::config::divert).collect(),
+            bridges: config.bridges.clone(),
+            bridge_targets: crate::bridge::Targets::from_file(config),
             status: config.status.clone(),
         })
     }
@@ -49,7 +54,7 @@ fn reloading(what: &str) {
 
 impl Broker {
     /// `deployReloadableConfigFromConfiguration`.
-    pub fn reload(&self, reload: Reload) {
+    pub async fn reload(self: &std::sync::Arc<Self>, reload: Reload) {
         saranga_buffer::status::update(
             saranga_buffer::status::CONFIGURATION_COMPONENT,
             reload.status,
@@ -68,6 +73,9 @@ impl Broker {
         reloading("addresses");
         undeploy_not_configured(&self.post_office, &reload.addresses);
         deploy_addresses(&self.post_office, &reload.addresses);
+
+        self.bridges.set_targets(reload.bridge_targets);
+        self.reload_bridges(&reload.bridges).await;
 
         tracing::info!("AMQ221087: Configuration reload completed");
     }

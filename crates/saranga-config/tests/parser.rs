@@ -507,3 +507,114 @@ fn broadcast_group_defaults_and_jgroups() {
     );
     assert!(matches!(e, ConfigError::InvalidValue { ref name, .. } if name == "broadcast-period"));
 }
+
+#[test]
+fn bridges() {
+    let c = parse(
+        r#"<bridges>
+             <bridge name="b1">
+               <queue-name>sausage-factory</queue-name>
+               <forwarding-address>mincing-machine</forwarding-address>
+               <filter string="name='aardvark'"/>
+               <transformer>
+                 <class-name>org.example.Transformer</class-name>
+                 <property key="k" value="v"/>
+               </transformer>
+               <retry-interval>1000</retry-interval>
+               <retry-interval-multiplier>2.5</retry-interval-multiplier>
+               <max-retry-interval>9000</max-retry-interval>
+               <initial-connect-attempts>3</initial-connect-attempts>
+               <reconnect-attempts>-1</reconnect-attempts>
+               <reconnect-attempts-same-node>4</reconnect-attempts-same-node>
+               <use-duplicate-detection>false</use-duplicate-detection>
+               <confirmation-window-size>1MB</confirmation-window-size>
+               <producer-window-size>-1</producer-window-size>
+               <check-period>5000</check-period>
+               <connection-ttl>7000</connection-ttl>
+               <min-large-message-size>50KB</min-large-message-size>
+               <routing-type>ANYCAST</routing-type>
+               <concurrency>2</concurrency>
+               <pending-ack-timeout>1234</pending-ack-timeout>
+               <client-id>cid</client-id>
+               <ha>true</ha>
+               <user>bridge-user</user>
+               <password>secret</password>
+               <static-connectors>
+                 <connector-ref>remote1</connector-ref>
+                 <connector-ref>remote2</connector-ref>
+               </static-connectors>
+             </bridge>
+             <bridge name="b2">
+               <queue-name>q</queue-name>
+               <transformer-class-name>org.example.Other</transformer-class-name>
+               <discovery-group-ref discovery-group-name="dg"/>
+             </bridge>
+           </bridges>"#,
+    );
+    let b = &c.bridges[0];
+    assert_eq!(b.name, "b1");
+    assert_eq!(b.parent_name, "b1");
+    assert_eq!(b.queue_name.as_deref(), Some("sausage-factory"));
+    assert_eq!(b.forwarding_address.as_deref(), Some("mincing-machine"));
+    assert_eq!(b.filter.as_deref(), Some("name='aardvark'"));
+    let t = b.transformer.as_ref().unwrap();
+    assert_eq!(t.class_name, "org.example.Transformer");
+    assert_eq!(t.properties, [("k".to_owned(), "v".to_owned())]);
+    assert_eq!(b.retry_interval, 1000);
+    assert_eq!(b.retry_interval_multiplier, 2.5);
+    assert_eq!(b.max_retry_interval, 9000);
+    assert_eq!(b.initial_connect_attempts, 3);
+    assert_eq!(b.reconnect_attempts, -1);
+    assert_eq!(b.reconnect_attempts_on_same_node, 4);
+    assert!(!b.use_duplicate_detection);
+    assert_eq!(b.confirmation_window_size, 1024 * 1024);
+    assert_eq!(b.producer_window_size, -1);
+    assert_eq!(b.client_failure_check_period, 5000);
+    assert_eq!(b.connection_ttl, 7000);
+    assert_eq!(b.min_large_message_size, 50 * 1024);
+    assert_eq!(
+        b.routing_type,
+        saranga_config::ComponentRoutingType::Anycast
+    );
+    assert_eq!(b.concurrency, 2);
+    assert_eq!(b.pending_ack_timeout, 1234);
+    assert_eq!(b.client_id.as_deref(), Some("cid"));
+    assert!(b.ha);
+    assert_eq!(b.user.as_deref(), Some("bridge-user"));
+    assert_eq!(b.password.as_deref(), Some("secret"));
+    assert_eq!(
+        b.static_connectors.as_deref(),
+        Some(&["remote1".to_owned(), "remote2".to_owned()][..])
+    );
+    assert!(b.configuration_managed);
+
+    let b = &c.bridges[1];
+    assert_eq!(b.discovery_group.as_deref(), Some("dg"));
+    assert_eq!(b.static_connectors, None);
+    assert_eq!(
+        b.transformer.as_ref().map(|t| t.class_name.as_str()),
+        Some("org.example.Other")
+    );
+    // BridgeConfiguration's defaults.
+    assert_eq!(b.forwarding_address, None);
+    assert_eq!(b.retry_interval, 2000);
+    assert_eq!(b.confirmation_window_size, 10 * 1024 * 1024);
+    assert_eq!(b.producer_window_size, 1024 * 1024);
+    assert_eq!(b.reconnect_attempts_on_same_node, 10);
+    assert!(b.use_duplicate_detection);
+    assert_eq!(b.user.as_deref(), Some("ACTIVEMQ.CLUSTER.ADMIN.USER"));
+    assert_eq!(b.password.as_deref(), Some("CHANGE ME!!"));
+    assert_eq!(b.routing_type, saranga_config::ComponentRoutingType::Pass);
+    assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+
+    // A queue-name given empty is refused; one left out is not (the bridge
+    // is not deployed).
+    let e = parse_err(r#"<bridges><bridge name="b"><queue-name> </queue-name></bridge></bridges>"#);
+    assert!(matches!(e, ConfigError::InvalidValue { ref name, .. } if name == "queue-name"));
+    let c = parse(r#"<bridges><bridge name="b"/></bridges>"#);
+    assert_eq!(c.bridges[0].queue_name, None);
+    let e = parse_err(
+        r#"<bridges><bridge name="b"><queue-name>q</queue-name><concurrency>0</concurrency></bridge></bridges>"#,
+    );
+    assert!(matches!(e, ConfigError::InvalidValue { ref name, .. } if name == "concurrency"));
+}

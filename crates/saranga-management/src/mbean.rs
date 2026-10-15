@@ -327,6 +327,7 @@ pub enum Bean {
     /// An acceptor: its name and URI parameters.
     Acceptor(String, Vec<(String, String)>),
     BroadcastGroup(String),
+    Bridge(String),
 }
 
 impl Bean {
@@ -338,6 +339,7 @@ impl Bean {
             Self::Divert(_) => &crate::catalog::DIVERT,
             Self::Acceptor(..) => &crate::catalog::ACCEPTOR,
             Self::BroadcastGroup(_) => &crate::catalog::BROADCAST_GROUP,
+            Self::Bridge(_) => &crate::catalog::BRIDGE,
         }
     }
 
@@ -350,6 +352,7 @@ impl Bean {
             Self::Divert(d) => format!("divert.{d}"),
             Self::Acceptor(a, _) => format!("acceptor.{a}"),
             Self::BroadcastGroup(g) => format!("broadcastgroup.{g}"),
+            Self::Bridge(b) => format!("bridge.{b}"),
         }
     }
 
@@ -370,6 +373,7 @@ impl Bean {
             Self::BroadcastGroup(_) => {
                 "org.apache.activemq.artemis.core.management.impl.BroadcastGroupControlImpl"
             }
+            Self::Bridge(_) => "org.apache.activemq.artemis.core.management.impl.BridgeControlImpl",
         }
     }
 }
@@ -400,6 +404,11 @@ pub fn registered(
             quote(g)
         )) {
             out.push((n, Bean::BroadcastGroup(g.clone())));
+        }
+    }
+    for b in broker.bridges().names() {
+        if let Some(n) = name(format!("{base},component=bridges,name={}", quote(&b))) {
+            out.push((n, Bean::Bridge(b)));
         }
     }
     let po = broker.post_office();

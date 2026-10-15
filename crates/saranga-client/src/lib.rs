@@ -21,9 +21,13 @@
 //! recreated on the new connection with their consumers, as
 //! `ClientSessionImpl.handleFailover` does.
 //!
-//! Not supported: XA, a confirmation window (resend cache, so sessions are
-//! recreated rather than reattached), and message handlers (use
-//! [`Consumer::receive`]).
+//! A session with a confirmation window
+//! ([`SessionOptions::confirmation_window_size`]) tells its
+//! [`SendAcknowledgementHandler`] of each send the broker answers.
+//!
+//! Not supported: XA, a resend cache (sessions are recreated rather than
+//! reattached after a failover, failing the sends still unanswered), and
+//! message handlers (use [`Consumer::receive`]).
 //!
 //! ```no_run
 //! # async fn demo() -> saranga_client::Result<()> {
@@ -67,5 +71,6 @@ pub use producer::Producer;
 pub use saranga_buffer::{PropertyValue, SimpleString};
 pub use saranga_message::{CoreMessage, message_type};
 pub use session::{
-    AddressQuery, QueueConfiguration, QueueQuery, RoutingType, Session, SessionOptions,
+    AddressQuery, QueueConfiguration, QueueQuery, RoutingType, SendAcknowledgementHandler, Session,
+    SessionOptions,
 };

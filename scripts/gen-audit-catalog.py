@@ -32,6 +32,7 @@ CONTROLS = {
     "AcceptorControlImpl.java": "Acceptor",
     "BaseBroadcastGroupControlImpl.java": "BroadcastGroup",
     "BroadcastGroupControlImpl.java": "BroadcastGroup",
+    "BridgeControlImpl.java": "Bridge",
 }
 
 
