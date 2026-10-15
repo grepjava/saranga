@@ -86,14 +86,15 @@ instance() {
   return "${PIPESTATUS[0]}"
 }
 
-# "artemis run --allow-kill" in the background.
+# "artemis run --allow-kill" in the background, a line added to the
+# instance's "exited" file when the process ends.
 launch() {
   local dir="$1"
   mkdir -p "$dir/log"
   if windows; then
-    (cd "$dir/bin" && cmd /c "$(cygpath -w "$dir/bin/artemis.cmd")" run --allow-kill >> "$dir/run.out" 2>&1 &)
+    (cd "$dir/bin" && { cmd /c "$(cygpath -w "$dir/bin/artemis.cmd")" run --allow-kill >> "$dir/run.out" 2>&1; echo >> "$dir/exited"; } &)
   else
-    (cd "$dir/bin" && ./artemis run --allow-kill >> "$dir/run.out" 2>&1 &)
+    (cd "$dir/bin" && { ./artemis run --allow-kill >> "$dir/run.out" 2>&1; echo >> "$dir/exited"; } &)
   fi
 }
 up() { (echo > "/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
@@ -103,6 +104,19 @@ wait_up() {
 }
 wait_down() {
   for _ in $(seq 1 300); do up "$1" || return 0; sleep 0.2; done
+  return 1
+}
+# Waits for the n-th "artemis run" of an instance to end (default the
+# first). A stop is waited for so rather than by its AMQ221002: Artemis's
+# Run stops the broker from a daemon timer thread, so once the broker's last
+# non-daemon threads end the JVM exits by itself, and its shutdown hooks
+# (log4j's among them) can race the rest of the stop, losing that line.
+wait_exit() {
+  local dir="$1" n="${2:-1}"
+  for _ in $(seq 1 600); do
+    [[ "$(grep -c "" "$dir/exited" 2>/dev/null)" -ge "$n" ]] && return 0
+    sleep 0.2
+  done
   return 1
 }
 # Waits for the n-th line matching text (default the first).
@@ -213,9 +227,7 @@ suite() {
 
   step "artemis stop (backup)"
   instance "$B" stop > /dev/null
-  # Not shown: an Artemis backup stopped here does not always log AMQ221002
-  # (also with an Artemis primary).
-  wait_for "$B/log/artemis.log" AMQ221002 2
+  wait_exit "$B"
   step "artemis stop (primary)"
   instance "$P" stop > /dev/null
   wait_down "$PORTP" && echo "primary: down"
