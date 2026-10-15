@@ -1746,6 +1746,7 @@ dependencies = [
  "saranga-buffer",
  "saranga-config",
  "saranga-core-protocol",
+ "saranga-fault",
  "saranga-ha",
  "saranga-message",
  "saranga-server",
@@ -1787,6 +1788,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "saranga-fault"
+version = "0.0.1"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "saranga-filter"
 version = "0.0.1"
 dependencies = [
@@ -1814,6 +1822,7 @@ version = "0.0.1"
 dependencies = [
  "flate2",
  "saranga-buffer",
+ "saranga-fault",
  "tar",
  "tempfile",
  "thiserror",
@@ -1958,6 +1967,7 @@ dependencies = [
  "saranga-client",
  "saranga-config",
  "saranga-core-protocol",
+ "saranga-fault",
  "saranga-filter",
  "saranga-ha",
  "saranga-journal",

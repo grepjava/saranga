@@ -45,6 +45,8 @@ pub struct LargeMessageStore {
     live: AtomicBool,
     /// With journal retention, bodies are also recorded in the journal.
     history: std::sync::OnceLock<History>,
+    /// Told of a body file that cannot be written.
+    critical: std::sync::OnceLock<std::sync::Weak<crate::storage::Storage>>,
     /// The backup durable bodies are replicated to. Writes hold it shared;
     /// the start of a synchronization holds it alone, so that each body is
     /// either copied or replicated.
@@ -99,6 +101,7 @@ impl LargeMessageStore {
             sync,
             live: AtomicBool::new(true),
             history: std::sync::OnceLock::new(),
+            critical: std::sync::OnceLock::new(),
             replication: RwLock::default(),
             deferred: Mutex::default(),
         })
@@ -119,9 +122,22 @@ impl LargeMessageStore {
             sync: false,
             live: AtomicBool::new(true),
             history: std::sync::OnceLock::new(),
+            critical: std::sync::OnceLock::new(),
             replication: RwLock::default(),
             deferred: Mutex::default(),
         })
+    }
+
+    /// The storage told of a body file that cannot be written
+    /// (`onIOError`).
+    pub fn set_critical(&self, storage: &Arc<crate::storage::Storage>) {
+        let _ = self.critical.set(Arc::downgrade(storage));
+    }
+
+    fn critical_io(&self, e: &io::Error, path: &std::path::Path) {
+        if let Some(s) = self.critical.get().and_then(std::sync::Weak::upgrade) {
+            s.critical_io(e, Some(path));
+        }
     }
 
     fn path(&self, id: i64, durable: bool) -> Option<PathBuf> {
@@ -291,11 +307,15 @@ impl LargeMessageStore {
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                let file = OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&path)?;
+                let file = saranga_fault::check(saranga_fault::Op::Open, &path)
+                    .and_then(|()| {
+                        OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .truncate(true)
+                            .open(&path)
+                    })
+                    .inspect_err(|e| self.critical_io(e, &path))?;
                 Some((file, path))
             }
             None => None,
@@ -359,7 +379,16 @@ impl LargeWriter {
         }
         let replication = self.store.replication();
         match &mut self.file {
-            Some((f, _)) => f.write_all(bytes)?,
+            Some((f, path)) => {
+                let written = match saranga_fault::write(path, bytes.len()) {
+                    Err((n, e)) => f.write_all(&bytes[..n]).and(Err(e)),
+                    Ok(()) => f.write_all(bytes),
+                };
+                if let Err(e) = written {
+                    self.store.critical_io(&e, path);
+                    return Err(e);
+                }
+            }
             None => self.memory.extend_from_slice(bytes),
         }
         if self.replicated
@@ -384,7 +413,9 @@ impl LargeWriter {
         let backing = match self.file.take() {
             Some((f, path)) => {
                 if self.store.sync {
-                    f.sync_all()?;
+                    saranga_fault::check(saranga_fault::Op::Sync, &path)
+                        .and_then(|()| f.sync_all())
+                        .inspect_err(|e| self.store.critical_io(e, &path))?;
                 }
                 if self.replicated
                     && let Some(r) = self.store.replication().replicator()

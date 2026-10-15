@@ -45,7 +45,11 @@ cleanup() {
     [[ -d "$i" ]] && instance "$i" stop > /dev/null 2>&1
   done
   sleep 3
-  rm -rf "$WORK"
+  if [[ -n "${KEEP:-}" ]]; then
+    echo "kept $WORK" >&2
+  else
+    rm -rf "$WORK"
+  fi
 }
 trap cleanup EXIT
 

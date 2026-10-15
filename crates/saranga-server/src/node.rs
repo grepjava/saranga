@@ -55,6 +55,17 @@ fn write_at(f: &File, data: &[u8], offset: u64) -> io::Result<()> {
     }
 }
 
+/// Writes `data` at `offset` of `server.lock` and syncs it.
+fn write_synced(f: &File, path: &Path, data: &[u8], offset: u64) -> io::Result<()> {
+    if let Err((n, e)) = saranga_fault::write(path, data.len()) {
+        write_at(f, &data[..n], offset)?;
+        return Err(e);
+    }
+    write_at(f, data, offset)?;
+    saranga_fault::check(saranga_fault::Op::Sync, path)?;
+    f.sync_all()
+}
+
 fn read_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     #[cfg(unix)]
     {
@@ -114,9 +125,12 @@ fn set_node_id(slot: &Mutex<String>, id: String) {
 pub fn write_node_id(dir: &Path, node_id: &str) -> io::Result<()> {
     let id = node_id_bytes(node_id)?;
     let n = NodeManager::open(dir, None)?;
-    let f = n.channels[STATE_LOCK_POS].file();
-    write_at(f, &id, 3)?;
-    f.sync_all()
+    write_synced(
+        n.channels[STATE_LOCK_POS].file(),
+        &n.server_lock_path,
+        &id,
+        3,
+    )
 }
 
 /// `new UUID(TYPE_TIME_BASED, UUID.stringToBytes(nodeID))`, as
@@ -248,15 +262,18 @@ impl NodeManager {
         let created = !server_lock_path.exists();
         let server_lock = LockFile::open(&server_lock_path)?;
         if created {
-            write_at(server_lock.file(), &[FIRST_TIME_START; 3], 0)?;
-            server_lock.file().sync_all()?;
+            write_synced(
+                server_lock.file(),
+                &server_lock_path,
+                &[FIRST_TIME_START; 3],
+                0,
+            )?;
         }
         let mut id = [0u8; 16];
         if read_at(server_lock.file(), &mut id, 3)? != 16 {
             // `UUIDGenerator.generateUUID`: time-based, as Artemis makes it.
             id = saranga_client::uuid::time_based();
-            write_at(server_lock.file(), &id, 3)?;
-            server_lock.file().sync_all()?;
+            write_synced(server_lock.file(), &server_lock_path, &id, 3)?;
         }
         let channels = [
             server_lock,
@@ -377,8 +394,7 @@ impl NodeManager {
         {
             let _lock = self.lock(STATE_LOCK_POS)?;
             let f = self.channels[STATE_LOCK_POS].file();
-            write_at(f, &[state], 0)?;
-            f.sync_all()?;
+            write_synced(f, &self.server_lock_path, &[state], 0)?;
         }
         *self.last_modified.lock().unwrap_or_else(|e| e.into_inner()) =
             std::fs::metadata(&self.server_lock_path)

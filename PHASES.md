@@ -15,7 +15,7 @@ Saranga is built in twelve phases. Each one ends with something runnable, and it
 | 8 | Management and operations | Done |
 | 9 | High availability | Done |
 | 10 | Clustering and federation | Done |
-| 11 | Hardening and 1.0 | Not started |
+| 11 | Hardening and 1.0 | In progress |
 
 Phase 3 is the first release anyone could adopt. Every phase after it can ship as a minor release.
 
@@ -501,6 +501,25 @@ The differences from Artemis are listed in COMPAT.md.
 - Documentation, a migration guide, container images and the release.
 
 **Exit check:** Saranga 1.0 ships.
+
+**Stages**, each committed on its own:
+1. **Storage faults.** A fault-injecting layer under every file the broker writes (the journal, paging, large messages, the server lock and the node ID), switched on only in tests. A failed write or fsync is a critical I/O error, as `IOCriticalErrorListener` makes it in Artemis: AMQ222010, the broker stops, and clients get an error in place of a response. A full disk blocks producers as `max-disk-usage` says. Tests: in-process failures at each write and sync, and a soak on a small real file system. None of them may lose a message a client was told is stored, and the broker must restart cleanly.
+2. **Network chaos.** A TCP fault proxy (`tools/saranga-chaos`) that delays, drops, cuts and black-holes connections on a schedule. Soak scripts run HA pairs, clusters, bridges, federation and mirroring through it for a set time, with Java and Saranga nodes, and check that nothing is lost and nothing is duplicated beyond what each feature allows.
+3. **Linearizability on HA.** Jepsen-style histories: clients record each send, receive and acknowledgement with its outcome while the chaos proxy partitions the pair and kills nodes. A checker then compares each history with the queue model. Acknowledged sends are received, and nothing is received twice unless the client was told the outcome was unknown. Replication and shared-store pairs both run, with Saranga and Java on each side.
+4. **Fuzzing.** cargo-fuzz targets for every codec: buffers and `TypedProperties`, `CoreMessage`, Core packets, journal records and files, page files, AMQP, MQTT, STOMP, OpenWire, WebSocket frames, filters and `broker.xml`. Each target is seeded from the golden corpus. Every crash found is fixed and kept as a regression test, and CI runs each target for a short time.
+5. **Benchmarks.** `scripts/bench.sh` runs Artemis and Saranga on the same machine and the same scenarios: Core and AMQP, persistent and not, small and large messages, and many queues. It measures throughput, p99 latency, memory and startup time, and its results are written to `docs/benchmarks.md`.
+6. **Documentation.** The user guide (installing, configuring, the CLI, protocols, security, HA, clustering, management and operations) and a migration guide from Artemis (data directories, `broker.xml`, clients, what differs), checked against COMPAT.md.
+7. **Container images and the release.** A container image laid out as Artemis's, binaries for Linux, Windows and macOS, a release workflow, the version set to 1.0.0, and a changelog.
+8. **Exit check:** every stage's tests and the full interop matrix pass, and Saranga 1.0.0 is tagged and released.
+
+**Progress**
+- Stage 1 (storage faults) is done.
+  - **Fault injection** ([crates/saranga-fault](crates/saranga-fault)): every file operation of the journals (data files, the compaction control file), page files, large message files and `server.lock` asks the crate first. A test arms a fault for the files under its own directory: an open, write, sync, rename or removal fails with `EIO` or `ENOSPC`, after so many successes, so many times, and a write can be torn after part of its bytes. Without the `inject` feature, which only tests turn on, the checks compile to nothing.
+  - **Critical I/O errors**, as Artemis's `IOCriticalErrorListener` handles them. The journal's first I/O error, in its flusher or in its own file handling, latches: no write is accepted after it, and it is reported once (AMQ144011, or AMQ144010 without a file). Page and large message files report theirs the same way. The broker logs AMQ222010 and stops as `stopTheServer(true)` stops it. The client waiting on the write gets an `IO_ERROR` exception, the stop goes on whatever the failing disk refuses, and `saranga run` exits with status 1 (COMPAT.md).
+  - **Tests.** [crates/saranga-journal/tests/faults.rs](crates/saranga-journal/tests/faults.rs) fails a sync, fills the disk, tears a write and fails a new file: the journal reports once, refuses later writes, and reloads with every record whose append was answered, without the torn one. [crates/saranga-client/tests/storage_faults.rs](crates/saranga-client/tests/storage_faults.rs) puts a client in front of an in-process broker and fails the journal (sync, full disk, torn write, a file it cannot make), a page write and sync, a large message write, a transaction's commit and an acknowledgement commit. In each case the client gets an error rather than waiting, the broker asks to stop, and a broker started on the same data has every message whose send or commit was answered, once and in order, and a failed transaction all or nothing. A `server.lock` that cannot be written stops the start, and every stopped broker must be freed with its storage.
+  - **The full-disk soak** ([scripts/disk-soak.sh](scripts/disk-soak.sh), [disk_soak.rs](crates/saranga-client/tests/disk_soak.rs), in CI): producers of small, paged and large messages fill a 64 MiB tmpfs, cycle after cycle. In odd cycles `max-disk-usage` holds them back, and in even cycles the disk runs out: `ENOSPC`, a critical stop, and a restart that keeps every answered send. After each cycle no file is left open and the space is back.
+  - **Fixed along the way.** The soak found that a stopped broker was never freed. Each queue's actor held its queue, its paging store and the storage, so a broker stopped in-process (as the network check and failback stop one) kept its queues, its pages and the bindings journal open. The actors now end with the broker, leaving their messages as stored. The lock monitor holds the node manager weakly, so `server.lock` closes with the broker rather than at its next check, and both journals are closed even when the first fails to stop.
+  - **Known flake.** In the failback suite with a Saranga primary and an Artemis backup, the Java backup now and then ignores `artemis stop` after failing back: its `etc/STOP_ME` is never taken, so `backup: stopped` is missing. HEAD before this stage does the same (1 run in 8), so it is not a Stage 1 regression; `KEEP=1` on the suite keeps its work directory to look into it.
 
 ---
 

@@ -330,7 +330,10 @@ enum Cmd {
     /// A management operation, run by the actor
     /// ([`control`](self::control)).
     Manage(Box<dyn FnOnce(&mut Actor) + Send>),
+    /// The queue is deleted: its messages go with it.
     Shutdown,
+    /// The broker stops: the actor ends, its messages left as stored.
+    Stop,
 }
 
 /// Why a reference left its queue (`AckReason`), for the queue's
@@ -1001,6 +1004,12 @@ impl Queue {
     pub fn shutdown(&self) {
         self.0.deleted.store(true, Ordering::SeqCst);
         self.send(Cmd::Shutdown);
+    }
+
+    /// Ends the actor as the broker stops, deleting nothing: its messages
+    /// stay in the journal and the pages for the next start.
+    pub fn stop(&self) {
+        self.send(Cmd::Stop);
     }
 }
 
@@ -1965,6 +1974,7 @@ impl Actor {
                 self.delete_all_references();
                 return false;
             }
+            Cmd::Stop => return false,
         }
         true
     }

@@ -10,6 +10,7 @@ saranga-buffer = { path = "../saranga-buffer" }
 saranga-client = { path = "../saranga-client" }
 saranga-config = { path = "../saranga-config" }
 saranga-core-protocol = { path = "../saranga-core-protocol" }
+saranga-fault = { path = "../saranga-fault" }
 saranga-filter = { path = "../saranga-filter" }
 saranga-ha = { path = "../saranga-ha" }
 saranga-journal = { path = "../saranga-journal" }
@@ -32,4 +33,5 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 
 [dev-dependencies]
 tempfile = "3"
+saranga-fault = { path = "../saranga-fault", features = ["inject"] }
 tokio = { version = "1", features = ["test-util"] }

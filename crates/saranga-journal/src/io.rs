@@ -9,10 +9,13 @@
 //! are batched into the next round, which is the group commit `TimedBuffer`
 //! provides without its timer.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+
+use saranga_fault::Op;
 
 use crate::JournalError;
 
@@ -20,6 +23,61 @@ use crate::JournalError;
 /// asked for it), with the I/O error otherwise. Completions run on the
 /// flusher thread and must not block on the journal.
 pub type Completion = Box<dyn FnOnce(Result<(), JournalError>) + Send>;
+
+/// `IOCriticalErrorListener`: told of the journal's first I/O error, with
+/// the file it happened on when there is one. After it the journal accepts
+/// no more writes.
+pub type CriticalListener = Arc<dyn Fn(&JournalError, Option<&Path>) + Send + Sync>;
+
+/// An open journal file and its path.
+#[derive(Debug)]
+pub(crate) struct DataFile {
+    pub(crate) file: File,
+    pub(crate) path: PathBuf,
+}
+
+/// Opens `path` to read and write, creating (and truncating) it with
+/// `create`.
+pub(crate) fn open(path: &Path, create: bool) -> io::Result<File> {
+    saranga_fault::check(Op::Open, path)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(create)
+        .open(path)
+}
+
+/// [`write_all_at`] on the file at `path`.
+pub(crate) fn write_at(file: &File, path: &Path, buf: &[u8], offset: u64) -> io::Result<()> {
+    if let Err((n, e)) = saranga_fault::write(path, buf.len()) {
+        write_all_at(file, &buf[..n], offset)?;
+        return Err(e);
+    }
+    write_all_at(file, buf, offset)
+}
+
+/// `fdatasync` on the file at `path`.
+pub(crate) fn sync_data(file: &File, path: &Path) -> io::Result<()> {
+    saranga_fault::check(Op::Sync, path)?;
+    file.sync_data()
+}
+
+/// `fsync` on the file at `path`.
+pub(crate) fn sync_all(file: &File, path: &Path) -> io::Result<()> {
+    saranga_fault::check(Op::Sync, path)?;
+    file.sync_all()
+}
+
+pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
+    saranga_fault::check(Op::Rename, from)?;
+    std::fs::rename(from, to)
+}
+
+pub(crate) fn remove_file(path: &Path) -> io::Result<()> {
+    saranga_fault::check(Op::Remove, path)?;
+    std::fs::remove_file(path)
+}
 
 pub(crate) fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
     #[cfg(unix)]
@@ -75,7 +133,7 @@ pub(crate) fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) ->
 
 /// Bytes for one file, contiguous from `offset`.
 struct Batch {
-    file: Arc<File>,
+    file: Arc<DataFile>,
     offset: u64,
     bytes: Vec<u8>,
 }
@@ -102,6 +160,39 @@ struct Shared {
     /// `epoch`; 0 while it waits for work. The critical analyzer reads it.
     busy_since: std::sync::atomic::AtomicU64,
     epoch: std::time::Instant,
+    critical: Mutex<Option<CriticalListener>>,
+}
+
+impl Shared {
+    /// Latches `e` as the journal's failure and, the first time, tells the
+    /// critical listener (`onIOError`).
+    fn fail(&self, e: &JournalError, file: Option<&Path>) {
+        let first = {
+            let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let first = p.failed.is_none();
+            p.failed.get_or_insert_with(|| e.clone());
+            first
+        };
+        self.done.notify_all();
+        if !first {
+            return;
+        }
+        match file {
+            Some(f) => tracing::warn!(
+                "AMQ144011: Critical IO Exception happened: {e} on {}",
+                f.display()
+            ),
+            None => tracing::warn!("AMQ144010: Critical IO Exception happened: {e}"),
+        }
+        let listener = self
+            .critical
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(l) = listener {
+            l(e, file);
+        }
+    }
 }
 
 /// The write queue and its flusher thread.
@@ -119,6 +210,7 @@ impl Writer {
             datasync,
             busy_since: std::sync::atomic::AtomicU64::new(0),
             epoch: std::time::Instant::now(),
+            critical: Mutex::new(None),
         });
         let s = shared.clone();
         let thread = std::thread::Builder::new()
@@ -142,7 +234,7 @@ impl Writer {
     /// the flusher hit: after that the journal accepts no more writes.
     pub fn write(
         &self,
-        file: &Arc<File>,
+        file: &Arc<DataFile>,
         offset: u64,
         bytes: &[u8],
         sync: bool,
@@ -204,6 +296,24 @@ impl Writer {
         self.lock().failed.clone()
     }
 
+    pub fn set_critical_listener(&self, listener: Option<CriticalListener>) {
+        *self
+            .shared
+            .critical
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = listener;
+    }
+
+    /// An error of the journal's own I/O outside the flusher (a file
+    /// created, opened, renamed or removed): an I/O error fails the journal
+    /// as the flusher's do. Other errors pass through.
+    pub fn critical(&self, e: JournalError, file: Option<&Path>) -> JournalError {
+        if matches!(e, JournalError::Io(_)) {
+            self.shared.fail(&e, file);
+        }
+        e
+    }
+
     /// How long the write (and sync) in progress has taken, and when it
     /// started; `None` while the flusher is idle.
     pub fn busy(&self) -> Option<(std::time::Duration, u64)> {
@@ -254,11 +364,11 @@ fn flusher(s: Arc<Shared>) {
         let result = write_batches(&batches, sync && s.datasync);
         s.busy_since.store(0, std::sync::atomic::Ordering::Release);
         drop(batches);
+        if let Err((e, path)) = &result {
+            s.fail(e, Some(path));
+        }
         let mut p = s.pending.lock().unwrap_or_else(|e| e.into_inner());
         p.completed = upto;
-        if let Err(e) = &result {
-            p.failed.get_or_insert_with(|| e.clone());
-        }
         let outcome = match &p.failed {
             Some(e) => Err(e.clone()),
             None => Ok(()),
@@ -271,17 +381,20 @@ fn flusher(s: Arc<Shared>) {
     }
 }
 
-fn write_batches(batches: &[Batch], sync: bool) -> Result<(), JournalError> {
-    let mut touched: Vec<&Arc<File>> = Vec::new();
+fn write_batches(batches: &[Batch], sync: bool) -> Result<(), (JournalError, PathBuf)> {
+    fn failed(f: &DataFile) -> impl FnOnce(io::Error) -> (JournalError, PathBuf) + '_ {
+        move |e| (JournalError::io(e), f.path.clone())
+    }
+    let mut touched: Vec<&Arc<DataFile>> = Vec::new();
     for b in batches {
-        write_all_at(&b.file, &b.bytes, b.offset).map_err(JournalError::io)?;
+        write_at(&b.file.file, &b.file.path, &b.bytes, b.offset).map_err(failed(&b.file))?;
         if !touched.iter().any(|f| Arc::ptr_eq(f, &b.file)) {
             touched.push(&b.file);
         }
     }
     if sync {
         for f in touched {
-            f.sync_data().map_err(JournalError::io)?;
+            sync_data(&f.file, &f.path).map_err(failed(f))?;
         }
     }
     Ok(())

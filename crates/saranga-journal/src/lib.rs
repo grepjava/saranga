@@ -18,7 +18,7 @@ pub use retention::{history_file_millis, local_date_millis};
 
 use std::sync::Arc;
 
-pub use io::Completion;
+pub use io::{Completion, CriticalListener};
 pub use journal::{
     Journal, JournalConfig, JournalFileInfo, LoadInfo, LoadResult, LoaderCallback,
     PreparedTransactionInfo, RecordInfo, Replicator, Retention,

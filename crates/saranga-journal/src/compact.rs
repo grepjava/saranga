@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::control::{ControlFile, FILE_COMPACT_CONTROL};
 use crate::format::{self, FileHeader, Record};
-use crate::io::{Writer, write_all_at};
+use crate::io::{self as fio, Writer};
 use crate::journal::{Books, Inner};
 use crate::{JournalError, Result};
 
@@ -364,12 +364,10 @@ impl Compactor<'_> {
             return Ok(());
         };
         self.buf.resize(self.inner.cfg.file_size, 0);
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(self.inner.file_path(cur))
-            .map_err(JournalError::io)?;
-        write_all_at(&f, &self.buf, 0).map_err(JournalError::io)?;
-        f.sync_all().map_err(JournalError::io)?;
+        let path = self.inner.file_path(cur);
+        let f = fio::open(&path, false).map_err(JournalError::io)?;
+        fio::write_at(&f, &path, &self.buf, 0).map_err(JournalError::io)?;
+        fio::sync_all(&f, &path).map_err(JournalError::io)?;
         self.new_data_files.push(cur);
         Ok(())
     }

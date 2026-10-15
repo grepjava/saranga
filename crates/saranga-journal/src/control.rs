@@ -99,11 +99,10 @@ impl ControlFile {
 
     /// Writes the control file into `dir`, synced.
     pub fn write(&self, dir: &Path) -> Result<()> {
-        use std::io::Write;
         let path = dir.join(FILE_COMPACT_CONTROL);
-        let mut f = std::fs::File::create(&path).map_err(JournalError::io)?;
-        f.write_all(&self.encode_file()).map_err(JournalError::io)?;
-        f.sync_all().map_err(JournalError::io)
+        let f = crate::io::open(&path, true).map_err(JournalError::io)?;
+        crate::io::write_at(&f, &path, &self.encode_file(), 0).map_err(JournalError::io)?;
+        crate::io::sync_all(&f, &path).map_err(JournalError::io)
     }
 }
 

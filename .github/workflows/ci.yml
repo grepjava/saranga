@@ -60,6 +60,16 @@ jobs:
       - name: Saranga primary, Java backup
         run: PRIMARY=saranga BACKUP=artemis tests/interop/ha/no-loss.sh
 
+  # Phase 11: producers fill a 64 MiB tmpfs, held back by max-disk-usage
+  # and run out of space, with nothing acknowledged lost.
+  disk-soak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/disk-soak.sh 120
+
   deny:
     runs-on: ubuntu-latest
     steps:

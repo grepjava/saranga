@@ -30,7 +30,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak, mpsc};
 
@@ -50,7 +50,7 @@ use crate::{BrokerError, Name};
 pub const REF_MEMORY_ESTIMATE: i64 = 72;
 
 /// A page file to sync, and who waits for it.
-type SyncRequest = (Arc<File>, Completion);
+type SyncRequest = (Arc<File>, PathBuf, Completion);
 
 /// `PageCache` size: decoded pages kept for the cursors.
 const PAGE_CACHE: usize = 5;
@@ -427,7 +427,7 @@ impl PagingManager {
 
     /// Syncs a page file, batched with the other requests waiting
     /// (`PageTimedWriter`), and waits for the backup, when there is one.
-    fn sync_file(&self, file: Arc<File>) -> Pending {
+    fn sync_file(&self, file: Arc<File>, path: PathBuf) -> Pending {
         let (c, p) = Pending::new();
         let c = match self.replicator() {
             Some(r) => r.join_barrier(c),
@@ -436,6 +436,7 @@ impl PagingManager {
         let mut syncer = lock(&self.syncer);
         let tx = syncer.get_or_insert_with(|| {
             let (tx, rx) = mpsc::channel::<SyncRequest>();
+            let storage = self.storage.as_ref().map(Arc::downgrade);
             std::thread::Builder::new()
                 .name("saranga-page-sync".into())
                 .spawn(move || {
@@ -443,12 +444,18 @@ impl PagingManager {
                         let mut batch = vec![first];
                         batch.extend(rx.try_iter());
                         let mut synced: Vec<(*const File, Result<(), String>)> = Vec::new();
-                        for (file, done) in batch {
+                        for (file, path, done) in batch {
                             let key = Arc::as_ptr(&file);
                             let result = match synced.iter().find(|(k, _)| *k == key) {
                                 Some((_, r)) => r.clone(),
                                 None => {
-                                    let r = file.sync_data().map_err(|e| e.to_string());
+                                    let r = sync_page(&file, &path);
+                                    if let Err(e) = &r
+                                        && let Some(s) = storage.as_ref().and_then(|s| s.upgrade())
+                                    {
+                                        s.critical_io(e, Some(&path));
+                                    }
+                                    let r = r.map_err(|e| e.to_string());
                                     synced.push((key, r.clone()));
                                     r
                                 }
@@ -462,10 +469,17 @@ impl PagingManager {
                 .expect("spawning the page sync thread");
             tx
         });
-        if tx.send((file, c)).is_err() {
+        if tx.send((file, path, c)).is_err() {
             *syncer = None;
         }
         p
+    }
+
+    /// `onIOError`: a page file could not be written.
+    fn critical_io(&self, e: &io::Error, path: &Path) {
+        if let Some(s) = &self.storage {
+            s.critical_io(e, Some(path));
+        }
     }
 
     /// Loads the paging records of the message journal into the stores'
@@ -987,11 +1001,19 @@ impl PagingStore {
         let folder = self.folder(st)?;
         let id = st.current_page_id + 1;
         let path = folder.join(saranga_paging::page_file_name(id));
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)?;
+        let file = saranga_fault::check(saranga_fault::Op::Open, &path)
+            .and_then(|()| {
+                OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)
+            })
+            .inspect_err(|e| {
+                if let Some(m) = self.manager.upgrade() {
+                    m.critical_io(e, &path);
+                }
+            })?;
         if st.replicated
             && let Some(old) = &st.current
             && let Some(r) = self.manager.upgrade().and_then(|m| m.replicator())
@@ -1357,7 +1379,10 @@ impl PagingStore {
         }
         let replicated = st.replicated;
         let current = st.current.as_mut().expect("a current page");
-        (&*current.file).write_all(&record).map_err(io)?;
+        if let Err(e) = write_page(&current.file, &current.path, &record) {
+            manager.critical_io(&e, &current.path);
+            return Err(io(e));
+        }
         let replicator = manager.replicator().filter(|_| replicated);
         if let Some(r) = &replicator {
             replicate_page_write(r, &self.address, current.id, &record);
@@ -1372,6 +1397,7 @@ impl PagingStore {
             message: Some(message.clone()),
         }));
         let file = current.file.clone();
+        let file_path = current.path.clone();
         if let Some(body) = message.large() {
             // The page holds it now: its file goes with the page.
             body.set_keep(true);
@@ -1397,7 +1423,7 @@ impl PagingStore {
                         .as_ref()
                         .is_some_and(|s| s.sync_non_transactional());
                 if sync {
-                    Some(manager.sync_file(file))
+                    Some(manager.sync_file(file, file_path))
                 } else {
                     replicator
                         .filter(|_| message.is_durable())
@@ -1439,9 +1465,16 @@ impl PagingStore {
     /// Syncs the current page (`ioSync`), before a transaction that paged
     /// commits.
     pub fn sync(&self) -> io::Result<()> {
-        let file = lock(&self.state).current.as_ref().map(|c| c.file.clone());
-        match file {
-            Some(f) => f.sync_data(),
+        let current = lock(&self.state)
+            .current
+            .as_ref()
+            .map(|c| (c.file.clone(), c.path.clone()));
+        match current {
+            Some((f, path)) => sync_page(&f, &path).inspect_err(|e| {
+                if let Some(m) = self.manager.upgrade() {
+                    m.critical_io(e, &path);
+                }
+            }),
             None => Ok(()),
         }
     }
@@ -2723,4 +2756,21 @@ fn replicate_page_write(
         },
         None,
     );
+}
+
+/// Appends a record to a page file.
+fn write_page(file: &File, path: &Path, record: &[u8]) -> io::Result<()> {
+    if let Err((n, e)) = saranga_fault::write(path, record.len()) {
+        let mut f = file;
+        f.write_all(&record[..n])?;
+        return Err(e);
+    }
+    let mut f = file;
+    f.write_all(record)
+}
+
+/// `fdatasync` on a page file.
+fn sync_page(file: &File, path: &Path) -> io::Result<()> {
+    saranga_fault::check(saranga_fault::Op::Sync, path)?;
+    file.sync_data()
 }

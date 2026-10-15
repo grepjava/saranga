@@ -366,6 +366,9 @@ fn spawn_address_queue_reaper(post_office: &Arc<PostOffice>, period_ms: i64) {
 /// row, the broker stops as for a critical IO error.
 fn spawn_lock_monitor(broker: &Arc<Broker>, n: Arc<node::NodeManager>, ha: &node::HaConfig) {
     let weak = Arc::downgrade(broker);
+    // Held weakly: the lock files close with the broker, not at the next
+    // check.
+    let n = Arc::downgrade(&n);
     let (period, max_retries) = (ha.lock_monitor_period, ha.lock_monitor_max_retries);
     tokio::spawn(async move {
         let mut failures = 0u32;
@@ -375,7 +378,8 @@ fn spawn_lock_monitor(broker: &Arc<Broker>, n: Arc<node::NodeManager>, ha: &node
             if broker.is_stopped() {
                 break;
             }
-            let check = n.clone();
+            let Some(check) = n.upgrade() else { break };
+            drop(broker);
             let lost = tokio::task::spawn_blocking(move || check.primary_lock_lost())
                 .await
                 .unwrap_or(true);
@@ -396,6 +400,7 @@ fn spawn_lock_monitor(broker: &Arc<Broker>, n: Arc<node::NodeManager>, ha: &node
                 );
                 continue;
             }
+            let Some(broker) = weak.upgrade() else { break };
             tracing::warn!(
                 "Lost the lock according to the monitor after {failures} failed check(s), notifying listeners"
             );
@@ -471,6 +476,8 @@ pub struct Broker {
     failover_on_shutdown: bool,
     /// The lock monitor found the primary lock lost.
     lock_lost: std::sync::atomic::AtomicBool,
+    /// A store hit an I/O error (`DefaultCriticalErrorListener.failedAlready`).
+    critical_io: std::sync::atomic::AtomicBool,
     /// The default cluster connection, started with the broker.
     cluster: Option<Arc<cluster::ClusterConnection>>,
     /// `ClusterManager.broadcastGroups`.
@@ -773,6 +780,7 @@ impl Broker {
             node_manager: node_manager.clone(),
             failover_on_shutdown: config.ha.failover_on_shutdown(),
             lock_lost: std::sync::atomic::AtomicBool::new(false),
+            critical_io: std::sync::atomic::AtomicBool::new(false),
             replication_policy: match &config.ha.policy {
                 saranga_config::HaPolicy::ReplicationPrimary(r) => Some(r.clone()),
                 _ => None,
@@ -806,6 +814,19 @@ impl Broker {
             ack_manager: std::sync::OnceLock::new(),
             ack_manager_settings: config.mirror_ack_manager,
         });
+        if let Some(s) = &broker.storage {
+            let weak = Arc::downgrade(&broker);
+            s.set_critical_listener(Arc::new(move |e, file| {
+                let message = match e {
+                    saranga_journal::JournalError::Io(e) => e.to_string(),
+                    e => e.to_string(),
+                };
+                if let Some(b) = weak.upgrade() {
+                    b.critical_io_error(&message, file);
+                }
+            }));
+            broker.large_messages.set_critical(s);
+        }
         for p in broker.post_office.plugins().all() {
             p.registered(&broker);
         }
@@ -1012,6 +1033,28 @@ impl Broker {
         self.stopped.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// `DefaultCriticalErrorListener.onIOException`: the first I/O error
+    /// writing the journals, a page file or a large message file stops the
+    /// broker (`stopTheServer(true)`); later ones are ignored.
+    pub fn critical_io_error(&self, message: &str, file: Option<&std::path::Path>) {
+        if self
+            .critical_io
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let file = file.map_or_else(|| "NULL".to_owned(), |f| f.display().to_string());
+        tracing::error!(
+            "AMQ222010: Critical IO Error, shutting down the server. file={file}, message={message}"
+        );
+        self.request_shutdown();
+    }
+
+    /// Whether a store hit an I/O error ([`Broker::critical_io_error`]).
+    pub fn is_critical_io_failed(&self) -> bool {
+        self.critical_io.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Asks whoever runs the broker to stop it (the critical analyzer's
     /// `SHUTDOWN` policy).
     pub fn request_shutdown(&self) {
@@ -1064,9 +1107,22 @@ impl Broker {
         self.stop_replicating();
         self.large_messages.stop();
         self.post_office.paging().stop();
+        // After a critical I/O error the stores fail whatever they are
+        // asked to write: the stop goes on regardless.
+        let critical = self.is_critical_io_failed();
         if let Some(s) = &self.storage {
-            s.stop()
-                .map_err(|e| BrokerError::internal(format!("stopping the journals: {e}")))?;
+            match s.stop() {
+                Err(e) if !critical => {
+                    return Err(BrokerError::internal(format!("stopping the journals: {e}")));
+                }
+                _ => {}
+            }
+        }
+        // Each queue's actor holds its queue, its pages and the storage:
+        // they end with the broker. What they drop is in the journals, and
+        // large message files are no longer deleted.
+        for q in self.post_office.queues() {
+            q.stop();
         }
         // The activation's close: the lock let go for a backup to take
         // over, or the broker marked paused.
@@ -1078,9 +1134,10 @@ impl Broker {
                 || self.failing_back.load(std::sync::atomic::Ordering::Acquire)
             {
                 n.crash_primary();
-            } else {
-                n.pause_primary()
-                    .map_err(|e| BrokerError::internal(format!("server.lock: {e}")))?;
+            } else if let Err(e) = n.pause_primary()
+                && !critical
+            {
+                return Err(BrokerError::internal(format!("server.lock: {e}")));
             }
         }
         Ok(())

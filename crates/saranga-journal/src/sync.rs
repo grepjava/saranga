@@ -148,7 +148,7 @@ impl SyncJournal {
             .truncate(true)
             .open(&path)
             .map_err(JournalError::io)?;
-        fill(&f, self.cfg.file_size)?;
+        fill(&f, &path, self.cfg.file_size)?;
         let header = FileHeader {
             journal_version: FORMAT_VERSION,
             user_version: self.cfg.user_version,

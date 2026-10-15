@@ -1578,6 +1578,11 @@ async fn run(
             if let Some(s) = running {
                 stop_broker(&s.broker, s.file.as_ref()).await?;
                 stopped(&s);
+                // A critical I/O error (AMQ222010): stopped as Artemis
+                // stops, and the process ends as failed.
+                if s.broker.is_critical_io_failed() {
+                    std::process::exit(1);
+                }
             }
         }
     }

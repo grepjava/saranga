@@ -10,13 +10,13 @@
 //! themselves reclaimable.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::control::{ControlFile, FILE_COMPACT_CONTROL};
 use crate::format::{self, FileHeader, Record, SIZE_HEADER};
-use crate::io::{Completion, Writer, read_exact_at, write_all_at};
+use crate::io::{self as fio, Completion, CriticalListener, DataFile, Writer, read_exact_at};
 use crate::{JournalError, Result};
 
 /// `JournalImpl.UPDATE_FACTOR`.
@@ -180,7 +180,7 @@ pub(crate) struct JFile {
     pub(crate) id: i64,
     pub(crate) version: i32,
     pub(crate) name: String,
-    handle: Option<Arc<File>>,
+    handle: Option<Arc<DataFile>>,
     pos_count: i32,
     replaceable_count: i32,
     add_record: i32,
@@ -993,7 +993,9 @@ impl Journal {
         if inner.preserve {
             return Ok(());
         }
-        inner.compact(&self.writer)
+        inner
+            .compact(&self.writer)
+            .map_err(|e| self.writer.critical(e, None))
     }
 
     /// Flushes and closes the journal (`stop`).
@@ -1005,7 +1007,7 @@ impl Journal {
             if let Some(h) = f.handle.take()
                 && datasync
             {
-                let _ = h.sync_data();
+                let _ = fio::sync_data(&h.file, &h.path);
             }
         }
         inner.state = State::Started;
@@ -1043,20 +1045,37 @@ impl Journal {
     pub fn force_move_next_file(&self) -> Result<()> {
         let mut inner = self.lock();
         inner.check_loaded()?;
-        inner.move_next_file(&self.writer, false)
+        inner
+            .move_next_file(&self.writer, false)
+            .map_err(|e| self.writer.critical(e, None))
     }
 
     /// `forceBackup`: the current file moves to the history now.
     pub fn force_backup(&self) -> Result<()> {
         let mut inner = self.lock();
         inner.check_loaded()?;
-        inner.move_next_file(&self.writer, true)
+        inner
+            .move_next_file(&self.writer, true)
+            .map_err(|e| self.writer.critical(e, None))
     }
 
     /// Runs reclaim now (`checkReclaimStatus`).
     pub fn check_reclaim_status(&self) -> Result<()> {
         let mut inner = self.lock();
-        inner.check_reclaim_status(&self.writer)
+        inner
+            .check_reclaim_status(&self.writer)
+            .map_err(|e| self.writer.critical(e, None))
+    }
+
+    /// `IOCriticalErrorListener`: told of the first I/O error writing the
+    /// journal, after which it takes no more writes.
+    pub fn set_critical_listener(&self, listener: Option<CriticalListener>) {
+        self.writer.set_critical_listener(listener);
+    }
+
+    /// The I/O error that stopped the journal taking writes, if one has.
+    pub fn failure(&self) -> Option<JournalError> {
+        self.writer.failure()
     }
 }
 
@@ -1103,11 +1122,7 @@ fn file_name_id(prefix: &str, name: &str) -> i64 {
 }
 
 fn open_rw(path: &Path) -> Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(JournalError::io)
+    fio::open(path, false).map_err(JournalError::io)
 }
 
 /// Load-time state of one transaction (`TransactionHolder`).
@@ -1500,12 +1515,15 @@ impl Inner {
         self.push_opened_file()
     }
 
-    fn open_handle(&mut self, k: FileKey) -> Result<Arc<File>> {
+    fn open_handle(&mut self, k: FileKey) -> Result<Arc<DataFile>> {
         if let Some(h) = &self.books.files[&k].handle {
             return Ok(h.clone());
         }
         let path = self.path(&self.books.files[&k].name);
-        let h = Arc::new(open_rw(&path)?);
+        let h = Arc::new(DataFile {
+            file: open_rw(&path)?,
+            path,
+        });
         self.books.file(k).handle = Some(h.clone());
         Ok(h)
     }
@@ -1534,21 +1552,20 @@ impl Inner {
         }
         let tmp = self.path(&format!("{name}.tmp"));
         {
-            let f = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)
-                .map_err(JournalError::io)?;
-            fill(&f, self.cfg.file_size)?;
-            write_all_at(&f, &FileHeader::new(self.cfg.user_version, id).encode(), 0)
-                .map_err(JournalError::io)?;
+            let f = fio::open(&tmp, true).map_err(JournalError::io)?;
+            fill(&f, &tmp, self.cfg.file_size)?;
+            fio::write_at(
+                &f,
+                &tmp,
+                &FileHeader::new(self.cfg.user_version, id).encode(),
+                0,
+            )
+            .map_err(JournalError::io)?;
             if self.cfg.datasync {
-                f.sync_data().map_err(JournalError::io)?;
+                fio::sync_data(&f, &tmp).map_err(JournalError::io)?;
             }
         }
-        std::fs::rename(&tmp, self.path(&name)).map_err(JournalError::io)?;
+        fio::rename(&tmp, &self.path(&name)).map_err(JournalError::io)?;
         let k = self
             .books
             .insert_file(JFile::new(id, format::FORMAT_VERSION, name));
@@ -1644,7 +1661,8 @@ impl Inner {
             return Err(e);
         }
         let size = record.encode_size();
-        self.switch_file_if_necessary(writer, size)?;
+        self.switch_file_if_necessary(writer, size)
+            .map_err(|e| writer.critical(e, None))?;
         let cur = self.current.expect("current file");
         if let Some(tx) = tx
             && matches!(record, Record::Prepare { .. } | Record::Commit { .. })
@@ -1652,7 +1670,13 @@ impl Inner {
             let n = self.books.tx(tx).counter(cur);
             record.set_num_records(n);
         }
-        let handle = self.open_handle(cur)?;
+        let handle = match self.open_handle(cur) {
+            Ok(h) => h,
+            Err(e) => {
+                let path = self.path(&self.books.files[&cur].name);
+                return Err(writer.critical(e, Some(&path)));
+            }
+        };
         let record_id = self.books.files[&cur].record_id();
         let mut buf = std::mem::take(&mut self.scratch);
         buf.clear();
@@ -1709,10 +1733,15 @@ impl Inner {
             let id = self.next_file_id;
             {
                 let f = open_rw(&path)?;
-                write_all_at(&f, &FileHeader::new(self.cfg.user_version, id).encode(), 0)
-                    .map_err(JournalError::io)?;
+                fio::write_at(
+                    &f,
+                    &path,
+                    &FileHeader::new(self.cfg.user_version, id).encode(),
+                    0,
+                )
+                .map_err(JournalError::io)?;
                 if self.cfg.datasync {
-                    f.sync_data().map_err(JournalError::io)?;
+                    fio::sync_data(&f, &path).map_err(JournalError::io)?;
                 }
             }
             self.books.files.remove(&k);
@@ -1723,7 +1752,7 @@ impl Inner {
             self.free_files.push_back(nk);
         } else {
             self.books.files.remove(&k);
-            std::fs::remove_file(&path).map_err(JournalError::io)?;
+            fio::remove_file(&path).map_err(JournalError::io)?;
         }
         Ok(())
     }
@@ -1743,10 +1772,10 @@ impl Inner {
                 "AMQ142044: Moving data file {} to attic",
                 name.to_string_lossy()
             );
-            std::fs::rename(path, attic.join(name)).map_err(JournalError::io)?;
+            fio::rename(path, &attic.join(name)).map_err(JournalError::io)?;
         } else {
             tracing::warn!("AMQ142045: Deleting {}", name.to_string_lossy());
-            std::fs::remove_file(path).map_err(JournalError::io)?;
+            fio::remove_file(path).map_err(JournalError::io)?;
         }
         Ok(())
     }
@@ -1806,7 +1835,7 @@ impl Inner {
         self.books.file(k).handle = None;
         let name = self.books.files[&k].name.clone();
         let cmp = format!("{name}.cmp");
-        std::fs::rename(self.path(&name), self.path(&cmp)).map_err(JournalError::io)?;
+        fio::rename(&self.path(&name), &self.path(&cmp)).map_err(JournalError::io)?;
         self.books.file(k).name = cmp;
         Ok(k)
     }
@@ -1820,7 +1849,7 @@ impl Inner {
     pub(crate) fn rename_file(&mut self, k: FileKey, to: String) -> Result<()> {
         self.books.file(k).handle = None;
         let from = self.file_path(k);
-        std::fs::rename(from, self.path(&to)).map_err(JournalError::io)?;
+        fio::rename(&from, &self.path(&to)).map_err(JournalError::io)?;
         self.books.file(k).name = to;
         Ok(())
     }
@@ -1848,12 +1877,12 @@ fn holder<'a>(
 
 /// `NIOSequentialFile.fill`: writes zeros so later appends never extend
 /// the file.
-pub(crate) fn fill(f: &File, size: usize) -> Result<()> {
+pub(crate) fn fill(f: &File, path: &Path, size: usize) -> Result<()> {
     let page = vec![0u8; 64 * 1024];
     let mut off = 0usize;
     while off < size {
         let n = page.len().min(size - off);
-        write_all_at(f, &page[..n], off as u64).map_err(JournalError::io)?;
+        fio::write_at(f, path, &page[..n], off as u64).map_err(JournalError::io)?;
         off += n;
     }
     Ok(())

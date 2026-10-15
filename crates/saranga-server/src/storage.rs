@@ -3,10 +3,13 @@
 //! `JournalStorageManager`, `BatchingIDGenerator` and `OperationContextImpl`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use saranga_buffer::{Reader, Writer};
-use saranga_journal::{Completion, Journal, JournalConfig, JournalError, PreparedTransactionInfo};
+use saranga_journal::{
+    Completion, CriticalListener, Journal, JournalConfig, JournalError, PreparedTransactionInfo,
+};
 use saranga_message::CoreMessage;
 use saranga_storage::RecordCodec;
 use saranga_storage::codec::{
@@ -303,6 +306,7 @@ pub struct Storage {
     pub(crate) messages: Journal,
     pub(crate) bindings: Arc<Journal>,
     ids: BatchingIdGenerator<BindingsIdStore>,
+    critical: OnceLock<CriticalListener>,
 }
 
 impl Storage {
@@ -335,7 +339,32 @@ impl Storage {
                 BindingsIdStore(bindings.clone()),
             ),
             bindings,
+            critical: OnceLock::new(),
         })
+    }
+
+    /// The broker's `IOCriticalErrorListener`, told of the first I/O error
+    /// writing the journals, the page files or the large message files.
+    pub fn set_critical_listener(&self, listener: CriticalListener) {
+        self.messages.set_critical_listener(Some(listener.clone()));
+        self.bindings.set_critical_listener(Some(listener.clone()));
+        let _ = self.critical.set(listener);
+    }
+
+    /// `onIOError` of a file outside the journals (a page or large message
+    /// file).
+    pub fn critical_io(&self, e: &std::io::Error, file: Option<&Path>) {
+        match file {
+            Some(f) => tracing::warn!(
+                "AMQ144011: Critical IO Exception happened: {e} on {}",
+                f.display()
+            ),
+            None => tracing::warn!("AMQ144010: Critical IO Exception happened: {e}"),
+        }
+        if let Some(l) = self.critical.get() {
+            let e = JournalError::Io(Arc::new(std::io::Error::new(e.kind(), e.to_string())));
+            l(&e, file);
+        }
     }
 
     /// `generateID`.
@@ -614,8 +643,11 @@ impl Storage {
     /// both journals.
     pub fn stop(&self) -> StoreResult<()> {
         self.ids.stop();
-        self.messages.stop()?;
-        self.bindings.stop()
+        // Both are closed, the second even when the first failed (as after
+        // a critical I/O error).
+        let messages = self.messages.stop();
+        let bindings = self.bindings.stop();
+        messages.and(bindings)
     }
 
     fn completion(&self, sync: bool) -> (Option<Completion>, Option<Pending>) {
