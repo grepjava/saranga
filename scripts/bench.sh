@@ -25,7 +25,8 @@
 # the sends a producer has outstanding; BROKER_CPUS and CLIENT_CPUS (default
 # the first and second half of the CPUs) the cores taskset gives each;
 # WORK (default target/bench) where the brokers and results go, which
-# should be on a local file system; ARTEMIS_DIST the distribution. The
+# should be on a local file system; ARTEMIS_DIST the distribution. SARANGA_BIN
+# a saranga binary built elsewhere, for a machine without Rust. The
 # results are written to $WORK/results.md and $WORK/results.tsv.
 set -uo pipefail
 
@@ -48,13 +49,16 @@ done
 [[ "$(uname -s)" == Linux ]] || { echo "bench.sh runs on Linux" >&2; exit 2; }
 [[ -d "$DIST/lib" ]] || { echo "no Artemis distribution at $DIST (scripts/build-artemis.sh)" >&2; exit 2; }
 
-cargo build -q --release -p saranga-cli --manifest-path "$ROOT/Cargo.toml" || exit 1
+# SARANGA_BIN: a saranga built elsewhere (a machine without Rust).
+if [[ -z "${SARANGA_BIN:-}" ]]; then
+  cargo build -q --release -p saranga-cli --manifest-path "$ROOT/Cargo.toml" || exit 1
+fi
 # Both brokers run from the same file system, so neither loads its code
 # from a slower one.
 rm -rf "$WORK/brokers" "$WORK/runs"
 mkdir -p "$WORK/brokers" "$WORK/runs"
 cp -r "$DIST" "$WORK/brokers/dist"
-mkdir -p "$WORK/brokers/bin" && cp "$TARGET/release/saranga" "$WORK/brokers/bin/saranga"
+mkdir -p "$WORK/brokers/bin" && cp "${SARANGA_BIN:-$TARGET/release/saranga}" "$WORK/brokers/bin/saranga"
 ARTEMIS="$WORK/brokers/dist/bin/artemis"
 SARANGA="$WORK/brokers/bin/saranga"
 RESULTS="$WORK/results.tsv"
@@ -129,7 +133,26 @@ perf() {
   taskset -c "$CLIENT_CPUS" "$ARTEMIS" perf client --protocol "$protocol" --url "$url" \
     --user admin --password admin --message-size "$size" "${persistent[@]}" "${dests[@]}" "${spread[@]}" \
     --max-pending "$MAX_PENDING" --duration "$DURATION" --warmup "$WARMUP" \
-    --json "$out.json" "$@" queue://BENCH > "$out.out" 2>&1
+    --json "$out.json" "$@" queue://BENCH > "$out.out" 2>&1 &
+  local client=$!
+  # The broker's CPU time from after the warmup (and the client's start) to
+  # the end: its ticks and the milliseconds they cover.
+  sleep $((WARMUP + 3))
+  local t0 c0 t1 c1
+  t0="$(now_ms)" c0="$(cpu_ticks "$PID")"
+  wait "$client"
+  t1="$(now_ms)" c1="$(cpu_ticks "$PID")"
+  echo "$((c1 - c0)) $((t1 - t0))" > "$out.cpu"
+}
+cpu_ticks() { awk '{ print $14 + $15 }' "/proc/$1/stat" 2>/dev/null || echo 0; }
+# The broker's CPU in a run, from its .cpu file and the rate received:
+# microseconds of CPU a message, and the cores it kept busy.
+cpu_cost() {
+  local ticks ms
+  read -r ticks ms < "$1"
+  perl -e 'my ($t, $ms, $rate, $hz) = @ARGV; my $cpu = $t / $hz; my $n = $rate * $ms / 1000;
+    printf "%d %.2f\n", $n ? $cpu * 1e6 / $n : 0, $ms ? $cpu * 1000 / $ms : 0' \
+    "$ticks" "$ms" "$2" "$(getconf CLK_TCK)"
 }
 
 # From a perf client's JSON report: the mean received rate after the
@@ -180,7 +203,9 @@ for scenario in $SCENARIOS; do
       read -r result received _ _ < <(report "$WORK/runs/$scenario-$kind-throughput.json" || echo "fail 0 0 0")
       peak="$(rss_kb "$PID" VmHWM)"
       stop "$kind"
-      echo "$scenario $kind: $received msg/s ($result), peak ${peak} kB"
+      read -r us cores < <(cpu_cost "$WORK/runs/$scenario-$kind-throughput.cpu" "$received")
+      echo "$scenario $kind: $received msg/s ($result), peak ${peak} kB, $us us of CPU a message, $cores cores"
+      record "$scenario" "$kind" thr_cpu_us "$us"
       [[ "$result" == success ]] || failed=$((failed + 1))
       thr[$kind]="$received"
       record "$scenario" "$kind" throughput "$received"
@@ -197,7 +222,10 @@ for scenario in $SCENARIOS; do
     read -r result received p50 p99 < <(report "$WORK/runs/$scenario-$kind-latency.json" || echo "fail 0 0 0")
     peak="$(rss_kb "$PID" VmHWM)"
     stop "$kind"
-    echo "$scenario $kind at $rate msg/s: $received msg/s received, p50 ${p50} us, p99 ${p99} us ($result)"
+    read -r us cores < <(cpu_cost "$WORK/runs/$scenario-$kind-latency.cpu" "$received")
+    echo "$scenario $kind at $rate msg/s: $received msg/s received, p50 ${p50} us, p99 ${p99} us, $us us of CPU a message, $cores cores ($result)"
+    record "$scenario" "$kind" cpu_us "$us"
+    record "$scenario" "$kind" cores "$cores"
     [[ "$result" == success ]] || failed=$((failed + 1))
     record "$scenario" "$kind" p50_us "$p50"
     record "$scenario" "$kind" p99_us "$p99"
@@ -219,13 +247,14 @@ perl -e '
   print "| Startup | Artemis | Saranga |\n|---|---|---|\n";
   print "| Time to the acceptor (median) | $r{startup}{artemis}{ms} ms | $r{startup}{saranga}{ms} ms |\n";
   print "| Resident memory when started | ", mib($r{startup}{artemis}{idle_kb}), " | ", mib($r{startup}{saranga}{idle_kb}), " |\n\n";
-  print "| Scenario | Artemis msg/s | Saranga msg/s | Saranga/Artemis | Latency at msg/s | Artemis p50 / p99 | Saranga p50 / p99 | Artemis peak RSS | Saranga peak RSS |\n";
-  print "|---|---|---|---|---|---|---|---|---|\n";
+  print "| Scenario | Artemis msg/s | Saranga msg/s | Saranga/Artemis | Same rate, msg/s | Artemis p50 / p99 | Saranga p50 / p99 | Artemis CPU a message | Saranga CPU a message | Artemis peak RSS | Saranga peak RSS |\n";
+  print "|---|---|---|---|---|---|---|---|---|---|---|\n";
   for my $s (sort { $o{$a} <=> $o{$b} } grep { $_ ne "startup" } keys %r) {
     my ($a, $b) = ($r{$s}{artemis}, $r{$s}{saranga});
-    printf "| %s | %d | %d | %s | %d | %s / %s | %s / %s | %s | %s |\n", $s,
+    printf "| %s | %d | %d | %s | %d | %s / %s | %s / %s | %d us | %d us | %s | %s |\n", $s,
       $a->{throughput}, $b->{throughput}, ratio($b->{throughput}, $a->{throughput}), $r{$s}{both}{rate},
-      us($a->{p50_us}), us($a->{p99_us}), us($b->{p50_us}), us($b->{p99_us}), mib($a->{peak_kb}), mib($b->{peak_kb});
+      us($a->{p50_us}), us($a->{p99_us}), us($b->{p50_us}), us($b->{p99_us}),
+      $a->{cpu_us}, $b->{cpu_us}, mib($a->{peak_kb}), mib($b->{peak_kb});
   }
 ' "$RESULTS" > "$WORK/results.md"
 cat "$WORK/results.md"

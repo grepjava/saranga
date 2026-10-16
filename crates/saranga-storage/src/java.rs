@@ -14,7 +14,7 @@ pub fn utf16(units: impl IntoIterator<Item = u16>) -> String {
 
 /// `SimpleString.toString()`.
 pub fn simple_string(s: &SimpleString) -> String {
-    utf16(s.code_units())
+    s.decode_lossy('?')
 }
 
 /// `String.valueOf(simpleString)`: `null` for null.

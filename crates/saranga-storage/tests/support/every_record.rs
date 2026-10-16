@@ -244,7 +244,7 @@ pub fn write(dir: &std::path::Path) {
         timestamp: 1_700_000_000_123,
         priority: 9,
         properties: props,
-        body: vec![1, 0, 0, 0, 2, 0x68, 0],
+        body: vec![1, 0, 0, 0, 2, 0x68, 0].into(),
     };
     add(
         &messages,

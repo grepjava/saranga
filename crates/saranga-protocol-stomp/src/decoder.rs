@@ -226,7 +226,7 @@ fn content_length(value: &str) -> Result<usize, DecodeError> {
 /// `StompDecoder.parseHeaders`: raw names and values; spaces and tabs at
 /// the start of a value are dropped.
 fn parse_headers_v10(buf: &[u8], pos: &mut usize) -> Result<Option<Headers>, DecodeError> {
-    let mut headers = Vec::new();
+    let mut headers = Vec::with_capacity(8);
     let mut length = None;
     let mut start = *pos;
     let mut in_name = true;
@@ -289,9 +289,9 @@ fn parse_headers_v11(
     pos: &mut usize,
 ) -> Result<Option<Headers>, DecodeError> {
     let v12 = rules == Rules::V12;
-    let mut headers = Vec::new();
+    let mut headers = Vec::with_capacity(8);
     let mut length = None;
-    let mut holder: Vec<u8> = Vec::new();
+    let mut holder: Vec<u8> = Vec::with_capacity(64);
     let mut escaping = false;
     let mut in_name = true;
     let mut whitespace_only = true;

@@ -1,7 +1,7 @@
 //! Filtering Core messages. Ported from `FilterImpl.FilterableServerMessage`
 //! and `FilterImpl.getHeaderFieldValue`.
 
-use saranga_buffer::{PropertyValue, SimpleString, Writer};
+use saranga_buffer::{PropertyValue, Writer};
 use saranga_message::CoreMessage;
 
 use crate::{Filterable, PropertyError, Value};
@@ -38,7 +38,7 @@ impl Filterable for CoreMessage {
         if result.is_none() {
             result = self
                 .properties
-                .get(&SimpleString::from(identifier))
+                .get_str(identifier)
                 .and_then(Value::from_property);
         }
         Ok(result)
@@ -91,7 +91,7 @@ fn hops(msg: &CoreMessage) -> Result<Option<Value>, PropertyError> {
         identifier: HDR_HOPS.into(),
         reason: reason.into(),
     };
-    match msg.properties.get(&SimpleString::from(HDR_HOPS)) {
+    match msg.properties.get_str(HDR_HOPS) {
         None | Some(PropertyValue::Null) => Ok(None),
         Some(PropertyValue::Bytes(b)) => match b.first_chunk::<4>() {
             Some(bytes) => Ok(Some(Value::Int(i32::from_be_bytes(*bytes)))),
@@ -105,7 +105,7 @@ fn hops(msg: &CoreMessage) -> Result<Option<Value>, PropertyError> {
 /// Java's `toString`, and `byte[]` cannot be converted.
 fn string_property(msg: &CoreMessage, key: &str) -> Result<Option<String>, PropertyError> {
     use crate::java::{double_to_string, float_to_string};
-    let Some(value) = msg.properties.get(&SimpleString::from(key)) else {
+    let Some(value) = msg.properties.get_str(key) else {
         return Ok(None);
     };
     Ok(Some(match value {

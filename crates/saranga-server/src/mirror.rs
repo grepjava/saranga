@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use saranga_buffer::{PropertyValue, SimpleString};
+use saranga_buffer::PropertyValue;
 use saranga_storage::codec::{AckRetryRecord, HASH_MAP_RECORD_VERSION, RecordCodec};
 
 use crate::message::MessageRef;
@@ -38,11 +38,7 @@ pub fn mirror_address(connection: &str) -> String {
 /// `ReferenceIDSupplier.getServerID`: the broker a message came from, none
 /// for one sent to this broker.
 pub fn server_id(message: &crate::message::ServerMessage) -> Option<String> {
-    match message
-        .core()
-        .properties
-        .get(&SimpleString::from(BROKER_ID))?
-    {
+    match message.core().properties.get_str(BROKER_ID)? {
         PropertyValue::Null => None,
         PropertyValue::String(s) => Some(s.to_string_lossy()),
         _ => crate::message::string_property(message.core(), BROKER_ID),
@@ -52,11 +48,7 @@ pub fn server_id(message: &crate::message::ServerMessage) -> Option<String> {
 /// `ReferenceIDSupplier.getID`: the message's ID on the broker it came
 /// from, else its own.
 pub fn internal_id(message: &crate::message::ServerMessage) -> i64 {
-    match message
-        .core()
-        .properties
-        .get(&SimpleString::from(INTERNAL_ID))
-    {
+    match message.core().properties.get_str(INTERNAL_ID) {
         Some(PropertyValue::Long(v)) => *v,
         Some(PropertyValue::Int(v)) => i64::from(*v),
         _ => message.message_id(),

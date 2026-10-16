@@ -142,13 +142,8 @@ impl BrokerPlugin for Recorder {
         ));
     }
     fn can_accept(&self, _consumer: &ConsumerEntry, message: &ServerMessage) -> bool {
-        self.refuse_property.is_none_or(|p| {
-            !message
-                .core()
-                .properties
-                .get(&SimpleString::from(p))
-                .is_some()
-        })
+        self.refuse_property
+            .is_none_or(|p| !message.core().properties.get_str(p).is_some())
     }
     fn before_deliver(&self, c: &ConsumerEntry, message: &ServerMessage) {
         self.push(format!("before_deliver {} {}", c.id, message.message_id()));
@@ -175,7 +170,12 @@ impl BrokerPlugin for Recorder {
 struct Sink(Mutex<Vec<i64>>);
 
 impl DeliverySink for Sink {
-    fn deliver(&self, _consumer_id: i64, message: &ServerMessage, _delivery_count: i32) -> i64 {
+    fn deliver(
+        &self,
+        _consumer_id: i64,
+        message: &Arc<ServerMessage>,
+        _delivery_count: i32,
+    ) -> i64 {
         self.0.lock().unwrap().push(message.message_id());
         1
     }
@@ -454,11 +454,7 @@ async fn the_notification_plugin_announces_addresses() {
         )
         .unwrap();
     let kind = |r: &saranga_server::message::MessageRef, key: &str| {
-        r.message
-            .core()
-            .properties
-            .get(&SimpleString::from(key))
-            .cloned()
+        r.message.core().properties.get_str(key).cloned()
     };
     let mut found = None;
     for _ in 0..200 {

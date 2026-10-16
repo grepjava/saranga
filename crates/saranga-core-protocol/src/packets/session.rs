@@ -1119,7 +1119,7 @@ fn decode_message_1x(r: &mut Reader<'_>, trailer: usize) -> Result<(CoreMessage,
     let body = mr.bytes(body_len)?.to_vec();
     let end_of_message = mr.i32()?;
     let mut message = CoreMessage::decode_headers_and_properties(&mut mr)?;
-    message.body = body;
+    message.body = body.into();
     if !mr.is_empty() {
         return Err(DecodeError::Invalid(format!(
             "{} unexpected bytes after message",

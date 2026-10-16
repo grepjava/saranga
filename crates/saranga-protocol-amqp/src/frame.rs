@@ -59,10 +59,13 @@ pub fn decode(buf: &[u8]) -> Result<Frame> {
         });
     }
     let mut d = Decoder::new(body);
-    let value = d.read()?;
     let body = match kind {
-        TYPE_AMQP => FrameBody::Amqp(Performative::from_value(value)?, d.rest().to_vec()),
+        TYPE_AMQP => {
+            let performative = Performative::decode(&mut d)?;
+            FrameBody::Amqp(performative, d.rest().to_vec())
+        }
         TYPE_SASL => {
+            let value = d.read()?;
             if d.has_remaining() {
                 return invalid("bytes after a SASL frame body");
             }

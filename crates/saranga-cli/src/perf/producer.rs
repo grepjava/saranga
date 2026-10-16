@@ -313,7 +313,7 @@ impl Load {
     /// group as `JMSXGroupID`.
     async fn send(&self, time: i64) -> anyhow::Result<()> {
         let mut message = saranga_client::message::new_message(message_type::BYTES, true);
-        message.body = self.content.to_vec();
+        message.body = self.content.to_vec().into();
         message.put_property("time", PropertyValue::Long(time));
         if let Some(g) = &self.config.group {
             message.put_property(

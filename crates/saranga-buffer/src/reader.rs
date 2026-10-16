@@ -5,6 +5,9 @@ use crate::{DecodeError, JString, Result, SimpleString, constants};
 pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// The buffer as shared bytes, when strings are to be slices of it
+    /// rather than copies.
+    shared: Option<&'a bytes::Bytes>,
 }
 
 macro_rules! read_be {
@@ -17,7 +20,20 @@ macro_rules! read_be {
 
 impl<'a> Reader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self {
+            buf,
+            pos: 0,
+            shared: None,
+        }
+    }
+
+    /// A reader whose strings are slices of `buf`, sharing it.
+    pub fn shared(buf: &'a bytes::Bytes) -> Self {
+        Self {
+            buf,
+            pos: 0,
+            shared: Some(buf),
+        }
     }
 
     pub fn position(&self) -> usize {
@@ -93,7 +109,11 @@ impl<'a> Reader<'a> {
 
     pub fn simple_string(&mut self) -> Result<SimpleString> {
         let len = self.len("SimpleString")?;
-        Ok(SimpleString::from_bytes(self.bytes(len)?.to_vec()))
+        let data = self.bytes(len)?;
+        Ok(match self.shared {
+            Some(shared) => SimpleString::from_shared(shared.slice_ref(data)),
+            None => SimpleString::from_bytes(data.to_vec()),
+        })
     }
 
     pub fn nullable_simple_string(&mut self) -> Result<Option<SimpleString>> {

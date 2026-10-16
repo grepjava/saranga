@@ -307,7 +307,8 @@ impl ConsumerShared {
         }
         d.message.body = controller
             .wait_completion(session.conn().call_timeout)
-            .await?;
+            .await?
+            .into();
         if is_compressed(&d.message) {
             inflate_body(&mut d.message);
         }
@@ -819,7 +820,7 @@ fn inflate_body(message: &mut CoreMessage) -> bool {
     };
     match large::inflate(&message.body, size_hint) {
         Ok(body) => {
-            message.body = body;
+            message.body = body.into();
             message.put_property(HDR_LARGE_COMPRESSED, PropertyValue::Bool(false));
             true
         }

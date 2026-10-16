@@ -72,6 +72,19 @@ impl PropertyValue {
             Self::String(v) => w.u8(c::STRING).simple_string(v),
         };
     }
+
+    /// The length of [`encode`](Self::encode)'s output.
+    fn encode_size(&self) -> usize {
+        1 + match self {
+            Self::Null => 0,
+            Self::Bool(_) | Self::Byte(_) => 1,
+            Self::Short(_) | Self::Char(_) => 2,
+            Self::Int(_) | Self::Float(_) => 4,
+            Self::Long(_) | Self::Double(_) => 8,
+            Self::Bytes(v) => 4 + v.len(),
+            Self::String(v) => 4 + v.as_bytes().len(),
+        }
+    }
 }
 
 /// Artemis `TypedProperties`: message properties keyed by `SimpleString`.
@@ -96,6 +109,48 @@ impl TypedProperties {
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v)
+    }
+
+    /// [`get`](Self::get) by a name, without making a key of it.
+    pub fn get_str(&self, key: &str) -> Option<&PropertyValue> {
+        // Names are nearly always ASCII: then a match is the key's bytes,
+        // each followed by a zero, and anything of another length is not
+        // one. The check is made once rather than for each entry.
+        if key.is_ascii() {
+            let len = key.len() * 2;
+            return self
+                .entries()
+                .iter()
+                .find(|(k, _)| {
+                    let b = k.as_bytes();
+                    b.len() == len
+                        && b.as_chunks::<2>()
+                            .0
+                            .iter()
+                            .zip(key.as_bytes())
+                            .all(|(&[lo, hi], &a)| lo == a && hi == 0)
+                })
+                .map(|(_, v)| v);
+        }
+        self.entries()
+            .iter()
+            .find(|(k, _)| k.eq_str(key))
+            .map(|(_, v)| v)
+    }
+
+    /// Room for `n` more entries and no more; none for none, which leaves
+    /// a NULL encoding NULL.
+    pub fn reserve_exact(&mut self, n: usize) {
+        if n > 0 {
+            self.0.get_or_insert_with(Vec::new).reserve_exact(n);
+        }
+    }
+
+    /// NULL again if room was reserved and nothing was put.
+    pub fn unreserve(&mut self) {
+        if matches!(&self.0, Some(v) if v.is_empty() && v.capacity() > 0) {
+            self.0 = None;
+        }
     }
 
     /// Inserts or replaces a property, keeping the position of an existing key.
@@ -159,6 +214,72 @@ impl TypedProperties {
                     v.encode(w);
                 }
             }
+        }
+    }
+
+    /// The length of [`encode`](Self::encode)'s output, without encoding.
+    pub fn encode_size(&self) -> usize {
+        match &self.0 {
+            None => 1,
+            Some(entries) => {
+                5 + entries
+                    .iter()
+                    .map(|(k, v)| 4 + k.as_bytes().len() + v.encode_size())
+                    .sum::<usize>()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_str_finds_ascii_and_other_names() {
+        let mut p = TypedProperties::default();
+        for name in ["a", "ab", "_AMQ_ROUTING_TYPE", "héllo", "日本"] {
+            p.insert(SimpleString::from(name), PropertyValue::String(name.into()));
+        }
+        for name in ["a", "ab", "_AMQ_ROUTING_TYPE", "héllo", "日本"] {
+            assert_eq!(
+                p.get_str(name),
+                Some(&PropertyValue::String(name.into())),
+                "{name}"
+            );
+        }
+        for name in ["", "b", "abc", "_AMQ_ROUTING_TYPF", "hello", "日"] {
+            assert_eq!(p.get_str(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn encode_size_is_what_encode_writes() {
+        let mut p = TypedProperties::default();
+        let size = |p: &TypedProperties| {
+            let mut w = Writer::new();
+            p.encode(&mut w);
+            (w.len(), p.encode_size())
+        };
+        let (written, sized) = size(&p);
+        assert_eq!(written, sized);
+        let values = [
+            PropertyValue::Null,
+            PropertyValue::Bool(true),
+            PropertyValue::Byte(-1),
+            PropertyValue::Bytes(vec![1, 2, 3]),
+            PropertyValue::Short(7),
+            PropertyValue::Int(7),
+            PropertyValue::Long(7),
+            PropertyValue::Float(1.5),
+            PropertyValue::Double(1.5),
+            PropertyValue::Char(65),
+            PropertyValue::String("héllo".into()),
+        ];
+        for (i, v) in values.into_iter().enumerate() {
+            p.insert(SimpleString::from(format!("k{i}").as_str()), v);
+            let (written, sized) = size(&p);
+            assert_eq!(written, sized);
         }
     }
 }

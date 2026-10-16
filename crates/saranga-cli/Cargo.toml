@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+mimalloc = { version = "0.1", default-features = false, optional = true }
 flate2 = "1"
 clap = { version = "4", features = ["derive"] }
 saranga-config = { path = "../saranga-config" }
@@ -42,3 +43,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+default = ["mimalloc"]

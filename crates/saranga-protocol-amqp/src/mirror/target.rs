@@ -71,6 +71,7 @@ impl MirrorTarget {
             .map_err(|e| BrokerError::internal(e.to_string()))?;
         let event = m
             .annotation(EVENT_TYPE)
+            .as_ref()
             .and_then(Value::as_symbol)
             .map(|s| s.as_str().to_owned());
         if let Some(event) = event {
@@ -167,7 +168,12 @@ impl MirrorTarget {
             Some((_, Value::String(s))) => Some(s),
             _ => None,
         };
-        let annotation = |k: &str| m.annotation(k).and_then(Value::as_str).map(str::to_owned);
+        let annotation = |k: &str| {
+            m.annotation(k)
+                .as_ref()
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
         match event {
             ADD_ADDRESS => match body().map(|b| address_from_json(&b)) {
                 Some(Ok(info)) => {
@@ -231,6 +237,7 @@ impl MirrorTarget {
                 let node_id = annotation(BROKER_ID).or_else(|| self.remote_id.clone());
                 let reason = saranga_server::mirror::reason_from(
                     m.annotation(ACK_REASON)
+                        .as_ref()
                         .and_then(Value::as_i64)
                         .unwrap_or(0),
                 );

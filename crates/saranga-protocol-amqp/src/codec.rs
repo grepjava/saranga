@@ -183,7 +183,7 @@ fn encode_ulong(v: u64, out: &mut Vec<u8>) {
     }
 }
 
-fn variable(short: u8, long: u8, bytes: &[u8], out: &mut Vec<u8>) {
+pub(crate) fn variable(short: u8, long: u8, bytes: &[u8], out: &mut Vec<u8>) {
     if let Ok(n) = u8::try_from(bytes.len()) {
         out.extend([short, n]);
     } else {
@@ -424,6 +424,37 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    /// Reads the `0x00` and descriptor of a described value, leaving the
+    /// value next; `None`, reading nothing, when the next value is not
+    /// described.
+    pub fn read_described_head(&mut self) -> Result<Option<Descriptor>> {
+        if self.peek()? != code::DESCRIBED {
+            return Ok(None);
+        }
+        self.pos += 1;
+        self.read_descriptor().map(Some)
+    }
+
+    /// Reads a list, giving the bytes of its first fields, as many as `out`
+    /// holds, without decoding them; fields the list does not have are
+    /// `None`.
+    pub fn list_fields(&mut self, out: &mut [Option<&'a [u8]>]) -> Result<()> {
+        out.fill(None);
+        let c = self.u8()?;
+        let (count, mut d) = match c {
+            code::LIST0 => return Ok(()),
+            code::LIST8 | code::LIST32 => self.compound(c == code::LIST32)?,
+            other => return invalid(format!("list expected, found {other:#04x}")),
+        };
+        for i in 0..count {
+            let field = d.skip()?;
+            if let Some(slot) = out.get_mut(i) {
+                *slot = Some(field);
+            }
+        }
+        Ok(())
+    }
+
     /// Skips one value, returning its bytes.
     pub fn skip(&mut self) -> Result<&'a [u8]> {
         let start = self.pos;
@@ -627,9 +658,38 @@ pub fn from_slice(bytes: &[u8]) -> Result<Value> {
     Ok(v)
 }
 
+/// The text of exactly one encoded `string` filling `bytes`, read in
+/// place; `None` for anything else.
+pub fn utf8_string(bytes: &[u8]) -> Option<&str> {
+    let text = match *bytes.first()? {
+        code::STR8 => {
+            let (&len, rest) = bytes[1..].split_first()?;
+            (rest.len() == usize::from(len)).then_some(rest)?
+        }
+        code::STR32 => {
+            let len = u32::from_be_bytes(bytes.get(1..5)?.try_into().ok()?);
+            let rest = &bytes[5..];
+            (rest.len() == len as usize).then_some(rest)?
+        }
+        _ => return None,
+    };
+    std::str::from_utf8(text).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf8_string_in_place() {
+        for s in ["", "queue", &"x".repeat(300)] {
+            let mut out = Vec::new();
+            encode(&Value::String(s.to_owned()), &mut out);
+            assert_eq!(utf8_string(&out), Some(s));
+        }
+        assert_eq!(utf8_string(&[code::STR8, 2, b'a']), None);
+        assert_eq!(utf8_string(&[code::NULL]), None);
+    }
 
     fn rt(v: Value) -> Vec<u8> {
         let bytes = to_vec(&v);

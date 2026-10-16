@@ -1,5 +1,6 @@
 //! Artemis Core messages. Ported from `CoreMessage`.
 
+pub use bytes::Bytes;
 use saranga_buffer::{DecodeError, Reader, Result, SimpleString, TypedProperties, Writer};
 
 /// `PacketImpl.PACKET_HEADERS_SIZE` (i32 length + type byte + i64 channel).
@@ -31,8 +32,9 @@ pub struct CoreMessage {
     pub priority: u8,
     pub properties: TypedProperties,
     /// The raw body buffer. Its layout depends on `message_type`
-    /// (for TEXT it holds a nullable SimpleString).
-    pub body: Vec<u8>,
+    /// (for TEXT it holds a nullable SimpleString). Shared, so that a copy
+    /// of the message, or the broker's encoding of it, holds no other.
+    pub body: Bytes,
 }
 
 impl CoreMessage {
@@ -47,7 +49,7 @@ impl CoreMessage {
             .ok_or_else(|| {
                 DecodeError::Invalid(format!("bad end-of-body position {end_of_body}"))
             })?;
-        let body = r.bytes(body_len)?.to_vec();
+        let body = Bytes::copy_from_slice(r.bytes(body_len)?);
         let mut msg = Self::decode_headers_and_properties(r)?;
         msg.body = body;
         Ok(msg)
@@ -71,7 +73,7 @@ impl CoreMessage {
             timestamp: r.i64()?,
             priority: r.u8()?,
             properties: TypedProperties::decode(r)?,
-            body: Vec::new(),
+            body: Bytes::new(),
         })
     }
 
@@ -105,7 +107,7 @@ mod tests {
             expiration: 0,
             timestamp: 1_700_000_000_000,
             priority: 4,
-            body: vec![1, 2, 3],
+            body: vec![1, 2, 3].into(),
             ..Default::default()
         };
         msg.properties.insert("k".into(), PropertyValue::Int(1));

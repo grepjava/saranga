@@ -126,7 +126,7 @@ impl CoreDeliverySink {
 }
 
 impl DeliverySink for CoreDeliverySink {
-    fn deliver(&self, consumer_id: i64, message: &ServerMessage, delivery_count: i32) -> i64 {
+    fn deliver(&self, consumer_id: i64, message: &Arc<ServerMessage>, delivery_count: i32) -> i64 {
         let ctx = self.conn.context();
         let frame = if ctx.is_version_before_address_change() {
             let core = self

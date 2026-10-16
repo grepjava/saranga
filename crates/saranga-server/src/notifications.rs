@@ -278,7 +278,7 @@ struct QueueInfo {
 struct QueueInfos(Vec<QueueInfo>);
 
 fn prop<'a>(m: &'a CoreMessage, name: &str) -> Option<&'a PropertyValue> {
-    m.properties.get(&SimpleString::from(name))
+    m.properties.get_str(name)
 }
 
 fn prop_string(m: &CoreMessage, name: &str) -> Option<SimpleString> {

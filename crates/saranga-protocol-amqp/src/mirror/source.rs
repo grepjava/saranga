@@ -406,6 +406,7 @@ fn annotation_broker_id(message: &ServerMessage) -> Option<String> {
     let n = message.native()?.as_any().downcast_ref::<AmqpNative>()?;
     n.message
         .annotation(super::BROKER_ID)
+        .as_ref()
         .and_then(Value::as_str)
         .map(str::to_owned)
 }

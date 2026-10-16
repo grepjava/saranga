@@ -388,9 +388,9 @@ pub(super) async fn send(
         if kind as u8 == message_type::TEXT {
             let mut w = Writer::new();
             w.nullable_simple_string(Some(&SimpleString::from(body.as_str())));
-            m.body = w.into_vec();
+            m.body = w.into_vec().into();
         } else {
-            m.body = base64_decode(&body).ok_or("Invalid base64 body")?;
+            m.body = base64_decode(&body).ok_or("Invalid base64 body")?.into();
         }
     }
     if create_message_id {

@@ -25,6 +25,17 @@ const ORIG_PREFIX: &str = "_AMQ_ORIG_";
 const MIRROR_INTERNAL_ID: &str = saranga_server::mirror::INTERNAL_ID;
 const MIRROR_BROKER_ID: &str = saranga_server::mirror::BROKER_ID;
 
+/// The keys the view gives every message, made once and shared.
+static KEYS: std::sync::LazyLock<[SimpleString; 4]> = std::sync::LazyLock::new(|| {
+    [
+        HDR_ROUTING_TYPE,
+        HDR_GROUP_ID,
+        HDR_GROUP_SEQUENCE,
+        HDR_SCHEDULED_DELIVERY_TIME,
+    ]
+    .map(SimpleString::from)
+});
+
 /// An AMQP message held by the broker.
 #[derive(Debug, Clone)]
 pub struct AmqpNative {
@@ -151,39 +162,47 @@ impl NativeMessage for AmqpNative {
             timestamp: m.timestamp(),
             ..Default::default()
         };
+        let application_properties = m.application_properties();
+        let (group_id, group_sequence) = m.group();
+        let routing_type = m.routing_type();
+        // Room for each at once: a queued message holds its view's
+        // properties, and growing them one by one would leave spare room.
+        let room = application_properties.len()
+            + m.extra_properties().map_or(0, |e| e.iter().count())
+            + usize::from(routing_type.is_some())
+            + usize::from(group_id.is_some())
+            + usize::from(group_sequence.is_some())
+            + usize::from(self.scheduled > 0);
         let props = &mut core.properties;
-        for (k, v) in m.application_properties() {
+        props.reserve_exact(room);
+        for (k, v) in application_properties {
             if let Some(p) = view_property(&v) {
                 props.insert(SimpleString::from(k.as_str()), p);
             }
         }
         if let Some(extra) = m.extra_properties() {
             for (k, v) in extra.iter() {
-                if k.to_string_lossy() != ADDRESS_PROPERTY {
+                if !k.eq_str(ADDRESS_PROPERTY) {
                     props.insert(k.clone(), v.clone());
                 }
             }
         }
-        if let Some(t) = m.routing_type() {
-            props.insert(HDR_ROUTING_TYPE.into(), PropertyValue::Byte(t));
+        if let Some(t) = routing_type {
+            props.insert(KEYS[0].clone(), PropertyValue::Byte(t));
         }
-        if let Some(p) = m.properties() {
-            if let Some(g) = &p.group_id {
-                props.insert(
-                    HDR_GROUP_ID.into(),
-                    PropertyValue::String(SimpleString::from(g.as_str())),
-                );
-            }
-            if let Some(s) = p.group_sequence {
-                props.insert(HDR_GROUP_SEQUENCE.into(), PropertyValue::Int(s as i32));
-            }
-        }
-        if self.scheduled > 0 {
+        if let Some(g) = group_id {
             props.insert(
-                HDR_SCHEDULED_DELIVERY_TIME.into(),
-                PropertyValue::Long(self.scheduled),
+                KEYS[1].clone(),
+                PropertyValue::String(SimpleString::from(g)),
             );
         }
+        if let Some(s) = group_sequence {
+            props.insert(KEYS[2].clone(), PropertyValue::Int(s as i32));
+        }
+        if self.scheduled > 0 {
+            props.insert(KEYS[3].clone(), PropertyValue::Long(self.scheduled));
+        }
+        props.unreserve();
         core
     }
 
@@ -205,6 +224,10 @@ impl NativeMessage for AmqpNative {
         self.message.encode_size()
     }
 
+    fn memory_estimate(&self) -> i64 {
+        self.message.memory_estimate()
+    }
+
     /// `FilterImpl` over an `AMQPMessage`: the `AMQ` header fields, `m.`
     /// for message annotations, then `getObjectPropertyForFilter`.
     fn filter_value(&self, id: &str) -> Option<saranga_filter::Value> {
@@ -213,7 +236,8 @@ impl NativeMessage for AmqpNative {
         if id.starts_with("AMQ") {
             let header = match id {
                 "AMQUserID" => {
-                    let text = match m.properties().and_then(|p| p.message_id.as_ref()) {
+                    let props = m.properties();
+                    let text = match props.as_deref().and_then(|p| p.message_id.as_ref()) {
                         Some(v) => id_text(v),
                         None => m
                             .application_property("NATIVE_MESSAGE_ID")
@@ -251,9 +275,10 @@ impl NativeMessage for AmqpNative {
             }
         }
         if let Some(name) = id.strip_prefix("m.") {
-            return m.annotation_lookup(name).and_then(filter_value);
+            return m.annotation_lookup(name).as_ref().and_then(filter_value);
         }
         let props = m.properties();
+        let props = props.as_deref();
         let value = match id {
             "JMSType" => props.and_then(|p| p.subject.clone()).map(F::String),
             "__AMQ_CID" => m.connection_id().map(|c| F::String(c.to_owned())),
@@ -311,7 +336,7 @@ impl NativeMessage for AmqpNative {
         // referenceOriginalMessage: the original's names, then no expiry.
         let mut referenced = false;
         for (k, v) in after.properties.entries() {
-            if k.to_string_lossy().starts_with(ORIG_PREFIX) && changed(k) {
+            if k.starts_with_str(ORIG_PREFIX) && changed(k) {
                 m.set_broker_property(&k.to_string_lossy(), v.clone());
                 referenced = true;
             }

@@ -259,7 +259,7 @@ async fn compressed_round_trip() {
     for (body, kind) in [(&small, None), (&big, Some("noise"))] {
         let d = receive(&consumer).await;
         assert_eq!(d.message.body.len(), body.len());
-        assert!(&d.message.body == body);
+        assert!(d.message.body == body);
         assert_eq!(d.message.string_property("kind").as_deref(), kind);
         assert_eq!(
             d.message.property(HDR_LARGE_COMPRESSED),

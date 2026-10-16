@@ -342,8 +342,9 @@ fn object_message(text: &str) -> CoreMessage {
     }
     data.extend_from_slice(&utf);
     let mut m = new_message(message_type::OBJECT, true);
-    m.body = (data.len() as i32).to_be_bytes().to_vec();
-    m.body.extend_from_slice(&data);
+    let mut body = (data.len() as i32).to_be_bytes().to_vec();
+    body.extend_from_slice(&data);
+    m.body = body.into();
     m
 }
 

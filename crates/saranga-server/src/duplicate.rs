@@ -18,10 +18,7 @@ use crate::storage::{Storage, StoreResult, ids};
 /// `Message.getDuplicateIDBytes`: a string ID as its `SimpleString` bytes,
 /// a byte array as it is.
 pub fn duplicate_id_bytes(message: &CoreMessage) -> Option<Vec<u8>> {
-    match message
-        .properties
-        .get(&SimpleString::from(HDR_DUPLICATE_DETECTION_ID))?
-    {
+    match message.properties.get_str(HDR_DUPLICATE_DETECTION_ID)? {
         PropertyValue::String(s) => Some(s.as_bytes().to_vec()),
         PropertyValue::Bytes(b) => Some(b.clone()),
         _ => None,

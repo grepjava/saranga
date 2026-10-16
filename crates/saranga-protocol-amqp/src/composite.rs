@@ -30,31 +30,44 @@ pub trait Composite: Sized {
     /// The fields to write, already cut after the last one that is set.
     fn to_fields(&self) -> Vec<Value>;
 
+    /// Writes the fields [`to_fields`](Self::to_fields) gives, without
+    /// making values of them, returning how many.
+    fn encode_fields(&self, out: &mut Vec<u8>) -> usize;
+
+    /// Reads the type from its list (or a null), which comes next, without
+    /// making values of its fields.
+    fn decode_fields(d: &mut codec::Decoder<'_>) -> Result<Self>;
+
     fn form(&self) -> ListForm {
         ListForm::Sized
     }
 
     /// Writes the described list.
     fn encode(&self, out: &mut Vec<u8>) {
+        self.encode_as(self.form(), out);
+    }
+
+    /// Writes the described list in `form`. The fields go straight after
+    /// room for a `list32` header, which a `list8` header then replaces.
+    fn encode_as(&self, form: ListForm, out: &mut Vec<u8>) {
         out.push(code::DESCRIBED);
         codec::encode_descriptor(&Descriptor::Code(Self::CODE), out);
-        let fields = self.to_fields();
-        if fields.is_empty() {
+        let start = out.len();
+        out.extend([0; 9]);
+        let count = self.encode_fields(out);
+        let body = out.len() - start - 9;
+        if count == 0 {
+            out.truncate(start);
             out.push(code::LIST0);
-            return;
-        }
-        let mut body = Vec::new();
-        for f in &fields {
-            codec::encode(f, &mut body);
-        }
-        if self.form() == ListForm::Sized && body.len() <= 253 {
-            out.extend([code::LIST8, (body.len() + 1) as u8, fields.len() as u8]);
+        } else if form == ListForm::Sized && body <= 253 {
+            out[start..start + 3].copy_from_slice(&[code::LIST8, (body + 1) as u8, count as u8]);
+            out.copy_within(start + 9.., start + 3);
+            out.truncate(out.len() - 6);
         } else {
-            out.push(code::LIST32);
-            out.extend(((body.len() + 4) as u32).to_be_bytes());
-            out.extend((fields.len() as u32).to_be_bytes());
+            out[start] = code::LIST32;
+            out[start + 1..start + 5].copy_from_slice(&((body + 4) as u32).to_be_bytes());
+            out[start + 5..start + 9].copy_from_slice(&(count as u32).to_be_bytes());
         }
-        out.extend(body);
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -104,6 +117,23 @@ pub trait Composite: Sized {
 pub trait Field: Sized {
     fn from_value(v: Value) -> Result<Self>;
     fn to_value(&self) -> Value;
+
+    /// Writes [`to_value`](Self::to_value); types that would copy
+    /// themselves into it write themselves.
+    fn encode_field(&self, out: &mut Vec<u8>) {
+        codec::encode(&self.to_value(), out);
+    }
+
+    /// Reads the field from its encoding, one value.
+    fn decode_field(bytes: &[u8]) -> Result<Self> {
+        Self::from_value(codec::from_slice(bytes)?)
+    }
+
+    /// Whether [`to_value`](Self::to_value) is null, which a trailing field
+    /// is cut for.
+    fn is_null_field(&self) -> bool {
+        false
+    }
 }
 
 fn wrong<T>(what: &str, v: &Value) -> Result<T> {
@@ -116,6 +146,12 @@ impl Field for Value {
     }
     fn to_value(&self) -> Value {
         self.clone()
+    }
+    fn encode_field(&self, out: &mut Vec<u8>) {
+        codec::encode(self, out);
+    }
+    fn is_null_field(&self) -> bool {
+        self.is_null()
     }
 }
 
@@ -186,6 +222,9 @@ impl Field for String {
     fn to_value(&self) -> Value {
         Value::String(self.clone())
     }
+    fn encode_field(&self, out: &mut Vec<u8>) {
+        codec::variable(code::STR8, code::STR32, self.as_bytes(), out);
+    }
 }
 
 impl Field for Symbol {
@@ -197,6 +236,9 @@ impl Field for Symbol {
     }
     fn to_value(&self) -> Value {
         Value::Symbol(self.clone())
+    }
+    fn encode_field(&self, out: &mut Vec<u8>) {
+        codec::variable(code::SYM8, code::SYM32, self.0.as_bytes(), out);
     }
 }
 
@@ -210,6 +252,9 @@ impl Field for Vec<u8> {
     }
     fn to_value(&self) -> Value {
         Value::Binary(self.clone())
+    }
+    fn encode_field(&self, out: &mut Vec<u8>) {
+        codec::variable(code::VBIN8, code::VBIN32, self, out);
     }
 }
 
@@ -311,6 +356,18 @@ impl<T: Composite> Field for T {
     fn to_value(&self) -> Value {
         <T as Composite>::to_value(self)
     }
+    /// As [`to_value`](Self::to_value) writes it: by size, whatever form the
+    /// type has on its own.
+    fn encode_field(&self, out: &mut Vec<u8>) {
+        self.encode_as(ListForm::Sized, out);
+    }
+    fn decode_field(bytes: &[u8]) -> Result<Self> {
+        let mut d = codec::Decoder::new(bytes);
+        match d.read_described_head()? {
+            Some(desc) if T::is(&desc) => T::decode_fields(&mut d),
+            _ => <T as Composite>::from_value(codec::from_slice(bytes)?),
+        }
+    }
 }
 
 /// Reads field `i` of a composite.
@@ -332,6 +389,43 @@ pub(crate) fn req<T: Field>(v: Value, name: &str) -> Result<T> {
         return invalid(format!("mandatory field {name} is null"));
     }
     T::from_value(v).map_err(|e| CodecError::Invalid(format!("{name}: {e}")))
+}
+
+/// Reads a composite's list, or a null as a list of no fields.
+pub(crate) fn read_list<'a>(
+    d: &mut codec::Decoder<'a>,
+    fields: &mut [Option<&'a [u8]>],
+) -> Result<()> {
+    if d.peek()? == code::NULL {
+        d.skip()?;
+        fields.fill(None);
+        return Ok(());
+    }
+    d.list_fields(fields)
+}
+
+fn is_null(bytes: Option<&[u8]>) -> bool {
+    bytes.is_none_or(|b| b == [code::NULL])
+}
+
+/// [`opt`] from a field's encoding.
+pub(crate) fn dopt<T: Field>(bytes: Option<&[u8]>, name: &str) -> Result<Option<T>> {
+    match bytes {
+        Some(b) if !is_null(bytes) => T::decode_field(b)
+            .map(Some)
+            .map_err(|e| CodecError::Invalid(format!("{name}: {e}"))),
+        _ => Ok(None),
+    }
+}
+
+/// [`req`] from a field's encoding.
+pub(crate) fn dreq<T: Field>(bytes: Option<&[u8]>, name: &str) -> Result<T> {
+    match bytes {
+        Some(b) if !is_null(bytes) => {
+            T::decode_field(b).map_err(|e| CodecError::Invalid(format!("{name}: {e}")))
+        }
+        _ => invalid(format!("mandatory field {name} is null")),
+    }
 }
 
 /// Cuts trailing fields that are unset (null) or at their default.
@@ -389,6 +483,36 @@ macro_rules! composite {
                 ])
             }
 
+            #[allow(unused_assignments, unused_mut, unused_variables)]
+            fn encode_fields(&self, out: &mut Vec<u8>) -> usize {
+                let keep: [bool; composite!(@count $($field)*)] =
+                    [ $( composite!(@keep $kind self.$field $(, $def)?) ),* ];
+                let count = keep.iter().rposition(|k| *k).map_or(0, |i| i + 1);
+                let mut i = 0;
+                $(
+                    if i < count {
+                        composite!(@enc $kind self.$field, out);
+                    }
+                    i += 1;
+                )*
+                count
+            }
+
+            #[allow(unused_assignments, unused_mut, unused_variables)]
+            fn decode_fields(d: &mut $crate::codec::Decoder<'_>) -> $crate::codec::Result<Self> {
+                let mut fields: [Option<&[u8]>; composite!(@count $($field)*)] =
+                    [None; composite!(@count $($field)*)];
+                $crate::composite::read_list(d, &mut fields)?;
+                let mut i = 0;
+                Ok(Self {
+                    $( $field: {
+                        let v = fields[i];
+                        i += 1;
+                        composite!(@dread $kind $field v $(, $def)?)
+                    } ),*
+                })
+            }
+
             $(
                 fn form(&self) -> $crate::composite::ListForm {
                     let $s = self;
@@ -396,6 +520,35 @@ macro_rules! composite {
                 }
             )?
         }
+    };
+    (@count) => { 0 };
+    (@count $head:ident $($tail:ident)*) => { 1 + composite!(@count $($tail)*) };
+    (@keep opt $f:expr) => {
+        match &$f {
+            Some(v) => !$crate::composite::Field::is_null_field(v),
+            None => false,
+        }
+    };
+    (@keep req $f:expr) => { !$crate::composite::Field::is_null_field(&$f) };
+    (@keep def $f:expr, $def:expr) => {
+        $f != $def && !$crate::composite::Field::is_null_field(&$f)
+    };
+    (@enc opt $f:expr, $out:ident) => {
+        match &$f {
+            Some(v) => $crate::composite::Field::encode_field(v, $out),
+            None => $out.push($crate::codec::code::NULL),
+        }
+    };
+    (@enc req $f:expr, $out:ident) => { $crate::composite::Field::encode_field(&$f, $out) };
+    (@enc def $f:expr, $out:ident) => { $crate::composite::Field::encode_field(&$f, $out) };
+    (@dread opt $field:ident $v:ident) => {
+        $crate::composite::dopt($v, stringify!($field))?
+    };
+    (@dread req $field:ident $v:ident) => {
+        $crate::composite::dreq($v, stringify!($field))?
+    };
+    (@dread def $field:ident $v:ident, $def:expr) => {
+        $crate::composite::dopt($v, stringify!($field))?.unwrap_or($def)
     };
     (@ty opt $ty:ty) => { Option<$ty> };
     (@ty req $ty:ty) => { $ty };

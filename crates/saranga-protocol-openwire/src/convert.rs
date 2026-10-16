@@ -335,7 +335,7 @@ pub fn inbound(msg: &Message, wf: &mut WireFormat, now: i64) -> R<CoreMessage> {
             }
         }
     }
-    core.body = body.into_vec();
+    core.body = body.into_vec().into();
 
     put(&mut core, AMQ_MSG_ARRIVAL, PropertyValue::Long(msg.arrival));
     put(
@@ -559,7 +559,7 @@ pub struct DispatchTarget<'a> {
 }
 
 fn property<'a>(core: &'a CoreMessage, key: &str) -> Option<&'a PropertyValue> {
-    core.properties.get(&SimpleString::from(key))
+    core.properties.get_str(key)
 }
 
 fn string_of(v: &PropertyValue) -> Option<String> {
@@ -817,7 +817,7 @@ fn to_amq_message(
     let mut r = Reader::new(&core.body);
     let (data_type, content) = match core.message_type {
         message_type::BYTES => {
-            let mut b = core.body.clone();
+            let mut b = core.body.to_vec();
             if compressed {
                 b = deflate_bytes_message(&b);
             }
@@ -881,7 +881,14 @@ fn to_amq_message(
         }
         message_type::DEFAULT => {
             let b = core.body.clone();
-            (23, Some(if compressed { deflate(&b, false) } else { b }))
+            (
+                23,
+                Some(if compressed {
+                    deflate(&b, false)
+                } else {
+                    b.to_vec()
+                }),
+            )
         }
         t => return Err(err(format!("Unknown message type: {t}"))),
     };

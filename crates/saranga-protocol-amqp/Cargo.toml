@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bytes = "1"
 saranga-buffer = { path = "../saranga-buffer" }
 saranga-config = { path = "../saranga-config" }
 saranga-core-protocol = { path = "../saranga-core-protocol" }

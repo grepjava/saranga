@@ -42,8 +42,9 @@ pub fn describe(record: &PersistedMessage) -> Option<(Option<String>, String)> {
             ),
         ));
     };
-    let user_id = m
-        .properties()
+    let props = m.properties();
+    let user_id = props
+        .as_deref()
         .and_then(|p| p.message_id.as_ref())
         .map(to_string);
     let app = m.application_properties();
@@ -52,8 +53,8 @@ pub fn describe(record: &PersistedMessage) -> Option<(Option<String>, String)> {
         Some(ma) => map_string(ma.iter().map(|(k, v)| (k.0.clone(), to_string(v)))),
         None => "{}".into(),
     };
-    let properties = m
-        .properties()
+    let properties = props
+        .as_deref()
         .map_or_else(|| "null".into(), properties_string);
     let extra = m
         .record()

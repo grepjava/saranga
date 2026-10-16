@@ -131,13 +131,13 @@ pub fn frame_to_message(
 pub fn set_body(frame: &Frame, message: &mut CoreMessage) {
     if frame.has_header(names::CONTENT_LENGTH) {
         message.message_type = message_type::BYTES;
-        message.body = frame.body.clone();
+        message.body = frame.body.clone().into();
     } else {
         message.message_type = message_type::TEXT;
         let text = SimpleString::from(frame.body_text());
         let mut w = Writer::new();
         w.nullable_simple_string(Some(&text));
-        message.body = w.into_vec();
+        message.body = w.into_vec().into();
     }
 }
 
@@ -163,7 +163,7 @@ pub fn property_text(value: &PropertyValue) -> String {
 }
 
 fn property<'a>(message: &'a CoreMessage, name: &str) -> Option<&'a PropertyValue> {
-    message.properties.get(&SimpleString::from(name))
+    message.properties.get_str(name)
 }
 
 /// `getStringProperty`: any value as text, `None` for none.

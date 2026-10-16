@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use saranga_buffer::{PropertyValue, SimpleString};
+use saranga_buffer::PropertyValue;
 use saranga_config::CheckType;
 use saranga_core_protocol::ErrorType;
 use saranga_core_protocol::packets::xa::Xid;
@@ -18,8 +18,9 @@ use saranga_message::CoreMessage;
 use saranga_security::{Authenticated, SecurityError};
 use saranga_server::postoffice::{AutoCreate, AutoCreateOptions, QueueSpec, split_fqqn};
 use saranga_server::protocol::Connection as Accepted;
+use saranga_server::queue::AckResult;
 use saranga_server::session::{
-    ClientConnection, Completion, ServerSession, SessionOptions, Transport,
+    AckPending, ClientConnection, Completion, ServerSession, SessionOptions, Transport,
 };
 use saranga_server::transaction::{self, TxError, TxRef, TxState, xa_code};
 use saranga_server::{Broker, BrokerError, RoutingType};
@@ -255,15 +256,23 @@ async fn completer(out: Arc<Outbound>, mut rx: mpsc::UnboundedReceiver<Reply>) {
                     &OwError::io(e.to_string()),
                 ));
             }
-            Ok(()) => {
-                if let Some(c) = &reply.command {
-                    out.send(c);
-                }
-                if let Some(after) = reply.after {
-                    after();
-                }
-            }
+            Ok(()) => completed(&out, reply.command, reply.after),
         }
+    }
+}
+
+/// A reply whose journal writes are done: the command goes out, then what
+/// follows it.
+fn completed(
+    out: &Outbound,
+    command: Option<DataStructure>,
+    after: Option<Box<dyn FnOnce() + Send>>,
+) {
+    if let Some(c) = &command {
+        out.send(c);
+    }
+    if let Some(after) = after {
+        after();
     }
 }
 
@@ -286,6 +295,13 @@ fn response(correlation_id: i32) -> DataStructure {
 enum Event {
     /// `delayedStop`: a refused login closes the connection.
     Stop,
+    /// The queue answered an acknowledgement made outside a transaction
+    /// ([`Connection::acknowledge`]).
+    Acked {
+        session: SessionId,
+        pending: AckPending,
+        result: AckResult,
+    },
 }
 
 // ---------------------------------------------------------------- naming
@@ -606,6 +622,7 @@ pub async fn serve(broker: Arc<Broker>, manager: Arc<Manager>, c: Accepted) {
             () = failed.failed() => break,
             event = events_rx.recv() => match event {
                 Some(Event::Stop) | None => break,
+                Some(Event::Acked { session, pending, result }) => conn.acked(&session, pending, result),
             },
             _ = tick.tick() => {
                 if !conn.check_ttl() {
@@ -622,6 +639,19 @@ pub async fn serve(broker: Arc<Broker>, manager: Arc<Manager>, c: Accepted) {
                     }
                 }
             },
+        }
+    }
+    // Acknowledgements the queues answered are finished; any answering
+    // later find the channel closed and finish on their own.
+    events_rx.close();
+    while let Ok(event) = events_rx.try_recv() {
+        if let Event::Acked {
+            session,
+            pending,
+            result,
+        } = event
+        {
+            conn.acked(&session, pending, result);
         }
     }
     conn.fail().await;
@@ -883,11 +913,15 @@ impl Connection {
         if command.is_none() && after.is_none() && completion.is_empty() {
             return;
         }
-        let _ = self.replies.send(Reply {
+        self.queue_reply(Reply {
             completion,
             command,
             after,
         });
+    }
+
+    fn queue_reply(&mut self, reply: Reply) {
+        let _ = self.replies.send(reply);
     }
 
     /// `sendException`: an `ExceptionResponse` now.
@@ -1453,7 +1487,7 @@ impl Connection {
         if let Some(mut s) = self.sessions.remove(id) {
             s.session.close(false).await;
             let c = s.session.take_completion();
-            let _ = self.replies.send(Reply {
+            self.queue_reply(Reply {
                 completion: c,
                 command: None,
                 after: None,
@@ -1651,10 +1685,7 @@ impl Connection {
         );
         if fault_tolerant
             && dup_detection
-            && core
-                .properties
-                .get(&SimpleString::from(DUPLICATE_ID_PROPERTY))
-                .is_none()
+            && core.properties.get_str(DUPLICATE_ID_PROPERTY).is_none()
             && !producer
                 .destination
                 .as_ref()
@@ -1689,7 +1720,7 @@ impl Connection {
             let session = self.sessions.get_mut(&sid).expect("checked");
             session
                 .session
-                .set_sender(Some(convert::producer_id_string(&pid)));
+                .set_sender(Some(convert::producer_id_string(&pid).into()));
             let result = session.session.send_in(m, None, tx.clone()).await;
             session.session.set_sender(None);
             if let Err(e) = result {
@@ -2314,6 +2345,20 @@ impl Connection {
         Ok(())
     }
 
+    /// The rest of an acknowledgement made outside a transaction, once the
+    /// queue answered: its journal writes go with the next reply.
+    fn acked(&mut self, sid: &SessionId, pending: AckPending, result: AckResult) {
+        match self.sessions.get_mut(sid) {
+            Some(s) => {
+                if let Err(e) = s.session.acknowledged(pending, result) {
+                    tracing::debug!("{}", e.message);
+                }
+            }
+            None => pending.finish_alone(result),
+        }
+        self.reply(None, None);
+    }
+
     /// `AMQConsumer.acknowledge`.
     async fn acknowledge(
         &mut self,
@@ -2361,6 +2406,38 @@ impl Connection {
                     m.replenish(1, false);
                 }
                 return Ok(());
+            }
+            2 | 4 if tx.is_none() => {
+                // Outside a transaction nothing waits for the queue's
+                // answer (its failure only marks a transaction): each
+                // acknowledgement is on its way at once, and the next
+                // delivery's credit need not wait for it.
+                for d in &acked {
+                    let events = self.events.clone();
+                    let session_id = sid.clone();
+                    let sent = session.session.acknowledge_then(
+                        m.core_id,
+                        d.core,
+                        move |pending, result| {
+                            let acked = Event::Acked {
+                                session: session_id,
+                                pending,
+                                result,
+                            };
+                            if let Err(mpsc::error::SendError(Event::Acked {
+                                pending,
+                                result,
+                                ..
+                            })) = events.send(acked)
+                            {
+                                pending.finish_alone(result);
+                            }
+                        },
+                    );
+                    if let Err(e) = sent {
+                        tracing::debug!("{}", e.message);
+                    }
+                }
             }
             2 | 4 => {
                 let mut failure = None;

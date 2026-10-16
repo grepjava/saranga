@@ -6,6 +6,14 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
+// mimalloc packs the many small allocations a queued message makes (its
+// properties, strings and references) tighter than the system allocator,
+// and faster. Off (--no-default-features) for heap profilers that track
+// the system allocator.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod activation;
 mod client;
 mod completion;

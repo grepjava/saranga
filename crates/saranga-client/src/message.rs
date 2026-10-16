@@ -77,7 +77,7 @@ pub fn text_message(text: &str) -> CoreMessage {
 /// A durable BYTES message.
 pub fn bytes_message(bytes: &[u8]) -> CoreMessage {
     let mut m = new_message(message_type::BYTES, true);
-    m.body = bytes.to_vec();
+    m.body = bytes.to_vec().into();
     m
 }
 
@@ -113,7 +113,7 @@ impl MessageExt for CoreMessage {
     fn set_text(&mut self, text: Option<&str>) -> &mut Self {
         let mut w = Writer::new();
         w.nullable_simple_string(text.map(SimpleString::from).as_ref());
-        self.body = w.into_vec();
+        self.body = w.into_vec().into();
         self
     }
 
@@ -206,7 +206,7 @@ mod tests {
             97, 0, 110, 0, 103, 0, 97, 0,
         ];
         let m = text_message("hello saranga");
-        assert_eq!(m.body, golden);
+        assert_eq!(m.body[..], golden);
         assert_eq!(m.message_type, 3);
         assert!(m.durable);
         assert_eq!(m.priority, 4);
@@ -214,7 +214,7 @@ mod tests {
 
         let mut n = new_message(message_type::TEXT, true);
         n.set_text(None);
-        assert_eq!(n.body, [0]);
+        assert_eq!(n.body[..], [0]);
         assert_eq!(n.text().unwrap(), None);
     }
 
@@ -222,7 +222,7 @@ mod tests {
     fn bytes_body_is_raw() {
         let m = bytes_message(&[0, 1, 2, 3, 255]);
         assert_eq!(m.message_type, 4);
-        assert_eq!(m.body, [0, 1, 2, 3, 255]);
+        assert_eq!(m.body[..], [0, 1, 2, 3, 255]);
     }
 
     #[test]

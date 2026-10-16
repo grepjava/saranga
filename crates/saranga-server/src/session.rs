@@ -20,7 +20,9 @@ use crate::notifications::{NotificationType, hdr, string};
 use crate::postoffice::{
     BindingQueryResult, Creator, QueueQueryResult, QueueSpec, RoutingTypes, queue_name_of,
 };
-use crate::queue::{ConsumerId, ConsumerMetrics, ConsumerRegistration, DeliverySink, Queue};
+use crate::queue::{
+    AckResult, ConsumerId, ConsumerMetrics, ConsumerRegistration, DeliverySink, Queue,
+};
 use crate::registry::{ConsumerEntry, SessionEntry};
 use crate::storage::{Pending, Storage};
 use crate::transaction::{self, Outcome, Transaction, TxError, TxRef, TxState, XaError, xa_code};
@@ -345,6 +347,15 @@ struct ServerConsumer {
     filter: Option<String>,
 }
 
+/// `b` after `a`, taking `b` whole when `a` is empty (no allocation).
+fn append<T>(a: &mut Vec<T>, b: Vec<T>) {
+    if a.is_empty() {
+        *a = b;
+    } else {
+        a.extend(b);
+    }
+}
+
 /// The journal writes a request lined up, and the queue updates that must
 /// wait for them (`OperationContext`).
 #[derive(Default)]
@@ -379,9 +390,9 @@ impl Completion {
 
     /// Adds another request's writes and updates to these.
     pub fn merge(&mut self, other: Completion) {
-        self.waits.extend(other.waits);
-        self.actions.extend(other.actions);
-        self.replicated.extend(other.replicated);
+        append(&mut self.waits, other.waits);
+        append(&mut self.actions, other.actions);
+        append(&mut self.replicated, other.replicated);
     }
 
     /// Waits for the journal writes, then makes the queue updates; after a
@@ -415,6 +426,32 @@ impl Completion {
 
 fn lock_replicated(r: &Replicated) -> std::sync::MutexGuard<'_, Vec<Pending>> {
     r.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// An acknowledgement on its way to its queue
+/// ([`ServerSession::acknowledge_then`]).
+pub struct AckPending {
+    consumer_id: i64,
+    message_id: i64,
+    queue: Queue,
+}
+
+impl AckPending {
+    /// The rest of the acknowledgement when its session has gone: the
+    /// references are acknowledged in storage, or go back.
+    pub fn finish_alone(self, result: AckResult) {
+        match result {
+            Ok(mut refs) => {
+                for r in &mut refs {
+                    if let Err(e) = self.queue.store_ack(r) {
+                        tracing::warn!("acknowledging message {}: {e}", self.message_id);
+                    }
+                    let _ = self.queue.post_acknowledge(r);
+                }
+            }
+            Err(failed) => self.queue.reinsert(failed.refs),
+        }
+    }
 }
 
 pub struct ServerSession {
@@ -457,7 +494,10 @@ pub struct ServerSession {
     /// What management sees of the session.
     entry: Arc<SessionEntry>,
     /// The producer the next sends are counted against.
-    sender: Option<String>,
+    sender: Option<Arc<str>>,
+    /// The address of the last message sent and its name, which the next one
+    /// to the same address takes without converting it again.
+    last_address: Option<(SimpleString, Name)>,
     /// How its routes are mirrored: by a mirror target, as from its peer.
     mirroring: crate::mirror::Mirroring,
     /// The `sync` mirror waits the request so far lined up.
@@ -527,6 +567,7 @@ impl ServerSession {
             conn,
             entry,
             sender: None,
+            last_address: None,
             name: options.name,
             auth: SecurityAuth {
                 username: options.username,
@@ -580,6 +621,7 @@ impl ServerSession {
             conn,
             entry,
             sender: None,
+            last_address: None,
             name: name.to_owned(),
             auth: SecurityAuth {
                 username: None,
@@ -656,7 +698,9 @@ impl ServerSession {
         if message.message_id == 0 {
             message.message_id = po.ids().next();
         }
-        if let Some(a) = address {
+        if let Some(a) = address
+            && message.address.as_ref().is_none_or(|m| !m.eq_str(a))
+        {
             message.address = Some(SimpleString::from(a));
         }
         let Some(address) = message.address.as_ref().map(|a| a.to_string_lossy()) else {
@@ -742,7 +786,7 @@ impl ServerSession {
 
     /// The producer the following sends are counted against
     /// (`send(..., senderName)`).
-    pub fn set_sender(&mut self, name: Option<String>) {
+    pub fn set_sender(&mut self, name: Option<Arc<str>>) {
         self.sender = name;
     }
 
@@ -924,9 +968,11 @@ impl ServerSession {
         let Some(max) = self.broker.max_record_size() else {
             return Ok(None);
         };
+        // The encoded size, without copying the body: its length, the body,
+        // then the headers and properties.
         let mut w = saranga_buffer::Writer::new();
-        message.encode(&mut w);
-        if w.len() + 512 <= max {
+        message.encode_headers_and_properties(&mut w);
+        if 4 + message.body.len() + w.len() + 512 <= max {
             return Ok(None);
         }
         let id = self.broker.post_office().ids().next();
@@ -940,7 +986,7 @@ impl ServerSession {
             writer.append(chunk).map_err(io)?;
         }
         let size = message.body.len() as i64;
-        message.body = Vec::new();
+        message.body = Vec::new().into();
         message.message_id = id;
         let key = SimpleString::from(crate::message::HDR_LARGE_BODY_SIZE);
         if message.properties.get(&key).is_none() {
@@ -1092,7 +1138,14 @@ impl ServerSession {
         let _critical = entry.critical.enter();
         let address: Name = match &message.address {
             Some(a) => {
-                let a: Name = a.to_string_lossy().into();
+                let a: Name = match &self.last_address {
+                    Some((s, n)) if s == a => n.clone(),
+                    _ => {
+                        let n: Name = a.to_string_lossy().into();
+                        self.last_address = Some((a.clone(), n.clone()));
+                        n
+                    }
+                };
                 if self.default_address.is_none() {
                     self.entry.set_default_address(&a);
                 }
@@ -1179,7 +1232,7 @@ impl ServerSession {
             && self.broker.reject_empty_validated_user()
             && message
                 .properties
-                .get(&SimpleString::from(crate::message::HDR_VALIDATED_USER))
+                .get_str(crate::message::HDR_VALIDATED_USER)
                 .is_none()
         {
             return Err(BrokerError::reject_empty_validated_user());
@@ -1213,6 +1266,11 @@ impl ServerSession {
         let mut r = MessageRef::new(match outgoing {
             Outgoing::Core(Some(body)) => ServerMessage::new_large(message, body),
             Outgoing::Core(None) => ServerMessage::new(message),
+            // Unchanged by the broker, as a message whose protocol set its ID
+            // and address is: the native message and its view as they are.
+            Outgoing::Native(native, before, _, body) if before == message => {
+                ServerMessage::with_view(native, before, body)
+            }
             Outgoing::Native(native, before, _, body) => {
                 let n = native.updated(&before, &message);
                 match body {
@@ -1611,7 +1669,104 @@ impl ServerSession {
             return Err(e);
         };
         let queue = c.queue.clone();
-        match queue.ack(c.id, message_id, individual, tx.is_some()).await {
+        let result = queue.ack(c.id, message_id, individual, tx.is_some()).await;
+        let pending = AckPending {
+            consumer_id,
+            message_id,
+            queue,
+        };
+        self.acknowledged_in(pending, tx, result)
+    }
+
+    /// [`acknowledge_in`](Self::acknowledge_in) of one message outside a
+    /// transaction, without waiting for the queue: `then` has its answer,
+    /// on the queue's task, and gives it to
+    /// [`acknowledged`](Self::acknowledged). A connection whose client
+    /// acknowledges message after message so has them all on their way at
+    /// once, rather than each waiting for the one before.
+    pub fn acknowledge_then(
+        &mut self,
+        consumer_id: i64,
+        message_id: i64,
+        then: impl FnOnce(AckPending, AckResult) + Send + 'static,
+    ) -> Result<()> {
+        let Some(c) = self.consumers.get(&consumer_id) else {
+            return Err(BrokerError::consumer_doesnt_exist(consumer_id));
+        };
+        let pending = AckPending {
+            consumer_id,
+            message_id,
+            queue: c.queue.clone(),
+        };
+        c.queue
+            .ack_then(c.id, message_id, true, false, move |result| {
+                then(pending, result)
+            });
+        Ok(())
+    }
+
+    /// The rest of an [`acknowledge_then`](Self::acknowledge_then), once the
+    /// queue answered.
+    pub fn acknowledged(&mut self, pending: AckPending, result: AckResult) -> Result<Vec<i64>> {
+        let entry = self.entry.clone();
+        let _critical = entry.critical.enter();
+        self.acknowledged_in(pending, None, result)
+    }
+
+    /// [`acknowledge_in`](Self::acknowledge_in) of one message as part of
+    /// `tx`, without waiting for the queue: `then` has its answer, on the
+    /// queue's task, and gives it to
+    /// [`acknowledged_tx`](Self::acknowledged_tx) before `tx` commits.
+    pub fn acknowledge_in_then(
+        &mut self,
+        consumer_id: i64,
+        message_id: i64,
+        individual: bool,
+        tx: &TxRef,
+        then: impl FnOnce(AckPending, AckResult) + Send + 'static,
+    ) -> Result<()> {
+        let Some(c) = self.consumers.get(&consumer_id) else {
+            let e = BrokerError::consumer_doesnt_exist(consumer_id);
+            transaction::lock(tx).mark_rollback_only(&e);
+            return Err(e);
+        };
+        let pending = AckPending {
+            consumer_id,
+            message_id,
+            queue: c.queue.clone(),
+        };
+        c.queue
+            .ack_then(c.id, message_id, individual, true, move |result| {
+                then(pending, result)
+            });
+        Ok(())
+    }
+
+    /// The rest of an [`acknowledge_in_then`](Self::acknowledge_in_then),
+    /// once the queue answered: the references join `tx`.
+    pub fn acknowledged_tx(
+        &mut self,
+        pending: AckPending,
+        tx: &TxRef,
+        result: AckResult,
+    ) -> Result<Vec<i64>> {
+        let entry = self.entry.clone();
+        let _critical = entry.critical.enter();
+        self.acknowledged_in(pending, Some(tx.clone()), result)
+    }
+
+    fn acknowledged_in(
+        &mut self,
+        pending: AckPending,
+        tx: Option<TxRef>,
+        result: AckResult,
+    ) -> Result<Vec<i64>> {
+        let AckPending {
+            consumer_id,
+            message_id,
+            queue,
+        } = pending;
+        match result {
             Ok(mut refs) => {
                 let ids = refs.iter().map(MessageRef::message_id).collect();
                 if crate::audit::message_enabled() {

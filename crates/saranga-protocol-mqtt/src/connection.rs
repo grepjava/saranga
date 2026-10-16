@@ -12,17 +12,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use saranga_buffer::{PropertyValue, Reader, SimpleString};
+use saranga_buffer::{PropertyValue, Reader};
 use saranga_core_protocol::ErrorType;
 use saranga_message::{CoreMessage, message_type};
 use saranga_security::Authenticated;
 use saranga_server::message::{ServerMessage, now_millis};
 use saranga_server::postoffice::{QueueSpec, RoutingTypes};
 use saranga_server::protocol::Connection as Accepted;
-use saranga_server::queue::{DeliverySink, Queue};
+use saranga_server::queue::{AckResult, DeliverySink, Queue};
 use saranga_server::session::{
-    ClientConnection, Completion, ServerSession, SessionOptions, Transport,
+    AckPending, ClientConnection, Completion, ServerSession, SessionOptions, Transport,
 };
+use saranga_server::transaction::TxRef;
 use saranga_server::wildcard::WildcardConfig;
 use saranga_server::{Broker, BrokerError, RoutingType};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -100,6 +101,21 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedRec
 enum Event {
     /// A QoS 0 delivery went out: acknowledge it (`individualAcknowledge`).
     Ack { consumer: i64, message: i64 },
+    /// The queue answered a QoS 0 delivery's acknowledgement.
+    AckedAlone {
+        pending: AckPending,
+        result: AckResult,
+    },
+    /// The queue answered a QoS 1 or 2 acknowledgement made in `tx`
+    /// ([`Core::acknowledge_delivery`]).
+    Acked {
+        packet_id: i32,
+        needs_pubrel: bool,
+        consumer: i64,
+        tx: TxRef,
+        pending: AckPending,
+        result: AckResult,
+    },
     /// A delivery for a subscription that is gone goes back
     /// (`individualCancel`).
     Cancel { consumer: i64, message: i64 },
@@ -157,7 +173,12 @@ struct MqttSink {
 }
 
 impl DeliverySink for MqttSink {
-    fn deliver(&self, _consumer_id: i64, message: &ServerMessage, _delivery_count: i32) -> i64 {
+    fn deliver(
+        &self,
+        _consumer_id: i64,
+        message: &Arc<ServerMessage>,
+        _delivery_count: i32,
+    ) -> i64 {
         if self.shared.closed.load(Ordering::SeqCst) {
             return 0;
         }
@@ -212,10 +233,7 @@ fn decide_qos(shared: &Shared, message: &CoreMessage, consumer: i64) -> i32 {
     let Some(sub) = lock(&shared.consumer_qos).get(&consumer).copied() else {
         return -1;
     };
-    let qos = match message
-        .properties
-        .get(&SimpleString::from(util::MQTT_QOS_LEVEL_KEY))
-    {
+    let qos = match message.properties.get_str(util::MQTT_QOS_LEVEL_KEY) {
         Some(v) => int_value(v).unwrap_or(2),
         None => 2,
     };
@@ -358,21 +376,15 @@ fn publish_after(
                 .ok_or("null text body")?;
             saranga_storage::java::simple_string(&text).into_bytes()
         }
-        _ => message.body.clone(),
+        _ => message.body.to_vec(),
     };
-    let has = |k: &str| message.properties.get(&SimpleString::from(k)).is_some();
+    let has = |k: &str| message.properties.get_str(k).is_some();
     let mut is_retain = has(util::MQTT_MESSAGE_RETAIN_INITIAL_DISTRIBUTION_KEY);
     let mut properties = Properties::default();
     if shared.version == Version::V5 {
         let mut s = lock(&shared.state);
         properties = publish_properties(&s, message, &topic)?;
-        if !is_retain
-            && bool_value(
-                message
-                    .properties
-                    .get(&SimpleString::from(util::MQTT_MESSAGE_RETAIN_KEY)),
-            )
-        {
+        if !is_retain && bool_value(message.properties.get_str(util::MQTT_MESSAGE_RETAIN_KEY)) {
             // Artemis looks the subscription up by the topic and fails when
             // it was made with a filter that is not the topic itself; here
             // that subscription just is not retain-as-published.
@@ -472,7 +484,7 @@ fn publish_properties(
     message: &CoreMessage,
     topic: &str,
 ) -> Result<Properties, String> {
-    let get = |k: &str| message.properties.get(&SimpleString::from(k));
+    let get = |k: &str| message.properties.get_str(k);
     let mut props = Properties::default();
     if let Some(v) = get(util::MQTT_PAYLOAD_FORMAT_INDICATOR_KEY) {
         props.add_int(prop::PAYLOAD_FORMAT_INDICATOR, int_value(v).unwrap_or(0));
@@ -630,7 +642,7 @@ impl Core {
                 self.session.add_producer(&name, "MQTT", None);
                 name
             });
-            self.session.set_sender(Some(sender.clone()));
+            self.session.set_sender(Some(sender.as_str().into()));
             let sent = self.session.send_in(message, None, tx.clone()).await;
             self.session.set_sender(None);
             sent?;
@@ -1156,7 +1168,10 @@ impl Core {
     }
 
     /// `MQTTPublishManager.acknowledgeDelivery`: the client confirmed a
-    /// QoS 1 or 2 delivery; for QoS 2 the PUBREL follows.
+    /// QoS 1 or 2 delivery; for QoS 2 the PUBREL follows. The
+    /// acknowledgement goes to the queue without waiting for it, so that a client acknowledging message after
+    /// message has them all on their way at once; the queue's answer comes
+    /// back as [`Event::Acked`] and [`acked`](Self::acked) commits.
     async fn acknowledge_delivery(&mut self, packet_id: i32, needs_pubrel: bool) {
         let info = lock(&self.state).core_delivery_info(packet_id).cloned();
         let Some(info) = info else {
@@ -1178,7 +1193,7 @@ impl Core {
             return;
         }
         let tx = self.session.new_transaction();
-        let result: Result<(), BrokerError> = async {
+        let result: Result<(), BrokerError> = (|| {
             if needs_pubrel {
                 let prefix = self.prefix();
                 lock(&self.state)
@@ -1188,17 +1203,52 @@ impl Core {
             self.manager
                 .correlations
                 .remove_in(&self.session, &self.client_id, &info.key, &tx)?;
-            self.session
-                .acknowledge_in(
-                    info.consumer_id,
-                    info.key.message_id,
-                    true,
-                    Some(tx.clone()),
-                )
-                .await?;
-            self.session.commit_tx(&tx)
+            let events = self.shared.events.clone();
+            let held = tx.clone();
+            let consumer = info.consumer_id;
+            self.session.acknowledge_in_then(
+                consumer,
+                info.key.message_id,
+                true,
+                &tx,
+                move |pending, result| {
+                    let acked = Event::Acked {
+                        packet_id,
+                        needs_pubrel,
+                        consumer,
+                        tx: held,
+                        pending,
+                        result,
+                    };
+                    if let Err(mpsc::error::SendError(Event::Acked {
+                        pending, result, ..
+                    })) = events.send(acked)
+                    {
+                        pending.finish_alone(result);
+                    }
+                },
+            )
+        })();
+        if let Err(e) = result {
+            self.ack_failed(packet_id, needs_pubrel, &tx, e);
         }
-        .await;
+    }
+
+    /// The rest of [`acknowledge_delivery`](Self::acknowledge_delivery)
+    /// once the queue answered.
+    fn acked(
+        &mut self,
+        packet_id: i32,
+        needs_pubrel: bool,
+        consumer: i64,
+        tx: TxRef,
+        pending: AckPending,
+        result: AckResult,
+    ) {
+        let result = self
+            .session
+            .acknowledged_tx(pending, &tx, result)
+            .and_then(|_| self.session.commit_tx(&tx));
         match result {
             Ok(()) => {
                 {
@@ -1206,19 +1256,21 @@ impl Core {
                     s.remove_core_delivery_info(packet_id);
                     s.send_quota -= 1;
                 }
-                self.session.prompt_delivery(info.consumer_id);
+                self.session.prompt_delivery(consumer);
                 self.ack_reply(packet_id, reason::SUCCESS, needs_pubrel);
             }
-            Err(e) => {
-                let _ = self.session.rollback_tx(&tx);
-                tracing::warn!(
-                    "AMQ832001: MQTT client {} failed to acknowledge message: {}",
-                    self.client_id,
-                    e.message
-                );
-                self.ack_reply(packet_id, reason::PACKET_IDENTIFIER_NOT_FOUND, needs_pubrel);
-            }
+            Err(e) => self.ack_failed(packet_id, needs_pubrel, &tx, e),
         }
+    }
+
+    fn ack_failed(&mut self, packet_id: i32, needs_pubrel: bool, tx: &TxRef, e: BrokerError) {
+        let _ = self.session.rollback_tx(tx);
+        tracing::warn!(
+            "AMQ832001: MQTT client {} failed to acknowledge message: {}",
+            self.client_id,
+            e.message
+        );
+        self.ack_reply(packet_id, reason::PACKET_IDENTIFIER_NOT_FOUND, needs_pubrel);
     }
 
     fn ack_reply(&mut self, packet_id: i32, code: u8, needs_pubrel: bool) {
@@ -1299,7 +1351,7 @@ fn create_server_message(
         address: Some(address.into()),
         message_type: message_type::BYTES,
         timestamp: now,
-        body: publish.payload.clone(),
+        body: publish.payload.clone().into(),
         ..CoreMessage::default()
     };
     let p = &mut m.properties;
@@ -1480,6 +1532,14 @@ pub async fn serve(
         }
         if conn.closing {
             break;
+        }
+    }
+    // Acknowledgements the queues answered are finished; any answering
+    // later find the channel closed and finish on their own.
+    events_rx.close();
+    while let Ok(event) = events_rx.try_recv() {
+        if matches!(event, Event::Acked { .. } | Event::AckedAlone { .. }) {
+            conn.on_event(event).await;
         }
     }
     if !conn.stopped {
@@ -1693,17 +1753,48 @@ impl Conn {
     }
 
     async fn on_event(&mut self, event: Event) {
-        let Some(core) = &mut self.core else { return };
+        let Some(core) = &mut self.core else {
+            // The session went before the queue answered.
+            match event {
+                Event::AckedAlone { pending, result } => pending.finish_alone(result),
+                Event::Acked {
+                    pending, result, ..
+                } => pending.finish_alone(result),
+                _ => {}
+            }
+            return;
+        };
         match event {
             Event::Ack { consumer, message } => {
-                if let Err(e) = core
-                    .session
-                    .acknowledge_in(consumer, message, true, None)
-                    .await
-                {
+                let events = self.events.clone();
+                let sent =
+                    core.session
+                        .acknowledge_then(consumer, message, move |pending, result| {
+                            if let Err(mpsc::error::SendError(Event::AckedAlone {
+                                pending,
+                                result,
+                            })) = events.send(Event::AckedAlone { pending, result })
+                            {
+                                pending.finish_alone(result);
+                            }
+                        });
+                if let Err(e) = sent {
                     tracing::debug!("{}", e.message);
                 }
             }
+            Event::AckedAlone { pending, result } => {
+                if let Err(e) = core.session.acknowledged(pending, result) {
+                    tracing::debug!("{}", e.message);
+                }
+            }
+            Event::Acked {
+                packet_id,
+                needs_pubrel,
+                consumer,
+                tx,
+                pending,
+                result,
+            } => core.acked(packet_id, needs_pubrel, consumer, tx, pending, result),
             Event::Cancel { consumer, message } => {
                 core.session.cancel_one(consumer, message, false)
             }

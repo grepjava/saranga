@@ -298,7 +298,7 @@ mod tests {
             durable: true,
             timestamp: 1_000,
             priority: 4,
-            body: vec![1, 0, 0, 0, 2, 0x61, 0],
+            body: vec![1, 0, 0, 0, 2, 0x61, 0].into(),
             ..Default::default()
         };
         m.properties.insert("k".into(), PropertyValue::Int(1));

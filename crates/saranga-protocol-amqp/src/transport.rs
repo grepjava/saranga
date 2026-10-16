@@ -243,6 +243,36 @@ pub enum Performative {
 }
 
 impl Performative {
+    /// Reads a performative straight from its encoding, as
+    /// [`from_value`](Self::from_value) reads it from its value.
+    pub fn decode(d: &mut crate::codec::Decoder<'_>) -> Result<Self> {
+        use crate::composite::Composite;
+        let Some(desc) = d.read_described_head()? else {
+            return Self::from_value(d.read()?);
+        };
+        Ok(if Transfer::is(&desc) {
+            Self::Transfer(Transfer::decode_fields(d)?)
+        } else if Disposition::is(&desc) {
+            Self::Disposition(Disposition::decode_fields(d)?)
+        } else if Flow::is(&desc) {
+            Self::Flow(Flow::decode_fields(d)?)
+        } else if Open::is(&desc) {
+            Self::Open(Open::decode_fields(d)?)
+        } else if Begin::is(&desc) {
+            Self::Begin(Begin::decode_fields(d)?)
+        } else if Attach::is(&desc) {
+            Self::Attach(Attach::decode_fields(d)?)
+        } else if Detach::is(&desc) {
+            Self::Detach(Detach::decode_fields(d)?)
+        } else if End::is(&desc) {
+            Self::End(End::decode_fields(d)?)
+        } else if Close::is(&desc) {
+            Self::Close(Close::decode_fields(d)?)
+        } else {
+            return Self::from_value(Value::Described(Box::new(desc), Box::new(d.read()?)));
+        })
+    }
+
     pub fn from_value(v: Value) -> Result<Self> {
         let Value::Described(d, body) = v else {
             return invalid(format!("performative {v:?}"));

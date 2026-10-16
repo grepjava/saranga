@@ -248,7 +248,7 @@ impl SessionState {
     pub fn decode(message: &CoreMessage) -> Result<Self, String> {
         let client_id = message
             .properties
-            .get(&SimpleString::from(util::HDR_LAST_VALUE_NAME))
+            .get_str(util::HDR_LAST_VALUE_NAME)
             .map(property_string)
             .unwrap_or_default();
         let mut state = Self::new(&client_id);
@@ -458,7 +458,7 @@ impl SessionState {
             w.nullable_i32(item.id);
         }
         w.i32(self.client_session_expiry_interval);
-        message.body = w.into_vec();
+        message.body = w.into_vec().into();
         message
     }
 
@@ -700,7 +700,7 @@ impl StateManager {
             let message = r.message.core();
             let client_id = message
                 .properties
-                .get(&SimpleString::from(util::HDR_LAST_VALUE_NAME))
+                .get_str(util::HDR_LAST_VALUE_NAME)
                 .map(property_string);
             let Some(client_id) = client_id.filter(|c| !c.is_empty()) else {
                 tracing::warn!(

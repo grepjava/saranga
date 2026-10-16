@@ -159,7 +159,7 @@ pub(crate) struct CoreSession {
     /// The size of the chunks large messages are sent to consumers in.
     min_large_message_size: i32,
     /// The client's producer IDs and the names the session knows them by.
-    producers: HashMap<i32, String>,
+    producers: HashMap<i32, Arc<str>>,
     /// The large message being received (`currentLargeMessage`): its
     /// headers, and its body so far.
     large: Option<(CoreMessage, LargeWriter)>,
@@ -721,7 +721,7 @@ impl CoreSession {
                     let name = format!("artemis:sender:ID:{}", uuid::Uuid::new_v4());
                     let address = p.address.map(|a| a.to_string_lossy());
                     self.session.add_producer(&name, "CORE", address.as_deref());
-                    self.producers.insert(p.id, name);
+                    self.producers.insert(p.id, name.into());
                 }
                 (false, Ok(None), false)
             }

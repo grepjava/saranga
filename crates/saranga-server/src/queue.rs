@@ -53,7 +53,7 @@ pub type FilterRef = Arc<dyn MessageFilter>;
 pub trait DeliverySink: Send + Sync {
     /// Sends one delivery and returns its size in flow-control credits
     /// (for Core, the size of the whole `SESS_RECEIVE_MSG` packet).
-    fn deliver(&self, consumer_id: i64, message: &ServerMessage, delivery_count: i32) -> i64;
+    fn deliver(&self, consumer_id: i64, message: &Arc<ServerMessage>, delivery_count: i32) -> i64;
 
     /// Starts a large message's delivery: its headers and body size
     /// (`sendLargeMessage`). Returns the credits used.
@@ -230,6 +230,27 @@ pub struct AckError {
     pub refs: Vec<MessageRef>,
 }
 
+/// What an acknowledgement took off the delivering list, or why it failed.
+pub type AckResult = Result<Vec<MessageRef>, AckError>;
+
+/// Where an acknowledgement's answer goes: to a caller waiting for it,
+/// or to a function the actor calls, which must not block.
+pub enum AckReply {
+    Wait(oneshot::Sender<AckResult>),
+    Then(Box<dyn FnOnce(AckResult) + Send>),
+}
+
+impl AckReply {
+    fn send(self, result: AckResult) {
+        match self {
+            Self::Wait(reply) => {
+                let _ = reply.send(result);
+            }
+            Self::Then(then) => then(result),
+        }
+    }
+}
+
 enum Cmd {
     Add(MessageRef),
     Reinsert(Vec<MessageRef>),
@@ -253,7 +274,7 @@ enum Cmd {
         message_id: i64,
         individual: bool,
         transactional: bool,
-        reply: oneshot::Sender<Result<Vec<MessageRef>, AckError>>,
+        reply: AckReply,
     },
     CancelDelivering {
         id: ConsumerId,
@@ -864,9 +885,29 @@ impl Queue {
             message_id,
             individual,
             transactional,
-            reply,
+            reply: AckReply::Wait(reply),
         });
         wait.await.unwrap_or(Ok(Vec::new()))
+    }
+
+    /// [`ack`](Self::ack) without waiting: `then` has the answer, on the
+    /// queue's task, so that a connection acknowledging message after
+    /// message need not wait for each in turn.
+    pub fn ack_then(
+        &self,
+        id: ConsumerId,
+        message_id: i64,
+        individual: bool,
+        transactional: bool,
+        then: impl FnOnce(AckResult) + Send + 'static,
+    ) {
+        self.send(Cmd::Ack {
+            id,
+            message_id,
+            individual,
+            transactional,
+            reply: AckReply::Then(Box::new(then)),
+        });
     }
 
     /// Stops a consumer and takes back everything it is delivering, for a
@@ -1133,20 +1174,23 @@ impl Consumer {
     }
 
     /// Hands a message to the sink; a large one starts a transfer.
-    fn send(&mut self, message: &ServerMessage, delivery_count: i32) {
+    fn send(&mut self, message: &Arc<ServerMessage>, delivery_count: i32) {
         let id = self.reg.client_id;
         // A native message holds its whole encoding: it goes as it is.
         let size = match message.large().filter(|_| message.native().is_none()) {
             None => self.reg.sink.deliver(id, message, delivery_count),
             Some(body) if !self.reg.sink.supports_large() => {
                 let mut core = message.core().clone();
-                core.body = body.read_all().unwrap_or_else(|e| {
-                    tracing::warn!(
-                        "AMQ222110: Error on resetting large message deliver - {}: {e}",
-                        message.message_id()
-                    );
-                    Vec::new()
-                });
+                core.body = body
+                    .read_all()
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "AMQ222110: Error on resetting large message deliver - {}: {e}",
+                            message.message_id()
+                        );
+                        Vec::new()
+                    })
+                    .into();
                 self.reg
                     .sink
                     .deliver(id, &ServerMessage::new(core), delivery_count)
@@ -1327,6 +1371,10 @@ impl Actor {
                     running = false;
                     break;
                 }
+                // try_recv takes no cooperative budget: without this, a
+                // steady stream of sends keeps the actor running, and the
+                // tasks it woke (a consumer's connection) wait behind it.
+                tokio::task::consume_budget().await;
             }
             if !running {
                 break;
@@ -1842,7 +1890,7 @@ impl Actor {
                 reply,
             } => {
                 let result = self.ack(id, message_id, individual, transactional);
-                let _ = reply.send(result);
+                reply.send(result);
             }
             Cmd::CancelDelivering {
                 id,
@@ -2286,7 +2334,7 @@ impl Actor {
         };
         let c = &mut self.consumers[index];
         r.delivery_count += 1;
-        c.send(flagged.as_deref().unwrap_or(&r.message), r.delivery_count);
+        c.send(flagged.as_ref().unwrap_or(&r.message), r.delivery_count);
         if c.large.is_some() && c.continue_large() {
             self.shared.tx.send(Cmd::ResumeLarge).ok();
         }

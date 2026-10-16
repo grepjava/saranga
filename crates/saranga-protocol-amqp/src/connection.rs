@@ -47,6 +47,7 @@ use crate::transport::{
 };
 use crate::types::{Symbol, Value};
 use crate::{AmqpConfig, Settings};
+use saranga_buffer::SimpleString;
 
 /// The SASL mechanisms offered by default (`MechanismFinder`).
 const DEFAULT_MECHANISMS: [&str; 2] = ["PLAIN", "ANONYMOUS"];
@@ -101,12 +102,83 @@ enum Out {
     Close,
 }
 
-#[derive(Clone)]
-struct Outbound(mpsc::UnboundedSender<Out>);
+/// Past this, corked bytes go to the writer without waiting for the task
+/// to run out of work.
+const CORK_LIMIT: usize = 64 * 1024;
+
+struct Outbound {
+    tx: mpsc::UnboundedSender<Out>,
+    /// What the task wrote since it last flushed, with nothing to wait for:
+    /// it goes to the writer as one once the task has no frame or event
+    /// left to handle, as Netty flushes at the end of a read. Handed over
+    /// one frame at a time, a burst of deliveries or dispositions went out
+    /// in a segment each, and the client woke and read for each.
+    corked: Mutex<Cork>,
+}
+
+#[derive(Default)]
+struct Cork {
+    bytes: Vec<u8>,
+    /// Only the task's loop flushes: before it, as the handshake waits
+    /// for the peer, everything goes at once.
+    on: bool,
+}
 
 impl Outbound {
+    fn new(tx: mpsc::UnboundedSender<Out>) -> Self {
+        Self {
+            tx,
+            corked: Mutex::new(Cork::default()),
+        }
+    }
+
+    /// Corks what is written from now on, or stops and flushes.
+    fn cork(&self, on: bool) {
+        lock(&self.corked).on = on;
+        if !on {
+            self.flush();
+        }
+    }
+
     fn send(&self, wait: Completion, bytes: Vec<u8>) {
-        let _ = self.0.send(Out::Send { wait, bytes });
+        if wait.is_empty() {
+            let mut corked = lock(&self.corked);
+            if !corked.on && corked.bytes.is_empty() {
+                drop(corked);
+                let _ = self.tx.send(Out::Send { wait, bytes });
+                return;
+            }
+            if corked.bytes.is_empty() {
+                corked.bytes = bytes;
+            } else {
+                corked.bytes.extend_from_slice(&bytes);
+            }
+            if corked.on && corked.bytes.len() < CORK_LIMIT {
+                return;
+            }
+            let bytes = std::mem::take(&mut corked.bytes);
+            drop(corked);
+            let _ = self.tx.send(Out::Send {
+                wait: Completion::default(),
+                bytes,
+            });
+        } else {
+            // What came before goes first, without waiting for these
+            // writes.
+            self.flush();
+            let _ = self.tx.send(Out::Send { wait, bytes });
+        }
+    }
+
+    /// Hands what is corked to the writer.
+    fn flush(&self) {
+        let bytes = std::mem::take(&mut lock(&self.corked).bytes);
+        if !bytes.is_empty() {
+            let _ = self.tx.send(Out::Send {
+                wait: Completion::default(),
+                bytes,
+            });
+        }
     }
 
     fn now(&self, bytes: Vec<u8>) {
@@ -114,11 +186,13 @@ impl Outbound {
     }
 
     fn close(&self) {
-        let _ = self.0.send(Out::Close);
+        self.flush();
+        let _ = self.tx.send(Out::Close);
     }
 
     fn frame(&self, channel: u16, p: Performative, payload: &[u8], wait: Completion) {
-        let mut out = Vec::new();
+        // The header and a performative fit in 128 bytes but for long names.
+        let mut out = Vec::with_capacity(128 + payload.len());
         frame::encode_amqp(&mut out, channel, &p, payload);
         self.send(wait, out);
     }
@@ -153,7 +227,8 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedRec
 
 struct Reader<R> {
     rd: R,
-    buf: Vec<u8>,
+    /// What was read and not yet taken: frames are split off it, not copied.
+    buf: ::bytes::BytesMut,
 }
 
 #[derive(Debug)]
@@ -166,16 +241,15 @@ enum ReadError {
 impl<R: AsyncRead + Unpin> Reader<R> {
     async fn fill(&mut self, n: usize) -> Result<(), ReadError> {
         while self.buf.len() < n {
-            let mut chunk = [0u8; 16 * 1024];
+            self.buf.reserve((n - self.buf.len()).max(16 * 1024));
             let got = self
                 .rd
-                .read(&mut chunk)
+                .read_buf(&mut self.buf)
                 .await
                 .map_err(|_| ReadError::Closed)?;
             if got == 0 {
                 return Err(ReadError::Closed);
             }
-            self.buf.extend_from_slice(&chunk[..got]);
         }
         Ok(())
     }
@@ -183,12 +257,19 @@ impl<R: AsyncRead + Unpin> Reader<R> {
     async fn header(&mut self) -> Result<[u8; 8], ReadError> {
         self.fill(8).await?;
         let h: [u8; 8] = self.buf[..8].try_into().expect("8 bytes");
-        self.buf.drain(..8);
+        let _ = self.buf.split_to(8);
         Ok(h)
     }
 
+    /// Whether a whole frame (or a header) is read and not yet taken.
+    fn ready(&self) -> bool {
+        self.buf.len() >= 8
+            && (self.buf.starts_with(b"AMQP")
+                || frame::frame_size(&self.buf).is_some_and(|n| self.buf.len() >= n as usize))
+    }
+
     /// The next frame, no larger than `max`.
-    async fn frame(&mut self, max: u32) -> Result<Vec<u8>, ReadError> {
+    async fn frame(&mut self, max: u32) -> Result<::bytes::Bytes, ReadError> {
         self.fill(8).await?;
         let size = frame::frame_size(&self.buf).expect("4 bytes");
         if size < 8 {
@@ -198,7 +279,7 @@ impl<R: AsyncRead + Unpin> Reader<R> {
             return Err(ReadError::TooLarge(size));
         }
         self.fill(size as usize).await?;
-        Ok(self.buf.drain(..size as usize).collect())
+        Ok(self.buf.split_to(size as usize).freeze())
     }
 }
 
@@ -215,6 +296,13 @@ enum Event {
     },
     /// A drain the client asked for is done: no more messages now.
     Drained { channel: u16, handle: u32 },
+    /// The queue's answer to an acknowledgement the client's
+    /// disposition made (`acknowledge_then`).
+    Acked {
+        channel: u16,
+        pending: saranga_server::session::AckPending,
+        result: saranga_server::queue::AckResult,
+    },
     /// The broker closes the link (`AMQPSessionCallback.disconnect`).
     Disconnect {
         channel: u16,
@@ -335,11 +423,11 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl DeliverySink for Sink {
-    fn deliver(&self, _consumer_id: i64, message: &ServerMessage, delivery_count: i32) -> i64 {
+    fn deliver(&self, _consumer_id: i64, message: &Arc<ServerMessage>, delivery_count: i32) -> i64 {
         if message
             .core()
             .properties
-            .get(&saranga_buffer::SimpleString::from(FORCED_DELIVERY_MESSAGE))
+            .get_str(FORCED_DELIVERY_MESSAGE)
             .is_some()
         {
             let _ = self.events.send(Event::Drained {
@@ -394,11 +482,11 @@ impl DeliverySink for Sink {
     }
 }
 
-/// The delivery's own handle on the message the queue keeps: the native
-/// form if it has one, else its Core form.
-fn delivery_message(m: &ServerMessage) -> Arc<ServerMessage> {
+/// The message to deliver: the one the queue keeps if it is native, else
+/// its Core form.
+fn delivery_message(m: &Arc<ServerMessage>) -> Arc<ServerMessage> {
     match m.native() {
-        Some(n) => ServerMessage::new_native(n.clone()),
+        Some(_) => m.clone(),
         None => ServerMessage::new(m.delivery_core().clone()),
     }
 }
@@ -455,9 +543,10 @@ struct Incoming {
 
 /// A link the client sends on (`ProtonServerReceiverContext`).
 struct ReceiverLink {
-    name: String,
-    target: ReceiverTarget,
-    source: Option<Source>,
+    // Shared, as each transfer takes them while the session is lent out.
+    name: Arc<str>,
+    target: Arc<ReceiverTarget>,
+    source: Option<Arc<Source>>,
     /// What the broker granted and has not been used.
     credit: u32,
     delivery_count: u32,
@@ -468,6 +557,9 @@ struct ReceiverLink {
     /// Its credit window and low mark, when not the acceptor's.
     window: Option<(i32, i32)>,
     state: ReceiverState,
+    /// The address its last message went to, kept for the next, which
+    /// shares it rather than holding its own.
+    last_address: Option<SimpleString>,
 }
 
 /// What a receiving link does with a message.
@@ -576,7 +668,8 @@ struct CoordinatorLink {
 
 enum Link {
     Receiver(ReceiverLink),
-    Sender(SenderLink),
+    // Boxed: a sender holds much more than the other links.
+    Sender(Box<SenderLink>),
     Coordinator(CoordinatorLink),
 }
 
@@ -681,6 +774,8 @@ struct Conn {
     password: Option<String>,
     auth: Authenticated,
     remote_container: Option<String>,
+    /// The same, shared by the messages it sends (`connectionID`).
+    remote_container_id: Option<Arc<str>>,
     registered: bool,
     opened: bool,
     remote_max_frame: u32,
@@ -812,12 +907,13 @@ where
         settings,
         config,
         registry,
-        out: Outbound(out_tx),
+        out: Outbound::new(out_tx),
         events: events_tx,
         user: None,
         password: None,
         auth: Authenticated::default(),
         remote_container: None,
+        remote_container_id: None,
         registered: false,
         opened: false,
         remote_max_frame: u32::MAX,
@@ -838,7 +934,7 @@ where
     };
     let mut reader = Reader {
         rd,
-        buf: Vec::new(),
+        buf: ::bytes::BytesMut::new(),
     };
     let shaken = if conn.outgoing.is_some() {
         conn.client_handshake(&mut reader).await
@@ -850,6 +946,19 @@ where
             conn.open_out().await;
         }
         conn.run(&mut reader, &mut events_rx).await;
+    }
+    // Acknowledgements on their way finish before the sessions close; one
+    // answered from now on finishes alone.
+    events_rx.close();
+    while let Ok(ev) = events_rx.try_recv() {
+        if let Event::Acked {
+            channel,
+            pending,
+            result,
+        } = ev
+        {
+            conn.acked(channel, pending, result);
+        }
     }
     conn.shutdown().await;
     conn.out.close();
@@ -1161,8 +1270,12 @@ impl Conn {
     ) {
         let max = self.settings.max_frame_size.max(frame::MIN_MAX_FRAME_SIZE);
         let client = self.client.clone();
+        // One timer, set again when it fires, rather than one made and
+        // dropped for each frame: tick looks at the idle times itself.
+        let tick = tokio::time::sleep(self.next_tick());
+        tokio::pin!(tick);
+        self.out.cork(true);
         while !self.closed {
-            let tick = self.next_tick();
             tokio::select! {
                 // Management failed the connection: it goes as if the
                 // client had.
@@ -1190,9 +1303,20 @@ impl Conn {
                         self.close_with(e);
                     }
                 }
-                _ = tokio::time::sleep(tick) => self.tick(),
+                () = &mut tick => {
+                    self.tick();
+                    tick.as_mut().reset(tokio::time::Instant::now() + self.next_tick());
+                }
             }
+            // Frames already read take no cooperative budget: without this,
+            // a client sending fast keeps the task running, and the tasks it
+            // woke (the queues) wait behind it.
+            if !r.ready() && events.is_empty() {
+                self.out.flush();
+            }
+            tokio::task::consume_budget().await;
         }
+        self.out.cork(false);
     }
 
     fn next_tick(&self) -> Duration {
@@ -1370,6 +1494,7 @@ impl Conn {
             return Err(Fatal::new(condition::ILLEGAL_STATE, "a second open"));
         }
         self.remote_container = Some(open.container_id.clone());
+        self.remote_container_id = Some(open.container_id.as_str().into());
         self.remote_max_frame = open.max_frame_size.max(frame::MIN_MAX_FRAME_SIZE);
         self.remote_idle = open
             .idle_time_out
@@ -1736,14 +1861,15 @@ impl Conn {
         s.links.insert(
             attach.handle,
             Link::Receiver(ReceiverLink {
-                name: attach.name.clone(),
-                target: ReceiverTarget {
+                last_address: None,
+                name: attach.name.clone().into(),
+                target: Arc::new(ReceiverTarget {
                     address: Some(address),
                     explicit: None,
                     implicit: None,
                     dynamic: false,
-                },
-                source: attach.source.clone(),
+                }),
+                source: attach.source.clone().map(Arc::new),
                 credit: credits,
                 delivery_count,
                 incoming: None,
@@ -1870,14 +1996,15 @@ impl Conn {
         s.links.insert(
             attach.handle,
             Link::Receiver(ReceiverLink {
-                name: attach.name.clone(),
-                target: ReceiverTarget {
+                last_address: None,
+                name: attach.name.clone().into(),
+                target: Arc::new(ReceiverTarget {
                     address: None,
                     explicit: None,
                     implicit: None,
                     dynamic: false,
-                },
-                source: attach.source.clone(),
+                }),
+                source: attach.source.clone().map(Arc::new),
                 credit: 10,
                 delivery_count,
                 incoming: None,
@@ -2366,9 +2493,10 @@ impl Conn {
         s.links.insert(
             attach.handle,
             Link::Receiver(ReceiverLink {
-                name: attach.name.clone(),
-                target: resolved,
-                source: attach.source,
+                last_address: None,
+                name: attach.name.as_str().into(),
+                target: Arc::new(resolved),
+                source: attach.source.map(Arc::new),
                 credit: credits,
                 delivery_count,
                 incoming: None,
@@ -2470,7 +2598,7 @@ impl Conn {
         let presettled = attach.snd_settle_mode == SenderSettleMode::Settled;
         s.links.insert(
             attach.handle,
-            Link::Sender(SenderLink {
+            Link::Sender(Box::new(SenderLink {
                 name: attach.name.clone(),
                 consumer,
                 resolved,
@@ -2483,7 +2611,7 @@ impl Conn {
                 fed: None,
                 bridge: None,
                 mirror: None,
-            }),
+            })),
         );
         let mut reply = reply;
         reply.source = source;
@@ -2526,7 +2654,7 @@ impl Conn {
         if let Some(l) = &link {
             match l {
                 Link::Receiver(rl) => {
-                    link_name = rl.name.clone();
+                    link_name = rl.name.to_string();
                     if let ReceiveMode::Managed(c) = &rl.mode {
                         intercepted = c.remote_closed(detach.error.as_ref());
                     }
@@ -2718,14 +2846,15 @@ impl Conn {
                 s.links.insert(
                     handle,
                     Link::Receiver(ReceiverLink {
-                        name,
-                        target: ReceiverTarget {
+                        last_address: None,
+                        name: name.into(),
+                        target: Arc::new(ReceiverTarget {
                             address: Some(address),
                             explicit: Some(routing),
                             implicit: Some(routing),
                             dynamic: false,
-                        },
-                        source: link.attach.source.clone(),
+                        }),
+                        source: link.attach.source.clone().map(Arc::new),
                         credit: credits,
                         delivery_count,
                         incoming: None,
@@ -2821,7 +2950,7 @@ impl Conn {
         let routing_type = s.server.queue_query(queue).routing_type;
         s.links.insert(
             handle,
-            Link::Sender(SenderLink {
+            Link::Sender(Box::new(SenderLink {
                 name,
                 consumer,
                 resolved: SenderSource {
@@ -2845,7 +2974,7 @@ impl Conn {
                 fed,
                 bridge: None,
                 mirror: None,
-            }),
+            })),
         );
         Ok(())
     }
@@ -2992,14 +3121,15 @@ impl Conn {
                     s.links.insert(
                         handle,
                         Link::Receiver(ReceiverLink {
-                            name,
-                            target: ReceiverTarget {
+                            last_address: None,
+                            name: name.into(),
+                            target: Arc::new(ReceiverTarget {
                                 address: None,
                                 explicit: None,
                                 implicit: None,
                                 dynamic: false,
-                            },
-                            source: remote.source.clone(),
+                            }),
+                            source: remote.source.clone().map(Arc::new),
                             credit: 10,
                             delivery_count,
                             incoming: None,
@@ -3061,14 +3191,15 @@ impl Conn {
         s.links.insert(
             handle,
             Link::Receiver(ReceiverLink {
-                name: link.attach.name.clone(),
-                target: ReceiverTarget {
+                last_address: None,
+                name: link.attach.name.clone().into(),
+                target: Arc::new(ReceiverTarget {
                     address: Some(address),
                     explicit: None,
                     implicit,
                     dynamic: false,
-                },
-                source: link.attach.source.clone(),
+                }),
+                source: link.attach.source.clone().map(Arc::new),
                 credit: credits,
                 delivery_count,
                 incoming: None,
@@ -3511,7 +3642,7 @@ impl Conn {
             },
             None => None,
         };
-        let container = self.remote_container.clone();
+        let container = self.remote_container_id.clone();
         let s = self.sessions.get_mut(&channel).expect("checked");
         let Some(Link::Receiver(rl)) = s.links.get_mut(&handle) else {
             return Ok(());
@@ -3578,13 +3709,14 @@ impl Conn {
                 {
                     let hops = m
                         .annotation(fed::MESSAGE_HOPS_ANNOTATION)
+                        .as_ref()
                         .and_then(Value::as_i64)
                         .map_or(1, |h| h as i32 + 1);
                     m.set_annotation(fed::MESSAGE_HOPS_ANNOTATION, Value::Int(hops));
                     m.reencode(now);
                     payload = m.data().to_vec();
                 }
-                target.address = Some(c.destination().to_owned());
+                Arc::make_mut(&mut target).address = Some(c.destination().to_owned());
             }
             ReceiveMode::Mirror(_) => {}
         }
@@ -3608,6 +3740,7 @@ impl Conn {
                     tx.clone(),
                     now,
                     large_at,
+                    &mut rl.last_address,
                 )
                 .await;
                 s.server.set_sender(None);
@@ -3643,7 +3776,7 @@ impl Conn {
                     saranga_server::transaction::lock(tx).mark_rollback_only(&e);
                 }
                 failure_state(
-                    source.as_ref(),
+                    source.as_deref(),
                     &e,
                     match &mode {
                         ReceiveMode::Managed(c) => c.use_modified(),
@@ -3830,6 +3963,14 @@ impl Conn {
                 message,
                 delivery_count,
             } => self.deliver(channel, handle, message, delivery_count).await,
+            Event::Acked {
+                channel,
+                pending,
+                result,
+            } => {
+                self.acked(channel, pending, result);
+                Ok(())
+            }
             Event::Drained { channel, handle } => {
                 let Some(s) = self.sessions.get_mut(&channel) else {
                     return Ok(());
@@ -3862,7 +4003,9 @@ impl Conn {
                 };
                 if let Some(l) = s.links.remove(&handle) {
                     // resourceDeletedAction: the peer hears when it is back.
-                    if let Link::Sender(SenderLink { fed: Some(fs), .. }) = &l {
+                    if let Link::Sender(sl) = &l
+                        && let Some(fs) = &sl.fed
+                    {
                         match &fs.kind {
                             FedSenderKind::Address { address, .. } => {
                                 fs.federation.register_missing_address(address);
@@ -3966,8 +4109,8 @@ impl Conn {
         self.sessions.iter().find_map(|(ch, s)| {
             s.links.iter().find_map(|(h, l)| {
                 let n = match l {
-                    Link::Receiver(rl) => &rl.name,
-                    Link::Sender(sl) => &sl.name,
+                    Link::Receiver(rl) => &*rl.name,
+                    Link::Sender(sl) => sl.name.as_str(),
                     Link::Coordinator(_) => return None,
                 };
                 (n == name).then_some((*ch, *h))
@@ -4133,6 +4276,24 @@ impl Conn {
         Ok(())
     }
 
+    /// The rest of an acknowledgement once its queue answered: in its
+    /// session, or alone if the session has ended.
+    fn acked(
+        &mut self,
+        channel: u16,
+        pending: saranga_server::session::AckPending,
+        result: saranga_server::queue::AckResult,
+    ) {
+        match self.sessions.get_mut(&channel) {
+            Some(s) => {
+                if let Err(e) = s.server.acknowledged(pending, result) {
+                    tracing::debug!("AMQ119007: error acknowledging message, {}", e.message);
+                }
+            }
+            None => pending.finish_alone(result),
+        }
+    }
+
     /// The client's disposition of deliveries the broker sent
     /// (`ProtonServerSenderContext.onMessage`).
     async fn on_disposition(&mut self, channel: u16, d: Disposition) -> Handled {
@@ -4172,12 +4333,38 @@ impl Conn {
             let mut settle = true;
             match &d.state {
                 Some(DeliveryState::Accepted) | Some(DeliveryState::AcceptedNew) => {
-                    if !browse
-                        && let Err(e) = s
-                            .server
+                    let acked = if browse {
+                        Ok(())
+                    } else if d.settled {
+                        // Settled by the client, so nothing goes back: the
+                        // queue's answer comes as an event, and the next
+                        // disposition need not wait for it.
+                        let events = self.events.clone();
+                        s.server
+                            .acknowledge_then(consumer, message_id, move |pending, result| {
+                                let acked = Event::Acked {
+                                    channel,
+                                    pending,
+                                    result,
+                                };
+                                if let Err(mpsc::error::SendError(Event::Acked {
+                                    pending,
+                                    result,
+                                    ..
+                                })) = events.send(acked)
+                                {
+                                    pending.finish_alone(result);
+                                }
+                            })
+                    } else {
+                        // The broker settles it once the acknowledgement is
+                        // stored, so it waits for the queue.
+                        s.server
                             .acknowledge_in(consumer, message_id, true, None)
                             .await
-                    {
+                            .map(drop)
+                    };
+                    if let Err(e) = acked {
                         tracing::debug!(
                             "AMQ119007: error acknowledging message {message_id}, {}",
                             e.message
@@ -4304,20 +4491,21 @@ async fn server_send(
     target: &ReceiverTarget,
     format: u32,
     payload: Vec<u8>,
-    container: Option<String>,
+    container: Option<Arc<str>>,
     tx: Option<saranga_server::transaction::TxRef>,
     now: i64,
     large_at: usize,
+    last_address: &mut Option<SimpleString>,
 ) -> Result<(), BrokerError> {
     // At amqpMinLargeMessageSize the message goes to a file of its own.
     let large = large_at > 0 && payload.len() >= large_at;
     let file = large.then(|| payload.clone());
     let mut msg = AmqpMessage::new(i64::from(format), payload, now)
         .map_err(|e| BrokerError::internal(e.to_string()))?;
-    let address = match &target.address {
-        Some(a) => a.clone(),
+    let address: std::borrow::Cow<'_, str> = match &target.address {
+        Some(a) => a.as_str().into(),
         None => match msg.address() {
-            Some(a) => a.to_string_lossy(),
+            Some(a) => a.to_string_lossy().into(),
             None => {
                 return Err(BrokerError::new(
                     ErrorType::InternalError,
@@ -4339,6 +4527,7 @@ async fn server_send(
         }
         None => match msg
             .annotation(crate::message::annotation::ROUTING_TYPE)
+            .as_ref()
             .and_then(Value::as_i64)
         {
             Some(b) => Some(routing_from_byte(b as i8)),
@@ -4374,6 +4563,17 @@ async fn server_send(
         }
         None => None,
     };
+    // The ID and the address the session would give it (setMessageID,
+    // setAddress), given here so that the session takes the message as it
+    // is rather than copying it to change them.
+    if msg.message_id() == 0 {
+        msg.set_message_id(server.broker().post_office().ids().next());
+    }
+    let to = match last_address {
+        Some(a) if a.eq_str(&address) => a.clone(),
+        _ => last_address.insert(SimpleString::from(&*address)).clone(),
+    };
+    msg.route_to(to);
     let native = AmqpNative::arc(msg);
     server
         .send_native_large_to(native, body, tx, Some(&address), routing)

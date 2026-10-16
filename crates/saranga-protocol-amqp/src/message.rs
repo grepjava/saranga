@@ -7,7 +7,7 @@
 //! properties are decoded on demand. Maps iterate as the Java maps Artemis
 //! keeps them in, so a re-encoded message matches Artemis byte for byte.
 
-use std::sync::Arc;
+use std::borrow::Cow;
 
 use saranga_buffer::{PropertyValue, SimpleString, TypedProperties};
 use saranga_buffer::{Reader, Writer};
@@ -22,6 +22,9 @@ use crate::types::{Descriptor, Symbol, Value};
 
 /// `AMQPMessage.ADDRESS_PROPERTY`: where `setAddress` keeps the address.
 pub const ADDRESS_PROPERTY: &str = "_AMQ_AD";
+/// [`ADDRESS_PROPERTY`] as a key, made once.
+static ADDRESS_KEY: std::sync::LazyLock<SimpleString> =
+    std::sync::LazyLock::new(|| SimpleString::from(ADDRESS_PROPERTY));
 /// `AMQPMessage.DEFAULT_MESSAGE_PRIORITY`.
 pub const DEFAULT_PRIORITY: u8 = 4;
 /// `AMQPMessage.MAX_MESSAGE_PRIORITY`.
@@ -66,6 +69,65 @@ pub type Annotations = JavaMap<Symbol, Value>;
 /// Extra properties: a `TypedProperties`, whose map is a `HashMap`.
 pub type ExtraProperties = JavaMap<SimpleString, PropertyValue>;
 
+/// Where a section starts in the data, if it is there: four bytes rather
+/// than an `Option<usize>`'s sixteen, as every queued message holds six.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pos(u32);
+
+impl Pos {
+    const NONE: Pos = Pos(u32::MAX);
+
+    fn at(p: usize) -> Self {
+        Pos(u32::try_from(p)
+            .ok()
+            .filter(|&p| p != u32::MAX)
+            .expect("a section within 4 GiB"))
+    }
+
+    fn get(self) -> Option<usize> {
+        (self != Self::NONE).then_some(self.0 as usize)
+    }
+}
+
+impl From<Option<usize>> for Pos {
+    fn from(p: Option<usize>) -> Self {
+        p.map_or(Self::NONE, Self::at)
+    }
+}
+
+/// What the broker reads from the message annotations of every message,
+/// found when they are scanned so that they need not be kept decoded.
+#[derive(Debug, Clone, Copy, Default)]
+struct Scanned {
+    /// `getRoutingType`.
+    routing_type: Option<i8>,
+    /// `x-opt-delivery-time` and `x-opt-delivery-delay`.
+    delivery_time: Option<i64>,
+    delivery_delay: Option<i64>,
+}
+
+impl Scanned {
+    fn of(ma: &Annotations) -> Self {
+        let get = |name: &str| ma.find(|k| k.as_str() == name);
+        let routing_type = match get(annotation::ROUTING_TYPE) {
+            Some(v) => v.as_i64().map(|t| t as i8),
+            None => match get(annotation::JMS_DEST)
+                .and_then(Value::as_i64)
+                .map(|t| t as i8)
+            {
+                Some(dest_type::QUEUE | dest_type::TEMP_QUEUE) => Some(1),
+                Some(dest_type::TOPIC | dest_type::TEMP_TOPIC) => Some(0),
+                _ => None,
+            },
+        };
+        Self {
+            routing_type,
+            delivery_time: get(annotation::DELIVERY_TIME).and_then(Value::as_i64),
+            delivery_delay: get(annotation::DELIVERY_DELAY).and_then(Value::as_i64),
+        }
+    }
+}
+
 /// An AMQP message (`AMQPStandardMessage`).
 #[derive(Debug, Clone)]
 pub struct AmqpMessage {
@@ -74,10 +136,10 @@ pub struct AmqpMessage {
     message_id: i64,
     address: Option<SimpleString>,
     /// The encoded sections.
-    data: Arc<[u8]>,
+    data: ::bytes::Bytes,
     /// Properties the broker carries with the message, kept only in its
     /// storage (`extraProperties`).
-    extra: Option<ExtraProperties>,
+    extra: Option<Box<ExtraProperties>>,
     expiration: i64,
     /// The expiration came from the journal record, not the sections.
     expiration_reload: bool,
@@ -89,24 +151,38 @@ pub struct AmqpMessage {
     // Where the sections are, from the last scan (`scanMessageData`).
     header: Option<Header>,
     encoded_header_size: usize,
-    delivery_annotations: Option<Value>,
+    delivery_annotations: Option<Box<Value>>,
     encoded_delivery_annotations_size: usize,
-    message_annotations: Option<Annotations>,
-    properties: Option<Properties>,
-    application_properties_position: Option<usize>,
+    /// The message annotations once changed, or read from a record;
+    /// otherwise they are decoded from the data when read, and what the
+    /// broker reads of them for every message is in `scanned`.
+    message_annotations: Option<Box<Annotations>>,
+    scanned: Scanned,
+    /// The properties once changed, or read from a record; otherwise they
+    /// are decoded from the data when read, so that a queued message holds
+    /// them once.
+    properties: Option<Box<Properties>>,
+    application_properties_position: Pos,
     /// Decoded application properties, once something read or changed
     /// them.
     application_properties: Option<Vec<(String, Value)>>,
-    remaining_body_position: Option<usize>,
+    remaining_body_position: Pos,
+    // From the properties at the last scan, which the broker reads for
+    // every message: the creation time and the group.
+    creation_time: i64,
+    group_id: Option<Box<str>>,
+    group_sequence: Option<u32>,
+    /// Where the properties' `to` is in the data, from the last scan.
+    to: Option<(u32, u32)>,
     /// `connectionID`: the sending connection's container ID, which no-local
     /// filters read. Not stored.
-    connection_id: Option<String>,
+    connection_id: Option<std::sync::Arc<str>>,
 
     // Where the other sections start, for a large message's record.
-    header_position: Option<usize>,
-    delivery_annotations_position: Option<usize>,
-    message_annotations_position: Option<usize>,
-    properties_position: Option<usize>,
+    header_position: Pos,
+    delivery_annotations_position: Pos,
+    message_annotations_position: Pos,
+    properties_position: Pos,
 
     /// An `AMQPLargeMessage`: the encoding is its file's, which the broker
     /// never rewrites; changes to the sections are kept in its record.
@@ -123,7 +199,7 @@ impl AmqpMessage {
         Ok(m)
     }
 
-    fn empty(message_format: i64, data: Arc<[u8]>) -> Self {
+    fn empty(message_format: i64, data: ::bytes::Bytes) -> Self {
         Self {
             message_format,
             message_id: 0,
@@ -139,15 +215,20 @@ impl AmqpMessage {
             delivery_annotations: None,
             encoded_delivery_annotations_size: 0,
             message_annotations: None,
+            scanned: Scanned::default(),
             properties: None,
-            application_properties_position: None,
+            application_properties_position: Pos::NONE,
             application_properties: None,
-            remaining_body_position: None,
+            remaining_body_position: Pos::NONE,
+            creation_time: 0,
+            group_id: None,
+            group_sequence: None,
+            to: None,
             connection_id: None,
-            header_position: None,
-            delivery_annotations_position: None,
-            message_annotations_position: None,
-            properties_position: None,
+            header_position: Pos::NONE,
+            delivery_annotations_position: Pos::NONE,
+            message_annotations_position: Pos::NONE,
+            properties_position: Pos::NONE,
             large: false,
             reencoded: false,
         }
@@ -157,7 +238,9 @@ impl AmqpMessage {
     /// properties are decoded now, as Artemis parses them.
     pub fn make_large(&mut self) {
         self.large = true;
-        if self.application_properties.is_none() && self.application_properties_position.is_some() {
+        if self.application_properties.is_none()
+            && self.application_properties_position.get().is_some()
+        {
             self.application_properties = Some(self.application_properties());
         }
     }
@@ -171,7 +254,10 @@ impl AmqpMessage {
     /// priority (which `setPriority` puts in its header).
     pub fn standard_copy(&self, now: i64) -> Result<Self> {
         let mut m = Self::new(self.message_format, self.data.to_vec(), now)?;
-        m.extra = self.extra.as_ref().map(JavaMap::hash_copy);
+        m.extra = self
+            .extra
+            .as_deref()
+            .map(|e| Box::new(JavaMap::hash_copy(e)));
         if self.expiration > 0 {
             m.expiration = self.expiration;
             m.expiration_reload = true;
@@ -195,7 +281,7 @@ impl AmqpMessage {
         m.extra = record
             .extra_properties
             .as_ref()
-            .map(|p| JavaMap::decoded(p.entries().to_vec()));
+            .map(|p| Box::new(JavaMap::decoded(p.entries().to_vec())));
         if let Some(a) = &record.address {
             m.set_address(a.clone());
         }
@@ -211,7 +297,7 @@ impl AmqpMessage {
             r.bytes(d.position()).map_err(bad)?;
             Ok(v)
         };
-        m.header_position = pos(&mut r)?;
+        m.header_position = Pos::from(pos(&mut r)?);
         m.encoded_header_size = r.i32().map_err(bad)?.max(0) as usize;
         if let v @ Value::Described(..) = value(&mut r)? {
             let h = <Header as Composite>::from_value(v)?;
@@ -220,18 +306,18 @@ impl AmqpMessage {
             }
             m.header = Some(h);
         }
-        m.delivery_annotations_position = pos(&mut r)?;
+        m.delivery_annotations_position = Pos::from(pos(&mut r)?);
         m.encoded_delivery_annotations_size = r.i32().map_err(bad)?.max(0) as usize;
-        m.message_annotations_position = pos(&mut r)?;
+        m.message_annotations_position = Pos::from(pos(&mut r)?);
         if let Value::Described(_, body) = value(&mut r)? {
-            m.message_annotations = Some(JavaMap::linked(symbol_map(*body)?));
+            m.message_annotations = Some(Box::new(JavaMap::linked(symbol_map(*body)?)));
         }
-        m.properties_position = pos(&mut r)?;
+        m.properties_position = Pos::from(pos(&mut r)?);
         if let v @ Value::Described(..) = value(&mut r)? {
-            m.properties = Some(<Properties as Composite>::from_value(v)?);
+            m.properties = Some(Box::new(<Properties as Composite>::from_value(v)?));
         }
-        m.application_properties_position = pos(&mut r)?;
-        m.remaining_body_position = pos(&mut r)?;
+        m.application_properties_position = Pos::from(pos(&mut r)?);
+        m.remaining_body_position = Pos::from(pos(&mut r)?);
         if let Value::Described(_, body) = value(&mut r)? {
             m.application_properties = Some(string_map(*body)?);
         }
@@ -262,24 +348,27 @@ impl AmqpMessage {
         let value = |w: &mut Writer, v: Option<Vec<u8>>| {
             w.bytes(&v.unwrap_or_else(|| vec![codec::code::NULL]));
         };
-        pos(&mut w, self.header_position);
+        pos(&mut w, self.header_position.get());
         w.i32(self.encoded_header_size as i32);
         value(&mut w, self.header.as_ref().map(Composite::to_bytes));
-        pos(&mut w, self.delivery_annotations_position);
+        pos(&mut w, self.delivery_annotations_position.get());
         w.i32(self.encoded_delivery_annotations_size as i32);
-        pos(&mut w, self.message_annotations_position);
+        pos(&mut w, self.message_annotations_position.get());
         value(
             &mut w,
-            self.message_annotations.as_ref().map(|ma| {
+            self.message_annotations().map(|ma| {
                 let mut out = Vec::new();
-                encode_annotations(section::MESSAGE_ANNOTATIONS, ma, &mut out);
+                encode_annotations(section::MESSAGE_ANNOTATIONS, &ma, &mut out);
                 out
             }),
         );
-        pos(&mut w, self.properties_position);
-        value(&mut w, self.properties.as_ref().map(Composite::to_bytes));
-        pos(&mut w, self.application_properties_position);
-        pos(&mut w, self.remaining_body_position);
+        pos(&mut w, self.properties_position.get());
+        value(
+            &mut w,
+            self.properties().as_deref().map(Composite::to_bytes),
+        );
+        pos(&mut w, self.application_properties_position.get());
+        pos(&mut w, self.remaining_body_position.get());
         value(
             &mut w,
             self.application_properties.as_ref().map(|ap| {
@@ -302,7 +391,7 @@ impl AmqpMessage {
     }
 
     /// `setConnectionID`.
-    pub fn set_connection_id(&mut self, id: Option<String>) {
+    pub fn set_connection_id(&mut self, id: Option<std::sync::Arc<str>>) {
         self.connection_id = id;
     }
 
@@ -319,7 +408,7 @@ impl AmqpMessage {
         m.extra = record
             .extra_properties
             .as_ref()
-            .map(|p| JavaMap::decoded(p.entries().to_vec()));
+            .map(|p| Box::new(JavaMap::decoded(p.entries().to_vec())));
         if let Some(e) = record.expiration {
             m.expiration = e;
             m.expiration_reload = true;
@@ -337,6 +426,7 @@ impl AmqpMessage {
     fn scan(&mut self, now: i64) -> Result<()> {
         self.header = None;
         self.message_annotations = None;
+        self.scanned = Scanned::default();
         self.properties = None;
         self.application_properties = None;
         if !self.expiration_reload {
@@ -346,26 +436,38 @@ impl AmqpMessage {
         self.encoded_header_size = 0;
         self.delivery_annotations = None;
         self.encoded_delivery_annotations_size = 0;
-        self.application_properties_position = None;
-        self.remaining_body_position = None;
-        self.header_position = None;
-        self.delivery_annotations_position = None;
-        self.message_annotations_position = None;
-        self.properties_position = None;
-        let data = self.data.clone();
-        let mut d = Decoder::new(&data);
+        self.application_properties_position = Pos::NONE;
+        self.remaining_body_position = Pos::NONE;
+        self.creation_time = 0;
+        self.group_id = None;
+        self.group_sequence = None;
+        self.header_position = Pos::NONE;
+        self.delivery_annotations_position = Pos::NONE;
+        self.message_annotations_position = Pos::NONE;
+        self.properties_position = Pos::NONE;
+        self.to = None;
+        // Taken out while the sections are read, rather than shared.
+        let data = std::mem::take(&mut self.data);
+        let scanned = self.scan_sections(&data, now);
+        self.data = data;
+        scanned
+    }
+
+    fn scan_sections(&mut self, data: &::bytes::Bytes, now: i64) -> Result<()> {
+        let mut d = Decoder::new(data);
+        // As scanMessageData: the sections before the application
+        // properties are decoded, those and the body are only found.
         while d.has_remaining() {
             let start = d.position();
-            let value = d.read()?;
-            let size = d.position() - start;
-            let Value::Described(desc, body) = value else {
-                self.remaining_body_position = Some(start);
+            let Some(desc) = d.read_described_head()? else {
+                self.remaining_body_position = Pos::at(start);
                 break;
             };
             match section_code(&desc) {
                 Some(section::HEADER) => {
-                    self.header_position = Some(start);
-                    let header = Header::from_described(&desc, *body)?;
+                    let body = d.read()?;
+                    self.header_position = Pos::at(start);
+                    let header = Header::from_described(&desc, body)?;
                     if let Some(ttl) = header.ttl
                         && !self.expiration_reload
                     {
@@ -375,42 +477,88 @@ impl AmqpMessage {
                         self.priority = p.min(MAX_PRIORITY);
                     }
                     self.header = Some(header);
-                    self.encoded_header_size = size;
+                    self.encoded_header_size = d.position() - start;
                 }
                 Some(section::DELIVERY_ANNOTATIONS) => {
-                    self.delivery_annotations_position = Some(start);
-                    self.delivery_annotations = Some(*body);
-                    self.encoded_delivery_annotations_size = size;
+                    let body = d.read()?;
+                    self.delivery_annotations_position = Pos::at(start);
+                    self.delivery_annotations = Some(Box::new(body));
+                    self.encoded_delivery_annotations_size = d.position() - start;
                 }
                 Some(section::MESSAGE_ANNOTATIONS) => {
-                    self.message_annotations_position = Some(start);
-                    self.message_annotations = Some(JavaMap::linked(symbol_map(*body)?));
+                    let body = d.read()?;
+                    self.message_annotations_position = Pos::at(start);
+                    self.scanned = Scanned::of(&JavaMap::linked(symbol_map(body)?));
                 }
                 Some(section::PROPERTIES) => {
-                    self.properties_position = Some(start);
-                    let p = Properties::from_described(&desc, *body)?;
-                    if let Some(Timestamp(t)) = p.absolute_expiry_time
-                        && t > 0
-                        && !self.expiration_reload
-                    {
-                        self.expiration = t;
-                    }
-                    self.properties = Some(p);
+                    self.properties_position = Pos::at(start);
+                    self.scan_properties(data, &mut d)?;
                 }
                 Some(section::APPLICATION_PROPERTIES) => {
-                    self.application_properties_position = Some(start);
+                    d.skip()?;
+                    self.application_properties_position = Pos::at(start);
                     if d.has_remaining() {
-                        self.remaining_body_position = Some(d.position());
+                        self.remaining_body_position = Pos::at(d.position());
                     }
                     break;
                 }
                 _ => {
                     // The body or the footer: kept as they are.
-                    self.remaining_body_position = Some(start);
+                    self.remaining_body_position = Pos::at(start);
                     break;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// The fields of the properties the broker reads for every message,
+    /// without decoding the others (the IDs, the reply address, ...): where
+    /// `to` is, the absolute expiry, the creation time and the group.
+    fn scan_properties(&mut self, data: &[u8], d: &mut Decoder<'_>) -> Result<()> {
+        const TO: usize = 2;
+        const ABSOLUTE_EXPIRY_TIME: usize = 8;
+        const CREATION_TIME: usize = 9;
+        const GROUP_ID: usize = 10;
+        const GROUP_SEQUENCE: usize = 11;
+        let mut fields = [None; GROUP_SEQUENCE + 1];
+        d.list_fields(&mut fields)?;
+        let value = |i: usize| -> Result<Value> {
+            match fields[i] {
+                Some(bytes) => codec::from_slice(bytes),
+                None => Ok(Value::Null),
+            }
+        };
+        let field = |what: &str| codec::CodecError::Invalid(format!("properties: bad {what}"));
+        if let Some(bytes) = fields[TO]
+            && bytes != [codec::code::NULL]
+        {
+            // Where its encoding is in the data.
+            let offset = bytes.as_ptr() as usize - data.as_ptr() as usize;
+            self.to = Some((offset as u32, bytes.len() as u32));
+        }
+        let timestamp = |v: Value, what: &str| match v {
+            Value::Null => Ok(None),
+            Value::Timestamp(t) => Ok(Some(t)),
+            _ => Err(field(what)),
+        };
+        if let Some(t) = timestamp(value(ABSOLUTE_EXPIRY_TIME)?, "absolute-expiry-time")?
+            && t > 0
+            && !self.expiration_reload
+        {
+            self.expiration = t;
+        }
+        self.creation_time = timestamp(value(CREATION_TIME)?, "creation-time")?.unwrap_or(0);
+        self.group_id = match value(GROUP_ID)? {
+            Value::Null => None,
+            Value::String(s) => Some(s.into_boxed_str()),
+            _ => return Err(field("group-id")),
+        };
+        self.group_sequence = match value(GROUP_SEQUENCE)? {
+            Value::Null => None,
+            Value::Uint(s) => Some(s),
+            _ => return Err(field("group-sequence")),
+        };
         Ok(())
     }
 
@@ -428,20 +576,49 @@ impl AmqpMessage {
         self.header.as_ref()
     }
 
-    pub fn properties(&self) -> Option<&Properties> {
-        self.properties.as_ref()
+    /// The properties: the changed copy, or decoded from the data.
+    pub fn properties(&self) -> Option<Cow<'_, Properties>> {
+        if let Some(p) = &self.properties {
+            return Some(Cow::Borrowed(p));
+        }
+        let mut d = Decoder::new(&self.data[self.properties_position.get()?..]);
+        match d.read() {
+            Ok(Value::Described(desc, body)) => Properties::from_described(&desc, *body)
+                .ok()
+                .map(Cow::Owned),
+            _ => None,
+        }
     }
 
-    pub fn message_annotations(&self) -> Option<&Annotations> {
-        self.message_annotations.as_ref()
+    /// The properties to change, decoded from the data the first time.
+    fn properties_mut(&mut self) -> &mut Properties {
+        if self.properties.is_none() {
+            let p = self.properties().map(Cow::into_owned).unwrap_or_default();
+            self.properties = Some(Box::new(p));
+        }
+        self.properties.as_mut().expect("just set")
+    }
+
+    /// The message annotations: the changed copy, or decoded from the data.
+    pub fn message_annotations(&self) -> Option<Cow<'_, Annotations>> {
+        if let Some(ma) = &self.message_annotations {
+            return Some(Cow::Borrowed(ma));
+        }
+        let mut d = Decoder::new(&self.data[self.message_annotations_position.get()?..]);
+        match d.read() {
+            Ok(Value::Described(_, body)) => symbol_map(*body)
+                .ok()
+                .map(|m| Cow::Owned(JavaMap::linked(m))),
+            _ => None,
+        }
     }
 
     pub fn extra_properties(&self) -> Option<&ExtraProperties> {
-        self.extra.as_ref()
+        self.extra.as_deref()
     }
 
     pub fn delivery_annotations(&self) -> Option<&Value> {
-        self.delivery_annotations.as_ref()
+        self.delivery_annotations.as_deref()
     }
 
     /// `getAddressSimpleString`: the address set, else the one kept in the
@@ -450,17 +627,19 @@ impl AmqpMessage {
         if let Some(a) = &self.address {
             return Some(a.clone());
         }
-        if let Some(PropertyValue::String(a)) = self
-            .extra
-            .as_ref()
-            .and_then(|e| e.get(&SimpleString::from(ADDRESS_PROPERTY)))
+        if let Some(PropertyValue::String(a)) =
+            self.extra.as_deref().and_then(|e| e.get(&ADDRESS_KEY))
         {
             return Some(a.clone());
         }
-        self.properties
-            .as_ref()
-            .and_then(|p| p.to.as_deref())
-            .map(SimpleString::from)
+        if let Some(p) = &self.properties {
+            return p.to.as_deref().map(SimpleString::from);
+        }
+        let (at, len) = self.to?;
+        match codec::from_slice(self.data.get(at as usize..(at + len) as usize)?) {
+            Ok(Value::String(s)) => Some(SimpleString::from(s.as_str())),
+            _ => None,
+        }
     }
 
     /// `isDurable`.
@@ -481,50 +660,56 @@ impl AmqpMessage {
 
     /// `getTimestamp`: the creation time.
     pub fn timestamp(&self) -> i64 {
-        self.properties
-            .as_ref()
-            .and_then(|p| p.creation_time)
-            .map_or(0, |t| t.0)
+        match &self.properties {
+            Some(p) => p.creation_time.map_or(0, |t| t.0),
+            None => self.creation_time,
+        }
+    }
+
+    /// The group ID and sequence.
+    pub fn group(&self) -> (Option<&str>, Option<u32>) {
+        match &self.properties {
+            Some(p) => (p.group_id.as_deref(), p.group_sequence),
+            None => (self.group_id.as_deref(), self.group_sequence),
+        }
     }
 
     /// A message annotation by name.
-    pub fn annotation(&self, name: &str) -> Option<&Value> {
-        self.message_annotations.as_ref()?.get(&Symbol::from(name))
+    pub fn annotation(&self, name: &str) -> Option<Value> {
+        self.message_annotations()?
+            .find(|k| k.as_str() == name)
+            .cloned()
     }
 
     /// `getMessageAnnotation(String)`: the annotation under the name as
     /// `toAnnotationName` makes it, else under the name itself.
-    pub fn annotation_lookup(&self, name: &str) -> Option<&Value> {
+    pub fn annotation_lookup(&self, name: &str) -> Option<Value> {
         self.annotation(&to_annotation_name(name))
             .or_else(|| self.annotation(name))
     }
 
+    /// What the broker reads of the annotations: from the changed copy, or
+    /// as the last scan found them.
+    fn scanned(&self) -> Scanned {
+        match &self.message_annotations {
+            Some(ma) => Scanned::of(ma),
+            None => self.scanned,
+        }
+    }
+
     /// `getRoutingType`: `x-opt-routing-type`, else from `x-opt-jms-dest`.
     pub fn routing_type(&self) -> Option<i8> {
-        if let Some(v) = self.annotation(annotation::ROUTING_TYPE) {
-            return v.as_i64().map(|t| t as i8);
-        }
-        let t = self.annotation(annotation::JMS_DEST)?.as_i64()? as i8;
-        match t {
-            dest_type::QUEUE | dest_type::TEMP_QUEUE => Some(1),
-            dest_type::TOPIC | dest_type::TEMP_TOPIC => Some(0),
-            _ => None,
-        }
+        self.scanned().routing_type
     }
 
     /// `getScheduledDeliveryTime`: `x-opt-delivery-time`, else now plus
     /// `x-opt-delivery-delay`, else 0.
     pub fn scheduled_delivery_time(&self, now: i64) -> i64 {
-        if let Some(t) = self
-            .annotation(annotation::DELIVERY_TIME)
-            .and_then(Value::as_i64)
-        {
+        let s = self.scanned();
+        if let Some(t) = s.delivery_time {
             return t;
         }
-        if let Some(d) = self
-            .annotation(annotation::DELIVERY_DELAY)
-            .and_then(Value::as_i64)
-        {
+        if let Some(d) = s.delivery_delay {
             return now + d;
         }
         0
@@ -535,7 +720,7 @@ impl AmqpMessage {
         if let Some(a) = &self.application_properties {
             return a.clone();
         }
-        let Some(pos) = self.application_properties_position else {
+        let Some(pos) = self.application_properties_position.get() else {
             return Vec::new();
         };
         let mut d = Decoder::new(&self.data[pos..]);
@@ -564,7 +749,7 @@ impl AmqpMessage {
     }
 
     fn scan_section(&self, codes: &[u64]) -> Option<(u64, Value)> {
-        let pos = self.remaining_body_position?;
+        let pos = self.remaining_body_position.get()?;
         let mut d = Decoder::new(&self.data[pos..]);
         while d.has_remaining() {
             let Ok(Value::Described(desc, body)) = d.read() else {
@@ -584,10 +769,69 @@ impl AmqpMessage {
         self.data.len() - self.encoded_delivery_annotations_size
     }
 
+    /// `getMemoryEstimate`: `Message.memoryOffset` and the data, with the
+    /// application properties' encoding again once they are decoded
+    /// (`AMQPStandardMessage`), or twice the offset for a large message,
+    /// whose body Artemis keeps in its file (`AMQPLargeMessage`).
+    pub fn memory_estimate(&self) -> i64 {
+        const MEMORY_OFFSET: i64 = 352;
+        if self.large {
+            return 2 * MEMORY_OFFSET;
+        }
+        let decoded = match (
+            &self.application_properties,
+            self.application_properties_position.get(),
+        ) {
+            (Some(_), Some(pos)) => {
+                self.remaining_body_position
+                    .get()
+                    .unwrap_or(self.data.len())
+                    - pos
+            }
+            _ => 0,
+        };
+        MEMORY_OFFSET + (self.data.len() + decoded) as i64
+    }
+
     // ------------------------------------------------------------ changing
 
     pub fn set_message_id(&mut self, id: i64) {
         self.message_id = id;
+    }
+
+    /// The address `serverSend` gives the message: set (`setAddress`) when
+    /// the message names another, else kept as the one it names, as
+    /// `getAddressSimpleString` keeps what it finds, so that a message
+    /// shares the caller's rather than decoding its own.
+    pub fn route_to(&mut self, address: SimpleString) {
+        if self.address_is(&address) {
+            self.address = Some(address);
+        } else {
+            self.set_address(address);
+        }
+    }
+
+    /// Whether [`address`](Self::address) is `a`, found without making it.
+    fn address_is(&self, a: &SimpleString) -> bool {
+        if let Some(x) = &self.address {
+            return x == a;
+        }
+        if let Some(PropertyValue::String(x)) =
+            self.extra.as_deref().and_then(|e| e.get(&ADDRESS_KEY))
+        {
+            return x == a;
+        }
+        if let Some(p) = &self.properties {
+            return p.to.as_deref().is_some_and(|t| a.eq_str(t));
+        }
+        let Some((at, len)) = self.to else {
+            return false;
+        };
+        let encoded = self.data.get(at as usize..(at + len) as usize);
+        match encoded.and_then(codec::utf8_string) {
+            Some(s) => a.eq_str(s),
+            None => false,
+        }
     }
 
     /// `setAddress`: also kept in the extra properties.
@@ -601,13 +845,19 @@ impl AmqpMessage {
         // createExtraProperties: a new TypedProperties, whose HashMap the
         // first put makes.
         self.extra
-            .get_or_insert_with(|| JavaMap::new(Kind::Hash(None)))
+            .get_or_insert_with(|| Box::new(JavaMap::new(Kind::Hash(None))))
     }
 
+    /// The annotations to change: the decoded ones (a `LinkedHashMap`), or
+    /// with none, a new `HashMap` (`getMessageAnnotationsMap(true)`).
     fn annotations_mut(&mut self) -> &mut Annotations {
-        // getMessageAnnotationsMap(true): a new HashMap.
-        self.message_annotations
-            .get_or_insert_with(|| JavaMap::new(Kind::Hash(None)))
+        if self.message_annotations.is_none() {
+            let ma = self
+                .message_annotations()
+                .map_or_else(|| JavaMap::new(Kind::Hash(None)), Cow::into_owned);
+            self.message_annotations = Some(Box::new(ma));
+        }
+        self.message_annotations.as_mut().expect("just set")
     }
 
     /// `setMessageAnnotation`.
@@ -617,24 +867,17 @@ impl AmqpMessage {
 
     /// `removeMessageAnnotation`.
     pub fn remove_annotation(&mut self, name: &str) -> Option<Value> {
-        self.message_annotations
-            .as_mut()?
-            .remove(&Symbol::from(name))
+        if self.message_annotations.is_none() && self.message_annotations_position.get().is_none() {
+            return None;
+        }
+        self.annotations_mut().remove(&Symbol::from(name))
     }
 
     /// `setExpiration`: an absolute expiry time replaces any TTL.
     pub fn set_expiration(&mut self, expiration: i64) {
-        match &mut self.properties {
-            Some(p) => {
-                p.absolute_expiry_time = (expiration > 0).then_some(Timestamp(expiration));
-            }
-            None if expiration > 0 => {
-                self.properties = Some(Properties {
-                    absolute_expiry_time: Some(Timestamp(expiration)),
-                    ..Default::default()
-                });
-            }
-            None => {}
+        if self.properties.is_some() || self.properties_position.get().is_some() || expiration > 0 {
+            self.properties_mut().absolute_expiry_time =
+                (expiration > 0).then_some(Timestamp(expiration));
         }
         if let Some(h) = &mut self.header {
             h.ttl = None;
@@ -717,8 +960,10 @@ impl AmqpMessage {
     /// `reencode`: writes the working copy of the sections over the
     /// encoding (`encodeMessage`), then scans it again.
     pub fn reencode(&mut self, now: i64) {
-        if let (Some(p), Some(a)) = (&mut self.properties, &self.address) {
-            p.to = Some(a.to_string_lossy());
+        if let Some(a) = self.address.clone()
+            && (self.properties.is_some() || self.properties_position.get().is_some())
+        {
+            self.properties_mut().to = Some(a.to_string_lossy());
         }
         if self.large {
             // AMQPLargeMessage.reencode: the file stays; the sections go
@@ -731,10 +976,10 @@ impl AmqpMessage {
             h.encode(&mut out);
         }
         // Delivery annotations are not kept.
-        if let Some(ma) = &self.message_annotations {
-            encode_annotations(section::MESSAGE_ANNOTATIONS, ma, &mut out);
+        if let Some(ma) = self.message_annotations() {
+            encode_annotations(section::MESSAGE_ANNOTATIONS, &ma, &mut out);
         }
-        if let Some(p) = &self.properties {
+        if let Some(p) = self.properties() {
             p.encode(&mut out);
         }
         if let Some(ap) = &self.application_properties {
@@ -749,12 +994,12 @@ impl AmqpMessage {
                 ),
                 &mut out,
             );
-            if let Some(pos) = self.remaining_body_position {
+            if let Some(pos) = self.remaining_body_position.get() {
                 out.extend(&self.data[pos..]);
             }
-        } else if let Some(pos) = self.application_properties_position {
+        } else if let Some(pos) = self.application_properties_position.get() {
             out.extend(&self.data[pos..]);
-        } else if let Some(pos) = self.remaining_body_position {
+        } else if let Some(pos) = self.remaining_body_position.get() {
             out.extend(&self.data[pos..]);
         }
         self.data = out.into();
@@ -777,7 +1022,9 @@ impl AmqpMessage {
         c.extra = if self.large {
             None
         } else {
-            self.extra.as_ref().map(JavaMap::hash_copy)
+            self.extra
+                .as_deref()
+                .map(|e| Box::new(JavaMap::hash_copy(e)))
         };
         if self.large {
             if c.scan(now).is_err() {
@@ -910,12 +1157,12 @@ impl AmqpMessage {
         }
         let mut position = self.encoded_header_size + self.encoded_delivery_annotations_size;
         if self.reencoded
-            && let Some(body) = self.remaining_body_position
+            && let Some(body) = self.remaining_body_position.get()
         {
-            if let Some(ma) = &self.message_annotations {
-                encode_annotations(section::MESSAGE_ANNOTATIONS, ma, &mut out);
+            if let Some(ma) = self.message_annotations() {
+                encode_annotations(section::MESSAGE_ANNOTATIONS, &ma, &mut out);
             }
-            if let Some(p) = &self.properties {
+            if let Some(p) = self.properties() {
                 p.encode(&mut out);
             }
             if let Some(ap) = &self.application_properties {

@@ -99,7 +99,8 @@ impl Frame {
         Self {
             command: command.to_owned(),
             kind,
-            headers: Vec::new(),
+            // Room for a MESSAGE's standard headers, grown once at most.
+            headers: Vec::with_capacity(12),
             body: Vec::new(),
             // STOMP 1.2 requires disconnecting after an ERROR.
             needs_disconnect: kind == Kind::V12 && command == names::ERROR,
@@ -176,51 +177,61 @@ impl Frame {
         if self.ping {
             return vec![b'\n'];
         }
-        let mut head = String::with_capacity(512);
-        head.push_str(&self.command);
-        head.push('\n');
+        let headers: usize = self
+            .headers
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 2)
+            .sum();
+        let mut out = Vec::with_capacity(self.command.len() + headers + self.body.len() + 32);
+        out.extend_from_slice(self.command.as_bytes());
+        out.push(b'\n');
         let escaped = matches!(self.kind, Kind::V11 | Kind::V12);
         for (k, v) in &self.headers {
             if escaped {
-                escape_into(&mut head, k);
-                head.push(':');
-                escape_into(&mut head, v);
+                escape_into(&mut out, k);
+                out.push(b':');
+                escape_into(&mut out, v);
             } else {
-                head.push_str(k);
-                head.push(':');
-                head.push_str(v);
+                out.extend_from_slice(k.as_bytes());
+                out.push(b':');
+                out.extend_from_slice(v.as_bytes());
             }
-            head.push('\n');
+            out.push(b'\n');
         }
         if !self.body.is_empty()
             && !self.has_header(names::CONTENT_LENGTH)
             && self.kind != Kind::V10
         {
-            head.push_str(names::CONTENT_LENGTH);
-            head.push(':');
-            head.push_str(&self.body.len().to_string());
-            head.push('\n');
+            out.extend_from_slice(names::CONTENT_LENGTH.as_bytes());
+            out.push(b':');
+            out.extend_from_slice(self.body.len().to_string().as_bytes());
+            out.push(b'\n');
         }
-        head.push('\n');
-        let mut out = Vec::with_capacity(head.len() + self.body.len() + 2);
-        out.extend_from_slice(head.as_bytes());
+        out.push(b'\n');
         out.extend_from_slice(&self.body);
         out.extend_from_slice(&[0, b'\n']);
         out
     }
 }
 
-/// `StompFrame.encode`: `\n`, `\r`, `\` and `:` escaped.
-fn escape_into(out: &mut String, s: &str) {
-    for c in s.chars() {
-        match c {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\\' => out.push_str("\\\\"),
-            ':' => out.push_str("\\c"),
-            c => out.push(c),
-        }
+/// `StompFrame.encode`: `\n`, `\r`, `\` and `:` escaped. All four are
+/// ASCII, so the runs between them are copied as they are.
+fn escape_into(out: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    let mut from = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let escape: &[u8] = match b {
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            b'\\' => b"\\\\",
+            b':' => b"\\c",
+            _ => continue,
+        };
+        out.extend_from_slice(&bytes[from..i]);
+        out.extend_from_slice(escape);
+        from = i + 1;
     }
+    out.extend_from_slice(&bytes[from..]);
 }
 
 #[cfg(test)]

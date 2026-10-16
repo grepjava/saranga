@@ -308,10 +308,7 @@ impl AmqConsumer {
     /// `handleDeliver`.
     fn deliver(self: &Arc<Self>, message: &ServerMessage, delivery_count: i32) -> i64 {
         let core = message.delivery_core();
-        let forced = core
-            .properties
-            .get(&SimpleString::from(FORCED_DELIVERY_MESSAGE))
-            .is_some();
+        let forced = core.properties.get_str(FORCED_DELIVERY_MESSAGE).is_some();
         let mut st = lock(&self.state);
         if st.closed {
             return 0;
@@ -437,7 +434,7 @@ pub(crate) fn message_size(m: &Message) -> i64 {
 struct Sink(Arc<AmqConsumer>);
 
 impl DeliverySink for Sink {
-    fn deliver(&self, _consumer_id: i64, message: &ServerMessage, delivery_count: i32) -> i64 {
+    fn deliver(&self, _consumer_id: i64, message: &Arc<ServerMessage>, delivery_count: i32) -> i64 {
         self.0.deliver(message, delivery_count)
     }
 

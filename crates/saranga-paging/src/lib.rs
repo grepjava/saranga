@@ -259,7 +259,7 @@ mod tests {
             message_id: id,
             address: Some(SimpleString::from("a")),
             durable: true,
-            body: vec![1, 2, 3],
+            body: vec![1, 2, 3].into(),
             ..Default::default()
         };
         m.properties.insert("k".into(), PropertyValue::Int(5));

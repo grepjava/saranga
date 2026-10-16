@@ -225,7 +225,7 @@ impl<R: std::io::BufRead> Importer<'_, R> {
         loop {
             match self.reader.next_event()? {
                 Event::Start { name, attributes } => match name.as_str() {
-                    "body" => message.body = self.body()?,
+                    "body" => message.body = self.body()?.into(),
                     "property" => property(&mut message, &attributes)?,
                     "queue" => {
                         if let Some(q) = attribute(&attributes, "name") {

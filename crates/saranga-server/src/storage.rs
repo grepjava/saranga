@@ -1206,7 +1206,7 @@ mod tests {
             message_id: 99,
             address: Some(SimpleString::from("addr")),
             durable: true,
-            body: vec![1, 2, 3],
+            body: vec![1, 2, 3].into(),
             ..Default::default()
         };
         let mut w = Writer::new();

@@ -681,7 +681,9 @@ pub fn resolve_source(
         }
     } else {
         let queue = match &fqqn_queue {
-            Some(q) => matching_queue(session, &address, q, None, None)?,
+            // Auto-created as anycast (getMatchingQueue with ANYCAST; the
+            // routing type only matters for a queue not there yet).
+            Some(q) => matching_queue(session, &address, q, Some(RoutingType::Anycast), None)?,
             None => {
                 let bare = session.remove_prefix(&address).to_owned();
                 matching_anycast_queue(session, &bare).unwrap_or(address.clone())

@@ -240,7 +240,12 @@ struct Sink(Arc<Inner>);
 impl DeliverySink for Sink {
     /// `handle`: the reference is the bridge's until its send is
     /// acknowledged.
-    fn deliver(&self, _consumer_id: i64, message: &ServerMessage, _delivery_count: i32) -> i64 {
+    fn deliver(
+        &self,
+        _consumer_id: i64,
+        message: &Arc<ServerMessage>,
+        _delivery_count: i32,
+    ) -> i64 {
         let inner = &self.0;
         inner.busy.store(true, Ordering::SeqCst);
         inner.refs().push(message.message_id());
@@ -1274,18 +1279,21 @@ fn embed(
             core.message_type = LARGE_EMBEDDED_TYPE;
             core.properties
                 .insert(AMQP_EMBED_LARGE.into(), PropertyValue::Bytes(encoding));
-            core.body = body.read_all().unwrap_or_else(|e| {
-                tracing::warn!(
-                    "AMQ222110: Error on resetting large message deliver - {message_id}: {e}"
-                );
-                Vec::new()
-            });
+            core.body = body
+                .read_all()
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "AMQ222110: Error on resetting large message deliver - {message_id}: {e}"
+                    );
+                    Vec::new()
+                })
+                .into();
         }
         None => {
             core.message_type = EMBEDDED_TYPE;
             let mut body = EMBED_SIGNATURE.to_vec();
             body.extend_from_slice(&encoding);
-            core.body = body;
+            core.body = body.into();
         }
     }
     core

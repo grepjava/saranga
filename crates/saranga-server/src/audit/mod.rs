@@ -1204,7 +1204,12 @@ impl AuditedSink {
 }
 
 impl crate::queue::DeliverySink for AuditedSink {
-    fn deliver(&self, consumer_id: i64, message: &ServerMessage, delivery_count: i32) -> i64 {
+    fn deliver(
+        &self,
+        consumer_id: i64,
+        message: &std::sync::Arc<ServerMessage>,
+        delivery_count: i32,
+    ) -> i64 {
         self.delivering(message, || {
             self.inner.deliver(consumer_id, message, delivery_count)
         })

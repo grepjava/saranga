@@ -22,8 +22,10 @@ pub const FQQN_SEPARATOR: &str = "::";
 
 /// Splits an FQQN into its address and queue (`CompositeAddress`).
 pub fn split_fqqn(name: &str) -> (&str, Option<&str>) {
-    match name.split_once(FQQN_SEPARATOR) {
-        Some((address, queue)) => (address, Some(queue)),
+    // A byte scan: this runs for every message sent.
+    let bytes = name.as_bytes();
+    match bytes.windows(2).position(|w| w == b"::") {
+        Some(i) => (&name[..i], Some(&name[i + 2..])),
         None => (name, None),
     }
 }
@@ -1786,6 +1788,23 @@ impl PostOffice {
         let temporary = options.temporary;
         let (real, fqqn_queue) = split_fqqn(address);
         let queue_name = fqqn_queue.unwrap_or(real);
+        // What every send to an existing address finds, under one lock
+        // and without the settings: the same answer as below.
+        {
+            let state = self.read();
+            if let Some(e) = state.addresses.get(real)
+                && e.info.routing_types.contains(routing_type)
+            {
+                if routing_type != RoutingType::Anycast && fqqn_queue.is_none() {
+                    return Ok(AutoCreate::Existed);
+                }
+                if let Some(q) = state.queues.get(queue_name)
+                    && (q.config().routing_type == RoutingType::Anycast || fqqn_queue.is_some())
+                {
+                    return Ok(AutoCreate::Existed);
+                }
+            }
+        }
         let s = self.settings(real);
         let mut result = match self.address_info(real) {
             None if s.auto_create_addresses || temporary => {
@@ -2024,7 +2043,7 @@ impl PostOffice {
         {
             return Err(BrokerError::address_does_not_exist(real));
         }
-        let bindings = self.bindings_route(message, address, mirror);
+        let bindings = self.bindings_route(message, address, routing_type, mirror);
         self.count_route(
             real,
             bindings.as_ref().is_some_and(|r| !r.queues.is_empty()),
@@ -2524,6 +2543,7 @@ impl PostOffice {
         &self,
         message: &MessageRef,
         address: &str,
+        routing_type: Option<RoutingType>,
         local_only: bool,
     ) -> Option<Routes> {
         let (real, fqqn_queue) = split_fqqn(address);
@@ -2646,7 +2666,9 @@ impl PostOffice {
             let Some(i) = chosen else { continue };
             match &group[i] {
                 Bound::Local(q) => {
-                    if accepts(q) {
+                    // LocalQueueBinding.isMatchRoutingType: a send of one
+                    // routing type skips the queues of the other.
+                    if accepts(q) && routing_type.is_none_or(|t| t == q.config().routing_type) {
                         routes.queues.push(q.clone());
                     }
                 }
@@ -3226,24 +3248,23 @@ fn with_route_context(message: &MessageRef, remote: &[Arc<RemoteBinding>]) -> Me
 /// `Message.INTERNAL_PROPERTY_NAMES_PREDICATE`: the routing context a
 /// cluster adds for its bridges, which a message must not carry into a
 /// route.
-fn is_internal_property(name: &str) -> bool {
-    (name.starts_with(HDR_ROUTE_TO_IDS) && name != HDR_ROUTE_TO_IDS)
-        || (name.starts_with(HDR_ROUTE_TO_ACK_IDS) && name != HDR_ROUTE_TO_ACK_IDS)
+fn is_internal_property(name: &saranga_buffer::SimpleString) -> bool {
+    (name.starts_with_str(HDR_ROUTE_TO_IDS) && !name.eq_str(HDR_ROUTE_TO_IDS))
+        || (name.starts_with_str(HDR_ROUTE_TO_ACK_IDS) && !name.eq_str(HDR_ROUTE_TO_ACK_IDS))
 }
 
 /// `clearInternalProperties`: the message without them, if it had any.
 fn clear_internal_properties(message: &MessageRef) -> Option<MessageRef> {
     let core = message.message.core();
-    let internal: Vec<_> = core
-        .properties
-        .entries()
-        .iter()
-        .map(|(k, _)| k.clone())
-        .filter(|k| is_internal_property(&k.to_string_lossy()))
-        .collect();
-    if internal.is_empty() {
+    let entries = core.properties.entries();
+    if !entries.iter().any(|(k, _)| is_internal_property(k)) {
         return None;
     }
+    let internal: Vec<_> = entries
+        .iter()
+        .filter(|(k, _)| is_internal_property(k))
+        .map(|(k, _)| k.clone())
+        .collect();
     let mut stripped = core.clone();
     for k in &internal {
         stripped.properties.remove(k);
@@ -3258,9 +3279,7 @@ fn clear_internal_properties(message: &MessageRef) -> Option<MessageRef> {
 fn route_to(message: &MessageRef) -> Option<(Vec<i64>, MessageRef)> {
     use saranga_buffer::{PropertyValue, SimpleString};
     let core = message.message.core();
-    let Some(PropertyValue::Bytes(bytes)) =
-        core.properties.get(&SimpleString::from(HDR_ROUTE_TO_IDS))
-    else {
+    let Some(PropertyValue::Bytes(bytes)) = core.properties.get_str(HDR_ROUTE_TO_IDS) else {
         return None;
     };
     let ids = bytes

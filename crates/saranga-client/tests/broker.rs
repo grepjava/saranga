@@ -153,7 +153,7 @@ async fn anycast_send_receive() {
 
     let d = consumer.receive(WAIT).await.unwrap().unwrap();
     assert_eq!(d.message.message_type, message_type::BYTES);
-    assert_eq!(d.message.body, [0, 1, 2, 255]);
+    assert_eq!(d.message.body[..], [0, 1, 2, 255]);
     consumer.acknowledge(&d).await.unwrap();
 
     for i in 0..200 {

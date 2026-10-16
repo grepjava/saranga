@@ -62,11 +62,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// `Message.getMemoryEstimate`: what a message in memory adds to its
 /// address's size.
 pub fn memory_estimate(m: &ServerMessage) -> i64 {
-    // Message.memoryOffset, the buffer, TypedProperties.getMemoryOffset.
-    let core = m.core();
-    let mut props = saranga_buffer::Writer::new();
-    core.properties.encode(&mut props);
-    352 + m.encoded().len() as i64 + props.len() as i64 + 8 * core.properties.entries().len() as i64
+    m.memory_estimate()
 }
 
 /// `getPersistentSize`: what a paged message counts as in its queues'

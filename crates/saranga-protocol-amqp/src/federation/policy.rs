@@ -474,7 +474,8 @@ pub fn decode_command(
     m: &AmqpMessage,
     wildcards: &WildcardConfiguration,
 ) -> Result<Received, String> {
-    let op = m.annotation(OPERATION_TYPE).and_then(Value::as_str);
+    let op = m.annotation(OPERATION_TYPE);
+    let op = op.as_ref().and_then(Value::as_str);
     let control = "119026: Malformed Federation control message";
     match op {
         Some(ADD_QUEUE_POLICY) => {
@@ -572,7 +573,8 @@ pub fn decode_command(
 
 /// The event message's event (`AMQPFederationEventProcessor`).
 pub fn decode_event(m: &AmqpMessage) -> Result<Received, String> {
-    let kind = m.annotation(EVENT_TYPE).and_then(Value::as_str);
+    let kind = m.annotation(EVENT_TYPE);
+    let kind = kind.as_ref().and_then(Value::as_str);
     let event = "119028: Malformed Federation event message";
     let text = |map: &[(String, Value)], key: &str, what: &str| -> Result<String, String> {
         match get(map, key) {

@@ -328,6 +328,10 @@ impl<'a> Input<'a> {
 
 /// Java's modified UTF-8, as `DataInputStream.readUTF` decodes it.
 pub fn decode_modified_utf8(b: &[u8]) -> R<String> {
+    // ASCII (a NUL byte included, as readUTF takes it) is itself.
+    if b.is_ascii() {
+        return Ok(String::from_utf8(b.to_vec()).unwrap_or_default());
+    }
     let bad = || CodecError::Io("UTFDataFormatException: malformed input".into());
     let mut units = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -363,6 +367,12 @@ pub fn decode_modified_utf8(b: &[u8]) -> R<String> {
 
 /// `DataOutput.writeUTF`.
 pub fn write_utf(out: &mut Vec<u8>, s: &str) -> R<()> {
+    // ASCII without NUL is written as it is.
+    if s.len() <= 65535 && s.bytes().all(|b| (1..0x80).contains(&b)) {
+        out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+        out.extend_from_slice(s.as_bytes());
+        return Ok(());
+    }
     let len: usize = s
         .encode_utf16()
         .map(|c| match c {
@@ -1051,6 +1061,9 @@ impl TightReader<'_, '_> {
             }
             // new String(bytes, 0): each byte is a char.
             let b = self.input.take(size as usize)?;
+            if b.is_ascii() {
+                return Ok(Some(String::from_utf8(b.to_vec()).unwrap_or_default()));
+            }
             Ok(Some(b.iter().map(|&c| c as char).collect()))
         } else {
             self.input.utf().map(Some)

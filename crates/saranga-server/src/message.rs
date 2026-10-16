@@ -6,8 +6,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use saranga_buffer::{PropertyValue, SimpleString, Writer};
-use saranga_message::CoreMessage;
+use saranga_buffer::{PropertyValue, Reader, SimpleString, Writer};
+use saranga_message::{Bytes, CoreMessage};
 use saranga_storage::message::{CoreMessageRecord, PersistedMessage};
 
 use crate::RoutingType;
@@ -53,7 +53,7 @@ pub fn now_millis() -> i64 {
 }
 
 fn property<'a>(message: &'a CoreMessage, name: &str) -> Option<&'a PropertyValue> {
-    message.properties.get(&SimpleString::from(name))
+    message.properties.get_str(name)
 }
 
 /// A numeric property as a long, as `getLongProperty` would read one
@@ -187,6 +187,15 @@ pub fn make_copy(
     copy
 }
 
+/// What `write` writes, in a buffer of its own size: a writer's spare
+/// capacity would otherwise stay with the message as long as it is held.
+fn exact(write: impl FnOnce(&mut Writer)) -> Bytes {
+    let mut w = Writer::new();
+    write(&mut w);
+    // A copy, as an allocator may shrink a block in place and keep its size.
+    Bytes::copy_from_slice(w.as_slice())
+}
+
 /// A message kept in its own protocol's encoding (`AMQPMessage`): the
 /// broker works on its [`view`](Self::view), and changes the broker makes
 /// to the view are carried over to the native form by
@@ -207,6 +216,10 @@ pub trait NativeMessage: Send + Sync + fmt::Debug {
 
     /// `getEncodeSize`.
     fn encode_size(&self) -> usize;
+
+    /// `getMemoryEstimate`: what the message adds to its address's size
+    /// while referenced.
+    fn memory_estimate(&self) -> i64;
 
     /// `getObjectPropertyForFilter` and the header fields a filter reads.
     fn filter_value(&self, identifier: &str) -> Option<saranga_filter::Value>;
@@ -287,12 +300,12 @@ pub struct ServerMessage {
     native: Option<Arc<dyn NativeMessage>>,
     /// A native message as a Core message, and its encoding, once a client
     /// of another protocol needed it.
-    converted: OnceLock<(CoreMessage, Vec<u8>)>,
+    converted: OnceLock<Box<(CoreMessage, Vec<u8>)>>,
     /// `core` encoded as `CoreMessage.encode` writes it, the form carried by
     /// `SESS_RECEIVE_MSG`. For a large message, only its headers and
     /// properties (`encodeHeadersAndProperties`), the form `ADD_LARGE_MESSAGE`
     /// and `SESS_RECEIVE_LARGE_MSG` carry.
-    encoded: Vec<u8>,
+    encoded: Bytes,
     /// References on durable queues not yet acknowledged
     /// (`RefCountMessage.durableUp/Down`); the record is deleted at zero.
     durable_refs: AtomicI32,
@@ -304,21 +317,36 @@ pub struct ServerMessage {
     /// The paging store of the message's address, which counts the memory
     /// it takes while referenced (`owner`).
     owner: OnceLock<Arc<crate::paging::PagingStore>>,
+    /// `getMemoryEstimate`, fixed when first asked as in Artemis, so that
+    /// what a reference adds its removal takes away.
+    estimate: OnceLock<i64>,
 }
 
 impl ServerMessage {
-    pub fn new(core: CoreMessage) -> Arc<Self> {
-        let mut w = Writer::new();
-        core.encode(&mut w);
+    pub fn new(mut core: CoreMessage) -> Arc<Self> {
+        let encoded = exact(|w| core.encode(w));
+        // The body is held once, in the encoding (after its i32 end-of-body),
+        // and so are the address and the properties' names and strings: read
+        // again from it, they are slices of it rather than copies.
+        let body = 4..4 + core.body.len();
+        let mut r = Reader::shared(&encoded);
+        if r.bytes(body.end).is_ok()
+            && let Ok(shared) = CoreMessage::decode_headers_and_properties(&mut r)
+        {
+            core.address = shared.address;
+            core.properties = shared.properties;
+        }
+        core.body = encoded.slice(body);
         Arc::new(Self {
             core,
             native: None,
             converted: OnceLock::new(),
-            encoded: w.into_vec(),
+            encoded,
             durable_refs: AtomicI32::new(0),
             large: None,
             refs: AtomicI32::new(0),
             owner: OnceLock::new(),
+            estimate: OnceLock::new(),
         })
     }
 
@@ -328,11 +356,32 @@ impl ServerMessage {
             core: native.view(),
             native: Some(native),
             converted: OnceLock::new(),
-            encoded: Vec::new(),
+            encoded: Bytes::new(),
             durable_refs: AtomicI32::new(0),
             large: None,
             refs: AtomicI32::new(0),
             owner: OnceLock::new(),
+            estimate: OnceLock::new(),
+        })
+    }
+
+    /// A native message whose view is already made, with its large body if
+    /// it has one.
+    pub fn with_view(
+        native: Arc<dyn NativeMessage>,
+        view: CoreMessage,
+        large: Option<Arc<LargeBody>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            core: view,
+            native: Some(native),
+            converted: OnceLock::new(),
+            encoded: Bytes::new(),
+            durable_refs: AtomicI32::new(0),
+            large,
+            refs: AtomicI32::new(0),
+            owner: OnceLock::new(),
+            estimate: OnceLock::new(),
         })
     }
 
@@ -343,28 +392,29 @@ impl ServerMessage {
             core: native.view(),
             native: Some(native),
             converted: OnceLock::new(),
-            encoded: Vec::new(),
+            encoded: Bytes::new(),
             durable_refs: AtomicI32::new(0),
             large: Some(body),
             refs: AtomicI32::new(0),
             owner: OnceLock::new(),
+            estimate: OnceLock::new(),
         })
     }
 
     /// A large message: `core` holds the headers and properties, `body` the
     /// body.
     pub fn new_large(core: CoreMessage, body: Arc<LargeBody>) -> Arc<Self> {
-        let mut w = Writer::new();
-        core.encode_headers_and_properties(&mut w);
+        let encoded = exact(|w| core.encode_headers_and_properties(w));
         Arc::new(Self {
             core,
             native: None,
             converted: OnceLock::new(),
-            encoded: w.into_vec(),
+            encoded,
             durable_refs: AtomicI32::new(0),
             large: Some(body),
             refs: AtomicI32::new(0),
             owner: OnceLock::new(),
+            estimate: OnceLock::new(),
         })
     }
 
@@ -442,7 +492,7 @@ impl ServerMessage {
             let core = n.to_core();
             let mut w = Writer::new();
             core.encode(&mut w);
-            (core, w.into_vec())
+            Box::new((core, w.into_vec()))
         }))
     }
 
@@ -502,6 +552,23 @@ impl ServerMessage {
             Some(n) => n.encode_size(),
             None => self.encoded.len(),
         }
+    }
+
+    /// `Message.getMemoryEstimate`: what the message adds to its address's
+    /// size while referenced. A Core message counts `Message.memoryOffset`,
+    /// its buffer and its properties' (`TypedProperties.getMemoryOffset`);
+    /// a native message counts what its protocol's message does, with no
+    /// conversion.
+    pub fn memory_estimate(&self) -> i64 {
+        *self.estimate.get_or_init(|| match &self.native {
+            Some(n) => n.memory_estimate(),
+            None => {
+                let props = &self.core.properties;
+                352 + self.encoded.len() as i64
+                    + props.encode_size() as i64
+                    + 8 * props.entries().len() as i64
+            }
+        })
     }
 
     /// `refUp`: returns the new count.
@@ -565,10 +632,7 @@ pub struct PagePosition {
 
 /// `Message.getRoutingType`: the `_AMQ_ROUTING_TYPE` byte property.
 pub fn routing_type(message: &CoreMessage) -> Option<RoutingType> {
-    match message
-        .properties
-        .get(&SimpleString::from(HDR_ROUTING_TYPE))
-    {
+    match message.properties.get_str(HDR_ROUTING_TYPE) {
         Some(PropertyValue::Byte(b)) => RoutingType::from_byte(*b),
         _ => None,
     }

@@ -444,13 +444,13 @@ impl Management {
             ..Default::default()
         };
         let prop = |name: &str| crate::message::string_property(request, name);
-        if let Some(reply_to) = request.properties.get(&SimpleString::from(REPLY_TO)) {
+        if let Some(reply_to) = request.properties.get_str(REPLY_TO) {
             reply.properties.insert(REPLY_TO.into(), reply_to.clone());
         }
         // getCorrelationIdentity: the correlation ID, else the message ID.
         let correlation = request
             .properties
-            .get(&SimpleString::from(CORRELATION_ID))
+            .get_str(CORRELATION_ID)
             .cloned()
             .unwrap_or_else(|| {
                 let id = prop(NATIVE_MESSAGE_ID).unwrap_or_else(|| match request.user_id {
@@ -519,7 +519,7 @@ fn store_result(reply: &mut CoreMessage, result: Json) {
     let text = (!result.is_null()).then(|| Json::Array(vec![result]).to_string());
     let mut w = Writer::new();
     w.nullable_simple_string(text.map(|t| SimpleString::from(t.as_str())).as_ref());
-    reply.body = w.into_vec();
+    reply.body = w.into_vec().into();
 }
 
 /// `DivertControl`'s attributes.

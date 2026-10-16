@@ -434,9 +434,9 @@ impl SecurityStore {
         let target = fqqn.as_deref().unwrap_or(bare_address);
 
         if let (Some(user), Some(cache)) = (user, &self.authorization_cache)
-            && cache
-                .get(&authorization_cache_key(user, check))
-                .is_some_and(|granted| granted.contains(target))
+            && with_cache_key(user, check, |key| {
+                cache.test(key, |granted| granted.contains(target))
+            })
         {
             return true;
         }
@@ -579,6 +579,21 @@ fn authorization_cache_key(user: &str, check: CheckType) -> String {
     format!("{user}.{}", check.name())
 }
 
+/// [`authorization_cache_key`] made in a buffer kept for the thread, for a
+/// lookup each message makes.
+fn with_cache_key<R>(user: &str, check: CheckType, f: impl FnOnce(&str) -> R) -> R {
+    thread_local! {
+        static KEY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+    KEY.with_borrow_mut(|key| {
+        key.clear();
+        key.push_str(user);
+        key.push('.');
+        key.push_str(check.name());
+        f(key)
+    })
+}
+
 /// A bounded map whose entries expire a fixed time after they were written.
 struct TtlCache<K, V> {
     capacity: usize,
@@ -603,6 +618,23 @@ impl<K: Eq + Hash + Clone, V: Clone> TtlCache<K, V> {
     /// (`estimatedSize`).
     fn len(&self) -> usize {
         self.lock().len()
+    }
+
+    /// Whether the live entry for `key` passes `test`, which sees it in place.
+    fn test<Q>(&self, key: &Q, test: impl FnOnce(&V) -> bool) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let mut entries = self.lock();
+        match entries.get(key) {
+            Some((at, v)) if at.elapsed() < self.ttl => test(v),
+            Some(_) => {
+                entries.remove(key);
+                false
+            }
+            None => false,
+        }
     }
 
     fn get(&self, key: &K) -> Option<V> {

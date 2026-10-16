@@ -15,10 +15,11 @@ use saranga_message::CoreMessage;
 use saranga_security::{Authenticated, SecurityError};
 use saranga_server::postoffice::{AutoCreate, QueueSpec, split_fqqn};
 use saranga_server::protocol::Connection as Accepted;
-use saranga_server::queue::{DeliverySink, Queue};
+use saranga_server::queue::{AckResult, DeliverySink, Queue};
 use saranga_server::session::{
-    ClientConnection, Completion, ServerSession, SessionOptions, Transport,
+    AckPending, ClientConnection, Completion, ServerSession, SessionOptions, Transport,
 };
+use saranga_server::transaction::TxRef;
 use saranga_server::{Broker, BrokerError, RoutingType};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -190,6 +191,12 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedRec
 enum Event {
     /// An auto-acknowledged delivery went out (`afterDeliveryTasks`).
     AutoAck { consumer: i64, message: i64 },
+    /// The queue answered an auto-acknowledgement made in `tx`.
+    AutoAcked {
+        tx: TxRef,
+        pending: AckPending,
+        result: AckResult,
+    },
     /// A reply that closes the connection was written.
     Close,
     /// The broker closed a subscription's consumer
@@ -216,27 +223,39 @@ async fn completer(
     mut rx: mpsc::UnboundedReceiver<Reply>,
 ) {
     while let Some(reply) = rx.recv().await {
-        let mut close = reply.close;
         match reply.completion.wait().await {
             Err(e) => {
                 tracing::warn!("AMQ222020: error processing IO callback: {e}");
                 let mut err = StompError::bundle("Error sending reply");
                 err.body = Some(e.to_string());
                 out.send(&err.frame(reply.kind));
-            }
-            Ok(()) => {
-                if let Some(frame) = &reply.frame {
-                    out.send(frame);
-                    close |= frame.needs_disconnect;
-                }
-                if let Some(after) = reply.after {
-                    after();
+                if reply.close {
+                    let _ = events.send(Event::Close);
                 }
             }
+            Ok(()) => completed(&out, &events, reply.frame, reply.after, reply.close),
         }
-        if close {
-            let _ = events.send(Event::Close);
-        }
+    }
+}
+
+/// A reply whose journal writes are done: the frame goes out, then what
+/// follows it.
+fn completed(
+    out: &Outbound,
+    events: &mpsc::UnboundedSender<Event>,
+    frame: Option<Frame>,
+    after: Option<Box<dyn FnOnce() + Send>>,
+    mut close: bool,
+) {
+    if let Some(frame) = &frame {
+        out.send(frame);
+        close |= frame.needs_disconnect;
+    }
+    if let Some(after) = after {
+        after();
+    }
+    if close {
+        let _ = events.send(Event::Close);
     }
 }
 
@@ -362,7 +381,7 @@ impl StompSession {
             self.session.add_producer(&name, "STOMP", None);
             name
         });
-        self.session.set_sender(Some(name.clone()));
+        self.session.set_sender(Some(name.as_str().into()));
     }
 }
 
@@ -370,7 +389,7 @@ impl DeliverySink for StompSink {
     fn deliver(
         &self,
         consumer_id: i64,
-        message: &saranga_server::message::ServerMessage,
+        message: &std::sync::Arc<saranga_server::message::ServerMessage>,
         delivery_count: i32,
     ) -> i64 {
         let sub = &self.subscription;
@@ -549,6 +568,7 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
             () = failed.failed() => break,
             event = events_rx.recv() => match event {
                 Some(Event::AutoAck { consumer, message }) => conn.auto_ack(consumer, message).await,
+                Some(Event::AutoAcked { tx, pending, result }) => conn.auto_acked(tx, pending, result),
                 Some(Event::Disconnected { consumer }) => conn.disconnected(consumer).await,
                 Some(Event::Close) | None => break,
             },
@@ -564,6 +584,19 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
                     }
                 }
             },
+        }
+    }
+    // Acknowledgements the queues answered are committed; any answering
+    // later find the channel closed and finish on their own.
+    events_rx.close();
+    while let Ok(event) = events_rx.try_recv() {
+        if let Event::AutoAcked {
+            tx,
+            pending,
+            result,
+        } = event
+        {
+            conn.auto_acked(tx, pending, result);
         }
     }
     conn.destroy().await;
@@ -1120,8 +1153,10 @@ impl Connection {
                 ),
             );
         }
-        let describe = describe(&message);
+        // Described only on a failure: this runs for every message.
+        let (id, durable, address) = (message.message_id, message.durable, message.address.clone());
         let send_error = |e: String| {
+            let describe = describe(id, durable, address.as_ref());
             StompError::bundle(format!("AMQ339011: Error sending message {describe}")).with_log(e)
         };
         // A body this big goes in a large-message file
@@ -1147,7 +1182,7 @@ impl Connection {
                 saranga_server::message::HDR_LARGE_BODY_SIZE.into(),
                 saranga_buffer::PropertyValue::Long(message.body.len() as i64),
             );
-            message.body = Vec::new();
+            message.body = Vec::new().into();
             message.message_id = id;
             session.start_sending();
             let sent = session.session.send(message, Some(body)).await;
@@ -1339,13 +1374,54 @@ impl Connection {
         }
     }
 
+    /// `afterDelivery` for `ack:auto`: the acknowledgement, in a transaction
+    /// of its own, goes to the queue without waiting for it, so that the
+    /// next delivery's need not wait either; [`auto_acked`](Self::auto_acked)
+    /// commits once the queue answered.
     async fn auto_ack(&mut self, consumer: i64, message: i64) {
         let Some(session) = self.main.as_mut() else {
             return;
         };
-        let result = match session.session.acknowledge(consumer, message, false).await {
-            Ok(_) => session.session.commit(),
-            Err(e) => Err(e),
+        let tx = session.session.new_transaction();
+        let events = self.events.clone();
+        let held = tx.clone();
+        let sent = session.session.acknowledge_in_then(
+            consumer,
+            message,
+            false,
+            &tx,
+            move |pending, result| {
+                let acked = Event::AutoAcked {
+                    tx: held,
+                    pending,
+                    result,
+                };
+                if let Err(mpsc::error::SendError(Event::AutoAcked {
+                    pending, result, ..
+                })) = events.send(acked)
+                {
+                    pending.finish_alone(result);
+                }
+            },
+        );
+        if let Err(e) = sent {
+            let _ = session.session.rollback_tx(&tx);
+            tracing::warn!("{}", e.message);
+        }
+    }
+
+    /// The rest of [`auto_ack`](Self::auto_ack).
+    fn auto_acked(&mut self, tx: TxRef, pending: AckPending, result: AckResult) {
+        let Some(session) = self.main.as_mut() else {
+            pending.finish_alone(result);
+            return;
+        };
+        let result = match session.session.acknowledged_tx(pending, &tx, result) {
+            Ok(_) => session.session.commit_tx(&tx),
+            Err(e) => {
+                let _ = session.session.rollback_tx(&tx);
+                Err(e)
+            }
         };
         if let Err(e) = result {
             tracing::warn!("{}", e.message);
@@ -1660,13 +1736,16 @@ fn security_error(e: SecurityError) -> StompError {
 }
 
 /// The start of `CoreMessage.toString`, for `Error sending message`.
-fn describe(m: &CoreMessage) -> String {
+fn describe(
+    message_id: i64,
+    durable: bool,
+    address: Option<&saranga_buffer::SimpleString>,
+) -> String {
     format!(
         "CoreMessage[messageID={}, durable={}, address={}]",
-        m.message_id,
-        m.durable,
-        m.address
-            .as_ref()
+        message_id,
+        durable,
+        address
             .map(|a| a.to_string_lossy())
             .unwrap_or_else(|| "null".into())
     )

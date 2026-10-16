@@ -85,6 +85,15 @@ impl<K: PartialEq + JavaHash + Clone, V: Clone> JavaMap<K, V> {
         self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
 
+    /// The value of the first key `matches` accepts, for a lookup that has no
+    /// key to hand.
+    pub fn find(&self, matches: impl Fn(&K) -> bool) -> Option<&V> {
+        self.entries
+            .iter()
+            .find(|(k, _)| matches(k))
+            .map(|(_, v)| v)
+    }
+
     pub fn contains_key(&self, key: &K) -> bool {
         self.get(key).is_some()
     }

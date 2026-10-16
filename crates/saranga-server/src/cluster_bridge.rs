@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use saranga_buffer::{PropertyValue, SimpleString};
+use saranga_buffer::PropertyValue;
 use saranga_client::{
     Connection, ConnectionOptions, Connector, CoreMessage, Error as ClientError, MessageExt,
     Session, TopologyEvent, TopologyHook,
@@ -394,7 +394,7 @@ impl Record {
 
     /// `onMessage`: a notification from the other node.
     fn on_message(&self, m: &CoreMessage) {
-        let has = |k: &str| m.properties.get(&SimpleString::from(k)).is_some();
+        let has = |k: &str| m.properties.get_str(k).is_some();
         if has(notifications::HDR_RESET_QUEUE_DATA) {
             self.st().reset = true;
             return;
@@ -502,7 +502,7 @@ impl Record {
         let address = required(string_prop(m, hdr::ADDRESS), "queueAddress")?;
         let cluster_name = required(string_prop(m, hdr::CLUSTER_NAME), "clusterName")?;
         let routing_name = required(string_prop(m, hdr::ROUTING_NAME), "routingName")?;
-        let queue_id = match m.properties.get(&SimpleString::from(hdr::BINDING_ID)) {
+        let queue_id = match m.properties.get_str(hdr::BINDING_ID) {
             Some(PropertyValue::Long(id)) => *id,
             _ => return Err("queueID is null".to_owned()),
         };
@@ -630,14 +630,14 @@ fn required<T>(v: Option<T>, what: &str) -> Result<T, String> {
 }
 
 fn string_prop(m: &CoreMessage, k: &str) -> Option<String> {
-    match m.properties.get(&SimpleString::from(k))? {
+    match m.properties.get_str(k)? {
         PropertyValue::String(s) => Some(s.to_string_lossy()),
         _ => None,
     }
 }
 
 fn int_prop(m: &CoreMessage, k: &str) -> Option<i32> {
-    match m.properties.get(&SimpleString::from(k))? {
+    match m.properties.get_str(k)? {
         PropertyValue::Int(i) => Some(*i),
         _ => None,
     }

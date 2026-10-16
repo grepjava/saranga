@@ -473,7 +473,7 @@ impl Producer {
         let message_body_size = body.len() as i64;
         if options.compress_large_messages {
             message.put_property(HDR_LARGE_COMPRESSED, PropertyValue::Bool(true));
-            body = large::deflate(&body, options.compression_level)?;
+            body = large::deflate(&body, options.compression_level)?.into();
             // Compressed below the minimum, it is sent as a regular message
             // carrying its real size.
             if body.len() < chunk_size {

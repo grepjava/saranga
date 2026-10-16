@@ -1240,7 +1240,7 @@ async fn federate(
             writer.append(chunk).map_err(io)?;
         }
         let size = message.body.len() as i64;
-        message.body = Vec::new();
+        message.body = Vec::new().into();
         let key = SimpleString::from(crate::message::HDR_LARGE_BODY_SIZE);
         if message.properties.get(&key).is_none() {
             message.properties.insert(key, PropertyValue::Long(size));

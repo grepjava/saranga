@@ -460,6 +460,7 @@ pub fn to_core(m: &AmqpMessage, now: i64) -> CoreMessage {
         ..Default::default()
     };
     let properties = m.properties();
+    let properties = properties.as_deref();
     let content_type = properties
         .and_then(|p| p.content_type.as_ref())
         .map(Symbol::as_str);
@@ -577,7 +578,7 @@ pub fn to_core(m: &AmqpMessage, now: i64) -> CoreMessage {
         },
         Some(_) => core.message_type = message_type::BYTES,
     }
-    core.body = body.into_vec();
+    core.body = body.into_vec().into();
     if let Some(o) = original {
         put(
             &mut core,
@@ -758,7 +759,7 @@ pub fn to_core(m: &AmqpMessage, now: i64) -> CoreMessage {
     // processExtraProperties
     if let Some(extra) = m.extra_properties() {
         for (k, v) in extra.iter() {
-            if k.to_string_lossy() != crate::message::ADDRESS_PROPERTY {
+            if !k.eq_str(crate::message::ADDRESS_PROPERTY) {
                 core.properties.insert(k.clone(), v.clone());
             }
         }
@@ -784,7 +785,7 @@ pub fn to_core(m: &AmqpMessage, now: i64) -> CoreMessage {
 /// `parseQueueAnnotation`: the destination type annotation, queue by
 /// default.
 fn queue_annotation(m: &AmqpMessage, name: &str) -> i8 {
-    match m.annotation(name).and_then(Value::as_i64) {
+    match m.annotation(name).as_ref().and_then(Value::as_i64) {
         Some(v) => v as i8,
         None => dest_type::QUEUE,
     }
@@ -793,7 +794,7 @@ fn queue_annotation(m: &AmqpMessage, name: &str) -> i8 {
 // ------------------------------------------------------------ Core -> AMQP
 
 fn property<'a>(core: &'a CoreMessage, key: &str) -> Option<&'a PropertyValue> {
-    core.properties.get(&SimpleString::from(key))
+    core.properties.get_str(key)
 }
 
 fn string_property(core: &CoreMessage, key: &str) -> Option<String> {
@@ -946,7 +947,7 @@ fn core_body(core: &CoreMessage, properties: &mut Properties) -> (i8, Option<(u6
             (jms_type::TEXT, body)
         }
         message_type::BYTES => {
-            let payload = Value::Binary(core.body.clone());
+            let payload = Value::Binary(core.body.to_vec());
             let body = match original {
                 encoding::NULL => None,
                 encoding::VALUE_BINARY => Some((section::AMQP_VALUE, payload)),
