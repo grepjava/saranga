@@ -204,7 +204,20 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedRec
     while let Some(out) = rx.recv().await {
         let close = match out {
             Out::Send { wait, bytes } => {
-                if let Err(e) = wait.wait().await {
+                // What is ready goes out before waiting for the journal, so
+                // frames already written are not held behind a later sync.
+                let mut done = std::pin::pin!(wait.wait());
+                let result = match saranga_server::session::poll_once(done.as_mut()).await {
+                    Some(r) => r,
+                    None => {
+                        if !broken && !buf.is_empty() {
+                            broken = wr.write_all(&buf).await.is_err() || wr.flush().await.is_err();
+                            buf.clear();
+                        }
+                        done.await
+                    }
+                };
+                if let Err(e) = result {
                     tracing::error!("AMQ119031: storage operation failed: {e}");
                 }
                 buf.extend_from_slice(&bytes);

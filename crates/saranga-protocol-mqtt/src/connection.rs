@@ -72,7 +72,20 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedRec
     while let Some(out) = rx.recv().await {
         let close = match out {
             Out::Send { wait, bytes } => {
-                match wait.wait().await {
+                // What is ready goes out before waiting for the journal, so
+                // packets already written are not held behind a later sync.
+                let mut done = std::pin::pin!(wait.wait());
+                let result = match saranga_server::session::poll_once(done.as_mut()).await {
+                    Some(r) => r,
+                    None => {
+                        if !broken && !buf.is_empty() {
+                            broken = wr.write_all(&buf).await.is_err();
+                            buf.clear();
+                        }
+                        done.await
+                    }
+                };
+                match result {
                     Ok(()) => {
                         if let Some(b) = bytes {
                             buf.extend_from_slice(&b);

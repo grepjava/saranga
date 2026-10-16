@@ -428,6 +428,19 @@ fn lock_replicated(r: &Replicated) -> std::sync::MutexGuard<'_, Vec<Pending>> {
     r.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Polls `f` once: its output if it is ready, `None` if it is not (it can
+/// still be awaited).
+pub async fn poll_once<F: Future>(f: std::pin::Pin<&mut F>) -> Option<F::Output> {
+    let mut f = f;
+    std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(match f.as_mut().poll(cx) {
+            std::task::Poll::Ready(v) => Some(v),
+            std::task::Poll::Pending => None,
+        })
+    })
+    .await
+}
+
 /// An acknowledgement on its way to its queue
 /// ([`ServerSession::acknowledge_then`]).
 pub struct AckPending {
