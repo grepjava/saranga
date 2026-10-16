@@ -26,11 +26,16 @@
 #                the clients connect through the proxy, with ha=true.
 #   replication  A primary and B its replicating backup, each announcing its
 #                proxy route, so replication and the clients' connections
-#                go through the proxy.
+#                go through the proxy, which only delays them unless FAULTS
+#                says otherwise: a lone pair's quorum vote needs no votes,
+#                so a broken replication connection leaves two active
+#                brokers, in Artemis as in Saranga (scripts/linearizability.sh
+#                partitions a pair with a lock manager instead).
 #
 # DURATION (default 120) is the seconds of chaos; FAULTS (default
-# cut,delay,blackhole,refuse,drop) the faults; SEED the proxy's seed (logged
-# when not given); LARGE_EVERY (default 25) makes every n-th message large.
+# cut,delay,blackhole,refuse,drop, delay alone for replication) the faults;
+# SEED the proxy's seed (logged when not given); LARGE_EVERY (default 25)
+# makes every n-th message large.
 # KEEP=1 keeps the work directory.
 set -uo pipefail
 
@@ -41,7 +46,6 @@ DIST="${ARTEMIS_DIST:-$ROOT/reference/activemq-artemis/artemis-distribution/targ
 SARANGA="$ROOT/target/release/saranga"
 CHAOS="$ROOT/target/release/saranga-chaos"
 DURATION="${DURATION:-120}"
-FAULTS="${FAULTS:-cut,delay,blackhole,refuse,drop}"
 LARGE_GIVEN="${LARGE_EVERY+set}"
 LARGE_EVERY="${LARGE_EVERY:-25}"
 SCENARIOS="bridge cluster federation mirror shared-store replication"
@@ -64,6 +68,10 @@ if [[ "$SCENARIO" == all ]]; then
 fi
 [[ " $SCENARIOS " == *" $SCENARIO "* ]] || { echo "unknown scenario: $SCENARIO" >&2; exit 2; }
 KIND_A="${2:-saranga}" KIND_B="${3:-saranga}"
+[[ "$SCENARIO" == replication ]] && FAULTS="${FAULTS:-delay}" || FAULTS="${FAULTS:-cut,delay,blackhole,refuse,drop}"
+# What a backup logs when it becomes active: a shared-store backup
+# AMQ221010, a replicating one AMQ221007, as a primary does.
+[[ "$SCENARIO" == shared-store ]] && ACTIVE=AMQ221010 || ACTIVE=AMQ221007
 # Artemis's Core queue federation never returns the credit of the large
 # message chunks it reads (LargeMessageControllerImpl.take), so an Artemis
 # downstream stops for good once a consumer window of them has passed:
@@ -199,7 +207,7 @@ prepare() {
             <static-connectors><connector-ref>target</connector-ref></static-connectors>
          </bridge>
       </bridges>"
-      ROUTES=("b=127.0.0.1:$PROXYB,localhost:$PORTB")
+      ROUTES=("b=127.0.0.1:$PROXYB,127.0.0.1:$PORTB")
       PRODUCER="$a" CONSUMER="$b"
       ;;
     cluster)
@@ -210,7 +218,7 @@ prepare() {
       add_queue "$B" "$redistribute"
       announce "$A" "$PROXYA"
       announce "$B" "$PROXYB"
-      ROUTES=("a=127.0.0.1:$PROXYA,localhost:$PORTA" "b=127.0.0.1:$PROXYB,localhost:$PORTB")
+      ROUTES=("a=127.0.0.1:$PROXYA,127.0.0.1:$PORTA" "b=127.0.0.1:$PROXYB,127.0.0.1:$PORTB")
       PRODUCER="$a" CONSUMER="$b"
       ;;
     federation)
@@ -231,7 +239,7 @@ prepare() {
             <queue-policy name=\"qp\"><include queue-match=\"q\" address-match=\"#\"/></queue-policy>
          </federation>
       </federations>"
-      ROUTES=("a=127.0.0.1:$PROXYA,localhost:$PORTA")
+      ROUTES=("a=127.0.0.1:$PROXYA,127.0.0.1:$PORTA")
       PRODUCER="$a" CONSUMER="$b"
       ;;
     mirror)
@@ -244,7 +252,7 @@ prepare() {
             <mirror/>
          </amqp-connection>
       </broker-connections>"
-      ROUTES=("b=127.0.0.1:$PROXYB,localhost:$PORTB")
+      ROUTES=("b=127.0.0.1:$PROXYB,127.0.0.1:$PORTB")
       PRODUCER="$a" CONSUMER="$b"
       ;;
     shared-store)
@@ -258,7 +266,7 @@ prepare() {
       add_queue "$B"
       announce "$A" "$PROXYA"
       announce "$B" "$PROXYB"
-      ROUTES=("a=127.0.0.1:$PROXYA,localhost:$PORTA" "b=127.0.0.1:$PROXYB,localhost:$PORTB")
+      ROUTES=("a=127.0.0.1:$PROXYA,127.0.0.1:$PORTA" "b=127.0.0.1:$PROXYB,127.0.0.1:$PORTB")
       PRODUCER="tcp://127.0.0.1:$PROXYA?ha=true&reconnectAttempts=-1&retryInterval=500" CONSUMER="$PRODUCER"
       ;;
     replication)
@@ -270,7 +278,7 @@ prepare() {
       add_queue "$B"
       announce "$A" "$PROXYA"
       announce "$B" "$PROXYB"
-      ROUTES=("a=127.0.0.1:$PROXYA,localhost:$PORTA" "b=127.0.0.1:$PROXYB,localhost:$PORTB")
+      ROUTES=("a=127.0.0.1:$PROXYA,127.0.0.1:$PORTA" "b=127.0.0.1:$PROXYB,127.0.0.1:$PORTB")
       PRODUCER="tcp://127.0.0.1:$PROXYA?ha=true&reconnectAttempts=-1&retryInterval=500" CONSUMER="$PRODUCER"
       ;;
   esac
@@ -344,7 +352,7 @@ soak() {
       | awk '{print $3}' | sort | uniq -c | awk '{printf "%s%s %s", sep, $1, $2; sep=", "}'))"
 
   if [[ "$SCENARIO" == shared-store || "$SCENARIO" == replication ]]; then
-    echo "b: became active $(grep -c AMQ221010 "$B/log/artemis.log" 2>/dev/null) times"
+    echo "b: became active $(grep -c "$ACTIVE" "$B/log/artemis.log" 2>/dev/null) times"
   fi
 
   step "healed; the producer stopped, the rest received"
@@ -354,7 +362,7 @@ soak() {
   grep -E "^(lost|received twice|corrupt|done):|^committed [0-9]+, received" "$out"
   grep -q -E "^done: lost 0, received twice 0$" "$out" || fail "the client lost or repeated messages"
   grep -q "^corrupt:" "$out" && fail "a large message arrived corrupt"
-  grep -q -E "^(java|javax|org)\.[A-Za-z.]*(Exception|Error)" "$out" && { fail "the client failed"; cat "$out"; }
+  grep -q "^failed:" "$out" && { fail "the client failed"; cat "$out"; }
 
   step "artemis stop (b, a)"
   stop_proxy

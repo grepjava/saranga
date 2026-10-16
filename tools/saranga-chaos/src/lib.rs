@@ -18,6 +18,14 @@
 //! Commands come from the control port, a schedule or the random chaos, which
 //! applies a fault to a route chosen at random, holds it and heals the route.
 //! Every command applied is logged with the seconds since the start.
+//! A route whose target refuses a connection, or ends one before its client
+//! has, checks the target, and while it refuses stops listening until it
+//! accepts again: a dead node looks dead through the proxy, its clients
+//! refused rather than accepted and reset.
+//!
+//! [`history`] checks the histories the linearizability runs record.
+
+pub mod history;
 
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -27,9 +35,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpSocket;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Instant, sleep, sleep_until};
 
 /// A route's mode.
@@ -226,6 +235,8 @@ pub struct Route {
     pub target: String,
     state: watch::Sender<State>,
     open: AtomicUsize,
+    /// Told when a connection to the target is refused.
+    down: Notify,
 }
 
 pub struct Chaos {
@@ -257,6 +268,7 @@ impl Chaos {
                 })
                 .0,
                 open: AtomicUsize::new(0),
+                down: Notify::new(),
             }));
             listeners.push(listener);
         }
@@ -497,15 +509,35 @@ impl Chaos {
         Ok(())
     }
 
-    async fn accept(self: Arc<Self>, route: Arc<Route>, listener: TcpListener) {
+    /// Accepts the route's connections. Once a connection to the target is
+    /// refused the route stops listening, so that its clients are refused as
+    /// the target's would be, rather than accepted and reset, and listens
+    /// again when the target accepts a connection.
+    async fn accept(self: Arc<Self>, route: Arc<Route>, mut listener: TcpListener) {
         loop {
-            match listener.accept().await {
-                Ok((client, _)) => {
-                    let chaos = self.clone();
-                    let route = route.clone();
-                    tokio::spawn(async move { chaos.connection(&route, client).await });
+            tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok((client, _)) => {
+                        let chaos = self.clone();
+                        let route = route.clone();
+                        tokio::spawn(async move { chaos.connection(&route, client).await });
+                    }
+                    Err(_) => sleep(Duration::from_millis(100)).await,
+                },
+                _ = route.down.notified() => {
+                    drop(listener);
+                    if TcpStream::connect(&route.target).await.is_ok() {
+                        // Up after all: back at once, and quietly.
+                        listener = relisten(route.listen).await;
+                        continue;
+                    }
+                    self.log(&format!("{}: target down, not listening", route.name));
+                    while TcpStream::connect(&route.target).await.is_err() {
+                        sleep(Duration::from_millis(200)).await;
+                    }
+                    listener = relisten(route.listen).await;
+                    self.log(&format!("{}: target up, listening", route.name));
                 }
-                Err(_) => sleep(Duration::from_millis(100)).await,
             }
         }
     }
@@ -528,6 +560,7 @@ impl Chaos {
             return reset(client);
         }
         let Ok(server) = TcpStream::connect(&route.target).await else {
+            route.down.notify_one();
             return reset(client);
         };
         let _ = client.set_nodelay(true);
@@ -535,14 +568,25 @@ impl Chaos {
         route.open.fetch_add(1, Ordering::Relaxed);
         let (mut cr, mut cw) = client.into_split();
         let (mut sr, mut sw) = server.into_split();
-        let failed = tokio::select! {
-            r = async {
-                tokio::try_join!(
-                    self.pump(route, &mut cr, &mut sw, epoch),
-                    self.pump(route, &mut sr, &mut cw, epoch),
-                )
-            } => r.is_err(),
-            _ = state.wait_for(|s| s.epoch != epoch) => true,
+        let failed = {
+            let to_server = self.pump(route, &mut cr, &mut sw, epoch);
+            let to_client = self.pump(route, &mut sr, &mut cw, epoch);
+            tokio::pin!(to_server, to_client);
+            tokio::select! {
+                r = async {
+                    tokio::select! {
+                        r = &mut to_server => if r.is_err() { r } else { to_client.await },
+                        r = &mut to_client => {
+                            // The target ended the connection first, as it
+                            // does when it dies: the route checks it before a
+                            // client reconnects.
+                            route.down.notify_one();
+                            if r.is_err() { r } else { to_server.await }
+                        }
+                    }
+                } => r.is_err(),
+                _ = state.wait_for(|s| s.epoch != epoch) => true,
+            }
         };
         route.open.fetch_sub(1, Ordering::Relaxed);
         if failed {
@@ -623,6 +667,29 @@ fn describe(mode: Mode) -> String {
         Mode::Refuse => "refuse".into(),
         Mode::Drop(p) => format!("drop {p}"),
     }
+}
+
+/// Listens on a route's address again, retrying until it can.
+async fn relisten(addr: SocketAddr) -> TcpListener {
+    loop {
+        match rebind(addr) {
+            Ok(listener) => return listener,
+            Err(_) => sleep(Duration::from_millis(50)).await,
+        }
+    }
+}
+
+/// Listens on a route's address again, which its old connections may still
+/// hold in TIME_WAIT.
+fn rebind(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(1024)
 }
 
 /// Closes a connection with a reset, as a failed network leaves it.

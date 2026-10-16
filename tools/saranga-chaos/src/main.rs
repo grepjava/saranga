@@ -19,12 +19,16 @@
 //!   an error. Commands: heal ROUTE, delay ROUTE MS [JITTER], blackhole
 //!   ROUTE, refuse ROUTE, drop ROUTE P, cut ROUTE, random on|off, status
 //!   (ROUTE may be all).
+//!
+//! saranga-chaos check HISTORY
+//!   checks a history of queue operations (see the history module) and
+//!   prints what it counted and found; exits 1 unless it is valid.
 //! ```
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use saranga_chaos::{Chaos, RandomSpec, RouteSpec, parse_range};
+use saranga_chaos::{Chaos, RandomSpec, RouteSpec, history, parse_range};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -33,6 +37,9 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("ctl") {
         return ctl(&args[1..]).await;
+    }
+    if args.first().map(String::as_str) == Some("check") {
+        return check(&args[1..]);
     }
     let mut routes = Vec::new();
     let mut control = None;
@@ -96,6 +103,19 @@ async fn main() -> Result<()> {
             chaos.control(listener).await;
         }
         None => std::future::pending::<()>().await,
+    }
+    Ok(())
+}
+
+fn check(args: &[String]) -> Result<()> {
+    let [file] = args else {
+        bail!("usage: saranga-chaos check HISTORY");
+    };
+    let text = std::fs::read_to_string(file).with_context(|| format!("read {file}"))?;
+    let report = history::check(&history::parse(&text)?);
+    println!("{report}");
+    if !report.valid() {
+        std::process::exit(1);
     }
     Ok(())
 }

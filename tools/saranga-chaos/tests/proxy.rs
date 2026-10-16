@@ -404,3 +404,108 @@ fn commands_times_and_routes_parse() {
     assert!("all=a,b".parse::<RouteSpec>().is_err());
     assert!("b=a".parse::<RouteSpec>().is_err());
 }
+
+#[tokio::test]
+async fn a_route_refuses_while_its_target_is_down() {
+    // A port nothing listens on, for now.
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = target.local_addr().unwrap();
+    drop(target);
+    let spec = RouteSpec {
+        name: "r".into(),
+        listen: "127.0.0.1:0".into(),
+        target: addr.to_string(),
+    };
+    let chaos = Chaos::start(&[spec], 7).await.unwrap();
+    let listen = chaos.route("r").unwrap().listen;
+
+    // The first connection is accepted and reset; then the route stops
+    // listening, as the target has.
+    let mut first = TcpStream::connect(listen).await.unwrap();
+    assert!(closed(&mut first).await);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect(listen).await.is_ok() {
+        assert!(Instant::now() < deadline, "the route still listens");
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    // The target comes up: the route listens and forwards again.
+    let listener = TcpListener::bind(addr).await.unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (mut r, mut w) = stream.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        if let Ok(stream) = TcpStream::connect(listen).await {
+            break stream;
+        }
+        assert!(Instant::now() < deadline, "the route does not listen again");
+        sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        round_trip(&mut stream, b"back", Duration::from_secs(5))
+            .await
+            .unwrap(),
+        b"back"
+    );
+}
+
+#[tokio::test]
+async fn a_route_stops_listening_when_its_target_dies_under_a_connection() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let spec = RouteSpec {
+        name: "r".into(),
+        listen: "127.0.0.1:0".into(),
+        target: target.local_addr().unwrap().to_string(),
+    };
+    let chaos = Chaos::start(&[spec], 7).await.unwrap();
+    let listen = chaos.route("r").unwrap().listen;
+    let mut stream = TcpStream::connect(listen).await.unwrap();
+    // The target accepts, then dies: its listener and connection close.
+    let (server, _) = target.accept().await.unwrap();
+    drop(target);
+    drop(server);
+    assert!(closed(&mut stream).await);
+    // No client had to be accepted and reset first.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect(listen).await.is_ok() {
+        assert!(Instant::now() < deadline, "the route still listens");
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_route_goes_on_listening_when_its_target_closes_a_connection() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let spec = RouteSpec {
+        name: "r".into(),
+        listen: "127.0.0.1:0".into(),
+        target: target.local_addr().unwrap().to_string(),
+    };
+    let chaos = Chaos::start(&[spec], 7).await.unwrap();
+    let listen = chaos.route("r").unwrap().listen;
+    let mut stream = TcpStream::connect(listen).await.unwrap();
+    let (server, _) = target.accept().await.unwrap();
+    drop(server);
+    assert!(closed(&mut stream).await);
+    // The target is alive, so a new connection reaches it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let accepted = loop {
+        if TcpStream::connect(listen).await.is_ok()
+            && let Ok(Ok(_)) = timeout(Duration::from_secs(2), target.accept()).await
+        {
+            break true;
+        }
+        if Instant::now() > deadline {
+            break false;
+        }
+        sleep(Duration::from_millis(50)).await;
+    };
+    assert!(accepted, "the route did not reach the live target");
+}

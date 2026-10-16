@@ -12,7 +12,8 @@
 //       outcome is unknown is not counted either way. It prints "committed
 //       <n>" every hundred, then what was lost: a message whose transaction
 //       committed and that was never received, or one received by two
-//       commits that succeeded.
+//       commits that succeeded, and "failed: <exception>" if a thread ends
+//       on one.
 // scripts/chaos-soak.sh runs it.
 
 import java.nio.file.*;
@@ -95,6 +96,7 @@ public class Chaos {
                     Thread.sleep(10);
                 }
             } catch (Exception e) {
+                System.out.println("failed: " + e);
                 e.printStackTrace(System.out);
             }
         });
@@ -153,6 +155,7 @@ public class Chaos {
                         }
                     }
                 } catch (Exception e) {
+                    System.out.println("failed: " + e);
                     e.printStackTrace(System.out);
                 }
             }));

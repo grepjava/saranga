@@ -64,6 +64,8 @@ jobs:
   # the links of a bridge, a cluster, a federation, a mirror and a
   # replicated pair under load, Java and Saranga on each side, with nothing
   # committed lost and nothing received twice.
+  # Then the linearizability runs: HA pairs under the same faults while
+  # their nodes are killed, each client history checked against a queue.
   chaos:
     runs-on: ubuntu-latest
     env:
@@ -93,6 +95,9 @@ jobs:
       - run: scripts/chaos-soak.sh federation artemis saranga
       - run: scripts/chaos-soak.sh mirror saranga artemis
       - run: scripts/chaos-soak.sh replication saranga artemis
+      - run: scripts/linearizability.sh shared-store saranga artemis
+      - run: scripts/linearizability.sh replication artemis saranga
+      - run: scripts/linearizability.sh pluggable saranga artemis
 
   # Phase 11: producers fill a 64 MiB tmpfs, held back by max-disk-usage
   # and run out of space, with nothing acknowledged lost.
