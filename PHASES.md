@@ -560,6 +560,32 @@ The differences from Artemis are listed in COMPAT.md.
   - **The proxy** now makes a dead node look dead. When a route's target refuses a connection, or ends one before its client has, the route checks the target. While the target refuses, the route stops listening, so clients are refused rather than accepted and then reset. Accept-then-reset stalled the Artemis client's failover for its 30 s call timeout: it holds `connectionLock` while CONNECT's blocking call runs, and a reset during that handshake is noticed only when the call times out.
   - **Split brain in a lone vote-replication pair.** The backup of a pair with no other primaries decides with a cluster size of 1. It needs no votes ("AMQ221083: ignoring quorum vote as max cluster size is 1"), so any break of its replication connection makes it active beside a live primary, in Artemis as in Saranga. Replication follows the connector the primary announces, so it cannot be kept off the proxy while the clients go through it. A run with partitions found 3 duplicated and 2 lost values with Saranga on both sides. The vote-replication pair therefore gets delays only, and partitions are tested on the pluggable pair, which is Artemis's answer to this. Stage 2's replicated soak gets delays only for the same reason.
   - **Seen once in Artemis, not yet diagnosed.** In one failing run, an Artemis backup that was active and failing back to a Saranga primary hung in `JournalStorageManager.internalStop`, waiting for the storage write lock. `stopReplication` and the readers waited too, and no thread showed as holding the read lock: perhaps a read lock leaked on an exception path. It has not been seen since and is not drafted as an issue.
+- Stage 4 (fuzzing) is done.
+  - **Targets.** Each target's body is a plain function in [crates/saranga-fuzz](crates/saranga-fuzz), so the workspace builds and tests it on stable. The cargo-fuzz crate [fuzz](fuzz), outside the workspace, wraps each one in a line. There are 15 targets:
+    - `buffer`: `TypedProperties`, `SimpleString`, strings, nullable strings and JSON;
+    - `core_message`: whole messages, and headers and properties alone;
+    - `core_packet`: frames of every packet, the first byte choosing the direction and the protocol version;
+    - `journal`: journal and bindings files (each record also written alone into a new file), the compaction control file, and record bodies;
+    - `storage_record`: every record type's body, described for `data print` (safe and not) and decoded;
+    - `page`: page files and each message's record;
+    - `amqp_frame`, `amqp_value` and `amqp_message`: frames, the type system with performatives and SASL frames, and messages scanned and re-encoded;
+    - `mqtt`, `stomp` and `openwire`: each version (OpenWire also with tight encoding, the marshal cache, stack traces and no size prefix);
+    - `websocket`: the HTTP upgrade and handshake, and frames as a binary or text stream;
+    - `filter`: parsed, converted from ActiveMQ syntax, and matched;
+    - `config`: `broker.xml`, `bootstrap.xml`, acceptor URIs and properties files.
+
+    Each target decodes its input and, where it decodes, encodes it, decodes that again and checks that the second encoding equals the first. Anything other than an error from the decoder is a bug.
+  - **Seeds.** `fuzz-seeds` writes 4,602 seeds from the golden corpus: Core and AMQP wire frames and the messages and properties they carry, the packet fixtures, OpenWire frames of every version, the journal, bindings and page files of the data directories, and the broker configurations. MQTT, STOMP, WebSocket, filter and JSON seeds are written by hand. A seed is at most 32 KiB, and an OpenWire run with the cache on at most 8 KiB, since bigger ones slowed their targets to a few executions a second.
+  - **Found and fixed.**
+    - A Core message's end-of-body position below 13 overflowed an `i32` (also from `data print`).
+    - An AMQP descriptor that was itself described recursed without bound and overflowed the stack. Values are now at most 100 deep, and a described descriptor is an error.
+    - An AMQP array with a zero-width element type (null, true, false, uint0, ulong0, list0) could claim four billion elements in a few bytes, and the decoder pushed them until memory ran out. As in proton-j, whose zero-width element limit is 0, such an array must be empty, and no array may count more elements than it has bytes.
+    - A JSON number beyond a double's range became an infinity that could not be written back. It is now an error (COMPAT.md).
+    - A harness bug: an AMQP empty frame with an extended header was re-encoded without it.
+
+    Each input is kept in [fuzz/regressions](fuzz/regressions), and [regressions.rs](crates/saranga-fuzz/tests/regressions.rs) runs them with the workspace's tests. `SARANGA_FUZZ_DIR` runs a whole corpus the same way.
+  - **Running.** [scripts/fuzz.sh](scripts/fuzz.sh) writes the seeds, builds the targets with nightly and runs each for a set time (`JOBS` at once), failing if any finds a crash. Three rounds of 120 s each ran in all; the last found nothing in any target. A CI job runs each target for 60 s and keeps what it finds.
+  - **Fixed along the way.** Random chaos could apply a new fault just after `random off` had healed every route, leaving it held. A test caught it about one run in five. The fault is now applied only while the flag is on, under the flag's lock.
 
 ---
 

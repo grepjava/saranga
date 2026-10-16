@@ -319,16 +319,35 @@ fn encode_array_body(a: &Array, wide: bool, out: &mut Vec<u8>) {
 
 // ---------------------------------------------------------------- decoding
 
+/// How deep described values and compounds may nest. Each level is a
+/// recursion when a value is decoded, encoded and dropped, so a peer must
+/// not choose it: a few kilobytes of nesting would overflow a stack.
+pub const MAX_DEPTH: usize = 100;
+
 /// Reads AMQP values from a byte slice.
 #[derive(Debug, Clone)]
 pub struct Decoder<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// The described values and compounds this decoder is inside.
+    depth: usize,
 }
 
 impl<'a> Decoder<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self {
+            buf,
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    /// Goes one level deeper, failing past [`MAX_DEPTH`].
+    fn deeper(&self) -> Result<usize> {
+        if self.depth >= MAX_DEPTH {
+            return invalid(format!("values nested more than {MAX_DEPTH} deep"));
+        }
+        Ok(self.depth + 1)
     }
 
     pub fn position(&self) -> usize {
@@ -382,15 +401,23 @@ impl<'a> Decoder<'a> {
         let c = self.u8()?;
         if c == code::DESCRIBED {
             let d = self.read_descriptor()?;
-            let v = self.read()?;
-            return Ok(Value::Described(Box::new(d), Box::new(v)));
+            let depth = self.depth;
+            self.depth = self.deeper()?;
+            let v = self.read();
+            self.depth = depth;
+            return Ok(Value::Described(Box::new(d), Box::new(v?)));
         }
         self.read_primitive(c)
     }
 
-    /// Reads a descriptor (after the `0x00`).
+    /// Reads a descriptor (after the `0x00`): a ulong or a symbol, never
+    /// itself described.
     pub fn read_descriptor(&mut self) -> Result<Descriptor> {
-        match self.read()? {
+        let c = self.u8()?;
+        if c == code::DESCRIBED {
+            return invalid("described descriptor");
+        }
+        match self.read_primitive(c)? {
             Value::Ulong(c) => Ok(Descriptor::Code(c)),
             Value::Symbol(s) => Ok(Descriptor::Name(s)),
             other => invalid(format!("descriptor {other:?}")),
@@ -405,11 +432,20 @@ impl<'a> Decoder<'a> {
     }
 
     fn skip_value(&mut self) -> Result<()> {
-        let c = self.u8()?;
-        if c == code::DESCRIBED {
-            self.skip_value()?;
-            return self.skip_value();
+        // Each descriptor, then the value they describe.
+        let mut c = self.u8()?;
+        while c == code::DESCRIBED {
+            let d = self.u8()?;
+            if d == code::DESCRIBED {
+                return invalid("described descriptor");
+            }
+            self.skip_primitive(d)?;
+            c = self.u8()?;
         }
+        self.skip_primitive(c)
+    }
+
+    fn skip_primitive(&mut self, c: u8) -> Result<()> {
         let n = match c >> 4 {
             0x4 => 0,
             0x5 => 1,
@@ -520,7 +556,14 @@ impl<'a> Decoder<'a> {
             }
             (size - 1, self.u8()? as usize)
         };
-        Ok((count, Decoder::new(self.take(size)?)))
+        let depth = self.deeper()?;
+        Ok((
+            count,
+            Decoder {
+                depth,
+                ..Decoder::new(self.take(size)?)
+            },
+        ))
     }
 
     fn array_body(&mut self, count: usize) -> Result<Array> {
@@ -532,7 +575,23 @@ impl<'a> Decoder<'a> {
         } else {
             ArrayType::Primitive(canonical(c))
         };
-        let mut items = Vec::with_capacity(count.min(self.remaining()));
+        // As proton-j's ArrayType (its zero-width element limit is 0 by
+        // default): a zero-width element costs no bytes, so its count would
+        // be bounded by nothing; every other element takes at least a byte.
+        let zero_width = matches!(
+            c,
+            code::NULL | code::TRUE | code::FALSE | code::UINT0 | code::ULONG0 | code::LIST0
+        );
+        if count > 0 && zero_width {
+            return invalid(format!("array of {count} zero-width elements"));
+        }
+        if count > self.remaining() {
+            return invalid(format!(
+                "array element count {count} greater than the {} bytes left",
+                self.remaining()
+            ));
+        }
+        let mut items = Vec::with_capacity(count);
         for _ in 0..count {
             items.push(self.read_primitive(c)?);
         }
@@ -617,5 +676,22 @@ mod tests {
         let mut d = Decoder::new(&bytes);
         assert_eq!(d.skip().unwrap(), &bytes[..]);
         assert!(!d.has_remaining());
+    }
+
+    #[test]
+    fn array_counts_are_bounded_by_their_bytes() {
+        // A billion nulls in two bytes, as proton-j refuses.
+        assert!(from_slice(&[0xf0, 0, 0, 0, 5, 0x3b, 0x9a, 0xca, 0x00, 0x40]).is_err());
+        assert!(from_slice(&[0xe0, 2, 3, 0x41]).is_err());
+        assert!(from_slice(&[0xe0, 3, 3, 0x50, 1]).is_err());
+        // No elements is fine whatever their type.
+        let empty = from_slice(&[0xe0, 2, 0, 0x40]).unwrap();
+        assert_eq!(
+            empty,
+            Value::Array(Array {
+                element: ArrayType::Primitive(code::NULL),
+                items: vec![]
+            })
+        );
     }
 }

@@ -354,12 +354,18 @@ impl Chaos {
                 Ok(lines)
             }
             Command::Random(on) => {
-                self.random.send_replace(*on);
                 self.log(&format!("random {}", if *on { "on" } else { "off" }));
-                if !on {
-                    self.apply(&Command::Set(Target::All, Mode::Heal))?;
-                }
-                Ok(String::new())
+                // The heal is made under the flag's lock, which the random
+                // task holds while it applies a fault, so no fault comes
+                // after it.
+                let mut healed = Ok(String::new());
+                self.random.send_modify(|random| {
+                    *random = *on;
+                    if !on {
+                        healed = self.apply(&Command::Set(Target::All, Mode::Heal));
+                    }
+                });
+                healed.map(|_| String::new())
             }
             Command::Cut(target) => {
                 for route in self.targets(target)? {
@@ -483,20 +489,29 @@ impl Chaos {
                 let route = &routes[chaos.below(routes.len() as u64) as usize];
                 let target = Target::Route(route.name.clone());
                 let fault = spec.faults[chaos.below(spec.faults.len() as u64) as usize];
-                let mode = match fault {
-                    Fault::Cut => {
-                        let _ = chaos.apply(&Command::Cut(target));
-                        continue;
-                    }
+                let command = match fault {
+                    Fault::Cut => Command::Cut(target.clone()),
                     Fault::Delay => {
                         let ms = 1 + chaos.below(spec.max_delay.max(1));
-                        Mode::Delay { ms, jitter: ms / 2 }
+                        Command::Set(target.clone(), Mode::Delay { ms, jitter: ms / 2 })
                     }
-                    Fault::Blackhole => Mode::Blackhole,
-                    Fault::Refuse => Mode::Refuse,
-                    Fault::Drop => Mode::Drop(spec.drop),
+                    Fault::Blackhole => Command::Set(target.clone(), Mode::Blackhole),
+                    Fault::Refuse => Command::Set(target.clone(), Mode::Refuse),
+                    Fault::Drop => Command::Set(target.clone(), Mode::Drop(spec.drop)),
                 };
-                let _ = chaos.apply(&Command::Set(target.clone(), mode));
+                {
+                    // random off may have come since the sleep: the fault is
+                    // applied only while the flag is on, holding it so that
+                    // random off's heal comes after.
+                    let on = chaos.random.borrow();
+                    if !*on {
+                        continue;
+                    }
+                    let _ = chaos.apply(&command);
+                }
+                if matches!(fault, Fault::Cut) {
+                    continue;
+                }
                 tokio::select! {
                     _ = sleep(chaos.between(spec.hold)) => {
                         let _ = chaos.apply(&Command::Set(target, Mode::Heal));

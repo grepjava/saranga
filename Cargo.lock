@@ -1812,6 +1812,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "saranga-fuzz"
+version = "0.0.1"
+dependencies = [
+ "flate2",
+ "saranga-buffer",
+ "saranga-config",
+ "saranga-core-protocol",
+ "saranga-filter",
+ "saranga-journal",
+ "saranga-message",
+ "saranga-paging",
+ "saranga-protocol-amqp",
+ "saranga-protocol-mqtt",
+ "saranga-protocol-openwire",
+ "saranga-protocol-stomp",
+ "saranga-storage",
+ "saranga-transport",
+ "tar",
+ "tokio",
+]
+
+[[package]]
 name = "saranga-ha"
 version = "0.0.1"
 dependencies = [

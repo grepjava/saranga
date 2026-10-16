@@ -1,0 +1,126 @@
+[package]
+name = "saranga-fuzz-targets"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+saranga-fuzz = { path = "../crates/saranga-fuzz" }
+
+# Not a member of the repository's workspace: cargo-fuzz builds it on its
+# own, with nightly and the sanitizer.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "buffer"
+path = "fuzz_targets/buffer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "core_message"
+path = "fuzz_targets/core_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "core_packet"
+path = "fuzz_targets/core_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal"
+path = "fuzz_targets/journal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "storage_record"
+path = "fuzz_targets/storage_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "page"
+path = "fuzz_targets/page.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "amqp_frame"
+path = "fuzz_targets/amqp_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "amqp_value"
+path = "fuzz_targets/amqp_value.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "amqp_message"
+path = "fuzz_targets/amqp_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mqtt"
+path = "fuzz_targets/mqtt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stomp"
+path = "fuzz_targets/stomp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openwire"
+path = "fuzz_targets/openwire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "websocket"
+path = "fuzz_targets/websocket.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter"
+path = "fuzz_targets/filter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false

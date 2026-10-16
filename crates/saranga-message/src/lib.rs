@@ -41,8 +41,12 @@ impl CoreMessage {
     /// i32 end-of-body position, body, then headers and properties.
     pub fn decode(r: &mut Reader<'_>) -> Result<Self> {
         let end_of_body = r.i32()?;
-        let body_len = usize::try_from(end_of_body - BUFFER_HEADER_SPACE)
-            .map_err(|_| DecodeError::Invalid(format!("bad end-of-body position {end_of_body}")))?;
+        let body_len = end_of_body
+            .checked_sub(BUFFER_HEADER_SPACE)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| {
+                DecodeError::Invalid(format!("bad end-of-body position {end_of_body}"))
+            })?;
         let body = r.bytes(body_len)?.to_vec();
         let mut msg = Self::decode_headers_and_properties(r)?;
         msg.body = body;

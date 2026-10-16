@@ -388,8 +388,11 @@ impl Parser<'_> {
             Ok(d) if d.fract() == 0.0 && d.abs() < 9.2e18 && !text.contains('.') => {
                 Ok(Json::Long(d as i64))
             }
-            Ok(d) => Ok(Json::Double(d)),
-            Err(_) => self.err("Invalid number"),
+            // Johnzon keeps a number past a double's range as a BigDecimal;
+            // as a double it would become an infinity, which JSON cannot
+            // write, so it is refused.
+            Ok(d) if d.is_finite() => Ok(Json::Double(d)),
+            _ => self.err("Invalid number"),
         }
     }
 

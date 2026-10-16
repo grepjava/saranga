@@ -1,0 +1,26 @@
+[package]
+name = "saranga-fuzz"
+description = "The bodies of the cargo-fuzz targets in fuzz/, their regression inputs and the seeds cut from the golden corpus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+saranga-buffer = { path = "../saranga-buffer" }
+saranga-config = { path = "../saranga-config" }
+saranga-core-protocol = { path = "../saranga-core-protocol" }
+saranga-filter = { path = "../saranga-filter" }
+saranga-journal = { path = "../saranga-journal" }
+saranga-message = { path = "../saranga-message" }
+saranga-paging = { path = "../saranga-paging" }
+saranga-protocol-amqp = { path = "../saranga-protocol-amqp" }
+saranga-protocol-mqtt = { path = "../saranga-protocol-mqtt" }
+saranga-protocol-openwire = { path = "../saranga-protocol-openwire" }
+saranga-protocol-stomp = { path = "../saranga-protocol-stomp" }
+saranga-storage = { path = "../saranga-storage" }
+saranga-transport = { path = "../saranga-transport" }
+tokio = { version = "1", features = ["io-util"] }
+# For the seeds: the golden data directories are tar.gz files.
+flate2 = "1"
+tar = "0.4"

@@ -109,6 +109,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: scripts/disk-soak.sh 120
 
+  # Phase 11: every codec under cargo-fuzz for a short time, seeded from
+  # the golden corpus. An input a target fails on is uploaded.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - run: cargo +nightly install cargo-fuzz --locked
+      - run: JOBS=4 scripts/fuzz.sh 60
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+
   deny:
     runs-on: ubuntu-latest
     steps:

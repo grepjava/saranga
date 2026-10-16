@@ -179,6 +179,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **Message counter dates** are in UTC, as the other dates are, and so are the hours of a counter's history.
 - **The slow-consumer advisory** (`ActiveMQ.Advisory.SlowConsumer.*`) is not sent to OpenWire clients; the `CONSUMER_SLOW` notification and the `KILL` policy work for consumers of every protocol.
 - **Slow consumers** are checked by one task for all queues, within 200 ms of each queue's check period. Artemis schedules a task for each queue.
+- **JSON numbers beyond a double's range** (such as `1e400`), in management arguments or JSON configuration, are an error. Artemis's Johnzon reads them as a `BigDecimal`.
 - **Records.** Paused queues and addresses, address settings and diverts are journaled as Artemis journals them (`QUEUE_STATUS_RECORD`, `ADDRESS_STATUS_RECORD`, `ADDRESS_SETTING_RECORD_JSON`, `DIVERT_RECORD`), so they move with the data directory in both directions. Like Artemis, Saranga journals every deployed divert, configured ones included.
 
 ## Web server differences
