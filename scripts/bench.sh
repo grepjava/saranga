@@ -156,15 +156,17 @@ cpu_cost() {
 }
 
 # From a perf client's JSON report: the mean received rate after the
-# warmup while the producer sends (not the backlog drained after it
-# stops, which would credit a broker that fell behind), the summary's
+# warmup until the producer's last send (not the backlog drained after it
+# stops, which would credit a broker that fell behind; a stall before then
+# counts), the summary's
 # transfer p50 and p99 in microseconds, and the messages received in the
 # broker CPU window (from three seconds after the warmup to the end).
 report() {
   perl -MJSON::PP -e '
     local $/; open my $f, "<", $ARGV[0] or exit 1; my $s = decode_json(<$f>);
     my @i = grep { $_->{sampleType} eq "interval" && !$_->{warmup} } @$s;
-    my @r = map { $_->{received} } grep { $_->{sent} > 0 } @i;
+    my ($last) = grep { $i[$_]{sent} > 0 } reverse 0 .. $#i;
+    my @r = map { $_->{received} } @i[0 .. ($last // -1)];
     my ($sum, $n) = (0, 0); $sum += $_ for @r; $n += $_->{received} for @i[3 .. $#i];
     my ($summary) = grep { $_->{sampleType} eq "summary" } @$s;
     my $t = $summary->{totalTransferTime} // {};
