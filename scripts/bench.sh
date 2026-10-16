@@ -132,7 +132,7 @@ perf() {
   local out="$WORK/runs/$scenario-$kind-$run"
   taskset -c "$CLIENT_CPUS" "$ARTEMIS" perf client --protocol "$protocol" --url "$url" \
     --user admin --password admin --message-size "$size" "${persistent[@]}" "${dests[@]}" "${spread[@]}" \
-    --max-pending "$MAX_PENDING" --duration "$DURATION" --warmup "$WARMUP" \
+    --max-pending "$MAX_PENDING" --duration "$((WARMUP + DURATION))" --warmup "$WARMUP" \
     --json "$out.json" "$@" queue://BENCH > "$out.out" 2>&1 &
   local client=$!
   # The broker's CPU time from after the warmup (and the client's start) to
@@ -145,26 +145,30 @@ perf() {
   echo "$((c1 - c0)) $((t1 - t0))" > "$out.cpu"
 }
 cpu_ticks() { awk '{ print $14 + $15 }' "/proc/$1/stat" 2>/dev/null || echo 0; }
-# The broker's CPU in a run, from its .cpu file and the rate received:
-# microseconds of CPU a message, and the cores it kept busy.
+# The broker's CPU in a run, from its .cpu file and the messages received
+# meanwhile: microseconds of CPU a message, and the cores it kept busy.
 cpu_cost() {
   local ticks ms
   read -r ticks ms < "$1"
-  perl -e 'my ($t, $ms, $rate, $hz) = @ARGV; my $cpu = $t / $hz; my $n = $rate * $ms / 1000;
+  perl -e 'my ($t, $ms, $n, $hz) = @ARGV; my $cpu = $t / $hz;
     printf "%d %.2f\n", $n ? $cpu * 1e6 / $n : 0, $ms ? $cpu * 1000 / $ms : 0' \
     "$ticks" "$ms" "$2" "$(getconf CLK_TCK)"
 }
 
 # From a perf client's JSON report: the mean received rate after the
-# warmup, and the summary's transfer p50 and p99 in microseconds.
+# warmup while the producer sends (not the backlog drained after it
+# stops, which would credit a broker that fell behind), the summary's
+# transfer p50 and p99 in microseconds, and the messages received in the
+# broker CPU window (from three seconds after the warmup to the end).
 report() {
   perl -MJSON::PP -e '
     local $/; open my $f, "<", $ARGV[0] or exit 1; my $s = decode_json(<$f>);
-    my @r = map { $_->{received} } grep { $_->{sampleType} eq "interval" && !$_->{warmup} } @$s;
-    my ($sum) = (0); $sum += $_ for @r;
+    my @i = grep { $_->{sampleType} eq "interval" && !$_->{warmup} } @$s;
+    my @r = map { $_->{received} } grep { $_->{sent} > 0 } @i;
+    my ($sum, $n) = (0, 0); $sum += $_ for @r; $n += $_->{received} for @i[3 .. $#i];
     my ($summary) = grep { $_->{sampleType} eq "summary" } @$s;
     my $t = $summary->{totalTransferTime} // {};
-    printf "%s %d %d %d\n", $summary->{result}, @r ? $sum / @r : 0, $t->{50} // 0, $t->{99} // 0;
+    printf "%s %d %d %d %d\n", $summary->{result}, @r ? $sum / @r : 0, $t->{50} // 0, $t->{99} // 0, $n;
   ' "$1"
 }
 
@@ -200,10 +204,10 @@ for scenario in $SCENARIOS; do
       reset "$kind"
       start "$kind" || exit 1
       perf "$scenario" "$kind" throughput
-      read -r result received _ _ < <(report "$WORK/runs/$scenario-$kind-throughput.json" || echo "fail 0 0 0")
+      read -r result received _ _ count < <(report "$WORK/runs/$scenario-$kind-throughput.json" || echo "fail 0 0 0 0")
       peak="$(rss_kb "$PID" VmHWM)"
       stop "$kind"
-      read -r us cores < <(cpu_cost "$WORK/runs/$scenario-$kind-throughput.cpu" "$received")
+      read -r us cores < <(cpu_cost "$WORK/runs/$scenario-$kind-throughput.cpu" "$count")
       echo "$scenario $kind: $received msg/s ($result), peak ${peak} kB, $us us of CPU a message, $cores cores"
       record "$scenario" "$kind" thr_cpu_us "$us"
       [[ "$result" == success ]] || failed=$((failed + 1))
@@ -219,10 +223,10 @@ for scenario in $SCENARIOS; do
     reset "$kind"
     start "$kind" || exit 1
     perf "$scenario" "$kind" latency --rate "$rate"
-    read -r result received p50 p99 < <(report "$WORK/runs/$scenario-$kind-latency.json" || echo "fail 0 0 0")
+    read -r result received p50 p99 count < <(report "$WORK/runs/$scenario-$kind-latency.json" || echo "fail 0 0 0 0")
     peak="$(rss_kb "$PID" VmHWM)"
     stop "$kind"
-    read -r us cores < <(cpu_cost "$WORK/runs/$scenario-$kind-latency.cpu" "$received")
+    read -r us cores < <(cpu_cost "$WORK/runs/$scenario-$kind-latency.cpu" "$count")
     echo "$scenario $kind at $rate msg/s: $received msg/s received, p50 ${p50} us, p99 ${p99} us, $us us of CPU a message, $cores cores ($result)"
     record "$scenario" "$kind" cpu_us "$us"
     record "$scenario" "$kind" cores "$cores"
