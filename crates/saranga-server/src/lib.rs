@@ -1423,7 +1423,7 @@ impl Broker {
                 }
             };
             tracing::debug!(%peer, "connection accepted");
-            let _ = stream.set_nodelay(true);
+            socket_options(&stream, &acceptor);
             let local = stream.local_addr().ok();
             let mut info = saranga_security::ConnectionInfo {
                 remote_address: core_protocol::java_socket_address(peer),
@@ -1470,5 +1470,29 @@ impl Broker {
                 audit::scoped(context, serve).await;
             });
         }
+    }
+}
+
+/// `NettyAcceptor`'s options for each connection it accepts: `tcpNoDelay`
+/// (default true) and `tcpSendBufferSize` and `tcpReceiveBufferSize`
+/// (default 1 MiB; -1 leaves the system's).
+fn socket_options(stream: &tokio::net::TcpStream, acceptor: &Acceptor) {
+    let param = |key: &str| acceptor.params.get(key).map(String::as_str);
+    // Boolean.valueOf: true only for "true", in any case.
+    let no_delay = param("tcpNoDelay").is_none_or(|v| v.eq_ignore_ascii_case("true"));
+    let _ = stream.set_nodelay(no_delay);
+    let size = |key: &str| {
+        param(key)
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .unwrap_or(1024 * 1024)
+    };
+    let socket = socket2::SockRef::from(stream);
+    let send = size("tcpSendBufferSize");
+    if send != -1 {
+        let _ = socket.set_send_buffer_size(send.max(0) as usize);
+    }
+    let receive = size("tcpReceiveBufferSize");
+    if receive != -1 {
+        let _ = socket.set_recv_buffer_size(receive.max(0) as usize);
     }
 }

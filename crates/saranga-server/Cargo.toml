@@ -20,6 +20,7 @@ saranga-paging = { path = "../saranga-paging" }
 saranga-security = { path = "../saranga-security" }
 saranga-transport = { path = "../saranga-transport" }
 regex = "1"
+socket2 = "0.6"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tracing = "0.1"

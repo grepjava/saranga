@@ -148,6 +148,11 @@ struct Pending {
     completed: u64,
     failed: Option<JournalError>,
     shutdown: bool,
+    /// The flusher is waiting for work, and how many wait for it to be
+    /// idle: a notification is a system call even with nobody waiting,
+    /// so one is made only when someone is.
+    flusher_waiting: bool,
+    idle_waiters: usize,
 }
 
 struct Shared {
@@ -259,8 +264,11 @@ impl Writer {
             p.completions.push(c);
         }
         p.enqueued += 1;
+        let wake = p.flusher_waiting;
         drop(p);
-        self.shared.work.notify_one();
+        if wake {
+            self.shared.work.notify_one();
+        }
         Ok(())
     }
 
@@ -274,8 +282,11 @@ impl Writer {
         p.sync |= sync;
         p.completions.push(completion);
         p.enqueued += 1;
+        let wake = p.flusher_waiting;
         drop(p);
-        self.shared.work.notify_one();
+        if wake {
+            self.shared.work.notify_one();
+        }
         Ok(())
     }
 
@@ -284,7 +295,9 @@ impl Writer {
         let mut p = self.lock();
         let target = p.enqueued;
         while p.completed < target && p.failed.is_none() {
+            p.idle_waiters += 1;
             p = self.shared.done.wait(p).unwrap_or_else(|e| e.into_inner());
+            p.idle_waiters -= 1;
         }
         match &p.failed {
             Some(e) => Err(e.clone()),
@@ -349,7 +362,9 @@ fn flusher(s: Arc<Shared>) {
                 if p.shutdown {
                     return;
                 }
+                p.flusher_waiting = true;
                 p = s.work.wait(p).unwrap_or_else(|e| e.into_inner());
+                p.flusher_waiting = false;
             }
             (
                 std::mem::take(&mut p.batches),
@@ -373,8 +388,11 @@ fn flusher(s: Arc<Shared>) {
             Some(e) => Err(e.clone()),
             None => Ok(()),
         };
+        let waiters = p.idle_waiters > 0;
         drop(p);
-        s.done.notify_all();
+        if waiters {
+            s.done.notify_all();
+        }
         for c in completions {
             c(outcome.clone());
         }

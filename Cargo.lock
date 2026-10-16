@@ -2028,6 +2028,7 @@ dependencies = [
  "saranga-security",
  "saranga-storage",
  "saranga-transport",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",
