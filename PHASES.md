@@ -586,6 +586,20 @@ The differences from Artemis are listed in COMPAT.md.
     Each input is kept in [fuzz/regressions](fuzz/regressions), and [regressions.rs](crates/saranga-fuzz/tests/regressions.rs) runs them with the workspace's tests. `SARANGA_FUZZ_DIR` runs a whole corpus the same way.
   - **Running.** [scripts/fuzz.sh](scripts/fuzz.sh) writes the seeds, builds the targets with nightly and runs each for a set time (`JOBS` at once), failing if any finds a crash. Three rounds of 120 s each ran in all; the last found nothing in any target. A CI job runs each target for 60 s and keeps what it finds.
   - **Fixed along the way.** Random chaos could apply a new fault just after `random off` had healed every route, leaving it held. A test caught it about one run in five. The fault is now applied only while the flag is on, under the flag's lock.
+- Stage 5 (benchmarks) is done.
+  - **The script** ([scripts/bench.sh](scripts/bench.sh), Linux) drives both brokers with the same client, Artemis's `perf client`. Each broker is an instance made by its own `create` with the NIO journal, on two cores, with the client on the others. Each scenario measures:
+    - throughput, received a second with the producer unbounded;
+    - latency, p50 and p99 at one rate for both, half the lower throughput;
+    - peak resident memory;
+    - startup, until the acceptor takes a connection, with the resident memory then.
+
+    The scenarios are Core and AMQP, persistent and not, 1 MiB large messages in each, and 100 queues at a set total rate. Unbounded, 100 producers outran their consumers, and Artemis stalled under its backlog. `start` refuses a port still held by the last broker, which had made one run's client fail at once.
+  - **Results** ([docs/benchmarks.md](docs/benchmarks.md), WSL 2 on 4 CPUs).
+    - Saranga starts in 53 ms against 2.3 s and holds 19 MiB when started against 198 MiB.
+    - Its peak memory is a tenth or less of Artemis's, except non-persistent AMQP: Saranga does not withhold AMQP credit from a filling address (COMPAT.md), so its backlog grows further.
+    - Its throughput is 0.87 to 0.93 of Artemis's on Core, 0.75 to 0.78 on AMQP, and 1.07 to 1.08 with large messages, and both keep up with the 100 queues.
+    - Its p99 at the same rate is lower in every scenario but the 100 queues.
+    - Two full runs an hour apart moved some ratios by up to 0.2, so differences under 15% are a tie.
 
 ---
 
