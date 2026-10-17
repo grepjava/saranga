@@ -147,6 +147,24 @@ impl Instance {
             .map(|(_, v)| v.clone())
     }
 
+    /// The system properties: those `artemis run` defines, then those
+    /// given with `-D`, the later of a name winning.
+    pub fn system_properties(&self) -> Vec<(String, String)> {
+        let mut defined: Vec<(String, String)> = self
+            .properties
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect();
+        defined.sort();
+        for (k, v) in &self.system {
+            match defined.iter_mut().find(|(n, _)| n == k) {
+                Some(p) => p.1 = v.clone(),
+                None => defined.push((k.clone(), v.clone())),
+            }
+        }
+        defined
+    }
+
     /// `${sys:name}` in log4j's configuration: the system properties given
     /// with `-D`, then those `artemis run` defines.
     pub fn system_lookup(&self) -> crate::logging::Lookup {

@@ -8,6 +8,7 @@ use super::json::Json;
 use super::{Management, Outcome};
 use crate::postoffice::{DivertDeployment, DivertRoutingType, QueueSpec, RoutingTypes};
 use crate::{Broker, RoutingType};
+use saranga_config::HaPolicy;
 
 /// The Artemis release whose management interface Saranga answers as
 /// (`getVersion`); see COMPAT.md.
@@ -89,10 +90,42 @@ pub(super) async fn attribute(
         "Version" => Json::from(VERSION),
         "NodeID" => Json::from(broker.node_id()),
         "Started" | "Active" => Json::from(true),
-        "Backup" | "SharedStore" | "Clustered" | "ReplicaSync" | "FailoverOnServerShutdown" => {
-            Json::from(false)
-        }
-        "HAPolicy" => Json::Null,
+        // The broker exists once it is active, so a replicating backup is
+        // a primary here, as `setHAPolicy` makes it in Artemis; a shared
+        // store backup keeps its policy.
+        "Backup" => Json::from(matches!(
+            file.map(|f| &f.ha_policy),
+            Some(HaPolicy::SharedStoreBackup { .. })
+        )),
+        "SharedStore" => Json::from(matches!(
+            file.map(|f| &f.ha_policy),
+            Some(HaPolicy::SharedStorePrimary { .. } | HaPolicy::SharedStoreBackup { .. })
+        )),
+        "Clustered" => Json::from(broker.cluster().is_some()),
+        "ReplicaSync" => Json::from(broker.is_replica_sync()),
+        "FailoverOnServerShutdown" => Json::from(match file.map(|f| &f.ha_policy) {
+            Some(HaPolicy::SharedStoreBackup {
+                failover_on_shutdown,
+                ..
+            }) => *failover_on_shutdown,
+            _ => false,
+        }),
+        // `HAPolicyConfiguration.TYPE`'s name, from the configuration.
+        "HAPolicy" => Json::from(
+            match file.map_or(&HaPolicy::PrimaryOnly, |f| &f.ha_policy) {
+                HaPolicy::PrimaryOnly => "Primary Only",
+                HaPolicy::SharedStorePrimary { .. } => "Shared Store Primary",
+                HaPolicy::SharedStoreBackup { .. } => "Shared Store Backup",
+                HaPolicy::ReplicationPrimary(r) if r.manager.is_some() => {
+                    "Replication Primary w/lock manager"
+                }
+                HaPolicy::ReplicationPrimary(_) => "Replication Primary w/quorum voting",
+                HaPolicy::ReplicationBackup(r) if r.manager.is_some() => {
+                    "Replication Backup w/lock manager"
+                }
+                HaPolicy::ReplicationBackup(_) => "Replication Backup w/quorum voting",
+            },
+        ),
         "Uptime" => Json::from(print_duration(uptime)),
         "UptimeMillis" => Json::from(uptime),
         "CurrentTimeMillis" => Json::from(crate::message::now_millis()),
@@ -1113,6 +1146,11 @@ pub(super) async fn invoke(
             )),
             Err(e) => Err(e),
         });
+    }
+    // Lock coordinators (`<lock-coordinators>`) are not there yet: the list
+    // is empty, as an Artemis broker without any lists it.
+    if call.is("listLockCoordinatorsAsJSON", &[]).is_some() {
+        return Some(Ok(Json::from("[]".to_owned())));
     }
     // Broker connections (`listBrokerConnections`, `startBrokerConnection`,
     // `stopBrokerConnection`).

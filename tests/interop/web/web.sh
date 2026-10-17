@@ -4,12 +4,17 @@
 #
 #   tests/interop/web/web.sh [--no-artemis]
 #
-# See web.py for what is checked.
+# See web.py for what is checked. Saranga serves the console of the
+# Artemis distribution (ARTEMIS_DIST, as scripts/build-artemis.sh builds
+# it), and console.py compares it with Artemis's. ARTEMIS_WEB_URL names an
+# Artemis already running (user artemis/artemis) in place of the
+# container.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 VERSION="${ARTEMIS_VERSION:-2.57.0}"
 SARANGA="$ROOT/target/release/saranga"
+DIST="${ARTEMIS_DIST:-$ROOT/reference/activemq-artemis/artemis-distribution/target/apache-artemis-$VERSION-bin/apache-artemis-$VERSION}"
 OFFSET=700
 WEB_PORT=$((8161 + OFFSET))
 CORE_PORT=$((61616 + OFFSET))
@@ -45,14 +50,16 @@ done
 # management.xml: enable the commented-out example that lets view read
 # queues.
 python -I "$(native "$ROOT/tests/interop/web/enable_queue_access.py")" "$(native "$I/etc/management.xml")" || exit 1
-ARTEMIS_INSTANCE="$(native "$I")" "$SARANGA" run > "$WORK/saranga.log" 2>&1 &
+ARTEMIS_HOME="$(native "$DIST")" ARTEMIS_INSTANCE="$(native "$I")" "$SARANGA" run > "$WORK/saranga.log" 2>&1 &
 PID=$!
 for _ in $(seq 1 100); do (echo > "/dev/tcp/127.0.0.1/$WEB_PORT") 2>/dev/null && break; sleep 0.1; done
 "$SARANGA" user add --user-command-user viewer --user-command-password viewer --role view \
   --url "tcp://127.0.0.1:$CORE_PORT" --user admin --password secret --silent > /dev/null
 
 ARGS=("http://localhost:$WEB_PORT" "tcp://127.0.0.1:$CORE_PORT")
-if [[ "${1:-}" != "--no-artemis" ]]; then
+if [[ "${1:-}" != "--no-artemis" && -n "${ARTEMIS_WEB_URL:-}" ]]; then
+  ARGS+=("$ARTEMIS_WEB_URL")
+elif [[ "${1:-}" != "--no-artemis" ]]; then
   docker rm -f "$NAME" > /dev/null 2>&1
   docker run -d --name "$NAME" -e ANONYMOUS_LOGIN=false \
     -p "127.0.0.1:$ARTEMIS_WEB:8161" -p "127.0.0.1:$ARTEMIS_CORE:61616" \
@@ -63,5 +70,8 @@ fi
 
 python -I "$(native "$ROOT/tests/interop/web/web.py")" "${ARGS[@]}"
 STATUS=$?
+if [[ ${#ARGS[@]} -gt 2 && -d "$DIST/web/console.war" ]]; then
+  python -I "$(native "$ROOT/tests/interop/web/console.py")"     "http://127.0.0.1:$WEB_PORT,admin,secret" "${ARGS[2]},artemis,artemis" || STATUS=1
+fi
 [[ $STATUS == 0 ]] || { echo "--- saranga log"; tail -20 "$WORK/saranga.log"; }
 exit $STATUS

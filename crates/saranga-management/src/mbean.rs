@@ -329,7 +329,15 @@ pub enum Bean {
     BroadcastGroup(String),
     Bridge(String),
     BrokerConnection(String),
+    /// hawtio's permission checks (`HawtioSecurityControl`), which
+    /// `artemis run` registers for the console.
+    HawtioSecurity,
+    /// One of the JDK's platform MBeans, answered from the process.
+    Platform(crate::platform::Platform),
 }
+
+/// `ObjectNameBuilder.getSecurityObjectName`.
+pub const HAWTIO_SECURITY: &str = "hawtio:type=security,area=jmx,name=ArtemisJMXSecurity";
 
 impl Bean {
     pub fn control(&self) -> &'static Control {
@@ -342,6 +350,8 @@ impl Bean {
             Self::BroadcastGroup(_) => &crate::catalog::BROADCAST_GROUP,
             Self::Bridge(_) => &crate::catalog::BRIDGE,
             Self::BrokerConnection(_) => &crate::catalog::BROKER_CONNECTION,
+            Self::HawtioSecurity => &crate::catalog::HAWTIO_SECURITY,
+            Self::Platform(p) => p.control(),
         }
     }
 
@@ -356,6 +366,8 @@ impl Bean {
             Self::BroadcastGroup(g) => format!("broadcastgroup.{g}"),
             Self::Bridge(b) => format!("bridge.{b}"),
             Self::BrokerConnection(c) => format!("brokerconnection.{c}"),
+            Self::HawtioSecurity => "hawtio.security".to_owned(),
+            Self::Platform(p) => format!("java.lang.{}", p.type_name()),
         }
     }
 
@@ -380,12 +392,17 @@ impl Bean {
             Self::BrokerConnection(_) => {
                 "org.apache.activemq.artemis.core.management.impl.BrokerConnectionControlImpl"
             }
+            Self::HawtioSecurity => {
+                "org.apache.activemq.artemis.core.server.management.impl.HawtioSecurityControlImpl"
+            }
+            Self::Platform(p) => p.class_name(),
         }
     }
 }
 
 /// The MBeans of a broker, by name (`ObjectNameBuilder`): the broker, its
-/// acceptors, then each address, queue and divert.
+/// acceptors, then each address, queue and divert, hawtio's permission
+/// checks and the platform MBeans.
 pub fn registered(
     broker: &Arc<Broker>,
     domain: &str,
@@ -453,6 +470,14 @@ pub fn registered(
             quote(&d.name)
         )) {
             out.push((n, Bean::Divert(d.name.to_string())));
+        }
+    }
+    if let Some(n) = name(HAWTIO_SECURITY.to_owned()) {
+        out.push((n, Bean::HawtioSecurity));
+    }
+    for p in crate::platform::Platform::ALL {
+        if let Some(n) = name(format!("java.lang:type={}", p.type_name())) {
+            out.push((n, Bean::Platform(p)));
         }
     }
     out

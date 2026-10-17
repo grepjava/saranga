@@ -6947,3 +6947,75 @@ pub static BROKER_CONNECTION: Control = Control {
         },
     ],
 };
+
+/// `HawtioSecurityControl`, the console's permission checks
+/// (`hawtio:type=security,area=jmx,name=ArtemisJMXSecurity`).
+pub static HAWTIO_SECURITY: Control = Control {
+    interface: "HawtioSecurityControl",
+    attrs: &[],
+    ops: &[
+        Op {
+            name: "canInvoke",
+            desc: "Can invoke a number of Objects",
+            impact: 1,
+            ret: "javax.management.openmbean.TabularData",
+            params: &[Param {
+                name: "p 1",
+                type_name: "java.util.Map",
+                desc: "parameter 1",
+            }],
+        },
+        Op {
+            name: "canInvoke",
+            desc: "Can invoke an Object",
+            impact: 1,
+            ret: "boolean",
+            params: &[
+                Param {
+                    name: "p 1",
+                    type_name: "java.lang.String",
+                    desc: "parameter 1",
+                },
+                Param {
+                    name: "p 2",
+                    type_name: "java.lang.String",
+                    desc: "parameter 2",
+                },
+                Param {
+                    name: "p 3",
+                    type_name: "[Ljava.lang.String;",
+                    desc: "parameter 3",
+                },
+            ],
+        },
+        Op {
+            name: "canInvoke",
+            desc: "Can invoke an Object",
+            impact: 1,
+            ret: "boolean",
+            params: &[
+                Param {
+                    name: "p 1",
+                    type_name: "java.lang.String",
+                    desc: "parameter 1",
+                },
+                Param {
+                    name: "p 2",
+                    type_name: "java.lang.String",
+                    desc: "parameter 2",
+                },
+            ],
+        },
+        Op {
+            name: "canInvoke",
+            desc: "Can invoke an Object",
+            impact: 1,
+            ret: "boolean",
+            params: &[Param {
+                name: "p 1",
+                type_name: "java.lang.String",
+                desc: "parameter 1",
+            }],
+        },
+    ],
+};

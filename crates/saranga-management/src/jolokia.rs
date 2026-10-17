@@ -39,6 +39,8 @@ impl Caller {
             Bean::BroadcastGroup(n) => ("BroadcastGroupControlImpl", n.as_str()),
             Bean::Bridge(n) => ("BridgeControlImpl", n.as_str()),
             Bean::BrokerConnection(n) => ("BrokerConnectionControlImpl", n.as_str()),
+            // Its getMBeanInfo is audited from another package; not yet.
+            Bean::HawtioSecurity | Bean::Platform(_) => return,
         };
         saranga_server::audit::mbean_info(
             class,
@@ -71,6 +73,22 @@ pub struct Agent {
     pub agent_id: String,
     /// The acceptors, by name, with their parameters.
     pub acceptors: Vec<(String, Vec<(String, String)>)>,
+    /// What the platform MBeans report.
+    pub process: Arc<crate::platform::Process>,
+}
+
+/// A platform MBean's failure, as the JDK's MBeans fail.
+fn platform_failure(f: crate::platform::Failure, what: &str) -> Failure {
+    match f {
+        crate::platform::Failure::Unsupported(m) => {
+            Failure::new("java.lang.UnsupportedOperationException", m, 500)
+        }
+        crate::platform::Failure::NotFound => Failure::new(
+            "javax.management.AttributeNotFoundException",
+            format!("No such attribute: {what}"),
+            404,
+        ),
+    }
 }
 
 /// A Jolokia error.
@@ -120,6 +138,44 @@ pub struct Request {
     value: Option<Json>,
     operation: Option<String>,
     arguments: Vec<Json>,
+    /// `canonicalNaming`: names with their keys sorted (the default), or
+    /// as registered.
+    canonical: bool,
+}
+
+/// Whether a `canonicalNaming` option asks for canonical names: anything
+/// but `false`.
+fn canonical_option(v: Option<&Json>) -> Option<bool> {
+    match v? {
+        Json::Bool(b) => Some(*b),
+        Json::String(s) => Some(!s.eq_ignore_ascii_case("false")),
+        _ => None,
+    }
+}
+
+/// The processing options of the request's query string.
+pub fn query_canonical(query: Option<&str>) -> bool {
+    query
+        .into_iter()
+        .flat_map(|q| q.split('&'))
+        .filter_map(|p| p.split_once('='))
+        .find(|(k, _)| *k == "canonicalNaming")
+        .is_none_or(|(_, v)| !v.eq_ignore_ascii_case("false"))
+}
+
+/// A name as `canonicalNaming` wants it.
+fn name_of(n: &ObjectName, canonical: bool) -> String {
+    if canonical {
+        n.canonical()
+    } else {
+        n.serialized()
+    }
+}
+
+/// A name's key properties as `canonicalNaming` wants them.
+fn props_of(n: &ObjectName, canonical: bool) -> String {
+    let s = name_of(n, canonical);
+    s[n.domain.len() + 1..].to_owned()
 }
 
 impl Request {
@@ -244,7 +300,13 @@ fn signature_arity(op: &str) -> Option<usize> {
 
 impl Agent {
     /// A GET request: `<type>/<arguments>` after the agent's path.
-    pub async fn get(&self, caller: &Caller, path_info: &str, url: &str) -> Answer {
+    pub async fn get(
+        &self,
+        caller: &Caller,
+        path_info: &str,
+        url: &str,
+        canonical: bool,
+    ) -> Answer {
         let trimmed = path_info.trim_start_matches('/');
         if trimmed.is_empty() {
             let req = Request {
@@ -255,6 +317,7 @@ impl Agent {
                 value: None,
                 operation: None,
                 arguments: Vec::new(),
+                canonical,
             };
             return Answer::Json(respond(Some(&req), Ok(self.version(url))));
         }
@@ -292,6 +355,7 @@ impl Agent {
             value: None,
             operation: None,
             arguments: Vec::new(),
+            canonical,
         };
         match kind {
             "version" => {}
@@ -358,7 +422,7 @@ impl Agent {
 
     /// A POST request: one JSON object, or an array of them answered in
     /// order.
-    pub async fn post(&self, caller: &Caller, body: &str, url: &str) -> Answer {
+    pub async fn post(&self, caller: &Caller, body: &str, url: &str, canonical: bool) -> Answer {
         let Ok(json) = Json::parse(body) else {
             return Answer::BadRequest("Invalid JSON request".to_owned());
         };
@@ -366,16 +430,16 @@ impl Agent {
             Json::Array(items) => {
                 let mut out = Vec::with_capacity(items.len());
                 for item in items {
-                    out.push(self.post_one(caller, &item, url).await);
+                    out.push(self.post_one(caller, &item, url, canonical).await);
                 }
                 Answer::Json(Json::Array(out))
             }
-            Json::Object(_) => Answer::Json(self.post_one(caller, &json, url).await),
+            Json::Object(_) => Answer::Json(self.post_one(caller, &json, url, canonical).await),
             _ => Answer::BadRequest("Invalid JSON request".to_owned()),
         }
     }
 
-    async fn post_one(&self, caller: &Caller, item: &Json, url: &str) -> Json {
+    async fn post_one(&self, caller: &Caller, item: &Json, url: &str, canonical: bool) -> Json {
         let text = |k: &str| item.get(k).and_then(Json::as_str).map(str::to_owned);
         let Some(kind) = text("type").and_then(|t| TYPES.iter().find(|x| **x == t).copied()) else {
             return respond(
@@ -416,6 +480,8 @@ impl Agent {
                 Some(Json::Null) | None => Vec::new(),
                 Some(other) => vec![other.clone()],
             },
+            canonical: canonical_option(item.get("config").and_then(|c| c.get("canonicalNaming")))
+                .unwrap_or(canonical),
         };
         let outcome = self.execute(caller, &req, url).await;
         respond(Some(&req), outcome)
@@ -424,8 +490,8 @@ impl Agent {
     async fn execute(&self, caller: &Caller, req: &Request, url: &str) -> Result<Json, Failure> {
         match req.kind {
             "version" => Ok(self.version(url)),
-            "search" => self.search(caller, req.mbean.as_ref()),
-            "list" => self.list(caller, req.path.as_deref()),
+            "search" => self.search(caller, req.mbean.as_ref(), req.canonical),
+            "list" => self.list(caller, req.path.as_deref(), req.canonical),
             "read" => {
                 let v = self.read(caller, req).await?;
                 navigate(v, req.path.as_deref())
@@ -491,12 +557,17 @@ impl Agent {
         )
     }
 
-    fn search(&self, caller: &Caller, pattern: Option<&ObjectName>) -> Result<Json, Failure> {
+    fn search(
+        &self,
+        caller: &Caller,
+        pattern: Option<&ObjectName>,
+        canonical: bool,
+    ) -> Result<Json, Failure> {
         let names: Vec<Json> = self
             .query(caller)?
             .into_iter()
             .filter(|(n, _)| pattern.is_none_or(|p| p.matches(n)))
-            .map(|(n, _)| Json::from(n.canonical()))
+            .map(|(n, _)| Json::from(name_of(&n, canonical)))
             .collect();
         Ok(Json::Array(names))
     }
@@ -588,6 +659,12 @@ impl Agent {
         };
         let getter = format!("{}{attr}", if info.is { "is" } else { "get" });
         self.check(caller, name, &getter, || Self::denied("attribute", attr))?;
+        if let Bean::Platform(p) = bean {
+            return self
+                .process
+                .attribute(*p, attr)
+                .map_err(|f| platform_failure(f, attr));
+        }
         if let Bean::Acceptor(n, params) = bean {
             let started = self.broker.get().acceptor(n).is_some_and(|(_, s)| s);
             return Ok(acceptor_attribute(n, params, started, attr));
@@ -618,7 +695,7 @@ impl Agent {
                 .filter(|(n, _)| name.matches(n))
             {
                 if let Ok(v) = self.read_bean(caller, &n, &bean, &req.attrs, true).await {
-                    out.put(&n.canonical(), v);
+                    out.put(&name_of(&n, req.canonical), v);
                 }
             }
             if matches!(&out, Json::Object(m) if m.is_empty()) {
@@ -700,6 +777,12 @@ impl Agent {
             Json::Null
         };
         let value = convert(req.value.as_ref().unwrap_or(&Json::Null), info.type_name)?;
+        if let Bean::Platform(p) = &bean {
+            self.process
+                .write(*p, attr, &value)
+                .map_err(|f| platform_failure(f, attr))?;
+            return Ok(old);
+        }
         self.broker
             .get()
             .management()
@@ -783,6 +866,32 @@ impl Agent {
         for (arg, p) in req.arguments.iter().zip(op.params) {
             params.push(convert(arg, p.type_name)?);
         }
+        if bean == Bean::HawtioSecurity {
+            // The `hawtio` domain is allowed (management.xml's allowlist)
+            // and unchecked by the RBAC guard.
+            self.check(caller, &n, op.name, || {
+                Failure::new(
+                    "java.lang.SecurityException",
+                    format!("User not authorized to access operation: {}", op.name),
+                    403,
+                )
+            })?;
+            return Ok(self.hawtio_can_invoke(caller, &params));
+        }
+        if let Bean::Platform(p) = &bean {
+            self.check(caller, &n, op.name, || {
+                Failure::new(
+                    "java.lang.SecurityException",
+                    format!("User not authorized to access operation: {}", op.name),
+                    403,
+                )
+            })?;
+            let v = self
+                .process
+                .invoke(*p, op.name, &params)
+                .map_err(|f| platform_failure(f, op.name))?;
+            return Ok(if op.ret == "void" { Json::Null } else { v });
+        }
         self.check(caller, &n, op.name, || {
             Failure::new(
                 "java.lang.SecurityException",
@@ -829,9 +938,66 @@ impl Agent {
         Ok(if op.ret == "void" { Json::Null } else { result })
     }
 
+    /// `HawtioSecurityControl.canInvoke`: whether the caller may call any
+    /// of an MBean's methods (no method), or a method by name or by
+    /// signature; the `Map` form answers a table of them, keyed by object
+    /// name and method, as Jolokia writes `TabularData`.
+    fn hawtio_can_invoke(&self, caller: &Caller, params: &[Json]) -> Json {
+        let one = |object: &str, method: Option<&str>| -> bool {
+            let Ok(name) = ObjectName::parse(object) else {
+                return false;
+            };
+            match (&self.access, method) {
+                // `ArtemisMBeanServerGuard`: no method is always allowed.
+                (Guard::Acl(_), None) => true,
+                // `ArtemisRbacInvocationHandler`: the VIEW permission.
+                (Guard::Rbac(r), None) => {
+                    r.visible(&self.broker.get(), caller.subject.clone(), &name)
+                }
+                (_, Some(m)) => self.can_invoke(caller, &name, m),
+            }
+        };
+        match params {
+            [Json::Object(query)] => {
+                let mut table = Json::object();
+                for (object, methods) in query {
+                    let methods: Vec<String> = match methods {
+                        Json::Array(a) => a
+                            .iter()
+                            .filter_map(|m| m.as_str().map(str::to_owned))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    let mut rows = Json::object();
+                    let row = |method: &str, can: bool| {
+                        Json::object()
+                            .with("CanInvoke", can)
+                            .with("Method", method)
+                            .with("ObjectName", object.as_str())
+                    };
+                    if methods.is_empty() {
+                        rows.put("", row("", one(object, None)));
+                    }
+                    for m in &methods {
+                        let method = m.trim();
+                        let name = method.split('(').next().unwrap_or(method);
+                        if rows.get(m).is_none() {
+                            rows.put(m, row(m, one(object, Some(name))));
+                        }
+                    }
+                    table.put(object, rows);
+                }
+                table
+            }
+            [object] => Json::from(one(object.as_str().unwrap_or(""), None)),
+            [object, method, ..] => Json::from(one(object.as_str().unwrap_or(""), method.as_str())),
+            [] => Json::from(false),
+        }
+    }
+
     /// `list`: the MBeans' metadata, as the agent with the Artemis RBAC
     /// decorator gives it, under `domain/properties/part`.
-    fn list(&self, caller: &Caller, path: Option<&str>) -> Result<Json, Failure> {
+    fn list(&self, caller: &Caller, path: Option<&str>, canonical: bool) -> Result<Json, Failure> {
         let segments: Vec<String> = path.map(split_path).unwrap_or_default();
         let segments: Vec<String> = segments.into_iter().filter(|s| !s.is_empty()).collect();
         if segments.len() > 3 {
@@ -843,7 +1009,7 @@ impl Agent {
         let mut domains = Json::object();
         for (n, bean) in self.query(caller)? {
             let info = self.bean_info(caller, &n, &bean);
-            let props = n.canonical_props();
+            let props = props_of(&n, canonical);
             let mut d = domains.get(&n.domain).cloned().unwrap_or_else(Json::object);
             d.put(&props, info);
             domains.put(&n.domain, d);
@@ -865,10 +1031,20 @@ impl Agent {
         }
         if let Some(props) = segments.get(1) {
             // The properties may be given in any order.
-            let key = ObjectName::parse(&format!("x:{props}"))
-                .map(|n| n.canonical_props())
-                .unwrap_or_else(|_| props.clone());
-            value = value.get(&key).cloned().ok_or_else(not_found)?;
+            let canonical_props = |p: &str| {
+                ObjectName::parse(&format!("x:{p}"))
+                    .map(|n| n.canonical_props())
+                    .unwrap_or_else(|_| p.to_owned())
+            };
+            let key = canonical_props(props);
+            let found = match &value {
+                Json::Object(members) => members
+                    .iter()
+                    .find(|(k, _)| canonical_props(k) == key)
+                    .map(|(_, v)| v.clone()),
+                _ => None,
+            };
+            value = found.ok_or_else(not_found)?;
         }
         if let Some(part) = segments.get(2) {
             value = value.get(part).cloned().ok_or_else(not_found)?;

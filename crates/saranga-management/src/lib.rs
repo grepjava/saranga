@@ -4,30 +4,32 @@
 //! - the REST API at `/api` (see [`rest`]), always;
 //! - the Prometheus metrics where the metrics plugin's app is
 //!   (`<app url="metrics" war="metrics.war"/>`);
-//! - the Jolokia compatibility layer where the web console's app is
-//!   (`<app url="console" war="console.war"/>`, at `/console/jolokia`), for
-//!   the Artemis console and tools that speak Jolokia. As in Artemis, it
-//!   needs a user of the broker's JAAS domain holding one of the console
-//!   roles (`HAWTIO_ROLES`), and every attribute and operation is checked
-//!   against `management.xml`'s `<authorisation>`. Without that app it is
-//!   not served.
+//! - where the web console's app is (`<app url="console"
+//!   war="console.war"/>`), Artemis's own console (see [`console`]) and the
+//!   Jolokia compatibility layer under it, at `/console/jolokia`, for the
+//!   console and tools that speak Jolokia. As in Artemis, Jolokia needs a
+//!   console session or a user of the broker's JAAS domain holding one of
+//!   the console roles (`HAWTIO_ROLES`), and every attribute and operation
+//!   is checked against `management.xml`'s `<authorisation>`. Without that
+//!   app neither is served.
 
 mod access;
 mod catalog;
+pub mod console;
 mod exceptions;
 mod jolokia;
 mod mbean;
 pub mod metrics;
+mod platform;
 mod rbac;
 pub mod rest;
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
@@ -66,6 +68,18 @@ pub struct Options {
     pub root_redirect: Option<String>,
     /// The acceptors, by name, with their parameters (`AcceptorControl`).
     pub acceptors: Vec<(String, Vec<(String, String)>)>,
+    /// Where the apps' `.war` directories are looked for: the instance's
+    /// `<web path>`, then the home's.
+    pub web_dirs: Vec<PathBuf>,
+    /// `hawtio.sessionTimeout`, in seconds: how long an idle console
+    /// session lasts.
+    pub session_timeout: i64,
+    /// `hawtio.http.strictTransportSecurity`, the console's
+    /// `Strict-Transport-Security` header.
+    pub strict_transport_security: Option<String>,
+    /// The system properties `java.lang:type=Runtime` reports: those
+    /// `artemis run` defines, then those given with `-D`.
+    pub system_properties: Vec<(String, String)>,
 }
 
 /// `jolokia-access.xml`'s `<cors>`: allowed origins, and whether a
@@ -119,7 +133,44 @@ struct AppState {
     broker: Arc<Current>,
     console_roles: Vec<String>,
     cors: Cors,
+    /// Jolokia's path, `/console/jolokia`.
     base: String,
+    console: console::Console,
+    strict_transport_security: Option<HeaderValue>,
+}
+
+/// `ContentSecurityPolicyFilter`'s policy, without Keycloak or OIDC.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; \
+    style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; \
+    connect-src 'self'; frame-src 'self'; manifest-src 'self'; media-src 'self'; \
+    object-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; \
+    script-src-elem 'self'; style-src-elem 'self' 'unsafe-inline'; form-action 'self'";
+
+impl AppState {
+    /// The headers `ResponseHeadersFilter` puts on every answer: with
+    /// `no_cache`, `CacheHeadersFilter`'s too, unless the answer has its
+    /// own.
+    fn secure(&self, mut r: Response, no_cache: bool) -> Response {
+        let h = r.headers_mut();
+        if no_cache && !h.contains_key(header::CACHE_CONTROL) {
+            h.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(console::NO_CACHE),
+            );
+        }
+        h.insert(
+            "Content-Security-Policy",
+            HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+        );
+        if let Some(v) = &self.strict_transport_security {
+            h.insert("Strict-Transport-Security", v.clone());
+        }
+        secure(r)
+    }
+
+    fn forbidden(&self) -> Response {
+        self.secure(console::forbidden("NONE"), true)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -132,7 +183,8 @@ pub async fn start(
     options: Options,
 ) -> std::io::Result<()> {
     let mut agent_id = None;
-    for b in bindings {
+    let process = Arc::new(platform::Process::new(options.system_properties.clone()));
+    for (index, b) in bindings.into_iter().enumerate() {
         // Java resolves a host name to its IPv4 address first.
         let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((b.host.as_str(), b.port))
             .await?
@@ -174,6 +226,21 @@ pub async fn start(
             if war.starts_with("console") {
                 let base = format!("/{url}/jolokia");
                 tracing::info!("AMQ241002: Jolokia REST API available at {}{base}", b.uri);
+                let dir = console::find_war(&options.web_dirs, war);
+                match &dir {
+                    Some(_) => {
+                        tracing::info!("AMQ241004: Artemis Console available at {}/{url}", b.uri)
+                    }
+                    None => tracing::warn!(
+                        "The console's pages are not served: no {war} in {}",
+                        options
+                            .web_dirs
+                            .iter()
+                            .map(|d| d.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(" or ")
+                    ),
+                }
                 let state = Arc::new(AppState {
                     agent: jolokia::Agent {
                         broker: broker.clone(),
@@ -182,18 +249,30 @@ pub async fn start(
                         access: options.access.clone(),
                         agent_id: agent_id.clone(),
                         acceptors: options.acceptors.clone(),
+                        process: process.clone(),
                     },
                     broker: broker.clone(),
                     console_roles: options.console_roles.clone(),
                     cors: options.cors.clone(),
-                    base: base.clone(),
+                    base,
+                    console: console::Console::new(
+                        format!("/{url}"),
+                        dir,
+                        format!("JSESSIONID_{index}_{}", addr.port()),
+                        b.tls.is_some(),
+                        options.session_timeout,
+                    ),
+                    strict_transport_security: options
+                        .strict_transport_security
+                        .as_deref()
+                        .and_then(|v| HeaderValue::from_str(v).ok()),
                 });
-                let api: Router = Router::new()
-                    .route(&base, any(jolokia_handler))
-                    .route(&format!("{base}/"), any(jolokia_handler))
-                    .route(&format!("{base}/{{*rest}}"), any(jolokia_handler))
+                let app: Router = Router::new()
+                    .route(&format!("/{url}"), any(console::handle))
+                    .route(&format!("/{url}/"), any(console::handle))
+                    .route(&format!("/{url}/{{*rest}}"), any(console::handle))
                     .with_state(state);
-                router = router.merge(api);
+                router = router.merge(app);
             } else if war.starts_with("metrics") {
                 let broker = broker.clone();
                 let handler = move || {
@@ -247,7 +326,8 @@ async fn serve(listener: TcpListener, tls: Option<Arc<TlsAcceptor>>, router: Rou
     }
 }
 
-/// The headers the console's filters put on every answer.
+/// The headers hawtio's filters put on every answer, which the REST API
+/// gives too.
 fn secure(mut r: Response) -> Response {
     let h = r.headers_mut();
     h.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
@@ -260,70 +340,46 @@ fn secure(mut r: Response) -> Response {
     r
 }
 
-fn forbidden() -> Response {
-    secure(
-        (
-            StatusCode::FORBIDDEN,
-            [
-                (
-                    header::CACHE_CONTROL,
-                    "max-age=0, no-cache, must-revalidate, proxy-revalidate, private",
-                ),
-                (
-                    header::HeaderName::from_static("hawtio-forbidden-reason"),
-                    "NONE",
-                ),
-            ],
-        )
-            .into_response(),
-    )
-}
-
-/// The roles and subject of the user the `Authorization: Basic` header
-/// names, when the broker's security manager validates it. Artemis's
-/// console does not audit this login (its `AuthenticationFilter` audits
-/// only the console's own login page).
-fn login(
+/// The roles and subject of the caller, as hawtio's `AuthenticationFilter`
+/// finds them: the console session's, unless an `Authorization: Basic`
+/// header names another user (which ends the session); else the header's
+/// user, when the broker's security manager validates it and the user
+/// holds a console role. Artemis's console does not audit this login (its
+/// `AuthenticationFilter` audits only the console's own login page).
+fn caller(
     state: &AppState,
     headers: &HeaderMap,
     peer: SocketAddr,
-) -> Option<(Vec<String>, Arc<saranga_security::jaas::Subject>)> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let encoded = value
-        .strip_prefix("Basic ")
-        .or_else(|| value.strip_prefix("basic "))?;
-    let decoded = String::from_utf8(base64_decode(encoded.trim())?).ok()?;
-    let (user, password) = decoded.split_once(':')?;
-    let broker = state.broker.get();
-    let store = broker.security()?;
-    let connection = saranga_security::ConnectionInfo {
-        remote_address: format!("/{peer}"),
-        certificates: None,
-        security_domain: None,
-        connection_id: None,
-    };
-    let subject = match store
-        .manager()
-        .authenticate(Some(user), Some(password), &connection)
-    {
-        Ok(Some(subject)) => Arc::new(subject),
-        _ => return None,
-    };
-    let roles: Vec<String> = subject.roles().map(str::to_owned).collect();
-    let allowed = state
-        .console_roles
-        .iter()
-        .any(|r| r == "*" || roles.iter().any(|u| u == r));
-    allowed.then_some((roles, subject))
+    session: Option<(String, console::Session)>,
+) -> Result<(Vec<String>, Arc<saranga_security::jaas::Subject>), Box<Response>> {
+    let basic = console::basic(headers);
+    if let Some((id, s)) = session {
+        match &basic {
+            Some((user, _)) if *user != s.user => state.console.invalidate(&id),
+            _ => return Ok((s.roles, s.subject)),
+        }
+    }
+    let (user, password) = basic.unzip();
+    match console::authenticate(state, user.as_deref(), password.as_deref(), peer) {
+        console::Auth::Authorized { roles, subject, .. } => Ok((roles, subject)),
+        console::Auth::NotAuthorized | console::Auth::NoCredentials => {
+            Err(Box::new(state.forbidden()))
+        }
+        console::Auth::Throttled(wait) => {
+            Err(Box::new(state.secure(console::too_many(wait), true)))
+        }
+    }
 }
 
-async fn jolokia_handler(
-    State(state): State<Arc<AppState>>,
-    Extension(Peer(peer)): Extension<Peer>,
+/// The Jolokia agent at `/console/jolokia`.
+async fn jolokia(
+    state: &AppState,
+    peer: SocketAddr,
     method: Method,
-    uri: Uri,
-    headers: HeaderMap,
+    uri: &Uri,
+    headers: &HeaderMap,
     body: Bytes,
+    session: Option<(String, console::Session)>,
 ) -> Response {
     let origin = headers
         .get(header::ORIGIN)
@@ -341,7 +397,7 @@ async fn jolokia_handler(
                 HeaderValue::from_static("true"),
             );
         }
-        secure(r)
+        state.secure(r, true)
     };
     // `handleCorsPreflightRequest`: only an allowed origin gets headers.
     if method == Method::OPTIONS {
@@ -358,8 +414,9 @@ async fn jolokia_handler(
         }
         return cors(r);
     }
-    let Some((roles, subject)) = login(&state, &headers, peer) else {
-        return forbidden();
+    let (roles, subject) = match caller(state, headers, peer, session) {
+        Ok(c) => c,
+        Err(r) => return *r,
     };
     // `<strict-checking/>`: the Origin, or else the Referer, must be
     // allowed (`HttpRequestHandler.checkAccess`); Jolokia answers a
@@ -396,15 +453,16 @@ async fn jolokia_handler(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("localhost");
     let url = format!("{scheme}://{host}{}", state.base);
+    let canonical = jolokia::query_canonical(uri.query());
     let answer = if method == Method::POST {
         state
             .agent
-            .post(&caller, &String::from_utf8_lossy(&body), &url)
+            .post(&caller, &String::from_utf8_lossy(&body), &url, canonical)
             .await
     } else {
         let raw = uri.path().strip_prefix(state.base.as_str()).unwrap_or("");
         let path = percent_decode(raw);
-        state.agent.get(&caller, &path, &url).await
+        state.agent.get(&caller, &path, &url, canonical).await
     };
     match answer {
         jolokia::Answer::Json(j) => cors(json_response(&j)),
@@ -421,11 +479,14 @@ async fn jolokia_handler(
 
 /// A Jolokia answer: always 200, the status in the JSON.
 fn json_response(j: &Json) -> Response {
+    // Jolokia's `Expires` is an hour ago.
+    let expires = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
     (
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, "application/json"),
-            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONTENT_TYPE, "application/json".to_owned()),
+            (header::CACHE_CONTROL, "no-cache".to_owned()),
+            (header::EXPIRES, httpdate::fmt_http_date(expires)),
         ],
         j.to_string(),
     )

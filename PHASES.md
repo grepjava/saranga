@@ -508,9 +508,10 @@ The differences from Artemis are listed in COMPAT.md.
 3. **Linearizability on HA.** Jepsen-style histories: clients record each send, receive and acknowledgement with its outcome while the chaos proxy partitions the pair and kills nodes. A checker then compares each history with the queue model. Acknowledged sends are received, and nothing is received twice unless the client was told the outcome was unknown. Replication and shared-store pairs both run, with Saranga and Java on each side.
 4. **Fuzzing.** cargo-fuzz targets for every codec: buffers and `TypedProperties`, `CoreMessage`, Core packets, journal records and files, page files, AMQP, MQTT, STOMP, OpenWire, WebSocket frames, filters and `broker.xml`. Each target is seeded from the golden corpus. Every crash found is fixed and kept as a regression test, and CI runs each target for a short time.
 5. **Benchmarks.** `scripts/bench.sh` runs Artemis and Saranga on the same machine and the same scenarios: Core and AMQP, persistent and not, small and large messages, and many queues. It measures throughput, p99 latency, memory and startup time, and its results are written to `docs/benchmarks.md`.
-6. **Documentation.** The user guide (installing, configuring, the CLI, protocols, security, HA, clustering, management and operations) and a migration guide from Artemis (data directories, `broker.xml`, clients, what differs), checked against COMPAT.md.
-7. **Container images and the release.** A container image laid out as Artemis's, binaries for Linux, Windows and macOS, a release workflow, the version set to 1.0.0, and a changelog.
-8. **Exit check:** every stage's tests and the full interop matrix pass, and Saranga 1.0.0 is tagged and released.
+6. **The web console.** Artemis's own console (`web/console.war`, hawtio 4.7.0 with the Artemis plugin) served as Artemis serves it: its pages from the `.war`, with the `<base href>` set and the console's client routes answered with `index.html`, and the hawtio endpoints behind them (the login form and its session, logout, `/user`, `/refresh`, the auth configuration, `/keycloak/enabled`, `/proxy/enabled` and `/plugin`), with Jolokia taking the session as well as Basic authentication. Tests: each endpoint's answers compared with Artemis's, and a browser that logs in and opens the console's pages on both brokers.
+7. **Documentation.** The user guide (installing, configuring, the CLI, protocols, security, HA, clustering, management and operations) and a migration guide from Artemis (data directories, `broker.xml`, clients, what differs), checked against COMPAT.md.
+8. **Container images and the release.** A container image laid out as Artemis's, binaries for Linux, Windows and macOS, a release workflow, the version set to 1.0.0, and a changelog.
+9. **Exit check:** every stage's tests and the full interop matrix pass, and Saranga 1.0.0 is tagged and released.
 
 **Progress**
 - Stage 1 (storage faults) is done.
@@ -600,6 +601,21 @@ The differences from Artemis are listed in COMPAT.md.
     - Its throughput is 0.87 to 0.93 of Artemis's on Core, 0.75 to 0.78 on AMQP, and 1.07 to 1.08 with large messages, and both keep up with the 100 queues.
     - Its p99 at the same rate is lower in every scenario but the 100 queues.
     - Two full runs an hour apart moved some ratios by up to 0.2, so differences under 15% are a tie.
+- Stage 6 (the web console) is done.
+  - **The console** ([console.rs](crates/saranga-management/src/console.rs)): where `bootstrap.xml` declares the console's app, Saranga serves the `console.war` directory of the instance's `web` directory, else of the home's, with what its hawtio 4.7.0 filters and servlets do:
+    - the console's own routes answered with `index.html`, its `<base href>` set to the app's URL, and a user without a session sent to `/login` unless the request carries a valid `Authorization: Basic`;
+    - the JSON login form, which starts a session (the `JSESSIONID_<binding>_<port>` cookie, `HttpOnly`, `SameSite=Strict`) and throttles a user who keeps failing (429 with `Retry-After`), audited as Artemis's own filter audits it;
+    - logout, `/user`, `/refresh`, a session ending after `hawtio.sessionTimeout` (1800 s) without use other than Jolokia's, the auth configuration, `/keycloak/*`, `/plugin` and `/proxy/enabled`;
+    - the headers of hawtio's filters (`Content-Security-Policy`, `Strict-Transport-Security` as the profile sets it, caching) and Jetty's redirects, error pages and `If-Modified-Since`.
+
+    Jolokia takes the session as well as Basic authentication; another user's `Authorization` ends the session.
+  - **What the console needed from the Jolokia layer:**
+    - `canonicalNaming=false`, which the console sends: names with their keys in registered order. The console builds its tree from that order, so with sorted keys a queue's menu had no Send, Purge, Browse or Delete;
+    - hawtio's permission checks, `hawtio:type=security,area=jmx,name=ArtemisJMXSecurity` (`canInvoke` by name, method or signature, and in bulk), answered by `management.xml`'s guard or the RBAC guard;
+    - the platform MBeans of the Runtime tab (`java.lang:type=Runtime`, `Memory`, `OperatingSystem`, `Threading`, `ClassLoading`), described as Artemis on OpenJDK 25 lists them and answered from the Saranga process ([platform](crates/saranga-management/src/platform));
+    - `listLockCoordinatorsAsJSON` (an empty list) and the broker's `HAPolicy`, `Backup`, `SharedStore`, `Clustered`, `ReplicaSync` and `FailoverOnServerShutdown`, which had been fixed values.
+  - **Tests.** [console.py](tests/interop/web/console.py) sends the same requests to Saranga and to Artemis 2.57.0 and compares statuses, headers and bodies: every route, endpoint and error, every file `index.html` loads, the login's throttling, sessions ended by logout, another user, Keycloak's check and idleness, Jolokia through a session, both naming modes and the permission checks. [web.sh](tests/interop/web/web.sh) runs it after web.py, Saranga serving the Artemis distribution's console (`ARTEMIS_DIST`), against the Artemis container or one already running (`ARTEMIS_WEB_URL`). All 156 checks of both pass. In Chrome, against both brokers side by side, the console logs in and shows the Status page, connections, addresses, queues with their menus, browsing a queue's messages, the broker diagram, the JMX trees and the Runtime tab.
+  - **Found along the way.** Artemis refuses a send from a connection without flow control (management's `sendMessage`, and some protocols) while the disk is beyond `max-disk-usage` (`AMQ229119`, `ServerSessionImpl.doSend`); Saranga accepts it. Not fixed yet.
 
 ---
 

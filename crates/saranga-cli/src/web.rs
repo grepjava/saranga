@@ -1,7 +1,8 @@
 //! The embedded web server of an instance (`bootstrap.xml`'s `<web>`), as
 //! `artemis run` starts it: each binding, with TLS from its key and trust
-//! stores, serving the management API and metrics.
+//! stores, serving the management API, metrics and the web console.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -34,6 +35,45 @@ fn profile_roles(instance: &Instance) -> Option<Vec<String>> {
         }
     }
     None
+}
+
+/// A hawtio setting: the system property, else its `-D` in the profile's
+/// `JAVA_ARGS`.
+fn hawtio_setting(instance: &Instance, name: &str) -> Option<String> {
+    if let Some(v) = instance.lookup(name) {
+        return Some(v);
+    }
+    let define = format!("-D{name}=");
+    ["artemis.profile", "artemis.profile.cmd"]
+        .iter()
+        .find_map(|f| {
+            let text = std::fs::read_to_string(instance.etc.join(f)).ok()?;
+            let rest = &text[text.find(&define)? + define.len()..];
+            let v = rest.split_whitespace().next().unwrap_or("");
+            Some(v.trim_end_matches(['"', '\'']).to_owned())
+        })
+}
+
+/// The directories an app's `.war` is looked for in: the instance's
+/// `<web path>`, then the home's (`ARTEMIS_HOME`, else the directory
+/// above saranga's).
+fn web_dirs(instance: &Instance, web: &WebConfig) -> Vec<PathBuf> {
+    let path = Path::new(&web.path);
+    let home = instance
+        .lookup("artemis.home")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let exe = std::env::current_exe().ok()?;
+            Some(exe.parent()?.parent()?.to_path_buf())
+        });
+    let mut dirs = vec![instance.dir.join(path)];
+    if let Some(home) = home {
+        let d = home.join(path);
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    dirs
 }
 
 /// The console roles: `-Dhawtio.roles` (or `hawtio.role`), the profile's
@@ -163,6 +203,15 @@ pub async fn start(
         cors: saranga_management::cors(&instance.etc),
         root_redirect: web.root_redirect_location.clone(),
         acceptors,
+        web_dirs: web_dirs(instance, web),
+        // `AuthSessionHelpers.getSessionTimeout`: 0 or not a number is the
+        // default.
+        session_timeout: hawtio_setting(instance, "hawtio.sessionTimeout")
+            .and_then(|t| t.trim().parse().ok())
+            .filter(|t| *t != 0)
+            .unwrap_or(saranga_management::console::DEFAULT_SESSION_TIMEOUT),
+        strict_transport_security: hawtio_setting(instance, "hawtio.http.strictTransportSecurity"),
+        system_properties: instance.system_properties(),
     };
     saranga_management::start(current.clone(), bindings, options)
         .await
