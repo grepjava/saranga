@@ -10,7 +10,7 @@ mod session;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use saranga_buffer::JString;
@@ -94,6 +94,44 @@ impl ConnShared {
 
     pub(crate) fn security_info(&self) -> Arc<ConnectionInfo> {
         self.client.security_info()
+    }
+}
+
+/// `ServerSessionImpl.requestProducerCredits`: granted at once, or under
+/// BLOCK once a full address has room, or refused under FAIL.
+pub(crate) fn producer_credits(
+    broker: &Broker,
+    conn: &Arc<ConnShared>,
+    channel: i64,
+    p: saranga_core_protocol::packets::session::SessionRequestProducerCreditsMessage,
+) {
+    use saranga_core_protocol::packets::session::{
+        SessionProducerCreditsFailMessage, SessionProducerCreditsMessage,
+    };
+    let raw = p.address.to_string_lossy();
+    let addr = conn.client.strip_prefix(&raw).0;
+    let grant: Box<dyn FnOnce() + Send> = {
+        let conn = conn.clone();
+        let (credits, address) = (p.credits, p.address.clone());
+        Box::new(move || conn.send(channel, SessionProducerCreditsMessage { credits, address }))
+    };
+    // getPageStore: the management address has no store, so what is sent
+    // to it is never blocked.
+    let store_name = addr.split_once("::").map_or(addr, |(a, _)| a);
+    if store_name.starts_with(broker.management().address()) {
+        grant();
+    } else if let crate::paging::Credits::Failed = broker
+        .post_office()
+        .paging_store(addr)
+        .request_credits(grant)
+    {
+        conn.send(
+            channel,
+            SessionProducerCreditsFailMessage {
+                credits: p.credits,
+                address: p.address,
+            },
+        );
     }
 }
 
@@ -330,10 +368,20 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedRec
     let _ = wr.shutdown().await;
 }
 
+/// Producer credits are answered as they are read while a session has at
+/// most this many bytes of packets read and not yet handled.
+const EARLY_CREDITS_BACKLOG: usize = 256 * 1024;
+
+/// A session's task: its packets, and the bytes of those not yet handled.
+struct SessionLink {
+    tx: mpsc::UnboundedSender<SessionInput>,
+    backlog: Arc<AtomicUsize>,
+}
+
 struct Connection {
     broker: Arc<Broker>,
     shared: Arc<ConnShared>,
-    sessions: HashMap<i64, mpsc::UnboundedSender<SessionInput>>,
+    sessions: HashMap<i64, SessionLink>,
     session_tasks: Vec<JoinHandle<()>>,
     /// The connection TTL in milliseconds; -1 never expires.
     ttl: i64,
@@ -486,20 +534,51 @@ impl Connection {
                     // We keep no resend cache, so there is nothing to clear.
                     return Ok(());
                 }
-                match self.sessions.get(&channel_id) {
-                    Some(session) => {
-                        if session
-                            .send(SessionInput::Packet(Box::new(packet), size))
-                            .is_err()
-                        {
-                            self.sessions.remove(&channel_id);
-                        }
+                let Some(session) = self.sessions.get(&channel_id) else {
+                    tracing::debug!(channel_id, "packet for an unknown channel");
+                    return Ok(());
+                };
+                // Producer credits are answered as the request is read while
+                // the session has little left to handle: the client's
+                // producer waits for them with only its window (64 KiB by
+                // default) sent ahead, and the trip through the session task
+                // and back held it there. Behind a longer backlog they wait
+                // their turn, as in Artemis, so a producer cannot send faster
+                // than its session handles what it sends.
+                if let Packet::SessionRequestProducerCreditsMessage(p) = packet {
+                    if session.backlog.load(Ordering::Relaxed) <= EARLY_CREDITS_BACKLOG {
+                        producer_credits(&self.broker, &self.shared, channel_id, p);
+                        return Ok(());
                     }
-                    None => tracing::debug!(channel_id, "packet for an unknown channel"),
+                    return self.pass_to_session(
+                        channel_id,
+                        Packet::SessionRequestProducerCreditsMessage(p),
+                        size,
+                    );
                 }
-                Ok(())
+                self.pass_to_session(channel_id, packet, size)
             }
         }
+    }
+
+    /// Hands a packet to its session, counting it until handled.
+    fn pass_to_session(
+        &mut self,
+        channel_id: i64,
+        packet: Packet,
+        size: usize,
+    ) -> Result<(), ConnError> {
+        if let Some(session) = self.sessions.get(&channel_id) {
+            session.backlog.fetch_add(size, Ordering::Relaxed);
+            if session
+                .tx
+                .send(SessionInput::Packet(Box::new(packet), size))
+                .is_err()
+            {
+                self.sessions.remove(&channel_id);
+            }
+        }
+        Ok(())
     }
 
     /// `CoreProtocolManager.LocalChannelHandler`.
@@ -916,9 +995,13 @@ impl Connection {
         // The session's packets are handled for its connection's subject
         // and address (ActiveMQPacketHandler's AuditLogger thread locals).
         let context = crate::audit::Context::Connection(self.shared.client.clone());
-        self.session_tasks
-            .push(tokio::spawn(crate::audit::scoped(context, session.run(rx))));
-        self.sessions.insert(channel_id, tx);
+        let backlog = Arc::new(AtomicUsize::new(0));
+        self.session_tasks.push(tokio::spawn(crate::audit::scoped(
+            context,
+            session.run(rx, backlog.clone()),
+        )));
+        self.sessions
+            .insert(channel_id, SessionLink { tx, backlog });
         self.shared.send(
             CHANNEL_SESSION,
             CreateSessionResponseMessage {
@@ -1013,7 +1096,7 @@ impl Connection {
             }
         }
         for (_, session) in self.sessions.drain() {
-            let _ = session.send(SessionInput::ConnectionFailed);
+            let _ = session.tx.send(SessionInput::ConnectionFailed);
         }
         for task in self.session_tasks.drain(..) {
             let _ = task.await;

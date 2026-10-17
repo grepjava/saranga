@@ -14,9 +14,8 @@ use saranga_core_protocol::packets::connection::{
 use saranga_core_protocol::packets::session::{
     BindingQueryDefaults, SessionBindingQueryResponseMessage, SessionBindingQueryResponseMessageV2,
     SessionBindingQueryResponseMessageV3, SessionBindingQueryResponseMessageV4,
-    SessionBindingQueryResponseMessageV5, SessionProducerCreditsMessage,
-    SessionQueueQueryResponseMessage, SessionQueueQueryResponseMessageV2,
-    SessionQueueQueryResponseMessageV3,
+    SessionBindingQueryResponseMessageV5, SessionQueueQueryResponseMessage,
+    SessionQueueQueryResponseMessageV2, SessionQueueQueryResponseMessageV3,
 };
 use saranga_core_protocol::packets::xa::{
     SessionXAGetInDoubtXidsResponseMessage, SessionXAGetTimeoutResponseMessage,
@@ -255,11 +254,18 @@ impl CoreSession {
         self.session.entry()
     }
 
-    pub(crate) async fn run(mut self, mut rx: mpsc::UnboundedReceiver<SessionInput>) {
+    /// Handles the session's packets; `backlog` counts the bytes of those
+    /// read and not yet handled.
+    pub(crate) async fn run(
+        mut self,
+        mut rx: mpsc::UnboundedReceiver<SessionInput>,
+        backlog: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         while let Some(input) = rx.recv().await {
             match input {
                 SessionInput::Packet(packet, size) => {
                     self.handle(*packet, size).await;
+                    backlog.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
                     if self.session.is_closed() {
                         break;
                     }
@@ -283,10 +289,6 @@ impl CoreSession {
     async fn close(&mut self, failed: bool) {
         self.session.close(failed).await;
         self.producers.clear();
-    }
-
-    fn send(&self, packet: impl Into<Packet>) {
-        self.conn.send(self.channel_id, packet);
     }
 
     fn null_response(&self, request: Request) -> Packet {
@@ -482,33 +484,9 @@ impl CoreSession {
                 (false, result.map(|()| None), false)
             }
             Packet::SessionRequestProducerCreditsMessage(p) => {
-                // requestProducerCredits: a full address under BLOCK grants
-                // them once memory is freed, under FAIL refuses them.
-                let raw = p.address.to_string_lossy();
-                let addr = self.session.remove_prefix(&raw);
-                let (conn, channel) = (self.conn.clone(), self.channel_id);
-                let (credits, address) = (p.credits, p.address.clone());
-                let grant: Box<dyn FnOnce() + Send> = Box::new(move || {
-                    conn.send(channel, SessionProducerCreditsMessage { credits, address });
-                });
-                // getPageStore: the management address has no store, so
-                // what is sent to it is never blocked.
-                let store_name = addr.split_once("::").map_or(addr, |(a, _)| a);
-                if store_name.starts_with(self.broker.management().address()) {
-                    grant();
-                } else if let crate::paging::Credits::Failed = self
-                    .broker
-                    .post_office()
-                    .paging_store(addr)
-                    .request_credits(grant)
-                {
-                    self.send(
-                        saranga_core_protocol::packets::session::SessionProducerCreditsFailMessage {
-                            credits: p.credits,
-                            address: p.address,
-                        },
-                    );
-                }
+                // The connection answers these as it reads them; this is
+                // for any that reach the session all the same.
+                super::producer_credits(&self.broker, &self.conn, self.channel_id, p);
                 (false, Ok(None), false)
             }
             Packet::SessionConsumerFlowCreditMessage(p) => {
