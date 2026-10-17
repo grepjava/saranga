@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/saranga.png" alt="Saranga: a pure-Rust message broker" width="600">
+</p>
+
 # Saranga
 
 Saranga is a message broker written in Rust that aims to be a drop-in replacement for [Apache ActiveMQ Artemis](https://activemq.apache.org/components/artemis/) 2.57.0. It speaks the same wire protocols: Core, AMQP 1.0, OpenWire, STOMP, MQTT 3.1.1 and 5, and WebSockets. It reads and writes the same journal, bindings, paging and large-message files, and takes the same `broker.xml`, so that Artemis's clients, management and command line work against it unchanged.
@@ -54,9 +58,24 @@ Both brokers ran on the same machine, with the same clients, in instances made b
 | MQTT, QoS 0 | 45,841 | 40 µs | 39 µs | 83 µs / 631 µs | 116 µs / 289 µs |
 | MQTT, QoS 1 | 21,591 | 115 µs | 49 µs | 2.9 ms / 18.4 ms | 855 µs / 6.6 ms |
 
-Saranga is behind in two places:
-- **p50 without persistence**, by 4 to 63 µs, and p99 on non-persistent OpenWire and STOMP.
-- **Peak memory where a backlog built up during the run**: non-persistent Core and Saranga's persistent AMQP.
+Saranga is behind on latency without persistence: p50 is 4 to 63 µs higher, and p99 is higher on OpenWire and STOMP.
+
+Its peak memory is higher on non-persistent Core (881 against 601 MiB) and persistent AMQP (1,116 against 591 MiB). This is not memory per message, which is about 2 KB in both. It is a backlog that the benchmark's client leaves behind.
+- **The client is the limit.** Its producer and consumer share the client's four CPUs, and in these runs the client used all of them.
+- **Saranga takes sends faster than that client can receive them.** The producer then gets more of the client's CPU, its consumer falls behind, and the difference waits in the broker.
+- **Artemis takes sends no faster than the client receives**, so nothing accumulates.
+- **The client does the same work for either broker:** 74 µs of client CPU a message with Artemis and 75 with Saranga, at 40,000 msg/s.
+
+Saranga still delivers more messages a second than Artemis in each of these runs:
+
+| Scenario | Broker | Sent/s | Received/s | Backlog grows by |
+|---|---|---|---|---|
+| Core | Artemis | 74,879 | 74,878 | 0/s |
+| Core | Saranga | 82,280 | 75,891 | 6,389/s |
+| AMQP, persistent | Artemis | 27,307 | 27,307 | 0/s |
+| AMQP, persistent | Saranga | 37,655 | 31,645 | 6,009/s |
+
+Over a 75 s run, that comes to about 430,000 messages held at the peak.
 
 Runs on this machine vary by up to 5%. The method, the machine and how to run [scripts/bench.sh](scripts/bench.sh) yourself are in [docs/benchmarks.md](docs/benchmarks.md).
 
