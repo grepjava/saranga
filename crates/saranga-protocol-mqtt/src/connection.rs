@@ -1530,13 +1530,16 @@ pub async fn serve(
         closing: false,
     };
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut last_read = tokio::time::Instant::now();
     loop {
         // The connection TTL check (`FailureCheckAndFlushThread`); a TTL of
-        // 0 fails a connection idle for one check period.
-        let ttl = match conn.ttl {
-            t if t < 0 => Duration::from_secs(u64::MAX / 4),
-            0 => Duration::from_millis(2000),
-            t => Duration::from_millis(t as u64),
+        // 0 fails a connection idle for one check period. Only bytes from
+        // the client keep it alive (`checkDataReceived`), not what goes to
+        // it meanwhile.
+        let deadline = match conn.ttl {
+            t if t < 0 => None,
+            0 => Some(last_read + Duration::from_millis(2000)),
+            t => Some(last_read + Duration::from_millis(t as u64)),
         };
         tokio::select! {
             // Management failed the connection: a failure, as if the
@@ -1557,21 +1560,26 @@ pub async fn serve(
                     break;
                 }
             },
-            read = tokio::time::timeout(ttl, rd.read_buf(&mut buf)), if !conn.closing => match read {
-                Err(_) => {
-                    tracing::warn!(
-                        "AMQ222067: Connection failure has been detected: AMQ229014: Did not receive data from {} within the {}ms connection TTL. The connection will now be closed. [code=CONNECTION_TIMEDOUT]",
-                        conn.remote, conn.ttl
-                    );
-                    conn.disconnect(true).await;
-                    break;
-                }
+            () = tokio::time::sleep_until(deadline.unwrap_or(last_read)),
+                if !conn.closing && deadline.is_some() =>
+            {
+                tracing::warn!(
+                    "AMQ222067: Connection failure has been detected: AMQ229014: Did not receive data from {} within the {}ms connection TTL. The connection will now be closed. [code=CONNECTION_TIMEDOUT]",
+                    conn.remote, conn.ttl
+                );
+                conn.disconnect(true).await;
+                break;
+            }
+            read = rd.read_buf(&mut buf), if !conn.closing => match read {
                 // The client went without DISCONNECT: a failure.
-                Ok(Ok(0)) | Ok(Err(_)) => {
+                Ok(0) | Err(_) => {
                     conn.disconnect(true).await;
                     break;
                 }
-                Ok(Ok(_)) => conn.process(&mut buf).await,
+                Ok(_) => {
+                    last_read = tokio::time::Instant::now();
+                    conn.process(&mut buf).await
+                }
             },
         }
         if conn.closing {

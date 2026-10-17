@@ -142,6 +142,24 @@ public class Load {
         return s;
     }
 
+    // A consumer only receives, and a broker closes a connection it has had
+    // nothing from within its TTL (Artemis's 60 s for STOMP without
+    // heart-beats, 1.5 times the MQTT keep-alive), so it pings as a real
+    // client does.
+    static void keepAlive(OutputStream out, byte[] ping, long ms) {
+        Thread t = new Thread(wrap(() -> {
+            try {
+                while (!stop) {
+                    Thread.sleep(ms);
+                    synchronized (out) { out.write(ping); out.flush(); }
+                }
+            } catch (IOException e) { throw new UncheckedIOException(e); }
+            catch (InterruptedException e) { }
+        }));
+        t.setDaemon(true);
+        t.start();
+    }
+
     // ---- STOMP 1.2: receipts every 100 sends, at most 10 outstanding.
     static void stompConnect(OutputStream out, InputStream in) throws IOException {
         out.write("CONNECT\naccept-version:1.2\nhost:localhost\nlogin:admin\npasscode:admin\n\n\0".getBytes(StandardCharsets.UTF_8));
@@ -157,6 +175,7 @@ public class Load {
             stompConnect(out, in);
             out.write("SUBSCRIBE\nid:1\ndestination:BENCH.STOMP\nsubscription-type:ANYCAST\nack:auto\n\n\0".getBytes(StandardCharsets.UTF_8));
             out.flush();
+            keepAlive(out, new byte[] {'\n'}, 10_000);
             while (!stop) {
                 Frame f = Frame.read(in);
                 if (f.command.equals("MESSAGE")) record(f.body, 0);
@@ -302,6 +321,7 @@ public class Load {
             b.write(qos);
             packet(out, 0x82, b.toByteArray());
             out.flush();
+            keepAlive(out, new byte[] {(byte) 0xc0, 0}, 30_000);
             byte[] ack = new byte[] {0x40, 2, 0, 0};
             while (!stop) {
                 int t = in.read();
@@ -314,8 +334,10 @@ public class Load {
                     ack[2] = r[off];
                     ack[3] = r[off + 1];
                     off += 2;
-                    out.write(ack);
-                    if (in.available() == 0) out.flush();
+                    synchronized (out) {
+                        out.write(ack);
+                        if (in.available() == 0) out.flush();
+                    }
                 }
                 record(r, off);
             }

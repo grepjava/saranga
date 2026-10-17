@@ -12,12 +12,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 async fn start() -> std::net::SocketAddr {
+    start_with(Acceptor::default()).await
+}
+
+async fn start_with(acceptor: Acceptor) -> std::net::SocketAddr {
     let mut config = BrokerConfig::new(Arc::new(SelectorFilters));
     config.protocols = vec![Arc::new(StompProtocol)];
     let broker = Broker::start(config).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    tokio::spawn(broker.serve_acceptor(listener, Acceptor::default()));
+    tokio::spawn(broker.serve_acceptor(listener, acceptor));
     address
 }
 
@@ -102,6 +106,46 @@ async fn send_and_receive() {
     assert_eq!(header(&m, "foo"), Some("bar"));
     assert_eq!(header(&m, "content-length"), Some("5"));
     assert!(m.ends_with("\n\nhello"), "{m}");
+}
+
+/// Messages going to a client that sends nothing do not keep its
+/// connection alive past the TTL: only bytes from it do.
+#[tokio::test]
+async fn a_receiving_client_that_sends_nothing_times_out() {
+    let mut acceptor = Acceptor::default();
+    acceptor
+        .params
+        .insert("connectionTtl".to_owned(), "1000".to_owned());
+    let address = start_with(acceptor).await;
+    let mut consumer = Client::connect(address, "1.2").await;
+    consumer
+        .send("SUBSCRIBE\ndestination:ttl\ndestination-type:ANYCAST\nsubscription-type:ANYCAST\nid:s\nack:auto\n\n")
+        .await;
+    let mut producer = Client::connect(address, "1.2").await;
+    let sending = tokio::spawn(async move {
+        loop {
+            producer
+                .send("SEND\ndestination:ttl\ndestination-type:ANYCAST\n\nm")
+                .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    let error = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let f = consumer.frame().await;
+            if !f.starts_with("MESSAGE\n") {
+                break f;
+            }
+        }
+    })
+    .await
+    .expect("closed within 3 s");
+    sending.abort();
+    assert!(error.starts_with("ERROR\n"), "{error}");
+    assert!(
+        header(&error, "message").is_some_and(|m| m.starts_with("AMQ229014")),
+        "{error}"
+    );
 }
 
 #[tokio::test]

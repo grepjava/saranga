@@ -577,8 +577,11 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
         closing: false,
     };
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut last_read = tokio::time::Instant::now();
     loop {
-        let ttl = Duration::from_millis(conn.ttl.max(1) as u64);
+        // Only bytes from the client keep the connection alive
+        // (`checkDataReceived`), not what goes to it meanwhile.
+        let deadline = last_read + Duration::from_millis(conn.ttl.max(1) as u64);
         tokio::select! {
             () = failed.failed() => break,
             event = events_rx.recv() => match event {
@@ -587,13 +590,14 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
                 Some(Event::Disconnected { consumer }) => conn.disconnected(consumer).await,
                 Some(Event::Close) | None => break,
             },
-            read = tokio::time::timeout(ttl, rd.read_buf(&mut buf)), if !conn.closing => match read {
-                Err(_) => {
-                    conn.fail_ttl();
-                    break;
-                }
-                Ok(Ok(0)) | Ok(Err(_)) => break,
-                Ok(Ok(_)) => {
+            () = tokio::time::sleep_until(deadline), if !conn.closing => {
+                conn.fail_ttl();
+                break;
+            }
+            read = rd.read_buf(&mut buf), if !conn.closing => match read {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    last_read = tokio::time::Instant::now();
                     if !conn.process(&mut buf).await {
                         break;
                     }
