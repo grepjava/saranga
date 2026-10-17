@@ -17,7 +17,7 @@ use saranga_core_protocol::packets::xa::Xid;
 use saranga_message::CoreMessage;
 use saranga_security::{Authenticated, SecurityError};
 use saranga_server::postoffice::{AutoCreate, AutoCreateOptions, QueueSpec, split_fqqn};
-use saranga_server::protocol::Connection as Accepted;
+use saranga_server::protocol::{Connection as Accepted, DirectOut, Written};
 use saranga_server::queue::AckResult;
 use saranga_server::session::{
     AckPending, ClientConnection, Completion, ServerSession, SessionOptions, Transport,
@@ -178,6 +178,7 @@ enum Out {
 /// to it: the negotiated wire format and the writer task's queue.
 pub(crate) struct Outbound {
     tx: mpsc::UnboundedSender<Out>,
+    direct: DirectOut,
     wf: Mutex<WireFormat>,
     destroyed: AtomicBool,
     /// When anything was last written (`lastSent`).
@@ -196,7 +197,8 @@ impl Outbound {
         };
         self.last_sent
             .store(saranga_server::message::now_millis(), Ordering::SeqCst);
-        self.tx.send(Out::Bytes(bytes)).is_ok()
+        let tx = &self.tx;
+        self.direct.write(bytes, |b| tx.send(Out::Bytes(b)).is_ok())
     }
 
     /// `sendCommand`: nothing once the connection is destroyed.
@@ -208,10 +210,16 @@ impl Outbound {
     }
 }
 
-async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedReceiver<Out>) {
+async fn write_loop<W: AsyncWrite + Unpin>(
+    mut wr: W,
+    mut rx: mpsc::UnboundedReceiver<Out>,
+    written: Written,
+) {
     let mut buf = Vec::with_capacity(64 * 1024);
     while let Some(first) = rx.recv().await {
         let mut close = matches!(first, Out::Close);
+        // The items taken, to count off once written.
+        let mut held = 1;
         if let Out::Bytes(b) = first {
             buf.extend_from_slice(&b);
         }
@@ -221,11 +229,13 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedRec
                 Ok(Out::Close) => close = true,
                 Err(_) => break,
             }
+            held += 1;
         }
         if !buf.is_empty() && wr.write_all(&buf).await.is_err() {
             break;
         }
         buf.clear();
+        written.done(held);
         if close {
             break;
         }
@@ -565,11 +575,13 @@ pub async fn serve(broker: Arc<Broker>, manager: Arc<Manager>, c: Accepted) {
     );
     let _registered = broker.registry().add(&client);
     let failed = client.clone();
-    let (mut rd, wr) = tokio::io::split(c.stream);
+    let (mut rd, wr) = saranga_server::protocol::split(c.stream);
     let (out_tx, out_rx) = mpsc::unbounded_channel();
-    let writer = tokio::spawn(write_loop(wr, out_rx));
+    let (direct, written) = DirectOut::new(&wr);
+    let writer = tokio::spawn(write_loop(wr, out_rx, written));
     let out = Arc::new(Outbound {
         tx: out_tx,
+        direct,
         wf: Mutex::new(WireFormat::new(crate::codec::DEFAULT_WIRE_VERSION)),
         destroyed: AtomicBool::new(false),
         last_sent: AtomicI64::new(-1),
@@ -1291,7 +1303,8 @@ impl Connection {
             let _ = completion.wait().await;
         }
         self.out.destroyed.store(true, Ordering::SeqCst);
-        let _ = self.out.tx.send(Out::Close);
+        let tx = &self.out.tx;
+        self.out.direct.queue(|| tx.send(Out::Close).is_ok());
     }
 
     /// The temporary destinations made through the connection's sessions

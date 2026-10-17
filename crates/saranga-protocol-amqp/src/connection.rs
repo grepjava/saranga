@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use saranga_core_protocol::ErrorType;
 use saranga_security::Authenticated;
 use saranga_server::message::{ServerMessage, now_millis};
-use saranga_server::protocol::Connection as Accepted;
+use saranga_server::protocol::{Connection as Accepted, DirectOut, Written};
 use saranga_server::queue::{DeliverySink, FORCED_DELIVERY_MESSAGE, Queue};
 use saranga_server::session::{
     ClientConnection, Completion, ServerSession, SessionOptions, Transport,
@@ -108,6 +108,7 @@ const CORK_LIMIT: usize = 64 * 1024;
 
 struct Outbound {
     tx: mpsc::UnboundedSender<Out>,
+    direct: DirectOut,
     /// What the task wrote since it last flushed, with nothing to wait for:
     /// it goes to the writer as one once the task has no frame or event
     /// left to handle, as Netty flushes at the end of a read. Handed over
@@ -125,11 +126,31 @@ struct Cork {
 }
 
 impl Outbound {
-    fn new(tx: mpsc::UnboundedSender<Out>) -> Self {
+    fn new(tx: mpsc::UnboundedSender<Out>, direct: DirectOut) -> Self {
         Self {
             tx,
+            direct,
             corked: Mutex::new(Cork::default()),
         }
+    }
+
+    /// Hands `out` to the writer.
+    fn queue(&self, out: Out) {
+        self.direct.queue(|| self.tx.send(out).is_ok());
+    }
+
+    /// Writes `bytes`, which wait for nothing: to the socket while the
+    /// writer has nothing left to write, rather than waking it on another
+    /// thread for each delivery and disposition.
+    fn ready(&self, bytes: Vec<u8>) {
+        self.direct.write(bytes, |bytes| {
+            self.tx
+                .send(Out::Send {
+                    wait: Completion::default(),
+                    bytes,
+                })
+                .is_ok()
+        });
     }
 
     /// Corks what is written from now on, or stops and flushes.
@@ -145,7 +166,7 @@ impl Outbound {
             let mut corked = lock(&self.corked);
             if !corked.on && corked.bytes.is_empty() {
                 drop(corked);
-                let _ = self.tx.send(Out::Send { wait, bytes });
+                self.ready(bytes);
                 return;
             }
             if corked.bytes.is_empty() {
@@ -158,26 +179,20 @@ impl Outbound {
             }
             let bytes = std::mem::take(&mut corked.bytes);
             drop(corked);
-            let _ = self.tx.send(Out::Send {
-                wait: Completion::default(),
-                bytes,
-            });
+            self.ready(bytes);
         } else {
             // What came before goes first, without waiting for these
             // writes.
             self.flush();
-            let _ = self.tx.send(Out::Send { wait, bytes });
+            self.queue(Out::Send { wait, bytes });
         }
     }
 
-    /// Hands what is corked to the writer.
+    /// Writes what is corked.
     fn flush(&self) {
         let bytes = std::mem::take(&mut lock(&self.corked).bytes);
         if !bytes.is_empty() {
-            let _ = self.tx.send(Out::Send {
-                wait: Completion::default(),
-                bytes,
-            });
+            self.ready(bytes);
         }
     }
 
@@ -187,7 +202,7 @@ impl Outbound {
 
     fn close(&self) {
         self.flush();
-        let _ = self.tx.send(Out::Close);
+        self.queue(Out::Close);
     }
 
     fn frame(&self, channel: u16, p: Performative, payload: &[u8], wait: Completion) {
@@ -198,8 +213,14 @@ impl Outbound {
     }
 }
 
-async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedReceiver<Out>) {
+async fn write_loop<W: AsyncWrite + Unpin>(
+    mut wr: W,
+    mut rx: mpsc::UnboundedReceiver<Out>,
+    written: Written,
+) {
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    // How many of the items taken are in `buf`, to count off once written.
+    let mut held = 0;
     let mut broken = false;
     while let Some(out) = rx.recv().await {
         let close = match out {
@@ -212,8 +233,9 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedRec
                     None => {
                         if !broken && !buf.is_empty() {
                             broken = wr.write_all(&buf).await.is_err() || wr.flush().await.is_err();
-                            buf.clear();
                         }
+                        buf.clear();
+                        written.done(std::mem::take(&mut held));
                         done.await
                     }
                 };
@@ -221,13 +243,17 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedRec
                     tracing::error!("AMQ119031: storage operation failed: {e}");
                 }
                 buf.extend_from_slice(&bytes);
+                held += 1;
                 false
             }
             Out::Close => true,
         };
-        if !broken && !buf.is_empty() && (close || rx.is_empty() || buf.len() > 256 * 1024) {
-            broken = wr.write_all(&buf).await.is_err() || wr.flush().await.is_err();
+        if close || rx.is_empty() || buf.len() > 256 * 1024 {
+            if !broken && !buf.is_empty() {
+                broken = wr.write_all(&buf).await.is_err() || wr.flush().await.is_err();
+            }
             buf.clear();
+            written.done(std::mem::take(&mut held));
         }
         if close {
             break;
@@ -906,9 +932,10 @@ where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let _registered = broker.registry().add(&client);
-    let (rd, wr) = tokio::io::split(stream);
+    let (rd, wr) = saranga_server::protocol::split(stream);
     let (out_tx, out_rx) = mpsc::unbounded_channel();
-    let writer = tokio::spawn(write_loop(wr, out_rx));
+    let (direct, written) = DirectOut::new(&wr);
+    let writer = tokio::spawn(write_loop(wr, out_rx, written));
     let ttl = match settings.idle_timeout {
         Some(t) => t,
         None if broker.connection_ttl_override() != -1 => broker.connection_ttl_override(),
@@ -920,7 +947,7 @@ where
         settings,
         config,
         registry,
-        out: Outbound::new(out_tx),
+        out: Outbound::new(out_tx, direct),
         events: events_tx,
         user: None,
         password: None,

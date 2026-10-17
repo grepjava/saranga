@@ -41,6 +41,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::message::ServerMessage;
+use crate::protocol::{DirectOut, Written};
 use crate::queue::DeliverySink;
 use crate::session::{ClientConnection, Transport};
 use crate::{Broker, BrokerError};
@@ -64,6 +65,7 @@ enum Outgoing {
 /// queues delivering to its consumers.
 pub(crate) struct ConnShared {
     out: mpsc::UnboundedSender<Outgoing>,
+    direct: DirectOut,
     /// The negotiated channel version (`getChannelVersion`); 0 until set.
     version: AtomicI32,
     /// What every protocol's connection keeps.
@@ -80,7 +82,8 @@ impl ConnShared {
     }
 
     pub(crate) fn send_raw(&self, frame: Vec<u8>) {
-        let _ = self.out.send(Outgoing::Frame(frame));
+        self.direct
+            .write(frame, |f| self.out.send(Outgoing::Frame(f)).is_ok());
     }
 
     pub(crate) fn send(&self, channel_id: i64, packet: impl Into<Packet>) {
@@ -89,7 +92,7 @@ impl ConnShared {
 
     /// Closes the connection once what is queued is written.
     pub(crate) fn close(&self) {
-        let _ = self.out.send(Outgoing::Close);
+        self.direct.queue(|| self.out.send(Outgoing::Close).is_ok());
     }
 
     pub(crate) fn security_info(&self) -> Arc<ConnectionInfo> {
@@ -274,11 +277,13 @@ pub async fn serve_stream<S>(
 ) where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    let (mut rd, wr) = tokio::io::split(stream);
+    let (mut rd, wr) = crate::protocol::split(stream);
     let (out, rx) = mpsc::unbounded_channel();
-    let writer = tokio::spawn(write_loop(wr, rx));
+    let (direct, written) = DirectOut::new(&wr);
+    let writer = tokio::spawn(write_loop(wr, rx, written));
     let shared = Arc::new(ConnShared {
         out,
+        direct,
         version: AtomicI32::new(0),
         client: Arc::new(
             ClientConnection::new(
@@ -341,10 +346,16 @@ pub async fn serve_stream<S>(
     let _ = writer.await;
 }
 
-async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedReceiver<Outgoing>) {
+async fn write_loop<W: AsyncWrite + Unpin>(
+    mut wr: W,
+    mut rx: mpsc::UnboundedReceiver<Outgoing>,
+    written: Written,
+) {
     let mut buf = Vec::with_capacity(64 * 1024);
     'outer: while let Some(first) = rx.recv().await {
         let mut close = false;
+        // The items taken, to count off once written.
+        let mut held = 1;
         match first {
             Outgoing::Frame(f) => buf.extend_from_slice(&f),
             Outgoing::Close => close = true,
@@ -356,11 +367,13 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedRec
                 Ok(Outgoing::Close) => close = true,
                 Err(_) => break,
             }
+            held += 1;
         }
         if !buf.is_empty() && wr.write_all(&buf).await.is_err() {
             break 'outer;
         }
         buf.clear();
+        written.done(held);
         if close {
             break;
         }
@@ -1102,7 +1115,7 @@ impl Connection {
             let _ = task.await;
         }
         self.shared.client.remove_temp_queues(&self.broker);
-        let _ = self.shared.out.send(Outgoing::Close);
+        self.shared.close();
     }
 }
 

@@ -18,7 +18,7 @@ use saranga_message::{CoreMessage, message_type};
 use saranga_security::Authenticated;
 use saranga_server::message::{ServerMessage, now_millis};
 use saranga_server::postoffice::{QueueSpec, RoutingTypes};
-use saranga_server::protocol::Connection as Accepted;
+use saranga_server::protocol::{Connection as Accepted, DirectOut, Written};
 use saranga_server::queue::{AckResult, DeliverySink, Queue};
 use saranga_server::session::{
     AckPending, ClientConnection, Completion, ServerSession, SessionOptions, Transport,
@@ -54,20 +54,45 @@ enum Out {
 /// The ordered output, shared with the delivering queues.
 pub struct Outbound {
     tx: mpsc::UnboundedSender<Out>,
+    direct: DirectOut,
 }
 
 impl Outbound {
     fn send(&self, wait: Completion, bytes: Option<Vec<u8>>) {
-        let _ = self.tx.send(Out::Send { wait, bytes });
+        let tx = &self.tx;
+        match bytes {
+            // Ready now: to the socket while the writer has nothing left
+            // to write, rather than waking it on another thread.
+            Some(bytes) if wait.is_empty() => {
+                self.direct.write(bytes, |bytes| {
+                    tx.send(Out::Send {
+                        wait: Completion::default(),
+                        bytes: Some(bytes),
+                    })
+                    .is_ok()
+                });
+            }
+            bytes => {
+                self.direct
+                    .queue(|| tx.send(Out::Send { wait, bytes }).is_ok());
+            }
+        }
     }
 
     fn close(&self) {
-        let _ = self.tx.send(Out::Close);
+        let tx = &self.tx;
+        self.direct.queue(|| tx.send(Out::Close).is_ok());
     }
 }
 
-async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedReceiver<Out>) {
+async fn write_loop<W: AsyncWrite + Unpin>(
+    mut wr: W,
+    mut rx: mpsc::UnboundedReceiver<Out>,
+    written: Written,
+) {
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    // How many of the items taken are in `buf`, to count off once written.
+    let mut held = 0;
     let mut broken = false;
     while let Some(out) = rx.recv().await {
         let close = match out {
@@ -80,8 +105,9 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedRec
                     None => {
                         if !broken && !buf.is_empty() {
                             broken = wr.write_all(&buf).await.is_err();
-                            buf.clear();
                         }
+                        buf.clear();
+                        written.done(std::mem::take(&mut held));
                         done.await
                     }
                 };
@@ -95,13 +121,17 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedRec
                         "AMQ834016: Storage operation failed. Error code: 0; message: {e}"
                     ),
                 }
+                held += 1;
                 false
             }
             Out::Close => true,
         };
-        if !broken && !buf.is_empty() && (close || rx.is_empty() || buf.len() > 256 * 1024) {
-            broken = wr.write_all(&buf).await.is_err();
+        if close || rx.is_empty() || buf.len() > 256 * 1024 {
+            if !broken && !buf.is_empty() {
+                broken = wr.write_all(&buf).await.is_err();
+            }
             buf.clear();
+            written.done(std::mem::take(&mut held));
         }
         if close {
             break;
@@ -1468,9 +1498,10 @@ pub async fn serve(
     );
     let _registered = broker.registry().add(&client);
     let failed = client.clone();
-    let (mut rd, wr) = tokio::io::split(c.stream);
+    let (mut rd, wr) = saranga_server::protocol::split(c.stream);
     let (out_tx, out_rx) = mpsc::unbounded_channel();
-    let writer = tokio::spawn(write_loop(wr, out_rx));
+    let (direct, written) = DirectOut::new(&wr);
+    let writer = tokio::spawn(write_loop(wr, out_rx, written));
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     // createConnectionEntry: the server's keep-alive until CONNECT says.
@@ -1485,7 +1516,7 @@ pub async fn serve(
         id: NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed),
         client,
         remote,
-        out: Arc::new(Outbound { tx: out_tx }),
+        out: Arc::new(Outbound { tx: out_tx, direct }),
         events: events_tx,
         control: control_tx,
         decoder: codec::Decoder::new(),
