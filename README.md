@@ -8,7 +8,9 @@ Saranga is a message broker written in Rust, inspired by [Apache ActiveMQ Artemi
 
 It is in Phase 11 (hardening and 1.0) of the plan in [PHASES.md](PHASES.md). [COMPAT.md](COMPAT.md) has the pinned version and the deliberate differences.
 
-The name: Śārṅga, the celestial bow of the Sustainer, preserver of the cosmic order. Across another sky, Artemis, the huntress, draws her bow. Two mythologies, one enduring symbol of grace and power.
+## The Name: Śārṅga
+
+Śārṅga, the celestial bow of the Sustainer, preserver of cosmic order. Across another sky, Artemis, the divine huntress, draws her bow. Two mythologies, one enduring symbol of grace and power.
 
 ## Goals
 
