@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/saranga.png" alt="Saranga: a pure-Rust message broker" width="600">
+  <img src="assets/saranga.svg" alt="Saranga: a pure-Rust message broker" width="600">
 </p>
 
 # Saranga
