@@ -4,9 +4,24 @@
 
 # Saranga
 
+<p align="center"><em>Artemis hunts with a bow of silver; Śārṅga is the bow the Sustainer keeps.<br>
+Where the huntress pursues, the preserver holds: every message carried, every message kept,<br>
+loosed with the same aim, and spending far less to fly.</em></p>
+
 Saranga is a message broker written in Rust that aims to be a drop-in replacement for [Apache ActiveMQ Artemis](https://activemq.apache.org/components/artemis/) 2.57.0. It speaks the same wire protocols: Core, AMQP 1.0, OpenWire, STOMP, MQTT 3.1.1 and 5, and WebSockets. It reads and writes the same journal, bindings, paging and large-message files, and takes the same `broker.xml`, so that Artemis's clients, management and command line work against it unchanged.
 
 It is in Phase 11 (hardening and 1.0) of the plan in [PHASES.md](PHASES.md). [COMPAT.md](COMPAT.md) has the pinned version and the deliberate differences.
+
+The name: Śārṅga is the celestial bow of Vishnu, the Sustainer, who keeps the world in balance. Artemis, the Greek huntress, also carries a bow. Saranga takes up the same aim as the broker it replaces and holds to its task: keeping every message safe until it is delivered.
+
+## Goals
+
+- **A drop-in replacement.** The wire protocols, `broker.xml`, the journal, paging and large-message formats, management and the command line all behave as Artemis 2.57.0's do. An existing deployment should be able to switch without changing a client or a file.
+- **Native speed.** It compiles to a single native binary, with no JVM to start, warm up or tune. It starts in about 150 ms against Artemis's 2.7 s, and its throughput is the same or higher in every benchmark scenario.
+- **Memory safety without a garbage collector.** It is written in Rust, so the compiler rules out use-after-free, data races and buffer overruns, with no collector pausing the broker. `unsafe` code is confined to a few operating-system calls: file locks, disk space, local time and the client's terminal.
+- **Less CPU and memory for the same work.** At the same message rate it takes less broker CPU a message than Artemis in 12 of the 13 benchmark scenarios, and 40 to 57% less with persistent and large messages. It starts in 36 MiB rather than 209, and holds a twentieth to a fifth of Artemis's memory on OpenWire, STOMP and MQTT.
+- **Small enough for the edge.** A small footprint and a fast start let it run on edge gateways, small devices and constrained networks where a JVM broker does not fit.
+- **Savings in the cloud.** Less CPU and memory a message means smaller instances, more brokers a node and lower bills for the same traffic.
 
 ## Building
 
