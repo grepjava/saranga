@@ -25,53 +25,48 @@ Saranga against Apache Artemis 2.57.0, on the same machine and in the same scena
 
 ## Results
 
-Run on 2026-10-17. Core, AMQP, large messages, `many-queues` and OpenWire ran at Saranga commit `9333701`. STOMP and MQTT ran at `0b49448`, which changes only those two protocols, after the first run's STOMP scenarios failed against Artemis.
-- **The STOMP failure:** the bench client's consumer sent nothing, so Artemis closed it at its 60 s TTL. The client now sends heart-beats.
-- **The MQTT rerun:** Artemis's JVM aborted (SIGABRT) during the second run's `mqtt-persistent` throughput run, so that scenario ran a third time. Its figures match the first run's (Artemis 43,548 msg/s at 2,293 MiB peak, Saranga 76,957 at 110 MiB).
+Run on 2026-10-17 at Saranga commit `bc9efdd`, every scenario in one run, with no failures.
 
 The machine was a dedicated Linux box (kernel 7.0) with an i5-8250U: four cores, eight threads. The broker had CPUs 0, 1, 4 and 5 (two cores and their hyperthreads), and the client the rest. It had 3.3 GiB of memory and ext4 on a SATA SSD. Both brokers and the clients ran on OpenJDK 25.0.4.1.
 
 | Startup | Artemis | Saranga |
 |---|---|---|
-| Time to the acceptor (median of 5) | 2,670 ms | 169 ms |
-| Resident memory when started | 207 MiB | 36 MiB |
+| Time to the acceptor (median of 5) | 2,717 ms | 145 ms |
+| Resident memory when started | 209 MiB | 36 MiB |
 
 | Scenario | Artemis msg/s | Saranga msg/s | Saranga/Artemis | Latency at msg/s | Artemis p50 / p99 | Saranga p50 / p99 | Artemis CPU a message | Saranga CPU a message | Artemis peak RSS | Saranga peak RSS |
 |---|---|---|---|---|---|---|---|---|---|---|
-| core | 72,064 | 71,061 | 0.99 | 35,530 | 141 us / 631 us | 173 us / 427 us | 65 us | 66 us | 578 MiB | 813 MiB |
-| core-persistent | 62,247 | 67,705 | 1.09 | 31,123 | 4.1 ms / 13.4 ms | 1.2 ms / 13.6 ms | 79 us | 53 us | 634 MiB | 135 MiB |
-| amqp | 30,223 | 31,354 | 1.04 | 15,111 | 134 us / 423 us | 140 us / 289 us | 84 us | 78 us | 2,213 MiB | 1,579 MiB |
-| amqp-persistent | 26,245 | 28,748 | 1.10 | 13,122 | 3.6 ms / 18.7 ms | 1.6 ms / 36.9 ms | 115 us | 70 us | 574 MiB | 1,394 MiB |
-| core-large | 58 | 78 | 1.34 | 29 | 23.2 ms / 41.5 ms | 18.0 ms / 30.1 ms | 20.1 ms | 10.4 ms | 579 MiB | 79 MiB |
-| amqp-large | 96 | 105 | 1.09 | 48 | 22.9 ms / 38.9 ms | 20.1 ms / 33.5 ms | 16.2 ms | 9.2 ms | 810 MiB | 199 MiB |
-| many-queues | 9,995 | 9,999 | 1.00 | 10,000 | 3.2 ms / 7.3 ms | 1.1 ms / 2.5 ms | 191 us | 152 us | 603 MiB | 133 MiB |
-| openwire | 48,811 | 48,040 | 0.98 | 24,020 | 181 us / 1.5 ms | 274 us / 2.9 ms | 119 us | 91 us | 638 MiB | 62 MiB |
-| openwire-persistent | 284 | 642 | 2.26 | 142 | 4.5 ms / 6.7 ms | 2.5 ms / 2.9 ms | 3.6 ms | 1.9 ms | 561 MiB | 45 MiB |
-| stomp | 91,408 | 77,015 | 0.84 | 38,507 | 75 us / 501 us | 130 us / 1.3 ms | 42 us | 57 us | 747 MiB | 57 MiB |
-| stomp-persistent | 68,477 | 63,507 | 0.93 | 31,753 | 4.0 ms / 12.8 ms | 1.3 ms / 12.4 ms | 67 us | 51 us | 636 MiB | 115 MiB |
-| mqtt | 93,674 | 103,608 | 1.11 | 46,837 | 86 us / 694 us | 141 us / 507 us | 42 us | 37 us | 591 MiB | 51 MiB |
-| mqtt-persistent | 44,478 | 77,255 | 1.74 | 22,239 | 2.9 ms / 26.0 ms | 860 us / 9.8 ms | 113 us | 53 us | 2,314 MiB | 106 MiB |
+| core | 74,878 | 75,891 | 1.01 | 37,439 | 139 us / 667 us | 156 us / 343 us | 64 us | 59 us | 601 MiB | 881 MiB |
+| core-persistent | 64,674 | 72,621 | 1.12 | 32,337 | 4.1 ms / 15.0 ms | 1.2 ms / 9.1 ms | 77 us | 43 us | 576 MiB | 288 MiB |
+| amqp | 30,961 | 33,155 | 1.07 | 15,480 | 129 us / 329 us | 133 us / 281 us | 81 us | 76 us | 2,238 MiB | 1,577 MiB |
+| amqp-persistent | 27,307 | 31,645 | 1.16 | 13,653 | 3.6 ms / 41.2 ms | 1.6 ms / 36.6 ms | 111 us | 64 us | 591 MiB | 1,116 MiB |
+| core-large | 61 | 78 | 1.28 | 30 | 22.9 ms / 41.2 ms | 17.8 ms / 30.3 ms | 19.4 ms | 10.5 ms | 576 MiB | 81 MiB |
+| amqp-large | 95 | 104 | 1.09 | 47 | 22.1 ms / 40.2 ms | 20.2 ms / 32.8 ms | 16.2 ms | 9.3 ms | 809 MiB | 197 MiB |
+| many-queues | 9,999 | 9,999 | 1.00 | 10,000 | 3.2 ms / 7.8 ms | 1.1 ms / 4.2 ms | 188 us | 144 us | 584 MiB | 118 MiB |
+| openwire | 49,575 | 52,375 | 1.06 | 24,787 | 182 us / 1.6 ms | 245 us / 2.6 ms | 117 us | 92 us | 719 MiB | 65 MiB |
+| openwire-persistent | 283 | 634 | 2.24 | 141 | 4.5 ms / 6.7 ms | 2.5 ms / 2.8 ms | 3.6 ms | 1.9 ms | 586 MiB | 45 MiB |
+| stomp | 87,287 | 99,570 | 1.14 | 43,643 | 80 us / 738 us | 124 us / 1.0 ms | 43 us | 38 us | 619 MiB | 50 MiB |
+| stomp-persistent | 70,023 | 78,592 | 1.12 | 35,011 | 4.2 ms / 13.2 ms | 1.3 ms / 11.7 ms | 65 us | 39 us | 651 MiB | 118 MiB |
+| mqtt | 91,683 | 121,195 | 1.32 | 45,841 | 83 us / 631 us | 116 us / 289 us | 40 us | 39 us | 583 MiB | 51 MiB |
+| mqtt-persistent | 43,183 | 90,555 | 2.10 | 21,591 | 2.9 ms / 18.4 ms | 855 us / 6.6 ms | 115 us | 49 us | 2,340 MiB | 105 MiB |
 
-In `mqtt-persistent`'s latency run, neither broker quite kept the rate: Artemis received 21,763 msg/s and Saranga 21,930.
+In `mqtt-persistent`'s latency run, neither broker quite kept the rate: Artemis received 21,140 msg/s and Saranga 21,334.
 
 ## Reading them
 
 - **Throughput.**
-  - It is higher for Saranga in 8 of the 12 unbounded scenarios: by 4 to 10% on AMQP and persistent Core, 9 to 34% with large messages, 11% on MQTT, 74% on persistent MQTT and 2.3 times on persistent OpenWire. Both keep up with 100 queues at 10,000 messages a second.
-  - On Core and OpenWire without persistence it is level, within this machine's noise.
-  - On STOMP it is lower: 84% of Artemis's without persistence and 93% with it.
-- **Startup** is about 16 times faster, at a sixth of the memory.
+  - It is higher for Saranga in 11 of the 12 unbounded scenarios and level on Core (1.01): 6 to 16% higher on AMQP, OpenWire, STOMP and persistent Core, 9 to 28% with large messages, 32% on MQTT, and 2.1 and 2.2 times on persistent MQTT and OpenWire. Both keep up with 100 queues at 10,000 messages a second.
+  - On non-persistent Core the difference is within this machine's noise.
+- **Startup** is about 19 times faster, at a sixth of the memory.
 - **CPU a message at the same rate.**
-  - It is lower for Saranga in 11 of the 13 scenarios: by a fifth to a half with persistent and large messages, a quarter on OpenWire, and 7 to 12% on non-persistent AMQP and MQTT.
-  - On non-persistent Core it is the same.
-  - On non-persistent STOMP it is a third higher: 57 against 42 microseconds.
+  - It is lower for Saranga in 12 of the 13 scenarios: by 40 to 57% with persistent and large messages, a quarter with 100 queues, a fifth on OpenWire, an eighth on STOMP, and 6 to 8% on non-persistent Core and AMQP.
+  - On non-persistent MQTT the two are level (39 against 40 microseconds).
 - **Latency at the same rate.**
-  - With persistent 1 KiB messages, p50 is a third to a half of Artemis's, and a little over half on persistent OpenWire. With large messages it is 10 to 20% lower.
-  - Without persistence, p50 is 6 to 93 microseconds higher.
-  - p99 is the same or lower in most scenarios. It is higher on non-persistent OpenWire and STOMP, and on `amqp-persistent`, a figure that moves a lot from run to run: runs on the same day have given 8.8 to 41 ms.
-- **Peak memory** is a twentieth to a fifth of Artemis's on OpenWire, STOMP and MQTT, and a seventh to a quarter with persistent Core, large messages and many queues. It is higher where the producer outran the consumer during the run, so that a backlog of messages was held in memory:
-  - non-persistent Core, for both brokers;
-  - non-persistent AMQP, for both brokers;
+  - With persistent 1 KiB messages, p50 is 30 to 45% of Artemis's, and a little over half on persistent OpenWire. With large messages it is 9 to 22% lower.
+  - Without persistence, p50 is 4 to 63 microseconds higher.
+  - p99 is lower in every scenario but non-persistent OpenWire and STOMP. `amqp-persistent`'s p99 moves a lot from run to run: runs on the same day have given 8.8 to 41 ms.
+- **Peak memory** is a twenty-second to a fifth of Artemis's on OpenWire, STOMP and MQTT, and a seventh to a half with persistent Core, large messages and many queues. Where the producer outran the consumer during the run, a backlog of messages was held in memory, and the peaks are high:
+  - non-persistent Core and AMQP, for both brokers (Saranga's higher on Core, lower on AMQP);
   - Saranga's persistent AMQP.
 
   Neither broker pages these backlogs: both page only beyond `global-max-size`, which is 1 GiB for each here (half of Artemis's 2 GiB heap, and Saranga's default).
