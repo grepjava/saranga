@@ -2431,6 +2431,7 @@ impl Connection {
                     let sent = session.session.acknowledge_then(
                         m.core_id,
                         d.core,
+                        true,
                         move |pending, result| {
                             let acked = Event::Acked {
                                 session: session_id,

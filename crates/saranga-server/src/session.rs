@@ -1701,9 +1701,9 @@ impl ServerSession {
         self.acknowledged_in(pending, tx, result)
     }
 
-    /// [`acknowledge_in`](Self::acknowledge_in) of one message outside a
-    /// transaction, without waiting for the queue: `then` has its answer,
-    /// on the queue's task, and gives it to
+    /// [`acknowledge_in`](Self::acknowledge_in) outside a transaction,
+    /// without waiting for the queue: `then` has its answer, on the
+    /// queue's task, and gives it to
     /// [`acknowledged`](Self::acknowledged). A connection whose client
     /// acknowledges message after message so has them all on their way at
     /// once, rather than each waiting for the one before.
@@ -1711,6 +1711,7 @@ impl ServerSession {
         &mut self,
         consumer_id: i64,
         message_id: i64,
+        individual: bool,
         then: impl FnOnce(AckPending, AckResult) + Send + 'static,
     ) -> Result<()> {
         let Some(c) = self.consumers.get(&consumer_id) else {
@@ -1722,7 +1723,7 @@ impl ServerSession {
             queue: c.queue.clone(),
         };
         c.queue
-            .ack_then(c.id, message_id, true, false, move |result| {
+            .ack_then(c.id, message_id, individual, false, move |result| {
                 then(pending, result)
             });
         Ok(())

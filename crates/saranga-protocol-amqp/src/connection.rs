@@ -4380,8 +4380,11 @@ impl Conn {
                         // queue's answer comes as an event, and the next
                         // disposition need not wait for it.
                         let events = self.events.clone();
-                        s.server
-                            .acknowledge_then(consumer, message_id, move |pending, result| {
+                        s.server.acknowledge_then(
+                            consumer,
+                            message_id,
+                            true,
+                            move |pending, result| {
                                 let acked = Event::Acked {
                                     channel,
                                     pending,
@@ -4395,7 +4398,8 @@ impl Conn {
                                 {
                                     pending.finish_alone(result);
                                 }
-                            })
+                            },
+                        )
                     } else {
                         // The broker settles it once the acknowledgement is
                         // stored, so it waits for the queue.

@@ -1819,17 +1819,18 @@ impl Conn {
         match event {
             Event::Ack { consumer, message } => {
                 let events = self.events.clone();
-                let sent =
-                    core.session
-                        .acknowledge_then(consumer, message, move |pending, result| {
-                            if let Err(mpsc::error::SendError(Event::AckedAlone {
-                                pending,
-                                result,
-                            })) = events.send(Event::AckedAlone { pending, result })
-                            {
-                                pending.finish_alone(result);
-                            }
-                        });
+                let sent = core.session.acknowledge_then(
+                    consumer,
+                    message,
+                    true,
+                    move |pending, result| {
+                        if let Err(mpsc::error::SendError(Event::AckedAlone { pending, result })) =
+                            events.send(Event::AckedAlone { pending, result })
+                        {
+                            pending.finish_alone(result);
+                        }
+                    },
+                );
                 if let Err(e) = sent {
                     tracing::debug!("{}", e.message);
                 }

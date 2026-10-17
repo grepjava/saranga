@@ -501,6 +501,9 @@ pub(crate) struct Inner {
     pub(crate) data_files: VecDeque<FileKey>,
     free_files: VecDeque<FileKey>,
     opened_files: VecDeque<FileKey>,
+    /// Opened files still being made, by the thread making each
+    /// (`pushOpenedFile` on the files executor).
+    creating: HashMap<FileKey, std::thread::JoinHandle<Result<()>>>,
     current: Option<FileKey>,
     position: u64,
     next_file_id: i64,
@@ -568,6 +571,7 @@ impl Journal {
                 data_files: VecDeque::new(),
                 free_files: VecDeque::new(),
                 opened_files: VecDeque::new(),
+                creating: HashMap::new(),
                 current: None,
                 position: 0,
                 next_file_id: 0,
@@ -1002,6 +1006,8 @@ impl Journal {
     pub fn stop(&self) -> Result<()> {
         let r = self.writer.wait_idle();
         let mut inner = self.lock();
+        // A file still being made is finished, not left as a `.tmp`.
+        let r = r.and(inner.finish_all_creating());
         let datasync = inner.cfg.datasync;
         for f in inner.books.files.values_mut() {
             if let Some(h) = f.handle.take()
@@ -1274,6 +1280,7 @@ impl Inner {
             replaceable,
             ..Books::default()
         };
+        let _ = self.finish_all_creating();
         self.data_files.clear();
         self.free_files.clear();
         self.opened_files.clear();
@@ -1541,6 +1548,19 @@ impl Inner {
     /// `createFile`: a new file named after a new file ID, written as
     /// `<name>.tmp`, filled with zeros, given its header and renamed.
     pub(crate) fn create_file(&mut self, keep_open: bool, cmp: Option<()>) -> Result<FileKey> {
+        let (id, name, file) = self.new_file(cmp);
+        file.write()?;
+        let k = self
+            .books
+            .insert_file(JFile::new(id, format::FORMAT_VERSION, name));
+        if keep_open {
+            self.open_handle(k)?;
+        }
+        Ok(k)
+    }
+
+    /// The next file ID, the file's name, and what makes it.
+    fn new_file(&mut self, cmp: Option<()>) -> (i64, String, NewFile) {
         self.next_file_id += 1;
         let id = self.next_file_id;
         let mut name = format!(
@@ -1550,29 +1570,38 @@ impl Inner {
         if cmp.is_some() {
             name.push_str(".cmp");
         }
-        let tmp = self.path(&format!("{name}.tmp"));
-        {
-            let f = fio::open(&tmp, true).map_err(JournalError::io)?;
-            fill(&f, &tmp, self.cfg.file_size)?;
-            fio::write_at(
-                &f,
-                &tmp,
-                &FileHeader::new(self.cfg.user_version, id).encode(),
-                0,
-            )
-            .map_err(JournalError::io)?;
-            if self.cfg.datasync {
-                fio::sync_data(&f, &tmp).map_err(JournalError::io)?;
+        let file = NewFile {
+            tmp: self.path(&format!("{name}.tmp")),
+            path: self.path(&name),
+            size: self.cfg.file_size,
+            header: FileHeader::new(self.cfg.user_version, id).encode(),
+            datasync: self.cfg.datasync,
+        };
+        (id, name, file)
+    }
+
+    /// Waits for an opened file still being made.
+    fn finish_creating(&mut self, k: FileKey) -> Result<()> {
+        match self.creating.remove(&k) {
+            Some(h) => h.join().unwrap_or_else(|_| {
+                Err(JournalError::IllegalState(
+                    "making a journal file panicked".into(),
+                ))
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Waits for every opened file still being made.
+    pub(crate) fn finish_all_creating(&mut self) -> Result<()> {
+        let keys: Vec<FileKey> = self.creating.keys().copied().collect();
+        let mut first = Ok(());
+        for k in keys {
+            if let Err(e) = self.finish_creating(k) {
+                first = first.and(Err(e));
             }
         }
-        fio::rename(&tmp, &self.path(&name)).map_err(JournalError::io)?;
-        let k = self
-            .books
-            .insert_file(JFile::new(id, format::FORMAT_VERSION, name));
-        if keep_open {
-            self.open_handle(k)?;
-        }
-        Ok(k)
+        first
     }
 
     /// `takeFile`: a free file if there is one, a new file otherwise.
@@ -1586,9 +1615,26 @@ impl Inner {
         }
     }
 
-    /// `pushOpenedFile`: keeps the next file ready.
+    /// `pushOpenedFile`: keeps the next file ready. A new one is made on a
+    /// thread of its own, as Artemis's files executor makes it, while the
+    /// current file fills: made here, it held every append behind its
+    /// zeros and sync.
     fn push_opened_file(&mut self) -> Result<()> {
-        let k = self.take_file()?;
+        let k = match self.free_files.pop_front() {
+            Some(k) => {
+                self.open_handle(k)?;
+                k
+            }
+            None => {
+                let (id, name, file) = self.new_file(None);
+                let k = self
+                    .books
+                    .insert_file(JFile::new(id, format::FORMAT_VERSION, name));
+                self.creating
+                    .insert(k, std::thread::spawn(move || file.write()));
+                k
+            }
+        };
         self.opened_files.push_back(k);
         Ok(())
     }
@@ -1607,6 +1653,7 @@ impl Inner {
                 self.opened_files.pop_front().expect("pushed")
             }
         };
+        self.finish_creating(k)?;
         self.open_handle(k)?;
         Ok(k)
     }
@@ -1877,6 +1924,30 @@ fn holder<'a>(
 
 /// `NIOSequentialFile.fill`: writes zeros so later appends never extend
 /// the file.
+/// A new file as `createFile` makes it: `<name>.tmp`, filled with zeros,
+/// given its header, synced and renamed.
+struct NewFile {
+    tmp: PathBuf,
+    path: PathBuf,
+    size: usize,
+    header: [u8; 16],
+    datasync: bool,
+}
+
+impl NewFile {
+    fn write(&self) -> Result<()> {
+        {
+            let f = fio::open(&self.tmp, true).map_err(JournalError::io)?;
+            fill(&f, &self.tmp, self.size)?;
+            fio::write_at(&f, &self.tmp, &self.header, 0).map_err(JournalError::io)?;
+            if self.datasync {
+                fio::sync_data(&f, &self.tmp).map_err(JournalError::io)?;
+            }
+        }
+        fio::rename(&self.tmp, &self.path).map_err(JournalError::io)
+    }
+}
+
 pub(crate) fn fill(f: &File, path: &Path, size: usize) -> Result<()> {
     let page = vec![0u8; 64 * 1024];
     let mut off = 0usize;

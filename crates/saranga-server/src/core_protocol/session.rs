@@ -29,7 +29,8 @@ use tokio::sync::mpsc;
 use super::{ConnShared, CoreDeliverySink};
 use crate::large::LargeWriter;
 use crate::postoffice::{BindingQueryResult, QueueQueryResult, QueueSpec, RoutingTypes};
-use crate::session::{Completion, ServerSession, SessionOptions};
+use crate::queue::AckResult;
+use crate::session::{AckPending, Completion, ServerSession, SessionOptions};
 use crate::transaction::{TxError, xa_code};
 use crate::{Broker, BrokerError, Result, RoutingType};
 
@@ -163,7 +164,18 @@ pub(crate) struct CoreSession {
     /// headers, and its body so far.
     large: Option<(CoreMessage, LargeWriter)>,
     completer: mpsc::UnboundedSender<Done>,
+    /// Whether the client confirms commands (a confirmation window).
+    confirms: bool,
+    /// Where the queues answer the acknowledgements sent without waiting
+    /// ([`ack_now`](Self::ack_now)), until [`run`](Self::run) takes it.
+    acked: mpsc::UnboundedSender<Acked>,
+    acked_rx: Option<mpsc::UnboundedReceiver<Acked>>,
+    /// How many of those are not yet answered.
+    in_flight: usize,
 }
+
+/// An acknowledgement the session did not wait for, as its queue answered.
+type Acked = (Request, AckPending, AckResult);
 
 /// How a request packet wants its response (`Packet.getCorrelationID`,
 /// `isResponseAsync`).
@@ -209,6 +221,8 @@ impl CoreSession {
         authenticated: Authenticated,
     ) -> Self {
         let (completer_tx, completer_rx) = mpsc::unbounded_channel();
+        let (acked, acked_rx) = mpsc::unbounded_channel();
+        let confirms = request.confirmation_window_size != -1;
         tokio::spawn(completer(
             conn.clone(),
             request.channel_id,
@@ -246,6 +260,10 @@ impl CoreSession {
             producers: HashMap::new(),
             large: None,
             completer: completer_tx,
+            confirms,
+            acked,
+            acked_rx: Some(acked_rx),
+            in_flight: 0,
         }
     }
 
@@ -261,9 +279,29 @@ impl CoreSession {
         mut rx: mpsc::UnboundedReceiver<SessionInput>,
         backlog: Arc<std::sync::atomic::AtomicUsize>,
     ) {
-        while let Some(input) = rx.recv().await {
+        let mut acked = self.acked_rx.take().expect("run once");
+        loop {
+            let input = tokio::select! {
+                biased;
+                Some(a) = acked.recv(), if self.in_flight > 0 => {
+                    self.acked(a);
+                    continue;
+                }
+                input = rx.recv() => input,
+            };
+            let Some(input) = input else {
+                break;
+            };
             match input {
                 SessionInput::Packet(packet, size) => {
+                    // Only credits and more such acknowledgements go ahead
+                    // of the acknowledgements on their way: anything else
+                    // finds them done, as it would have in turn.
+                    if !self.ack_now(&packet)
+                        && !matches!(*packet, Packet::SessionConsumerFlowCreditMessage(_))
+                    {
+                        self.settle(&mut acked).await;
+                    }
                     self.handle(*packet, size).await;
                     backlog.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
                     if self.session.is_closed() {
@@ -271,18 +309,87 @@ impl CoreSession {
                     }
                 }
                 SessionInput::ConnectionFailed => {
+                    self.settle(&mut acked).await;
                     self.close(true).await;
                     break;
                 }
                 SessionInput::Close(_force) => {
                     // ServerSessionImpl.close(failed = true, force).
+                    self.settle(&mut acked).await;
                     self.close(true).await;
                     break;
                 }
             }
         }
+        self.settle(&mut acked).await;
         if !self.session.is_closed() {
             self.close(true).await;
+        }
+    }
+
+    /// Whether `packet` is an acknowledgement sent to its queue without
+    /// waiting for the answer: one outside a transaction that asks for no
+    /// response or confirmation. Waiting for each held the consumer's
+    /// credits, which follow it, behind everything its queue had to do
+    /// first, and so the consumer behind its producer.
+    fn ack_now(&self, packet: &Packet) -> bool {
+        let (consumer_id, requires_response) = match packet {
+            Packet::SessionAcknowledgeMessage(p) => (p.consumer_id, p.requires_response),
+            Packet::SessionIndividualAcknowledgeMessage(p) => (p.consumer_id, p.requires_response),
+            _ => return false,
+        };
+        !requires_response
+            && !self.confirms
+            && self.session.auto_commit_acks()
+            && self.session.has_consumer(consumer_id)
+    }
+
+    /// Sends an [`ack_now`](Self::ack_now) acknowledgement on its way.
+    fn ack_in_flight(
+        &mut self,
+        request: Request,
+        consumer_id: i64,
+        message_id: i64,
+        individual: bool,
+    ) {
+        let acked = self.acked.clone();
+        let sent = self.session.acknowledge_then(
+            consumer_id,
+            message_id,
+            individual,
+            move |pending, result| {
+                if let Err(mpsc::error::SendError((_, pending, result))) =
+                    acked.send((request, pending, result))
+                {
+                    pending.finish_alone(result);
+                }
+            },
+        );
+        match sent {
+            Ok(()) => self.in_flight += 1,
+            Err(e) => {
+                let response = self.outcome(request, false, Err(e));
+                self.respond(request, response, false);
+            }
+        }
+    }
+
+    /// The rest of an acknowledgement sent on its way, as its queue
+    /// answered.
+    fn acked(&mut self, (request, pending, result): Acked) {
+        self.in_flight -= 1;
+        let result = self.session.acknowledged(pending, result).map(|_| None);
+        let response = self.outcome(request, false, result);
+        self.respond(request, response, false);
+    }
+
+    /// Waits for the queues to answer every acknowledgement on its way.
+    async fn settle(&mut self, acked: &mut mpsc::UnboundedReceiver<Acked>) {
+        while self.in_flight > 0 {
+            match acked.recv().await {
+                Some(a) => self.acked(a),
+                None => break,
+            }
         }
     }
 
@@ -446,6 +553,18 @@ impl CoreSession {
 
     async fn handle(&mut self, packet: Packet, size: usize) {
         let request = Request::of(&packet, size);
+        if self.ack_now(&packet) {
+            match packet {
+                Packet::SessionAcknowledgeMessage(p) => {
+                    self.ack_in_flight(request, p.consumer_id, p.message_id, false)
+                }
+                Packet::SessionIndividualAcknowledgeMessage(p) => {
+                    self.ack_in_flight(request, p.consumer_id, p.message_id, true)
+                }
+                _ => unreachable!("ack_now is for acknowledgements"),
+            }
+            return;
+        }
         let (requires_response, result, flush) = match packet {
             Packet::SessionSendMessage(p) => (
                 p.requires_response,
