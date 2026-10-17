@@ -18,7 +18,13 @@
 # Scenarios (default all): core, core-persistent, amqp, amqp-persistent,
 # core-large, amqp-large (1 MiB messages, persistent) and many-queues (Core,
 # persistent, NUM_QUEUES queues, a producer and a consumer on each, run at
-# MANY_RATE messages a second in all, default 10000, rather than unbounded).
+# MANY_RATE messages a second in all, default 10000, rather than unbounded),
+# then openwire, openwire-persistent, stomp, stomp-persistent, mqtt (QoS 0)
+# and mqtt-persistent (QoS 1). The perf client speaks only Core and AMQP:
+# for the last six both brokers get scripts/bench/Load.java, a producer and a
+# consumer with 1 KiB messages and at most LOAD_INFLIGHT (default 1000) sent
+# and not yet received, over the ActiveMQ 5 JMS client for OpenWire and
+# plain STOMP 1.2 and MQTT 3.1.1 over a socket.
 #
 # DURATION (default 60) and WARMUP (default 15) are each run's seconds;
 # STARTS (default 5); NUM_QUEUES (default 100); MAX_PENDING (default 100),
@@ -37,11 +43,12 @@ TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
 WORK="${WORK:-$ROOT/target/bench}"
 DURATION="${DURATION:-60}" WARMUP="${WARMUP:-15}" STARTS="${STARTS:-5}"
 NUM_QUEUES="${NUM_QUEUES:-100}" MANY_RATE="${MANY_RATE:-10000}" MAX_PENDING="${MAX_PENDING:-100}"
+LOAD_INFLIGHT="${LOAD_INFLIGHT:-1000}"
 CPUS="$(nproc)"
 BROKER_CPUS="${BROKER_CPUS:-0-$((CPUS / 2 - 1))}"
 CLIENT_CPUS="${CLIENT_CPUS:-$((CPUS / 2))-$((CPUS - 1))}"
 PORT=61616
-ALL="core core-persistent amqp amqp-persistent core-large amqp-large many-queues"
+ALL="core core-persistent amqp amqp-persistent core-large amqp-large many-queues openwire openwire-persistent stomp stomp-persistent mqtt mqtt-persistent"
 SCENARIOS="${*:-$ALL}"
 for s in $SCENARIOS; do
   [[ " $ALL " == *" $s "* ]] || { echo "unknown scenario: $s" >&2; exit 2; }
@@ -120,6 +127,9 @@ record() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$RESULTS"; }
 # Runs the perf client: scenario, broker, run name, then its options.
 perf() {
   local scenario="$1" kind="$2" run="$3"; shift 3
+  case "$scenario" in
+    openwire* | stomp* | mqtt*) load "$scenario" "$kind" "$run" "$@"; return ;;
+  esac
   local protocol=core url="tcp://localhost:$PORT" size=1024 persistent=() dests=() spread=()
   case "$scenario" in
     amqp*) protocol=amqp url="amqp://localhost:$PORT" ;;
@@ -145,6 +155,32 @@ perf() {
   echo "$((c1 - c0)) $((t1 - t0))" > "$out.cpu"
 }
 cpu_ticks() { awk '{ print $14 + $15 }' "/proc/$1/stat" 2>/dev/null || echo 0; }
+
+# Runs Load.java as perf runs the perf client (its options: --rate N or
+# none), leaving its RESULT line in the run's .result file.
+load() {
+  local scenario="$1" kind="$2" run="$3" rate=0 proto persistent=false; shift 3
+  [[ "${1:-}" == --rate ]] && rate="$2"
+  case "$scenario" in
+    openwire*) proto=openwire ;;
+    stomp*) proto=stomp ;;
+    mqtt-persistent) proto=mqtt1 ;;
+    mqtt) proto=mqtt0 ;;
+  esac
+  [[ "$scenario" == *-persistent ]] && persistent=true
+  local out="$WORK/runs/$scenario-$kind-$run"
+  taskset -c "$CLIENT_CPUS" java -Dinflight="$LOAD_INFLIGHT" -Dpersistent="$persistent" \
+    -cp "$WORK/brokers/dist/lib/*" "$ROOT/scripts/bench/Load.java" \
+    "$proto" 127.0.0.1 "$PORT" "$((WARMUP + DURATION))" "$WARMUP" "$rate" > "$out.out" 2>&1 &
+  local client=$!
+  sleep $((WARMUP + 3))
+  local t0 c0 t1 c1
+  t0="$(now_ms)" c0="$(cpu_ticks "$PID")"
+  wait "$client"
+  t1="$(now_ms)" c1="$(cpu_ticks "$PID")"
+  echo "$((c1 - c0)) $((t1 - t0))" > "$out.cpu"
+  grep '^RESULT ' "$out.out" | cut -d' ' -f2- > "$out.result"
+}
 # The broker's CPU in a run, from its .cpu file and the messages received
 # meanwhile: microseconds of CPU a message, and the cores it kept busy.
 cpu_cost() {
@@ -162,6 +198,8 @@ cpu_cost() {
 # transfer p50 and p99 in microseconds, and the messages received in the
 # broker CPU window (from three seconds after the warmup to the end).
 report() {
+  # Load.java's runs have it already.
+  if [[ -s "${1%.json}.result" ]]; then cat "${1%.json}.result"; return; fi
   perl -MJSON::PP -e '
     local $/; open my $f, "<", $ARGV[0] or exit 1; my $s = decode_json(<$f>);
     my @i = grep { $_->{sampleType} eq "interval" && !$_->{warmup} } @$s;
