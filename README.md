@@ -12,7 +12,7 @@ The name: Śārṅga, the celestial bow of the Sustainer, keeper of the world’
 
 ## Goals
 
-- **Compatibility with Artemis.** The wire protocols, `broker.xml`, the journal, paging and large-message formats, management and the command line all behave as Artemis 2.57.0's do, so that its clients, tools and data files work against Saranga unchanged.
+- **Compatibility with Artemis.** The wire protocols, `broker.xml`, the journal, paging and large-message formats, management and the command line all behave as Artemis 2.57.0's do, so that its clients, tools and data files work against Saranga unchanged. The intent is to stay fully compatible as Artemis releases new versions, following each one.
 - **High availability and clustering alongside Artemis.** A Saranga broker can be an Artemis broker's backup, with a shared store, replication or a pluggable quorum, or its primary, and the two fail over and fail back between each other. Mixed clusters of Artemis and Saranga nodes load-balance, redistribute and group messages, and federation, bridges, broker connections and mirroring work in both directions. Nodes can therefore be moved from one broker to the other one at a time, with no downtime.
 - **Native speed.** It compiles to a single native binary, with no JVM to start, warm up or tune. It starts in about 150 ms against Artemis's 2.7 s, and its throughput is the same or higher in every benchmark scenario.
 - **Memory safety without a garbage collector.** It is written in Rust, so the compiler rules out use-after-free, data races and buffer overruns, with no collector pausing the broker. `unsafe` code is confined to a few operating-system calls: file locks, disk space, local time and the client's terminal.
