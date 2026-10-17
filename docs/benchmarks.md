@@ -27,7 +27,7 @@ Saranga against Apache Artemis 2.57.0, on the same machine and in the same scena
 
 Run on 2026-10-17 at Saranga commit `bc9efdd`, every scenario in one run, with no failures.
 
-The machine was a dedicated Linux box (kernel 7.0) with an i5-8250U: four cores, eight threads. The broker had CPUs 0, 1, 4 and 5 (two cores and their hyperthreads), and the client the rest. It had 3.3 GiB of memory and ext4 on a SATA SSD. Both brokers and the clients ran on OpenJDK 25.0.4.1.
+The machine was a dedicated Linux box (kernel 7.0) with an i5-8250U: four cores, eight threads. The broker had CPUs 0, 1, 4 and 5 (two cores and their hyperthreads), and the client the rest. It had 3.3 GiB of memory and ext4 on a SATA SSD. Artemis and the clients ran on OpenJDK 25.0.4.1.
 
 | Startup | Artemis | Saranga |
 |---|---|---|

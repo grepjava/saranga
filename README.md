@@ -34,7 +34,20 @@ The binary is `target/release/saranga`. `saranga create <dir>` makes an instance
 
 ## Performance against Artemis
 
-Both brokers ran on the same machine, with the same clients, in instances made by their own `create`, each on an empty NIO journal with `journal-datasync` on. The machine was an i5-8250U: the broker had two cores and their hyperthreads, and the client the other two. Messages are 1 KiB except in the large-message rows, which are 1 MiB.
+Both brokers ran on the same machine, with the same clients, in instances made by their own `create`, each on an empty NIO journal with `journal-datasync` on. Messages are 1 KiB except in the large-message rows, which are 1 MiB.
+
+The benchmark machine:
+
+| | |
+|---|---|
+| CPU | Intel Core i5-8250U, 4 cores, 8 threads |
+| CPUs for the broker | 0, 1, 4 and 5 (two cores and their hyperthreads) |
+| CPUs for the client | 2, 3, 6 and 7 |
+| Memory | 3.3 GiB |
+| Storage | SATA SSD, ext4 |
+| Operating system | Linux, kernel 7.0, dedicated to the run |
+| Java (Artemis and the clients) | OpenJDK 25.0.4.1, Artemis with a 2 GiB heap |
+| Versions | Artemis 2.57.0, Saranga at `bc9efdd` (2026-10-17) |
 
 | | Artemis | Saranga |
 |---|---|---|
