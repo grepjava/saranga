@@ -1128,7 +1128,11 @@ impl PagingStore {
 
     /// `isFull`: the address or the broker is at its limit.
     pub fn is_full(&self) -> bool {
-        let s = self.settings();
+        self.is_full_with(&self.settings())
+    }
+
+    /// [`is_full`](Self::is_full) under settings already read.
+    fn is_full_with(&self, s: &AddressSettings) -> bool {
         let own = (s.max_size_bytes >= 0 && self.size.load(Ordering::SeqCst) >= s.max_size_bytes)
             || (s.max_size_messages >= 0
                 && self.messages.load(Ordering::SeqCst) >= s.max_size_messages);
@@ -1158,14 +1162,15 @@ impl PagingStore {
         if let Some(m) = self.manager.upgrade() {
             m.add_global(size, messages);
         }
-        match self.settings().address_full_policy {
+        let s = self.settings();
+        match s.address_full_policy {
             AddressFullPolicy::Block | AddressFullPolicy::Fail => {
                 if size < 0 || messages < 0 {
                     self.check_released_memory();
                 }
             }
             AddressFullPolicy::Page => {
-                if size > 0 && self.is_full() {
+                if size > 0 && self.is_full_with(&s) {
                     self.start_paging();
                 }
             }

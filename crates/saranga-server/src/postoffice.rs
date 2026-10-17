@@ -4,7 +4,7 @@
 //! `ServerSessionImpl` (`createQueue`, `checkAutoCreate`, the queries).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::error::{BrokerError, Result};
@@ -375,6 +375,8 @@ struct AddressEntry {
     unrouted: AtomicI64,
     /// `AddressInfo.isPaused`: none of its queues deliver.
     paused: bool,
+    /// Whether its name has wildcards, once routing asked.
+    wild: std::sync::OnceLock<bool>,
     /// The `ADDRESS_STATUS_RECORD` of a persisted pause; -1 for none.
     pause_record: i64,
 }
@@ -392,6 +394,7 @@ impl AddressEntry {
             unrouted: AtomicI64::new(0),
             paused: false,
             pause_record: -1,
+            wild: std::sync::OnceLock::new(),
         }
     }
 }
@@ -452,6 +455,8 @@ pub struct PostOffice {
     /// `CopyOnWriteBindings.BindingIndex`: the next binding to try of each
     /// routing name of each address.
     positions: Mutex<HashMap<(Name, Name), usize>>,
+    /// Some position in `positions` is not 0.
+    balanced: AtomicBool,
     /// The broker's grouping handler, when it has one.
     grouping: std::sync::OnceLock<Arc<crate::grouping::GroupingHandler>>,
     /// The mirror sources installed.
@@ -487,6 +492,7 @@ impl PostOffice {
             listeners: RwLock::default(),
             plugins: Arc::default(),
             positions: Mutex::default(),
+            balanced: AtomicBool::new(false),
             grouping: std::sync::OnceLock::new(),
             mirrors: crate::mirror::Mirrors::default(),
         })
@@ -1075,6 +1081,10 @@ impl PostOffice {
 
     pub fn address_info(&self, name: &str) -> Option<AddressInfo> {
         self.read().addresses.get(name).map(|e| e.info.clone())
+    }
+
+    pub fn has_address(&self, name: &str) -> bool {
+        self.read().addresses.contains_key(name)
     }
 
     pub fn queue(&self, name: &str) -> Option<Queue> {
@@ -2016,7 +2026,7 @@ impl PostOffice {
         let (real, _) = split_fqqn(address);
         // checkAddress
         if auto_create
-            && self.address_info(real).is_none()
+            && !self.has_address(real)
             && self.check_auto_create(address, routing_type, creator)? == AutoCreate::NotFound
         {
             return Err(BrokerError::address_does_not_exist(real));
@@ -2518,7 +2528,8 @@ impl PostOffice {
         let mut entries: Vec<&AddressEntry> = state.addresses.get(real).into_iter().collect();
         if self.wildcard.routing_enabled && !self.wildcard.is_wild(real) {
             entries.extend(state.addresses.values().filter(|e| {
-                self.wildcard.is_wild(&e.info.name) && self.wildcard.matches(real, &e.info.name)
+                *e.wild.get_or_init(|| self.wildcard.is_wild(&e.info.name))
+                    && self.wildcard.matches(real, &e.info.name)
             }));
         }
         entries
@@ -2561,6 +2572,31 @@ impl PostOffice {
             return None;
         }
         let target: &crate::message::ServerMessage = &message.message;
+        let accepts = |q: &Queue| {
+            let c = q.config();
+            c.enabled && !(c.purge_on_no_consumers && q.consumer_count() == 0)
+        };
+        // A lone queue, with no divert, remote binding or grouping: it is
+        // its routing name's only binding, which getNextBinding always
+        // takes if it matches, its position staying 0. (Once a group of
+        // more than one has moved its position, the general way keeps it.)
+        if let [e] = entries.as_slice()
+            && let [q] = e.queues.as_slice()
+            && e.diverts.is_empty()
+            && remote.is_empty()
+            && self.grouping().is_none()
+            && !self.balanced.load(Ordering::Relaxed)
+        {
+            let mut routes = Routes::default();
+            if fqqn_queue.is_none_or(|n| &**q.name() == n)
+                && q.filter().is_none_or(|f| f.matches(target))
+                && accepts(q)
+                && routing_type.is_none_or(|t| t == q.config().routing_type)
+            {
+                routes.queues.push(q.clone());
+            }
+            return Some(routes);
+        }
         let divert_matches = |d: &Divert| d.filter.as_ref().is_none_or(|f| f.matches(target));
         // Exclusive diverts take the message from everything else.
         if fqqn_queue.is_none() {
@@ -2634,10 +2670,6 @@ impl PostOffice {
                     }) && r.filter().is_none_or(|f| f.matches(target))
                 }
             }
-        };
-        let accepts = |q: &Queue| {
-            let c = q.config();
-            c.enabled && !(c.purge_on_no_consumers && q.consumer_count() == 0)
         };
         // routeUsingStrictOrdering: with a grouping handler, a message of a
         // group goes where its group goes.
@@ -2733,6 +2765,9 @@ impl PostOffice {
             position = (low + 1) % count;
         }
         let i = chosen?;
+        if position != 0 {
+            self.balanced.store(true, Ordering::Relaxed);
+        }
         positions.insert(key.clone(), position);
         Some(i)
     }

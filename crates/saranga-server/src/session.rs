@@ -388,6 +388,18 @@ impl Completion {
         self.waits.push(wait);
     }
 
+    /// With no journal write to wait for, makes the queue updates now, as
+    /// `OperationContext.executeOnCompletion` runs a task at once when no
+    /// store is pending. What is left (the mirrors' waits) is still to be
+    /// waited for.
+    pub fn apply_if_written(&mut self) {
+        if self.waits.is_empty() {
+            for action in std::mem::take(&mut self.actions) {
+                action();
+            }
+        }
+    }
+
     /// Adds another request's writes and updates to these.
     pub fn merge(&mut self, other: Completion) {
         append(&mut self.waits, other.waits);
@@ -983,9 +995,7 @@ impl ServerSession {
         };
         // The encoded size, without copying the body: its length, the body,
         // then the headers and properties.
-        let mut w = saranga_buffer::Writer::new();
-        message.encode_headers_and_properties(&mut w);
-        if 4 + message.body.len() + w.len() + 512 <= max {
+        if message.encode_size() + 512 <= max {
             return Ok(None);
         }
         let id = self.broker.post_office().ids().next();

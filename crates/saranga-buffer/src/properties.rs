@@ -217,6 +217,29 @@ impl TypedProperties {
         }
     }
 
+    /// Makes the names and string values slices of `encoded`, where
+    /// [`encode`](Self::encode) wrote these properties from `at`, in place
+    /// of copies of their own.
+    pub fn share(&mut self, encoded: &bytes::Bytes, mut at: usize) {
+        let Some(entries) = &mut self.0 else {
+            return;
+        };
+        let share = |s: &mut SimpleString, at: usize| {
+            let end = at + s.as_bytes().len();
+            debug_assert_eq!(&encoded[at..end], s.as_bytes());
+            *s = SimpleString::from_shared(encoded.slice(at..end));
+            end
+        };
+        at += 5;
+        for (k, v) in entries {
+            at = share(k, at + 4);
+            at = match v {
+                PropertyValue::String(s) => share(s, at + 5),
+                other => at + other.encode_size(),
+            };
+        }
+    }
+
     /// The length of [`encode`](Self::encode)'s output, without encoding.
     pub fn encode_size(&self) -> usize {
         match &self.0 {

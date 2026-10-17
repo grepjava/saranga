@@ -7,7 +7,7 @@
 //! messages go straight to the writer from the queues delivering them.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -143,15 +143,7 @@ struct Outbound {
 impl Outbound {
     /// `StompProtocolManager.send` with `physicalSend`.
     fn send(&self, frame: &Frame) -> bool {
-        if self.destroyed.load(Ordering::SeqCst) {
-            tracing::warn!("AMQ332068: connection closed {}", self.remote);
-            return false;
-        }
-        let tx = &self.tx;
-        if !self
-            .direct
-            .write(frame.encode(), |b| tx.send(Out::Bytes(b)).is_ok())
-        {
+        if !self.send_bytes(frame.encode()) {
             return false;
         }
         if frame.command == names::ERROR && !frame.ping {
@@ -164,6 +156,16 @@ impl Outbound {
             );
         }
         true
+    }
+
+    /// [`send`](Self::send) of a frame already encoded, not an ERROR.
+    fn send_bytes(&self, bytes: Vec<u8>) -> bool {
+        if self.destroyed.load(Ordering::SeqCst) {
+            tracing::warn!("AMQ332068: connection closed {}", self.remote);
+            return false;
+        }
+        let tx = &self.tx;
+        self.direct.write(bytes, |b| tx.send(Out::Bytes(b)).is_ok())
     }
 }
 
@@ -233,6 +235,7 @@ struct Reply {
 async fn completer(
     out: Arc<Outbound>,
     events: mpsc::UnboundedSender<Event>,
+    queued: Arc<AtomicUsize>,
     mut rx: mpsc::UnboundedReceiver<Reply>,
 ) {
     while let Some(reply) = rx.recv().await {
@@ -248,6 +251,7 @@ async fn completer(
             }
             Ok(()) => completed(&out, &events, reply.frame, reply.after, reply.close),
         }
+        queued.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -411,7 +415,7 @@ impl DeliverySink for StompSink {
         }
         // A message of another protocol as Core (`toCore`).
         let core = message.delivery_core();
-        let frame = match convert::message_frame(
+        let bytes = match convert::message_bytes(
             self.kind,
             &sub.id,
             self.kind == Kind::V12 && sub.ack != AckMode::Auto,
@@ -419,7 +423,7 @@ impl DeliverySink for StompSink {
             core,
             delivery_count,
         ) {
-            Ok(f) => f,
+            Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
                     "AMQ332071: Unable to send message to client: {}: {e}",
@@ -428,9 +432,9 @@ impl DeliverySink for StompSink {
                 return 0;
             }
         };
-        let length = frame.encode().len() as i64;
+        let length = bytes.len() as i64;
         if sub.ack == AckMode::Auto {
-            if self.out.send(&frame) {
+            if self.out.send_bytes(bytes) {
                 let _ = self.events.send(Event::AutoAck {
                     consumer: consumer_id,
                     message: core.message_id,
@@ -439,7 +443,7 @@ impl DeliverySink for StompSink {
         } else {
             // Recorded before it goes out, or the client could ack first.
             lock(&self.to_ack).insert((consumer_id, core.message_id), length);
-            self.out.send(&frame);
+            self.out.send_bytes(bytes);
         }
         length
     }
@@ -508,6 +512,8 @@ struct Connection {
     client: Arc<ClientConnection>,
     out: Arc<Outbound>,
     replies: mpsc::UnboundedSender<Reply>,
+    /// Replies sent to the completer and not yet finished.
+    queued: Arc<AtomicUsize>,
     events: mpsc::UnboundedSender<Event>,
     settings: Settings,
     /// The connection ID (`getID`), the `session` header of CONNECTED.
@@ -555,13 +561,20 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
     });
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let (replies_tx, replies_rx) = mpsc::unbounded_channel();
-    let completer = tokio::spawn(completer(out.clone(), events_tx.clone(), replies_rx));
+    let queued = Arc::new(AtomicUsize::new(0));
+    let completer = tokio::spawn(completer(
+        out.clone(),
+        events_tx.clone(),
+        queued.clone(),
+        replies_rx,
+    ));
     let ttl = settings.ttl;
     let mut conn = Connection {
         broker,
         client,
         out,
         replies: replies_tx,
+        queued,
         events: events_tx,
         settings,
         id: uuid::Uuid::new_v4().simple().to_string()[..8].to_owned(),
@@ -632,23 +645,32 @@ impl Connection {
     /// Decodes and handles every complete frame in `buf`. False when the
     /// connection must close at once.
     async fn process(&mut self, buf: &mut Vec<u8>) -> bool {
+        // What was decoded goes from `buf` once, after the last frame.
+        let mut at = 0;
+        let open = self.process_from(buf, &mut at).await;
+        buf.drain(..at);
+        open
+    }
+
+    async fn process_from(&mut self, buf: &[u8], at: &mut usize) -> bool {
         loop {
             if self.closing {
                 return true;
             }
-            match decoder::decode(self.handler.rules(), buf) {
+            let rest = &buf[*at..];
+            match decoder::decode(self.handler.rules(), rest) {
                 Ok(Some((decoded, used))) => {
-                    buf.drain(..used);
+                    *at += used;
                     let frame =
                         Frame::decoded(decoded.command, Kind::V11, decoded.headers, decoded.body);
                     self.handle_frame(frame).await;
                 }
                 Ok(None) => {
                     // Heart-beats alone: drop them, keeping a trailing `\r`.
-                    let eols = decoder::leading_eols(buf);
-                    if eols == buf.len() {
-                        let keep = usize::from(buf.last() == Some(&b'\r'));
-                        buf.drain(..eols - keep);
+                    let eols = decoder::leading_eols(rest);
+                    if eols == rest.len() {
+                        let keep = usize::from(rest.last() == Some(&b'\r'));
+                        *at += eols - keep;
                     }
                     return true;
                 }
@@ -673,7 +695,7 @@ impl Connection {
                 }
                 Err(e) => {
                     tracing::error!("AMQ224021: Failed to decode packet: {e:?}");
-                    buf.clear();
+                    *at = buf.len();
                     return true;
                 }
             }
@@ -714,6 +736,17 @@ impl Connection {
         if close || frame.as_ref().is_some_and(|f| f.needs_disconnect) {
             self.closing = true;
         }
+        // With nothing to wait for and no reply ahead of it, it is done
+        // here (`afterCompleteOperations` with no store pending runs at
+        // once) rather than on the completer's task.
+        if self.queued.load(Ordering::Acquire) == 0 {
+            completion.apply_if_written();
+            if completion.is_empty() {
+                completed(&self.out, &self.events, frame, after, close);
+                return;
+            }
+        }
+        self.queued.fetch_add(1, Ordering::AcqRel);
         let _ = self.replies.send(Reply {
             completion,
             frame,
@@ -799,10 +832,10 @@ impl Connection {
 
     /// `VersionedStompFrameHandler.handleFrame` for everything but
     /// SUBSCRIBE.
-    async fn dispatch(&mut self, request: Frame) -> Option<Frame> {
+    async fn dispatch(&mut self, mut request: Frame) -> Option<Frame> {
         let v10 = self.handler == Version::V10;
         let result = match request.command.as_str() {
-            names::SEND => self.on_send(&request).await,
+            names::SEND => self.on_send(&mut request).await,
             names::ACK => self.on_ack(&request).await,
             names::NACK if !v10 => self.on_ack(&request).await,
             names::BEGIN => self.on_begin(&request).await,
@@ -1121,7 +1154,7 @@ impl Connection {
     }
 
     /// `onSend` and `sendServerMessage`.
-    async fn on_send(&mut self, frame: &Frame) -> StompResult<Option<Frame>> {
+    async fn on_send(&mut self, frame: &mut Frame) -> StompResult<Option<Frame>> {
         self.validate()?;
         let destination = self.destination(frame, names::DESTINATION);
         let routing_type = self

@@ -6,7 +6,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use saranga_buffer::{PropertyValue, Reader, SimpleString, Writer};
+use saranga_buffer::{PropertyValue, SimpleString, Writer};
 use saranga_message::{Bytes, CoreMessage};
 use saranga_storage::message::{CoreMessageRecord, PersistedMessage};
 
@@ -189,11 +189,17 @@ pub fn make_copy(
 
 /// What `write` writes, in a buffer of its own size: a writer's spare
 /// capacity would otherwise stay with the message as long as it is held.
-fn exact(write: impl FnOnce(&mut Writer)) -> Bytes {
-    let mut w = Writer::new();
+fn exact(size: usize, write: impl FnOnce(&mut Writer)) -> Bytes {
+    let mut w = Writer::with_capacity(size);
     write(&mut w);
-    // A copy, as an allocator may shrink a block in place and keep its size.
-    Bytes::copy_from_slice(w.as_slice())
+    let v = w.into_vec();
+    if v.len() == v.capacity() {
+        v.into()
+    } else {
+        // A copy, as an allocator may shrink a block in place and keep its
+        // size.
+        Bytes::copy_from_slice(&v)
+    }
 }
 
 /// A message kept in its own protocol's encoding (`AMQPMessage`): the
@@ -324,19 +330,11 @@ pub struct ServerMessage {
 
 impl ServerMessage {
     pub fn new(mut core: CoreMessage) -> Arc<Self> {
-        let encoded = exact(|w| core.encode(w));
+        let encoded = exact(core.encode_size(), |w| core.encode(w));
         // The body is held once, in the encoding (after its i32 end-of-body),
-        // and so are the address and the properties' names and strings: read
-        // again from it, they are slices of it rather than copies.
-        let body = 4..4 + core.body.len();
-        let mut r = Reader::shared(&encoded);
-        if r.bytes(body.end).is_ok()
-            && let Ok(shared) = CoreMessage::decode_headers_and_properties(&mut r)
-        {
-            core.address = shared.address;
-            core.properties = shared.properties;
-        }
-        core.body = encoded.slice(body);
+        // and so are the address and the properties' names and strings:
+        // slices of it rather than copies.
+        core.share(&encoded);
         Arc::new(Self {
             core,
             native: None,
@@ -404,7 +402,9 @@ impl ServerMessage {
     /// A large message: `core` holds the headers and properties, `body` the
     /// body.
     pub fn new_large(core: CoreMessage, body: Arc<LargeBody>) -> Arc<Self> {
-        let encoded = exact(|w| core.encode_headers_and_properties(w));
+        let encoded = exact(core.headers_and_properties_size(), |w| {
+            core.encode_headers_and_properties(w)
+        });
         Arc::new(Self {
             core,
             native: None,

@@ -53,10 +53,19 @@ pub enum DecodeError {
 /// (heart-beats) before a frame are skipped; `Ok(None)` with only those
 /// in `buf` means nothing is pending.
 pub fn decode(rules: Rules, buf: &[u8]) -> Result<Option<(Decoded, usize)>, DecodeError> {
+    decode_lines(rules, buf, true)
+}
+
+/// [`decode`], taking plain header lines whole (`fast`) or not.
+fn decode_lines(
+    rules: Rules,
+    buf: &[u8],
+    fast: bool,
+) -> Result<Option<(Decoded, usize)>, DecodeError> {
     let Some((command, mut pos)) = parse_command(rules, buf)? else {
         return Ok(None);
     };
-    let Some((headers, content_length)) = parse_headers(rules, buf, &mut pos)? else {
+    let Some((headers, content_length)) = parse_headers(rules, buf, &mut pos, fast)? else {
         return Ok(None);
     };
     let Some(body) = parse_body(rules, buf, &mut pos, content_length) else {
@@ -197,10 +206,11 @@ fn parse_headers(
     rules: Rules,
     buf: &[u8],
     pos: &mut usize,
+    fast: bool,
 ) -> Result<Option<Headers>, DecodeError> {
     match rules {
         Rules::V10 => parse_headers_v10(buf, pos),
-        Rules::V11 | Rules::V12 => parse_headers_v11(rules, buf, pos),
+        Rules::V11 | Rules::V12 => parse_headers_v11(rules, buf, pos, fast),
     }
 }
 
@@ -287,6 +297,7 @@ fn parse_headers_v11(
     rules: Rules,
     buf: &[u8],
     pos: &mut usize,
+    fast: bool,
 ) -> Result<Option<Headers>, DecodeError> {
     let v12 = rules == Rules::V12;
     let mut headers = Vec::with_capacity(8);
@@ -298,11 +309,42 @@ fn parse_headers_v11(
     let mut name = String::new();
     let mut cr = false;
     let text = |h: &[u8]| String::from_utf8_lossy(h).into_owned();
+    let mut line_start = fast;
     loop {
+        // A whole line with one `:` and nothing escaped or carriage
+        // returned but its end is taken at once; anything else, byte by
+        // byte below.
+        if line_start
+            && !escaping
+            && let Some(n) = buf[*pos..].iter().position(|&b| b == b'\n')
+        {
+            let end = *pos + n;
+            let mut line = &buf[*pos..end];
+            if v12 && line.last() == Some(&b'\r') {
+                line = &line[..line.len() - 1];
+            }
+            let mut colons = line.iter().enumerate().filter(|(_, b)| **b == b':');
+            if let (Some((c, _)), None) = (colons.next(), colons.next())
+                && !line.iter().any(|&b| b == b'\\' || (v12 && b == b'\r'))
+            {
+                *pos = end + 1;
+                name = text(&line[..c]);
+                let value = text(&line[c + 1..]);
+                if name == names::CONTENT_LENGTH {
+                    length = Some(content_length(&value)?);
+                }
+                put(&mut headers, name.clone(), value, v12);
+                if *pos == buf.len() {
+                    return Ok(None);
+                }
+                continue;
+            }
+        }
         let Some(&b) = buf.get(*pos) else {
             return Ok(None);
         };
         *pos += 1;
+        line_start = fast && b == b'\n';
         match b {
             b'\\' => {
                 if escaping {
@@ -521,5 +563,37 @@ mod tests {
             Err(DecodeError::InvalidCommand(_))
         ));
         assert_eq!(one(Rules::V11, b"NACK\n\n\0").0.command, "NACK");
+    }
+
+    /// Taking plain header lines whole changes nothing: generated frames
+    /// decode the same, or fail the same, both ways.
+    #[test]
+    fn whole_lines_decode_as_bytes_do() {
+        let alphabet: &[u8] = b"ab:\\ncr\r\n\n\n\0";
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20_000 {
+            let mut frame = b"SEND\n".to_vec();
+            let len = (next() % 40) as usize;
+            for _ in 0..len {
+                frame.push(alphabet[(next() % alphabet.len() as u64) as usize]);
+            }
+            if next() % 2 == 0 {
+                frame.extend_from_slice(b"\n\nbody\0");
+            }
+            for rules in [Rules::V11, Rules::V12] {
+                assert_eq!(
+                    decode_lines(rules, &frame, true),
+                    decode_lines(rules, &frame, false),
+                    "{:?} {rules:?}",
+                    String::from_utf8_lossy(&frame)
+                );
+            }
+        }
     }
 }

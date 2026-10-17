@@ -127,11 +127,11 @@ pub fn frame_to_message(
 }
 
 /// The frame's body as the message's: bytes when it has a
-/// `content-length`, text otherwise.
-pub fn set_body(frame: &Frame, message: &mut CoreMessage) {
+/// `content-length`, text otherwise. The frame keeps no body.
+pub fn set_body(frame: &mut Frame, message: &mut CoreMessage) {
     if frame.has_header(names::CONTENT_LENGTH) {
         message.message_type = message_type::BYTES;
-        message.body = frame.body.clone().into();
+        message.body = std::mem::take(&mut frame.body).into();
     } else {
         message.message_type = message_type::TEXT;
         let text = SimpleString::from(frame.body_text());
@@ -281,6 +281,262 @@ pub fn message_frame(
     Ok(frame)
 }
 
+/// The headers [`message_frame`] writes besides the properties, but for
+/// `destination`, which no property is written as, and `content-length`,
+/// which [`message_bytes`] replaces as a 1.0 `Frame` does.
+const STANDARD_HEADERS: [&str; 15] = [
+    names::SUBSCRIPTION,
+    names::MESSAGE_ID,
+    names::CORRELATION_ID,
+    names::EXPIRES,
+    names::REDELIVERED,
+    names::PRIORITY,
+    names::PERSISTENT,
+    names::REPLY_TO,
+    names::TIMESTAMP,
+    names::TYPE,
+    names::CONTENT_TYPE,
+    names::VALIDATED_USER,
+    names::DESTINATION_TYPE,
+    names::INGRESS_TIMESTAMP,
+    names::ACK_HEADER,
+];
+
+/// `message_frame(..).encode()`, written straight to bytes rather than
+/// through a [`Frame`], which holds each header as two `String`s. A
+/// property named as a header already written is written again in 1.1 and
+/// 1.2 ([`Frame::add_header`]), but replaces it in 1.0, which only a
+/// `Frame` does: such a 1.0 message is made that way.
+pub fn message_bytes(
+    kind: Kind,
+    subscription: &str,
+    ack_header: bool,
+    consumer_id: i64,
+    message: &CoreMessage,
+    delivery_count: i32,
+) -> Result<Vec<u8>, String> {
+    let properties = properties_in_java_order(message);
+    if !matches!(kind, Kind::V11 | Kind::V12)
+        && properties
+            .iter()
+            .any(|(k, _)| STANDARD_HEADERS.iter().any(|h| k.eq_str(h)))
+    {
+        return message_frame(
+            kind,
+            subscription,
+            ack_header,
+            consumer_id,
+            message,
+            delivery_count,
+        )
+        .map(|f| f.encode());
+    }
+    let mut text = None;
+    let bytes_body = !message.body.is_empty()
+        && (property(message, names::CONTENT_LENGTH).is_some()
+            || message.message_type == message_type::BYTES);
+    if !message.body.is_empty() && !bytes_body {
+        let mut r = Reader::new(&message.body);
+        let t = r
+            .nullable_simple_string()
+            .map_err(|e| format!("the body is not text: {e}"))?;
+        text = t.map(|t| java::simple_string(&t).into_bytes());
+    }
+    let body: &[u8] = match &text {
+        Some(t) => t,
+        None if bytes_body => &message.body,
+        None => &[],
+    };
+    let mut out = Vec::with_capacity(320 + body.len() + 32 * properties.len());
+    let mut h = Headers {
+        out: &mut out,
+        escaped: matches!(kind, Kind::V11 | Kind::V12),
+    };
+    h.out.extend_from_slice(names::MESSAGE.as_bytes());
+    h.out.push(b'\n');
+    h.str(names::SUBSCRIPTION, subscription);
+    // A `content-length` property (a SEND's header) is that header again,
+    // which a 1.0 frame writes in place of the first and the others not.
+    let length_property = property(message, names::CONTENT_LENGTH);
+    if bytes_body {
+        match length_property {
+            Some(v) if kind == Kind::V10 => h.property(names::CONTENT_LENGTH, v),
+            _ => h.int(names::CONTENT_LENGTH, body.len() as i64),
+        }
+    }
+    h.message_id(names::MESSAGE_ID, consumer_id, message.message_id);
+    // copyStandardHeadersFromMessageToFrame
+    h.key(names::DESTINATION);
+    if let Some(prefix) = property(message, HDR_PREFIX).filter(|v| **v != PropertyValue::Null) {
+        h.value(prefix);
+    }
+    match &message.address {
+        Some(a) => h.simple(a),
+        None => h.out.extend_from_slice(b"null"),
+    }
+    h.out.push(b'\n');
+    if let Some(v) = property(message, JMS_CORRELATION_ID).filter(|v| **v != PropertyValue::Null) {
+        h.property(names::CORRELATION_ID, v);
+    }
+    h.int(names::EXPIRES, message.expiration);
+    h.bool(names::REDELIVERED, delivery_count > 1);
+    h.int(names::PRIORITY, (message.priority as i8).into());
+    h.bool(names::PERSISTENT, message.durable);
+    if let Some(v) = property(message, JMS_REPLY_TO).filter(|v| **v != PropertyValue::Null) {
+        h.property(names::REPLY_TO, v);
+    }
+    h.int(names::TIMESTAMP, message.timestamp);
+    if let Some(v) = property(message, JMS_TYPE).filter(|v| **v != PropertyValue::Null) {
+        h.property(names::TYPE, v);
+    }
+    if let Some(v) = property(message, HDR_CONTENT_TYPE).filter(|v| **v != PropertyValue::Null) {
+        h.property(names::CONTENT_TYPE, v);
+    }
+    if let Some(v) = property(message, m::HDR_VALIDATED_USER).filter(|v| **v != PropertyValue::Null)
+    {
+        h.property(names::VALIDATED_USER, v);
+    }
+    if let Some(v) = property(message, m::HDR_ROUTING_TYPE) {
+        let t = match v {
+            PropertyValue::Byte(b) => RoutingType::from_byte(*b).map(RoutingType::name),
+            _ => None,
+        };
+        h.str(names::DESTINATION_TYPE, t.unwrap_or("null"));
+    }
+    if let Some(v) = property(message, HDR_INGRESS_TIMESTAMP) {
+        h.property(names::INGRESS_TIMESTAMP, v);
+    }
+    for (name, value) in properties {
+        if NOT_HEADERS.iter().any(|n| name.eq_str(n))
+            || (bytes_body && name.eq_str(names::CONTENT_LENGTH))
+        {
+            continue;
+        }
+        h.simple(name);
+        h.out.push(b':');
+        h.value(value);
+        h.out.push(b'\n');
+    }
+    if ack_header {
+        h.message_id(names::ACK_HEADER, consumer_id, message.message_id);
+    }
+    if !body.is_empty() && !bytes_body && kind != Kind::V10 {
+        h.int(names::CONTENT_LENGTH, body.len() as i64);
+    }
+    out.push(b'\n');
+    out.extend_from_slice(body);
+    out.extend_from_slice(&[0, b'\n']);
+    Ok(out)
+}
+
+/// `Long.toString`, without the formatting machinery.
+fn push_int(out: &mut Vec<u8>, v: i64) {
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    let mut n = v.unsigned_abs();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if v < 0 {
+        out.push(b'-');
+    }
+    out.extend_from_slice(&digits[i..]);
+}
+
+fn push_bool(out: &mut Vec<u8>, v: bool) {
+    out.extend_from_slice(if v { b"true" } else { b"false" });
+}
+
+/// Headers written as [`Frame::encode`] writes them.
+struct Headers<'a> {
+    out: &'a mut Vec<u8>,
+    escaped: bool,
+}
+
+impl Headers<'_> {
+    fn key(&mut self, key: &str) {
+        self.text(key);
+        self.out.push(b':');
+    }
+
+    fn text(&mut self, s: &str) {
+        if self.escaped {
+            crate::frame::escape_into(self.out, s);
+        } else {
+            self.out.extend_from_slice(s.as_bytes());
+        }
+    }
+
+    fn str(&mut self, key: &str, value: &str) {
+        self.key(key);
+        self.text(value);
+        self.out.push(b'\n');
+    }
+
+    fn int(&mut self, key: &str, value: i64) {
+        self.key(key);
+        push_int(self.out, value);
+        self.out.push(b'\n');
+    }
+
+    fn bool(&mut self, key: &str, value: bool) {
+        self.key(key);
+        push_bool(self.out, value);
+        self.out.push(b'\n');
+    }
+
+    /// A `message-id`: the consumer's ID and the message's.
+    fn message_id(&mut self, key: &str, consumer_id: i64, message_id: i64) {
+        self.key(key);
+        push_int(self.out, consumer_id);
+        self.out.push(b',');
+        push_int(self.out, message_id);
+        self.out.push(b'\n');
+    }
+
+    fn property(&mut self, key: &str, value: &PropertyValue) {
+        self.key(key);
+        self.value(value);
+        self.out.push(b'\n');
+    }
+
+    /// [`property_text`], without a `String` for the common kinds.
+    fn value(&mut self, value: &PropertyValue) {
+        match value {
+            PropertyValue::String(s) => self.simple(s),
+            PropertyValue::Bool(v) => push_bool(self.out, *v),
+            PropertyValue::Byte(v) => push_int(self.out, (*v).into()),
+            PropertyValue::Short(v) => push_int(self.out, (*v).into()),
+            PropertyValue::Int(v) => push_int(self.out, (*v).into()),
+            PropertyValue::Long(v) => push_int(self.out, *v),
+            v => self.text(&property_text(v)),
+        }
+    }
+
+    /// [`java::simple_string`]: ASCII is copied unit by unit.
+    fn simple(&mut self, s: &SimpleString) {
+        let units = s.as_bytes().as_chunks::<2>().0;
+        if units.iter().all(|&[lo, hi]| hi == 0 && lo < 0x80) {
+            for &[b, _] in units {
+                match (self.escaped, b) {
+                    (true, b'\n') => self.out.extend_from_slice(b"\\n"),
+                    (true, b'\r') => self.out.extend_from_slice(b"\\r"),
+                    (true, b'\\') => self.out.extend_from_slice(b"\\\\"),
+                    (true, b':') => self.out.extend_from_slice(b"\\c"),
+                    _ => self.out.push(b),
+                }
+            }
+        } else {
+            self.text(&java::simple_string(s));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,12 +549,12 @@ mod tests {
 
     #[test]
     fn send_headers_become_message_fields() {
-        let f = frame(
+        let mut f = frame(
             b"SEND\ndestination:q\npriority:7\npersistent:TRUE\ncorrelation-id:c1\nexpires:99\nfoo:bar\nreceipt:r\n\nhello\0",
         );
         let mut msg = CoreMessage::default();
         frame_to_message(&f, &mut msg, None, 1000).unwrap();
-        set_body(&f, &mut msg);
+        set_body(&mut f, &mut msg);
         assert_eq!(msg.priority, 7);
         assert!(msg.durable);
         assert_eq!(msg.expiration, 99);
@@ -325,7 +581,7 @@ mod tests {
 
     #[test]
     fn message_frame_headers() {
-        let f = frame(b"SEND\ndestination:q\ncontent-length:3\nk:v\n\nabc\0");
+        let mut f = frame(b"SEND\ndestination:q\ncontent-length:3\nk:v\n\nabc\0");
         let mut msg = CoreMessage {
             message_id: 5,
             address: Some("q".into()),
@@ -334,7 +590,7 @@ mod tests {
             ..Default::default()
         };
         frame_to_message(&f, &mut msg, None, 0).unwrap();
-        set_body(&f, &mut msg);
+        set_body(&mut f, &mut msg);
         let out = message_frame(Kind::V12, "sub-0", true, 3, &msg, 2).unwrap();
         let text = String::from_utf8(out.encode()).unwrap();
         assert!(text.starts_with(
@@ -342,5 +598,106 @@ mod tests {
         ), "{text}");
         assert!(text.contains("\nk:v\n"));
         assert!(text.ends_with("ack:3,5\n\nabc\0\n"), "{text}");
+    }
+
+    #[test]
+    fn message_bytes_is_message_frame_encoded() {
+        use PropertyValue as V;
+        let text = |s: &str| {
+            let mut w = Writer::new();
+            w.nullable_simple_string(Some(&SimpleString::from(s)));
+            w.into_vec()
+        };
+        let props: Vec<Vec<(&str, V)>> = vec![
+            vec![],
+            vec![("k", V::String("a:b\nc\\d\re".into()))],
+            vec![
+                ("h\u{e9}llo", V::String("\u{65e5}\u{672c}".into())),
+                ("x:y", V::Int(-3)),
+            ],
+            vec![
+                (JMS_CORRELATION_ID, V::String("c1".into())),
+                (JMS_TYPE, V::Long(9)),
+                (JMS_REPLY_TO, V::String("r".into())),
+                (HDR_CONTENT_TYPE, V::String("text/plain".into())),
+                (m::HDR_VALIDATED_USER, V::String("u".into())),
+                (m::HDR_ROUTING_TYPE, V::Byte(1)),
+                (HDR_INGRESS_TIMESTAMP, V::Long(12)),
+                (HDR_PREFIX, V::String("pre.".into())),
+            ],
+            vec![
+                (JMS_CORRELATION_ID, V::Null),
+                (JMS_TYPE, V::Null),
+                (m::HDR_ROUTING_TYPE, V::Int(3)),
+                (HDR_INGRESS_TIMESTAMP, V::Null),
+                ("b", V::Bool(true)),
+                ("y", V::Byte(-1)),
+                ("s", V::Short(7)),
+                ("f", V::Float(1.5)),
+                ("d", V::Double(0.1)),
+                ("c", V::Char(0x41)),
+                ("n", V::Null),
+                ("bytes", V::Bytes(vec![1, 2])),
+            ],
+            vec![("expires", V::String("x".into())), ("ack", V::Int(1))],
+            vec![("subscription", V::Null), ("content-length", V::Int(2))],
+            vec![
+                ("content-length", V::String("3".into())),
+                ("destination", V::Int(1)),
+            ],
+            vec![
+                ("content-length", V::Null),
+                ("receipt", V::String("r".into())),
+            ],
+            vec![
+                ("destination-type", V::String("ANYCAST".into())),
+                (m::HDR_ROUTING_TYPE, V::Byte(1)),
+                ("content-length", V::String("1024".into())),
+            ],
+        ];
+        let bodies: Vec<(u8, Vec<u8>)> = vec![
+            (message_type::BYTES, b"abc".to_vec()),
+            (message_type::BYTES, vec![]),
+            (message_type::TEXT, text("hi:\n")),
+            (message_type::TEXT, text("")),
+            (message_type::TEXT, vec![0]),
+        ];
+        for p in &props {
+            for (t, body) in &bodies {
+                for address in [None, Some("q:1")] {
+                    let mut msg = CoreMessage {
+                        message_id: 5,
+                        address: address.map(Into::into),
+                        durable: true,
+                        timestamp: 7,
+                        expiration: 99,
+                        priority: 200,
+                        message_type: *t,
+                        body: body.clone().into(),
+                        ..Default::default()
+                    };
+                    for (k, v) in p {
+                        msg.properties.insert((*k).into(), v.clone());
+                    }
+                    for kind in [Kind::V10, Kind::V11, Kind::V12] {
+                        for (ack, count) in [(false, 1), (true, 2)] {
+                            let frame =
+                                message_frame(kind, "s:1", ack, 3, &msg, count).map(|f| f.encode());
+                            let bytes = message_bytes(kind, "s:1", ack, 3, &msg, count);
+                            assert_eq!(frame, bytes, "{kind:?} {p:?} {t} {address:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn push_int_is_to_string() {
+        for v in [0, 7, -1, 10, -10, 1_700_000_000_000, i64::MAX, i64::MIN] {
+            let mut out = Vec::new();
+            push_int(&mut out, v);
+            assert_eq!(out, v.to_string().into_bytes());
+        }
     }
 }

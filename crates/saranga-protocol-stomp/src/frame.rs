@@ -216,7 +216,7 @@ impl Frame {
 
 /// `StompFrame.encode`: `\n`, `\r`, `\` and `:` escaped. All four are
 /// ASCII, so the runs between them are copied as they are.
-fn escape_into(out: &mut Vec<u8>, s: &str) {
+pub(crate) fn escape_into(out: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
     let mut from = 0;
     for (i, &b) in bytes.iter().enumerate() {

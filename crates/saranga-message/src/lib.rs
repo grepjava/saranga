@@ -77,6 +77,48 @@ impl CoreMessage {
         })
     }
 
+    /// The length of [`encode_headers_and_properties`](Self::encode_headers_and_properties)'s
+    /// output, without encoding.
+    pub fn headers_and_properties_size(&self) -> usize {
+        8 + 1
+            + self.address.as_ref().map_or(0, |a| 4 + a.as_bytes().len())
+            + 1
+            + self.user_id.map_or(0, |id| id.len())
+            + 1
+            + 1
+            + 8
+            + 8
+            + 1
+            + self.properties.encode_size()
+    }
+
+    /// The length of [`encode`](Self::encode)'s output: the body's length,
+    /// the body, then the headers and properties.
+    pub fn encode_size(&self) -> usize {
+        4 + self.body.len() + self.headers_and_properties_size()
+    }
+
+    /// Makes the body, the address and the properties' names and strings
+    /// slices of `encoded`, this message as [`encode`](Self::encode) wrote
+    /// it, in place of copies of their own.
+    pub fn share(&mut self, encoded: &Bytes) {
+        let body_end = 4 + self.body.len();
+        debug_assert_eq!(&encoded[4..body_end], &self.body[..]);
+        self.body = encoded.slice(4..body_end);
+        // The message ID, then the address's null flag.
+        let mut at = body_end + 8 + 1;
+        if let Some(a) = &mut self.address {
+            let start = at + 4;
+            at = start + a.as_bytes().len();
+            debug_assert_eq!(&encoded[start..at], a.as_bytes());
+            *a = SimpleString::from_shared(encoded.slice(start..at));
+        }
+        // The user ID, the type, durability, expiration, timestamp and
+        // priority.
+        at += 1 + self.user_id.map_or(0, |id| id.len()) + 1 + 1 + 8 + 8 + 1;
+        self.properties.share(encoded, at);
+    }
+
     /// `CoreMessage.encodeHeadersAndProperties`.
     pub fn encode_headers_and_properties(&self, w: &mut Writer) {
         w.i64(self.message_id)
@@ -113,9 +155,51 @@ mod tests {
         msg.properties.insert("k".into(), PropertyValue::Int(1));
         let mut w = Writer::new();
         msg.encode(&mut w);
+        assert_eq!(w.len(), msg.encode_size());
+        assert_eq!(
+            w.len() - 4 - msg.body.len(),
+            msg.headers_and_properties_size()
+        );
+        let empty = CoreMessage::default();
+        let mut e = Writer::new();
+        empty.encode(&mut e);
+        assert_eq!(e.len(), empty.encode_size());
         assert_eq!(&w.as_slice()[..4], &16i32.to_be_bytes());
         let mut r = Reader::new(w.as_slice());
         assert_eq!(CoreMessage::decode(&mut r).unwrap(), msg);
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn share_points_into_the_encoding() {
+        for (address, user_id) in [(Some("golden.q1"), Some([7; 16])), (None, None)] {
+            let mut msg = CoreMessage {
+                message_id: 42,
+                address: address.map(Into::into),
+                user_id,
+                body: vec![1, 2, 3].into(),
+                ..Default::default()
+            };
+            let p = &mut msg.properties;
+            p.insert("a".into(), PropertyValue::String("x".into()));
+            p.insert("b".into(), PropertyValue::Bytes(vec![1, 2]));
+            p.insert("c".into(), PropertyValue::Null);
+            p.insert("d".into(), PropertyValue::Long(-1));
+            p.insert("e".into(), PropertyValue::String("".into()));
+            let mut w = Writer::new();
+            msg.encode(&mut w);
+            let encoded = Bytes::from(w.into_vec());
+            let mut shared = msg.clone();
+            shared.share(&encoded);
+            assert_eq!(shared, msg);
+            let inside = |b: &[u8]| encoded.as_ptr_range().contains(&b.as_ptr());
+            assert!(inside(&shared.body));
+            let (k, v) = &shared.properties.entries()[0];
+            assert!(inside(k.as_bytes()));
+            assert!(matches!(v, PropertyValue::String(s) if inside(s.as_bytes())));
+            if let Some(a) = &shared.address {
+                assert!(inside(a.as_bytes()));
+            }
+        }
     }
 }
