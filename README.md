@@ -12,15 +12,25 @@ It is in Phase 11 (hardening and 1.0) of the plan in [PHASES.md](PHASES.md). [CO
 
 Śārṅga, the celestial bow of the Sustainer, preserver of cosmic order. Across another sky, Artemis, the divine huntress, draws her bow. Two mythologies, one enduring symbol of grace and power.
 
-## Goals
+## Why Saranga?
 
-- **Compatibility with Artemis.** The wire protocols, `broker.xml`, the journal, paging and large-message formats, management and the command line all behave as Artemis 2.57.0's do, so that its clients, tools and data files work against Saranga unchanged. The intent is to stay fully compatible as Artemis releases new versions, following each one.
-- **High availability and clustering alongside Artemis.** A Saranga broker can be an Artemis broker's backup, with a shared store, replication or a pluggable quorum, or its primary, and the two fail over and fail back between each other. Mixed clusters of Artemis and Saranga nodes load-balance, redistribute and group messages, and federation, bridges, broker connections and mirroring work in both directions. Nodes can therefore be moved from one broker to the other one at a time, with no downtime.
-- **Native speed.** It compiles to a single native binary, with no JVM to start, warm up or tune. It starts in about 150 ms against Artemis's 2.7 s, and its throughput is the same or higher in every benchmark scenario.
-- **Memory safety without a garbage collector.** It is written in Rust, so the compiler rules out use-after-free, data races and buffer overruns, with no collector pausing the broker. `unsafe` code is confined to a few operating-system calls: file locks, disk space, local time and the client's terminal.
-- **Less CPU and memory for the same work.** At the same message rate it takes less broker CPU a message than Artemis in 12 of the 13 benchmark scenarios, and 40 to 57% less with persistent and large messages. It starts in 36 MiB rather than 209, and holds a twentieth to a fifth of Artemis's memory on OpenWire, STOMP and MQTT.
-- **Small enough for the edge.** A small footprint and a fast start let it run on edge gateways, small devices and constrained networks where a JVM broker does not fit.
-- **Savings in the cloud.** Less CPU and memory a message means smaller instances, more brokers a node and lower bills for the same traffic.
+Saranga is a high-performance, memory-safe message broker built in Rust, designed to deliver full Apache ActiveMQ Artemis compatibility with the efficiency, reliability and operational simplicity of a native application.
+
+**Seamless Artemis Compatibility.** Saranga targets full compatibility with Apache ActiveMQ Artemis 2.57.0, preserving wire protocols, `broker.xml` configuration, journal, paging and large-message formats, management interfaces and command-line tooling. Existing Artemis clients, tools, configurations and data files are intended to work unchanged. Saranga's compatibility roadmap tracks upstream Artemis releases to maintain interoperability as the platform evolves.
+
+**High Availability and Clustering Across Both Brokers.** Saranga is designed to operate interchangeably with Artemis in high-availability configurations, serving as either primary or backup through shared storage, replication or pluggable quorum mechanisms. Mixed Artemis–Saranga clusters support message load balancing, redistribution, grouping, federation, bridges, broker connections and bidirectional mirroring. This enables incremental, node-by-node migration without planned downtime, while preserving failover and failback capabilities.
+
+**Native Performance, Without JVM Overhead.** Compiled into a standalone native executable, Saranga eliminates JVM startup, warm-up and tuning requirements. Benchmarks show startup times of approximately 150 ms versus 2.7 seconds for Artemis—an 18× improvement—with throughput matching or exceeding Artemis across all tested scenarios.
+
+**Memory Safety Without Garbage Collection.** Built in Rust, Saranga uses compile-time ownership, borrowing and type-safety guarantees to prevent common memory-safety defects and data races in safe code. With no garbage collector, it also avoids garbage-collection pauses. The limited use of `unsafe` is isolated to operating-system integrations, including file locking, disk-space queries, local-time handling and terminal operations.
+
+**Greater Resource Efficiency.** Saranga uses less broker CPU per message in 12 of 13 benchmark scenarios, with CPU reductions of 40–57% for persistent and large-message workloads. Its initial memory footprint is approximately 36 MiB compared with Artemis's 209 MiB, while OpenWire, STOMP and MQTT workloads consume only 5–20% of Artemis's memory in the measured scenarios. This translates into greater workload density and more efficient infrastructure utilization.
+
+**Engineered for Edge Deployments.** With a compact memory footprint, rapid startup and no JVM dependency, Saranga extends enterprise-grade messaging to edge gateways, resource-constrained devices and distributed environments where conventional JVM-based brokers may be impractical.
+
+**Lower Cloud Infrastructure Costs.** Reduced CPU and memory consumption enables smaller compute instances, higher broker density per host and more efficient container deployments. For equivalent messaging workloads, these improvements create opportunities to reduce infrastructure spending without sacrificing protocol compatibility or throughput.
+
+Saranga combines the established messaging capabilities of Apache ActiveMQ Artemis with Rust's memory safety, native execution and resource efficiency—providing a practical path to modernize messaging infrastructure without abandoning existing Artemis investments.
 
 ## Building
 
