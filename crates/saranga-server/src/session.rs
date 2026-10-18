@@ -39,6 +39,10 @@ pub struct Transport {
     pub remote_address: String,
     /// `getTransportLocalAddress`: `127.0.0.1:61616`, `[::1]:61616`.
     pub local_address: String,
+    /// `isSupportsFlowControl`: the client can be held back by credits.
+    /// Sends from one that cannot fail the connection while the disk is
+    /// full.
+    pub flow_control: bool,
 }
 
 impl Transport {
@@ -70,16 +74,29 @@ impl Transport {
             implementation,
             remote_address: text(peer, false),
             local_address: text(local, true),
+            // STOMP's and MQTT's connections keep AbstractRemotingConnection's
+            // false; Core, AMQP and OpenWire override it.
+            flow_control: !matches!(protocol, "STOMP" | "MQTT"),
         }
     }
 
-    /// A connection inside the broker (management's own sends).
+    /// A connection inside the broker.
     pub fn internal(name: &str) -> Self {
         Self {
             protocol: "CORE",
             implementation: "RemotingConnectionImpl",
             remote_address: name.to_owned(),
             local_address: name.to_owned(),
+            flow_control: true,
+        }
+    }
+
+    /// The connection of management's own sends
+    /// (`ManagementRemotingConnection`), which has no flow control.
+    pub fn management() -> Self {
+        Self {
+            flow_control: false,
+            ..Self::internal("management")
         }
     }
 }
@@ -107,6 +124,9 @@ pub struct ClientConnection {
     /// Management closed the connection (`fail`).
     failed: AtomicBool,
     fail_notify: tokio::sync::Notify,
+    /// The exception the broker failed the connection with
+    /// (`fail(ActiveMQException)`), when the broker did.
+    cause: Mutex<Option<BrokerError>>,
     /// The slow-consumer policy killed the connection.
     killed: AtomicBool,
     /// The broker is stopping (`RemotingServiceImpl.freeze`).
@@ -140,6 +160,7 @@ impl ClientConnection {
             acceptor: None,
             sessions: Mutex::default(),
             failed: AtomicBool::new(false),
+            cause: Mutex::default(),
             killed: AtomicBool::new(false),
             disconnecting: AtomicBool::new(false),
             fail_notify: tokio::sync::Notify::new(),
@@ -205,6 +226,27 @@ impl ClientConnection {
     pub fn fail(&self) {
         self.failed.store(true, Ordering::SeqCst);
         self.fail_notify.notify_waiters();
+    }
+
+    /// `RemotingConnection.fail(e)` from the broker: the connection fails
+    /// as [`fail`](Self::fail) does, its protocol telling the client `e`
+    /// where it can. The first cause stays.
+    pub fn fail_with(&self, e: BrokerError) {
+        self.cause
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(e);
+        self.fail();
+    }
+
+    /// What the broker failed the connection with, if it did.
+    pub fn cause(&self) -> Option<BrokerError> {
+        self.cause.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// `isSupportsFlowControl`.
+    pub fn supports_flow_control(&self) -> bool {
+        self.transport.flow_control
     }
 
     /// The slow-consumer policy's `KILL`: the client is told, where its
@@ -1204,6 +1246,28 @@ impl ServerSession {
         {
             plugins.each(|p| p.on_send_exception(&entry, &message, &e));
             return Err(e);
+        }
+        // A client that credits cannot hold back is failed while the disk
+        // is full: there is nothing else to do with it.
+        if !self.conn.supports_flow_control() {
+            let paging = self.broker.post_office().paging();
+            if paging.is_disk_full() {
+                let (usable, total) = paging.disk_space();
+                let e = BrokerError::new(
+                    ErrorType::IoError,
+                    format!(
+                        "AMQ229119: Free storage space is at {} of {} total. Usage rate is {:.1}% which is beyond the configured <max-disk-usage>. System will start blocking producers.",
+                        crate::disk::human_bytes(usable),
+                        crate::disk::human_bytes(total),
+                        crate::disk::usage_of(usable, total) * 100.0
+                    ),
+                );
+                self.conn.fail_with(e.clone());
+                if let Some(plugins) = &plugins {
+                    plugins.each(|p| p.on_send_exception(&entry, &message, &e));
+                }
+                return Err(e);
+            }
         }
         // handleManagementMessage: a message to the management address is
         // a request, answered on its reply-to address.

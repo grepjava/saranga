@@ -1,14 +1,18 @@
 //! The disk monitor: past `min-disk-free`, addresses refuse or drop what is
-//! sent as their `disk-full-policy` says.
+//! sent as their `disk-full-policy` says, and connections without flow
+//! control (management's) have their sends refused outright.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use saranga_buffer::SimpleString;
 use saranga_config as cfg;
+use saranga_message::CoreMessage;
 use saranga_server::disk::{self, Limit, MonitorConfig};
 use saranga_server::management::Json;
 use saranga_server::postoffice::SelectorFilters;
+use saranga_server::session::{ClientConnection, ServerSession, SessionOptions, Transport};
 use saranga_server::{Broker, BrokerConfig};
 
 async fn start(dir: &Path, min_disk_free: &str) -> Arc<Broker> {
@@ -82,6 +86,49 @@ async fn send(broker: &Arc<Broker>, address: &str) -> Result<Json, String> {
     .await
 }
 
+/// A send from a session whose connection has flow control, as a Core
+/// client's has.
+async fn session_send(broker: &Arc<Broker>, address: &str) -> Result<(), String> {
+    let conn = Arc::new(ClientConnection::new(
+        Transport::internal("test"),
+        Arc::new(saranga_security::ConnectionInfo {
+            remote_address: "test".into(),
+            certificates: None,
+            security_domain: None,
+            connection_id: None,
+        }),
+        Vec::new(),
+    ));
+    let mut session = ServerSession::new(
+        broker.clone(),
+        conn,
+        SessionOptions {
+            name: "s".into(),
+            username: None,
+            password: None,
+            xa: false,
+            auto_commit_sends: true,
+            auto_commit_acks: true,
+            pre_acknowledge: false,
+            default_address: None,
+        },
+        Default::default(),
+    );
+    let message = CoreMessage {
+        address: Some(SimpleString::from(address)),
+        durable: true,
+        ..Default::default()
+    };
+    let sent = session.send(message, None).await;
+    session.close(false).await;
+    session
+        .take_completion()
+        .wait()
+        .await
+        .map_err(|e| e.to_string())?;
+    sent.map_err(|e| e.message)
+}
+
 async fn count(broker: &Arc<Broker>, queue: &str) -> Json {
     op(broker, &format!("queue.{queue}"), "countMessages", vec![])
         .await
@@ -111,11 +158,30 @@ async fn full_disk_fails_or_drops_by_policy() {
     }
     wait_disk_full(&broker, true).await;
 
-    let e = send(&broker, "failing").await.unwrap_err();
+    let e = session_send(&broker, "failing").await.unwrap_err();
     assert!(e.contains("AMQ229102"), "{e}");
-    send(&broker, "dropping").await.unwrap();
+    session_send(&broker, "dropping").await.unwrap();
     assert_eq!(count(&broker, "failing").await, Json::Long(0));
     assert_eq!(count(&broker, "dropping").await, Json::Long(0));
+    broker.stop().unwrap();
+}
+
+/// Management's sends have no flow control: a full disk refuses them
+/// whatever the address's policy.
+#[tokio::test]
+async fn full_disk_refuses_management_sends() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(dir.path(), "1000000000000000000").await;
+    for q in ["failing", "dropping"] {
+        queue(&broker, q).await;
+    }
+    wait_disk_full(&broker, true).await;
+
+    for q in ["failing", "dropping"] {
+        let e = send(&broker, q).await.unwrap_err();
+        assert!(e.starts_with("AMQ229119: Free storage space is at "), "{e}");
+        assert!(e.ends_with("System will start blocking producers."), "{e}");
+    }
     broker.stop().unwrap();
 }
 

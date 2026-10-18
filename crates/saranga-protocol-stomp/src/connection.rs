@@ -533,6 +533,8 @@ struct Connection {
     /// A reply that closes the connection is on its way; nothing more is
     /// read.
     closing: bool,
+    /// The client was told why the broker failed the connection.
+    failure_reported: bool,
 }
 
 /// Serves a STOMP connection until it closes.
@@ -588,6 +590,7 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
         ttl,
         heart_beat: None,
         closing: false,
+        failure_reported: false,
     };
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut last_read = tokio::time::Instant::now();
@@ -596,7 +599,12 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
         // (`checkDataReceived`), not what goes to it meanwhile.
         let deadline = last_read + Duration::from_millis(conn.ttl.max(1) as u64);
         tokio::select! {
-            () = failed.failed() => break,
+            // Management failed the connection; a failure the client was
+            // told of closes after its last reply instead.
+            () = failed.failed(), if !conn.failure_reported => {
+                conn.report_failure();
+                break;
+            }
             event = events_rx.recv() => match event {
                 Some(Event::AutoAck { consumer, message }) => conn.auto_ack(consumer, message).await,
                 Some(Event::AutoAcked { tx, pending, result }) => conn.auto_acked(tx, pending, result),
@@ -722,6 +730,35 @@ impl Connection {
         );
     }
 
+    /// `StompConnection.fail(e)` for a cause the broker failed the
+    /// connection with: an ERROR carrying it, then the sessions' failure
+    /// listeners. Once; true once it has been.
+    fn report_failure(&mut self) -> bool {
+        if self.failure_reported {
+            return true;
+        }
+        let Some(e) = self.client.cause() else {
+            return false;
+        };
+        self.failure_reported = true;
+        let mut frame = Frame::new(names::ERROR, self.kind());
+        frame.add_header(names::MESSAGE_HEADER, &e.message);
+        self.reply(Some(frame), None, false);
+        tracing::warn!(
+            "AMQ222067: Connection failure has been detected: {} [code={}]",
+            e.message,
+            e.kind.name()
+        );
+        for s in self.main.iter().chain(self.transacted.values()) {
+            let name = s.session.name();
+            tracing::warn!(
+                "AMQ222061: Client connection failed, clearing up resources for session {name}"
+            );
+            tracing::warn!("AMQ222107: Cleared up resources for session {name}");
+        }
+        true
+    }
+
     /// Sends a reply after the journal writes the sessions lined up.
     fn reply(
         &mut self,
@@ -784,6 +821,9 @@ impl Connection {
                 }
             }
         };
+        // A send that failed the connection: why, ahead of the reply, which
+        // is the last.
+        let failed = self.report_failure();
         // replySent: the pinger starts once CONNECTED is out.
         let after = match &reply {
             Some(f) if f.command == names::CONNECTED && self.handler != Version::V10 => {
@@ -791,7 +831,7 @@ impl Connection {
             }
             _ => None,
         };
-        self.reply(reply, after, cmd == names::DISCONNECT);
+        self.reply(reply, after, cmd == names::DISCONNECT || failed);
     }
 
     /// `negotiateVersion`, once: the highest version in `accept-version`.

@@ -1700,7 +1700,9 @@ impl Conn {
                     "AMQ834002: Error processing MQTT packet; client ID: {}; packet: {name}; {e}",
                     self.client_id.as_deref().unwrap_or("null")
                 );
-                if self.v5() {
+                // A connection the broker failed is closed already
+                // (`MQTTConnection.fail`): nothing more reaches the client.
+                if self.v5() && self.client.cause().is_none() {
                     self.send_disconnect(reason::IMPLEMENTATION_SPECIFIC_ERROR);
                 }
                 self.disconnect(true).await;

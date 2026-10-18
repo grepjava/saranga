@@ -2010,12 +2010,14 @@ name = "saranga-protocol-stomp"
 version = "0.0.1"
 dependencies = [
  "saranga-buffer",
+ "saranga-config",
  "saranga-core-protocol",
  "saranga-filter",
  "saranga-message",
  "saranga-security",
  "saranga-server",
  "saranga-storage",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",

@@ -116,6 +116,64 @@ impl ErrorType {
         self as i32
     }
 
+    /// The constant's Java name, as `[code=...]` in log lines shows it
+    /// (Artemis's own spelling, `NOT_IMPLEMTNED_EXCEPTION` included).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::InternalError => "INTERNAL_ERROR",
+            Self::UnsupportedPacket => "UNSUPPORTED_PACKET",
+            Self::NotConnected => "NOT_CONNECTED",
+            Self::ConnectionTimedOut => "CONNECTION_TIMEDOUT",
+            Self::Disconnected => "DISCONNECTED",
+            Self::Unblocked => "UNBLOCKED",
+            Self::IoError => "IO_ERROR",
+            Self::QueueDoesNotExist => "QUEUE_DOES_NOT_EXIST",
+            Self::QueueExists => "QUEUE_EXISTS",
+            Self::ObjectClosed => "OBJECT_CLOSED",
+            Self::InvalidFilterExpression => "INVALID_FILTER_EXPRESSION",
+            Self::IllegalState => "ILLEGAL_STATE",
+            Self::SecurityException => "SECURITY_EXCEPTION",
+            Self::AddressDoesNotExist => "ADDRESS_DOES_NOT_EXIST",
+            Self::AddressExists => "ADDRESS_EXISTS",
+            Self::IncompatibleClientServerVersions => "INCOMPATIBLE_CLIENT_SERVER_VERSIONS",
+            Self::LargeMessageErrorBody => "LARGE_MESSAGE_ERROR_BODY",
+            Self::TransactionRolledBack => "TRANSACTION_ROLLED_BACK",
+            Self::SessionCreationRejected => "SESSION_CREATION_REJECTED",
+            Self::DuplicateIdRejected => "DUPLICATE_ID_REJECTED",
+            Self::DuplicateMetadata => "DUPLICATE_METADATA",
+            Self::TransactionOutcomeUnknown => "TRANSACTION_OUTCOME_UNKNOWN",
+            Self::AlreadyReplicating => "ALREADY_REPLICATING",
+            Self::InterceptorRejectedPacket => "INTERCEPTOR_REJECTED_PACKET",
+            Self::InvalidTransientQueueUse => "INVALID_TRANSIENT_QUEUE_USE",
+            Self::RemoteDisconnect => "REMOTE_DISCONNECT",
+            Self::TransactionTimeout => "TRANSACTION_TIMEOUT",
+            Self::NativeErrorInternal => "NATIVE_ERROR_INTERNAL",
+            Self::NativeErrorInvalidBuffer => "NATIVE_ERROR_INVALID_BUFFER",
+            Self::NativeErrorNotAligned => "NATIVE_ERROR_NOT_ALIGNED",
+            Self::NativeErrorCantInitializeAio => "NATIVE_ERROR_CANT_INITIALIZE_AIO",
+            Self::NativeErrorCantReleaseAio => "NATIVE_ERROR_CANT_RELEASE_AIO",
+            Self::NativeErrorCantOpenCloseFile => "NATIVE_ERROR_CANT_OPEN_CLOSE_FILE",
+            Self::NativeErrorCantAllocateQueue => "NATIVE_ERROR_CANT_ALLOCATE_QUEUE",
+            Self::NativeErrorPreallocateFile => "NATIVE_ERROR_PREALLOCATE_FILE",
+            Self::NativeErrorAllocateMemory => "NATIVE_ERROR_ALLOCATE_MEMORY",
+            Self::AddressFull => "ADDRESS_FULL",
+            Self::LargeMessageInterrupted => "LARGE_MESSAGE_INTERRUPTED",
+            Self::ClusterSecurityException => "CLUSTER_SECURITY_EXCEPTION",
+            Self::NotImplemented => "NOT_IMPLEMTNED_EXCEPTION",
+            Self::MaxConsumerLimitExceeded => "MAX_CONSUMER_LIMIT_EXCEEDED",
+            Self::UnexpectedRoutingTypeForAddress => "UNEXPECTED_ROUTING_TYPE_FOR_ADDRESS",
+            Self::InvalidQueueConfiguration => "INVALID_QUEUE_CONFIGURATION",
+            Self::DeleteAddressError => "DELETE_ADDRESS_ERROR",
+            Self::NullRef => "NULL_REF",
+            Self::ShutdownError => "SHUTDOWN_ERROR",
+            Self::ReplicationTimeoutError => "REPLICATION_TIMEOUT_ERROR",
+            Self::DivertDoesNotExist => "DIVERT_DOES_NOT_EXIST",
+            Self::RoutingException => "ROUTING_EXCEPTION",
+            Self::TimeoutException => "TIMEOUT_EXCEPTION",
+            Self::GenericException => "GENERIC_EXCEPTION",
+        }
+    }
+
     /// `ActiveMQExceptionType.getType`: unknown codes map to
     /// `GenericException`.
     pub fn from_code(code: i32) -> Self {

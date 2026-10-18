@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak, mpsc};
 
 use saranga_core_protocol::packets::replication::ReplicationPageEventMessage;
@@ -104,6 +104,10 @@ pub struct PagingManager {
     loaded: AtomicBool,
     /// The disk is past `max-disk-usage` or `min-disk-free` (`diskFull`).
     disk_full: AtomicBool,
+    /// The usable and total bytes the disk monitor last read
+    /// (`diskUsableSpace`, `diskTotalSpace`).
+    disk_usable: AtomicU64,
+    disk_total: AtomicU64,
     /// The backup page files are replicated to.
     replication: crate::replication::Slot,
     /// No page is deleted while a backup copies them (`disableCleanup`).
@@ -129,6 +133,8 @@ impl PagingManager {
             global_size: AtomicI64::new(0),
             global_messages: AtomicI64::new(0),
             disk_full: AtomicBool::new(false),
+            disk_usable: AtomicU64::new(0),
+            disk_total: AtomicU64::new(0),
             stores: Mutex::default(),
             transactions: Mutex::default(),
             blocked: Mutex::default(),
@@ -275,6 +281,15 @@ impl PagingManager {
         self.disk_full.load(Ordering::SeqCst)
     }
 
+    /// `getDiskUsableSpace` and `getDiskTotalSpace`: what the disk monitor
+    /// last read, or zeros before it first looks.
+    pub fn disk_space(&self) -> (u64, u64) {
+        (
+            self.disk_usable.load(Ordering::SeqCst),
+            self.disk_total.load(Ordering::SeqCst),
+        )
+    }
+
     /// `LocalMonitor.tick`: the disk monitor's verdict on the last store it
     /// read.
     pub fn disk_tick(
@@ -284,6 +299,8 @@ impl PagingManager {
         within_limit: bool,
         limit: crate::disk::Limit,
     ) {
+        self.disk_usable.store(usable, Ordering::SeqCst);
+        self.disk_total.store(total, Ordering::SeqCst);
         let space = || {
             (
                 crate::disk::human_bytes(usable),

@@ -615,7 +615,12 @@ The differences from Artemis are listed in COMPAT.md.
     - the platform MBeans of the Runtime tab (`java.lang:type=Runtime`, `Memory`, `OperatingSystem`, `Threading`, `ClassLoading`), described as Artemis on OpenJDK 25 lists them and answered from the Saranga process ([platform](crates/saranga-management/src/platform));
     - `listLockCoordinatorsAsJSON` (an empty list) and the broker's `HAPolicy`, `Backup`, `SharedStore`, `Clustered`, `ReplicaSync` and `FailoverOnServerShutdown`, which had been fixed values.
   - **Tests.** [console.py](tests/interop/web/console.py) sends the same requests to Saranga and to Artemis 2.57.0 and compares statuses, headers and bodies: every route, endpoint and error, every file `index.html` loads, the login's throttling, sessions ended by logout, another user, Keycloak's check and idleness, Jolokia through a session, both naming modes and the permission checks. [web.sh](tests/interop/web/web.sh) runs it after web.py, Saranga serving the Artemis distribution's console (`ARTEMIS_DIST`), against the Artemis container or one already running (`ARTEMIS_WEB_URL`). All 156 checks of both pass. In Chrome, against both brokers side by side, the console logs in and shows the Status page, connections, addresses, queues with their menus, browsing a queue's messages, the broker diagram, the JMX trees and the Runtime tab.
-  - **Found along the way.** Artemis refuses a send from a connection without flow control (management's `sendMessage`, and some protocols) while the disk is beyond `max-disk-usage` (`AMQ229119`, `ServerSessionImpl.doSend`); Saranga accepts it. Not fixed yet.
+  - **Found along the way, and fixed.** While the disk is beyond `max-disk-usage`, Artemis refuses a send from a connection without flow control (`ServerSessionImpl.send`, `AMQ229119`) and fails the connection; Saranga accepted it. Now it does the same, checked against Artemis 2.57.0 on a disk past 90%:
+    - STOMP: the ERROR carrying `AMQ229119`, then the SEND's own ERROR (`AMQ339011`) with its receipt, then the connection closes, with Artemis's `AMQ222067`, `AMQ222061` and `AMQ222107` lines;
+    - MQTT: the connection closes without a PUBACK;
+    - management's `sendMessage` on an address or queue: `IllegalStateException` with the `AMQ229119` text, whatever the address's `disk-full-policy`.
+
+    Core, AMQP and OpenWire have flow control, so they are blocked or refused by the address's policy as before.
 
 ---
 

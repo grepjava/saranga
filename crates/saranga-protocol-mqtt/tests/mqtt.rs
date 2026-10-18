@@ -211,3 +211,41 @@ async fn session_and_packet_ids_survive_a_restart() {
     let (_, _, payload) = parse_publish(&sub.packet().await.unwrap());
     assert_eq!(payload, b"m2");
 }
+
+/// While the disk is full a PUBLISH fails the connection, as MQTT has no
+/// flow control to hold the client back: it closes, unacknowledged.
+#[tokio::test]
+async fn a_publish_while_the_disk_is_full_closes_the_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = cfg::BrokerConfig::parse(
+        r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+             <persistence-enabled>true</persistence-enabled>
+             <min-disk-free>1000000000000000000</min-disk-free>
+             <disk-scan-period>50</disk-scan-period>
+           </core></configuration>"#,
+    )
+    .unwrap();
+    let mut config =
+        BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path()).unwrap();
+    config.protocols = vec![Arc::new(MqttProtocol::default())];
+    let broker = Broker::start(config).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(broker.clone().serve_acceptor(listener, Acceptor::default()));
+    for _ in 0..100 {
+        if broker.post_office().paging().is_disk_full() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(broker.post_office().paging().is_disk_full());
+
+    let (mut publisher, connack) = Client::open(address, "full", true).await;
+    assert_eq!(connack, vec![0x20, 2, 0, 0]);
+    let mut body = string("full/t");
+    body.extend(1u16.to_be_bytes());
+    body.extend_from_slice(b"m");
+    publisher.send(&packet(0x32, &body)).await;
+    assert_eq!(publisher.packet().await, None, "closed without a PUBACK");
+    broker.stop().unwrap();
+}

@@ -1248,6 +1248,10 @@ fn error_type(operation: &str, message: &str) -> &'static str {
         "addAddressSettings",
         "createBridge",
     ];
+    // The address's and queue's sendMessage rethrow whatever they catch.
+    if operation == "sendMessage" {
+        return "java.lang.IllegalStateException";
+    }
     let class = message
         .strip_prefix("AMQ")
         .and_then(|m| m.get(..6))
@@ -1291,6 +1295,11 @@ mod tests {
         // deleteAddress rethrows as IllegalStateException.
         assert_eq!(
             error_type("deleteAddress", "AMQ229203: Address Does Not Exist: a"),
+            "java.lang.IllegalStateException"
+        );
+        // So do the address's and queue's sendMessage, whatever the cause.
+        assert_eq!(
+            error_type("sendMessage", "AMQ229119: Free storage space is at"),
             "java.lang.IllegalStateException"
         );
         assert_eq!(

@@ -349,7 +349,7 @@ pub(super) async fn send(
         None => Default::default(),
     };
     let conn = Arc::new(crate::session::ClientConnection::new(
-        crate::session::Transport::internal("management"),
+        crate::session::Transport::management(),
         info,
         Vec::new(),
     ));

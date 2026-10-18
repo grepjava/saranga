@@ -216,3 +216,57 @@ async fn version_errors() {
     );
     assert!(text.ends_with("Supported protocol versions are v1.0 v1.1 v1.2\0\n"));
 }
+
+/// While the disk is full a SEND fails the connection, as STOMP has no
+/// flow control to hold the client back: the ERROR it failed with, the
+/// SEND's own ERROR with its receipt, and the connection closes.
+#[tokio::test]
+async fn a_send_while_the_disk_is_full_fails_the_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = saranga_config::BrokerConfig::parse(
+        r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+             <persistence-enabled>true</persistence-enabled>
+             <min-disk-free>1000000000000000000</min-disk-free>
+             <disk-scan-period>50</disk-scan-period>
+           </core></configuration>"#,
+    )
+    .unwrap();
+    let mut config =
+        BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path()).unwrap();
+    config.protocols = vec![Arc::new(StompProtocol)];
+    let broker = Broker::start(config).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(broker.clone().serve_acceptor(listener, Acceptor::default()));
+    for _ in 0..100 {
+        if broker.post_office().paging().is_disk_full() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(broker.post_office().paging().is_disk_full());
+
+    let mut c = Client::connect(address, "1.2").await;
+    c.send("SEND\ndestination:full\nreceipt:r1\n\nhello").await;
+    let failure = c.frame().await;
+    assert!(failure.starts_with("ERROR\n"), "{failure}");
+    assert!(
+        header(&failure, "message")
+            .is_some_and(|m| m.starts_with(r"AMQ229119\c Free storage space is at ")),
+        "{failure}"
+    );
+    assert_eq!(header(&failure, "receipt-id"), None);
+    let error = c.frame().await;
+    assert!(
+        header(&error, "message").is_some_and(|m| m.starts_with("AMQ339011 Error sending message")),
+        "{error}"
+    );
+    assert_eq!(header(&error, "receipt-id"), Some("r1"));
+    let mut chunk = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), c.stream.read(&mut chunk))
+        .await
+        .expect("closed within 5 s")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "the connection closed");
+    broker.stop().unwrap();
+}
