@@ -114,7 +114,7 @@ Where Saranga differs:
 
 - Only Artemis's MBeans exist, plus hawtio's permission checks and five platform MBeans (see below). There are no other `java.lang`, `java.nio`, `JMImplementation`, `jdk.management`, `com.sun.management` or `jolokia` MBeans.
 - A failed operation answers status 500 with the error type Artemis's message bundles give its AMQ code. A failure without an AMQ code answers `java.lang.Exception`.
-- `listCache` is ignored, and `list` gives no constructors.
+- `listCache` is ignored.
 
 See [COMPAT.md, Web server differences](../../COMPAT.md#web-server-differences).
 

@@ -1,11 +1,13 @@
 //! The JDK's platform MXBeans in `java.lang`, as Artemis 2.57.0 on OpenJDK
 //! 25 lists them (generated from its `list` answers). On Unix,
-//! `OperatingSystem` has the two file descriptor counts too.
+//! `OperatingSystem` has the two file descriptor counts too. MXBeans list no
+//! constructors.
 
 use crate::mbean::{Attr, Control, Op, Param};
 
 pub static RUNTIME: Control = Control {
     interface: "RuntimeMXBean",
+    ctors: &[],
     attrs: &[
         Attr {
             name: "BootClassPath",
@@ -157,6 +159,7 @@ pub static RUNTIME: Control = Control {
 
 pub static MEMORY: Control = Control {
     interface: "MemoryMXBean",
+    ctors: &[],
     attrs: &[
         Attr {
             name: "HeapMemoryUsage",
@@ -211,6 +214,7 @@ pub static MEMORY: Control = Control {
 #[cfg(not(unix))]
 pub static OPERATING_SYSTEM: Control = Control {
     interface: "OperatingSystemMXBean",
+    ctors: &[],
     attrs: &[
         Attr {
             name: "Arch",
@@ -355,6 +359,7 @@ pub static OPERATING_SYSTEM: Control = Control {
 #[cfg(unix)]
 pub static OPERATING_SYSTEM: Control = Control {
     interface: "OperatingSystemMXBean",
+    ctors: &[],
     attrs: &[
         Attr {
             name: "Arch",
@@ -514,6 +519,7 @@ pub static OPERATING_SYSTEM: Control = Control {
 
 pub static THREADING: Control = Control {
     interface: "ThreadMXBean",
+    ctors: &[],
     attrs: &[
         Attr {
             name: "AllThreadIds",
@@ -911,6 +917,7 @@ pub static THREADING: Control = Control {
 
 pub static CLASS_LOADING: Control = Control {
     interface: "ClassLoadingMXBean",
+    ctors: &[],
     attrs: &[
         Attr {
             name: "LoadedClassCount",

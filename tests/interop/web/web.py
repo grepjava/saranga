@@ -82,7 +82,7 @@ def normalize(v):
     if isinstance(v, dict):
         out = {}
         for k, x in v.items():
-            if k in ("canInvoke", "canRead", "canWrite", "ctor"):
+            if k in ("canInvoke", "canRead", "canWrite"):
                 continue
             if k in ("agent_id", "id", "agentId", "url"):
                 x = "#"
@@ -119,6 +119,8 @@ COMPARED = [
     ("list queue", "/list/org.apache.activemq.artemis/" + q('address="DLQ",broker="0.0.0.0",component=addresses,queue="DLQ",routing-type="anycast",subcomponent=queues')),
     ("list address", "/list/org.apache.activemq.artemis/" + q('address="DLQ",broker="0.0.0.0",component=addresses')),
     ("list too deep", "/list/org.apache.activemq.artemis/" + q('broker="0.0.0.0"') + "/attr/Version"),
+    ("list constructor", "/list/org.apache.activemq.artemis/" + q('broker="0.0.0.0"') + "/ctor"),
+    ("list hawtio security", "/list/hawtio/" + q("area=jmx,name=ArtemisJMXSecurity,type=security")),
     ("unknown type", "/nope/x"),
 ]
 
@@ -134,6 +136,13 @@ if ARTEMIS:
         theirs = normalize(j(ARTEMIS, path, ARTEMIS_AUTH))
         check("artemis: " + name, mine == theirs,
               f"\n  saranga {json.dumps(mine)[:1500]}\n  artemis {json.dumps(theirs)[:1500]}")
+    # An MBean's parts are listed in Jolokia's order (op, canInvoke, ctor,
+    # opByString, attr, class, desc), each only where the MBean has some.
+    for name, path in COMPARED:
+        if name.startswith("list ") and path.count("/") == 3:
+            keys = lambda base, auth: list((j(base, path, auth).get("value") or {}).keys())
+            mine, theirs = keys(SARANGA, SARANGA_AUTH), keys(ARTEMIS, ARTEMIS_AUTH)
+            check("artemis: order of " + name, mine == theirs, f"saranga {mine} artemis {theirs}")
     for name, body in POSTED:
         mine = normalize(j(SARANGA, "", SARANGA_AUTH, body))
         theirs = normalize(j(ARTEMIS, "", ARTEMIS_AUTH, body))
@@ -186,6 +195,9 @@ MBEAN_STEPS = [
     ("exec removeAllMessages", "/exec/" + q(CMP_QUEUE) + "/removeAllMessages()", None),
     ("exec destroyQueue", "/exec/" + q(BROKER) + "/destroyQueue(java.lang.String)/web.cmp", None),
     ("read destroyed queue", "/read/" + q(CMP_QUEUE) + "/MessageCount", None),
+    # Left behind, the address would show in the next run's searches of an
+    # Artemis that is not a new container (ARTEMIS_WEB_URL).
+    ("exec deleteAddress", "/exec/" + q(BROKER) + "/deleteAddress(java.lang.String)/web.cmp", None),
 ]
 
 

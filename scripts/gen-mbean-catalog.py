@@ -2,7 +2,9 @@
 """Generates crates/saranga-management/src/catalog.rs: the attributes and
 operations of the Artemis management MBeans, as MBeanInfoHelper builds
 their MBeanInfo from the control interfaces (artemis-core-client's
-api/core/management/*Control.java).
+api/core/management/*Control.java), and the public constructors of the
+classes implementing them (artemis-server's *ControlImpl.java), which
+StandardMBean lists in the MBeanInfo too.
 
     python3 scripts/gen-mbean-catalog.py
 
@@ -13,6 +15,8 @@ api/core/management/*Control.java).
 - Every other method is an operation, described by @Operation (or its name)
   with its impact, and parameters named by @Parameter (or "p N").
 - Types are written as Class.getName writes them.
+- A constructor's parameters are its types alone: StandardMBean names them
+  p1, p2... with no description.
 """
 
 import os
@@ -22,6 +26,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "reference", "activemq-artemis", "artemis-core-client", "src", "main",
                    "java", "org", "apache", "activemq", "artemis", "api", "core", "management")
+SERVER = os.path.join(ROOT, "reference", "activemq-artemis", "artemis-server", "src", "main", "java")
 OUT = os.path.join(ROOT, "crates", "saranga-management", "src", "catalog.rs")
 
 # The MBeans Saranga has resources for.
@@ -36,6 +41,12 @@ CONTROLS = [
     ("BROKER_CONNECTION", "BrokerConnectionControl"),
     ("CLUSTER_CONNECTION", "ClusterConnectionControl"),
 ]
+
+# The classes implementing them, in artemis-server, and hawtio's
+# HawtioSecurityControl, whose catalog is mbean.rs's.
+IMPLS = {iface: "org.apache.activemq.artemis.core.management.impl." + iface + "Impl"
+         for _, iface in CONTROLS}
+HAWTIO_SECURITY_IMPL = "org.apache.activemq.artemis.core.server.management.impl.HawtioSecurityControlImpl"
 
 IMPACT = {"MBeanOperationInfo.INFO": 0, "MBeanOperationInfo.ACTION": 1,
           "MBeanOperationInfo.ACTION_INFO": 2, "MBeanOperationInfo.UNKNOWN": 3}
@@ -286,6 +297,56 @@ def parse_interface(name, seen=None):
     return methods
 
 
+def constructors(impl):
+    """The public constructors of a class, as Class.getConstructors gives
+    them (in declaration order): each as its parameters' types."""
+    path = os.path.join(SERVER, *impl.split(".")) + ".java"
+    text = strip_comments(open(path, encoding="utf-8").read())
+    package = impl.rsplit(".", 1)[0]
+    simple = impl.rsplit(".", 1)[1]
+    imports = {m.group(1).rsplit(".", 1)[1]: m.group(1)
+               for m in re.finditer(r"^\s*import\s+([\w.]+)\s*;", text, re.M)}
+
+    def resolve(t):
+        t = re.sub(r"<.*>", "", t.strip()).replace("...", "[]")
+        dims = t.count("[]")
+        base = t.replace("[]", "").strip()
+        if base in PRIMITIVES:
+            full = base
+        elif "." in base:
+            full = base
+        elif base in imports:
+            full = imports[base]
+        elif os.path.exists(os.path.join(SERVER, *package.split("."), base + ".java")):
+            full = f"{package}.{base}"
+        else:
+            full = f"java.lang.{base}"
+        if dims == 0:
+            return full
+        return "[" * dims + (PRIMITIVES.get(full) or f"L{full};")
+
+    out = []
+    for m in re.finditer(r"\bpublic\s+" + simple + r"\s*\(", text):
+        start = m.end()
+        depth, k = 1, start
+        while depth:
+            depth += {"(": 1, ")": -1}.get(text[k], 0)
+            k += 1
+        params = strip_annotations(text[start:k - 1])
+        types = []
+        for p in split_params(params):
+            p = re.sub(r"\bfinal\b", "", p).strip()
+            types.append(resolve(p.rsplit(None, 1)[0]))
+        out.append(types)
+    if not out:
+        sys.exit(f"{impl}: no public constructor")
+    return out
+
+
+def rust_ctors(ctors):
+    return "&[" + ", ".join("&[" + ", ".join(rust_str(t) for t in c) + "]" for c in ctors) + "]"
+
+
 def is_getter(m):
     return m["name"] != "get" and m["name"].startswith("get") and not m["params"] and m["ret"] != "void"
 
@@ -361,6 +422,7 @@ def main():
         out.append(f"/// `{iface}`.")
         out.append(f"pub static {const}: Control = Control {{")
         out.append(f"    interface: {rust_str(iface)},")
+        out.append(f"    ctors: {rust_ctors(constructors(IMPLS[iface]))},")
         out.append("    attrs: &[")
         for n in order:
             a = attrs[n]
@@ -375,6 +437,9 @@ def main():
         out.append("};")
         out.append("")
         print(f"{iface}: {len(order)} attributes, {len(ops)} operations", file=sys.stderr)
+    out.append(f"/// The public constructors of `{HAWTIO_SECURITY_IMPL.rsplit('.', 1)[1]}`.")
+    out.append(f"pub static HAWTIO_SECURITY_CTORS: &[&[&str]] = {rust_ctors(constructors(HAWTIO_SECURITY_IMPL))};")
+    out.append("")
     with open(OUT, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(out))
 

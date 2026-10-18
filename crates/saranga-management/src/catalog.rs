@@ -6,6 +6,16 @@ use crate::mbean::{Attr, Control, Op, Param};
 /// `ActiveMQServerControl`.
 pub static BROKER: Control = Control {
     interface: "ActiveMQServerControl",
+    ctors: &[&[
+        "org.apache.activemq.artemis.core.postoffice.PostOffice",
+        "org.apache.activemq.artemis.core.config.Configuration",
+        "org.apache.activemq.artemis.core.transaction.ResourceManager",
+        "org.apache.activemq.artemis.core.remoting.server.RemotingService",
+        "org.apache.activemq.artemis.core.server.ActiveMQServer",
+        "org.apache.activemq.artemis.core.messagecounter.MessageCounterManager",
+        "org.apache.activemq.artemis.core.persistence.StorageManager",
+        "javax.management.NotificationBroadcasterSupport",
+    ]],
     attrs: &[
         Attr {
             name: "AddressMemoryUsage",
@@ -4819,6 +4829,15 @@ pub static BROKER: Control = Control {
 /// `AddressControl`.
 pub static ADDRESS: Control = Control {
     interface: "AddressControl",
+    ctors: &[&[
+        "org.apache.activemq.artemis.core.server.impl.AddressInfo",
+        "org.apache.activemq.artemis.core.server.ActiveMQServer",
+        "org.apache.activemq.artemis.core.paging.PagingManager",
+        "org.apache.activemq.artemis.core.persistence.StorageManager",
+        "org.apache.activemq.artemis.core.settings.HierarchicalRepository",
+        "org.apache.activemq.artemis.core.security.SecurityStore",
+        "org.apache.activemq.artemis.core.server.management.ManagementService",
+    ]],
     attrs: &[
         Attr {
             name: "Address",
@@ -5263,6 +5282,13 @@ pub static ADDRESS: Control = Control {
 /// `QueueControl`.
 pub static QUEUE: Control = Control {
     interface: "QueueControl",
+    ctors: &[&[
+        "org.apache.activemq.artemis.core.server.Queue",
+        "java.lang.String",
+        "org.apache.activemq.artemis.core.server.ActiveMQServer",
+        "org.apache.activemq.artemis.core.persistence.StorageManager",
+        "org.apache.activemq.artemis.core.settings.HierarchicalRepository",
+    ]],
     attrs: &[
         Attr {
             name: "ConfigurationManaged",
@@ -6437,6 +6463,11 @@ pub static QUEUE: Control = Control {
 /// `DivertControl`.
 pub static DIVERT: Control = Control {
     interface: "DivertControl",
+    ctors: &[&[
+        "org.apache.activemq.artemis.core.server.Divert",
+        "org.apache.activemq.artemis.core.persistence.StorageManager",
+        "java.lang.String",
+    ]],
     attrs: &[
         Attr {
             name: "Filter",
@@ -6533,6 +6564,11 @@ pub static DIVERT: Control = Control {
 /// `AcceptorControl`.
 pub static ACCEPTOR: Control = Control {
     interface: "AcceptorControl",
+    ctors: &[&[
+        "org.apache.activemq.artemis.spi.core.remoting.Acceptor",
+        "org.apache.activemq.artemis.core.persistence.StorageManager",
+        "org.apache.activemq.artemis.api.core.TransportConfiguration",
+    ]],
     attrs: &[
         Attr {
             name: "FactoryClassName",
@@ -6595,6 +6631,12 @@ pub static ACCEPTOR: Control = Control {
 /// `BroadcastGroupControl`.
 pub static BROADCAST_GROUP: Control = Control {
     interface: "BroadcastGroupControl",
+    ctors: &[&[
+        "org.apache.activemq.artemis.core.server.cluster.BroadcastGroup",
+        "org.apache.activemq.artemis.core.persistence.StorageManager",
+        "org.apache.activemq.artemis.api.core.BroadcastGroupConfiguration",
+        "org.apache.activemq.artemis.api.core.UDPBroadcastEndpointFactory",
+    ]],
     attrs: &[
         Attr {
             name: "LocalBindPort",
@@ -6682,6 +6724,10 @@ pub static BROADCAST_GROUP: Control = Control {
 /// `BridgeControl`.
 pub static BRIDGE: Control = Control {
     interface: "BridgeControl",
+    ctors: &[&[
+        "org.apache.activemq.artemis.core.server.cluster.Bridge",
+        "org.apache.activemq.artemis.core.persistence.StorageManager",
+    ]],
     attrs: &[
         Attr {
             name: "Name",
@@ -6865,6 +6911,10 @@ pub static BRIDGE: Control = Control {
 /// `BrokerConnectionControl`.
 pub static BROKER_CONNECTION: Control = Control {
     interface: "BrokerConnectionControl",
+    ctors: &[&[
+        "org.apache.activemq.artemis.core.server.BrokerConnection",
+        "org.apache.activemq.artemis.core.persistence.StorageManager",
+    ]],
     attrs: &[
         Attr {
             name: "Connected",
@@ -6952,6 +7002,11 @@ pub static BROKER_CONNECTION: Control = Control {
 /// `ClusterConnectionControl`.
 pub static CLUSTER_CONNECTION: Control = Control {
     interface: "ClusterConnectionControl",
+    ctors: &[&[
+        "org.apache.activemq.artemis.core.server.cluster.ClusterConnection",
+        "org.apache.activemq.artemis.core.persistence.StorageManager",
+        "org.apache.activemq.artemis.core.config.ClusterConnectionConfiguration",
+    ]],
     attrs: &[
         Attr {
             name: "Started",
@@ -7118,3 +7173,9 @@ pub static CLUSTER_CONNECTION: Control = Control {
         },
     ],
 };
+
+/// The public constructors of `HawtioSecurityControlImpl`.
+pub static HAWTIO_SECURITY_CTORS: &[&[&str]] = &[&[
+    "org.apache.activemq.artemis.core.server.management.GuardInvocationHandler",
+    "org.apache.activemq.artemis.core.persistence.StorageManager",
+]];

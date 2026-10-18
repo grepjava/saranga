@@ -642,6 +642,7 @@ The differences from Artemis are listed in COMPAT.md.
   - each connection has its `ClusterConnectionControl`. `ClusterConnectionNames` lists them in Java hash order, `listNetworkTopology` covers them all, and `Clustered` is true when any is configured.
 
   [multi.sh](tests/interop/cluster/multi.sh) runs two nodes with two cluster connections: `orders-cluster` in XML (`ON_DEMAND`) and `news-cluster` as a `<cluster-connection-uri>` (`STRICT`, `maxHops=1`), with a `local` queue that neither connection covers. It checks both controls, the topology and where each address's messages go, and it was recorded with Artemis. It passes in all four pairings. So do the HA suites (20 of 20 runs) and every cluster driver suite (45 of 45 runs).
+- Jolokia's `list` gives each MBean's constructors (`ctor`), the gap the ClusterConnectionControl work found. As `StandardMBean` does, it lists the implementing class's public constructors, keyed by the class, with their parameters named `p1`, `p2`… and no description. `gen-mbean-catalog.py` reads them from the `*ControlImpl` sources, and the platform MXBeans have none. Jolokia leaves out the parts an MBean has none of, so `HawtioSecurityControl` has no `attr`, and the parts come in Jolokia's order. The web suite compares a `list` down to `ctor`, hawtio's security MBean and the key order of every listed MBean with Artemis's.
 
 ---
 

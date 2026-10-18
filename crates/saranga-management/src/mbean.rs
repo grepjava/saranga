@@ -13,6 +13,9 @@ pub struct Control {
     /// The Java interface, for the record.
     #[allow(dead_code)]
     pub interface: &'static str,
+    /// The public constructors of the class implementing it, each as its
+    /// parameters' types, which `StandardMBean` lists in the MBeanInfo.
+    pub ctors: &'static [&'static [&'static str]],
     pub attrs: &'static [Attr],
     pub ops: &'static [Op],
 }
@@ -502,6 +505,7 @@ pub fn registered(
 /// (`hawtio:type=security,area=jmx,name=ArtemisJMXSecurity`).
 pub static HAWTIO_SECURITY_CONTROL: Control = Control {
     interface: "HawtioSecurityControl",
+    ctors: crate::catalog::HAWTIO_SECURITY_CTORS,
     attrs: &[],
     ops: &[
         Op {

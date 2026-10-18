@@ -1114,16 +1114,55 @@ impl Agent {
             j.put("desc", a.desc);
             attrs.put(a.name, j);
         }
-        Json::object()
-            .with("op", ops)
-            .with("canInvoke", true)
-            .with("opByString", by_string)
-            .with("attr", attrs)
-            .with("class", bean.class_name())
-            .with(
-                "desc",
-                "Information on the management interface of the MBean",
-            )
+        // StandardMBean lists the implementing class's public constructors,
+        // their parameters named p1, p2... with no description.
+        let ctor_json = |types: &[&str]| {
+            Json::object()
+                .with(
+                    "args",
+                    Json::Array(
+                        types
+                            .iter()
+                            .enumerate()
+                            .map(|(i, t)| {
+                                Json::object()
+                                    .with("name", format!("p{}", i + 1))
+                                    .with("type", *t)
+                                    .with("desc", "")
+                            })
+                            .collect(),
+                    ),
+                )
+                .with("desc", "Public constructor of the MBean")
+        };
+        let mut ctors = Json::object();
+        match control.ctors {
+            [] => {}
+            [one] => ctors.put(bean.class_name(), ctor_json(one)),
+            many => ctors.put(
+                bean.class_name(),
+                Json::Array(many.iter().map(|c| ctor_json(c)).collect()),
+            ),
+        }
+        // Jolokia leaves out the parts an MBean has none of.
+        let mut info = Json::object();
+        if !control.ops.is_empty() {
+            info.put("op", ops);
+        }
+        info.put("canInvoke", true);
+        if !control.ctors.is_empty() {
+            info.put("ctor", ctors);
+        }
+        if !control.ops.is_empty() {
+            info.put("opByString", by_string);
+        }
+        if !control.attrs.is_empty() {
+            info.put("attr", attrs);
+        }
+        info.with("class", bean.class_name()).with(
+            "desc",
+            "Information on the management interface of the MBean",
+        )
     }
 }
 
