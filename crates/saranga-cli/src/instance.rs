@@ -117,9 +117,12 @@ impl Instance {
         let slash = |p: &Path| p.display().to_string().replace('\\', "/");
         let mut properties = HashMap::new();
         properties.insert("artemis.instance", slash(&dir));
+        // bin/artemis passes the profile's ARTEMIS_HOME on.
         properties.insert(
             "artemis.home",
-            std::env::var("ARTEMIS_HOME").unwrap_or_else(|_| slash(&dir)),
+            crate::create::saranga_home()
+                .map(|h| slash(&h))
+                .unwrap_or_else(|_| slash(&dir)),
         );
         properties.insert("artemis.instance.etc", slash(&etc));
         properties.insert("artemis.URI.instance", uri_path(&dir));

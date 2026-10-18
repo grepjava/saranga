@@ -2,3 +2,4 @@
 /reference
 /.claude
 tests/golden/data/
+/dist

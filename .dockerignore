@@ -1,0 +1,10 @@
+.git
+.github
+.vscode
+target
+reference
+output
+fuzz/corpus
+fuzz/artifacts
+fuzz/*.log
+tests/interop/clients/dotnet/obj

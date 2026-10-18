@@ -1,0 +1,151 @@
+name: release
+# A tag v<version> releases Saranga: the binaries, packaged as homes by
+# scripts/package.sh, with SHA256SUMS; the container image (docker/) for
+# amd64 and arm64 on ghcr.io; and a GitHub release whose notes are the
+# version's section of CHANGELOG.md. Run by hand, it builds everything and
+# publishes nothing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/saranga
+  PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  # The tag names the workspace's version, and the changelog dates it.
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$PUBLISH" == true ]]; then
+            [[ "$GITHUB_REF_NAME" == "v$version" ]] || { echo "::error::tag $GITHUB_REF_NAME is not v$version"; exit 1; }
+            grep -qE "^## $version \([0-9]{4}-[0-9]{2}-[0-9]{2}\)$" CHANGELOG.md \
+              || { echo "::error::CHANGELOG.md has no dated section for $version"; exit 1; }
+          fi
+
+  # Both Linux binaries, against glibc 2.28, as scripts/build-linux.sh
+  # builds them anywhere.
+  linux:
+    needs: check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/build-linux.sh
+      - run: target/x86_64-unknown-linux-gnu/release/saranga version
+      - id: package
+        run: |
+          {
+            echo "archives<<EOF"
+            scripts/package.sh x86_64-unknown-linux-gnu
+            scripts/package.sh aarch64-unknown-linux-gnu
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: saranga-linux
+          path: ${{ steps.package.outputs.archives }}
+          if-no-files-found: error
+
+  binaries:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-pc-windows-msvc, os: windows-2022 }
+          - { target: aarch64-apple-darwin, os: macos-14 }
+          - { target: x86_64-apple-darwin, os: macos-14 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # rustup installs the toolchain rust-toolchain.toml pins.
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked -p saranga-cli --target ${{ matrix.target }}
+      - name: Check the binary
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: target/${{ matrix.target }}/release/saranga version
+      - id: package
+        shell: bash
+        run: echo "archive=$(scripts/package.sh ${{ matrix.target }})" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: saranga-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  image:
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, os: ubuntu-24.04 }
+          - { arch: arm64, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build -f docker/Dockerfile -t "$IMAGE:${{ needs.check.outputs.version }}-${{ matrix.arch }}" .
+      - name: Check the image
+        run: |
+          tag="$IMAGE:${{ needs.check.outputs.version }}-${{ matrix.arch }}"
+          docker run -d --name saranga -p 61616:61616 "$tag"
+          for _ in $(seq 1 60); do docker logs saranga 2>&1 | grep -q AMQ221007 && break; sleep 1; done
+          docker logs saranga
+          docker logs saranga 2>&1 | grep -q AMQ221007
+          docker exec saranga ./bin/artemis queue stat --user artemis --password artemis
+          docker rm -f saranga
+      - name: Push
+        if: env.PUBLISH == 'true'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE:${{ needs.check.outputs.version }}-${{ matrix.arch }}"
+
+  # One tag for both architectures, and latest.
+  manifest:
+    needs: [check, image]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          v="${{ needs.check.outputs.version }}"
+          docker buildx imagetools create -t "$IMAGE:$v" -t "$IMAGE:latest" "$IMAGE:$v-amd64" "$IMAGE:$v-arm64"
+
+  release:
+    needs: [check, linux, binaries, manifest]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and notes
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS)
+          v="${{ needs.check.outputs.version }}"
+          awk -v h="^## $v " '$0 ~ h {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md
+          echo "Container image: \`$IMAGE:$v\`" >> notes.md
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "Saranga ${{ needs.check.outputs.version }}" --notes-file notes.md dist/*

@@ -1,6 +1,41 @@
 # Getting started
 
-This page takes you from the source tree to a running broker: building the `saranga` binary, creating a broker instance, starting it, sending and receiving a few messages with the CLI, and stopping it again. Saranga is inspired by Apache ActiveMQ Artemis 2.57.0 and works interchangeably with it, so an instance looks and behaves like one made by `artemis create`: the same `etc/` files, the same `bin/artemis` script, the same ports. If you know Artemis, most of this page will be familiar; the notes say where Saranga differs.
+This page takes you from a release or the source tree to a running broker: installing or building the `saranga` binary, creating a broker instance, starting it, sending and receiving a few messages with the CLI, and stopping it again. Saranga is inspired by Apache ActiveMQ Artemis 2.57.0 and works interchangeably with it, so an instance looks and behaves like one made by `artemis create`: the same `etc/` files, the same `bin/artemis` script, the same ports. If you know Artemis, most of this page will be familiar; the notes say where Saranga differs.
+
+## Installing a release
+
+Each release on GitHub has an archive for Linux (x86_64 and aarch64), Windows (x86_64) and macOS (x86_64 and aarch64), with `SHA256SUMS` to check them. An archive is a Saranga home, laid out as an Artemis home is:
+
+```
+saranga-1.0.0-x86_64-unknown-linux-gnu/
+  bin/saranga
+  web/                 where Artemis's console.war goes (see README.txt there)
+  docs/guide/  docs/benchmarks.md
+  CHANGELOG.md  COMPAT.md  LICENSE  NOTICE  README.md
+```
+
+```bash
+tar xzf saranga-1.0.0-x86_64-unknown-linux-gnu.tar.gz -C /opt
+/opt/saranga-1.0.0-x86_64-unknown-linux-gnu/bin/saranga version
+```
+
+The Linux binaries need glibc 2.28 or later (RHEL 8, Debian 10, Ubuntu 18.04 and later). On Windows, unzip the `.zip` and run `bin\saranga.exe`.
+
+## Running in a container
+
+The image is laid out as Artemis's: the home is `/opt/saranga`, and on its first start the container makes a broker instance in the `/var/lib/artemis-instance` volume. It uses the same variables as Artemis's image: `ARTEMIS_USER` and `ARTEMIS_PASSWORD` (both `artemis`), `ANONYMOUS_LOGIN` (`false`) and `EXTRA_ARGS` (`--http-host 0.0.0.0 --relax-jolokia`), passed to `saranga create`. Files in the instance's `etc-override` directory are copied over its `etc` once it has been made, and the container runs the instance's `bin/artemis` with its arguments, `run` by default.
+
+```bash
+docker run -d --name saranga -p 61616:61616 -p 8161:8161 ghcr.io/grepjava/saranga:1.0.0
+```
+
+It exposes Artemis's ports: 61616 (all protocols), 5445 (HornetQ and STOMP), 5672 (AMQP), 1883 (MQTT), 61613 (STOMP) and 8161 (HTTP). To build the image yourself:
+
+```bash
+docker build -f docker/Dockerfile -t saranga .
+```
+
+Saranga ships no web console. To have Artemis's, mount its `console.war` at `/opt/saranga/web/console.war`.
 
 ## Building
 
@@ -17,7 +52,7 @@ target/release/saranga version
 ```
 
 ```
-Saranga 0.0.1 (Apache Artemis 2.57.0)
+Saranga 1.0.0 (Apache Artemis 2.57.0)
 Saranga home: /home/me/saranga/target
 Saranga instance: null
 ```
@@ -79,7 +114,7 @@ The log goes to the console and to `log/artemis.log`, in Artemis's format and wi
 
 ```
 AMQ221007: Server is now active
-AMQ221001: Saranga Message Broker version 0.0.1 [0.0.0.0, nodeID=4ba9e790-...]
+AMQ221001: Saranga Message Broker version 1.0.0 [0.0.0.0, nodeID=4ba9e790-...]
 ```
 
 A fresh instance listens on the same ports as an Artemis instance: 61616 for every protocol, 5672 for AMQP, 61613 for STOMP, 5445 for the HornetQ acceptor, 1883 for MQTT, and 8161 for the web server, Jolokia and the REST API. One warning is expected on a fresh instance: `The console's pages are not served: no console.war in ...`. Saranga ships no web console of its own. Jolokia and the REST API are served anyway. [Management](management.md#the-web-console) explains how to serve Artemis's console.

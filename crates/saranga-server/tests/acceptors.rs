@@ -39,6 +39,24 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// A Core PING on channel 0 (length, type 10, channel 0, connection TTL),
+/// answered by the broker.
+async fn ping(s: &mut TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&17u32.to_be_bytes());
+    frame.push(10);
+    frame.extend_from_slice(&0i64.to_be_bytes());
+    frame.extend_from_slice(&60_000i64.to_be_bytes());
+    s.write_all(&frame).await.unwrap();
+    let mut reply = [0u8; 21];
+    tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut reply))
+        .await
+        .expect("the broker answers the ping")
+        .unwrap();
+    assert_eq!(&reply[..5], &frame[..5]);
+}
+
 async fn accepts(address: &str) -> bool {
     tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(address))
         .await
@@ -81,12 +99,18 @@ async fn management_stops_starts_and_reloads_an_acceptor() {
     // Starting a started acceptor does nothing.
     op(&broker, "start").await.unwrap();
 
-    // A reload binds again; connections stay.
-    let kept = TcpStream::connect(&address).await.unwrap();
+    // A reload binds again; connections stay. The ping before it makes sure
+    // the connection was accepted: one still in the listen backlog goes
+    // with the listener, in Netty too.
+    let mut kept = TcpStream::connect(&address).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut kept, b"ARTEMIS")
+        .await
+        .unwrap();
+    ping(&mut kept).await;
     op(&broker, "reload").await.unwrap();
     assert_eq!(started(&broker).await, Json::from(true));
     assert!(accepts(&address).await);
-    assert!(kept.peer_addr().is_ok());
+    ping(&mut kept).await;
 
     assert_eq!(
         op(&broker, "frobnicate").await,

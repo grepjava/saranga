@@ -1738,7 +1738,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-buffer"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "proptest",
@@ -1747,7 +1747,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-capture"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "tokio",
@@ -1755,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-chaos"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "tokio",
@@ -1763,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-cli"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1796,7 +1796,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-client"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "flate2",
  "saranga-buffer",
@@ -1816,11 +1816,11 @@ dependencies = [
 
 [[package]]
 name = "saranga-cluster"
-version = "0.0.1"
+version = "1.0.0"
 
 [[package]]
 name = "saranga-config"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "blowfish",
  "pbkdf2 0.12.2",
@@ -1835,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-core-protocol"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "flate2",
  "saranga-buffer",
@@ -1845,14 +1845,14 @@ dependencies = [
 
 [[package]]
 name = "saranga-fault"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "saranga-filter"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "saranga-buffer",
  "saranga-message",
@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-fuzz"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "flate2",
  "saranga-buffer",
@@ -1883,7 +1883,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-ha"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "libc",
  "tempfile",
@@ -1896,7 +1896,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-journal"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "flate2",
  "saranga-buffer",
@@ -1909,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-management"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "axum",
  "httpdate",
@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-message"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "saranga-buffer",
@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-paging"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "flate2",
  "saranga-buffer",
@@ -1948,7 +1948,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-protocol-amqp"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "saranga-buffer",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-protocol-mqtt"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "saranga-buffer",
  "saranga-config",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-protocol-openwire"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "flate2",
  "saranga-buffer",
@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-protocol-stomp"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "saranga-buffer",
  "saranga-config",
@@ -2025,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-security"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "ldap3",
  "p12-keystore",
@@ -2044,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-server"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "libc",
  "regex",
@@ -2072,7 +2072,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-storage"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "flate2",
  "saranga-buffer",
@@ -2087,7 +2087,7 @@ dependencies = [
 
 [[package]]
 name = "saranga-transport"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "regex",
  "rustls",

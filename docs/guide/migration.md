@@ -114,7 +114,7 @@ Saranga and Artemis brokers can be each other's HA partner and can share a clust
 
 ### A mixed HA pair
 
-A Saranga backup works with an Artemis primary, and an Artemis backup with a Saranga primary, in all three ways Artemis pairs them: shared store, replication with the quorum vote, and replication with the ZooKeeper lock manager. The broker locks are taken as Java takes them, so a Java broker and a Saranga broker exclude each other on one journal directory. [tests/interop/ha/no-loss.sh](../../tests/interop/ha/no-loss.sh) checks it in all four Artemis/Saranga pairings: the Artemis JMS client produces and consumes in transactions while the primary is killed, the backup takes over, and the restarted primary takes its node back. No committed message is lost or received twice. CI runs it with a Java primary and a Saranga backup, then the other way round.
+A Saranga backup works with an Artemis primary, and an Artemis backup with a Saranga primary, in all three ways Artemis pairs them: shared store, replication with the quorum vote, and replication with the ZooKeeper lock manager. The broker locks are taken as Java takes them, so a Java broker and a Saranga broker exclude each other on one journal directory. [tests/interop/ha/no-loss.sh](https://github.com/grepjava/saranga/blob/main/tests/interop/ha/no-loss.sh) checks it in all four Artemis/Saranga pairings: the Artemis JMS client produces and consumes in transactions while the primary is killed, the backup takes over, and the restarted primary takes its node back. No committed message is lost or received twice. CI runs it with a Java primary and a Saranga backup, then the other way round.
 
 With an Artemis HA pair already running, a move looks like this:
 
@@ -126,7 +126,7 @@ Clients keep going through the move only if they fail over: for the Artemis JMS 
 
 ### A mixed cluster
 
-Java and Saranga nodes work in one cluster: load balancing, redistribution, message grouping (either kind can be the `LOCAL` grouping node), topic subscriptions and the topology clients see. [tests/interop/cluster/mixed.sh](../../tests/interop/cluster/mixed.sh) runs a three-node cluster and stops and restarts a node while the others go on; the cluster bridges to it again when it comes back. Its output, recorded with Artemis on every node, matches with all three nodes Saranga and in four mixes of the two. Core and AMQP federation, core bridges, AMQP broker connections and mirroring also work between Java and Saranga in both directions ([scripts/cluster-interop.sh](../../scripts/cluster-interop.sh)).
+Java and Saranga nodes work in one cluster: load balancing, redistribution, message grouping (either kind can be the `LOCAL` grouping node), topic subscriptions and the topology clients see. [tests/interop/cluster/mixed.sh](https://github.com/grepjava/saranga/blob/main/tests/interop/cluster/mixed.sh) runs a three-node cluster and stops and restarts a node while the others go on; the cluster bridges to it again when it comes back. Its output, recorded with Artemis on every node, matches with all three nodes Saranga and in four mixes of the two. Core and AMQP federation, core bridges, AMQP broker connections and mirroring also work between Java and Saranga in both directions ([scripts/cluster-interop.sh](https://github.com/grepjava/saranga/blob/main/scripts/cluster-interop.sh)).
 
 To move a cluster, take one node at a time: stop it, `saranga upgrade` it, start it, and wait until the other nodes have bridged to it again before moving the next one. Messages held on a stopped node wait for it unless that node has an HA backup. See [clustering.md](clustering.md).
 
@@ -146,7 +146,7 @@ To move a cluster, take one node at a time: stop it, `saranga upgrade` it, start
 
 ## Clients
 
-Clients need no change. They connect to the same acceptors on the same ports and speak the same protocols. The client matrix of Phase 7 in [PHASES.md](../../PHASES.md#phase-7-protocols) passes against Artemis 2.57.0 and against Saranga:
+Clients need no change. They connect to the same acceptors on the same ports and speak the same protocols. The client matrix of Phase 7 in [PHASES.md](https://github.com/grepjava/saranga/blob/main/PHASES.md#phase-7-protocols) passes against Artemis 2.57.0 and against Saranga:
 
 - the Artemis JMS client (Core);
 - Qpid JMS (AMQP 1.0);
@@ -156,7 +156,7 @@ Clients need no change. They connect to the same acceptors on the same ports and
 - the Python (Qpid Proton), .NET (AMQPNetLite) and Rust (fe2o3-amqp) AMQP clients;
 - STOMP, MQTT and AMQP over WebSockets.
 
-A 1.x Artemis JMS client, which names queues `jms.queue.<name>` and topics `jms.topic.<name>`, works against an acceptor with those prefixes, as on Artemis (Phase 6 in [PHASES.md](../../PHASES.md#phase-6-config-and-security)).
+A 1.x Artemis JMS client, which names queues `jms.queue.<name>` and topics `jms.topic.<name>`, works against an acceptor with those prefixes, as on Artemis (Phase 6 in [PHASES.md](https://github.com/grepjava/saranga/blob/main/PHASES.md#phase-6-config-and-security)).
 
 Messages sent with one protocol are received with another as on Artemis. The protocol features Saranga does not have yet are listed per protocol in COMPAT.md; the ones most likely to matter are the AMQP SASL mechanisms SCRAM, GSSAPI, OAUTHBEARER and XOAUTH2 ([AMQP differences](../../COMPAT.md#amqp-differences)), Core over HTTP and WebSocket compression ([WebSocket differences](../../COMPAT.md#websocket-differences)), and address-full policies for OpenWire producers ([OpenWire differences](../../COMPAT.md#openwire-differences)). See [protocols.md](protocols.md).
 
@@ -164,7 +164,7 @@ A client that checks the broker's name sees Saranga's: the STOMP `server` header
 
 ## Going back to Artemis
 
-The data directory Saranga writes is readable by Artemis. The Phase 3 cross-store checks in [PHASES.md](../../PHASES.md#phase-3-persistence-on-disk-compatible-first-usable-release) move data directories from Saranga to Artemis and back, after a clean stop and after a kill, and Artemis's own journal code loads journals Saranga wrote. Address settings, diverts, paused queues and addresses, and the basic security manager's users are journaled as Artemis journals them, so they move too.
+The data directory Saranga writes is readable by Artemis. The Phase 3 cross-store checks in [PHASES.md](https://github.com/grepjava/saranga/blob/main/PHASES.md#phase-3-persistence-on-disk-compatible-first-usable-release) move data directories from Saranga to Artemis and back, after a clean stop and after a kill, and Artemis's own journal code loads journals Saranga wrote. Address settings, diverts, paused queues and addresses, and the basic security manager's users are journaled as Artemis journals them, so they move too.
 
 To move an instance back in place, stop Saranga and run Artemis's own `upgrade` on it:
 

@@ -55,17 +55,11 @@ fn hawtio_setting(instance: &Instance, name: &str) -> Option<String> {
 }
 
 /// The directories an app's `.war` is looked for in: the instance's
-/// `<web path>`, then the home's (`ARTEMIS_HOME`, else the directory
-/// above saranga's).
+/// `<web path>`, then the home's (`artemis.home`: `ARTEMIS_HOME`, else the
+/// directory above saranga's).
 fn web_dirs(instance: &Instance, web: &WebConfig) -> Vec<PathBuf> {
     let path = Path::new(&web.path);
-    let home = instance
-        .lookup("artemis.home")
-        .map(PathBuf::from)
-        .or_else(|| {
-            let exe = std::env::current_exe().ok()?;
-            Some(exe.parent()?.parent()?.to_path_buf())
-        });
+    let home = instance.lookup("artemis.home").map(PathBuf::from);
     let mut dirs = vec![instance.dir.join(path)];
     if let Some(home) = home {
         let d = home.join(path);

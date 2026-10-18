@@ -445,13 +445,9 @@ async fn run_client(command: Command) -> anyhow::Result<()> {
 /// `getBrokerHome`: `ARTEMIS_HOME`, as the scripts set it, else the
 /// directory above saranga's.
 fn broker_home() -> String {
-    std::env::var("ARTEMIS_HOME")
-        .ok()
-        .or_else(|| {
-            let exe = std::env::current_exe().ok()?;
-            Some(dunce_path(exe.parent()?.parent()?))
-        })
-        .unwrap_or_else(|| "null".to_owned())
+    create::saranga_home()
+        .map(|h| dunce_path(&h))
+        .unwrap_or_else(|_| "null".to_owned())
         .replace('\\', "/")
 }
 

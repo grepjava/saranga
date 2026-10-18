@@ -105,8 +105,8 @@ pub struct InstallArgs {
     /// relative to the instance directory. Default: data.
     #[arg(long, default_value = "data")]
     pub(crate) data: String,
-    /// Directory written as the profiles' ARTEMIS_HOME. Default: the
-    /// directory of this saranga.
+    /// Directory written as the profiles' ARTEMIS_HOME. Default:
+    /// ARTEMIS_HOME, else the directory above this saranga's.
     #[arg(long)]
     pub(crate) home: Option<PathBuf>,
     /// The encoding that text files should use. Default: UTF-8 (the only
@@ -1224,10 +1224,19 @@ pub(crate) fn file_uri(dir: &Path) -> String {
     format!("file:{encoded}")
 }
 
-/// The directory of this `saranga`, as the instance's home.
+/// The home, as Artemis's `artemis.home`: `ARTEMIS_HOME`, else the
+/// directory above the one holding this `saranga`, as an Artemis home holds
+/// `bin/artemis`.
 pub(crate) fn saranga_home() -> anyhow::Result<PathBuf> {
-    let exe = std::env::current_exe()?;
-    canonical(exe.parent().context("saranga has no directory")?)
+    if let Some(home) = std::env::var_os("ARTEMIS_HOME").filter(|h| !h.is_empty()) {
+        return Ok(PathBuf::from(home));
+    }
+    let exe = canonical(&std::env::current_exe()?)?;
+    Ok(exe
+        .parent()
+        .and_then(Path::parent)
+        .context("saranga has no directory above its own")?
+        .to_path_buf())
 }
 
 #[cfg(unix)]

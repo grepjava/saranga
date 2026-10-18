@@ -178,4 +178,4 @@ Each of these clients runs the same test suite against Artemis 2.57.0 and agains
 | MQTT | Eclipse Paho 1.2.5, for 3.1.1 and 5 |
 | WebSockets | Paho (`ws://`), Qpid JMS (`amqpws://`), STOMP and OpenWire |
 
-A conversion suite sends from each of Core JMS, Qpid JMS, the ActiveMQ 5 client, STOMP and MQTT 5 to each of them, 25 pairs in all. The suites are in [tests/interop](../../tests/interop), and Phase 7 in [PHASES.md](../../PHASES.md#phase-7-protocols) lists what each covers.
+A conversion suite sends from each of Core JMS, Qpid JMS, the ActiveMQ 5 client, STOMP and MQTT 5 to each of them, 25 pairs in all. The suites are in [tests/interop](https://github.com/grepjava/saranga/blob/main/tests/interop), and Phase 7 in [PHASES.md](https://github.com/grepjava/saranga/blob/main/PHASES.md#phase-7-protocols) lists what each covers.
