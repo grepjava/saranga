@@ -6,7 +6,7 @@
 
 Saranga is a message broker written in Rust, inspired by [Apache ActiveMQ Artemis](https://activemq.apache.org/components/artemis/) 2.57.0, and built to work interchangeably with it. It speaks the same wire protocols as Artemis: Core, AMQP 1.0, OpenWire, STOMP, MQTT 3.1.1 and 5, and WebSockets. It reads and writes the same journal, bindings, paging and large-message files, and takes the same `broker.xml`.
 
-It is in Phase 11 (hardening and 1.0) of the plan in [PHASES.md](PHASES.md). [COMPAT.md](COMPAT.md) has the pinned version and the deliberate differences.
+It is in Phase 11 (hardening and 1.0) of the plan in [PHASES.md](PHASES.md). [COMPAT.md](COMPAT.md) has the pinned version and the deliberate differences. The [user guide](docs/guide/README.md) covers installing, configuring and running it, and migrating from Artemis.
 
 ## The Name: Śārṅga
 

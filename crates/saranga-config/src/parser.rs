@@ -425,6 +425,10 @@ fn parse_core(
 /// `<core>` children Saranga reads but does not act on yet, and why.
 const NOT_ACTED_ON: &[(&str, &str)] = &[
     ("connection-routers", "connection routers are not supported"),
+    (
+        "lock-coordinators",
+        "lock coordinators are not supported yet",
+    ),
     ("metrics", "metrics are not supported yet"),
     ("metrics-plugin", "metrics are not supported yet"),
     (
@@ -436,7 +440,7 @@ const NOT_ACTED_ON: &[(&str, &str)] = &[
 /// `parseHAPolicyConfiguration`: the first of `live-only`, `primary-only`,
 /// `shared-store` and `replication` found decides, and within it
 /// `colocated`, then `master`, `slave`, `primary` and `backup`. Colocated
-/// backups and pluggable quorum (`manager`) are refused.
+/// backups are refused.
 fn parse_ha_policy(
     core: Node<'_, '_>,
     config: &mut BrokerConfig,

@@ -621,6 +621,11 @@ The differences from Artemis are listed in COMPAT.md.
     - management's `sendMessage` on an address or queue: `IllegalStateException` with the `AMQ229119` text, whatever the address's `disk-full-policy`.
 
     Core, AMQP and OpenWire have flow control, so they are blocked or refused by the address's policy as before.
+- Stage 7 (documentation) is done. [docs/guide](docs/guide/README.md) has the user guide: getting started, the CLI, configuration, protocols, security, storage, high availability, clustering, management and operations, and the migration guide from Artemis (in place with `saranga upgrade`, side by side, and without downtime through a mixed HA pair or cluster, and back again). Each page says where Saranga does as Artemis does, linking Artemis's manual, and links COMPAT.md for the differences. Every claim was checked against the code, COMPAT.md and the CLI's help, and the examples were run on throwaway instances. Checking found, and fixed:
+  - `<lock-coordinators>` was ignored without the warning the other unsupported elements give;
+  - COMPAT.md called the critical analyzer settings accepted silently, though they are acted on, and left `bridgeConfigurations` out of the broker properties applied;
+  - COMPAT.md did not say that cluster connections have no management control, or that HORNETQ is not served;
+  - `saranga run --help` said `--config` opens only the acceptors that speak CORE.
 
 ---
 

@@ -51,7 +51,7 @@ struct Cli {
 enum Command {
     /// Runs the broker in the foreground.
     Run {
-        /// A broker.xml; its acceptors that speak CORE are opened. Its
+        /// A broker.xml; its acceptors are opened. Its
         /// relative data directories are under the broker instance, the
         /// directory above the file's (`<instance>/etc/broker.xml`), and
         /// `login.config` and `bootstrap.xml` next to it apply. Without a

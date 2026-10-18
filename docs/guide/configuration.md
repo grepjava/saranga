@@ -1,0 +1,189 @@
+# Configuration
+
+Saranga reads the configuration of an Artemis instance: the same `etc/` directory, the same `broker.xml`, `bootstrap.xml`, `login.config` and profiles, and the same broker properties. An instance made by `artemis create` starts on Saranga as it is, and the `etc/` files `saranga create` writes are the ones `artemis create` writes. This page explains how `saranga run` finds the files, how `${...}` placeholders and broker properties are resolved, what a configuration reload changes, and which parts of `broker.xml` Saranga ignores or refuses. Where Saranga does what Artemis does, the page says so and links Artemis's documentation; the full list of differences is in [COMPAT.md](../../COMPAT.md#configuration-differences).
+
+## The instance layout
+
+`saranga create` writes the instance `artemis create` writes, from the same templates (see [The CLI](cli.md)). The files Saranga reads are these:
+
+| File | What Saranga does with it |
+|---|---|
+| `etc/bootstrap.xml` | Names `broker.xml` (`<server configuration>`), the security manager (`<jaas-security>` or `<security-manager>`) and the web server (`<web>`). |
+| `etc/broker.xml` | The broker's configuration. |
+| `etc/broker.properties` | Broker properties applied over `broker.xml`, when the file exists. |
+| `etc/login.config` | The JAAS domains. See [Security](security.md). |
+| `etc/artemis.profile` (`artemis.profile.cmd` on Windows) | The `-D` options of `JAVA_ARGS` and `JAVA_ARGS_APPEND` become system properties for `saranga run`. Other Java options are ignored. |
+| `etc/management.xml` | Its `<authorisation>` guards the web console and Jolokia. Saranga has no JMX, so the rest of the file has no effect. See [Management](management.md). |
+| `etc/jolokia-access.xml` | The Jolokia layer's CORS rules. |
+| `etc/log4j2.properties` | Logging for `saranga run`. `etc/log4j2-utility.properties` configures the other commands. See [Operations](operations.md). |
+| `etc/artemis-users.properties`, `etc/artemis-roles.properties` | Users and roles for the properties login module. See [Security](security.md). |
+
+Relative data directories in `broker.xml` (`data/journal` and the like) are taken from the instance directory, the directory above `etc/`.
+
+Logging works as Artemis's does: Saranga writes Artemis's format, codes and logger names to the console and to `log/artemis.log`. It supports the log4j 2 properties format with the common appenders and layouts; see [COMPAT.md](../../COMPAT.md#logging-differences) for what it does not support.
+
+## How `saranga run` finds the configuration
+
+`saranga run` looks for its configuration in this order:
+
+1. `--config <broker.xml>`: that file. Its directory is taken as `etc/`, so `bootstrap.xml` (for the security manager), `login.config` and `broker.properties` next to it apply.
+2. A configuration URI, as `artemis run` takes one: `xml:<path to bootstrap.xml>`, relative to the current directory. The bootstrap file names `broker.xml`.
+3. `--etc <dir>`: an instance's `etc/` directory, read as `artemis run` reads it. Its `bootstrap.xml` names `broker.xml`; without a `bootstrap.xml`, `broker.xml` in that directory is used.
+4. The instance named by `ARTEMIS_INSTANCE_ETC` or `ARTEMIS_INSTANCE`, which an instance's `bin/artemis` sets.
+
+With none of these, the broker keeps everything in memory, has no security and listens on `0.0.0.0:61616`.
+
+`--broker <broker.xml>` replaces the `broker.xml` that `bootstrap.xml` names. `--bind <host:port>` makes the broker listen there instead of on its configured acceptors, with the settings of the first acceptor.
+
+The usual ways to start an instance:
+
+```bash
+# From the instance, as with Artemis
+/var/lib/broker1/bin/artemis run
+
+# The same instance, from anywhere
+saranga run --etc /var/lib/broker1/etc
+
+# A single broker.xml, for tests
+saranga run --config ./broker.xml
+```
+
+On Windows, use `bin\artemis.cmd run`.
+
+`artemis create` writes the instance's absolute path into `bootstrap.xml`. If the instance has moved and that path no longer exists, Saranga logs a warning and uses `broker.xml` in the instance's `etc/`.
+
+A URI without a scheme, with a scheme other than `xml`, or naming a file that is not there is refused with Artemis's `Invalid configuration URI` messages, and `saranga run` exits with status 1.
+
+## `${...}` placeholders and system properties
+
+`broker.xml`, `bootstrap.xml`, `login.config` and broker properties may hold `${name}` and `${name:default}` placeholders. They are replaced in the file's text before it is parsed, as Artemis replaces them. A name is looked up in this order:
+
+1. System properties given to `saranga run` with `-D`. Those from the profile's `JAVA_ARGS` and `JAVA_ARGS_APPEND` come first, so the command line's win.
+2. The properties `artemis run` defines: `artemis.instance`, `artemis.home`, `artemis.instance.etc`, `artemis.URI.instance`, `data.dir` and `java.security.auth.login.config`.
+3. Environment variables.
+4. The default after `:`, else the empty string.
+
+```bash
+saranga run --etc /var/lib/broker1/etc -D broker.port=61617 -Dbroker.host=0.0.0.0
+```
+
+`-D` takes `name=value`, and may be repeated. Artemis's `artemis run` does not take `-D` options; there, set them in `JAVA_ARGS` in `etc/artemis.profile`. That works with Saranga too, because an instance's `bin/artemis` passes the profile's `JAVA_ARGS` to `saranga run`. The arguments are split on spaces, so a value cannot hold a space.
+
+Some system properties have a meaning of their own:
+
+- `brokerconfig.<key>` is a broker property (see below). `<system-property-prefix>` in `broker.xml` changes the prefix.
+- `broker.properties` names the broker properties sources, over `--properties`.
+- `webconfig.` properties change `bootstrap.xml`'s `<web>`, and `securityconfig.` properties choose the security manager, as in Artemis. See [Management](management.md) and [Security](security.md).
+- `artemis.discovery.enabled` turns on UDP discovery. See [Clustering](clustering.md).
+- `log4j2.configurationFile` names another logging configuration.
+
+## Broker properties
+
+Broker properties set configuration values over `broker.xml`, as in Artemis. Keys are paths over the configuration, in the camel-case form of the `broker.xml` element:
+
+```properties
+globalMaxSize=1G
+addressSettings."orders.#".maxSizeBytes=10M
+acceptorConfigurations.tcp.params.port=61617
+```
+
+A key segment that holds dots is wrapped in quotes (or in what `key.surround` says). A collection entry whose value is `-` (or what `remove.value` says) is removed.
+
+The sources, in the order Saranga applies them:
+
+1. The `broker.properties` system property, else `--properties`, else `etc/broker.properties` when it exists. `--properties` takes a comma-separated list of files, and of directories ending in `/`. A directory's files that match `.*\.(json|yaml|properties)` (or the regular expression of a `?filter=` query) are applied in name order.
+2. System properties starting with `brokerconfig.`.
+
+```bash
+saranga run --etc /var/lib/broker1/etc \
+  --properties /etc/broker1/common.properties,/etc/broker1/conf.d/ \
+  -Dbrokerconfig.globalMaxSize=512M
+```
+
+Files ending in `.json` are read as Artemis reads them: nested members become dotted keys. YAML files are reported as a load error and skipped.
+
+Saranga applies the top-level settings it supports and these collections: `addressSettings`, `securityRoles`, `addressConfigurations`, `acceptorConfigurations`, `divertConfigurations`, `bridgeConfigurations` and `jaasConfigs`. Any other key is not applied. The broker still starts, logs a warning such as
+
+    broker.properties: clusterConfigurations.c1.name was not applied: clusterConfigurations is not supported by Saranga
+
+and records the key in the broker's status under `configuration.properties.<source>`, as Artemis does. See [COMPAT.md](../../COMPAT.md#configuration-differences).
+
+Artemis's documentation on broker properties is in its [configuration index](https://activemq.apache.org/components/artemis/documentation/latest/configuration-index.html).
+
+## Configuration reload
+
+While the broker runs, Saranga checks `broker.xml` and the broker properties sources (the files, and the files in directories) every `configuration-file-refresh-period` milliseconds (5000 by default). When one has changed, it reads the configuration again and logs `AMQ221056: Reloading configuration: ...` for each part, then `AMQ221087: Configuration reload completed`. If the new configuration does not parse, it logs `configuration not reloaded: <reason>` and keeps the running one.
+
+A reload does what Artemis's does:
+
+- swaps the security settings and the address settings;
+- reconciles the diverts with the configured ones;
+- deploys new addresses and queues and updates the queues that exist;
+- undeploys addresses and queues that left the configuration, where `config-delete-addresses` or `config-delete-queues` is `FORCE`;
+- deploys new bridges, deploys again bridges that changed, and destroys bridges no longer configured.
+
+A reload does not change acceptors, connection routers, `jaasConfigs` or AMQP broker connections. `login.config` is not reloaded either, as in Artemis. Other settings take a restart. See [Artemis's configuration reload](https://activemq.apache.org/components/artemis/documentation/latest/config-reload.html) and [COMPAT.md](../../COMPAT.md#configuration-differences).
+
+When a reload changes a queue's filter, the record Saranga writes holds the new filter, where Artemis writes the old one. Either broker reads the other's record. See [COMPAT.md](../../COMPAT.md#persistence-differences).
+
+## Address settings
+
+`<address-settings>` work as in Artemis, with the same match syntax, the same hierarchy and the same defaults, except where noted below. See [Artemis's address settings](https://activemq.apache.org/components/artemis/documentation/latest/address-settings.html) and [wildcard syntax](https://activemq.apache.org/components/artemis/documentation/latest/wildcard-syntax.html).
+
+- A second `<address-setting>` with the same match is reported, and the first is kept, as Artemis keeps it.
+- An element Saranga does not know inside an `<address-setting>` is reported and ignored.
+- `global-max-size` defaults to 1 GiB. Artemis defaults to half the JVM's maximum heap, which Saranga does not have.
+- Paging needs persistence. Without `persistence-enabled`, only `BLOCK`, `FAIL` and `DROP` limit an address. See [Storage](storage.md).
+
+The queue behaviours that address settings turn on (dead letters, expiry, redelivery, last-value, ring, non-destructive and exclusive queues, message groups and the like) follow Artemis. The small differences in timing are listed in [COMPAT.md](../../COMPAT.md#queue-semantics-differences).
+
+## Addresses and queues
+
+`<addresses>`, with their `<anycast>` and `<multicast>` queues and every queue attribute, are deployed as Artemis deploys them, at startup and on a reload. Auto-creation and auto-deletion follow the address settings. See [Artemis's address model](https://activemq.apache.org/components/artemis/documentation/latest/address-model.html).
+
+The deprecated top-level `<queues>` element is ignored, with a warning: declare queues under `<addresses>`.
+
+`<wild-card-routing-enabled>` in `<core>` is ignored with a warning, as Artemis ignores it. Use `<wildcard-addresses><routing-enabled>`.
+
+## Diverts
+
+`<diverts>` work as in Artemis: exclusive and non-exclusive diverts, filters and routing types. See [Artemis's diverts](https://activemq.apache.org/components/artemis/documentation/latest/diverts.html). Where Saranga differs:
+
+- A transformer is Rust code, not a Java class. An application that embeds Saranga registers a transformer under the class name that `broker.xml` gives. A divert whose transformer is not registered is not deployed, and a warning is logged.
+- Duplicate detection checks the message a client sends. Copies that a divert makes are not checked against the forwarding address's cache.
+
+See [COMPAT.md](../../COMPAT.md#queue-semantics-differences).
+
+## What Saranga ignores, and what stops it
+
+Saranga reads the whole `broker.xml` schema. Elements are matched by their local name, so a prefixed element that Java would miss is accepted.
+
+These are read and ignored, each with a warning in the log:
+
+- an element the schema does not define at that position;
+- `xi:include`, which is not expanded;
+- the legacy `<jms>` element;
+- `<connection-routers>`;
+- `<lock-coordinators>`;
+- `<metrics>` and `<metrics-plugin>` (the broker, address and queue metrics are still served where `bootstrap.xml` declares the metrics app; see [Management](management.md));
+- `<resource-limit-settings>`, which are not enforced;
+- `scale-down` in an HA policy;
+- `<security-setting-plugin>` (see [Security](security.md));
+- the `<authorization>` and `<naming>` elements of `bootstrap.xml`, which are for JMX;
+- deprecated settings, such as `master` and `slave`, with Artemis's `AMQ221038` message.
+
+The critical analyzer settings are accepted. See [Operations](operations.md).
+
+These stop the broker from starting, with a reason. Starting anyway would make it something it is not:
+
+- a colocated backup (`<colocated>` in the HA policy);
+- the JDBC store (`<database-store>`);
+- a JGroups broadcast or discovery group (`jgroups-file`): discovery is over UDP only;
+- broadcast or discovery groups while the `artemis.discovery.enabled` system property is not `true` (`AMQ229262`, `AMQ229263`), as in Artemis 2.57;
+- a `<security-manager>` class other than `ActiveMQBasicSecurityManager`;
+- a `<broker-plugin>` class Saranga has no port of;
+- an acceptor with TLS settings Saranga cannot honour (see [Protocols](protocols.md#tls)).
+
+An acceptor that lists only protocols Saranga does not serve is not opened, and a warning says so. See [Protocols](protocols.md).
+
+For HA, clustering, federation and AMQP broker connections, see [High availability](ha.md) and [Clustering](clustering.md). The complete list of configuration differences is in [COMPAT.md](../../COMPAT.md#configuration-differences).
