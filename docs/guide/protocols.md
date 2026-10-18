@@ -18,11 +18,7 @@ The URL syntax, the `protocols` parameter and the per-protocol parameters are Ar
 How Saranga treats an acceptor:
 
 - **Protocol detection.** Each connection's protocol is picked from its first 8 bytes, among the protocols the acceptor lists, as Artemis's `ProtocolHandler` picks it. An acceptor without `protocols` serves all of them.
-- **Protocols Saranga does not serve.** Saranga does not serve the `HORNETQ` protocol. An acceptor that lists it alongside others opens for the others, with a warning:
-
-      acceptor artemis does not serve HORNETQ: Saranga does not serve them yet
-
-  An acceptor that lists only protocols Saranga does not serve is not opened. A name that is no protocol at all gets Artemis's `AMQ222203` warning.
+- **Protocols.** Saranga serves all six of Artemis's: `CORE`, `AMQP`, `STOMP`, `HORNETQ`, `MQTT` and `OPENWIRE`. A name that is no protocol at all gets Artemis's `AMQ222203` warning and is ignored.
 - **Host names.** A host binds to the first address the name resolves to, IPv4 first, as Java's `InetAddress.getByName` does. So `localhost` means 127.0.0.1.
 - **Socket options.** `tcpNoDelay`, `tcpSendBufferSize` and `tcpReceiveBufferSize` are honoured. Netty's own options, such as `useEpoll`, are accepted and have no effect.
 - **Address prefixes.** `anycastPrefix` and `multicastPrefix` work on every protocol, as in Artemis.
@@ -31,7 +27,7 @@ How Saranga treats an acceptor:
 
 The startup log names each acceptor and the protocols it serves, with Artemis's message:
 
-    AMQ221020: Started NIO Acceptor at 0.0.0.0:61616 for protocols [CORE,STOMP,MQTT,AMQP,OPENWIRE]
+    AMQ221020: Started NIO Acceptor at 0.0.0.0:61616 for protocols [CORE,HORNETQ,STOMP,MQTT,AMQP,OPENWIRE]
 
 Acceptors can be stopped, started and reloaded through management, as in Artemis. A configuration reload does not change them; restart the broker. See [Configuration](configuration.md#configuration-reload).
 
@@ -39,13 +35,13 @@ Acceptors can be stopped, started and reloaded through management, as in Artemis
 
 `saranga create` writes the acceptors `artemis create` writes:
 
-| Acceptor | Port | Protocols listed | What Saranga serves |
-|---|---|---|---|
-| `artemis` | 61616 | CORE, AMQP, STOMP, HORNETQ, MQTT, OPENWIRE | all but HORNETQ |
-| `amqp` | 5672 | AMQP | AMQP |
-| `stomp` | 61613 | STOMP | STOMP |
-| `hornetq` | 5445 | HORNETQ, STOMP | STOMP only |
-| `mqtt` | 1883 | MQTT | MQTT |
+| Acceptor | Port | Protocols |
+|---|---|---|
+| `artemis` | 61616 | CORE, AMQP, STOMP, HORNETQ, MQTT, OPENWIRE |
+| `amqp` | 5672 | AMQP |
+| `stomp` | 61613 | STOMP |
+| `hornetq` | 5445 | HORNETQ, STOMP |
+| `mqtt` | 1883 | MQTT |
 
 The web server listens on 8161. `--default-port` changes the port of the `artemis` acceptor, `--http-port` the web server's, and `--port-offset` adds a number to every port. `--no-amqp-acceptor`, `--no-stomp-acceptor`, `--no-hornetq-acceptor` and `--no-mqtt-acceptor` leave out the single-protocol acceptors.
 
@@ -101,7 +97,14 @@ See [COMPAT.md](../../COMPAT.md#websocket-differences).
 
 Core is Artemis's own protocol, used by the Artemis JMS client and by the CLI. Saranga puts on the wire what Artemis puts there, quirks included, so Artemis's 2.x clients work unchanged. For 1.x clients, add `anycastPrefix=jms.queue.;multicastPrefix=jms.topic.` to the acceptor, as Artemis's `broker.xml` comment says; Saranga then puts the old prefixes back on query results and delivered messages. See [Artemis's Core documentation](https://activemq.apache.org/components/artemis/documentation/latest/core.html).
 
-HornetQ clients, which use the `HORNETQ` protocol, are not served.
+## HornetQ
+
+HornetQ 2.x clients connect to the `hornetq` acceptor on 5445, as they do to Artemis. Its `anycastPrefix=jms.queue.;multicastPrefix=jms.topic.` maps their queue and topic names. The `HORNETQ` protocol is Core with HornetQ's handshake, which a client may leave out, and with HornetQ's names converted as Artemis's interceptors convert them:
+
+- **Properties.** A message a HornetQ client sends has its `_HQ_` properties renamed to Artemis's `_AMQ_` ones, and a message it receives has them renamed back. These are the properties for duplicate detection, scheduled delivery, groups, last-value queues, large messages, expiry and a message's origin.
+- **Filters.** `HQPriority`, `HQDurable`, `HQTimestamp`, `HQUserID` and `HQExpiration` in a consumer's or a queue's filter become Artemis's `AMQ` identifiers.
+
+A HornetQ client uses only queues and topics that exist, so create them in `broker.xml` or through management. As in Artemis, a message delivered to a HornetQ client carries the old prefix on its address, but Saranga leaves the queued message as it is; see [COMPAT.md](../../COMPAT.md#artemis-wire-quirks-saranga-reproduces-on-purpose).
 
 ## AMQP 1.0
 

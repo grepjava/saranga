@@ -797,9 +797,11 @@ impl Broker {
             transformers: config.transformers,
             populate_validated_user: config.populate_validated_user,
             reject_empty_validated_user: config.reject_empty_validated_user,
-            protocols: std::iter::once(
-                Arc::new(protocol::CoreProtocol) as Arc<dyn protocol::ProtocolManager>
-            )
+            protocols: [
+                Arc::new(protocol::CoreProtocol) as Arc<dyn protocol::ProtocolManager>,
+                Arc::new(protocol::HornetQProtocol),
+            ]
+            .into_iter()
             .chain(config.protocols)
             .collect(),
             extra_records: Mutex::new(extra_records),

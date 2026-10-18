@@ -637,7 +637,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
 }
 
 /// The protocols besides Core that `saranga run` serves.
-const SERVED_PROTOCOLS: [&str; 5] = ["CORE", "STOMP", "MQTT", "AMQP", "OPENWIRE"];
+const SERVED_PROTOCOLS: [&str; 6] = ["CORE", "HORNETQ", "STOMP", "MQTT", "AMQP", "OPENWIRE"];
 
 /// The protocols besides Core that `saranga run` serves, as configured.
 fn protocol_managers(
@@ -1039,6 +1039,9 @@ async fn boot(
     broker_config.protocols = protocol_managers(file_config.as_ref(), &binds);
     tracing::info!(
         "AMQ221043: Protocol module found: [saranga-server]. Adding protocol support for: CORE"
+    );
+    tracing::info!(
+        "AMQ221043: Protocol module found: [saranga-server]. Adding protocol support for: HORNETQ"
     );
     for p in &broker_config.protocols {
         tracing::info!(

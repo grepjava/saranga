@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<!-- A HORNETQ acceptor, as `artemis create` makes it (HornetQ.java). -->
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+   <core xmlns="urn:activemq:core">
+      <name>hornetq</name>
+      <persistence-enabled>false</persistence-enabled>
+      <security-enabled>false</security-enabled>
+      <acceptors>
+         <acceptor name="hornetq">tcp://0.0.0.0:61616?anycastPrefix=jms.queue.;multicastPrefix=jms.topic.;protocols=HORNETQ,STOMP</acceptor>
+      </acceptors>
+      <address-settings>
+         <address-setting match="hq.dead.#">
+            <dead-letter-address>DLQ</dead-letter-address>
+            <max-delivery-attempts>2</max-delivery-attempts>
+         </address-setting>
+      </address-settings>
+      <addresses>
+         <address name="hq.q"><anycast><queue name="hq.q"/></anycast></address>
+         <address name="hq.sel"><anycast><queue name="hq.sel"/></anycast></address>
+         <address name="hq.dup"><anycast><queue name="hq.dup"/></anycast></address>
+         <address name="hq.sched"><anycast><queue name="hq.sched"/></anycast></address>
+         <address name="hq.group"><anycast><queue name="hq.group"/></anycast></address>
+         <address name="hq.dead"><anycast><queue name="hq.dead"/></anycast></address>
+         <address name="hq.large"><anycast><queue name="hq.large"/></anycast></address>
+         <address name="hq.t"><multicast/></address>
+         <address name="hq.d"><multicast/></address>
+         <address name="DLQ">
+            <anycast>
+               <queue name="DLQ"/>
+            </anycast>
+         </address>
+      </addresses>
+   </core>
+</configuration>

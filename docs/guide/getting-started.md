@@ -82,10 +82,7 @@ AMQ221007: Server is now active
 AMQ221001: Saranga Message Broker version 0.0.1 [0.0.0.0, nodeID=4ba9e790-...]
 ```
 
-A fresh instance listens on the same ports as an Artemis instance: 61616 for every protocol, 5672 for AMQP, 61613 for STOMP, 5445 for the HornetQ acceptor, 1883 for MQTT, and 8161 for the web server, Jolokia and the REST API. Two warnings are expected on a fresh instance:
-
-- `acceptor artemis does not serve HORNETQ` and `acceptor hornetq does not serve HORNETQ`: Saranga does not speak the HornetQ protocol. The `hornetq` acceptor still serves STOMP, and `artemis` serves the other protocols.
-- `The console's pages are not served: no console.war in ...`: Saranga ships no web console of its own. Jolokia and the REST API are served anyway. [Management](management.md#the-web-console) explains how to serve Artemis's console.
+A fresh instance listens on the same ports as an Artemis instance: 61616 for every protocol, 5672 for AMQP, 61613 for STOMP, 5445 for the HornetQ acceptor, 1883 for MQTT, and 8161 for the web server, Jolokia and the REST API. One warning is expected on a fresh instance: `The console's pages are not served: no console.war in ...`. Saranga ships no web console of its own. Jolokia and the REST API are served anyway. [Management](management.md#the-web-console) explains how to serve Artemis's console.
 
 ### `saranga run` directly
 

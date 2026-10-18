@@ -6,6 +6,7 @@
 //! Ported from `CoreProtocolManager`, `ActiveMQPacketHandler`,
 //! `RemotingConnectionImpl`, `ChannelImpl` and `CoreSessionCallback`.
 
+mod hornetq;
 mod session;
 
 use std::collections::HashMap;
@@ -70,6 +71,8 @@ pub(crate) struct ConnShared {
     version: AtomicI32,
     /// What every protocol's connection keeps.
     pub(crate) client: Arc<ClientConnection>,
+    /// Served as HORNETQ: messages and filters are converted.
+    hornetq: bool,
 }
 
 impl ConnShared {
@@ -164,6 +167,19 @@ impl CoreDeliverySink {
         ));
         Some(core)
     }
+
+    /// The message as the client is sent it, if not as it is: with the
+    /// legacy prefix, and for HORNETQ with HornetQ's property names (the
+    /// outgoing `HQPropertiesConversionInterceptor`).
+    fn for_client(&self, message: &ServerMessage) -> Option<saranga_message::CoreMessage> {
+        let legacy = self.legacy(message);
+        if !self.conn.hornetq {
+            return legacy;
+        }
+        let mut core = legacy.unwrap_or_else(|| message.delivery_core().clone());
+        hornetq::rename(&mut core.properties, false);
+        Some(core)
+    }
 }
 
 impl DeliverySink for CoreDeliverySink {
@@ -171,10 +187,17 @@ impl DeliverySink for CoreDeliverySink {
         let ctx = self.conn.context();
         let frame = if ctx.is_version_before_address_change() {
             let core = self
-                .legacy(message)
+                .for_client(message)
                 .unwrap_or_else(|| message.delivery_core().clone());
             let packet = SessionReceiveMessage1X {
                 end_of_message_position: legacy_end_of_message_position(&core),
+                message: core,
+                consumer_id,
+                delivery_count,
+            };
+            Packet::from(packet).encode_frame(self.channel_id, &ctx)
+        } else if let Some(core) = self.for_client(message) {
+            let packet = saranga_core_protocol::packets::message::SessionReceiveMessage {
                 message: core,
                 consumer_id,
                 delivery_count,
@@ -202,7 +225,7 @@ impl DeliverySink for CoreDeliverySink {
     ) -> i64 {
         // SessionReceiveLargeMessage: the headers and properties are the
         // message's encoded form.
-        let legacy = self.legacy(message).map(|core| {
+        let legacy = self.for_client(message).map(|core| {
             let mut w = saranga_buffer::Writer::new();
             core.encode_headers_and_properties(&mut w);
             w.into_vec()
@@ -277,6 +300,36 @@ pub async fn serve_stream<S>(
 ) where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
+    serve(broker, stream, peer, local, info, acceptor, false).await;
+}
+
+/// Serves one HORNETQ connection (`HornetQProtocolManager`): Core with
+/// HornetQ's handshake, which the client may leave out, and its property
+/// names and filter identifiers.
+pub async fn serve_hornetq_stream<S>(
+    broker: Arc<Broker>,
+    stream: S,
+    peer: Option<std::net::SocketAddr>,
+    local: Option<std::net::SocketAddr>,
+    info: ConnectionInfo,
+    acceptor: Arc<crate::Acceptor>,
+) where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    serve(broker, stream, peer, local, info, acceptor, true).await;
+}
+
+async fn serve<S>(
+    broker: Arc<Broker>,
+    stream: S,
+    peer: Option<std::net::SocketAddr>,
+    local: Option<std::net::SocketAddr>,
+    info: ConnectionInfo,
+    acceptor: Arc<crate::Acceptor>,
+    hornetq: bool,
+) where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
     let (mut rd, wr) = crate::protocol::split(stream);
     let (out, rx) = mpsc::unbounded_channel();
     let (direct, written) = DirectOut::new(&wr);
@@ -293,6 +346,7 @@ pub async fn serve_stream<S>(
             )
             .with_acceptor(&acceptor.name),
         ),
+        hornetq,
     });
     let _registered = broker.registry().add(&shared.client);
     // `CoreFrameWithSizeLimitDecoder`: with connection security, frames are
@@ -439,20 +493,34 @@ enum ConnError {
 impl Connection {
     async fn read_loop<R: AsyncRead + Unpin>(&mut self, rd: &mut R) -> Result<(), ConnError> {
         let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-        while buf.len() < HANDSHAKE.len() {
+        let hornetq = self.shared.hornetq;
+        let handshake = if hornetq {
+            hornetq::HANDSHAKE
+        } else {
+            HANDSHAKE
+        };
+        while buf.len() < handshake.len() {
             if self.read_more(rd, &mut buf).await? == 0 {
                 return Ok(());
             }
         }
-        if !buf.starts_with(HANDSHAKE) {
+        // `HornetQProtocolManager.handshake`: a client may start with its
+        // first frame.
+        let mut start = if buf.starts_with(handshake) {
+            handshake.len()
+        } else if hornetq {
+            0
+        } else {
             return Err(ConnError::NotCore);
-        }
-        let mut start = HANDSHAKE.len();
+        };
         loop {
             self.check_frame_size(&buf[start..])?;
             while let Some((frame, used)) = read_frame(&buf[start..])? {
                 let ctx = Context::new(Direction::ToServer, self.shared.version());
-                let packet = Packet::decode(&frame, &ctx)?;
+                let mut packet = Packet::decode(&frame, &ctx)?;
+                if hornetq {
+                    hornetq::incoming(&mut packet);
+                }
                 self.dispatch(frame.channel_id, packet, used).await?;
                 start += used;
                 self.check_frame_size(&buf[start..])?;

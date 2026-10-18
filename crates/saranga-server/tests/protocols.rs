@@ -91,14 +91,10 @@ async fn only_the_listed_protocols() {
     assert_eq!(exchange(address, b"CONNECT\n\n\0\n").await, "");
 }
 
-#[tokio::test]
-async fn unknown_bytes_are_core() {
-    let address = start(Acceptor::default()).await;
-    // Not the ARTEMIS handshake: Core closes the connection.
-    assert_eq!(exchange(address, b"GARBAGE!\n").await, "");
-    // A Core client gets an answer to its ping.
+/// Sends `handshake` and a PING, and checks the PING comes back.
+async fn ping(address: std::net::SocketAddr, handshake: &[u8]) {
     let mut s = TcpStream::connect(address).await.unwrap();
-    s.write_all(b"ARTEMIS").await.unwrap();
+    s.write_all(handshake).await.unwrap();
     // PING on channel 0: length, type 10, channel 0, connection TTL.
     let mut frame = Vec::new();
     frame.extend_from_slice(&17u32.to_be_bytes());
@@ -112,6 +108,28 @@ async fn unknown_bytes_are_core() {
         .unwrap()
         .unwrap();
     assert_eq!(&reply[..5], &frame[..5]);
+}
+
+#[tokio::test]
+async fn unknown_bytes_are_core() {
+    let address = start(Acceptor {
+        protocols: Some(vec!["CORE".to_owned(), "AMQP".to_owned()]),
+        ..Acceptor::default()
+    })
+    .await;
+    // Not the ARTEMIS handshake: Core closes the connection.
+    assert_eq!(exchange(address, b"GARBAGE!\n").await, "");
+    // A Core client gets an answer to its ping.
+    ping(address, b"ARTEMIS").await;
+}
+
+#[tokio::test]
+async fn hornetq_takes_clients_without_a_handshake() {
+    // Every protocol: HORNETQ takes what no other recognises.
+    let address = start(Acceptor::default()).await;
+    ping(address, b"HORNETQ").await;
+    ping(address, b"").await;
+    ping(address, b"ARTEMIS").await;
 }
 
 #[tokio::test]

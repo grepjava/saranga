@@ -462,6 +462,31 @@ impl ProtocolManager for CoreProtocol {
     }
 }
 
+/// The HORNETQ protocol (`HornetQProtocolManager`): Core for HornetQ
+/// clients.
+pub struct HornetQProtocol;
+
+impl ProtocolManager for HornetQProtocol {
+    fn name(&self) -> &'static str {
+        "HORNETQ"
+    }
+
+    fn is_protocol(&self, header: &[u8]) -> bool {
+        header.starts_with(b"HORNETQ")
+    }
+
+    /// A client that sends no handshake is taken for an old HornetQ one.
+    fn accepts_no_handshake(&self) -> bool {
+        true
+    }
+
+    fn serve(&self, broker: Arc<Broker>, c: Connection) -> ServeFuture {
+        Box::pin(crate::core_protocol::serve_hornetq_stream(
+            broker, c.stream, c.peer, c.local, c.info, c.acceptor,
+        ))
+    }
+}
+
 /// `ProtocolHandler.ProtocolDecoder.decode`: waits for 8 bytes, then hands
 /// the connection to the first enabled protocol that recognises them, or
 /// to the one that takes clients without a handshake, or to Core.

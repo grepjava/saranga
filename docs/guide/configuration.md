@@ -184,6 +184,4 @@ These stop the broker from starting, with a reason. Starting anyway would make i
 - a `<broker-plugin>` class Saranga has no port of;
 - an acceptor with TLS settings Saranga cannot honour (see [Protocols](protocols.md#tls)).
 
-An acceptor that lists only protocols Saranga does not serve is not opened, and a warning says so. See [Protocols](protocols.md).
-
 For HA, clustering, federation and AMQP broker connections, see [High availability](ha.md) and [Clustering](clustering.md). The complete list of configuration differences is in [COMPAT.md](../../COMPAT.md#configuration-differences).
