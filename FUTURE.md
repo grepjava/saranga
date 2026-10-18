@@ -2,6 +2,40 @@
 
 Work planned for after 1.0, once Phase 11 of [PHASES.md](PHASES.md) is done. Nothing here is started, and nothing here changes what Saranga promises about Artemis compatibility.
 
+| Release | Work |
+|---|---|
+| 1.1 | Saranga's own console (the priority) |
+| Later | IBM MQ client support |
+
+---
+
+## Saranga's own console (1.1)
+
+**Goal**
+
+Saranga gets a web console of its own, so that an instance has one without a copy of Artemis's `console.war`. The server side is in Rust on Axum, which the web server (`saranga-management`) already runs on. The pages are in Svelte. Until 1.1, and afterwards for anyone who prefers it, Saranga serves Artemis's own console when it finds a `console.war` (Phase 11, Stage 6).
+
+**Decisions**
+- **Built into the binary.** The compiled Svelte pages are embedded in `saranga` at build time and served by the web server. Nothing needs to be installed beside it, and no Node.js is needed to run it, only to build it.
+- **Talks to Saranga's own management API.** The console calls the REST API, which gets the endpoints the pages need. It does not go through Jolokia's JMX emulation.
+- **The same security.** The console uses the same login and roles as management: `management.xml` and the RBAC guard decide what a user may see and do.
+- **Next to Artemis's console, not in place of it.** When `console.war` is present, Artemis's console stays at its `bootstrap.xml` URL. Saranga's console is a separate app with its own URL.
+
+**Scope**
+- **Status:** version, uptime, HA role and replica sync, cluster membership, memory, disk, and the acceptors.
+- **Connections, sessions, producers and consumers:** each with filters and paging. Connections and sessions can be closed.
+- **Addresses and queues:** create, delete, pause and resume. Queues can also be purged.
+- **Messages:** send, browse, move, retry and delete.
+- **Cluster and HA:** the nodes, bridges, federation, broker connections, mirrors and their state.
+- **Live charts:** message rates, queue depths and disk use.
+- **Phone-width layout,** plus light and dark themes.
+
+**Stages**
+1. **API.** Fill the REST API's gaps for the pages: the list views with their filters, sends and message operations, and cluster state. Tests for each endpoint.
+2. **Shell.** The Svelte project under `console/` and the build that embeds it. The login, the session and the layout. CI builds it.
+3. **Pages.** The pages in the order of the scope above.
+4. **Exit check.** End-to-end browser tests run against a running broker, on every page and with every role. The guide's Management page is updated.
+
 ---
 
 ## IBM MQ client support
@@ -87,9 +121,3 @@ As in every phase, one test suite runs against a real IBM MQ and against Saranga
 - **No specification.** All behaviour comes from captures, and an IBM fix pack can change it. So the version stays pinned and the capture corpus can be re-run.
 - **Semantics wider than Artemis's.** Browse locking, segmentation, report messages and triggering may need new hooks in `saranga-server`. Triggering may be deferred.
 - **Size.** About Phases 7 and 8 together. The smallest useful release is Stages 0 to 4 plus 6.
-
----
-
-## A Saranga console
-
-A console of Saranga's own, in Svelte, comes after 1.0. Until then Saranga serves Artemis's console (Phase 11, Stage 6).
