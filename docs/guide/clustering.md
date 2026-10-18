@@ -34,11 +34,37 @@ saranga create node2 --clustered --static-cluster tcp://localhost:61616 \
 
 Every `<cluster-connection>` element is read as Artemis reads it, including the reconnection settings, `confirmation-window-size`, `producer-window-size`, `notification-interval`, `notification-attempts`, `topology-scanner-attempts` and `allow-direct-connections-only`. The nodes connect to each other as the cluster user (`cluster-user` and `cluster-password`), as in Artemis.
 
+### Several cluster connections
+
+A node can have several cluster connections, as in Artemis, each with its own `address`, load balancing and bridges. Every one is deployed. One that names a connector that does not exist (`AMQ222129`), reuses a name (`AMQ222130`) or names a missing discovery group (`AMQ222131`) is left out with Artemis's warning. The first one deployed is the default, which HA and quorum votes use. An acceptor sends its clients the default one's topology and hands it the node announcements other nodes send, unless the acceptor names another with its `clusterConnection` parameter:
+
+```xml
+<acceptor name="news">tcp://0.0.0.0:61626?clusterConnection=news-cluster</acceptor>
+```
+
+A cluster connection can also be written as a URI, as Artemis takes it, with the settings as its parameters. `static://` lists the nodes to connect to; `multicast://<discovery group>` finds them through a discovery group:
+
+```xml
+<cluster-connections>
+   <cluster-connection name="orders-cluster">
+      <address>orders</address>
+      <connector-ref>artemis</connector-ref>
+      <static-connectors>
+         <connector-ref>node0</connector-ref>
+      </static-connectors>
+   </cluster-connection>
+   <cluster-connection-uri name="news-cluster"
+      address="static://(tcp://node2:61616)?connectorName=artemis&amp;address=news&amp;messageLoadBalancingType=STRICT"/>
+</cluster-connections>
+```
+
+Broker properties set them too (`clusterConfigurations.news-cluster.maxHops=2`), with the same property names. As in Artemis, a value that is not a number or a boolean becomes 0 or false, and a load balancing type that is no constant is refused.
+
 ### Load balancing and redistribution
 
-`message-load-balancing` takes `OFF`, `STRICT`, `ON_DEMAND` and `OFF_WITH_REDISTRIBUTION`, with Artemis's meanings. A message picks one queue among the local and remote queues that share a routing name, round robin, as Artemis picks it.
+`message-load-balancing` takes `OFF`, `STRICT`, `ON_DEMAND` and `OFF_WITH_REDISTRIBUTION`, with Artemis's meanings. A cluster connection's URI and broker properties also take `LOCAL_ONLY`, which Artemis keeps for its own use: remote queues get nothing. A message picks one queue among the local and remote queues that share a routing name, round robin, as Artemis picks it.
 
-`redistribution-delay` in the address settings moves messages from a queue with no consumers to a node with consumers. Only `ON_DEMAND` and `OFF_WITH_REDISTRIBUTION` redistribute. Internal queues, the management address and grouped messages are left alone, as in Artemis. See Artemis's [message redistribution](https://activemq.apache.org/components/artemis/documentation/latest/clusters.html).
+`redistribution-delay` in the address settings moves messages from a queue with no consumers to a node with consumers. `STRICT` and `OFF` do not redistribute. Internal queues, the management address and grouped messages are left alone, as in Artemis. See Artemis's [message redistribution](https://activemq.apache.org/components/artemis/documentation/latest/clusters.html).
 
 Clients: the Artemis client balances its connections across the topology as usual. saranga-client's locator sends each new connection to the next node round robin once the topology has arrived.
 
@@ -224,9 +250,8 @@ So you can migrate a cluster node by node. Stop one Artemis node, start Saranga 
 
 ## Managing a cluster
 
-- `listNetworkTopology` on the server control lists the cluster connection's members.
-- `BroadcastGroupControl`, `BridgeControl`, `BrokerConnectionControl` and `ClusterConnectionControl` are registered as in Artemis. The cluster connection's control shows its settings, the topology, the nodes it is bridged to and its bridges' metrics, and stops and starts it.
-- Only the first `<cluster-connection>` in `broker.xml` is deployed, so only it has a control.
+- `listNetworkTopology` on the server control lists the members of every cluster connection.
+- `BroadcastGroupControl`, `BridgeControl`, `BrokerConnectionControl` and `ClusterConnectionControl` are registered as in Artemis. Each cluster connection's control shows its settings, the topology, the nodes it is bridged to and its bridges' metrics, and stops and starts it. The server's `ClusterConnectionNames` lists them all.
 - `artemis check cluster` is not in Saranga's CLI.
 
 See [Management](management.md) and [Management differences](../../COMPAT.md#management-differences).

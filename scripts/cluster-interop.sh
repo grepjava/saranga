@@ -8,7 +8,7 @@
 #
 #   scripts/cluster-interop.sh [suite...]
 #
-# Suites: discovery bridge cluster grouping federation amqp-connection
+# Suites: discovery bridge cluster multi grouping federation amqp-connection
 # amqp-federation amqp-bridge amqp-mirror mixed (default: all of them).
 # Needs the Artemis distribution (scripts/build-artemis.sh) and java.
 # Prints a line per run and a summary; exits with the number of failures.
@@ -17,7 +17,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HERE="$ROOT/tests/interop/cluster"
 SUITES=("$@")
-[[ ${#SUITES[@]} -eq 0 ]] && SUITES=(discovery bridge cluster grouping federation
+[[ ${#SUITES[@]} -eq 0 ]] && SUITES=(discovery bridge cluster multi grouping federation
   amqp-connection amqp-federation amqp-bridge amqp-mirror mixed)
 PAIRS=("artemis saranga" "saranga artemis" "saranga saranga" "artemis artemis")
 TRIPLES=("saranga saranga saranga" "artemis saranga saranga" "saranga artemis artemis"

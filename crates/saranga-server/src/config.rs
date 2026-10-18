@@ -401,7 +401,7 @@ impl BrokerConfig {
             protocols: Vec::new(),
             critical: crate::critical::CriticalConfig::from_file(config),
             ha: crate::node::HaConfig::from_file(config, instance),
-            cluster: crate::cluster::ClusterConfig::from_file(config),
+            clusters: crate::cluster::ClusterConfig::all_from_file(config),
             broadcast_groups: crate::discovery::broadcast_groups(config),
             bridges: config.bridges.clone(),
             grouping_handler: config.grouping_handler.clone(),

@@ -633,6 +633,15 @@ The differences from Artemis are listed in COMPAT.md.
   - the server's `ClusterConnectionNames`, the audit messages Artemis logs for each method, and the MBean's attributes and operations in the order Artemis's MBeanInfo gives them.
 
   The catalog generators now cover `BrokerConnectionControl` too, which had been added to their output by hand, and hawtio's `HawtioSecurityControl` moved out of the generated catalog. The cluster suite reads each node's control through management messages, stops and starts node 1's cluster connection and sends across it again, and passes in all four Artemis/Saranga pairings; through Jolokia, the MBean lists and reads as Artemis's does.
+- Every cluster connection is deployed, as `ClusterManager.deploy` does, where Saranga had deployed only the first:
+  - the checks run in Artemis's order, each skipping the connection with Artemis's warning: a name (AMQ222127), the connector (AMQ222129), a name not already taken (AMQ222130) and the discovery group (AMQ222131);
+  - the first connection deployed is the default. An acceptor's `clusterConnection` parameter names the one that serves `CLUSTER_CONNECT`, `NODE_ANNOUNCE` and the client topology subscription, and the default serves otherwise;
+  - cluster connections start and stop in the Java hash order of their names, as Artemis's `HashMap` iterates them. Broadcast groups stop first, then the cluster connections, then the bridges, and the server stops them before it closes connections. Saranga had closed connections first and logged AMQ222295 ("possible split brain") about itself at every shutdown;
+  - `<cluster-connection-uri>` is parsed (`static://(…)?…` with composite members, `multicast://group?…`), converting values as BeanSupport does ([cluster_uri.rs](crates/saranga-config/src/cluster_uri.rs)). So are the `clusterConfigurations.<name>.<property>` broker properties, with Artemis's status error for an unknown property;
+  - `LOCAL_ONLY` load balancing is served, never matching a remote binding, and only `STRICT` and `OFF` refuse redistribution;
+  - each connection has its `ClusterConnectionControl`. `ClusterConnectionNames` lists them in Java hash order, `listNetworkTopology` covers them all, and `Clustered` is true when any is configured.
+
+  [multi.sh](tests/interop/cluster/multi.sh) runs two nodes with two cluster connections: `orders-cluster` in XML (`ON_DEMAND`) and `news-cluster` as a `<cluster-connection-uri>` (`STRICT`, `maxHops=1`), with a `local` queue that neither connection covers. It checks both controls, the topology and where each address's messages go, and it was recorded with Artemis. It passes in all four pairings. So do the HA suites (20 of 20 runs) and every cluster driver suite (45 of 45 runs).
 
 ---
 

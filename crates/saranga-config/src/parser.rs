@@ -1446,6 +1446,15 @@ fn parse_cluster_connections(
         }
         config.cluster_connections.push(c);
     }
+    // `parseClusterConnectionConfigurationURI`, after every
+    // `<cluster-connection>`.
+    for node in elements(list).filter(|c| c.tag_name().name() == "cluster-connection-uri") {
+        let name = node.attribute("name").unwrap_or_default();
+        let uri = node.attribute("address").unwrap_or_default();
+        config
+            .cluster_connections
+            .push(crate::cluster_uri::from_uri(name, uri)?);
+    }
     Ok(())
 }
 

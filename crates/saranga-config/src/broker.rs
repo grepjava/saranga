@@ -624,6 +624,36 @@ pub enum MessageLoadBalancing {
     Strict,
     OnDemand,
     OffWithRedistribution,
+    /// For Artemis's internal use (a mirror routes with it), and settable
+    /// only through a cluster connection's URI or broker properties:
+    /// remote bindings take nothing.
+    LocalOnly,
+}
+
+impl MessageLoadBalancing {
+    /// The enum constant's name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Strict => "STRICT",
+            Self::OnDemand => "ON_DEMAND",
+            Self::OffWithRedistribution => "OFF_WITH_REDISTRIBUTION",
+            Self::LocalOnly => "LOCAL_ONLY",
+        }
+    }
+
+    /// `Enum.valueOf`, as bean properties convert it: every constant.
+    pub fn value_of(s: &str) -> Option<Self> {
+        [
+            Self::Off,
+            Self::Strict,
+            Self::OnDemand,
+            Self::OffWithRedistribution,
+            Self::LocalOnly,
+        ]
+        .into_iter()
+        .find(|m| m.name() == s)
+    }
 }
 
 impl std::str::FromStr for MessageLoadBalancing {
@@ -711,6 +741,10 @@ pub struct ClusterConnectionConfig {
     pub topology_scanner_attempts: i32,
     /// `static-connectors`: connector names, in order.
     pub static_connectors: Vec<String>,
+    /// `compositeMembers`: a `<cluster-connection-uri>`'s
+    /// `static://(tcp://a:61616,tcp://b:61616)` members, which it connects
+    /// to in place of named connectors.
+    pub static_members: Vec<crate::AcceptorConfig>,
     pub allow_direct_connections_only: bool,
     /// `discovery-group-ref`'s `discovery-group-name`.
     pub discovery_group: Option<String>,
@@ -742,6 +776,7 @@ impl ClusterConnectionConfig {
             notification_attempts: 2,
             topology_scanner_attempts: 30,
             static_connectors: Vec::new(),
+            static_members: Vec::new(),
             allow_direct_connections_only: false,
             discovery_group: None,
             client_id: None,

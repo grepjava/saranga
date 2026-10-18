@@ -18,6 +18,7 @@ mod broker;
 mod broker_connection;
 pub mod broker_properties;
 mod bytes;
+mod cluster_uri;
 mod federation;
 pub mod mask;
 mod matcher;

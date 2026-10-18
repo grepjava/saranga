@@ -771,7 +771,7 @@ impl Connection {
             };
             self.shared.send(CHANNEL_PING, packet);
         }
-        if let Some(cluster) = self.broker.cluster() {
+        if let Some(cluster) = self.broker.acceptor_cluster(&self.acceptor) {
             let listener = Arc::new(ClientTopologyListener {
                 conn: self.shared.clone(),
             });
@@ -794,7 +794,9 @@ impl Connection {
             let Packet::ClusterConnectMessage(msg) = packet else {
                 return Ok(());
             };
-            if self.broker.cluster().is_none() && self.broker.security().is_some() {
+            if self.broker.acceptor_cluster(&self.acceptor).is_none()
+                && self.broker.security().is_some()
+            {
                 tracing::warn!(
                     "AMQ222290: Failed to find cluster-connection when handling cluster-connect packet. Ignoring: {}",
                     Packet::from(msg).name()
@@ -822,7 +824,7 @@ impl Connection {
                 } else {
                     (msg.connector.0, msg.backup_connector.0)
                 };
-                match self.broker.cluster() {
+                match self.broker.acceptor_cluster(&self.acceptor) {
                     Some(cluster) => cluster.node_announced(
                         msg.current_event_id,
                         &msg.node_id.to_string_lossy(),

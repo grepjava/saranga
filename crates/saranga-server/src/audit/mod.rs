@@ -347,7 +347,7 @@ fn source(broker: &Broker, control: Control, name: &str) -> String {
             identity(("broker-connection", name))
         ),
         Control::ClusterConnection => broker
-            .cluster()
+            .cluster_named(name)
             .map_or_else(|| "null".to_owned(), |c| c.describe(broker)),
     }
 }

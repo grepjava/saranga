@@ -684,6 +684,11 @@ impl ClusterConnection {
         let weak = Arc::downgrade(self);
         TopologyHook(Arc::new(move |event| {
             let Some(c) = weak.upgrade() else { return };
+            // `stop` removes the cluster connection from its locator's
+            // listeners first.
+            if c.is_stopping() {
+                return;
+            }
             match event {
                 TopologyEvent::Up {
                     node_id,

@@ -61,7 +61,7 @@ fn backup_config(bc: &BrokerConfig, fail_back: bool) -> BackupConfig {
     BackupConfig {
         name: "backup".into(),
         policy: saranga_config::Replication::default(),
-        cluster: bc.cluster.clone().unwrap(),
+        cluster: bc.cluster().cloned().unwrap(),
         messages: storage.messages.clone(),
         bindings: storage.bindings.clone(),
         paging: storage.paging.clone(),
@@ -353,7 +353,7 @@ async fn the_restarted_primary_takes_its_node_back() {
 
     // The primary starts again: its node is active on the backup, so it
     // copies the backup's data and asks for its node back.
-    let cluster = pc.cluster.clone().unwrap();
+    let cluster = pc.cluster().cloned().unwrap();
     use saranga_server::replication::backup::is_node_id_used;
     assert!(is_node_id_used(&cluster, &node_id).await);
     assert!(!is_node_id_used(&cluster, "no-such-node").await);

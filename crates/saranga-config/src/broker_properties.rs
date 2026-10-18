@@ -13,7 +13,8 @@
 //! element (`journalFileSize` for `<journal-file-size>`) and go through the
 //! same parsing; so do address settings. Saranga supports the collections
 //! `addressSettings`, `securityRoles`, `addressConfigurations`,
-//! `acceptorConfigurations`, `divertConfigurations`, `bridgeConfigurations`
+//! `acceptorConfigurations`, `divertConfigurations`, `bridgeConfigurations`,
+//! `clusterConfigurations`
 //! and `jaasConfigs`.
 //! Anything else is reported as a [`Warning`], as Artemis reports what it
 //! cannot apply in its status instead of failing.
@@ -446,6 +447,11 @@ fn apply_one(
             Ok(())
         }
         ["bridgeConfigurations", name, field] => bridge_property(config, name, field, value),
+        ["clusterConfigurations", name] if remove => {
+            config.cluster_connections.retain(|c| c.name != *name);
+            Ok(())
+        }
+        ["clusterConfigurations", name, field] => cluster_property(config, name, field, value),
         ["jaasConfigs", realm] if remove => {
             config.jaas_configs.retain(|(r, _)| r != realm);
             Ok(())
@@ -690,6 +696,37 @@ fn bridge_property(
     Ok(())
 }
 
+/// `clusterConfigurations.<name>.<property>`: `ClusterConnectionConfiguration`'s
+/// bean properties on the cluster connection of that name, made if there
+/// is none. `staticConnectors` is a comma-separated list.
+fn cluster_property(
+    config: &mut BrokerConfig,
+    name: &str,
+    field: &str,
+    v: &str,
+) -> std::result::Result<(), String> {
+    let i = match config
+        .cluster_connections
+        .iter()
+        .position(|c| c.name == name)
+    {
+        Some(i) => i,
+        None => {
+            config
+                .cluster_connections
+                .push(crate::ClusterConnectionConfig::new(name, ""));
+            config.cluster_connections.len() - 1
+        }
+    };
+    let c = &mut config.cluster_connections[i];
+    match crate::cluster_uri::set_property(c, field, Some(v), true)? {
+        true => Ok(()),
+        false => Err(format!(
+            "No accessor method descriptor for: {field} on: class org.apache.activemq.artemis.core.config.ClusterConnectionConfiguration"
+        )),
+    }
+}
+
 /// `jaasConfigs.<realm>.modules.<module>.loginModuleClass`, `.controlFlag`
 /// and `.params.<key>`.
 fn jaas_property(
@@ -905,9 +942,9 @@ acceptorConfigurations.tcp.params.host=localhost
 acceptorConfigurations.tcp.params.port=${PORT}
 jaasConfigs.guestRealm.modules.guest.loginModuleClass=org.apache.activemq.artemis.spi.core.security.jaas.GuestLoginModule
 jaasConfigs.guestRealm.modules.guest.controlFlag=sufficient
-clusterConfigurations.c.name=c"#,
+brokerPlugins.p.className=x"#,
         );
-        assert_eq!(w.len(), 1, "only the cluster: {w:?}");
+        assert_eq!(w.len(), 1, "only the plugin: {w:?}");
         let (m, s) = &c.address_settings[0];
         assert_eq!(m, "orders.#");
         assert_eq!(s.max_size_bytes, Some(10 * 1024 * 1024));
@@ -930,5 +967,39 @@ clusterConfigurations.c.name=c"#,
         );
         assert!(w.is_empty());
         assert!(c.address_settings.is_empty() && c.acceptors.is_empty());
+    }
+
+    /// As Artemis 2.57.0 applies them (the values checked with its
+    /// `ConfigurationImpl.parsePrefixedProperties`).
+    #[test]
+    fn cluster_configurations() {
+        let mut c = BrokerConfig::default();
+        let w = apply_str(
+            &mut c,
+            "clusterConfigurations.c.connectorName=netty\n\
+             clusterConfigurations.c.staticConnectors=a, b,c\n\
+             clusterConfigurations.c.maxHops=abc\n\
+             clusterConfigurations.c.duplicateDetection=maybe\n\
+             clusterConfigurations.c.messageLoadBalancingType=OFF_WITH_REDISTRIBUTION\n\
+             clusterConfigurations.c.clientId=me\n\
+             clusterConfigurations.d.bogus=1\n\
+             clusterConfigurations.d.messageLoadBalancingType=strict",
+        );
+        assert_eq!(w.len(), 2, "{w:?}");
+        let cc = &c.cluster_connections[0];
+        assert_eq!(cc.name, "c");
+        assert_eq!(cc.connector_name, "netty");
+        assert_eq!(cc.static_connectors, ["a", " b", "c"]);
+        assert_eq!(cc.max_hops, 0);
+        assert!(!cc.use_duplicate_detection);
+        assert_eq!(
+            cc.message_load_balancing,
+            crate::MessageLoadBalancing::OffWithRedistribution
+        );
+        assert_eq!(cc.client_id.as_deref(), Some("me"));
+        assert_eq!(c.cluster_connections[1].name, "d");
+        let w = apply_str(&mut c, "clusterConfigurations.d=-");
+        assert!(w.is_empty());
+        assert_eq!(c.cluster_connections.len(), 1);
     }
 }

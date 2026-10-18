@@ -1066,7 +1066,7 @@ async fn boot(
         let m = policy.manager.as_ref().expect("a manager");
         let manager = saranga_ha::lockmanager::LockManager::new(&m.class_name, &m.properties)
             .map_err(|e| anyhow::anyhow!("AMQ224000: Failure in initialisation: {e}"))?;
-        let Some(cluster) = broker_config.cluster.clone() else {
+        let Some(cluster) = broker_config.cluster().cloned() else {
             anyhow::bail!("a replicating broker needs a cluster-connection to find its peer");
         };
         let primary = !file.ha_policy.is_backup();
@@ -1110,15 +1110,10 @@ async fn boot(
     if broker_config.ha.coordination.is_none()
         && let (Some(storage), Some(dir), Some(file)) =
             (&broker_config.storage, &lock_dir, file_config.as_ref())
-        && let Some((backup_policy, fail_back, active_policy)) = replica_role(
-            &file.ha_policy,
-            as_backup,
-            dir,
-            broker_config.cluster.as_ref(),
-        )
-        .await?
+        && let Some((backup_policy, fail_back, active_policy)) =
+            replica_role(&file.ha_policy, as_backup, dir, broker_config.cluster()).await?
     {
-        let Some(cluster) = broker_config.cluster.clone() else {
+        let Some(cluster) = broker_config.cluster().cloned() else {
             anyhow::bail!("a replicating backup needs a cluster-connection to find its primary");
         };
         // The node manager's start: `server.lock` is there before the data
@@ -1164,7 +1159,7 @@ async fn boot(
                 await_primary(
                     dir.clone(),
                     broker_config.ha.lock_acquisition_timeout,
-                    broker_config.cluster.clone(),
+                    broker_config.cluster().cloned(),
                 )
                 .await?,
             )
@@ -1339,13 +1334,16 @@ fn announce(instance: Option<&Arc<instance::Instance>>, started: &Started) {
     }
 }
 
-/// `ActiveMQServerImpl.stop`: no new connections, the clients given
-/// `graceful-shutdown-timeout` when graceful shutdown is enabled, the rest
-/// closed, then the broker stopped.
+/// `ActiveMQServerImpl.stop`: the broker's services, then no new
+/// connections, the clients given `graceful-shutdown-timeout` when graceful
+/// shutdown is enabled, the rest closed, then the broker stopped.
 async fn stop_broker(
     broker: &Arc<Broker>,
     file: Option<&saranga_config::BrokerConfig>,
 ) -> anyhow::Result<()> {
+    // The grouping handler, federation, cluster manager and protocol
+    // services go first, while the connections are still open.
+    broker.stop_services();
     // RemotingService.pauseAcceptors: no new connections.
     broker.pause_acceptors().await;
     if let Some(timeout) = file

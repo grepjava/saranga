@@ -1,0 +1,34 @@
+=== artemis run (node 1, node 2)
+node 1: listening
+node 2: listening
+node 1: both bridged to node 2
+node 2: both bridged to node 1
+=== Cluster.java controls (node 1)
+clusterConnectionNames (sorted) = [news-cluster, orders-cluster]
+clustered = true
+news-cluster: address=news messageLoadBalancingType=STRICT staticConnectors=[] discoveryGroupName=null started=true nodes=1
+orders-cluster: address=orders messageLoadBalancingType=ON_DEMAND staticConnectors=[node0] discoveryGroupName=null started=true nodes=1
+listNetworkTopology entries = 4
+=== Cluster.java controls (node 2)
+clusterConnectionNames (sorted) = [news-cluster, orders-cluster]
+clustered = true
+news-cluster: address=news messageLoadBalancingType=STRICT staticConnectors=[] discoveryGroupName=null started=true nodes=1
+orders-cluster: address=orders messageLoadBalancingType=ON_DEMAND staticConnectors=[node0] discoveryGroupName=null started=true nodes=1
+listNetworkTopology entries = 4
+=== Cluster.java on-demand orders 10
+node 2 received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
+no more
+=== Cluster.java send news 10 (node 1)
+sent 10
+=== Cluster.java drain news (node 1)
+drained 5
+=== Cluster.java drain news (node 2)
+drained 5
+=== Cluster.java on-demand local 3
+node 2 received []
+no more
+=== Cluster.java drain local (node 1)
+drained 3
+=== artemis stop (node 1, node 2)
+node 1: down
+node 2: down

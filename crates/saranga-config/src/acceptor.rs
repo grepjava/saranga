@@ -290,7 +290,7 @@ fn parse_query(raw: &str) -> std::result::Result<Vec<(String, Option<String>)>, 
 
 /// Decodes `%XX` escapes as UTF-8; with `plus_as_space` also `+`, as
 /// `URLDecoder.decode` does.
-fn percent_decode(s: &str, plus_as_space: bool) -> std::result::Result<String, String> {
+pub(crate) fn percent_decode(s: &str, plus_as_space: bool) -> std::result::Result<String, String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

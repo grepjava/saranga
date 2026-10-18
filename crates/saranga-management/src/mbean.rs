@@ -435,7 +435,7 @@ pub fn registered(
             out.push((n, Bean::BroadcastGroup(g.clone())));
         }
     }
-    if let Some(c) = broker.cluster() {
+    for c in broker.clusters() {
         let c = c.config().name.clone();
         if let Some(n) = name(format!(
             "{base},component=cluster-connections,name={}",

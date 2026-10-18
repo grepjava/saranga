@@ -19,6 +19,10 @@
 //       management messages, with what differs between runs left out.
 //   java -cp '<artemis>/lib/*' Cluster.java control-restart <url>
 //       stop through management, then start, and the bridge comes back.
+//   java -cp '<artemis>/lib/*' Cluster.java controls <url>
+//       every cluster connection's control, and the network topology.
+//   java -cp '<artemis>/lib/*' Cluster.java drain <url> <queue>
+//       how many messages the queue has, taking them.
 // tests/interop/cluster/cluster.sh runs it; it prints what it saw.
 
 import java.util.*;
@@ -43,6 +47,8 @@ public class Cluster {
             case "receive" -> receive(args[1], args[2], Integer.parseInt(args[3]));
             case "control" -> control(args[1]);
             case "control-restart" -> controlRestart(args[1]);
+            case "controls" -> controls(args[1]);
+            case "drain" -> drain(args[1], args[2]);
             default -> throw new IllegalArgumentException(args[0]);
         }
     }
@@ -123,6 +129,42 @@ public class Cluster {
             + ", pending " + bridge.get("messagesPendingAcknowledgement"));
         System.out.println("getBridgeMetrics(unknown) = "
             + manage(url, cc, "getBridgeMetrics", true, "00000000-0000-0000-0000-000000000000"));
+    }
+
+    static void controls(String url) throws Exception {
+        Object[] names = (Object[]) manage(url, "broker", "clusterConnectionNames", false);
+        List<String> sorted = new ArrayList<>();
+        for (Object n : names) {
+            sorted.add(String.valueOf(n));
+        }
+        Collections.sort(sorted);
+        System.out.println("clusterConnectionNames (sorted) = " + sorted);
+        System.out.println("clustered = " + manage(url, "broker", "clustered", false));
+        for (String name : sorted) {
+            String cc = "clusterconnection." + name;
+            StringBuilder b = new StringBuilder(name + ":");
+            for (String a : new String[] {"address", "messageLoadBalancingType", "staticConnectors",
+                    "discoveryGroupName", "started"}) {
+                b.append(' ').append(a).append('=').append(show(manage(url, cc, a, false)));
+            }
+            b.append(" nodes=").append(nodes(url, cc).size());
+            System.out.println(b);
+        }
+        String topology = String.valueOf(manage(url, "broker", "listNetworkTopology", true));
+        System.out.println("listNetworkTopology entries = " + (topology.split("\"nodeID\"", -1).length - 1));
+    }
+
+    static void drain(String url, String queue) throws Exception {
+        try (Connection c = core(url)) {
+            Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            MessageConsumer consumer = s.createConsumer(s.createQueue(queue));
+            c.start();
+            int n = 0;
+            while (consumer.receive(2000) != null) {
+                n++;
+            }
+            System.out.println("drained " + n);
+        }
     }
 
     static void controlRestart(String url) throws Exception {

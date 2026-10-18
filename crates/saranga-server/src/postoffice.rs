@@ -2659,6 +2659,9 @@ impl PostOffice {
             {
                 return false;
             }
+            if lb == MessageLoadBalancing::LocalOnly && matches!(b, Bound::Remote(_)) {
+                return false;
+            }
             match b {
                 Bound::Local(q) => {
                     fqqn_queue.is_none_or(|n| &**q.name() == n)
@@ -2850,13 +2853,12 @@ impl PostOffice {
             .get(real)
             .copied()
             .unwrap_or(MessageLoadBalancing::Off);
-        if !matches!(
-            lb,
-            MessageLoadBalancing::OnDemand | MessageLoadBalancing::OffWithRedistribution
-        ) {
+        // Only STRICT and OFF refuse it.
+        if matches!(lb, MessageLoadBalancing::Strict | MessageLoadBalancing::Off) {
             tracing::debug!(
-                "Rejecting redistribution of message={} as the loadBalancingType is {lb:?}",
-                message.message_id()
+                "Rejecting redistribution of message={} as the loadBalancingType is {}",
+                message.message_id(),
+                lb.name()
             );
             return None;
         }

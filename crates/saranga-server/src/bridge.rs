@@ -1668,14 +1668,14 @@ impl Broker {
         self.recover_stored_bridges();
     }
 
-    /// `ClusterManager.stop`: the bridges, broadcast groups and cluster
-    /// connection stop, as when a bridge fails to authenticate.
+    /// `ClusterManager.stop`: the broadcast groups, cluster connections and
+    /// bridges stop, as when a bridge fails to authenticate.
     pub async fn stop_cluster_manager(&self) {
-        if let Some(c) = &self.cluster {
-            c.stop();
-        }
         for g in &self.broadcast_groups {
             g.stop();
+        }
+        for c in crate::cluster::start_order(self.clusters()) {
+            c.stop();
         }
         let bridges = std::mem::take(&mut *self.bridges.deployed());
         for b in bridges {

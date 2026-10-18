@@ -259,8 +259,7 @@ impl Management {
         }
         if let Some(c) = name.strip_prefix("clusterconnection.") {
             return broker
-                .cluster()
-                .filter(|cc| cc.config().name == c)
+                .cluster_named(c)
                 .cloned()
                 .map(Resource::ClusterConnection);
         }
@@ -707,7 +706,6 @@ fn cluster_connection_attribute(
     c: &crate::cluster::ClusterConnection,
     attr: &str,
 ) -> Option<Json> {
-    use saranga_config::MessageLoadBalancing as M;
     let s = &c.config().settings;
     let connectors = || {
         Json::Array(
@@ -722,12 +720,7 @@ fn cluster_connection_attribute(
         "Address" => Json::from(s.address.as_str()),
         "NodeID" => Json::from(c.node_id()),
         "DuplicateDetection" => Json::from(s.use_duplicate_detection),
-        "MessageLoadBalancingType" => Json::from(match s.message_load_balancing {
-            M::Off => "OFF",
-            M::Strict => "STRICT",
-            M::OnDemand => "ON_DEMAND",
-            M::OffWithRedistribution => "OFF_WITH_REDISTRIBUTION",
-        }),
+        "MessageLoadBalancingType" => Json::from(s.message_load_balancing.name()),
         "Topology" => Json::from(c.describe_topology(broker)),
         "MaxHops" => Json::from(s.max_hops),
         "StaticConnectors" => connectors(),

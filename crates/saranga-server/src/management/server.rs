@@ -101,7 +101,11 @@ pub(super) async fn attribute(
             file.map(|f| &f.ha_policy),
             Some(HaPolicy::SharedStorePrimary { .. } | HaPolicy::SharedStoreBackup { .. })
         )),
-        "Clustered" => Json::from(broker.cluster().is_some()),
+        // `Configuration.isClustered`: it has cluster connections, whether
+        // or not they could be deployed.
+        "Clustered" => Json::from(file.map_or(!broker.clusters().is_empty(), |f| {
+            !f.cluster_connections.is_empty()
+        })),
         "ReplicaSync" => Json::from(broker.is_replica_sync()),
         "FailoverOnServerShutdown" => Json::from(match file.map(|f| &f.ha_policy) {
             Some(HaPolicy::SharedStoreBackup {
@@ -229,13 +233,24 @@ pub(super) async fn attribute(
         | "BrokerPluginClassNames"
         | "ConnectorServices"
         | "Connectors" => Json::Array(Vec::new()),
-        "ClusterConnectionNames" => Json::Array(
-            broker
-                .cluster()
-                .map(|c| Json::from(c.config().name.as_str()))
-                .into_iter()
-                .collect(),
-        ),
+        // The keys of `ControlRegistries`' `ConcurrentHashMap` of them.
+        "ClusterConnectionNames" => {
+            let names: Vec<&str> = broker
+                .clusters()
+                .iter()
+                .map(|c| c.config().name.as_str())
+                .collect();
+            let hashes: Vec<i32> = names
+                .iter()
+                .map(|n| saranga_buffer::java_hash::string_hash(n))
+                .collect();
+            Json::Array(
+                saranga_buffer::java_hash::hash_map_order(&hashes, None)
+                    .into_iter()
+                    .map(|i| Json::from(names[i]))
+                    .collect(),
+            )
+        }
         "BridgeNames" => Json::Array(
             broker
                 .bridges()
@@ -1008,29 +1023,35 @@ pub(super) async fn invoke(
             .collect();
         return Some(Ok(Json::from(names)));
     }
-    // The members of the cluster connection's topology with a primary, in
+    // The members with a primary of each cluster connection's topology, in
     // the order of its ConcurrentHashMap: "live" is kept beside "primary".
+    // The cluster connections come in deploy order (Artemis takes them from
+    // a HashSet, in their identity hashes' order).
     if call.is("listNetworkTopology", &[]).is_some() {
-        let members = broker.cluster().map(|c| c.members()).unwrap_or_default();
-        let hashes: Vec<i32> = members
-            .iter()
-            .map(|m| saranga_buffer::java_hash::string_hash(&m.node_id))
-            .collect();
-        let list: Vec<Json> = saranga_buffer::java_hash::hash_map_order(&hashes, None)
-            .into_iter()
-            .map(|i| &members[i])
-            .filter_map(|m| {
-                let primary = m.primary.as_ref()?;
-                let mut o = Json::object();
-                o.put("nodeID", m.node_id.as_str());
-                o.put("live", host_port(primary));
-                o.put("primary", host_port(primary));
-                if let Some(b) = &m.backup {
-                    o.put("backup", host_port(b));
-                }
-                Some(o)
-            })
-            .collect();
+        let mut list: Vec<Json> = Vec::new();
+        for c in broker.clusters() {
+            let members = c.members();
+            let hashes: Vec<i32> = members
+                .iter()
+                .map(|m| saranga_buffer::java_hash::string_hash(&m.node_id))
+                .collect();
+            list.extend(
+                saranga_buffer::java_hash::hash_map_order(&hashes, None)
+                    .into_iter()
+                    .map(|i| &members[i])
+                    .filter_map(|m| {
+                        let primary = m.primary.as_ref()?;
+                        let mut o = Json::object();
+                        o.put("nodeID", m.node_id.as_str());
+                        o.put("live", host_port(primary));
+                        o.put("primary", host_port(primary));
+                        if let Some(b) = &m.backup {
+                            o.put("backup", host_port(b));
+                        }
+                        Some(o)
+                    }),
+            );
+        }
         return Some(Ok(Json::from(Json::Array(list).to_string())));
     }
     if let Some(a) = call.is("listQueues", &[S, I, I]) {

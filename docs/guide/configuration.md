@@ -102,9 +102,9 @@ saranga run --etc /var/lib/broker1/etc \
 
 Files ending in `.json` are read as Artemis reads them: nested members become dotted keys. YAML files are reported as a load error and skipped.
 
-Saranga applies the top-level settings it supports and these collections: `addressSettings`, `securityRoles`, `addressConfigurations`, `acceptorConfigurations`, `divertConfigurations`, `bridgeConfigurations` and `jaasConfigs`. Any other key is not applied. The broker still starts, logs a warning such as
+Saranga applies the top-level settings it supports and these collections: `addressSettings`, `securityRoles`, `addressConfigurations`, `acceptorConfigurations`, `divertConfigurations`, `bridgeConfigurations`, `clusterConfigurations` and `jaasConfigs`. Any other key is not applied. The broker still starts, logs a warning such as
 
-    broker.properties: clusterConfigurations.c1.name was not applied: clusterConfigurations is not supported by Saranga
+    broker.properties: brokerPlugins.p1.className was not applied: brokerPlugins is not supported by Saranga
 
 and records the key in the broker's status under `configuration.properties.<source>`, as Artemis does. See [COMPAT.md](../../COMPAT.md#configuration-differences).
 

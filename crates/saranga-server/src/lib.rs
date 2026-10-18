@@ -259,8 +259,9 @@ pub struct BrokerConfig {
     pub critical: critical::CriticalConfig,
     /// The HA policy and the node manager's settings.
     pub ha: node::HaConfig,
-    /// The default cluster connection, if there is one.
-    pub cluster: Option<cluster::ClusterConfig>,
+    /// The cluster connections to deploy, in the configuration's order:
+    /// the first is the default one.
+    pub clusters: Vec<cluster::ClusterConfig>,
     /// `<broadcast-groups>`, started once the broker is active.
     pub broadcast_groups: Vec<discovery::BroadcastGroupConfig>,
     /// `<bridges>`, deployed once the broker is active.
@@ -282,6 +283,12 @@ pub struct BrokerConfig {
 }
 
 impl BrokerConfig {
+    /// The default cluster connection (`ClusterManager.getDefaultConnection`):
+    /// the first deployed.
+    pub fn cluster(&self) -> Option<&cluster::ClusterConfig> {
+        self.clusters.first()
+    }
+
     /// Artemis's built-in defaults, with the given filter parser.
     pub fn new(filters: Arc<dyn FilterFactory>) -> Self {
         Self {
@@ -311,7 +318,7 @@ impl BrokerConfig {
             management: management::ManagementConfig::default(),
             critical: critical::CriticalConfig::default(),
             ha: node::HaConfig::default(),
-            cluster: None,
+            clusters: Vec::new(),
             broadcast_groups: Vec::new(),
             bridges: Vec::new(),
             grouping_handler: None,
@@ -478,8 +485,9 @@ pub struct Broker {
     lock_lost: std::sync::atomic::AtomicBool,
     /// A store hit an I/O error (`DefaultCriticalErrorListener.failedAlready`).
     critical_io: std::sync::atomic::AtomicBool,
-    /// The default cluster connection, started with the broker.
-    cluster: Option<Arc<cluster::ClusterConnection>>,
+    /// `ClusterManager.clusterConnections`, in the order they were deployed:
+    /// the first is the default one. Started with the broker.
+    clusters: Vec<Arc<cluster::ClusterConnection>>,
     /// `ClusterManager.broadcastGroups`.
     broadcast_groups: Vec<Arc<discovery::BroadcastGroup>>,
     /// `ClusterManager.bridges`.
@@ -520,6 +528,8 @@ pub struct Broker {
     /// (`mapPersistedSecuritySettings`).
     security_records: Mutex<HashMap<String, i64>>,
     stopped: std::sync::atomic::AtomicBool,
+    /// [`Broker::stop_services`] ran.
+    services_stopped: std::sync::atomic::AtomicBool,
     /// The critical analyzer asked for the broker to stop.
     shutdown: tokio::sync::Notify,
     acceptors: acceptors::Acceptors,
@@ -584,7 +594,7 @@ impl Broker {
                         // SharedStorePrimaryActivation: a backup is active
                         // on the data, so this primary announces itself as
                         // its backup, which asks it to fail back.
-                        let announcer = match &config.cluster {
+                        let announcer = match config.cluster() {
                             Some(cc) if !replicating && n.is_backup_active().unwrap_or(false) => {
                                 Some(cluster::BackupAnnouncer::start(cc.clone(), n.node_id()))
                             }
@@ -787,10 +797,11 @@ impl Broker {
             },
             replicating: Mutex::new(None),
             coordination: coordination.clone(),
-            cluster: config
-                .cluster
-                .clone()
-                .map(|c| cluster::ClusterConnection::new(c, &node_id)),
+            clusters: config
+                .clusters
+                .iter()
+                .map(|c| cluster::ClusterConnection::new(c.clone(), &node_id))
+                .collect(),
             failing_back: std::sync::atomic::AtomicBool::new(false),
             failback: tokio::sync::Notify::new(),
             security: config.security.clone(),
@@ -811,6 +822,7 @@ impl Broker {
             users: config.users.clone(),
             security_records: Mutex::default(),
             stopped: Default::default(),
+            services_stopped: Default::default(),
             shutdown: tokio::sync::Notify::new(),
             acceptors: Default::default(),
             ack_manager: std::sync::OnceLock::new(),
@@ -910,7 +922,8 @@ impl Broker {
         if let Some(g) = &grouping {
             g.start();
         }
-        if let Some(c) = &broker.cluster {
+        // `ClusterManager.start`: in the order of its `HashMap` of names.
+        for c in cluster::start_order(&broker.clusters) {
             c.activate();
             c.start_bridging(&broker);
         }
@@ -956,9 +969,34 @@ impl Broker {
         self.protocols.iter().any(|p| p.name() == name)
     }
 
-    /// The default cluster connection.
+    /// The default cluster connection (`getDefaultConnection(null)`): the
+    /// first deployed.
     pub fn cluster(&self) -> Option<&Arc<cluster::ClusterConnection>> {
-        self.cluster.as_ref()
+        self.clusters.first()
+    }
+
+    /// Every cluster connection, in the order they were deployed.
+    pub fn clusters(&self) -> &[Arc<cluster::ClusterConnection>] {
+        &self.clusters
+    }
+
+    /// `ClusterManager.getClusterConnection`.
+    pub fn cluster_named(&self, name: &str) -> Option<&Arc<cluster::ClusterConnection>> {
+        self.clusters.iter().find(|c| c.config().name == name)
+    }
+
+    /// `RemotingServiceImpl.lookupClusterConnection`: the cluster connection
+    /// an acceptor's `clusterConnection` parameter names, else the default
+    /// one (every TCP acceptor is equivalent to its connector).
+    pub fn acceptor_cluster(
+        &self,
+        acceptor: &Acceptor,
+    ) -> Option<&Arc<cluster::ClusterConnection>> {
+        acceptor
+            .params
+            .get("clusterConnection")
+            .and_then(|n| self.cluster_named(n))
+            .or_else(|| self.cluster())
     }
 
     /// The broadcast groups, in the configuration's order.
@@ -982,7 +1020,7 @@ impl Broker {
         let Some(n) = self.node_manager.clone() else {
             return;
         };
-        let Some(cluster) = self.cluster.clone() else {
+        let Some(cluster) = self.cluster().cloned() else {
             tracing::warn!(
                 "AMQ222308: Unable to listen for incoming fail-back request because cluster connection is null. Ensure the broker has the proper cluster-connection configuration."
             );
@@ -1081,6 +1119,37 @@ impl Broker {
         }
     }
 
+    /// What `ActiveMQServerImpl.stop` stops before it pauses the acceptors
+    /// and closes the connections: the grouping handler (before the cluster,
+    /// so its groups outlive the bindings the cluster takes away),
+    /// federation, the cluster manager (broadcast groups, cluster
+    /// connections, bridges) and the protocols' services. Done once; a
+    /// cluster connection stopped first is not told by the other nodes that
+    /// this one went away.
+    pub fn stop_services(&self) {
+        if self
+            .services_stopped
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        if let Some(g) = self.post_office.grouping() {
+            g.stop();
+        }
+        self.federation.stop();
+        for g in &self.broadcast_groups {
+            g.stop();
+        }
+        // `ClusterManager.stop`: in the order of its `HashMap` of names.
+        for c in cluster::start_order(&self.clusters) {
+            c.stop();
+        }
+        self.stop_bridges();
+        for p in &self.protocols {
+            p.stop_services(self);
+        }
+    }
+
     /// A clean stop: the ID generator's checkpoint and the journals are
     /// written out, and `server.lock` marked paused.
     pub fn stop(&self) -> Result<()> {
@@ -1090,22 +1159,7 @@ impl Broker {
                 p.unregistered(self);
             }
         }
-        // The grouping handler stops before the cluster, so its groups
-        // outlive the bindings the cluster takes away.
-        if let Some(g) = self.post_office.grouping() {
-            g.stop();
-        }
-        self.federation.stop();
-        if let Some(c) = &self.cluster {
-            c.stop();
-        }
-        for p in &self.protocols {
-            p.stop_services(self);
-        }
-        for g in &self.broadcast_groups {
-            g.stop();
-        }
-        self.stop_bridges();
+        self.stop_services();
         self.stop_replicating();
         self.large_messages.stop();
         self.post_office.paging().stop();

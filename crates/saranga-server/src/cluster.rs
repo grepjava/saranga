@@ -51,31 +51,68 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
-    /// The first cluster connection of the configuration, if it has one.
-    pub fn from_file(config: &saranga_config::BrokerConfig) -> Option<Self> {
-        let cc = config.cluster_connections.first()?;
-        let connector = |name: &str| {
-            config
-                .connectors
+    /// `ClusterManager.deploy`: every cluster connection of the
+    /// configuration that can be deployed, in its order; the first is the
+    /// default one. One whose connector is missing (`AMQ222129`), whose
+    /// name was taken (`AMQ222130`) or whose discovery group is missing
+    /// (`AMQ222131`) is left out.
+    pub fn all_from_file(config: &saranga_config::BrokerConfig) -> Vec<Self> {
+        let mut out: Vec<Self> = Vec::new();
+        for cc in &config.cluster_connections {
+            // `getTransportConfiguration`.
+            let Some(connector) = connector(config, &cc.connector_name) else {
+                let name = if cc.connector_name.is_empty() {
+                    "null"
+                } else {
+                    &cc.connector_name
+                };
+                tracing::warn!(
+                    "AMQ222129: No connector with name {name}. The cluster connection will not be deployed."
+                );
+                continue;
+            };
+            if out.iter().any(|c| c.name == cc.name) {
+                tracing::warn!(
+                    "AMQ222130: Cluster Configuration  {} already exists. The cluster connection will not be deployed.",
+                    cc.connector_name
+                );
+                continue;
+            }
+            if let Some(c) = Self::deploy(config, cc, connector) {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// One cluster connection, with its connector resolved.
+    fn deploy(
+        config: &saranga_config::BrokerConfig,
+        cc: &saranga_config::ClusterConnectionConfig,
+        connector: TransportConfiguration,
+    ) -> Option<Self> {
+        // `getTransportConfigurations`: a URI's members, else the named
+        // connectors.
+        let static_connectors = if !cc.static_members.is_empty() {
+            cc.static_members
                 .iter()
-                .find(|c| c.name.as_deref() == Some(name))
-                .map(|c| transport_configuration(name, c))
+                .map(|m| transport_configuration(m.name.as_deref().unwrap_or_default(), m))
+                .collect()
+        } else {
+            cc.static_connectors
+                .iter()
+                .filter_map(|name| {
+                    let found = self::connector(config, name);
+                    if found.is_none() {
+                        tracing::warn!(
+                            "AMQ222024: Could not find connector {name} for cluster connection {}",
+                            cc.name
+                        );
+                    }
+                    found
+                })
+                .collect()
         };
-        let static_connectors = cc
-            .static_connectors
-            .iter()
-            .filter_map(|name| {
-                let found = connector(name);
-                if found.is_none() {
-                    // `ClusterConnectionConfiguration.getTransportConfigurations`.
-                    tracing::warn!(
-                        "AMQ222024: Could not find connector {name} for cluster connection {}",
-                        cc.name
-                    );
-                }
-                found
-            })
-            .collect();
         let millis = |v: i64| Duration::from_millis(v.max(0) as u64);
         let discovery = match &cc.discovery_group {
             Some(name) => match crate::discovery::discovery_config(config, name) {
@@ -92,7 +129,7 @@ impl ClusterConfig {
         };
         Some(Self {
             name: cc.name.clone(),
-            connector: connector(&cc.connector_name)?,
+            connector,
             static_connectors,
             discovery_group: cc.discovery_group.clone(),
             discovery,
@@ -107,6 +144,15 @@ impl ClusterConfig {
             settings: cc.clone(),
         })
     }
+}
+
+/// The connector of that name, as announced.
+fn connector(config: &saranga_config::BrokerConfig, name: &str) -> Option<TransportConfiguration> {
+    config
+        .connectors
+        .iter()
+        .find(|c| c.name.as_deref() == Some(name))
+        .map(|c| transport_configuration(name, c))
 }
 
 /// `TCPTransportConfigurationSchema`: a connector's URI as the
@@ -151,6 +197,15 @@ pub fn transport_configuration(
             })
             .collect(),
     }
+}
+
+/// The cluster connections in the order `ClusterManager`'s `HashMap` of
+/// them by name iterates.
+pub(crate) fn start_order(clusters: &[Arc<ClusterConnection>]) -> Vec<&Arc<ClusterConnection>> {
+    java_hash_order(clusters.iter().map(|c| c.config().name.as_str()).collect())
+        .into_iter()
+        .map(|i| &clusters[i])
+        .collect()
 }
 
 /// The indexes of `keys` in the order a Java `HashMap` of them iterates:
@@ -1134,5 +1189,63 @@ mod tests {
             false,
         );
         assert_eq!(cc.members()[0].primary, Some(connector("artemis", 61616)));
+    }
+
+    /// `ClusterManager.deploy`: every cluster connection, but not one with
+    /// no connector, a taken name or a missing discovery group; a URI's
+    /// members in place of named connectors.
+    #[test]
+    fn deploys_every_cluster_connection() {
+        let xml = r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+            <connectors>
+              <connector name="me">tcp://localhost:61616</connector>
+              <connector name="other">tcp://localhost:61617</connector>
+            </connectors>
+            <cluster-connections>
+              <cluster-connection name="orders">
+                <address>orders</address><connector-ref>me</connector-ref>
+                <static-connectors><connector-ref>other</connector-ref></static-connectors>
+              </cluster-connection>
+              <cluster-connection name="news">
+                <address>news</address><connector-ref>me</connector-ref>
+                <message-load-balancing>STRICT</message-load-balancing>
+                <static-connectors><connector-ref>other</connector-ref></static-connectors>
+              </cluster-connection>
+              <cluster-connection name="orders">
+                <connector-ref>me</connector-ref>
+              </cluster-connection>
+              <cluster-connection name="found">
+                <connector-ref>me</connector-ref>
+                <discovery-group-ref discovery-group-name="nowhere"/>
+              </cluster-connection>
+              <cluster-connection-uri name="by-uri"
+                address="static://(tcp://localhost:61618,tcp://localhost:61619)?connectorName=me&amp;address=events"/>
+              <cluster-connection-uri name="no-connector" address="static://(tcp://localhost:61618)"/>
+            </cluster-connections>
+        </core></configuration>"#;
+        let file = saranga_config::BrokerConfig::parse(xml).unwrap();
+        let all = ClusterConfig::all_from_file(&file);
+        let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["orders", "news", "by-uri"]);
+        assert_eq!(all[1].settings.address, "news");
+        assert_eq!(
+            all[1].settings.message_load_balancing,
+            saranga_config::MessageLoadBalancing::Strict
+        );
+        let uri = &all[2];
+        assert_eq!(uri.connector, connector("me", 61616));
+        assert_eq!(uri.settings.address, "events");
+        let ports: Vec<_> = uri
+            .static_connectors
+            .iter()
+            .filter_map(socket_address)
+            .collect();
+        assert_eq!(
+            ports,
+            [
+                ("localhost".to_owned(), 61618),
+                ("localhost".to_owned(), 61619)
+            ]
+        );
     }
 }
