@@ -35,33 +35,33 @@ pub struct QueueArgs {
     #[arg(long)]
     address: Option<String>,
     /// The queue is durable. Default: input.
-    #[arg(long)]
-    durable: bool,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    durable: Option<bool>,
     /// The queue is not durable. Default: input.
-    #[arg(long = "no-durable")]
-    no_durable: bool,
+    #[arg(long = "no-durable", num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    no_durable: Option<bool>,
     /// Delete the contents of this queue when its last consumer
     /// disconnects. Default: input.
-    #[arg(long = "purge-on-no-consumers")]
-    purge_on_no_consumers: bool,
+    #[arg(long = "purge-on-no-consumers", num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    purge_on_no_consumers: Option<bool>,
     /// Preserve the contents of this queue when its last consumer
     /// disconnects. Default: input.
-    #[arg(long = "preserve-on-no-consumers")]
-    preserve_on_no_consumers: bool,
+    #[arg(long = "preserve-on-no-consumers", num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    preserve_on_no_consumers: Option<bool>,
     /// The maximum number of concurrent consumers allowed on this queue.
     /// Default: no limit.
     #[arg(long = "max-consumers", allow_negative_numbers = true)]
     max_consumers: Option<i32>,
     /// Automatically create the address (if it doesn't exist) with default
     /// values. Default: input.
-    #[arg(long = "auto-create-address")]
-    auto_create_address: bool,
+    #[arg(long = "auto-create-address", num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    auto_create_address: Option<bool>,
     /// Create an anycast queue. Default: input.
-    #[arg(long)]
-    anycast: bool,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    anycast: Option<bool>,
     /// Create a multicast queue. Default: input.
-    #[arg(long)]
-    multicast: bool,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    multicast: Option<bool>,
 }
 
 /// `QueueAbstract`'s getters, with its prompts and silent defaults.
@@ -77,8 +77,8 @@ impl<'a> Queue<'a> {
         Self {
             args,
             name: args.name.clone(),
-            anycast: args.anycast.then_some(true),
-            multicast: args.multicast.then_some(true),
+            anycast: args.anycast,
+            multicast: args.multicast,
         }
     }
 
@@ -151,40 +151,45 @@ impl<'a> Queue<'a> {
         })
     }
 
+    /// `isDurable`: --durable, else the opposite of --no-durable, else
+    /// input.
     fn durable(&self) -> anyhow::Result<bool> {
-        Ok(if self.args.durable {
-            true
-        } else if self.args.no_durable {
-            false
-        } else {
-            self.common()
-                .input_boolean("--durable", "Is this a durable queue?", false)?
-        })
+        match self.args.durable.or(self.args.no_durable.map(|no| !no)) {
+            Some(durable) => Ok(durable),
+            None => self
+                .common()
+                .input_boolean("--durable", "Is this a durable queue?", false),
+        }
     }
 
+    /// `isPurgeOnNoConsumers`: --purge-on-no-consumers, else the opposite
+    /// of --preserve-on-no-consumers, else input when `use_input`.
     fn purge_on_no_consumers(&self, use_input: bool) -> anyhow::Result<Option<bool>> {
-        Ok(if self.args.purge_on_no_consumers {
-            Some(true)
-        } else if self.args.preserve_on_no_consumers {
-            Some(false)
-        } else if use_input {
-            Some(self.common().input_boolean(
+        let given = self
+            .args
+            .purge_on_no_consumers
+            .or(self.args.preserve_on_no_consumers.map(|preserve| !preserve));
+        Ok(match given {
+            Some(purge) => Some(purge),
+            None if use_input => Some(self.common().input_boolean(
                 "--purge-on-no-consumers",
                 "Purge the contents of the queue once the last consumer disconnects?",
                 false,
-            )?)
-        } else {
-            None
+            )?),
+            None => None,
         })
     }
 
+    /// `isAutoCreateAddress`: as given, else input.
     fn auto_create_address(&self) -> anyhow::Result<bool> {
-        Ok(self.args.auto_create_address
-            || self.common().input_boolean(
+        match self.args.auto_create_address {
+            Some(auto) => Ok(auto),
+            None => self.common().input_boolean(
                 "--auto-create-address",
                 "Automatically create the address if it doesn't exist?",
                 false,
-            )?)
+            ),
+        }
     }
 }
 
@@ -370,12 +375,12 @@ pub struct StatArgs {
     /// Ctrl-C, sleeping for --loop-time between each iteration.
     #[arg(long = "loop")]
     use_loop: bool,
-    #[arg(long = "loop-sleep", hide = true)]
-    old_sleep: Option<u64>,
+    #[arg(long = "loop-sleep", hide = true, default_value_t = -1)]
+    old_sleep: i64,
     /// Amount of Milliseconds to sleep before each iteration on queue
     /// stat. Default=60000
-    #[arg(long)]
-    sleep: Option<u64>,
+    #[arg(long, default_value_t = -1)]
+    sleep: i64,
     /// Use a single line on the header titles
     #[arg(long = "single-line-header")]
     single_line_header: bool,
@@ -508,15 +513,26 @@ async fn stat(mut args: StatArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     single_execution(&args, params()).await?;
-    let sleep = args.sleep.or(args.old_sleep);
-    let use_loop = args.use_loop || sleep.is_some();
-    let sleep = sleep.unwrap_or(60_000);
+    // -1 is unset; the hidden --loop-sleep wins, and either sleep means
+    // --loop.
+    let mut sleep = args.sleep;
+    if args.old_sleep != -1 {
+        sleep = args.old_sleep;
+    }
+    let use_loop = args.use_loop || sleep != -1;
+    if use_loop && sleep == -1 {
+        sleep = 60_000;
+    }
     if !use_loop {
         return Ok(());
     }
     loop {
         println!("Waiting {sleep} before another queue stat iteration");
-        tokio::time::sleep(std::time::Duration::from_millis(sleep)).await;
+        let Ok(millis) = u64::try_from(sleep) else {
+            // `Thread.sleep`'s IllegalArgumentException.
+            bail!(UsageError("timeout value is negative".to_owned()));
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
         println!(
             "{}>> Queue stat results for {}",
             crate::client::check::java_date_now(),

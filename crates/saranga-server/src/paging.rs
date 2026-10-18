@@ -2001,9 +2001,16 @@ impl PagingStore {
                     }
                     match &tx {
                         // A prepared transaction's messages count once it
-                        // commits.
+                        // commits, but their pages are the queue's
+                        // meanwhile, even with no other paged message on
+                        // it. Artemis's queues read their pages before its
+                        // cleanup runs, after this rebuild, and each such
+                        // message holds its page as a late delivery; here
+                        // the cleanup runs as the journal loads, before any
+                        // queue reads, so the queue is not empty.
                         Some(t) if !lock(&t.state).committed => {
                             lock(&t.state).pending_counters.push((sub.clone(), size));
+                            lock(&sub.state).empty = false;
                         }
                         Some(_) => {
                             let c = counts.entry(*qid).or_default();

@@ -28,7 +28,7 @@ pub struct JournalArgs {
     suffix: String,
     /// The journal size.
     #[arg(long = "file-size", default_value_t = 10_485_760)]
-    size: usize,
+    size: i32,
     #[command(flatten)]
     dirs: DataDirArgs,
 }
@@ -58,11 +58,20 @@ impl JournalArgs {
         };
         Ok((dir, lock))
     }
+
+    /// The journal's file size, which `JournalImpl` checks as it is made.
+    fn file_size(&self) -> anyhow::Result<usize> {
+        match usize::try_from(self.size) {
+            Ok(size) if size >= 1024 => Ok(size),
+            _ => bail!("File size cannot be less than 1024 bytes"),
+        }
+    }
 }
 
 /// `encode`.
 pub fn encode(args: &JournalArgs) -> anyhow::Result<()> {
     let (dir, _lock) = args.directory()?;
+    args.file_size()?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     for (file_id, name, bytes) in order_files(&dir, &args.prefix, &args.suffix)? {
@@ -190,13 +199,14 @@ pub fn decode(args: &DecodeArgs) -> anyhow::Result<()> {
     if !dir.exists() && std::fs::create_dir_all(&dir).is_err() {
         eprintln!("Could not create directory {}", dir.display());
     }
+    let file_size = a.file_size()?;
     if !order_files(&dir, &a.prefix, &a.suffix)?.is_empty() {
         bail!("Import needs to create a brand new journal");
     }
     let mut config = JournalConfig::messages(&dir);
     config.file_prefix = a.prefix.clone();
     config.file_extension = a.suffix.clone();
-    config.file_size = a.size;
+    config.file_size = file_size;
     config.min_files = 2;
     config.pool_size = 2;
     config.compact_min_files = 0;

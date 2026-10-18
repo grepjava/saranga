@@ -689,8 +689,11 @@ impl Queue {
     }
 
     /// `refUp`: the message's memory counts against its address while
-    /// referenced, and each reference against the queue's address.
-    fn ref_up(&self, r: &MessageRef) {
+    /// referenced, and each reference against the queue's address. As
+    /// Artemis's `processRoute` does, a reference counts from when it is
+    /// routed, before it is stored or its transaction commits, so that the
+    /// next message is paged once the address is full.
+    pub(crate) fn ref_up(&self, r: &MessageRef) {
         let po = self.0.post_office.upgrade();
         let owner = r.message.owner(|| {
             let address = r.message.core().address.as_ref()?.to_string_lossy();
@@ -706,8 +709,9 @@ impl Queue {
         }
     }
 
-    /// `refDown`.
-    fn ref_down(&self, r: &MessageRef) {
+    /// `refDown`: also for a counted reference that never joins the queue
+    /// (its transaction rolled back, `AddOperation.beforeRollback`).
+    pub(crate) fn ref_down(&self, r: &MessageRef) {
         if r.message.ref_down() == 0
             && let Some(owner) = r.message.owner(|| None)
         {
@@ -802,11 +806,17 @@ impl Queue {
         let _ = self.0.tx.send(cmd);
     }
 
-    /// Adds a routed message to the tail (`addTail`).
+    /// Adds a routed message to the tail (`addTail`), counting it.
     pub fn add(&self, r: MessageRef) {
+        self.ref_up(&r);
+        self.add_counted(r);
+    }
+
+    /// Adds a routed message counted already ([`Queue::ref_up`] when it
+    /// was routed) to the tail.
+    pub fn add_counted(&self, r: MessageRef) {
         self.0.message_count.fetch_add(1, Ordering::SeqCst);
         self.0.messages_added.fetch_add(1, Ordering::SeqCst);
-        self.ref_up(&r);
         self.send(Cmd::Add(r));
     }
 

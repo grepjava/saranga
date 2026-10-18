@@ -422,6 +422,471 @@ QueueCheck failed. Reason: error: Failed to get queue.nosuch.Paused. Reason: Pro
 Connection brokerURL = URL
 QueueCheck failed. Reason: java.lang.IllegalArgumentException: Invalid  number of messages to produce: 0
 --- exit 1
+=== producer --destination queue://clineg --message-count 1 --threads -5
+Connection brokerURL = URL
+-5
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== producer --destination queue://clineg --message-count 1 --threads 0
+Connection brokerURL = URL
+--- exit 0
+=== consumer --destination queue://clineg --message-count 1 --receive-timeout 200 --threads -5
+Connection brokerURL = URL
+Consumer:: filter = null
+-5
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== browser --destination queue://clineg --threads -5
+Connection brokerURL = URL
+Consumer:: filter = null
+-5
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== check node --up --timeout -5
+Connection brokerURL = URL
+NodeCheck failed. Reason: timeout
+--- exit 1
+=== check queue --name DLQ --up --timeout -5
+Connection brokerURL = URL
+QueueCheck failed. Reason: timeout
+--- exit 1
+=== queue stat --queueName clineg --sleep -5
+Connection brokerURL = URL
+|NAME|ADDRESS|CONSUMER|MESSAGE|MESSAGES|DELIVERING|MESSAGES|SCHEDULED|ROUTING|INTERNAL|
+|    |       | COUNT  | COUNT | ADDED  |  COUNT   | ACKED  |  COUNT  | TYPE  |        |
+Waiting -5 before another queue stat iteration
+timeout value is negative
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== producer --frob
+Unknown option: '--frob'
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== frob
+Unmatched argument at index 0: 'frob'
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== frob x --y
+Unmatched arguments from index 0: 'frob', 'x', '--y'
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== queue stt
+Unmatched argument at index 1: 'stt'
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== queue
+Usage: CLI queue [COMMAND]
+use 'help queue' for sub commands list
+Commands:
+  create  Create a queue.
+  delete  Delete a queue.
+  update  Update a queue.
+  stat    Print basic stats of a queue. Output includes CONSUMER_COUNT (number
+            of consumers), MESSAGE_COUNT (current message count on the queue,
+            including scheduled, paged and in-delivery messages),
+            MESSAGES_ADDED (messages added to the queue), DELIVERING_COUNT
+            (messages broker is currently delivering to consumer(s)),
+            MESSAGES_ACKED (messages acknowledged from the consumer(s)). Queues
+            can be filtered using EITHER '--queueName X' where X is contained
+            in the queue name OR using a full filter '--field NAME --operation
+            EQUALS --value X'.
+  purge   Delete all messages in a queue.
+--- exit 0
+=== producer x
+Unmatched argument at index 1: 'x'
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== producer --message-count abc
+Invalid value for option '--message-count': 'abc' is not a long
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== producer --message-count
+Missing required parameter for option '--message-count' (<messageCount>)
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== producer --message-count 1 --message-count 2
+option '--message-count' (<messageCount>) should be specified only once
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== producer --non-persistent=maybe
+Invalid value for option '--non-persistent': 'maybe' is not a boolean
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== producer --protocol frob
+Invalid value for option '--protocol': cannot convert 'frob' to ConnectionProtocol (java.lang.IllegalArgumentException: No enum constant org.apache.activemq.artemis.cli.commands.messages.ConnectionProtocol.FROB)
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== queue create --name
+Missing required parameter for option '--name' (<name>)
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== check queue --name x --frob
+Unknown option: '--frob'
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== data print --frob
+Unknown option: '--frob'
+
+Usage: CLI help [<args>...]
+use 'help <command>' for more information
+      [<args>...]
+--- exit 1
+=== shell
+ BANNER
+
+
+Shell history disabled as recorded in HISTORY
+
+For a list of commands, type help:
+Type exit or press <CTRL-D> to leave the session:
+CLI > Unknown option: '--frob'
+Usage: CLI producer [--non-persistent] [--silent] [--verbose]
+                        [--acceptor=<acceptor>] [--clientID=<clientID>]
+                        [--commit-interval=<txBatchSize>] [--data=<file>]
+                        [--destination=<destination>] [--group=<msgGroupID>]
+                        [--message=<message>] [--message-count=<messageCount>]
+                        [--message-size=<messageSize>] [--msgttl=<msgTTL>]
+                        [--object-size=<objectSize>] [--password=<password>]
+                        [--properties=<properties>] [--protocol=<protocol>]
+                        [--serializer=<serializer>] [--sleep=<sleep>]
+                        [--text-size=<textMessageSize>] [--threads=<threads>]
+                        [--url=<brokerURL>] [--user=<user>]
+Send message(s) to a broker.
+      --acceptor=<acceptor>  Name used to find the default connection URL on
+                               the acceptor list. If an acceptor with that name
+                               cannot be found the CLI will look for a
+                               connector with the same name.
+      --clientID=<clientID>  ClientID set on the connection.
+      --commit-interval=<txBatchSize>
+                             Transaction batch size.
+      --data=<file>          Messages will be read from the specified file.
+                               Other message options will be ignored.
+      --destination=<destination>
+                             Destination to be used. It can be prefixed with
+                               queue:// or topic:// and can be an FQQN in the
+                               form of <address>::<queue>. Default: queue:
+      --group=<msgGroupID>   Message Group to be used.
+      --message=<message>    Content of each textMessage. The producer will use
+                               JMS TextMessage.
+      --message-count=<messageCount>
+                             Number of messages to act on. Default: 1000.
+      --message-size=<messageSize>
+                             Size of each bytesMessage. The producer will use
+                               JMS BytesMessage.
+      --msgttl=<msgTTL>      TTL for each message.
+      --non-persistent       Send messages non persistently.
+      --object-size=<objectSize>
+                             Size of each ObjectMessage. The producer will use
+                               JMS ObjectMessage.
+      --password=<password>  Password used to connect.
+      --properties=<properties>
+                             The properties to set on the message in JSON, e.
+                               g.: [{"type":"string","key":"myKey1","value":"
+                               myValue1"},{"type":"string","key":"myKey2","
+                               value":"myValue2"}]. Valid types are boolean,
+                               byte, short, int, long, float, double, and
+                               string.
+      --protocol=<protocol>  Protocol used. Valid values are AMQP, CORE
+      --serializer=<serializer>
+                             The class name of the custom serializer
+                               implementation to use intead of the default.
+      --silent               Disable all the inputs, and make a best guess for
+                               any required input.
+      --sleep=<sleep>        Time wait between each message.
+      --text-size=<textMessageSize>
+                             Size of each textMessage. The producer will use
+                               JMS TextMessage.
+      --threads=<threads>    Number of threads to use. Default: 1.
+      --url=<brokerURL>      Connection URL. Default: build URL from the
+                               'artemis' acceptor defined in the broker.xml or
+                               tcp://localhost:61616 if the acceptor cannot be
+                               parsed.
+      --user=<user>          User used to connect.
+      --verbose              Print additional information.
+CLI > Unknown command: frob
+CLI > Unknown command: prodcer
+CLI > Unmatched argument at index 1: 'frob'
+Usage: CLI queue [COMMAND]
+use 'help queue' for sub commands list
+Commands:
+  create  Create a queue.
+  delete  Delete a queue.
+  update  Update a queue.
+  stat    Print basic stats of a queue. Output includes CONSUMER_COUNT (number
+            of consumers), MESSAGE_COUNT (current message count on the queue,
+            including scheduled, paged and in-delivery messages),
+            MESSAGES_ADDED (messages added to the queue), DELIVERING_COUNT
+            (messages broker is currently delivering to consumer(s)),
+            MESSAGES_ACKED (messages acknowledged from the consumer(s)). Queues
+            can be filtered using EITHER '--queueName X' where X is contained
+            in the queue name OR using a full filter '--field NAME --operation
+            EQUALS --value X'.
+  purge   Delete all messages in a queue.
+CLI > Unmatched argument at index 1: 'stt'
+Did you mean: queue stat?
+CLI > Unknown option: '--u'
+Possible solutions: --url, --user
+CLI > Invalid value for option '--message-count': 'abc' is not a long
+Usage: CLI producer [--non-persistent] [--silent] [--verbose]
+                        [--acceptor=<acceptor>] [--clientID=<clientID>]
+                        [--commit-interval=<txBatchSize>] [--data=<file>]
+                        [--destination=<destination>] [--group=<msgGroupID>]
+                        [--message=<message>] [--message-count=<messageCount>]
+                        [--message-size=<messageSize>] [--msgttl=<msgTTL>]
+                        [--object-size=<objectSize>] [--password=<password>]
+                        [--properties=<properties>] [--protocol=<protocol>]
+                        [--serializer=<serializer>] [--sleep=<sleep>]
+                        [--text-size=<textMessageSize>] [--threads=<threads>]
+                        [--url=<brokerURL>] [--user=<user>]
+Send message(s) to a broker.
+      --acceptor=<acceptor>  Name used to find the default connection URL on
+                               the acceptor list. If an acceptor with that name
+                               cannot be found the CLI will look for a
+                               connector with the same name.
+      --clientID=<clientID>  ClientID set on the connection.
+      --commit-interval=<txBatchSize>
+                             Transaction batch size.
+      --data=<file>          Messages will be read from the specified file.
+                               Other message options will be ignored.
+      --destination=<destination>
+                             Destination to be used. It can be prefixed with
+                               queue:// or topic:// and can be an FQQN in the
+                               form of <address>::<queue>. Default: queue:
+      --group=<msgGroupID>   Message Group to be used.
+      --message=<message>    Content of each textMessage. The producer will use
+                               JMS TextMessage.
+      --message-count=<messageCount>
+                             Number of messages to act on. Default: 1000.
+      --message-size=<messageSize>
+                             Size of each bytesMessage. The producer will use
+                               JMS BytesMessage.
+      --msgttl=<msgTTL>      TTL for each message.
+      --non-persistent       Send messages non persistently.
+      --object-size=<objectSize>
+                             Size of each ObjectMessage. The producer will use
+                               JMS ObjectMessage.
+      --password=<password>  Password used to connect.
+      --properties=<properties>
+                             The properties to set on the message in JSON, e.
+                               g.: [{"type":"string","key":"myKey1","value":"
+                               myValue1"},{"type":"string","key":"myKey2","
+                               value":"myValue2"}]. Valid types are boolean,
+                               byte, short, int, long, float, double, and
+                               string.
+      --protocol=<protocol>  Protocol used. Valid values are AMQP, CORE
+      --serializer=<serializer>
+                             The class name of the custom serializer
+                               implementation to use intead of the default.
+      --silent               Disable all the inputs, and make a best guess for
+                               any required input.
+      --sleep=<sleep>        Time wait between each message.
+      --text-size=<textMessageSize>
+                             Size of each textMessage. The producer will use
+                               JMS TextMessage.
+      --threads=<threads>    Number of threads to use. Default: 1.
+      --url=<brokerURL>      Connection URL. Default: build URL from the
+                               'artemis' acceptor defined in the broker.xml or
+                               tcp://localhost:61616 if the acceptor cannot be
+                               parsed.
+      --user=<user>          User used to connect.
+      --verbose              Print additional information.
+CLI > Usage: CLI queue [COMMAND]
+use 'help queue' for sub commands list
+Commands:
+  create  Create a queue.
+  delete  Delete a queue.
+  update  Update a queue.
+  stat    Print basic stats of a queue. Output includes CONSUMER_COUNT (number
+            of consumers), MESSAGE_COUNT (current message count on the queue,
+            including scheduled, paged and in-delivery messages),
+            MESSAGES_ADDED (messages added to the queue), DELIVERING_COUNT
+            (messages broker is currently delivering to consumer(s)),
+            MESSAGES_ACKED (messages acknowledged from the consumer(s)). Queues
+            can be filtered using EITHER '--queueName X' where X is contained
+            in the queue name OR using a full filter '--field NAME --operation
+            EQUALS --value X'.
+  purge   Delete all messages in a queue.
+CLI > Unmatched argument at index 1: 'x'
+Usage: CLI producer [--non-persistent] [--silent] [--verbose]
+                        [--acceptor=<acceptor>] [--clientID=<clientID>]
+                        [--commit-interval=<txBatchSize>] [--data=<file>]
+                        [--destination=<destination>] [--group=<msgGroupID>]
+                        [--message=<message>] [--message-count=<messageCount>]
+                        [--message-size=<messageSize>] [--msgttl=<msgTTL>]
+                        [--object-size=<objectSize>] [--password=<password>]
+                        [--properties=<properties>] [--protocol=<protocol>]
+                        [--serializer=<serializer>] [--sleep=<sleep>]
+                        [--text-size=<textMessageSize>] [--threads=<threads>]
+                        [--url=<brokerURL>] [--user=<user>]
+Send message(s) to a broker.
+      --acceptor=<acceptor>  Name used to find the default connection URL on
+                               the acceptor list. If an acceptor with that name
+                               cannot be found the CLI will look for a
+                               connector with the same name.
+      --clientID=<clientID>  ClientID set on the connection.
+      --commit-interval=<txBatchSize>
+                             Transaction batch size.
+      --data=<file>          Messages will be read from the specified file.
+                               Other message options will be ignored.
+      --destination=<destination>
+                             Destination to be used. It can be prefixed with
+                               queue:// or topic:// and can be an FQQN in the
+                               form of <address>::<queue>. Default: queue:
+      --group=<msgGroupID>   Message Group to be used.
+      --message=<message>    Content of each textMessage. The producer will use
+                               JMS TextMessage.
+      --message-count=<messageCount>
+                             Number of messages to act on. Default: 1000.
+      --message-size=<messageSize>
+                             Size of each bytesMessage. The producer will use
+                               JMS BytesMessage.
+      --msgttl=<msgTTL>      TTL for each message.
+      --non-persistent       Send messages non persistently.
+      --object-size=<objectSize>
+                             Size of each ObjectMessage. The producer will use
+                               JMS ObjectMessage.
+      --password=<password>  Password used to connect.
+      --properties=<properties>
+                             The properties to set on the message in JSON, e.
+                               g.: [{"type":"string","key":"myKey1","value":"
+                               myValue1"},{"type":"string","key":"myKey2","
+                               value":"myValue2"}]. Valid types are boolean,
+                               byte, short, int, long, float, double, and
+                               string.
+      --protocol=<protocol>  Protocol used. Valid values are AMQP, CORE
+      --serializer=<serializer>
+                             The class name of the custom serializer
+                               implementation to use intead of the default.
+      --silent               Disable all the inputs, and make a best guess for
+                               any required input.
+      --sleep=<sleep>        Time wait between each message.
+      --text-size=<textMessageSize>
+                             Size of each textMessage. The producer will use
+                               JMS TextMessage.
+      --threads=<threads>    Number of threads to use. Default: 1.
+      --url=<brokerURL>      Connection URL. Default: build URL from the
+                               'artemis' acceptor defined in the broker.xml or
+                               tcp://localhost:61616 if the acceptor cannot be
+                               parsed.
+      --user=<user>          User used to connect.
+      --verbose              Print additional information.
+CLI > Unknown option: '--help'
+Usage: CLI producer [--non-persistent] [--silent] [--verbose]
+                        [--acceptor=<acceptor>] [--clientID=<clientID>]
+                        [--commit-interval=<txBatchSize>] [--data=<file>]
+                        [--destination=<destination>] [--group=<msgGroupID>]
+                        [--message=<message>] [--message-count=<messageCount>]
+                        [--message-size=<messageSize>] [--msgttl=<msgTTL>]
+                        [--object-size=<objectSize>] [--password=<password>]
+                        [--properties=<properties>] [--protocol=<protocol>]
+                        [--serializer=<serializer>] [--sleep=<sleep>]
+                        [--text-size=<textMessageSize>] [--threads=<threads>]
+                        [--url=<brokerURL>] [--user=<user>]
+Send message(s) to a broker.
+      --acceptor=<acceptor>  Name used to find the default connection URL on
+                               the acceptor list. If an acceptor with that name
+                               cannot be found the CLI will look for a
+                               connector with the same name.
+      --clientID=<clientID>  ClientID set on the connection.
+      --commit-interval=<txBatchSize>
+                             Transaction batch size.
+      --data=<file>          Messages will be read from the specified file.
+                               Other message options will be ignored.
+      --destination=<destination>
+                             Destination to be used. It can be prefixed with
+                               queue:// or topic:// and can be an FQQN in the
+                               form of <address>::<queue>. Default: queue:
+      --group=<msgGroupID>   Message Group to be used.
+      --message=<message>    Content of each textMessage. The producer will use
+                               JMS TextMessage.
+      --message-count=<messageCount>
+                             Number of messages to act on. Default: 1000.
+      --message-size=<messageSize>
+                             Size of each bytesMessage. The producer will use
+                               JMS BytesMessage.
+      --msgttl=<msgTTL>      TTL for each message.
+      --non-persistent       Send messages non persistently.
+      --object-size=<objectSize>
+                             Size of each ObjectMessage. The producer will use
+                               JMS ObjectMessage.
+      --password=<password>  Password used to connect.
+      --properties=<properties>
+                             The properties to set on the message in JSON, e.
+                               g.: [{"type":"string","key":"myKey1","value":"
+                               myValue1"},{"type":"string","key":"myKey2","
+                               value":"myValue2"}]. Valid types are boolean,
+                               byte, short, int, long, float, double, and
+                               string.
+      --protocol=<protocol>  Protocol used. Valid values are AMQP, CORE
+      --serializer=<serializer>
+                             The class name of the custom serializer
+                               implementation to use intead of the default.
+      --silent               Disable all the inputs, and make a best guess for
+                               any required input.
+      --sleep=<sleep>        Time wait between each message.
+      --text-size=<textMessageSize>
+                             Size of each textMessage. The producer will use
+                               JMS TextMessage.
+      --threads=<threads>    Number of threads to use. Default: 1.
+      --url=<brokerURL>      Connection URL. Default: build URL from the
+                               'artemis' acceptor defined in the broker.xml or
+                               tcp://localhost:61616 if the acceptor cannot be
+                               parsed.
+      --user=<user>          User used to connect.
+      --verbose              Print additional information.
+CLI > Unmatched argument at index 1: 'creat'
+Did you mean: address create or address update?
+CLI > Unmatched argument at index 1: 'nod'
+Did you mean: check node?
+CLI > --- exit 0
 === shell
  BANNER
 

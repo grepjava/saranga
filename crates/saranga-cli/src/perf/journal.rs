@@ -18,13 +18,13 @@ use crate::data::dirs::{CliLock, DataDirArgs};
 pub struct PerfJournalArgs {
     /// The block size for each write. Default 4096.
     #[arg(long = "block-size", default_value_t = 4096)]
-    size: usize,
+    size: i32,
     /// The number of writes to be performed. Default: 250.
     #[arg(long, default_value_t = 250)]
-    writes: u64,
+    writes: i32,
     /// The number of tries for the test. Default: 5.
     #[arg(long, default_value_t = 5)]
-    tries: u32,
+    tries: i32,
     /// Disable syncs.
     #[arg(long = "no-sync")]
     no_sync: bool,
@@ -109,10 +109,10 @@ pub fn run(args: &PerfJournalArgs) -> anyhow::Result<()> {
         datasync,
         args.dirs.verbose,
     )?;
-    let nanos = to_nanos(time, args.writes, args.dirs.verbose);
+    let nanos = to_nanos(time, i64::from(args.writes), args.dirs.verbose);
     println!(
         "Your system can execute {} writes per millisecond",
-        decimal_format(args.writes as f64 / time as f64)
+        decimal_format(f64::from(args.writes) / time as f64)
     );
     println!("Your journal-buffer-timeout should be:{nanos}");
     println!("You should use this following configuration:");
@@ -154,15 +154,24 @@ fn notices(args: &PerfJournalArgs, journal_type: JournalType) {
 /// synced when `fsync`, over a file `file_name` in `dir` filled first; the
 /// fastest run's milliseconds. Every journal type writes through a file
 /// here, as `NIO` does (and as Artemis does for `ASYNCIO` without libaio).
+/// As Artemis's, a negative block size fails as its buffer does, a
+/// negative number of tries as its array of results does, and a negative
+/// number of blocks writes nothing.
 pub(crate) fn sync_test(
     dir: &Path,
     file_name: &str,
-    block_size: usize,
-    blocks: u64,
-    tries: u32,
+    block_size: i32,
+    blocks: i32,
+    tries: i32,
     fsync: bool,
     verbose: bool,
 ) -> anyhow::Result<u64> {
+    let Ok(block_size) = usize::try_from(block_size) else {
+        anyhow::bail!(crate::client::UsageError(format!(
+            "newLimit < 0: ({block_size} < 0)"
+        )));
+    };
+    let blocks = u64::try_from(blocks).unwrap_or(0);
     let path = dir.join(file_name);
     let _ = std::fs::remove_file(&path);
     let block = vec![b't'; block_size];
@@ -182,6 +191,9 @@ pub(crate) fn sync_test(
             left -= n as u64;
         }
         file.sync_all()?;
+        let Ok(tries) = u32::try_from(tries) else {
+            anyhow::bail!(crate::client::UsageError(tries.to_string()));
+        };
         let mut best = u64::MAX;
         for n in 0..tries {
             if verbose {
@@ -203,7 +215,7 @@ pub(crate) fn sync_test(
                     "Writes / millisecond = {}",
                     decimal_format(blocks as f64 / time as f64)
                 );
-                println!("bufferTimeout = {}", to_nanos(time, blocks, verbose));
+                println!("bufferTimeout = {}", to_nanos(time, blocks as i64, verbose));
                 println!("**************************************************");
             }
             best = best.min(time);
@@ -215,7 +227,7 @@ pub(crate) fn sync_test(
 }
 
 /// `SyncCalculation.toNanos`: the nanoseconds a block write takes.
-pub(crate) fn to_nanos(time_ms: u64, blocks: u64, verbose: bool) -> i64 {
+pub(crate) fn to_nanos(time_ms: u64, blocks: i64, verbose: bool) -> i64 {
     let per_ms = blocks as f64 / time_ms as f64;
     if verbose {
         println!("Blocks per millisecond::{}", java::double(per_ms));
@@ -233,7 +245,7 @@ pub(crate) fn to_nanos(time_ms: u64, blocks: u64, verbose: bool) -> i64 {
 /// half-even, without trailing zeros or a leading zero.
 pub(crate) fn decimal_format(d: f64) -> String {
     if d.is_infinite() {
-        return "\u{221e}".to_owned();
+        return if d < 0.0 { "-\u{221e}" } else { "\u{221e}" }.to_owned();
     }
     if d.is_nan() {
         return "\u{fffd}".to_owned();
@@ -278,5 +290,6 @@ mod tests {
         assert_eq!(decimal_format(0.5), ".5");
         assert_eq!(decimal_format(0.0), "0");
         assert_eq!(decimal_format(f64::INFINITY), "\u{221e}");
+        assert_eq!(decimal_format(f64::NEG_INFINITY), "-\u{221e}");
     }
 }

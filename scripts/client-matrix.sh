@@ -27,7 +27,7 @@ for lang in "${LANGS[@]}"; do
     python)
       dir="$CLIENTS_DIR/python"
       if [[ ! -d "$dir/venv" ]]; then
-        python -m venv "$dir/venv"
+        python -m venv "$(native "$dir/venv")"
         "$dir/venv/Scripts/python" -m pip install -q python-qpid-proton==0.40.0 2>/dev/null \
           || "$dir/venv/bin/python" -m pip install -q python-qpid-proton==0.40.0
       fi
@@ -38,7 +38,7 @@ for lang in "${LANGS[@]}"; do
       dir="$CLIENTS_DIR/dotnet"
       mkdir -p "$dir"
       cp "$ROOT"/tests/interop/clients/dotnet/{Program.cs,AmqpCheck.csproj} "$dir/"
-      dotnet build -nologo -v q -c Release -o "$dir/out" "$dir/AmqpCheck.csproj" >/dev/null
+      dotnet build -nologo -v q -c Release -o "$(native "$dir/out")" "$(native "$dir/AmqpCheck.csproj")" >/dev/null
       cmd="$dir/out/AmqpCheck"
       ;;
     rust)

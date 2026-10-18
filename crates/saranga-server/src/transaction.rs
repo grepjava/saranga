@@ -178,7 +178,7 @@ impl Outcome {
             d.apply();
         }
         for (q, r) in self.add {
-            q.add(r);
+            q.add_counted(r);
         }
         if self.committed {
             self.paging.after_commit();
@@ -272,7 +272,11 @@ impl Transaction {
     fn internal_rollback(&mut self) -> Outcome {
         let journaled = self.persistent || (self.xid.is_some() && self.state == TxState::Prepared);
         self.state = TxState::RolledBack;
-        self.sends.clear();
+        // The sends never join their queues: their count goes
+        // (`AddOperation.beforeRollback`).
+        for (q, r) in self.sends.drain(..) {
+            q.ref_down(&r);
+        }
         self.duplicates.clear();
         self.replicated.clear();
         Outcome {

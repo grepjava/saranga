@@ -101,6 +101,12 @@ make_instance() {
       artemis_home create "$(native "$dir")" "${opts[@]}" > /dev/null
       "$SARANGA" upgrade "$(native "$dir")" > /dev/null 2>&1 ;;
   esac
+  # The acceptors on ports of the dynamic range (49152 and up), where
+  # Windows reserves blocks of ports for Hyper-V and WSL that no broker
+  # can bind (os error 10013), move 20000 below it: artemis and stomp
+  # (61616 and 61613 plus the offset). The others and the web port keep
+  # the offset.
+  perl -pi -e 's#(<acceptor name="[^"]+">tcp://0\.0\.0\.0:)(\d+)#$1 . ($2 >= 49152 ? $2 - 20000 : $2)#e' "$dir/etc/broker.xml"
 }
 
 # The instance's bin/artemis, run from its bin/ as the manual runs it.
@@ -167,7 +173,7 @@ wait_for() {
 
 step() { echo "=== $*"; }
 I1="$WORK/i1" I2="$WORK/i2" I3="$WORK/i3"
-PORT1=62316 PORT2=62416 PORT3=62516 WEB1=8861 WEB2=8871 WEB3=8981
+PORT1=42316 PORT2=42416 PORT3=42516 WEB1=8861 WEB2=8871 WEB3=8981
 AUTH=(--user admin --password admin)
 run() {
   step "artemis $*"
@@ -690,7 +696,7 @@ properties() {
 # property is not theirs, and they try the variable's port: the connection
 # fails, a URL for a retry is asked for, and there is none (No line found).
 substitution() {
-  local xml="$I2/etc/broker.xml" env=62436 prop=62446 profile
+  local xml="$I2/etc/broker.xml" env=42436 prop=42446 profile
   if windows; then profile="$I2/etc/artemis.profile.cmd"; else profile="$I2/etc/artemis.profile"; fi
   cp "$xml" "$WORK/broker.bak"
   cp "$profile" "$WORK/profile.bak"

@@ -45,6 +45,7 @@ public class Persist {
         tests.put("largeMessages", new Test(Persist::largeBefore, Persist::largeAfter));
         tests.put("largeXaPrepared", new Test(Persist::largeXaBefore, Persist::largeXaAfter));
         tests.put("paging", new Test(Persist::pagingBefore, Persist::pagingAfter));
+        tests.put("pagedXaPrepared", new Test(Persist::pagedXaBefore, Persist::pagedXaAfter));
         tests.put("amqpMessages", new Test(Persist::amqpBefore, Persist::amqpAfter));
         tests.put("amqpDurableSubscription", new Test(Persist::amqpSubBefore, Persist::amqpSubAfter));
 
@@ -672,6 +673,46 @@ public class Persist {
                 try (MessageConsumer c = s.createConsumer(s.createQueue(paged("xa")))) {
                     expectPaged(c, "prepared", 0, 40);
                     check(c.receive(500) == null, "nothing more on xa");
+                }
+            }
+        }
+    }
+
+    /**
+     * A prepared XA branch that fills a paging address by itself: the address pages during
+     * the branch, so its pages hold only the branch's messages. Committed after the restart,
+     * every message arrives, those in the pages too.
+     */
+    static void pagedXaBefore() throws Exception {
+        try (XAConnection xc = new ActiveMQXAConnectionFactory(url).createXAConnection()) {
+            xc.start();
+            XASession xs = xc.createXASession();
+            Queue q = xs.createQueue(paged("xaonly"));
+            XAResource xa = xs.getXAResource();
+            Xid x = xid(22);
+            xa.start(x, XAResource.TMNOFLAGS);
+            sendPaged(xs, q, "branch", 80);
+            xa.end(x, XAResource.TMSUCCESS);
+            xa.prepare(x);
+        }
+    }
+
+    static void pagedXaAfter() throws Exception {
+        try (Connection plain = new ActiveMQConnectionFactory(url).createConnection();
+             XAConnection xc = new ActiveMQXAConnectionFactory(url).createXAConnection()) {
+            plain.start();
+            xc.start();
+            XAResource xa = xc.createXASession().getXAResource();
+            List<Xid> inDoubt = Arrays.asList(xa.recover(XAResource.TMSTARTRSCAN | XAResource.TMENDRSCAN));
+            check(inDoubt.contains(xid(22)), "the branch in doubt: " + inDoubt);
+            try (Session s = plain.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                try (MessageConsumer c = s.createConsumer(s.createQueue(paged("xaonly")))) {
+                    check(c.receive(500) == null, "prepared messages wait");
+                }
+                xa.commit(xid(22), false);
+                try (MessageConsumer c = s.createConsumer(s.createQueue(paged("xaonly")))) {
+                    expectPaged(c, "branch", 0, 80);
+                    check(c.receive(500) == null, "nothing more on xaonly");
                 }
             }
         }

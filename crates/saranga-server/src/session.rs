@@ -1669,11 +1669,17 @@ impl ServerSession {
                     if let Some((jtx, true)) = own_tx {
                         self.ops.push(s.commit(jtx).map_err(io_error)?);
                     }
-                    // The references join their queues once journaled.
+                    // The references count against their addresses now,
+                    // and join their queues once journaled.
+                    for (r, queues) in &routed {
+                        for q in queues {
+                            q.ref_up(r);
+                        }
+                    }
                     self.actions.push(Box::new(move || {
                         for (r, queues) in routed {
                             for q in queues {
-                                q.add(r.clone());
+                                q.add_counted(r.clone());
                             }
                         }
                     }));
@@ -1706,6 +1712,10 @@ impl ServerSession {
                             .map_err(io_error)?;
                         }
                         t.persistent = true;
+                    }
+                    // Counted now; they join their queues at the commit.
+                    for q in &queues {
+                        q.ref_up(&r);
                     }
                     t.sends.extend(queues.into_iter().map(|q| (q, r.clone())));
                 }

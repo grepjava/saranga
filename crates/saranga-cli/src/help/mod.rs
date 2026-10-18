@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 use saranga_buffer::json::Json;
 
 mod breaks;
+pub mod parse;
 
 /// picocli's `usageHelpWidth`.
 const WIDTH: usize = 80;
@@ -65,6 +66,33 @@ pub struct Arg {
     /// `file` (`File` or `Path`, completed with file names) or `host`
     /// (`InetAddress`, completed with host names).
     pub kind: Option<String>,
+    /// How picocli converts its values.
+    pub java: Java,
+    /// Whether its values are collected in a list (or an array).
+    pub list: bool,
+}
+
+/// The type an argument's values are converted to, as picocli converts
+/// them (`scripts/CliHelp.java`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Java {
+    /// `boolean`, or `Boolean` (`boxed`), whose commands tell a value left
+    /// unset from false.
+    Boolean {
+        boxed: bool,
+    },
+    Int,
+    Long,
+    String,
+    File,
+    /// An enum, by picocli's converter: the constant of that name.
+    Enum(Vec<String>),
+    /// An enum by Artemis's `ConnectionProtocol.ProtocolConverter`: the
+    /// constant named by the value in upper case.
+    UpperEnum {
+        class: String,
+        constants: Vec<String>,
+    },
 }
 
 impl Arg {
@@ -185,6 +213,20 @@ fn arg(json: &Json) -> Arg {
         candidates: strings(json.get("candidates")),
         completion: json.get("completion").map(|c| strings(Some(c))),
         kind: json.get("type").and_then(Json::as_str).map(str::to_owned),
+        java: match text("java") {
+            "boolean" => Java::Boolean { boxed: false },
+            "Boolean" => Java::Boolean { boxed: true },
+            "int" => Java::Int,
+            "long" => Java::Long,
+            "File" => Java::File,
+            "enum" => Java::Enum(strings(json.get("constants"))),
+            "upper-enum" => Java::UpperEnum {
+                class: text("class").to_owned(),
+                constants: strings(json.get("constants")),
+            },
+            _ => Java::String,
+        },
+        list: json.get("list").and_then(Json::as_bool).unwrap_or(false),
     }
 }
 
@@ -201,7 +243,9 @@ impl Spec {
                         "shell" => !in_shell,
                         "connect" | "disconnect" => in_shell,
                         "run" => mode == Mode::Instance && !in_shell,
-                        "user" | "stop" | "kill" | "perf-journal" => mode == Mode::Instance,
+                        "activation" | "user" | "stop" | "kill" | "perf-journal" => {
+                            mode == Mode::Instance
+                        }
                         "create" | "upgrade" => mode == Mode::Home,
                         _ => true,
                     }

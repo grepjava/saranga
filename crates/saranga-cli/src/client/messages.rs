@@ -32,7 +32,7 @@ pub struct DestArgs {
     message_count: i64,
     /// Time wait between each message.
     #[arg(long, default_value_t = 0)]
-    sleep: u64,
+    sleep: i32,
     /// Transaction batch size. (deprecated)
     #[arg(long = "txt-size", hide = true, default_value_t = 0)]
     old_batch_size: i64,
@@ -41,7 +41,7 @@ pub struct DestArgs {
     tx_batch_size: i64,
     /// Number of threads to use. Default: 1.
     #[arg(long, default_value_t = 1)]
-    threads: usize,
+    threads: i32,
     /// The class name of the custom serializer implementation to use
     /// intead of the default (not supported by saranga).
     #[arg(long)]
@@ -69,6 +69,18 @@ impl DestArgs {
 
     fn verbose(&self) -> bool {
         self.conn.common.verbose
+    }
+
+    /// The threads to run: a negative count fails as Artemis's array of
+    /// threads does (`NegativeArraySizeException`, whose message is the
+    /// count).
+    fn threads(&self) -> anyhow::Result<usize> {
+        usize::try_from(self.threads).map_err(|_| UsageError(self.threads.to_string()).into())
+    }
+
+    /// The wait between messages: none unless positive (`if (sleep > 0)`).
+    fn sleep_millis(&self) -> u64 {
+        u64::try_from(self.sleep).unwrap_or(0)
     }
 
     /// The connection, with `Consumer:: clientID = ` first when there is
@@ -105,16 +117,16 @@ pub struct ProducerArgs {
     non_persistent: bool,
     /// Size of each bytesMessage. The producer will use JMS BytesMessage.
     #[arg(long = "message-size", default_value_t = 0)]
-    message_size: usize,
+    message_size: i32,
     /// Content of each textMessage. The producer will use JMS TextMessage.
     #[arg(long)]
     message: Option<String>,
     /// Size of each textMessage. The producer will use JMS TextMessage.
     #[arg(long = "text-size", default_value_t = 0)]
-    text_size: usize,
+    text_size: i32,
     /// Size of each ObjectMessage. The producer will use JMS ObjectMessage.
     #[arg(long = "object-size", default_value_t = 0)]
-    object_size: usize,
+    object_size: i32,
     /// TTL for each message.
     #[arg(long, default_value_t = 0)]
     msgttl: i64,
@@ -163,21 +175,21 @@ pub async fn producer(mut args: ProducerArgs) -> anyhow::Result<()> {
     let conn = Arc::new(args.dest.connect().await?);
     let spec = Arc::new(ProducerSpec {
         persistent: !args.non_persistent,
-        message_size: args.message_size,
+        message_size: usize::try_from(args.message_size).unwrap_or(0),
         message: args.message.clone(),
-        text_size: args.text_size,
-        object_size: args.object_size,
+        text_size: usize::try_from(args.text_size).unwrap_or(0),
+        object_size: usize::try_from(args.object_size).unwrap_or(0),
         ttl: args.msgttl,
         group: args.group.clone(),
         properties,
         count: args.dest.message_count,
-        sleep: args.dest.sleep,
+        sleep: args.dest.sleep_millis(),
         batch: args.dest.tx_batch_size,
         verbose: args.dest.verbose(),
     });
     let dest = Destination::parse(&args.dest.destination);
     let mut threads = tokio::task::JoinSet::new();
-    for i in 0..args.dest.threads {
+    for i in 0..args.dest.threads()? {
         let session = conn.session(spec.batch > 0).await?;
         let (spec, dest) = (spec.clone(), dest.clone());
         let name = format!("Producer {dest}, thread={i}");
@@ -427,14 +439,14 @@ pub async fn consumer(mut args: ConsumerArgs) -> anyhow::Result<()> {
         receive_timeout: args.receive_timeout,
         filter: args.filter.clone(),
         count: args.dest.message_count,
-        sleep: args.dest.sleep,
+        sleep: args.dest.sleep_millis(),
         batch: args.dest.tx_batch_size,
         verbose: args.dest.verbose(),
         client_id: conn.client_id.clone(),
     });
     let dest = Destination::parse(&args.dest.destination);
     let mut threads = tokio::task::JoinSet::new();
-    for i in 0..args.dest.threads {
+    for i in 0..args.dest.threads()? {
         let session = conn.session(spec.batch > 0).await?;
         session.start().await?;
         let (spec, dest) = (spec.clone(), dest.clone());
@@ -601,14 +613,14 @@ pub async fn browser(mut args: BrowseArgs) -> anyhow::Result<()> {
         );
     };
     let mut threads = tokio::task::JoinSet::new();
-    for i in 0..args.dest.threads {
+    for i in 0..args.dest.threads()? {
         let session = conn.session(args.dest.tx_batch_size > 0).await?;
         session.start().await?;
         let thread = format!("Consumer {dest}, thread={i}");
         let (queue, filter) = (queue.clone(), args.filter.clone());
         let (count, sleep, verbose) = (
             args.dest.message_count,
-            args.dest.sleep,
+            args.dest.sleep_millis(),
             args.dest.verbose(),
         );
         threads.spawn(async move {

@@ -193,10 +193,12 @@ enum Command {
         /// ARTEMIS_DEFAULT_SENSITIVE_STRING_CODEC_KEY).
         #[arg(long)]
         key: Option<String>,
-        /// Use the <password-codec> of the broker.xml given with --config.
-        #[arg(long, requires = "config")]
+        /// Use the <password-codec> of the instance's broker.xml, or of the
+        /// one given with --config.
+        #[arg(long)]
         password_codec: bool,
-        /// The broker.xml whose password codec --password-codec uses.
+        /// The broker.xml whose password codec --password-codec uses, in
+        /// place of the instance's.
         #[arg(long)]
         config: Option<PathBuf>,
         /// Print additional information.
@@ -235,6 +237,41 @@ fn command_line(in_shell: bool) -> clap::Command {
     for name in hidden {
         command = command.mut_subcommand(name, |c| c.hide(true));
     }
+    any_path(command)
+}
+
+/// A file option takes any value, the empty one too, as picocli's `File`
+/// converter does (`new File("")`); clap's refuses an empty path.
+fn any_path(mut command: clap::Command) -> clap::Command {
+    #[derive(Clone)]
+    struct AnyPath;
+    impl clap::builder::TypedValueParser for AnyPath {
+        type Value = std::path::PathBuf;
+        fn parse_ref(
+            &self,
+            _: &clap::Command,
+            _: Option<&clap::Arg>,
+            value: &std::ffi::OsStr,
+        ) -> Result<Self::Value, clap::Error> {
+            Ok(std::path::PathBuf::from(value))
+        }
+    }
+    let path = clap::builder::ValueParser::path_buf().type_id();
+    let ids: Vec<clap::Id> = command
+        .get_arguments()
+        .filter(|a| a.get_value_parser().type_id() == path)
+        .map(|a| a.get_id().clone())
+        .collect();
+    for id in ids {
+        command = command.mut_arg(id, |a| a.value_parser(AnyPath));
+    }
+    let subs: Vec<String> = command
+        .get_subcommands()
+        .map(|s| s.get_name().to_owned())
+        .collect();
+    for name in subs {
+        command = command.mut_subcommand(name, any_path);
+    }
     command
 }
 
@@ -266,10 +303,83 @@ where
     args
 }
 
+/// What picocli makes of a command line (`help::parse`), as
+/// `Artemis.execute` and the shell act on it.
+pub(crate) enum Parsed {
+    /// The command line in the form saranga's clap command line reads.
+    Args(Vec<String>),
+    /// A mistake, `ParameterException`'s message.
+    Mistake(help::parse::ParseError),
+    /// A group alone (`queue`), whose action prints its help: the group's
+    /// words.
+    Group(Vec<String>),
+    /// Not for the parser: words that are not text, or saranga's own
+    /// `--help` and `--version`, which clap answers.
+    Clap,
+}
+
+/// The command line `words` (without the program's name), parsed as
+/// picocli parses Artemis's.
+pub(crate) fn parse_artemis(
+    words: &[std::ffi::OsString],
+    command: &clap::Command,
+    in_shell: bool,
+) -> Parsed {
+    let Some(words) = words
+        .iter()
+        .map(|w| w.to_str().map(str::to_owned))
+        .collect::<Option<Vec<String>>>()
+    else {
+        return Parsed::Clap;
+    };
+    // The shell takes them as Artemis's does: as no option of its commands.
+    let own = |w: &String| matches!(w.as_str(), "-h" | "--help" | "-V" | "--version");
+    if !in_shell && words.iter().take_while(|w| *w != "--").any(own) {
+        return Parsed::Clap;
+    }
+    match help::parse::parse(&words, in_shell) {
+        Err(e) => Parsed::Mistake(e),
+        Ok(p) if p.is_group() => Parsed::Group(p.path),
+        Ok(p) => Parsed::Args(artemis_spellings(p.clap_args("saranga", command))),
+    }
+}
+
+/// The help mode of where saranga runs: in an instance or from the home.
+pub(crate) fn help_mode() -> help::Mode {
+    if client::instance_dir().is_some() {
+        help::Mode::Instance
+    } else {
+        help::Mode::Home
+    }
+}
+
+/// A `ParameterException`, as `Artemis.execute` reports a
+/// `RuntimeException`: its message, then `help help`.
+fn report_mistake(e: &help::parse::ParseError) {
+    eprintln!("{e}");
+    println!();
+    print!(
+        "{}",
+        help::help("saranga", &["help".to_owned()], help::Mode::Home, false)
+    );
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let mut command_line = command_line(false);
-    let args = artemis_spellings(std::env::args_os().collect());
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let args: Vec<std::ffi::OsString> = match parse_artemis(&raw[1..], &command_line, false) {
+        Parsed::Args(args) => args.into_iter().map(Into::into).collect(),
+        Parsed::Mistake(e) => {
+            report_mistake(&e);
+            return std::process::ExitCode::FAILURE;
+        }
+        Parsed::Group(words) => {
+            print!("{}", help::help("saranga", &words, help_mode(), false));
+            return std::process::ExitCode::SUCCESS;
+        }
+        Parsed::Clap => artemis_spellings(raw),
+    };
     let cli = Cli::from_arg_matches(&command_line.clone().get_matches_from(args))
         .unwrap_or_else(|e| e.format(&mut command_line).exit());
     let command = match cli.command {
@@ -320,12 +430,10 @@ async fn execute(command: Command) -> bool {
         apply_discovery_switch(&java_args_system_properties());
     }
     if let Command::Help { args } = &command {
-        let mode = if client::instance_dir().is_some() {
-            help::Mode::Instance
-        } else {
-            help::Mode::Home
-        };
-        print!("{}", help::help("saranga", args, mode, shell::in_shell()));
+        print!(
+            "{}",
+            help::help("saranga", args, help_mode(), shell::in_shell())
+        );
         return true;
     }
     let client = matches!(
@@ -622,12 +730,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             password_codec,
             config,
             ..
-        } => mask(
-            &password,
-            hash,
-            key,
-            password_codec.then_some(config).flatten(),
-        ),
+        } => mask(&password, hash, key, password_codec, config),
         _ => unreachable!("a client command"),
     }
 }
@@ -870,33 +973,55 @@ fn prefixes(a: &saranga_config::AcceptorConfig) -> Vec<(String, saranga_server::
 }
 
 /// `artemis mask` (`Mask.execute`).
+/// `Mask.execute`: with `--password-codec`, the codec of the instance's
+/// broker configuration (or of saranga's `--config`), else the default
+/// codec with `--hash` and `--key`.
 fn mask(
     password: &str,
     hash: bool,
     key: Option<String>,
+    password_codec: bool,
     config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use saranga_config::mask::Codec;
-    let codec = match config {
-        Some(path) => {
-            let instance = instance::Instance::from_broker_xml(&path, Default::default())?;
-            let file = instance.broker_config()?;
-            Codec::from_desc(Some(&file.password_codec))?
+    let mut params = Vec::new();
+    if hash {
+        params.push(("algorithm".to_owned(), "one-way".to_owned()));
+    }
+    if let Some(key) = key {
+        if hash {
+            println!("Option --key ignored in case of hashing");
+        } else {
+            params.push(("key".to_owned(), key));
         }
-        None => {
-            let mut params = Vec::new();
-            if hash {
-                params.push(("algorithm".to_owned(), "one-way".to_owned()));
+    }
+    let codec = if password_codec {
+        let instance = match (config, client::instance_etc()) {
+            (Some(path), _) => instance::Instance::from_broker_xml(&path, Default::default())?,
+            (None, Some(etc)) => instance::Instance::from_etc(&etc, Default::default())?,
+            (None, None) => {
+                // `getBrokerConfiguration` outside an instance reads
+                // null/etc/broker.xml, which is not there.
+                let path = std::env::current_dir()
+                    .unwrap_or_default()
+                    .join("null")
+                    .join("etc")
+                    .join("broker.xml");
+                anyhow::bail!(
+                    "java.io.FileNotFoundException: {} ({})",
+                    path.display(),
+                    if cfg!(windows) {
+                        "The system cannot find the path specified"
+                    } else {
+                        "No such file or directory"
+                    }
+                );
             }
-            if let Some(key) = key {
-                if hash {
-                    println!("Option --key ignored in case of hashing");
-                } else {
-                    params.push(("key".to_owned(), key));
-                }
-            }
-            Codec::init(&params, |n| std::env::var(n).ok())?
-        }
+        };
+        let file = instance.broker_config()?;
+        Codec::from_desc(Some(&file.password_codec))?
+    } else {
+        Codec::init(&params, |n| std::env::var(n).ok())?
     };
     println!("result: {}", codec.encode(password)?);
     Ok(())

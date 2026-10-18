@@ -297,15 +297,44 @@ async fn end_of_input() -> bool {
     true
 }
 
-/// One command line, parsed as the shell's command line and run.
+/// One command line, parsed as the shell's command line and run: as
+/// JLine's registry runs it, `Unknown command` for a first word that names
+/// none, and as picocli's `execute` does, a mistake's message, then the
+/// suggestions for an unmatched word or else the usage of the command it
+/// was made in, on the error stream.
 async fn execute(words: Vec<String>) {
     use clap::FromArgMatches;
+    if !crate::help::parse::shell_command(&words[0]) {
+        println!("Unknown command: {}", words[0]);
+        return;
+    }
     let mut command = crate::command_line(true);
-    let matches = match command
-        .clone()
-        .try_get_matches_from(crate::artemis_spellings(
-            std::iter::once("saranga".to_owned()).chain(words).collect(),
-        )) {
+    let os: Vec<std::ffi::OsString> = words.iter().map(Into::into).collect();
+    let args = match crate::parse_artemis(&os, &command, true) {
+        crate::Parsed::Args(args) => args,
+        crate::Parsed::Mistake(e) => {
+            eprintln!("{e}");
+            match e.suggestions() {
+                Some(s) => eprintln!("{s}"),
+                None => eprint!(
+                    "{}",
+                    crate::help::help("saranga", &e.path, crate::help_mode(), true)
+                ),
+            }
+            return;
+        }
+        crate::Parsed::Group(words) => {
+            print!(
+                "{}",
+                crate::help::help("saranga", &words, crate::help_mode(), true)
+            );
+            return;
+        }
+        crate::Parsed::Clap => {
+            crate::artemis_spellings(std::iter::once("saranga".to_owned()).chain(words).collect())
+        }
+    };
+    let matches = match command.clone().try_get_matches_from(args) {
         Ok(m) => m,
         Err(e) => {
             let _ = e.print();

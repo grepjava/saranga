@@ -39,17 +39,17 @@ pub struct AddressArgs {
     #[arg(long)]
     name: Option<String>,
     /// Whether the address supports anycast queues.
-    #[arg(long)]
-    anycast: bool,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    anycast: Option<bool>,
     /// Whether the address won't support anycast queues.
-    #[arg(long = "no-anycast")]
-    no_anycast: bool,
+    #[arg(long = "no-anycast", num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    no_anycast: Option<bool>,
     /// Whether the address supports multicast queues.
-    #[arg(long)]
-    multicast: bool,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    multicast: Option<bool>,
     /// Whether the address won't support multicast queues.
-    #[arg(long = "no-multicast")]
-    no_multicast: bool,
+    #[arg(long = "no-multicast", num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    no_multicast: Option<bool>,
 }
 
 impl AddressArgs {
@@ -63,30 +63,29 @@ impl AddressArgs {
         Ok(self.name.clone())
     }
 
+    /// `getAnycast`: the opposite of --no-anycast when given, else
+    /// --anycast, else input.
     fn is_anycast(&self) -> anyhow::Result<bool> {
-        Ok(if self.no_anycast {
-            false
-        } else {
-            self.anycast
-                || self.conn.common.input_boolean(
-                    "--anycast",
-                    "Will this address support anycast queues?",
-                    false,
-                )?
-        })
+        match self.no_anycast.map(|no| !no).or(self.anycast) {
+            Some(anycast) => Ok(anycast),
+            None => self.conn.common.input_boolean(
+                "--anycast",
+                "Will this address support anycast queues?",
+                false,
+            ),
+        }
     }
 
+    /// `getMulticast`, as [`is_anycast`](Self::is_anycast).
     fn is_multicast(&self) -> anyhow::Result<bool> {
-        Ok(if self.no_multicast {
-            false
-        } else {
-            self.multicast
-                || self.conn.common.input_boolean(
-                    "--multicast",
-                    "Will this address support multicast queues?",
-                    true,
-                )?
-        })
+        match self.no_multicast.map(|no| !no).or(self.multicast) {
+            Some(multicast) => Ok(multicast),
+            None => self.conn.common.input_boolean(
+                "--multicast",
+                "Will this address support multicast queues?",
+                true,
+            ),
+        }
     }
 
     /// `getRoutingTypes`: `ANYCAST,MULTICAST`, either, or (none) the

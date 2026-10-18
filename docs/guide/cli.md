@@ -26,7 +26,9 @@ saranga <command> --help        # Saranga's help for a command, every option it 
 saranga help <command>          # Artemis's help text for the command
 ```
 
-`saranga help` prints Artemis's own usage message, laid out as Artemis's CLI lays it out, with the commands Artemis offers in the same place: from an instance's `bin` it lists `run`, `stop`, `kill` and `user`, and from the binary it lists `create` and `upgrade` instead. The commands Saranga does not have yet (`lock`, `properties` and `check cluster`) are left out. Every option `saranga help` lists is one Saranga takes; `--help` shows them in Saranga's words and adds Saranga's own, such as `run --config`.
+`saranga help` prints Artemis's own usage message, laid out as Artemis's CLI lays it out, with the commands Artemis offers in the same place: from an instance's `bin` it lists `activation`, `user`, `run`, `stop`, `kill` and `perf-journal`, and from the binary it lists `create` and `upgrade` instead. Every command works in both places all the same. The commands Saranga does not have yet (`lock`, `properties` and `check cluster`) are left out. Every option `saranga help` lists is one Saranga takes; `--help` shows them in Saranga's words and adds Saranga's own, such as `run --config`.
+
+A mistake on the command line is reported as Artemis's CLI reports it, so scripts that check its output keep working: the message (`Unknown option: '--frob'`, `Invalid value for option '--message-count': 'abc' is not a long`) on standard error, then `help help`'s usage, with status 1.
 
 The sections below show the useful options. `saranga <command> --help` lists the rest.
 
@@ -327,6 +329,8 @@ In the shell, `connect --url ... --user ... --password ...` keeps a connection's
 ```bash
 printf 'queue stat\naddress show\n' | saranga shell --url tcp://localhost:61616 --user admin --password admin
 ```
+
+The shell answers a mistake as Artemis's does. It prints `Unknown command: <word>` when the first word names no command. Otherwise it prints the message, then the command's usage or the commands it might mean (`Did you mean: queue stat?`). Use `help <command>` there: as in Artemis's shell, the commands take no `--help`.
 
 ### completion
 

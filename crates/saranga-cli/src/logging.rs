@@ -44,6 +44,8 @@ pub type Lookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// Artemis's console and file pattern.
 pub const ARTEMIS_PATTERN: &str = "%d %-5level [%logger] %msg%n";
+/// `DefaultConfiguration.DEFAULT_PATTERN`.
+const LOG4J2_DEFAULT_PATTERN: &str = "%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n";
 
 // log4j 2's level values.
 const OFF: u32 = 0;
@@ -1031,6 +1033,29 @@ impl Config {
         }
     }
 
+    /// log4j2's `DefaultConfiguration`, which a JVM with no configuration
+    /// file logs with: ERROR, to standard output, in log4j2's default
+    /// pattern.
+    pub fn log4j2_default() -> Self {
+        let (layout, _) = Pattern::compile(LOG4J2_DEFAULT_PATTERN);
+        Self {
+            root: LoggerConfig {
+                name: String::new(),
+                level: ERROR,
+                refs: vec![(0, ALL)],
+                additive: false,
+            },
+            loggers: HashMap::new(),
+            appenders: vec![Appender {
+                layout,
+                threshold: ALL,
+                sink: Sink::Stdout,
+            }],
+            max_level: ERROR,
+            monitor_interval: 0,
+        }
+    }
+
     /// The configuration a `log4j2.properties` gives, and what in it was
     /// not understood. `sys` resolves `${sys:..}` lookups.
     pub fn parse(text: &[u8], sys: &dyn Fn(&str) -> Option<String>) -> (Self, Vec<String>) {
@@ -1567,11 +1592,18 @@ pub fn init_broker() {
 
 /// Starts logging as the utility commands do (`artemis-utility.profile`):
 /// WARN to the console in Artemis's pattern, then the instance's
-/// `log4j2-utility.properties`, found on the classpath through etc/.
+/// `log4j2-utility.properties`, found on the classpath through etc/. Run
+/// from the home, whose `bin/artemis` names no configuration, it is
+/// log4j2's default: errors only, so that what a command writes to
+/// standard output (`data exp`'s XML) is all there is.
 pub fn init_utility(etc: Option<&Path>) {
     let env = EnvFilter::try_from_default_env().ok();
+    let config = match etc {
+        Some(_) => Config::console(WARN, false),
+        None => Config::log4j2_default(),
+    };
     let shared = Arc::new(Shared {
-        config: RwLock::new(Arc::new(Config::console(WARN, false))),
+        config: RwLock::new(Arc::new(config)),
         levels: env.is_none(),
     });
     let _ = SHARED.set(shared.clone());

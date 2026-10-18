@@ -58,9 +58,9 @@ pub struct DbArgs {
 #[derive(Args, Clone, Debug, Default)]
 pub struct JdbcArgs {
     /// Whether to store message data in JDBC instead of local files.
-    /// Saranga does not.
-    #[arg(long)]
-    pub jdbc: bool,
+    /// Saranga does not: --jdbc (true) is refused.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub jdbc: Option<bool>,
     /// Name of the jdbc bindings table.
     #[arg(long = "jdbc-bindings-table-name", hide = true)]
     pub bindings_table_name: Option<String>,
@@ -112,7 +112,7 @@ impl DbArgs {
     /// The CLI lock (`OptionalLocking`): none taken with `--f`. `--jdbc`
     /// is refused first.
     pub fn lock(&self) -> anyhow::Result<CliLock> {
-        if self.jdbc.jdbc {
+        if self.jdbc.jdbc == Some(true) {
             return Err(crate::client::CliError(
                 "saranga data does not support --jdbc: Saranga does not store messages in a database".to_owned(),
             )

@@ -130,6 +130,34 @@ suite() {
   run check queue --name DLQ --consume -1 --browse -1
   run check queue --name nosuch
   run check queue --name DLQ --produce 0
+  # Negative values, which fail or are taken as Artemis's commands take them.
+  run producer --destination queue://clineg --message-count 1 --threads -5
+  run producer --destination queue://clineg --message-count 1 --threads 0
+  run consumer --destination queue://clineg --message-count 1 --receive-timeout 200 --threads -5
+  run browser --destination queue://clineg --threads -5
+  run check node --up --timeout -5
+  run check queue --name DLQ --up --timeout -5
+  run queue stat --queueName clineg --sleep -5
+  # Mistakes on the command line: the message, then `help help`.
+  run_bare producer --frob
+  run_bare frob
+  run_bare frob x --y
+  run_bare queue stt
+  run_bare queue
+  run_bare producer x
+  run_bare producer --message-count abc
+  run_bare producer --message-count
+  run_bare producer --message-count 1 --message-count 2
+  run_bare producer --non-persistent=maybe
+  run_bare producer --protocol frob
+  run_bare queue create --name
+  run_bare check queue --name x --frob
+  run_bare data print --frob
+  # And in the shell: Unknown command, or the message and the command's
+  # usage, or picocli's suggestions.
+  shell "producer --frob" "frob" "prodcer" "queue frob" "queue stt" "queue stat --u" \
+    "producer --message-count abc" "queue" "producer x" "producer --help" "address creat" \
+    "check nod" "exit"
   # shell
   shell "# the shell's connection" "" "connect --url $URL" \
     "queue create --name clishell --address clishell --anycast --auto-create-address --silent" \
@@ -150,7 +178,7 @@ normalize() {
     -e '/^Executing org\.apache\.activemq\.artemis\.cli\./d' \
     -e '/^Home::/d' \
     -e 's/\x1b\[[0-9;]*m//g' \
-    -e 's/^Usage: (artemis|saranga) help/Usage: CLI help/' \
+    -e 's/(^|> )Usage: (artemis|saranga) /\1Usage: CLI /' \
     -e 's/(Elapsed time in second :) [0-9]+ s/\1 # s/' \
     -e 's/(Elapsed time in milli second :) [0-9]+ milli/\1 # milli/' \
     -e 's/Time elapsed: [0-9.]+ sec/Time elapsed: # sec/' \

@@ -400,6 +400,8 @@ pub async fn load_messages(
             m.durable_up();
             let mut r = MessageRef::new(m.clone());
             r.scheduled_time = message::scheduled_delivery_time(m.core());
+            // Counted as a routed reference is, until the branch ends.
+            q.ref_up(&r);
             tx.sends.push((q.clone(), r));
         }
         for (queue_id, message_id) in p.acks {

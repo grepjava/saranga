@@ -85,7 +85,60 @@ public class CliHelp {
    static String arg(ArgSpec a) {
       return ",\"label\":" + str(a.paramLabel()) + ",\"arity\":" + str(a.arity().toString())
          + ",\"multi\":" + a.isMultiValue() + ",\"hidden\":" + a.hidden() + ",\"required\":" + a.required()
-         + ",\"description\":" + strs(a.description()) + candidates(a) + completion(a);
+         + ",\"description\":" + strs(a.description()) + candidates(a) + completion(a) + java(a);
+   }
+
+   /*
+    * How picocli converts the argument's values (its element type's, for a
+    * list), for saranga's parser: "boolean", "Boolean", "int", "long",
+    * "String" or "File" for picocli's own converters, "enum" with the
+    * constants for its enum converter, "upper-enum" with the enum's class
+    * and constants for Artemis's ConnectionProtocol.ProtocolConverter
+    * (valueOf of the value in upper case), and "list" when the values are
+    * collected.
+    */
+   static String java(ArgSpec a) {
+      Class<?> type = a.typeInfo().isMultiValue() ? a.typeInfo().getAuxiliaryTypes()[0] : a.type();
+      StringBuilder out = new StringBuilder(",\"java\":");
+      if (a.converters().length > 0) {
+         check(a.converters().length == 1 && a.converters()[0].getClass().getName()
+            .equals("org.apache.activemq.artemis.cli.commands.messages.ConnectionProtocol$ProtocolConverter"),
+            "converter of " + a.paramLabel());
+         List<String> l = new ArrayList<>();
+         for (Object c : type.getEnumConstants()) {
+            l.add(str(((Enum<?>) c).name()));
+         }
+         out.append("\"upper-enum\",\"class\":").append(str(type.getName()));
+         out.append(",\"constants\":[").append(String.join(",", l)).append("]");
+      } else if (type.isEnum()) {
+         List<String> l = new ArrayList<>();
+         for (Object c : type.getEnumConstants()) {
+            l.add(str(((Enum<?>) c).name()));
+         }
+         out.append("\"enum\",\"constants\":[").append(String.join(",", l)).append("]");
+      } else if (type == Boolean.TYPE || type == Boolean.class && a.initialValue() != null) {
+         out.append("\"boolean\"");
+      } else if (type == Boolean.class) {
+         // Unset (null), true or false: Artemis's commands ask for a value
+         // left unset.
+         out.append("\"Boolean\"");
+      } else if (type == Integer.TYPE || type == Integer.class) {
+         out.append("\"int\"");
+      } else if (type == Long.TYPE || type == Long.class) {
+         out.append("\"long\"");
+      } else if (type == String.class) {
+         out.append("\"String\"");
+      } else if (type == java.io.File.class) {
+         out.append("\"File\"");
+      } else {
+         throw new IllegalStateException("not supported by saranga's parser: " + type + " of " + a.paramLabel());
+      }
+      if (a.typeInfo().isMultiValue()) {
+         check(a.typeInfo().isCollection() || a.typeInfo().isArray(), "map of " + a.paramLabel());
+         check(a.splitRegex().isEmpty(), "split of " + a.paramLabel());
+         out.append(",\"list\":true");
+      }
+      return out.toString();
    }
 
    /*

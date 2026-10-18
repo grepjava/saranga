@@ -28,7 +28,7 @@ pub struct CheckArgs {
     name: Option<String>,
     /// Time to wait for the check to complete (in milliseconds).
     #[arg(long, default_value_t = 30000)]
-    timeout: u64,
+    timeout: i32,
     /// Continue with the rest of the checks even if a particular module
     /// check fails.
     #[arg(long = "fail-at-end")]
@@ -198,7 +198,8 @@ pub async fn run(cmd: CheckCommand) -> anyhow::Result<()> {
             (args.check, "QueueCheck", tasks)
         }
     };
-    let timeout = Duration::from_millis(check.timeout);
+    // A negative timeout passes at once (`Future.get`).
+    let timeout = Duration::from_millis(u64::try_from(check.timeout).unwrap_or(0));
     match tokio::time::timeout(timeout, run_tasks(&check, kind, &tasks)).await {
         Ok(r) => r,
         Err(_) => bail!(CliError(format!("{kind} failed. Reason: timeout"))),

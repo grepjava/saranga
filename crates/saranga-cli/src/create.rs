@@ -218,29 +218,29 @@ pub struct CreateArgs {
     purge_page_folders: bool,
     /// Allow connections from users with no security credentials. Opposite
     /// of --require-login. Default: input.
-    #[arg(long = "allow-anonymous")]
-    allow_anonymous: bool,
+    #[arg(long = "allow-anonymous", num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    allow_anonymous: Option<bool>,
     /// Require security credentials from users for connection. Opposite of
     /// --allow-anonymous.
-    #[arg(long = "require-login")]
-    require_login: bool,
+    #[arg(long = "require-login", num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    require_login: Option<bool>,
     /// Page messages to disk when address becomes full. Opposite of
     /// --blocking. Default: true.
-    #[arg(long)]
-    paging: bool,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    paging: Option<bool>,
     /// Block producers when address becomes full. Opposite of --paging.
     /// Default: false.
-    #[arg(long)]
-    blocking: bool,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    blocking: Option<bool>,
     /// Disable auto tuning of the journal-buffer-timeout in broker.xml.
     #[arg(long = "no-autotune")]
     no_autotune: bool,
     /// Disable auto creation for addresses & queues.
-    #[arg(long = "no-autocreate")]
-    no_autocreate: bool,
+    #[arg(long = "no-autocreate", num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    no_autocreate: Option<bool>,
     /// Allow automatic creation of addresses & queues. Default: true.
-    #[arg(long)]
-    autocreate: bool,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    autocreate: Option<bool>,
     /// Allow automatic deletion of addresses & queues. Default: false.
     #[arg(long)]
     autodelete: bool,
@@ -482,12 +482,12 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
     } else {
         "NIO"
     };
-    let allow_anonymous_given = if args.require_login {
+    // `--require-login` (true) means no anonymous access, before any
+    // question.
+    let allow_anonymous_given = if args.require_login == Some(true) {
         Some(false)
-    } else if args.allow_anonymous {
-        Some(true)
     } else {
-        None
+        args.allow_anonymous
     };
 
     println!(
@@ -909,13 +909,18 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
     }
     f.put(
         "${full-policy}",
-        if args.blocking && !args.paging {
+        if args.paging != Some(true) && args.blocking == Some(true) {
             "BLOCK"
         } else {
             "PAGE"
         },
     );
-    let auto_create = args.autocreate || !args.no_autocreate;
+    // `isAutoCreate`: --autocreate, else the opposite of --no-autocreate,
+    // else true.
+    let auto_create = args
+        .autocreate
+        .or(args.no_autocreate.map(|no| !no))
+        .unwrap_or(true);
     f.put("${auto-create}", auto_create.to_string());
     f.put("${auto-delete}", args.autodelete.to_string());
     auto_tune(&mut f, &args, &data, journal_type)?;
@@ -1061,7 +1066,7 @@ fn auto_tune(
             "...Since you disabled sync and are using MAPPED journal, we are diabling buffer times"
         );
     } else {
-        let writes = 250;
+        let writes: i32 = 250;
         match sync_test(
             data,
             "journal-test.tmp",
@@ -1072,8 +1077,8 @@ fn auto_tune(
             args.common.verbose,
         ) {
             Ok(time) => {
-                let nanoseconds = to_nanos(time, writes, args.common.verbose);
-                let per_ms = decimal_format(writes as f64 / time as f64);
+                let nanoseconds = to_nanos(time, i64::from(writes), args.common.verbose);
+                let per_ms = decimal_format(f64::from(writes) / time as f64);
                 sync.put("${nanoseconds}", nanoseconds.to_string());
                 sync.put("${writesPerMillisecond}", per_ms.clone());
                 sync.put(
