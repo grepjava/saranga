@@ -225,8 +225,8 @@ So you can migrate a cluster node by node. Stop one Artemis node, start Saranga 
 ## Managing a cluster
 
 - `listNetworkTopology` on the server control lists the cluster connection's members.
-- `BroadcastGroupControl`, `BridgeControl` and `BrokerConnectionControl` are registered as in Artemis.
-- There is no `ClusterConnectionControl` for a cluster connection (`component=cluster-connections`).
+- `BroadcastGroupControl`, `BridgeControl`, `BrokerConnectionControl` and `ClusterConnectionControl` are registered as in Artemis. The cluster connection's control shows its settings, the topology, the nodes it is bridged to and its bridges' metrics, and stops and starts it.
+- Only the first `<cluster-connection>` in `broker.xml` is deployed, so only it has a control.
 - `artemis check cluster` is not in Saranga's CLI.
 
 See [Management](management.md) and [Management differences](../../COMPAT.md#management-differences).

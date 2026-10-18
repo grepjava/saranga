@@ -197,6 +197,8 @@ struct Inner {
     /// The queue consumer the bridge is now, 0 when it is none.
     consumer_id: AtomicU64,
     connected: AtomicBool,
+    /// The forwarding connection's remote address, while connected.
+    remote: Mutex<Option<String>>,
     metrics: Metrics,
     /// Acknowledged message IDs, for the acknowledging task.
     acks: mpsc::UnboundedSender<i64>,
@@ -474,6 +476,7 @@ impl Bridge {
             outbox: Mutex::new(None),
             consumer_id: AtomicU64::new(0),
             connected: AtomicBool::new(false),
+            remote: Mutex::new(None),
             metrics: Metrics::default(),
             acks: acks_tx,
         });
@@ -537,6 +540,15 @@ impl Bridge {
 
     pub fn metrics(&self) -> &Metrics {
         &self.inner.metrics
+    }
+
+    /// `getForwardingConnection().getRemoteAddress()`, while connected.
+    pub fn remote_address(&self) -> Option<String> {
+        self.inner
+            .remote
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// `BridgeImpl.toString`.
@@ -961,6 +973,7 @@ impl Bridge {
             return Some(());
         }
         inner.connected.store(true, Ordering::SeqCst);
+        *inner.remote.lock().unwrap_or_else(|e| e.into_inner()) = link.conn.remote_address();
         self.add_consumer();
         tracing::info!("AMQ221027: Bridge {} is connected", self.describe());
         let ended = loop {
@@ -991,6 +1004,7 @@ impl Bridge {
         };
         *inner.outbox.lock().unwrap_or_else(|e| e.into_inner()) = None;
         inner.connected.store(false, Ordering::SeqCst);
+        *inner.remote.lock().unwrap_or_else(|e| e.into_inner()) = None;
         match ended {
             Ended::Stop => {
                 self.finish_stop(link).await;

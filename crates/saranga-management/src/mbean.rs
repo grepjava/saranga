@@ -329,6 +329,7 @@ pub enum Bean {
     BroadcastGroup(String),
     Bridge(String),
     BrokerConnection(String),
+    ClusterConnection(String),
     /// hawtio's permission checks (`HawtioSecurityControl`), which
     /// `artemis run` registers for the console.
     HawtioSecurity,
@@ -350,7 +351,8 @@ impl Bean {
             Self::BroadcastGroup(_) => &crate::catalog::BROADCAST_GROUP,
             Self::Bridge(_) => &crate::catalog::BRIDGE,
             Self::BrokerConnection(_) => &crate::catalog::BROKER_CONNECTION,
-            Self::HawtioSecurity => &crate::catalog::HAWTIO_SECURITY,
+            Self::ClusterConnection(_) => &crate::catalog::CLUSTER_CONNECTION,
+            Self::HawtioSecurity => &HAWTIO_SECURITY_CONTROL,
             Self::Platform(p) => p.control(),
         }
     }
@@ -366,6 +368,7 @@ impl Bean {
             Self::BroadcastGroup(g) => format!("broadcastgroup.{g}"),
             Self::Bridge(b) => format!("bridge.{b}"),
             Self::BrokerConnection(c) => format!("brokerconnection.{c}"),
+            Self::ClusterConnection(c) => format!("clusterconnection.{c}"),
             Self::HawtioSecurity => "hawtio.security".to_owned(),
             Self::Platform(p) => format!("java.lang.{}", p.type_name()),
         }
@@ -391,6 +394,9 @@ impl Bean {
             Self::Bridge(_) => "org.apache.activemq.artemis.core.management.impl.BridgeControlImpl",
             Self::BrokerConnection(_) => {
                 "org.apache.activemq.artemis.core.management.impl.BrokerConnectionControlImpl"
+            }
+            Self::ClusterConnection(_) => {
+                "org.apache.activemq.artemis.core.management.impl.ClusterConnectionControlImpl"
             }
             Self::HawtioSecurity => {
                 "org.apache.activemq.artemis.core.server.management.impl.HawtioSecurityControlImpl"
@@ -427,6 +433,15 @@ pub fn registered(
             quote(g)
         )) {
             out.push((n, Bean::BroadcastGroup(g.clone())));
+        }
+    }
+    if let Some(c) = broker.cluster() {
+        let c = c.config().name.clone();
+        if let Some(n) = name(format!(
+            "{base},component=cluster-connections,name={}",
+            quote(&c)
+        )) {
+            out.push((n, Bean::ClusterConnection(c)));
         }
     }
     for b in broker.bridges().names() {
@@ -482,6 +497,78 @@ pub fn registered(
     }
     out
 }
+
+/// `HawtioSecurityControl`, the console's permission checks
+/// (`hawtio:type=security,area=jmx,name=ArtemisJMXSecurity`).
+pub static HAWTIO_SECURITY_CONTROL: Control = Control {
+    interface: "HawtioSecurityControl",
+    attrs: &[],
+    ops: &[
+        Op {
+            name: "canInvoke",
+            desc: "Can invoke a number of Objects",
+            impact: 1,
+            ret: "javax.management.openmbean.TabularData",
+            params: &[Param {
+                name: "p 1",
+                type_name: "java.util.Map",
+                desc: "parameter 1",
+            }],
+        },
+        Op {
+            name: "canInvoke",
+            desc: "Can invoke an Object",
+            impact: 1,
+            ret: "boolean",
+            params: &[
+                Param {
+                    name: "p 1",
+                    type_name: "java.lang.String",
+                    desc: "parameter 1",
+                },
+                Param {
+                    name: "p 2",
+                    type_name: "java.lang.String",
+                    desc: "parameter 2",
+                },
+                Param {
+                    name: "p 3",
+                    type_name: "[Ljava.lang.String;",
+                    desc: "parameter 3",
+                },
+            ],
+        },
+        Op {
+            name: "canInvoke",
+            desc: "Can invoke an Object",
+            impact: 1,
+            ret: "boolean",
+            params: &[
+                Param {
+                    name: "p 1",
+                    type_name: "java.lang.String",
+                    desc: "parameter 1",
+                },
+                Param {
+                    name: "p 2",
+                    type_name: "java.lang.String",
+                    desc: "parameter 2",
+                },
+            ],
+        },
+        Op {
+            name: "canInvoke",
+            desc: "Can invoke an Object",
+            impact: 1,
+            ret: "boolean",
+            params: &[Param {
+                name: "p 1",
+                type_name: "java.lang.String",
+                desc: "parameter 1",
+            }],
+        },
+    ],
+};
 
 #[cfg(test)]
 mod tests {

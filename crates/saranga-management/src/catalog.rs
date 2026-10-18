@@ -6862,6 +6862,7 @@ pub static BRIDGE: Control = Control {
     ],
 };
 
+/// `BrokerConnectionControl`.
 pub static BROKER_CONNECTION: Control = Control {
     interface: "BrokerConnectionControl",
     attrs: &[
@@ -6948,74 +6949,172 @@ pub static BROKER_CONNECTION: Control = Control {
     ],
 };
 
-/// `HawtioSecurityControl`, the console's permission checks
-/// (`hawtio:type=security,area=jmx,name=ArtemisJMXSecurity`).
-pub static HAWTIO_SECURITY: Control = Control {
-    interface: "HawtioSecurityControl",
-    attrs: &[],
+/// `ClusterConnectionControl`.
+pub static CLUSTER_CONNECTION: Control = Control {
+    interface: "ClusterConnectionControl",
+    attrs: &[
+        Attr {
+            name: "Started",
+            type_name: "boolean",
+            desc: "whether this component is started",
+            readable: true,
+            writable: false,
+            is: true,
+        },
+        Attr {
+            name: "Address",
+            type_name: "java.lang.String",
+            desc: "address used by this cluster connection",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "MessageLoadBalancingType",
+            type_name: "java.lang.String",
+            desc: "type of message load balancing strategy this bridge will use",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "MessagesAcknowledged",
+            type_name: "long",
+            desc: "The messagesAcknowledged counter is the number of messages actually received by a remote broker for all bridges in this cluster connection",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "Topology",
+            type_name: "java.lang.String",
+            desc: "Topology that this Cluster Connection knows about",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "MaxHops",
+            type_name: "int",
+            desc: "maximum number of hops used by this cluster connection",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "Nodes",
+            type_name: "java.util.Map",
+            desc: "map of the nodes connected to this cluster connection (keys are node IDs, values are the addresses used to connect to the nodes)",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "Name",
+            type_name: "java.lang.String",
+            desc: "name of this cluster connection",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "DuplicateDetection",
+            type_name: "boolean",
+            desc: "whether this cluster connection use duplicate detection",
+            readable: true,
+            writable: false,
+            is: true,
+        },
+        Attr {
+            name: "DiscoveryGroupName",
+            type_name: "java.lang.String",
+            desc: "name of the discovery group used by this cluster connection",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "Metrics",
+            type_name: "java.util.Map",
+            desc: "The metrics for this cluster connection. The messagesPendingAcknowledgement counter is incremented when any bridge in the cluster connection has forwarded a message and is waiting acknowledgement from the other broker. The messagesAcknowledged counter is the number of messages actually received by a remote broker for all bridges in this cluster connection",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "MessagesPendingAcknowledgement",
+            type_name: "long",
+            desc: "The messagesPendingAcknowledgement counter is incremented when any bridge in the cluster connection has forwarded a message and is waiting acknowledgement from the other broker. (aggregate over all bridges)",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "StaticConnectors",
+            type_name: "[Ljava.lang.Object;",
+            desc: "list of static connectors",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "NodeID",
+            type_name: "java.lang.String",
+            desc: "node ID used by this cluster connection",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "RetryInterval",
+            type_name: "long",
+            desc: "connection retry interval used by this cluster connection",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "ProducerWindowSize",
+            type_name: "long",
+            desc: "The Producer Window Size used by the Cluster Connection",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+        Attr {
+            name: "StaticConnectorsAsJSON",
+            type_name: "java.lang.String",
+            desc: "list of static connectors as JSON",
+            readable: true,
+            writable: false,
+            is: false,
+        },
+    ],
     ops: &[
         Op {
-            name: "canInvoke",
-            desc: "Can invoke a number of Objects",
-            impact: 1,
-            ret: "javax.management.openmbean.TabularData",
+            name: "stop",
+            desc: "stops this component",
+            impact: 3,
+            ret: "void",
+            params: &[],
+        },
+        Op {
+            name: "getBridgeMetrics",
+            desc: "The metrics for the bridge by nodeId. The messagesPendingAcknowledgement counter is incremented when the bridge is has forwarded a message but is waiting acknowledgement from the other broker. The messagesAcknowledged counter is the number of messages actually received by the remote broker for this bridge.",
+            impact: 3,
+            ret: "java.util.Map",
             params: &[Param {
-                name: "p 1",
-                type_name: "java.util.Map",
-                desc: "parameter 1",
-            }],
-        },
-        Op {
-            name: "canInvoke",
-            desc: "Can invoke an Object",
-            impact: 1,
-            ret: "boolean",
-            params: &[
-                Param {
-                    name: "p 1",
-                    type_name: "java.lang.String",
-                    desc: "parameter 1",
-                },
-                Param {
-                    name: "p 2",
-                    type_name: "java.lang.String",
-                    desc: "parameter 2",
-                },
-                Param {
-                    name: "p 3",
-                    type_name: "[Ljava.lang.String;",
-                    desc: "parameter 3",
-                },
-            ],
-        },
-        Op {
-            name: "canInvoke",
-            desc: "Can invoke an Object",
-            impact: 1,
-            ret: "boolean",
-            params: &[
-                Param {
-                    name: "p 1",
-                    type_name: "java.lang.String",
-                    desc: "parameter 1",
-                },
-                Param {
-                    name: "p 2",
-                    type_name: "java.lang.String",
-                    desc: "parameter 2",
-                },
-            ],
-        },
-        Op {
-            name: "canInvoke",
-            desc: "Can invoke an Object",
-            impact: 1,
-            ret: "boolean",
-            params: &[Param {
-                name: "p 1",
+                name: "nodeId",
                 type_name: "java.lang.String",
-                desc: "parameter 1",
+                desc: "The target node ID",
             }],
+        },
+        Op {
+            name: "start",
+            desc: "starts this component",
+            impact: 3,
+            ret: "void",
+            params: &[],
         },
     ],
 };

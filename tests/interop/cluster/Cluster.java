@@ -14,12 +14,18 @@
 //   java -cp '<artemis>/lib/*' Cluster.java send <url> <queue> <count>
 //   java -cp '<artemis>/lib/*' Cluster.java receive <url> <queue> <count>
 //       the messages, then that no more come.
+//   java -cp '<artemis>/lib/*' Cluster.java control <url>
+//       ClusterConnectionControl's attributes and getBridgeMetrics, through
+//       management messages, with what differs between runs left out.
+//   java -cp '<artemis>/lib/*' Cluster.java control-restart <url>
+//       stop through management, then start, and the bridge comes back.
 // tests/interop/cluster/cluster.sh runs it; it prints what it saw.
 
 import java.util.*;
 import javax.jms.*;
 
 import org.apache.activemq.artemis.api.core.client.TopologyMember;
+import org.apache.activemq.artemis.api.jms.management.JMSManagementHelper;
 import org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory;
 
 public class Cluster {
@@ -35,8 +41,98 @@ public class Cluster {
             case "topic" -> topic(args[1], args[2], args[3], Integer.parseInt(args[4]));
             case "send" -> send(args[1], args[2], Integer.parseInt(args[3]));
             case "receive" -> receive(args[1], args[2], Integer.parseInt(args[3]));
+            case "control" -> control(args[1]);
+            case "control-restart" -> controlRestart(args[1]);
             default -> throw new IllegalArgumentException(args[0]);
         }
+    }
+
+    /** A management call: an attribute (no operation) or an operation. */
+    static Object manage(String url, String resource, String name, boolean operation, Object... params)
+            throws Exception {
+        try (QueueConnection c = new ActiveMQConnectionFactory(url).createQueueConnection(USER, PASSWORD)) {
+            QueueSession s = c.createQueueSession(false, Session.AUTO_ACKNOWLEDGE);
+            QueueRequestor r = new QueueRequestor(s, s.createQueue("activemq.management"));
+            c.start();
+            Message m = s.createMessage();
+            if (operation) {
+                JMSManagementHelper.putOperationInvocation(m, resource, name, params);
+            } else {
+                JMSManagementHelper.putAttribute(m, resource, name);
+            }
+            Message reply = r.request(m);
+            Object result = JMSManagementHelper.getResult(reply);
+            if (!JMSManagementHelper.hasOperationSucceeded(reply)) {
+                throw new java.lang.IllegalStateException(String.valueOf(result));
+            }
+            return result;
+        }
+    }
+
+    static String show(Object v) {
+        if (v instanceof Object[] a) {
+            return Arrays.toString(a);
+        }
+        if (v instanceof Map<?, ?> m) {
+            return new TreeMap<>(m).toString();
+        }
+        return String.valueOf(v);
+    }
+
+    /** The cluster connection's name, from the broker's list. */
+    static String clusterConnection(String url) throws Exception {
+        Object[] names = (Object[]) manage(url, "broker", "clusterConnectionNames", false);
+        System.out.println("clusterConnectionNames = " + Arrays.toString(names));
+        return "clusterconnection." + names[0];
+    }
+
+    /** The nodes bridged to, waiting up to 10 s for one. */
+    static Map<?, ?> nodes(String url, String resource) throws Exception {
+        Map<?, ?> nodes = Map.of();
+        for (int i = 0; i < 100 && nodes.isEmpty(); i++) {
+            nodes = (Map<?, ?>) manage(url, resource, "nodes", false);
+            if (nodes.isEmpty()) {
+                Thread.sleep(100);
+            }
+        }
+        return nodes;
+    }
+
+    static void control(String url) throws Exception {
+        String cc = clusterConnection(url);
+        for (String a : new String[] {"name", "address", "duplicateDetection", "messageLoadBalancingType",
+                "maxHops", "staticConnectors", "staticConnectorsAsJSON", "discoveryGroupName",
+                "retryInterval", "producerWindowSize", "started", "messagesPendingAcknowledgement"}) {
+            System.out.println(a + " = " + show(manage(url, cc, a, false)));
+        }
+        String nodeId = String.valueOf(manage(url, cc, "nodeID", false));
+        System.out.println("nodeID is a UUID: " + nodeId.matches("[0-9a-f-]{36}"));
+        Map<?, ?> nodes = nodes(url, cc);
+        System.out.println("nodes: " + nodes.size() + ", the other node's address "
+            + nodes.values().stream().map(String::valueOf).toList());
+        String other = String.valueOf(nodes.keySet().iterator().next());
+        System.out.println("nodes leave out this node: " + !nodes.containsKey(nodeId));
+        String topology = String.valueOf(manage(url, cc, "topology", false));
+        System.out.println("topology: starts " + topology.startsWith("topology on Topology@")
+            + ", members " + topology.lines().filter(l -> l.contains(" => TopologyMember[id=")).count()
+            + ", " + topology.substring(topology.lastIndexOf("nodes=")).replace('\t', ' '));
+        Map<?, ?> metrics = (Map<?, ?>) manage(url, cc, "metrics", false);
+        System.out.println("metrics keys " + new TreeSet<>(metrics.keySet()));
+        Map<?, ?> bridge = (Map<?, ?>) manage(url, cc, "getBridgeMetrics", true, other);
+        System.out.println("getBridgeMetrics(other) keys " + new TreeSet<>(bridge.keySet())
+            + ", pending " + bridge.get("messagesPendingAcknowledgement"));
+        System.out.println("getBridgeMetrics(unknown) = "
+            + manage(url, cc, "getBridgeMetrics", true, "00000000-0000-0000-0000-000000000000"));
+    }
+
+    static void controlRestart(String url) throws Exception {
+        String cc = clusterConnection(url);
+        manage(url, cc, "stop", true);
+        System.out.println("stopped: started = " + manage(url, cc, "started", false)
+            + ", nodes = " + show(manage(url, cc, "nodes", false)));
+        manage(url, cc, "start", true);
+        System.out.println("started: started = " + manage(url, cc, "started", false)
+            + ", nodes " + nodes(url, cc).size());
     }
 
     static Connection core(String url) throws JMSException {

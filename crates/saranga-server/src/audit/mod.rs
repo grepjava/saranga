@@ -33,6 +33,7 @@ pub(crate) enum Control {
     BroadcastGroup,
     Bridge,
     BrokerConnection,
+    ClusterConnection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,6 +346,9 @@ fn source(broker: &Broker, control: Control, name: &str) -> String {
             "org.apache.activemq.artemis.protocol.amqp.connect.AMQPBrokerConnection@{:x}",
             identity(("broker-connection", name))
         ),
+        Control::ClusterConnection => broker
+            .cluster()
+            .map_or_else(|| "null".to_owned(), |c| c.describe(broker)),
     }
 }
 

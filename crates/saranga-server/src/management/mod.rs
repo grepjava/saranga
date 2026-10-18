@@ -138,6 +138,7 @@ enum Resource {
     BroadcastGroup(Arc<crate::discovery::BroadcastGroup>),
     Bridge(Arc<crate::bridge::Bridge>),
     BrokerConnection(Arc<dyn crate::broker_connection::BrokerConnection>),
+    ClusterConnection(Arc<crate::cluster::ClusterConnection>),
 }
 
 impl Resource {
@@ -153,6 +154,7 @@ impl Resource {
             Resource::BroadcastGroup(g) => (Control::BroadcastGroup, g.config().name.clone()),
             Resource::Bridge(b) => (Control::Bridge, b.name().to_owned()),
             Resource::BrokerConnection(c) => (Control::BrokerConnection, c.name().to_owned()),
+            Resource::ClusterConnection(c) => (Control::ClusterConnection, c.config().name.clone()),
         }
     }
 }
@@ -255,6 +257,13 @@ impl Management {
                 .get(c)
                 .map(Resource::BrokerConnection);
         }
+        if let Some(c) = name.strip_prefix("clusterconnection.") {
+            return broker
+                .cluster()
+                .filter(|cc| cc.config().name == c)
+                .cloned()
+                .map(Resource::ClusterConnection);
+        }
         None
     }
 
@@ -285,6 +294,7 @@ impl Management {
             Resource::BroadcastGroup(g) => Ok(broadcast_group_attribute(g, &upper)),
             Resource::Bridge(b) => bridge_attribute(b, &upper),
             Resource::BrokerConnection(c) => Ok(broker_connection_attribute(c.as_ref(), &upper)),
+            Resource::ClusterConnection(c) => Ok(cluster_connection_attribute(broker, c, &upper)),
         };
         match found {
             // A boolean attribute is read through its `is` method.
@@ -393,6 +403,7 @@ impl Management {
             Resource::BroadcastGroup(g) => invoke_broadcast_group(g, &call),
             Resource::Bridge(b) => invoke_bridge(b, &call).await,
             Resource::BrokerConnection(c) => invoke_broker_connection(c.as_ref(), &call),
+            Resource::ClusterConnection(c) => invoke_cluster_connection(c, &call).await,
         };
         if let Some(outcome) = found {
             return outcome;
@@ -413,6 +424,9 @@ impl Management {
                         Resource::Bridge(b) => bridge_attribute(b, attr),
                         Resource::BrokerConnection(c) => {
                             Ok(broker_connection_attribute(c.as_ref(), attr))
+                        }
+                        Resource::ClusterConnection(c) => {
+                            Ok(cluster_connection_attribute(broker, c, attr))
                         }
                     };
                     match value {
@@ -649,32 +663,111 @@ fn bridge_attribute(b: &crate::bridge::Bridge, attr: &str) -> Result<Option<Json
             Json::from(b.metrics().messages_pending_acknowledgement())
         }
         "MessagesAcknowledged" => Json::from(b.metrics().messages_acknowledged()),
-        // `BridgeMetrics.convertToMap`: a `HashMap` of the two.
-        "Metrics" => {
-            let entries = [
-                (
-                    "messagesPendingAcknowledgement",
-                    b.metrics().messages_pending_acknowledgement(),
-                ),
-                ("messagesAcknowledged", b.metrics().messages_acknowledged()),
-            ];
-            let hashes: Vec<i32> = entries
-                .iter()
-                .map(|(k, _)| {
-                    k.encode_utf16()
-                        .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(i32::from(c)))
-                })
-                .collect();
-            let mut o = Json::object();
-            for i in saranga_buffer::java_hash::hash_map_order(&hashes, None) {
-                o.put(entries[i].0, entries[i].1);
-            }
-            o
-        }
+        "Metrics" => metrics_map(
+            b.metrics().messages_pending_acknowledgement(),
+            b.metrics().messages_acknowledged(),
+        ),
         "Connected" => Json::from(b.is_connected()),
         "Started" => Json::from(b.is_started()),
         _ => return Ok(None),
     }))
+}
+
+/// A `HashMap` of string keys, in its iteration order.
+fn java_map<V: Into<Json>>(entries: Vec<(String, V)>) -> Json {
+    let hashes: Vec<i32> = entries
+        .iter()
+        .map(|(k, _)| {
+            k.encode_utf16()
+                .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(i32::from(c)))
+        })
+        .collect();
+    let mut slots: Vec<Option<(String, V)>> = entries.into_iter().map(Some).collect();
+    let mut o = Json::object();
+    for i in saranga_buffer::java_hash::hash_map_order(&hashes, None) {
+        if let Some((k, v)) = slots[i].take() {
+            o.put(&k, v);
+        }
+    }
+    o
+}
+
+/// `BridgeMetrics.convertToMap` and `ClusterConnectionMetrics.convertToMap`:
+/// a `HashMap` of the two counts.
+fn metrics_map(pending: i64, acknowledged: i64) -> Json {
+    java_map(vec![
+        ("messagesPendingAcknowledgement".to_owned(), pending),
+        ("messagesAcknowledged".to_owned(), acknowledged),
+    ])
+}
+
+/// `ClusterConnectionControl`'s attributes.
+fn cluster_connection_attribute(
+    broker: &Broker,
+    c: &crate::cluster::ClusterConnection,
+    attr: &str,
+) -> Option<Json> {
+    use saranga_config::MessageLoadBalancing as M;
+    let s = &c.config().settings;
+    let connectors = || {
+        Json::Array(
+            s.static_connectors
+                .iter()
+                .map(|n| Json::from(n.as_str()))
+                .collect(),
+        )
+    };
+    Some(match attr {
+        "Name" => Json::from(s.name.as_str()),
+        "Address" => Json::from(s.address.as_str()),
+        "NodeID" => Json::from(c.node_id()),
+        "DuplicateDetection" => Json::from(s.use_duplicate_detection),
+        "MessageLoadBalancingType" => Json::from(match s.message_load_balancing {
+            M::Off => "OFF",
+            M::Strict => "STRICT",
+            M::OnDemand => "ON_DEMAND",
+            M::OffWithRedistribution => "OFF_WITH_REDISTRIBUTION",
+        }),
+        "Topology" => Json::from(c.describe_topology(broker)),
+        "MaxHops" => Json::from(s.max_hops),
+        "StaticConnectors" => connectors(),
+        "StaticConnectorsAsJSON" => Json::from(connectors().to_string()),
+        "DiscoveryGroupName" => Json::from(s.discovery_group.clone()),
+        "RetryInterval" => Json::from(s.retry_interval),
+        "Nodes" => java_map(c.nodes()),
+        "MessagesPendingAcknowledgement" => Json::from(c.metrics().0),
+        "MessagesAcknowledged" => Json::from(c.metrics().1),
+        "Metrics" => {
+            let (pending, acknowledged) = c.metrics();
+            metrics_map(pending, acknowledged)
+        }
+        "ProducerWindowSize" => Json::from(i64::from(s.producer_window_size)),
+        "Started" => Json::from(c.is_started()),
+        _ => return None,
+    })
+}
+
+/// `ClusterConnectionControl`'s operations: `start`, `stop`, which waits
+/// for the records to close (`flushExecutor`), and `getBridgeMetrics`.
+async fn invoke_cluster_connection(
+    c: &Arc<crate::cluster::ClusterConnection>,
+    call: &args::Call<'_>,
+) -> Option<Outcome> {
+    match (call.op, call.params) {
+        ("start", []) => {
+            c.start();
+            Some(Ok(Json::Null))
+        }
+        ("stop", []) => {
+            c.stop_flushed().await;
+            Some(Ok(Json::Null))
+        }
+        ("getBridgeMetrics", [node]) => Some(Ok(node
+            .as_str()
+            .and_then(|n| c.bridge_metrics(n))
+            .map_or(Json::Null, |(p, a)| metrics_map(p, a)))),
+        _ => None,
+    }
 }
 
 /// `BridgeControl`'s operations: `start`, and `stop`, which waits for the

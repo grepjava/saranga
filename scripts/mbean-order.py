@@ -20,6 +20,7 @@ KEYS = {
     "QueueControl": lambda k: "subcomponent=queues" in k,
     "DivertControl": lambda k: "subcomponent=diverts" in k,
     "AcceptorControl": lambda k: "component=acceptors" in k,
+    "ClusterConnectionControl": lambda k: "component=cluster-connections" in k,
 }
 
 value = json.load(open(sys.argv[1], encoding="utf-8"))["value"]

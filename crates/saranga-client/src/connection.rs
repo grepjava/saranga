@@ -634,6 +634,35 @@ struct FactoryState {
     /// `primaryNodeID`: the node of the connector in use, once the topology
     /// named it.
     primary_node_id: Option<String>,
+    /// The socket's other end, as `NettyConnection.getRemoteAddress` gives
+    /// it.
+    remote_address: Option<String>,
+}
+
+/// `SocketAddressUtil.toString` of the `InetSocketAddress` a host and the
+/// address it resolved to make: `host/ip:port`, or `ip:port` when the host
+/// is that address.
+fn java_remote_address(host: &str, addr: std::net::SocketAddr) -> String {
+    // `Inet6Address.getHostAddress`: every group, without brackets.
+    let ip = match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => v6
+            .segments()
+            .iter()
+            .map(|s| format!("{s:x}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    };
+    let literal = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok();
+    if literal {
+        format!("{ip}:{}", addr.port())
+    } else {
+        format!("{host}/{ip}:{}", addr.port())
+    }
 }
 
 /// What a `ServerLocatorImpl` keeps for all the session factories it makes:
@@ -939,6 +968,10 @@ impl Factory {
             if let Ok(Ok(stream)) = tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
                 let _ = stream.set_nodelay(true);
                 let mut st = self.state();
+                st.remote_address = stream
+                    .peer_addr()
+                    .ok()
+                    .map(|a| java_remote_address(&connector.host, a));
                 st.previous = st.current.take();
                 st.current = Some(connector);
                 return Some(stream);
@@ -1365,6 +1398,7 @@ impl Connection {
                     let factory = Factory::new(options, vec![connector.clone()]);
                     {
                         let mut st = factory.state();
+                        st.remote_address = Some(java_remote_address(&connector.host, addr));
                         st.connector = Some(connector.clone());
                         st.current = Some(connector);
                     }
@@ -1471,6 +1505,12 @@ impl Connection {
     /// (`getBackupConnector`).
     pub fn backup_connector(&self) -> Option<Connector> {
         self.factory.state().backup.clone()
+    }
+
+    /// The server's end of the socket in use (`getRemoteAddress`), as Java
+    /// writes it: `localhost/127.0.0.1:61616`.
+    pub fn remote_address(&self) -> Option<String> {
+        self.factory.state().remote_address.clone()
     }
 
     /// `setFailoverListener`: told when a failure is detected and when the

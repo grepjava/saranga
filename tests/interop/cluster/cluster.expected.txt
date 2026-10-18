@@ -29,6 +29,55 @@ node 2 received [m0, m1, m2, m3]
 no more
 === Cluster.java topology (node 1)
 topology: 2 nodes, 2 with a primary
+=== Cluster.java control (node 1)
+clusterConnectionNames = [my-cluster]
+name = my-cluster
+address = 
+duplicateDetection = true
+messageLoadBalancingType = ON_DEMAND
+maxHops = 1
+staticConnectors = [node0]
+staticConnectorsAsJSON = ["node0"]
+discoveryGroupName = null
+retryInterval = 500
+producerWindowSize = 1048576
+started = true
+messagesPendingAcknowledgement = 4
+nodeID is a UUID: true
+nodes: 1, the other node's address [localhost/127.0.0.1:64916]
+nodes leave out this node: true
+topology: starts true, members 2, nodes=2 members=2
+metrics keys [messagesAcknowledged, messagesPendingAcknowledgement]
+getBridgeMetrics(other) keys [messagesAcknowledged, messagesPendingAcknowledgement], pending 4
+getBridgeMetrics(unknown) = null
+=== Cluster.java control (node 2)
+clusterConnectionNames = [my-cluster]
+name = my-cluster
+address = 
+duplicateDetection = true
+messageLoadBalancingType = ON_DEMAND
+maxHops = 1
+staticConnectors = [node0]
+staticConnectorsAsJSON = ["node0"]
+discoveryGroupName = null
+retryInterval = 500
+producerWindowSize = 1048576
+started = true
+messagesPendingAcknowledgement = 0
+nodeID is a UUID: true
+nodes: 1, the other node's address [localhost/127.0.0.1:64816]
+nodes leave out this node: true
+topology: starts true, members 2, nodes=2 members=2
+metrics keys [messagesAcknowledged, messagesPendingAcknowledgement]
+getBridgeMetrics(other) keys [messagesAcknowledged, messagesPendingAcknowledgement], pending 0
+getBridgeMetrics(unknown) = null
+=== Cluster.java control-restart (node 1)
+clusterConnectionNames = [my-cluster]
+stopped: started = false, nodes = {}
+started: started = true, nodes 1
+=== Cluster.java on-demand orders 2
+node 2 received [m0, m1]
+no more
 === artemis stop (node 1, node 2)
 node 1: down
 node 2: down

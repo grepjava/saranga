@@ -979,6 +979,39 @@ impl ClusterConnection {
         self.records().values().cloned().collect()
     }
 
+    /// `getNodes`: each node whose bridge is connected, with the remote
+    /// address of its connection.
+    pub fn nodes(&self) -> Vec<(String, String)> {
+        self.records()
+            .iter()
+            .filter_map(|(id, r)| Some((id.clone(), r.bridge()?.remote_address()?)))
+            .collect()
+    }
+
+    /// `getMetrics`: the messages pending acknowledgement and acknowledged,
+    /// over every bridge.
+    pub fn metrics(&self) -> (i64, i64) {
+        self.records()
+            .values()
+            .filter_map(|r| r.bridge())
+            .fold((0, 0), |(p, a), b| {
+                (
+                    p + b.metrics().messages_pending_acknowledgement(),
+                    a + b.metrics().messages_acknowledged(),
+                )
+            })
+    }
+
+    /// `getBridgeMetrics`: the bridge to a node's.
+    pub fn bridge_metrics(&self, node_id: &str) -> Option<(i64, i64)> {
+        let records = self.records();
+        let b = records.get(node_id)?.bridge()?;
+        Some((
+            b.metrics().messages_pending_acknowledgement(),
+            b.metrics().messages_acknowledged(),
+        ))
+    }
+
     /// `stop`'s part for bridging: every record is closed, and
     /// `CLUSTER_CONNECTION_STOPPED` told.
     pub(crate) async fn stop_bridging(&self) {

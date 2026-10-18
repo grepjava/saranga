@@ -39,6 +39,7 @@ impl Caller {
             Bean::BroadcastGroup(n) => ("BroadcastGroupControlImpl", n.as_str()),
             Bean::Bridge(n) => ("BridgeControlImpl", n.as_str()),
             Bean::BrokerConnection(n) => ("BrokerConnectionControlImpl", n.as_str()),
+            Bean::ClusterConnection(n) => ("ClusterConnectionControlImpl", n.as_str()),
             // Its getMBeanInfo is audited from another package; not yet.
             Bean::HawtioSecurity | Bean::Platform(_) => return,
         };

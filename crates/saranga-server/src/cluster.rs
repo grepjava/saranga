@@ -430,11 +430,41 @@ impl ClusterConnection {
         });
     }
 
+    /// `isStarted`: bridging, and not stopped.
+    pub fn is_started(&self) -> bool {
+        self.broker.get().is_some() && !self.is_stopping()
+    }
+
+    /// `ClusterConnectionControl.start`: a cluster connection stopped
+    /// through management activates and bridges again. One that never
+    /// started (a backup's) waits for its broker to be active.
+    pub fn start(self: &Arc<Self>) {
+        let Some(broker) = self.broker() else { return };
+        if !self.stopping.send_replace(false) {
+            return;
+        }
+        self.activate();
+        self.start_bridging(&broker);
+    }
+
+    /// `ClusterConnectionControl.stop`: [`stop`](Self::stop), returning once
+    /// the records are closed (`flushExecutor`).
+    pub async fn stop_flushed(self: &Arc<Self>) {
+        if let Some(t) = self.stop_records() {
+            let _ = t.await;
+        }
+    }
+
     /// `stop`: no more announcements, no more bridges; the records close
     /// on a task of their own.
     pub fn stop(self: &Arc<Self>) {
+        self.stop_records();
+    }
+
+    /// [`stop`](Self::stop), with the task closing the records.
+    fn stop_records(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
         if self.stopping.send_replace(true) {
-            return;
+            return None;
         }
         for t in self
             .tasks
@@ -457,11 +487,62 @@ impl ClusterConnection {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some(id) = listener {
-            self.remove_listener(id);
-            let this = self.clone();
-            tokio::spawn(async move { this.stop_bridging().await });
+        let id = listener?;
+        self.remove_listener(id);
+        let this = self.clone();
+        Some(tokio::spawn(async move { this.stop_bridging().await }))
+    }
+
+    /// `ClusterConnectionImpl.toString`.
+    pub fn describe(&self, broker: &crate::Broker) -> String {
+        format!(
+            "ClusterConnectionImpl@{}[nodeUUID={}, connector={}, address={}, server={}]",
+            crate::audit::identity(("cluster-connection", &self.config.name)),
+            self.node_id,
+            crate::replication::quorum::transport_to_string(&self.config.connector),
+            self.config.settings.address,
+            crate::audit::server_string(broker)
+        )
+    }
+
+    /// `Topology.describe`: each member, in the order of a `HashMap` of
+    /// them, then their count.
+    pub fn describe_topology(&self, broker: &crate::Broker) -> String {
+        let members = self.members();
+        let tc = |c: &Option<TransportConfiguration>| {
+            c.as_ref().map_or_else(
+                || "null".to_owned(),
+                crate::replication::quorum::transport_to_string,
+            )
+        };
+        let mut out = format!(
+            "topology on Topology@{:x}[owner={}]:\n",
+            crate::audit::identity(("topology", &self.config.name)),
+            self.describe(broker)
+        );
+        let order = java_hash_order(members.iter().map(|m| m.node_id.as_str()).collect());
+        for i in order {
+            let m = &members[i];
+            out.push_str(&format!(
+                "\t{} => TopologyMember[id={}, connector=Pair[a={}, b={}], backupGroupName={}, scaleDownGroupName={}]\n",
+                m.node_id,
+                m.node_id,
+                tc(&m.primary),
+                tc(&m.backup),
+                m.backup_group_name.as_deref().unwrap_or("null"),
+                m.scale_down_group_name.as_deref().unwrap_or("null"),
+            ));
         }
+        // `nodes`: the primaries and backups.
+        let nodes: usize = members
+            .iter()
+            .map(|m| usize::from(m.primary.is_some()) + usize::from(m.backup.is_some()))
+            .sum();
+        out.push_str(&format!("\tnodes={nodes}\tmembers={}", members.len()));
+        if members.is_empty() {
+            out.push_str("\tEmpty");
+        }
+        out
     }
 
     /// `Topology.updateAsPrimary`.

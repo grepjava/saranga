@@ -33,6 +33,8 @@ CONTROLS = {
     "BaseBroadcastGroupControlImpl.java": "BroadcastGroup",
     "BroadcastGroupControlImpl.java": "BroadcastGroup",
     "BridgeControlImpl.java": "Bridge",
+    "BrokerConnectionControlImpl.java": "BrokerConnection",
+    "ClusterConnectionControlImpl.java": "ClusterConnection",
 }
 
 

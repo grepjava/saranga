@@ -1011,5 +1011,40 @@
     "()"
    ]
   ]
+ },
+ "ClusterConnectionControl": {
+  "attrs": [
+   "Started",
+   "Address",
+   "MessageLoadBalancingType",
+   "MessagesAcknowledged",
+   "Topology",
+   "MaxHops",
+   "Nodes",
+   "Name",
+   "DuplicateDetection",
+   "DiscoveryGroupName",
+   "Metrics",
+   "MessagesPendingAcknowledgement",
+   "StaticConnectors",
+   "NodeID",
+   "RetryInterval",
+   "ProducerWindowSize",
+   "StaticConnectorsAsJSON"
+  ],
+  "ops": [
+   [
+    "stop",
+    "()"
+   ],
+   [
+    "getBridgeMetrics",
+    "(java.lang.String)"
+   ],
+   [
+    "start",
+    "()"
+   ]
+  ]
  }
 }

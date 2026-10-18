@@ -33,6 +33,8 @@ CONTROLS = [
     ("ACCEPTOR", "AcceptorControl"),
     ("BROADCAST_GROUP", "BroadcastGroupControl"),
     ("BRIDGE", "BridgeControl"),
+    ("BROKER_CONNECTION", "BrokerConnectionControl"),
+    ("CLUSTER_CONNECTION", "ClusterConnectionControl"),
 ]
 
 IMPACT = {"MBeanOperationInfo.INFO": 0, "MBeanOperationInfo.ACTION": 1,

@@ -164,7 +164,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
   - Core over HTTP (`httpEnabled`, `HttpAcceptorHandler`): an HTTP request without a WebSocket upgrade gets `403 Forbidden`.
 
 ## Management differences
-- **Cluster connections** have no control (`component=cluster-connections`, `ClusterConnectionControl`): a cluster connection cannot be listed, started or stopped through management, and the console's cluster connection node is absent.
+- **Cluster connections** have their control (`component=cluster-connections`, `ClusterConnectionControl`) with every attribute, `getBridgeMetrics`, and `start` and `stop`. Saranga deploys only the first `<cluster-connection>` of `broker.xml`, so only that one has a control and is in the server's `ClusterConnectionNames`. `Topology` describes the topology as Artemis's `Topology.describe` does, but its identity hashes are Saranga's own.
 - **`getVersion`** reports 2.57.0, the Artemis release whose management interface Saranga answers, so tools that check the version keep working.
 - **`browse`** over management messages answers `no operation`, by design. Artemis answers it with JMX `CompositeData` objects, Java-serialized and base64-encoded inside the JSON, which only a Java client can read; Saranga does not produce Java serialization. `listMessages` and `listMessagesAsJSON` return the same messages as plain JSON, and the REST API (`GET /api/queues/{name}/messages`) and the Jolokia layer return `browse`'s messages as JSON.
 - **`changeMessagesPriority`** changes the messages in memory. Artemis also changes paged messages it reads in through the queue's own cursor; Saranga leaves messages still in pages as they are.

@@ -17,6 +17,8 @@
 #      on both nodes each receive everything.
 #   3. Node 2 stops: node 1 keeps its messages; node 2 comes back and the
 #      nodes bridge to each other again.
+#   4. Each node's ClusterConnectionControl, and node 1's cluster
+#      connection stopped and started through it.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -143,6 +145,17 @@ suite() {
   client on-demand "$U1" "$U2" orders 4
   step "Cluster.java topology (node 1)"
   client topology "$U1"
+
+  # 4. Management: the cluster connection's control on each node, then a
+  #    stop and start through it.
+  step "Cluster.java control (node 1)"
+  client control "$U1"
+  step "Cluster.java control (node 2)"
+  client control "$U2"
+  step "Cluster.java control-restart (node 1)"
+  client control-restart "$U1"
+  step "Cluster.java on-demand orders 2"
+  client on-demand "$U1" "$U2" orders 2
 
   step "artemis stop (node 1, node 2)"
   instance "$N1" stop > /dev/null

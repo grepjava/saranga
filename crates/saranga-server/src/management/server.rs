@@ -227,9 +227,15 @@ pub(super) async fn attribute(
         | "OutgoingInterceptorClassNames"
         | "InterceptorClassNames"
         | "BrokerPluginClassNames"
-        | "ClusterConnectionNames"
         | "ConnectorServices"
         | "Connectors" => Json::Array(Vec::new()),
+        "ClusterConnectionNames" => Json::Array(
+            broker
+                .cluster()
+                .map(|c| Json::from(c.config().name.as_str()))
+                .into_iter()
+                .collect(),
+        ),
         "BridgeNames" => Json::Array(
             broker
                 .bridges()
