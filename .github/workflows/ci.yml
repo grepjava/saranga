@@ -109,6 +109,46 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: scripts/disk-soak.sh 120
 
+  # Phase 11: the web suite. Saranga serves the Artemis distribution's
+  # console, and every console and Jolokia request is compared with an
+  # Artemis 2.57.0 container's answer. On a cache hit only the
+  # distribution is restored, so artemis-docker is fetched for the image.
+  web:
+    runs-on: ubuntu-latest
+    env:
+      ARTEMIS_VERSION: 2.57.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - id: artemis
+        uses: actions/cache@v4
+        with:
+          path: reference/activemq-artemis/artemis-distribution/target/apache-artemis-2.57.0-bin
+          key: artemis-dist-2.57.0
+      - name: Build the Artemis distribution
+        if: steps.artemis.outputs.cache-hit != 'true'
+        run: |
+          git clone -c core.autocrlf=false --depth 1 --branch "$ARTEMIS_VERSION" https://github.com/apache/activemq-artemis.git reference/activemq-artemis
+          cd reference/activemq-artemis
+          mvn -B -ntp install -pl artemis-distribution -am -DskipTests -Dcheckstyle.skip -Drat.skip -Denforcer.skip -Dmaven.javadoc.skip
+      - name: Build the Artemis image
+        run: |
+          if [[ ! -d reference/activemq-artemis/artemis-docker ]]; then
+            git clone -c core.autocrlf=false --depth 1 --branch "$ARTEMIS_VERSION" --filter=blob:none --sparse https://github.com/apache/activemq-artemis.git "$RUNNER_TEMP/artemis"
+            git -C "$RUNNER_TEMP/artemis" sparse-checkout set artemis-docker
+            cp -r "$RUNNER_TEMP/artemis/artemis-docker" reference/activemq-artemis/
+          fi
+          bash scripts/build-artemis.sh
+      - run: bash tests/interop/web/web.sh
+
   # Phase 11: every codec under cargo-fuzz for a short time, seeded from
   # the golden corpus. An input a target fails on is uploaded.
   fuzz:

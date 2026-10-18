@@ -17,7 +17,7 @@ Saranga is built in twelve phases. Each one ends with something runnable, and it
 | 10 | Clustering and federation | Done |
 | 11 | Hardening and 1.0 | In progress |
 
-Phase 3 is the first release anyone could adopt. Every phase after it can ship as a minor release.
+Phase 3 is the first release anyone could adopt. Every phase after it can ship as a minor release. Work planned for after 1.0 is in [FUTURE.md](FUTURE.md).
 
 ---
 
@@ -614,7 +614,7 @@ The differences from Artemis are listed in COMPAT.md.
     - hawtio's permission checks, `hawtio:type=security,area=jmx,name=ArtemisJMXSecurity` (`canInvoke` by name, method or signature, and in bulk), answered by `management.xml`'s guard or the RBAC guard;
     - the platform MBeans of the Runtime tab (`java.lang:type=Runtime`, `Memory`, `OperatingSystem`, `Threading`, `ClassLoading`), described as Artemis on OpenJDK 25 lists them and answered from the Saranga process ([platform](crates/saranga-management/src/platform));
     - `listLockCoordinatorsAsJSON` (an empty list) and the broker's `HAPolicy`, `Backup`, `SharedStore`, `Clustered`, `ReplicaSync` and `FailoverOnServerShutdown`, which had been fixed values.
-  - **Tests.** [console.py](tests/interop/web/console.py) sends the same requests to Saranga and to Artemis 2.57.0 and compares statuses, headers and bodies: every route, endpoint and error, every file `index.html` loads, the login's throttling, sessions ended by logout, another user, Keycloak's check and idleness, Jolokia through a session, both naming modes and the permission checks. [web.sh](tests/interop/web/web.sh) runs it after web.py, Saranga serving the Artemis distribution's console (`ARTEMIS_DIST`), against the Artemis container or one already running (`ARTEMIS_WEB_URL`). All 156 checks of both pass. In Chrome, against both brokers side by side, the console logs in and shows the Status page, connections, addresses, queues with their menus, browsing a queue's messages, the broker diagram, the JMX trees and the Runtime tab.
+  - **Tests.** [console.py](tests/interop/web/console.py) sends the same requests to Saranga and to Artemis 2.57.0 and compares statuses, headers and bodies: every route, endpoint and error, every file `index.html` loads, the login's throttling, sessions ended by logout, another user, Keycloak's check and idleness, Jolokia through a session, both naming modes and the permission checks. [web.sh](tests/interop/web/web.sh) runs it after web.py, Saranga serving the Artemis distribution's console (`ARTEMIS_DIST`), against the Artemis container or one already running (`ARTEMIS_WEB_URL`), and CI's `web` job runs it on every push. All 156 checks of both pass. In Chrome, against both brokers side by side, the console logs in and shows the Status page, connections, addresses, queues with their menus, browsing a queue's messages, the broker diagram, the JMX trees and the Runtime tab.
   - **Found along the way, and fixed.** While the disk is beyond `max-disk-usage`, Artemis refuses a send from a connection without flow control (`ServerSessionImpl.send`, `AMQ229119`) and fails the connection; Saranga accepted it. Now it does the same, checked against Artemis 2.57.0 on a disk past 90%:
     - STOMP: the ERROR carrying `AMQ229119`, then the SEND's own ERROR (`AMQ339011`) with its receipt, then the connection closes, with Artemis's `AMQ222067`, `AMQ222061` and `AMQ222107` lines;
     - MQTT: the connection closes without a PUBACK;
