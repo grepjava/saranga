@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use saranga_config::{
-    BootstrapConfig, BootstrapSecurity, BrokerConfig, Validation, broker_properties,
+    BootstrapConfig, BootstrapSecurity, BrokerConfig, ConfigError, DecodeError, Validation,
+    broker_properties,
 };
 use saranga_security::jaas::{ControlFlag, ModuleEntry, ModuleFactory};
 use saranga_security::{
@@ -20,6 +21,49 @@ use saranga_security::{
     SecurityStoreConfig,
 };
 use saranga_server::users::Users;
+
+/// What `XmlUtil.decode` threw, as a command that does not catch it ends:
+/// a `RuntimeException` with its message and the usage
+/// (`Artemis.execute`), another as Java's `main` reports an uncaught
+/// exception. Other errors are left as they are.
+pub fn uncaught(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast::<DecodeError>() {
+        Ok(d) if d.runtime => {
+            crate::client::UsageError(d.message.clone().unwrap_or_default()).into()
+        }
+        Ok(d) => crate::client::CliError(format!("Exception in thread \"main\" {d}")).into(),
+        Err(e) => e,
+    }
+}
+
+/// What `XmlUtil.decode` threw, as `Run` ends: its stack trace printed.
+pub fn run_failure(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast::<DecodeError>() {
+        Ok(d) => crate::client::CliError(d.to_string()).into(),
+        Err(e) => e,
+    }
+}
+
+/// `Artemis.verifyManagementDTO`, before every command: `management.xml`
+/// in `etc` decoded, what fails printed and the command run all the same.
+pub fn verify_management_xml(etc: &Path, system: Vec<(String, String)>) {
+    let path = etc.join("management.xml");
+    let Ok(xml) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let instance = Instance::without_bootstrap(
+        etc,
+        Options {
+            system,
+            broker_properties: None,
+        },
+    );
+    if let Err(e) = saranga_config::decode_dto(saranga_config::Dto::ManagementContext, &xml, &|n| {
+        instance.lookup(n)
+    }) {
+        eprintln!("{e}");
+    }
+}
 
 /// `ActiveMQBasicSecurityManager`'s class name in `bootstrap.xml`.
 const BASIC_SECURITY_MANAGER: &str =
@@ -110,6 +154,14 @@ impl Instance {
         Ok(instance)
     }
 
+    /// An instance from its `etc/` directory with its `broker.xml`, which
+    /// is read as Artemis's `getBrokerConfiguration` reads it, without
+    /// `bootstrap.xml`.
+    pub fn without_bootstrap(etc: &Path, options: Options) -> Self {
+        let etc = absolute(etc);
+        Self::new(etc.clone(), etc.join("broker.xml"), options)
+    }
+
     fn new(etc: PathBuf, broker_xml: PathBuf, options: Options) -> Self {
         // `<instance>/etc` -> `<instance>`.
         let dir = etc
@@ -193,16 +245,59 @@ impl Instance {
             .or_else(|| std::env::var(name).ok())
     }
 
+    /// `bootstrap.xml` decoded as `Configurable.getBrokerDTO` decodes it;
+    /// what `XmlUtil.decode` throws is a `DecodeError` alone, for the
+    /// command to report as Artemis's does ([`uncaught`], [`run_failure`]).
     fn read_bootstrap(&self, path: &Path) -> anyhow::Result<BootstrapConfig> {
         let xml =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut bootstrap = BootstrapConfig::parse(&xml, |n| self.lookup(n))
-            .with_context(|| format!("reading {}", path.display()))?;
+        let mut bootstrap = match BootstrapConfig::parse(&xml, |n| self.lookup(n)) {
+            Ok(b) => b,
+            Err(ConfigError::Decode(e)) => return Err(e.into()),
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!("reading {}", path.display())));
+            }
+        };
         bootstrap.apply_system_security(&self.system);
         for w in &bootstrap.warnings {
             tracing::warn!("{}: {w}", path.display());
         }
         Ok(bootstrap)
+    }
+
+    /// `etc/management.xml` decoded as `Run.getManagementDTO` decodes it.
+    /// Without the file, `ManagementFactory`'s `ConfigurationException`
+    /// when `required`.
+    pub fn read_management_xml(&self, required: bool) -> anyhow::Result<()> {
+        let path = self.etc.join("management.xml");
+        if !path.exists() {
+            if required {
+                anyhow::bail!(crate::client::CliError(
+                    "org.apache.activemq.artemis.cli.ConfigurationException: Invalid configuration URI, can't find file: management.xml".to_owned()
+                ));
+            }
+            return Ok(());
+        }
+        let xml = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        saranga_config::decode_dto(saranga_config::Dto::ManagementContext, &xml, &|n| {
+            self.lookup(n)
+        })?;
+        // `ManagementFactory.create` on the deprecated `<whitelist>`.
+        let (whitelist, allowlist) = saranga_config::management_lists(&xml);
+        if whitelist {
+            tracing::warn!(
+                target: "org.apache.activemq.artemis.core.server",
+                "AMQ224110: Configuration 'whitelist' is deprecated, please use the 'allowlist' configuration"
+            );
+            if allowlist {
+                tracing::warn!(
+                    target: "org.apache.activemq.artemis.core.server",
+                    "AMQ224111: Both 'whitelist' and 'allowlist' detected. Configuration 'whitelist' is deprecated, please use only the 'allowlist' configuration"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// `broker.xml` read and validated as the broker deploys it, its

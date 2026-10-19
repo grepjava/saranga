@@ -79,6 +79,17 @@ pub async fn run(cmd: DataCommand) -> anyhow::Result<()> {
 /// end the command.
 fn treat_error(result: anyhow::Result<()>) -> anyhow::Result<()> {
     match result {
+        // What `XmlUtil.decode` threw: its message, then its stack trace.
+        Err(e) if e.downcast_ref::<saranga_config::DecodeError>().is_some() => {
+            let d = e
+                .downcast_ref::<saranga_config::DecodeError>()
+                .expect("a DecodeError");
+            eprintln!();
+            eprintln!("Error:{}", d.message.as_deref().unwrap_or("null"));
+            eprintln!();
+            eprintln!("{d}");
+            Ok(())
+        }
         Err(e)
             if e.downcast_ref::<crate::client::CliError>().is_none()
                 && e.downcast_ref::<crate::client::UsageError>().is_none()
@@ -98,7 +109,10 @@ fn treat_error(result: anyhow::Result<()>) -> anyhow::Result<()> {
 /// checks before the tool runs.
 fn parameter_dirs(args: &dirs::DataDirArgs) -> anyhow::Result<dirs::DataDirs> {
     args.resolve().map_err(|e| {
-        if e.downcast_ref::<crate::client::ConfigurationError>()
+        if e.downcast_ref::<saranga_config::DecodeError>().is_some() {
+            crate::instance::uncaught(e)
+        } else if e
+            .downcast_ref::<crate::client::ConfigurationError>()
             .is_some()
         {
             e

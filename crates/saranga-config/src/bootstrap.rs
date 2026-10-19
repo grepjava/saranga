@@ -9,15 +9,16 @@
 //! </broker>
 //! ```
 //!
-//! `${...}` placeholders are replaced before parsing, as `XmlUtil.decode`
-//! does with system properties.
+//! The file is decoded as `XmlUtil.decode` decodes it ([`crate::dto`]):
+//! validated against `activemq.xsd`, `${...}` replaced in attribute values
+//! only.
 
 use std::path::PathBuf;
 
-use roxmltree::{Document, ParsingOptions};
+use roxmltree::{Document, Node, ParsingOptions};
 
+use crate::Result;
 use crate::broker::Warning;
-use crate::{ConfigError, Result};
 
 /// How clients are authenticated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,67 +46,67 @@ pub struct BootstrapConfig {
 }
 
 impl BootstrapConfig {
+    /// `bootstrap.xml` decoded as `XmlUtil.decode` decodes a `BrokerDTO`,
+    /// `lookup` giving the properties of `${...}` in attribute values.
     pub fn parse(xml: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
-        let text = crate::substitute::replace_system_props(xml, lookup);
+        crate::dto::decode(crate::dto::Dto::Broker, xml, &lookup)?;
         let options = ParsingOptions {
             allow_dtd: true,
             ..ParsingOptions::default()
         };
-        let doc = Document::parse_with_options(&text, options)?;
+        let doc = Document::parse_with_options(xml, options)?;
         let root = doc.root_element();
+        let value = |n: Node, a: &str| n.attribute(a).map(|v| crate::dto::filter(v, &lookup));
         let mut config = Self {
             security: None,
             server_configuration: None,
             web: None,
             warnings: Vec::new(),
         };
+        // `activemq.xsd` has the children in this order: the security, the
+        // server, then the web servers and components.
         for child in root.children().filter(|c| c.is_element()) {
             let name = child.tag_name().name();
-            let attribute = |a: &str| {
-                child
-                    .attribute(a)
-                    .map(str::to_owned)
-                    .ok_or_else(|| ConfigError::MissingAttribute {
-                        element: name.to_owned(),
-                        attribute: a.to_owned(),
-                    })
-            };
             match name {
                 "jaas-security" => {
                     config.security = Some(BootstrapSecurity::Jaas {
-                        domain: attribute("domain")?,
-                        certificate_domain: child
-                            .attribute("certificate-domain")
-                            .map(str::to_owned),
+                        domain: value(child, "domain").unwrap_or_default(),
+                        certificate_domain: value(child, "certificate-domain"),
                     })
                 }
                 "security-manager" => {
                     let properties = child
                         .children()
-                        .filter(|p| p.is_element() && p.tag_name().name() == "property")
+                        .filter(|p| p.is_element())
                         .map(|p| {
                             (
-                                p.attribute("key").unwrap_or_default().to_owned(),
-                                p.attribute("value").unwrap_or_default().to_owned(),
+                                value(p, "key").unwrap_or_default(),
+                                value(p, "value").unwrap_or_default(),
                             )
                         })
                         .collect();
                     config.security = Some(BootstrapSecurity::Manager {
-                        class_name: attribute("class-name")?,
+                        class_name: value(child, "class-name").unwrap_or_default(),
                         properties,
                     });
                 }
-                "server" => config.server_configuration = Some(attribute("configuration")?),
-                "web" => config.web = Some(WebConfig::parse(child)),
-                // Management (`management.xml` holds the JMX side) and plugin
-                // components.
-                "authorization" | "naming" => config.warnings.push(Warning::Unsupported {
+                "server" => {
+                    // `ServerDTO.getConfigurationURI`: the `configurationURI`
+                    // element, else the `configuration` attribute.
+                    let uri = child
+                        .children()
+                        .find(|c| c.is_element() && c.tag_name().name() == "configurationURI")
+                        .map(|c| c.text().unwrap_or_default().to_owned());
+                    config.server_configuration = uri.or_else(|| value(child, "configuration"));
+                }
+                "web" if config.web.is_none() => {
+                    config.web = Some(WebConfig::parse(child, &|v| crate::dto::filter(v, &lookup)))
+                }
+                // Further web servers and components (`ExternalComponent`
+                // classes) are started by Artemis.
+                _ => config.warnings.push(Warning::Unsupported {
                     name: name.to_owned(),
-                    reason: "JMX is not supported",
-                }),
-                _ => config.warnings.push(Warning::UnknownElement {
-                    parent: "broker".to_owned(),
-                    name: name.to_owned(),
+                    reason: "Saranga runs one web server and no Java components",
                 }),
             }
         }
@@ -222,13 +223,19 @@ pub struct WebApp {
 }
 
 impl WebConfig {
-    fn parse(node: roxmltree::Node) -> Self {
-        let attr = |n: roxmltree::Node, a: &str| n.attribute(a).map(str::to_owned);
-        let flag = |n: roxmltree::Node, a: &str| {
-            n.attribute(a)
-                .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+    /// `<web>`, `filter` giving the values of its attributes.
+    fn parse(node: Node, filter: &dyn Fn(&str) -> String) -> Self {
+        let attr = |n: Node, a: &str| n.attribute(a).map(filter);
+        // JAXB's `xs:boolean`: `true` or `1`, the white space collapsed.
+        let flag = |n: Node, a: &str| {
+            attr(n, a).is_some_and(|v| {
+                matches!(
+                    v.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r')),
+                    "true" | "1"
+                )
+            })
         };
-        let apps = |n: roxmltree::Node| -> Vec<WebApp> {
+        let apps = |n: Node| -> Vec<WebApp> {
             n.children()
                 .filter(|c| c.is_element() && c.tag_name().name() == "app")
                 .map(|c| WebApp {
@@ -238,7 +245,7 @@ impl WebConfig {
                 })
                 .collect()
         };
-        let binding = |n: roxmltree::Node, uri: String, apps: Vec<WebApp>| WebBinding {
+        let binding = |n: Node, uri: String, apps: Vec<WebApp>| WebBinding {
             name: attr(n, "name"),
             uri,
             client_auth: flag(n, "clientAuth"),
@@ -261,18 +268,14 @@ impl WebConfig {
             root_redirect_location: attr(node, "rootRedirectLocation"),
             ..Self::default()
         };
-        for child in node.children().filter(|c| c.is_element()) {
-            match child.tag_name().name() {
-                "binding" => {
-                    let uri = attr(child, "uri").unwrap_or_default();
-                    config.bindings.push(binding(child, uri, apps(child)));
-                }
-                "app" | "request-log" => {}
-                other => config.warnings.push(Warning::UnknownElement {
-                    parent: "web".to_owned(),
-                    name: other.to_owned(),
-                }),
-            }
+        // `<app>`s are the legacy `bind`'s; the schema allows nothing else
+        // but `<request-log>`.
+        for child in node
+            .children()
+            .filter(|c| c.is_element() && c.tag_name().name() == "binding")
+        {
+            let uri = attr(child, "uri").unwrap_or_default();
+            config.bindings.push(binding(child, uri, apps(child)));
         }
         // `WebServerDTO.getAllBindings`: the legacy `bind` is one more
         // binding, with the `<web>`-level settings and apps.
@@ -490,6 +493,42 @@ mod tests {
     }
 
     #[test]
+    fn decoded_as_xml_util_decodes() {
+        let lookup = |n: &str| (n == "i").then(|| "/var/lib/i".to_owned());
+        // `${...}` only in attribute values; `configurationURI` over
+        // `configuration`; a boolean of 1.
+        let xml = r#"<broker xmlns="http://activemq.apache.org/schema">
+   <jaas-security domain="${i}"/>
+   <server configuration="file:/x/broker.xml"><configurationURI>file:${i}/b.xml</configurationURI></server>
+   <web path="web"><binding uri="https://h:1" clientAuth=" 1 "/></web>
+   <component componentClassName="c"/>
+</broker>"#;
+        let config = BootstrapConfig::parse(xml, lookup).unwrap();
+        assert_eq!(
+            config.security,
+            Some(BootstrapSecurity::Jaas {
+                domain: "/var/lib/i".into(),
+                certificate_domain: None
+            })
+        );
+        assert_eq!(
+            config.server_configuration.as_deref(),
+            Some("file:${i}/b.xml")
+        );
+        assert!(config.web.unwrap().bindings[0].client_auth);
+        assert_eq!(config.warnings.len(), 1);
+        // What the schema refuses fails the file.
+        let invalid = r#"<broker xmlns="http://activemq.apache.org/schema"><jaas-security domain="a" x="1"/><server/></broker>"#;
+        let e = BootstrapConfig::parse(invalid, lookup).unwrap_err();
+        assert!(
+            e.to_string().contains(
+                "lineNumber: 1; columnNumber: 84; cvc-complex-type.3.2.2: Attribute 'x' is not allowed to appear in element 'jaas-security'."
+            ),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn file_uris() {
         assert_eq!(file_uri_path("file:/a/b"), Some(PathBuf::from("/a/b")));
         assert_eq!(file_uri_path("file:///a/b"), Some(PathBuf::from("/a/b")));
@@ -503,6 +542,7 @@ mod tests {
     fn securityconfig_system_properties() {
         let xml = r#"<broker xmlns="http://activemq.apache.org/schema">
    <jaas-security domain="activemq"/>
+   <server configuration="file:broker.xml"/>
 </broker>"#;
         let props = |p: &[(&str, &str)]| -> Vec<(String, String)> {
             p.iter()
@@ -551,6 +591,8 @@ mod tests {
     #[test]
     fn webconfig_system_properties() {
         let xml = r#"<broker xmlns="http://activemq.apache.org/schema">
+   <jaas-security domain="activemq"/>
+   <server configuration="file:broker.xml"/>
    <web path="web">
        <binding name="artemis" uri="http://localhost:8161"/>
        <binding uri="http://localhost:8163"><app url="console" war="console.war"/></binding>

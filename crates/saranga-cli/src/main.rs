@@ -380,6 +380,10 @@ fn report_mistake(e: &help::parse::ParseError) {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // `Artemis.execute` checks management.xml before it reads the command.
+    if let Some(etc) = client::instance_etc() {
+        instance::verify_management_xml(&etc, java_args_system_properties());
+    }
     let mut command_line = command_line(false);
     let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let args: Vec<std::ffi::OsString> = match parse_artemis(&raw[1..], &command_line, false) {
@@ -477,7 +481,7 @@ async fn execute(command: Command) -> bool {
             | Command::Disconnect(_)
     );
     if client {
-        return match run_client(command).await {
+        return match run_client(command).await.map_err(instance::uncaught) {
             Ok(()) => true,
             Err(e) => {
                 report_client_error(&e);
@@ -485,7 +489,7 @@ async fn execute(command: Command) -> bool {
             }
         };
     }
-    match run_command(command).await {
+    match run_command(command).await.map_err(instance::uncaught) {
         Ok(()) => true,
         Err(e)
             if e.downcast_ref::<client::UsageError>().is_some()
@@ -724,18 +728,23 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
                 .filter(|c| !c.is_empty())
                 .map(|c| instance::bootstrap_path(&c))
                 .transpose()?;
+            // saranga's own --config reads a management.xml next to the
+            // file if there is one; `artemis run` needs it.
+            let management_required = config.is_none();
             let mut instance = match (config, etc, bootstrap) {
-                (Some(c), _, _) => Some(instance::Instance::from_broker_xml(&c, options)?),
+                (Some(c), _, _) => Some(instance::Instance::from_broker_xml(&c, options)),
                 (None, etc, Some(b)) => {
                     // Outside an instance, the bootstrap file's directory.
                     let etc = etc
                         .or_else(|| b.parent().map(Path::to_path_buf))
                         .unwrap_or_default();
-                    Some(instance::Instance::from_bootstrap(&etc, &b, options)?)
+                    Some(instance::Instance::from_bootstrap(&etc, &b, options))
                 }
-                (None, Some(e), None) => Some(instance::Instance::from_etc(&e, options)?),
+                (None, Some(e), None) => Some(instance::Instance::from_etc(&e, options)),
                 (None, None, None) => None,
-            };
+            }
+            .transpose()
+            .map_err(instance::run_failure)?;
             if let (Some(i), Some(b)) = (&mut instance, broker) {
                 i.broker_xml = broker_path(&b);
             }
@@ -754,7 +763,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
                 Some(i) => Some(data::dirs::CliLock::hold(&i.dir)?),
                 None => None,
             };
-            run(instance, bind, allow_kill).await
+            run(instance, bind, allow_kill, management_required).await
         }
         Command::Data(cmd) => data::run(cmd).await,
         Command::Activation(cmd) => activation::run(cmd).await,
@@ -1073,8 +1082,14 @@ fn mask(
     }
     let codec = if password_codec {
         let instance = match (config, client::instance_etc()) {
-            (Some(path), _) => instance::Instance::from_broker_xml(&path, Default::default())?,
-            (None, Some(etc)) => instance::Instance::from_etc(&etc, Default::default())?,
+            (Some(path), _) => {
+                let path = std::path::absolute(&path).unwrap_or(path);
+                let etc = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                let mut i = instance::Instance::without_bootstrap(&etc, Default::default());
+                i.broker_xml = path;
+                i
+            }
+            (None, Some(etc)) => instance::Instance::without_bootstrap(&etc, Default::default()),
             (None, None) => {
                 // `getBrokerConfiguration` outside an instance reads
                 // null/etc/broker.xml, which is not there.
@@ -1621,10 +1636,15 @@ async fn run(
     instance: Option<instance::Instance>,
     bind: Option<SocketAddr>,
     allow_kill: bool,
+    management_required: bool,
 ) -> anyhow::Result<()> {
-    // FileBroker.createComponents reads the configuration before start()
-    // says the server is starting: one that cannot be read never starts.
     if let Some(instance) = &instance {
+        // `Run.getManagementDTO`, then FileBroker.createComponents reads
+        // the configuration before start() says the server is starting:
+        // one that cannot be read never starts.
+        instance
+            .read_management_xml(management_required)
+            .map_err(instance::run_failure)?;
         instance.read_broker_xml()?;
     }
     tracing::info!("AMQ101000: Starting Saranga Server version {VERSION}");

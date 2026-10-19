@@ -56,7 +56,7 @@ A URI without a scheme, with a scheme other than `xml`, or naming a file that is
 
 ## `${...}` placeholders and system properties
 
-`broker.xml`, `bootstrap.xml`, `login.config` and broker properties may hold `${name}` and `${name:default}` placeholders. They are replaced in the file's text before it is parsed, as Artemis replaces them. A name is looked up in this order:
+`broker.xml`, `login.config` and broker properties may hold `${name}` and `${name:default}` placeholders. They are replaced in the file's text before it is parsed, as Artemis replaces them. A name is looked up in this order:
 
 1. System properties given to `saranga run` with `-D`. Those from the profile's `JAVA_ARGS` and `JAVA_ARGS_APPEND` come first, so the command line's win.
 2. The properties `artemis run` defines: `artemis.instance`, `artemis.home`, `artemis.instance.etc`, `artemis.URI.instance`, `data.dir` and `java.security.auth.login.config`.
@@ -68,6 +68,8 @@ saranga run --etc /var/lib/broker1/etc -D broker.port=61617 -Dbroker.host=0.0.0.
 ```
 
 `-D` takes `name=value`, and may be repeated. Artemis's `artemis run` does not take `-D` options; there, set them in `JAVA_ARGS` in `etc/artemis.profile`. That works with Saranga too, because an instance's `bin/artemis` passes the profile's `JAVA_ARGS` to `saranga run`. The arguments are split on spaces, so a value cannot hold a space.
+
+`bootstrap.xml` and `management.xml` are read as Artemis's `XmlUtil.decode` reads them, which works differently. Only attribute values are replaced, not element text. A name is looked up in the system properties, including those `artemis run` defines, then in the environment. There is no `:default`, and a placeholder with no value is left as it is. Artemis replaces each value with `Matcher.replaceFirst`, which replaces the first placeholder of the value. So `${unset}-${set}` becomes `<value>-${set}`, and Saranga does the same.
 
 Some system properties have a meaning of their own:
 
@@ -169,6 +171,17 @@ A reload validates the whole file against `artemis-server.xsd` and, as Artemis d
 
 As Artemis's XInclude processing does, an included element gets an `xml:base` attribute, and the schema allows it only on some elements: an included `<addresses>` or `<address-settings>` is valid, a lone `<acceptor>` is not.
 
+`bootstrap.xml` and `management.xml` are validated against Artemis's `activemq.xsd`, as JAXB validates them in Artemis. The attributes are checked in the order they are written, after their `${...}` are replaced. An error gives the line and column where Java's XML reader stops. The first error is printed as Artemis prints it:
+
+```
+javax.xml.bind.UnmarshalException
+ - with linked exception:
+[org.xml.sax.SAXParseException; lineNumber: 21; columnNumber: 48; cvc-complex-type.3.2.2: Attribute 'bogus' is not allowed to appear in element 'jaas-security'.]
+Caused by: org.xml.sax.SAXParseException; lineNumber: 21; columnNumber: 48; cvc-complex-type.3.2.2: Attribute 'bogus' is not allowed to appear in element 'jaas-security'.
+```
+
+Java's stack frames are left out. Every command checks `management.xml` before it runs, prints such an error, and goes on, as Artemis's CLI does. `saranga run` exits with status 1 when `bootstrap.xml` is not valid, when `management.xml` is not valid, or when `management.xml` is missing; with `--config`, a `management.xml` next to the file is checked only if it is there. `stop`, `kill`, `data print`, `data recover`, `perf-journal` and `activation` end as Artemis's do on the exception, with `Exception in thread "main"` and status 1. `data exp`, `compact`, `encode` and `decode` print `Error:null` and then the exception, with status 0. A file whose root element is another of the schema's ends with Artemis's `ClassCastException` (`Cannot cast org.apache.activemq.artemis.dto.ManagementContextDTO to org.apache.activemq.artemis.dto.BrokerDTO`). The commands that only need `broker.xml`, such as `mask` and the CLI's default URL, do not read `bootstrap.xml`, as in Artemis.
+
 ## What Saranga ignores, and what stops it
 
 Saranga reads the whole `broker.xml` schema. Elements are matched by their local name, so a prefixed element that Java would miss is accepted.
@@ -182,7 +195,7 @@ These are read and ignored, each with a warning in the log:
 - `<resource-limit-settings>`, which are not enforced;
 - `scale-down` in an HA policy;
 - `<security-setting-plugin>` (see [Security](security.md));
-- the `<authorization>` and `<naming>` elements of `bootstrap.xml`, which are for JMX;
+- in `bootstrap.xml`, `<component>`s and every `<web>` after the first: Artemis starts each as a Java component, and Saranga runs one web server and no Java code;
 - deprecated settings, such as `master` and `slave`, with Artemis's `AMQ221038` message.
 
 The critical analyzer settings are accepted. See [Operations](operations.md).

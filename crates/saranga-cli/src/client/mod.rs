@@ -427,7 +427,7 @@ pub fn instance_url(name: Option<&str>) -> String {
     };
     let found = (|| -> anyhow::Result<Option<String>> {
         let instance =
-            crate::instance::Instance::from_etc(&etc, crate::instance::Options::default())?;
+            crate::instance::Instance::without_bootstrap(&etc, crate::instance::Options::default());
         // getBrokerConfiguration deploys only the core configuration.
         let config =
             instance.broker_config_validated(saranga_config::Validation::Deploy { jms: false })?;

@@ -561,15 +561,20 @@ fn rand_u32() -> u32 {
 /// without one, `rbac` when `builder` (`javax.management.builder.initial`)
 /// names `ArtemisRbacMBeanServerBuilder`, else the default list. Artemis
 /// sets the property to its own builder for an `<authorisation>`, over the
-/// one given.
-pub fn guard(etc: &Path, builder: Option<&str>, rbac: Rbac) -> Guard {
+/// one given. `filter` gives the values of the file's attributes.
+pub fn guard(
+    etc: &Path,
+    builder: Option<&str>,
+    rbac: Rbac,
+    filter: &dyn Fn(&str) -> String,
+) -> Guard {
     let xml = std::fs::read_to_string(etc.join("management.xml")).ok();
     let authorisation = xml.as_deref().is_some_and(access::has_authorisation);
     if !authorisation && builder == Some(RBAC_BUILDER) {
         return Guard::Rbac(rbac);
     }
     Guard::Acl(match xml {
-        Some(xml) => AccessList::parse(&xml).unwrap_or_else(|e| {
+        Some(xml) => AccessList::parse_with(&xml, filter).unwrap_or_else(|e| {
             tracing::warn!("management.xml: {e}; using the default access list");
             AccessList::default_list()
         }),

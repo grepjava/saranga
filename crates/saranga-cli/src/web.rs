@@ -192,6 +192,7 @@ pub async fn start(
                 delimiter: file.wildcard_addresses.delimiter,
                 domain: file.jmx_domain.clone(),
             },
+            &|v| saranga_config::dto_filter(v, &|n| instance.lookup(n)),
         ),
         console_roles: console_roles(instance),
         cors: saranga_management::cors(&instance.etc),

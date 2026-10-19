@@ -1,7 +1,11 @@
 //! An element validated as Xerces's `XMLSchemaValidator` validates the
 //! events `DOMValidatorHelper` sends it for a DOM node, up to the first
-//! error, where the JAXP validator's default error handler throws.
+//! error, where the JAXP validator's default error handler throws; or, for
+//! JAXB's `ValidatingUnmarshaller`, the events its `StAXStreamConnector`
+//! sends: the attributes in the document's order, as a filter on the
+//! reader gives their values, and each error where the reader is.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
@@ -86,6 +90,20 @@ pub(super) struct Validator<'s, 't> {
     text: &'t str,
     ids: HashSet<String>,
     idrefs: Vec<String>,
+    /// The events of a StAX reader, with this filter on attribute values,
+    /// rather than of a DOM.
+    stream: Option<&'t dyn Fn(&str) -> String>,
+}
+
+/// What `handleStartElement` makes of an element.
+struct Opened<'s> {
+    raw: String,
+    decl: Option<usize>,
+    ty: usize,
+    complex: Option<&'s super::model::ComplexType>,
+    cm: Option<&'s ContentModel>,
+    state: Option<State>,
+    nil: bool,
 }
 
 /// What an element's children were seen to hold.
@@ -103,14 +121,43 @@ impl<'s, 't> Validator<'s, 't> {
             text,
             ids: HashSet::new(),
             idrefs: Vec::new(),
+            stream: None,
         }
+    }
+
+    /// A validator of a StAX reader's events, `filter` giving the values of
+    /// attributes.
+    pub(super) fn streaming(
+        schema: &'s Schema,
+        text: &'t str,
+        filter: &'t dyn Fn(&str) -> String,
+    ) -> Self {
+        Self {
+            stream: Some(filter),
+            ..Self::new(schema, text)
+        }
+    }
+
+    /// An attribute's value as the validator gets it.
+    fn value<'a>(&self, a: &Attribute<'a, '_>) -> Cow<'a, str> {
+        match self.stream {
+            Some(filter) => Cow::Owned(filter(a.value())),
+            None => Cow::Borrowed(a.value()),
+        }
+    }
+
+    /// The value of an attribute of `node`, as [`value`](Self::value).
+    fn attribute<'a>(&self, node: Node<'a, '_>, name: (&str, &str)) -> Option<Cow<'a, str>> {
+        node.attributes()
+            .find(|a| a.namespace() == Some(name.0) && a.name() == name.1)
+            .map(|a| self.value(&a))
     }
 
     /// The validation root, then Validation Root Valid (ID/IDREF).
     pub(super) fn root(&mut self, node: Node<'_, '_>) -> Result<(), Fail> {
         self.element(node, None, None, 0)?;
         match first_missing(&self.idrefs, &self.ids) {
-            Some(missing) => Err(fail("cvc-id.1", vec![missing])),
+            Some(missing) => Err(fail("cvc-id.1", vec![missing]).at(node.range().end)),
             None => Ok(()),
         }
     }
@@ -153,7 +200,9 @@ impl<'s, 't> Validator<'s, 't> {
         schema.simple(ty).validate(schema, content, &mut ctx)
     }
 
-    /// `handleStartElement`, the children, then `handleEndElement`.
+    /// `handleStartElement`, the children, then `handleEndElement`, an
+    /// error at the end of the start tag or of the element, where a StAX
+    /// reader is when it reports it.
     fn element(
         &mut self,
         node: Node<'_, '_>,
@@ -161,51 +210,19 @@ impl<'s, 't> Validator<'s, 't> {
         wildcard: Option<&Wildcard>,
         depth: usize,
     ) -> Result<(), Fail> {
+        let start = start_tag_end(self.text, node.range().start);
+        let Opened {
+            raw,
+            decl,
+            ty,
+            complex,
+            cm,
+            mut state,
+            nil,
+        } = self
+            .open(node, decl, wildcard, depth)
+            .map_err(|f| f.at(start))?;
         let schema = self.schema;
-        let raw = self.raw_name(node);
-        let ns = element_ns(node);
-        let local = node.tag_name().name();
-        let mut decl = decl;
-        if decl.is_none() && schema.has_grammar(ns) {
-            decl = schema.global_elem(ns, local);
-        }
-        let mut ty = decl.map(|d| schema.elems[d].ty);
-        let xsi_type = node.attribute((XSI_NS, "type"));
-        match xsi_type {
-            None if ty.is_none() => {
-                if depth == 0 {
-                    return Err(fail("cvc-elt.1.a", vec![raw]));
-                }
-                if wildcard.is_some_and(|w| w.process == Process::Strict) {
-                    return Err(fail("cvc-complex-type.2.4.c", vec![raw]));
-                }
-                ty = Some(schema.any_type);
-            }
-            None => {}
-            Some(x) => ty = Some(self.xsi_type(node, &raw, x, ty)?),
-        }
-        let ty = ty.expect("a type");
-        if decl.is_some_and(|d| schema.elems[d].abstract_) {
-            return Err(fail("cvc-elt.2", vec![raw]));
-        }
-        let complex = schema.complex(ty);
-        if complex.is_some_and(|c| c.abstract_) {
-            return Err(fail("cvc-type.2", vec![raw]));
-        }
-        let cm = complex.and_then(|c| {
-            c.cm.get_or_init(|| match &c.content {
-                Content::Element(p) | Content::Mixed(p) => Some(ContentModel::build(p)),
-                _ => None,
-            })
-            .as_ref()
-        });
-        let mut state = cm.map(ContentModel::start);
-        let mut nil = false;
-        if let (Some(v), Some(d)) = (node.attribute((XSI_NS, "nil")), decl) {
-            nil = self.xsi_nil(&raw, v, d)?;
-        }
-        self.attributes(node, &raw, ty)?;
-
         let fixed =
             decl.is_some_and(|d| schema.elems[d].constraint.as_ref().is_some_and(|c| c.fixed));
         let append = fixed
@@ -233,7 +250,9 @@ impl<'s, 't> Validator<'s, 't> {
             } else if child.is_element() {
                 seen.elements = true;
                 let (child_decl, child_wildcard) = match (cm, state.as_mut()) {
-                    (Some(m), Some(s)) => self.transition(m, s, child)?,
+                    (Some(m), Some(s)) => self
+                        .transition(m, s, child)
+                        .map_err(|f| f.at(start_tag_end(self.text, child.range().start)))?,
                     _ => (None, None),
                 };
                 if child_wildcard
@@ -246,6 +265,70 @@ impl<'s, 't> Validator<'s, 't> {
             }
         }
         self.element_content(node, &raw, decl, ty, nil, &seen, cm, state.as_ref())
+            .map_err(|f| f.at(node.range().end))
+    }
+
+    /// `handleStartElement` up to the element's children.
+    fn open(
+        &mut self,
+        node: Node<'_, '_>,
+        decl: Option<usize>,
+        wildcard: Option<&Wildcard>,
+        depth: usize,
+    ) -> Result<Opened<'s>, Fail> {
+        let schema = self.schema;
+        let raw = self.raw_name(node);
+        let ns = element_ns(node);
+        let local = node.tag_name().name();
+        let mut decl = decl;
+        if decl.is_none() && schema.has_grammar(ns) {
+            decl = schema.global_elem(ns, local);
+        }
+        let mut ty = decl.map(|d| schema.elems[d].ty);
+        let xsi_type = self.attribute(node, (XSI_NS, "type"));
+        match xsi_type {
+            None if ty.is_none() => {
+                if depth == 0 {
+                    return Err(fail("cvc-elt.1.a", vec![raw]));
+                }
+                if wildcard.is_some_and(|w| w.process == Process::Strict) {
+                    return Err(fail("cvc-complex-type.2.4.c", vec![raw]));
+                }
+                ty = Some(schema.any_type);
+            }
+            None => {}
+            Some(x) => ty = Some(self.xsi_type(node, &raw, &x, ty)?),
+        }
+        let ty = ty.expect("a type");
+        if decl.is_some_and(|d| schema.elems[d].abstract_) {
+            return Err(fail("cvc-elt.2", vec![raw]));
+        }
+        let complex = schema.complex(ty);
+        if complex.is_some_and(|c| c.abstract_) {
+            return Err(fail("cvc-type.2", vec![raw]));
+        }
+        let cm = complex.and_then(|c| {
+            c.cm.get_or_init(|| match &c.content {
+                Content::Element(p) | Content::Mixed(p) => Some(ContentModel::build(p)),
+                _ => None,
+            })
+            .as_ref()
+        });
+        let state = cm.map(ContentModel::start);
+        let mut nil = false;
+        if let (Some(v), Some(d)) = (self.attribute(node, (XSI_NS, "nil")), decl) {
+            nil = self.xsi_nil(&raw, &v, d)?;
+        }
+        self.attributes(node, &raw, ty)?;
+        Ok(Opened {
+            raw,
+            decl,
+            ty,
+            complex,
+            cm,
+            state,
+            nil,
+        })
     }
 
     /// A child's transition in its parent's content model, with the errors
@@ -338,7 +421,7 @@ impl<'s, 't> Validator<'s, 't> {
 
     /// `processAttributes` and the required attributes of
     /// `addDefaultAttributes`, the attributes in the order of the DOM's
-    /// attribute map: sorted by name.
+    /// attribute map, sorted by name, or a reader's, as written.
     fn attributes(&mut self, node: Node<'_, '_>, raw: &str, ty: usize) -> Result<(), Fail> {
         let schema = self.schema;
         let complex = schema.complex(ty);
@@ -346,7 +429,9 @@ impl<'s, 't> Validator<'s, 't> {
             .attributes()
             .map(|a| (self.attr_raw_name(&a), a))
             .collect();
-        attrs.sort_by(|a, b| java_compare(&a.0, &b.0));
+        if self.stream.is_none() {
+            attrs.sort_by(|a, b| java_compare(&a.0, &b.0));
+        }
         let mut wild_id: Option<String> = None;
         for (araw, a) in &attrs {
             let ans = a.namespace();
@@ -354,7 +439,8 @@ impl<'s, 't> Validator<'s, 't> {
             if ans == Some(XSI_NS)
                 && let Some(decl) = schema.global_attr(Some(XSI_NS), alocal)
             {
-                self.one_attribute(node, raw, araw, a.value(), decl, None)?;
+                let v = self.value(a);
+                self.one_attribute(node, raw, araw, &v, decl, None)?;
                 continue;
             }
             let Some(c) = complex else {
@@ -400,14 +486,8 @@ impl<'s, 't> Validator<'s, 't> {
                     d
                 }
             };
-            self.one_attribute(
-                node,
-                raw,
-                araw,
-                a.value(),
-                decl,
-                found.map(|i| &c.attr_uses[i]),
-            )?;
+            let v = self.value(a);
+            self.one_attribute(node, raw, araw, &v, decl, found.map(|i| &c.attr_uses[i]))?;
         }
         if let (Some(c), Some(w)) = (complex, &wild_id)
             && let Some(id) = &c.id_attr
@@ -631,6 +711,20 @@ impl<'s, 't> Validator<'s, 't> {
             }
         }
     }
+}
+
+/// Where a start tag beginning at `start` ends: after its `>`.
+fn start_tag_end(text: &str, start: usize) -> usize {
+    let mut quote = None;
+    for (i, &b) in text.as_bytes()[start..].iter().enumerate() {
+        match (quote, b) {
+            (None, b'"' | b'\'') => quote = Some(b),
+            (Some(q), b) if q == b => quote = None,
+            (None, b'>') => return start + i + 1,
+            _ => {}
+        }
+    }
+    text.len()
 }
 
 /// An element's namespace, `xmlns=""` being none.

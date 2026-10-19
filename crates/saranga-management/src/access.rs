@@ -159,7 +159,14 @@ impl AccessList {
     /// `management.xml`'s `<authorisation>` (`ManagementContextDTO`), or
     /// the default list without one.
     pub fn parse(xml: &str) -> Result<Self, String> {
+        Self::parse_with(xml, &|v| v.to_owned())
+    }
+
+    /// [`parse`](Self::parse), `filter` giving the attributes' values, as
+    /// `XmlUtil.decode`'s reader does with `${...}`.
+    pub fn parse_with(xml: &str, filter: &dyn Fn(&str) -> String) -> Result<Self, String> {
         let doc = roxmltree::Document::parse(xml).map_err(|e| e.to_string())?;
+        let attribute = |n: roxmltree::Node, a: &str| n.attribute(a).map(filter);
         let Some(auth) = doc
             .root_element()
             .children()
@@ -169,8 +176,8 @@ impl AccessList {
         };
         let mut l = Self::empty();
         let roles = |n: roxmltree::Node| -> Vec<String> {
-            n.attribute("roles")
-                .unwrap_or("")
+            attribute(n, "roles")
+                .unwrap_or_default()
                 .split(',')
                 .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty())
@@ -183,13 +190,16 @@ impl AccessList {
                         .children()
                         .filter(|c| c.is_element() && c.tag_name().name() == "entry")
                     {
-                        l.add_allow(e.attribute("domain").unwrap_or(""), e.attribute("key"));
+                        l.add_allow(
+                            &attribute(e, "domain").unwrap_or_default(),
+                            attribute(e, "key").as_deref(),
+                        );
                     }
                 }
                 "default-access" => {
                     for a in accesses(section) {
                         l.default_access
-                            .add(a.attribute("method").unwrap_or(""), &roles(a));
+                            .add(&attribute(a, "method").unwrap_or_default(), &roles(a));
                     }
                 }
                 "role-access" => {
@@ -197,12 +207,13 @@ impl AccessList {
                         .children()
                         .filter(|c| c.is_element() && c.tag_name().name() == "match")
                     {
-                        let domain = m.attribute("domain").unwrap_or("");
+                        let domain = attribute(m, "domain").unwrap_or_default();
+                        let key = attribute(m, "key");
                         for a in accesses(m) {
                             l.add_role_access(
-                                domain,
-                                m.attribute("key"),
-                                a.attribute("method").unwrap_or(""),
+                                &domain,
+                                key.as_deref(),
+                                &attribute(a, "method").unwrap_or_default(),
                                 &roles(a),
                             );
                         }

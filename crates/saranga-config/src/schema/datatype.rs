@@ -102,7 +102,11 @@ pub(super) struct Context<'a> {
 }
 
 pub(super) fn fail(key: &'static str, args: Vec<String>) -> Fail {
-    Fail { key, args }
+    Fail {
+        key,
+        args,
+        offset: None,
+    }
 }
 
 /// The schema-wide table of simple types the validator indexes into.

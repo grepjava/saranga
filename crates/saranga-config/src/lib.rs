@@ -19,6 +19,7 @@ mod broker_connection;
 pub mod broker_properties;
 mod bytes;
 mod cluster_uri;
+mod dto;
 mod federation;
 pub mod mask;
 mod matcher;
@@ -54,6 +55,9 @@ pub use broker_connection::{
     AmqpFederationQueuePolicy, AmqpMatchElement, AmqpMirrorElement, AmqpQueueMatch,
 };
 pub use bytes::convert_text_bytes;
+pub use dto::{
+    DTO_NS, DecodeError, Dto, decode as decode_dto, filter as dto_filter, management_lists,
+};
 pub use federation::{
     FederationAddressPolicyConfig, FederationConfig, FederationConnectionConfig,
     FederationDownstreamConfig, FederationPolicyConfig, FederationQueueMatcher,
@@ -110,6 +114,9 @@ pub enum ConfigError {
     /// `SAXParseException` it was caused by.
     #[error("Invalid configuration: org.xml.sax.SAXParseException; {0}")]
     Invalid(String),
+    /// `bootstrap.xml` or `management.xml` that `XmlUtil.decode` fails on.
+    #[error("{0}")]
+    Decode(#[from] DecodeError),
 }
 
 /// How `broker.xml` is validated against Artemis's schemas.

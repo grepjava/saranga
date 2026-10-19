@@ -130,7 +130,7 @@ The console's Runtime tab reads `java.lang:type=Runtime`, `Memory`, `OperatingSy
 
 ## Access control
 
-`etc/management.xml`'s `<authorisation>` decides who may call what over Jolokia and the console, as Artemis's `ArtemisMBeanServerGuard` applies it: the `<allowlist>`, `<default-access>` and `<role-access>` entries, matched by domain, key and method. `saranga create` writes the same file `artemis create` writes. A `management.xml` that cannot be parsed is logged as a warning, and the default list applies.
+`etc/management.xml`'s `<authorisation>` decides who may call what over Jolokia and the console, as Artemis's `ArtemisMBeanServerGuard` applies it: the `<allowlist>`, `<default-access>` and `<role-access>` entries, matched by domain, key and method. `saranga create` writes the same file `artemis create` writes. The file is validated as Artemis validates it (see [Schema validation](configuration.md#schema-validation)): an invalid one is reported by every command, and `saranga run` will not start with it. `${...}` in its attribute values are replaced, as in Artemis. A deprecated `<whitelist>` is applied as Artemis applies it, with Artemis's `AMQ224110` warning, and `AMQ224111` when an `<allowlist>` is there too.
 
 Artemis can instead guard MBeans with security settings in `broker.xml`. Saranga does the same when `management.xml` has no `<authorisation>` and the system properties set the RBAC builder:
 
