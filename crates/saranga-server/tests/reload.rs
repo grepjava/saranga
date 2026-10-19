@@ -305,7 +305,10 @@ async fn acceptors_are_reconciled() {
     let mut names = broker.acceptor_names();
     names.sort();
     assert_eq!(names, ["added", "changed", "kept", "manual"]);
-    assert_eq!(broker.acceptor("manual").map(|(_, started)| started), Some(false));
+    assert_eq!(
+        broker.acceptor("manual").map(|(_, started)| started),
+        Some(false)
+    );
     broker.start_acceptor("manual").await.unwrap();
     assert!(listens(manual));
 

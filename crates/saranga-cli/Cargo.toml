@@ -28,6 +28,7 @@ saranga-server = { path = "../saranga-server" }
 saranga-ha = { path = "../saranga-ha" }
 saranga-storage = { path = "../saranga-storage" }
 saranga-transport = { path = "../saranga-transport" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1770,6 +1770,7 @@ dependencies = [
  "flate2",
  "libc",
  "mimalloc",
+ "rustls",
  "saranga-buffer",
  "saranga-client",
  "saranga-config",

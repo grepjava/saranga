@@ -80,6 +80,8 @@ A failed write, sync, open, rename or removal under the journals, a page file or
 
 `saranga run` reads `network-check-list`, `network-check-URL-list`, `network-check-period`, `network-check-timeout`, `network-check-ping-command` and `network-check-ping6-command` as Artemis does. While no address or URL answers, the broker is stopped (AMQ201001). Once one answers again, a new broker is started on the same data and ports (AMQ201000). The process and its web server stay up throughout.
 
+A URL is read as Java's `URLConnection` reads it. An `http` or `https` URL answers when the server's status is below 400, after redirects to the same protocol (at most 20). An `https` server's certificate is checked against the `javax.net.ssl.trustStore` given in `JAVA_ARGS` (or with `-D`), else against the platform's certificate authorities, and its host name is checked. The `http.proxyHost`, `https.proxyHost`, their ports and `http.nonProxyHosts` system properties route the request through a proxy, as in Java. A `file` URL answers when the file can be opened. A URL that does not answer logs `AMQ202006` with Java's exception, such as `java.io.FileNotFoundException: http://host/health` for a 404.
+
 `saranga create --ping` writes the settings, as `artemis create --ping` does:
 
 ```bash
@@ -90,7 +92,8 @@ Where Saranga differs:
 
 - Without a custom ping command, Saranga first tries a TCP connection to the address's echo port (7), and a refusal counts as an answer. If there is no answer, it runs the ping command. It never sends ICMP itself.
 - `network-check-NIC` is reported and not used.
-- `https` URLs are reported and not checked. `http` and `file` URLs are checked.
+- Without a truststore, an `https` server is checked against the platform's certificate authorities, where Java uses its own `cacerts`.
+- SOCKS proxies (`socksProxyHost`) are not used.
 - An unhealthy network at startup leaves the process running, and the broker starts once the network answers. Artemis's process exits.
 
 See [COMPAT.md, Network check differences](../../COMPAT.md#network-check-differences) and Artemis's [network isolation](https://activemq.apache.org/components/artemis/documentation/latest/network-isolation.html) chapter.

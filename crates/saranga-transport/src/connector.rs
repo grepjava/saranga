@@ -42,7 +42,9 @@ pub fn set_system_properties(properties: Vec<(String, String)>) {
     *SYSTEM_PROPERTIES.write().unwrap_or_else(|e| e.into_inner()) = properties;
 }
 
-fn system_property(name: &str) -> Option<String> {
+/// `System.getProperty`: a system property given to the broker or the
+/// command line.
+pub fn system_property(name: &str) -> Option<String> {
     SYSTEM_PROPERTIES
         .read()
         .unwrap_or_else(|e| e.into_inner())
@@ -150,7 +152,7 @@ impl ConnectorTlsSettings {
             enabled_cipher_suites: list("enabledCipherSuites"),
         };
         if flag("useDefaultSslContext") {
-            s.default_context()?;
+            s.default_context();
         } else if !flag("forceSSLParameters") {
             s.apply_system_properties(param("activemq.passwordcodec").as_deref())?;
         }
@@ -206,10 +208,21 @@ impl ConnectorTlsSettings {
         Ok(())
     }
 
+    /// The JVM's default context, as `HttpsURLConnection` uses it: the
+    /// `javax.net.ssl.*` properties, the host name checked.
+    pub fn jvm_default() -> Self {
+        let mut s = Self {
+            verify_host: true,
+            ..Self::default()
+        };
+        s.default_context();
+        s
+    }
+
     /// `SSLContext.getDefault`: the JVM's default key and trust managers,
     /// which read the `javax.net.ssl.*` properties only. The JVM's default
     /// store type reads both JKS and PKCS#12 files (`keystore.type.compat`).
-    fn default_context(&mut self) -> Result<(), TlsError> {
+    fn default_context(&mut self) {
         self.key_store_path = system_property("javax.net.ssl.keyStore");
         self.key_store_password = system_property("javax.net.ssl.keyStorePassword");
         self.key_password = None;
@@ -222,7 +235,6 @@ impl ConnectorTlsSettings {
             system_property("javax.net.ssl.trustStoreType").unwrap_or_else(|| "JKS".into());
         self.crl_path = None;
         self.trust_all = false;
-        Ok(())
     }
 
     /// The files the configuration is read from: when one changes, the
@@ -588,7 +600,12 @@ impl TlsConnector {
         self.settings.as_ref().map_err(String::as_str)
     }
 
-    fn config(&self, host: &str) -> Result<(Arc<ClientConfig>, ServerName<'static>), String> {
+    /// The client configuration for a connection to `host`, and the name
+    /// the server's certificate is checked against.
+    pub fn client_config_for(
+        &self,
+        host: &str,
+    ) -> Result<(Arc<ClientConfig>, ServerName<'static>), String> {
         let settings = self.settings.as_ref().map_err(Clone::clone)?;
         let name = settings.sni_host.as_deref().unwrap_or(host);
         let server_name = ServerName::try_from(name.to_owned())
@@ -631,7 +648,7 @@ impl TlsConnector {
         host: &str,
         stream: TcpStream,
     ) -> std::io::Result<(TlsStream<TcpStream>, bool)> {
-        let (config, name) = self.config(host).map_err(|e| {
+        let (config, name) = self.client_config_for(host).map_err(|e| {
             tracing::error!("AMQ214016: Failed to create netty connection: {e}");
             std::io::Error::other(e)
         })?;
