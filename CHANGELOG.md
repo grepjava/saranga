@@ -2,7 +2,7 @@
 
 Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Artemis 2.57.0 and works interchangeably with it. [COMPAT.md](COMPAT.md) lists where the two differ.
 
-## 1.0.0 (unreleased)
+## 1.0.0 (2026-10-19)
 
 The first release.
 
@@ -32,7 +32,7 @@ The first release.
 - **Management**: management messages to `activemq.management`, Artemis's MBeans through a Jolokia layer, and a REST API.
 - **Web console**: Artemis's own web console (`console.war`) is served when it is present.
 - **Monitoring**: Prometheus metrics with Artemis's names. The audit log, the critical analyzer and broker plugins as a Rust trait.
-- **CLI**: the full `artemis` command line as `saranga`: `run`, `create`, `upgrade`, `producer`, `consumer`, `queue`, `address`, `user`, `check`, `data`, `perf` and the shell.
+- **CLI**: the full `artemis` command line as `saranga`: `run`, `create`, `upgrade`, `producer`, `consumer`, `queue`, `address`, `user`, `check`, `data`, `perf` and the shell. Command lines are parsed as Artemis's picocli parses them, so options, values and mistakes give the same results and messages.
 
 ### High availability
 
