@@ -399,6 +399,11 @@ struct Shared {
     used: AtomicBool,
     /// Found deletable by the last reaper pass (`isSwept`).
     swept: AtomicBool,
+    /// Routed references sent to the actor and not yet at its tail: the
+    /// page is not read while there are any, so a paged message is not
+    /// delivered before one routed ahead of it (Artemis adds to the tail
+    /// as it routes).
+    adds_pending: AtomicI64,
     /// `messagesAdded`, `messagesAcknowledged`, `messagesExpired`,
     /// `messagesKilled` and `messagesReplaced`.
     messages_added: AtomicI64,
@@ -478,6 +483,7 @@ impl Queue {
             consumer_removed_at: AtomicI64::new(-1),
             used: AtomicBool::new(false),
             swept: AtomicBool::new(false),
+            adds_pending: AtomicI64::new(0),
             messages_added: AtomicI64::new(0),
             messages_acknowledged: AtomicI64::new(0),
             messages_expired: AtomicI64::new(0),
@@ -817,6 +823,7 @@ impl Queue {
     pub fn add_counted(&self, r: MessageRef) {
         self.0.message_count.fetch_add(1, Ordering::SeqCst);
         self.0.messages_added.fetch_add(1, Ordering::SeqCst);
+        self.0.adds_pending.fetch_add(1, Ordering::SeqCst);
         self.send(Cmd::Add(r));
     }
 
@@ -1827,7 +1834,10 @@ impl Actor {
     /// Handles one command; returns false to stop the actor.
     fn handle(&mut self, cmd: Cmd) -> bool {
         match cmd {
-            Cmd::Add(r) => self.add_tail(r),
+            Cmd::Add(r) => {
+                self.shared.adds_pending.fetch_sub(1, Ordering::SeqCst);
+                self.add_tail(r)
+            }
             Cmd::Reinsert(refs) => self.return_refs(refs),
             Cmd::AddConsumer(reg) => {
                 let consumer = Consumer::new(*reg);
@@ -2387,6 +2397,9 @@ impl Actor {
         let Some(store) = sub.store() else {
             return;
         };
+        if self.shared.adds_pending.load(Ordering::SeqCst) > 0 {
+            return;
+        }
         let s = self.queue().settings();
         let now = now_millis();
         loop {
