@@ -30,6 +30,7 @@ mod schema;
 mod security;
 mod substitute;
 mod wildcard;
+pub mod xerces;
 mod xinclude;
 
 pub use acceptor::{AcceptorConfig, query_params};

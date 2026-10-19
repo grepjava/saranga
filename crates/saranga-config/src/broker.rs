@@ -1045,7 +1045,11 @@ impl BrokerConfig {
     /// expanding its `xi:include`s, relative ones against the working
     /// directory as Artemis does.
     pub fn parse_with(xml: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
-        Self::parse_validated(xml, lookup, crate::Validation::Deploy { jms: true })
+        let text = crate::substitute::replace_system_props(xml, &lookup);
+        let text = well_formed(&text, false)?;
+        let text = crate::xinclude::expand(&text, None, &lookup)?;
+        crate::parser::validate_document(&text, crate::Validation::Deploy { jms: true })?;
+        crate::parser::parse_document(&text)
     }
 
     /// Only validates `broker.xml` text against Artemis's schemas, as
@@ -1058,6 +1062,7 @@ impl BrokerConfig {
         validation: crate::Validation,
     ) -> Result<()> {
         let text = crate::substitute::replace_system_props(xml, &lookup);
+        let text = well_formed(&text, true)?;
         let text = crate::xinclude::expand(&text, None, &lookup)?;
         match crate::parser::schema_error(&text, validation)? {
             Some(message) => Err(ConfigError::Invalid(message)),
@@ -1073,6 +1078,7 @@ impl BrokerConfig {
         validation: crate::Validation,
     ) -> Result<Self> {
         let text = crate::substitute::replace_system_props(xml, &lookup);
+        let text = well_formed(&text, true)?;
         let text = crate::xinclude::expand(&text, None, &lookup)?;
         crate::parser::validate_document(&text, validation)?;
         crate::parser::parse_document(&text)
@@ -1213,6 +1219,32 @@ impl Default for BrokerConfig {
                 .to_owned(),
             warnings: Vec::new(),
             status: saranga_buffer::json::Json::object(),
+        }
+    }
+}
+
+/// `broker.xml` as `XMLUtil.readerToElement` parses it: what the DOM
+/// refuses fails as it does, after what its error handler printed (printed
+/// as it went, warnings too when `print_warnings`); the text with XML 1.1's
+/// line ends as XML 1.0's for the reader that builds the tree.
+fn well_formed(text: &str, print_warnings: bool) -> Result<String> {
+    let base = std::env::current_dir().unwrap_or_default();
+    match crate::xerces::check_dom(text, base) {
+        Ok(checked) => {
+            if print_warnings {
+                crate::dto::print_errors(&checked.printed);
+            }
+            Ok(if checked.xml11 {
+                crate::xerces::xml11_line_ends(text)
+            } else {
+                text.to_owned()
+            })
+        }
+        Err(failure) => {
+            if let crate::xerces::Failure::Parse(p) = &failure {
+                crate::dto::print_errors(&p.printed);
+            }
+            Err(ConfigError::Decode(crate::DecodeError::from_dom(&failure)))
         }
     }
 }

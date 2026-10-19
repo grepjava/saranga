@@ -49,12 +49,18 @@ impl BootstrapConfig {
     /// `bootstrap.xml` decoded as `XmlUtil.decode` decodes a `BrokerDTO`,
     /// `lookup` giving the properties of `${...}` in attribute values.
     pub fn parse(xml: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
-        crate::dto::decode(crate::dto::Dto::Broker, xml, &lookup)?;
+        Self::parse_bytes(xml.as_bytes(), lookup)
+    }
+
+    /// [`parse`](Self::parse) on the file's bytes, which the reader
+    /// decodes as their encoding says.
+    pub fn parse_bytes(bytes: &[u8], lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let xml = crate::dto::decode(crate::dto::Dto::Broker, bytes, &lookup)?;
         let options = ParsingOptions {
             allow_dtd: true,
             ..ParsingOptions::default()
         };
-        let doc = Document::parse_with_options(xml, options)?;
+        let doc = Document::parse_with_options(&xml, options)?;
         let root = doc.root_element();
         let value = |n: Node, a: &str| n.attribute(a).map(|v| crate::dto::filter(v, &lookup));
         let mut config = Self {

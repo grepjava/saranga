@@ -164,7 +164,17 @@ pub(crate) fn stax_location(text: &str, offset: usize) -> (i64, i64) {
         None => (text, end),
     };
     let bytes = text.as_bytes();
-    let (mut line, mut column) = (1i64, 1i64);
+    // A document starting with `<?xml` that is not its declaration (a PI
+    // whose target begins with xml): XMLDeclDriver puts the reader back at
+    // the start without taking back the 5 columns it counted.
+    let column_start = if text.starts_with("<?xml")
+        && !matches!(bytes.get(5), Some(b' ' | b'\t' | b'\r' | b'\n'))
+    {
+        6
+    } else {
+        1
+    };
+    let (mut line, mut column) = (1i64, column_start);
     let mut at = At::Outside;
     let mut depth = 0usize;
     // Whether the tag being read closes an element or is empty.

@@ -18,9 +18,15 @@ fn decode(xml: &str) -> String {
         "XQ" => Some("1".to_owned()),
         _ => None,
     };
-    match decode_dto(dto, xml, &lookup) {
-        Ok(()) => "OK".to_owned(),
-        Err(e) if !e.runtime => {
+    match decode_dto(dto, xml.as_bytes(), &lookup) {
+        Ok(_) => "OK".to_owned(),
+        Err(e)
+            if !e.runtime
+                && e.trace.contains(
+                    "
+Caused by: ",
+                ) =>
+        {
             let linked = e.trace.split("\nCaused by: ").nth(1).expect("a cause");
             format!("INVALID {}", linked.replace('\n', " "))
         }

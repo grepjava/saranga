@@ -48,7 +48,7 @@ pub fn run_failure(e: anyhow::Error) -> anyhow::Error {
 /// in `etc` decoded, what fails printed and the command run all the same.
 pub fn verify_management_xml(etc: &Path, system: Vec<(String, String)>) {
     let path = etc.join("management.xml");
-    let Ok(xml) = std::fs::read_to_string(&path) else {
+    let Ok(xml) = std::fs::read(&path) else {
         return;
     };
     let instance = Instance::without_bootstrap(
@@ -249,9 +249,8 @@ impl Instance {
     /// what `XmlUtil.decode` throws is a `DecodeError` alone, for the
     /// command to report as Artemis's does ([`uncaught`], [`run_failure`]).
     fn read_bootstrap(&self, path: &Path) -> anyhow::Result<BootstrapConfig> {
-        let xml =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut bootstrap = match BootstrapConfig::parse(&xml, |n| self.lookup(n)) {
+        let xml = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut bootstrap = match BootstrapConfig::parse_bytes(&xml, |n| self.lookup(n)) {
             Ok(b) => b,
             Err(ConfigError::Decode(e)) => return Err(e.into()),
             Err(e) => {
@@ -278,11 +277,11 @@ impl Instance {
             }
             return Ok(());
         }
-        let xml = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        saranga_config::decode_dto(saranga_config::Dto::ManagementContext, &xml, &|n| {
-            self.lookup(n)
-        })?;
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let xml =
+            saranga_config::decode_dto(saranga_config::Dto::ManagementContext, &bytes, &|n| {
+                self.lookup(n)
+            })?;
         // `ManagementFactory.create` on the deprecated `<whitelist>`.
         let (whitelist, allowlist) = saranga_config::management_lists(&xml);
         if whitelist {
@@ -303,12 +302,26 @@ impl Instance {
     /// `broker.xml` read and validated as the broker deploys it, its
     /// warnings left for [`broker_config`](Self::broker_config).
     pub fn read_broker_xml(&self) -> anyhow::Result<()> {
-        let path = &self.broker_xml;
-        let xml =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        BrokerConfig::parse_with(&xml, |n| self.lookup(n))
-            .with_context(|| format!("reading {}", path.display()))?;
+        let xml = self.broker_xml_text()?;
+        BrokerConfig::parse_with(&xml, |n| self.lookup(n)).map_err(|e| self.broker_xml_error(e))?;
         Ok(())
+    }
+
+    /// `broker.xml` as `XMLUtil.streamToElement` reads it: through an
+    /// `InputStreamReader` in UTF-8, which puts U+FFFD for what is not.
+    fn broker_xml_text(&self) -> anyhow::Result<String> {
+        let path = &self.broker_xml;
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// What reading `broker.xml` failed with: what the parser threw as it
+    /// threw it, anything else with the file named.
+    fn broker_xml_error(&self, e: saranga_config::ConfigError) -> anyhow::Error {
+        match e {
+            saranga_config::ConfigError::Decode(d) => d.into(),
+            e => anyhow::Error::new(e).context(format!("reading {}", self.broker_xml.display())),
+        }
     }
 
     /// The broker configuration as the broker deploys it: `<core>` and
@@ -322,10 +335,9 @@ impl Instance {
     /// read again by a reload, which only logs what is not valid.
     pub fn broker_config_validated(&self, validation: Validation) -> anyhow::Result<BrokerConfig> {
         let path = &self.broker_xml;
-        let xml =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let xml = self.broker_xml_text()?;
         let mut config = BrokerConfig::parse_validated(&xml, |n| self.lookup(n), validation)
-            .with_context(|| format!("reading {}", path.display()))?;
+            .map_err(|e| self.broker_xml_error(e))?;
         for w in &config.warnings {
             tracing::warn!("{}: {w}", path.display());
         }

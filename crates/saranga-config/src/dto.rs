@@ -158,44 +158,33 @@ fn find_placeholder(s: &str, start: usize) -> Option<(usize, usize, String)> {
     None
 }
 
-/// `XmlUtil.decode`: whether `xml` unmarshals as `dto`, with `lookup` the
-/// properties its attributes' `${...}` are replaced from.
+/// `XmlUtil.decode`: whether the file's `bytes` unmarshal as `dto`, with
+/// `lookup` the properties its attributes' `${...}` are replaced from. The
+/// text as the reader decoded it, up to the end of the root element, when
+/// they do.
 pub fn decode(
     dto: Dto,
-    xml: &str,
+    bytes: &[u8],
     lookup: &dyn Fn(&str) -> Option<String>,
-) -> Result<(), DecodeError> {
+) -> Result<String, DecodeError> {
     let options = || ParsingOptions {
         allow_dtd: true,
         ..ParsingOptions::default()
     };
-    let doc = match Document::parse_with_options(xml, options()) {
+    let base = std::env::current_dir().unwrap_or_default();
+    let xml = match crate::xerces::check_stax(bytes, base) {
+        Ok(scanned) => scanned.text,
+        Err(failure) => return Err(stream_failure(&failure, lookup)),
+    };
+    let doc = match Document::parse_with_options(&xml, options()) {
         Ok(doc) => doc,
+        // Xerces read it; roxmltree does not (a name it does not take).
         Err(e) => {
             let pos = e.pos();
-            let malformed = DecodeError::unmarshal(format!(
+            return Err(DecodeError::unmarshal(format!(
                 "javax.xml.stream.XMLStreamException: ParseError at [row,col]:[{},{}]\nMessage: {e}",
                 pos.row, pos.col
-            ));
-            // The reader reads up to what it cannot: the validator has seen
-            // what comes before, and stops at an error there first.
-            let at = offset_of(xml, pos.row, pos.col);
-            if let Some((cut, prefix)) = readable_prefix(xml, at)
-                && let Ok(doc) = Document::parse_with_options(&prefix, options())
-            {
-                let attribute_filter = |v: &str| filter(v, lookup);
-                if let Err(f) =
-                    validate_stream(Xsd::Dto, &prefix, doc.root_element(), &attribute_filter)
-                    && f.offset().is_some_and(|o| o <= cut)
-                {
-                    let (line, column) = f.location(&prefix);
-                    return Err(DecodeError::unmarshal(format!(
-                        "org.xml.sax.SAXParseException; lineNumber: {line}; columnNumber: {column}; {}",
-                        f.message()
-                    )));
-                }
-            }
-            return Err(malformed);
+            )));
         }
     };
     let root = doc.root_element();
@@ -208,12 +197,12 @@ pub fn decode(
             .map(|e| (n.range().start, e))
     });
     let attribute_filter = |v: &str| filter(v, lookup);
-    let invalid = validate_stream(Xsd::Dto, xml, root, &attribute_filter).err();
+    let invalid = validate_stream(Xsd::Dto, &xml, root, &attribute_filter).err();
     match (invalid, thrown) {
         (Some(f), thrown)
             if thrown.is_none_or(|(element, _)| f.offset().is_some_and(|o| o <= element)) =>
         {
-            let (line, column) = f.location(xml);
+            let (line, column) = f.location(&xml);
             return Err(DecodeError::unmarshal(format!(
                 "org.xml.sax.SAXParseException; lineNumber: {line}; columnNumber: {column}; {}",
                 f.message()
@@ -236,7 +225,131 @@ pub fn decode(
             format!("Cannot cast {PACKAGE}.{class} to {PACKAGE}.{}", dto.class()),
         ));
     }
-    Ok(())
+    Ok(xml)
+}
+
+/// The exception a reader that stopped on `failure` ends the decoding with:
+/// a validation error on what it delivered before, else its own.
+fn stream_failure(
+    failure: &crate::xerces::Failure,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> DecodeError {
+    use crate::xerces::Failure;
+    let options = || ParsingOptions {
+        allow_dtd: true,
+        ..ParsingOptions::default()
+    };
+    let (message, line, column, at_init, printed) = match failure {
+        Failure::Parse(p) => (
+            p.message.clone(),
+            p.line,
+            p.column,
+            p.at_init,
+            p.printed.clone(),
+        ),
+        Failure::Io {
+            message,
+            line,
+            column,
+            ..
+        }
+        | Failure::Xni {
+            message,
+            line,
+            column,
+        } => (message.clone(), *line, *column, false, Vec::new()),
+        Failure::Runtime { class, message } => {
+            return DecodeError::runtime(class, message.clone());
+        }
+    };
+    let stream = format!("ParseError at [row,col]:[{line},{column}]\nMessage: {message}");
+    if at_init {
+        // createXMLStreamReader threw it, before JAXB.
+        print_errors(&printed);
+        return DecodeError {
+            trace: format!("javax.xml.stream.XMLStreamException: {stream}"),
+            message: Some(stream),
+            runtime: false,
+        };
+    }
+    // The validator has seen the events the reader delivered: it stops at
+    // an error there first.
+    if let Some((text, cut)) = failure.delivered()
+        && let Some((cut, prefix)) = readable_prefix(&text, cut)
+        && let Ok(doc) = Document::parse_with_options(&prefix, options())
+    {
+        let attribute_filter = |v: &str| filter(v, lookup);
+        if let Err(f) = validate_stream(Xsd::Dto, &prefix, doc.root_element(), &attribute_filter)
+            && f.offset().is_some_and(|o| o <= cut)
+        {
+            let (line, column) = f.location(&prefix);
+            return DecodeError::unmarshal(format!(
+                "org.xml.sax.SAXParseException; lineNumber: {line}; columnNumber: {column}; {}",
+                f.message()
+            ));
+        }
+    }
+    print_errors(&printed);
+    DecodeError::unmarshal(format!("javax.xml.stream.XMLStreamException: {stream}"))
+}
+
+impl DecodeError {
+    /// What `DocumentBuilder.parse` throws for a document the DOM refuses,
+    /// as `XMLUtil` reads `broker.xml`: the `SAXParseException` (or the
+    /// `IOException`, or the `SAXException` without a location).
+    pub fn from_dom(failure: &crate::xerces::Failure) -> Self {
+        use crate::xerces::Failure;
+        match failure {
+            Failure::Parse(p) => {
+                // SAXParseException.toString.
+                let mut trace = "org.xml.sax.SAXParseException".to_owned();
+                if let Some(id) = &p.system_id {
+                    trace.push_str(&format!("; systemId: {id}"));
+                }
+                if p.line != -1 {
+                    trace.push_str(&format!("; lineNumber: {}", p.line));
+                }
+                if p.column != -1 {
+                    trace.push_str(&format!("; columnNumber: {}", p.column));
+                }
+                trace.push_str(&format!("; {}", p.message));
+                Self {
+                    message: Some(p.message.clone()),
+                    trace,
+                    runtime: false,
+                }
+            }
+            Failure::Io { class, message, .. } => Self {
+                message: Some(message.clone()),
+                trace: format!("{class}: {message}"),
+                runtime: false,
+            },
+            Failure::Xni { message, .. } => Self {
+                message: Some(message.clone()),
+                trace: format!("org.xml.sax.SAXException: {message}"),
+                runtime: false,
+            },
+            Failure::Runtime { class, message } => {
+                let trace = if message.is_empty() {
+                    class.clone()
+                } else {
+                    format!("{class}: {message}")
+                };
+                Self {
+                    message: (!message.is_empty()).then(|| message.clone()),
+                    trace,
+                    runtime: true,
+                }
+            }
+        }
+    }
+}
+
+/// What Xerces's default error handler prints to the standard error.
+pub(crate) fn print_errors(printed: &[String]) {
+    for line in printed {
+        eprintln!("{line}");
+    }
 }
 
 /// Whether a decoded `management.xml`'s `<authorisation>` has a
@@ -257,23 +370,6 @@ pub fn management_lists(xml: &str) -> (bool, bool) {
             .any(|c| c.is_element() && c.tag_name().name() == name)
     };
     (has("whitelist"), has("allowlist"))
-}
-
-/// The byte offset of roxmltree's `row`:`col` (lines ending at `\n`,
-/// columns in characters).
-fn offset_of(text: &str, row: u32, col: u32) -> usize {
-    let mut offset = 0;
-    for (i, line) in text.split_inclusive('\n').enumerate() {
-        if i + 1 == row as usize {
-            return offset
-                + line
-                    .char_indices()
-                    .nth(col.saturating_sub(1) as usize)
-                    .map_or(line.len(), |(o, _)| o);
-        }
-        offset += line.len();
-    }
-    text.len()
 }
 
 /// What a streaming reader reads of `text` before failing at `at`: the
@@ -360,7 +456,7 @@ fn readable_prefix(text: &str, at: usize) -> Option<(usize, String)> {
     } else {
         markup
     };
-    if !seen_root || open.is_empty() {
+    if !seen_root {
         return None;
     }
     let mut prefix = text[..cut].to_owned();

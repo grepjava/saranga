@@ -114,7 +114,7 @@ Artemis's documentation on broker properties is in its [configuration index](htt
 
 ## Configuration reload
 
-While the broker runs, Saranga checks `broker.xml` and the broker properties sources (the files, and the files in directories) every `configuration-file-refresh-period` milliseconds (5000 by default). When one has changed, it reads the configuration again and logs `AMQ221056: Reloading configuration: ...` for each part, then `AMQ221087: Configuration reload completed`. If the new configuration does not parse, it logs `configuration not reloaded: <reason>` and keeps the running one.
+While the broker runs, Saranga checks `broker.xml` and the broker properties sources (the files, and the files in directories) every `configuration-file-refresh-period` milliseconds (5000 by default). When one has changed, it reads the configuration again and logs `AMQ221056: Reloading configuration: ...` for each part, then `AMQ221087: Configuration reload completed`. If the new configuration does not parse, it keeps the running one: a `broker.xml` that is not well formed logs `AMQ224069: Change detected in broker configuration file, but reload failed` with the parser's exception, as Artemis logs it, and other failures log `configuration not reloaded: <reason>`.
 
 A reload does what Artemis's does:
 
@@ -155,6 +155,17 @@ The deprecated top-level `<queues>` element is ignored, with a warning: declare 
 - Duplicate detection checks the message a client sends. Copies that a divert makes are not checked against the forwarding address's cache.
 
 See [COMPAT.md](../../COMPAT.md#queue-semantics-differences).
+
+## Well-formedness
+
+Artemis reads its files with the JDK's Xerces parser: `broker.xml` through a DOM parser that resolves `xi:include`, `bootstrap.xml` and `management.xml` through the streaming reader JAXB uses. Saranga ports both, so a file that is not well formed (an unclosed tag, an attribute written twice, an undeclared entity, a bad byte in the declared encoding, a missing included file) is refused with the same message, at the same line and column. The DOM parser's lines on standard error come first, as Java's default error handler prints them:
+
+```
+[Fatal Error] :286:6: The element type "core" must be terminated by the matching end-tag "</core>".
+org.xml.sax.SAXParseException; lineNumber: 286; columnNumber: 6; The element type "core" must be terminated by the matching end-tag "</core>".
+```
+
+`saranga run` prints this and exits with status 1. The commands that read `broker.xml` end as Artemis's do: `data print` and `perf-journal` with `Exception in thread "main"`, `data exp` and `compact` with `Error:` and the message, and the CLI's default URL with `Can not get the broker url instance:`. As in Artemis, `broker.xml` is read as UTF-8 whatever its XML declaration says, while `bootstrap.xml` and `management.xml` are read in the encoding their declaration or byte-order mark gives. All three are held to the JDK's limits on entity expansion, attributes, nesting and name length. The few cases that differ are listed in [COMPAT.md](../../COMPAT.md#configuration-differences).
 
 ## Schema validation
 

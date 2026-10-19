@@ -469,7 +469,14 @@ pub fn instance_url(name: Option<&str>) -> String {
         Ok(Some(url)) => url,
         Ok(None) => DEFAULT_BROKER_URL.to_owned(),
         Err(e) => {
-            print!("Can not get the broker url instance: {e:#}");
+            match e.downcast_ref::<saranga_config::DecodeError>() {
+                // The exception's message, then its stack trace.
+                Some(d) => println!(
+                    "Can not get the broker url instance: {}{d}",
+                    d.message.as_deref().unwrap_or("null")
+                ),
+                None => print!("Can not get the broker url instance: {e:#}"),
+            }
             DEFAULT_BROKER_URL.to_owned()
         }
     }

@@ -154,13 +154,10 @@ fn include_one(
         }
         Err(e) => e,
     };
+    // The scanner has printed the warning, as XIncludeHandler does, and
+    // failed the document when there is no fallback.
     match include.children().find(|c| is_xi(c, "fallback")) {
-        Some(fallback) => {
-            tracing::warn!(
-                "Include operation failed, reverting to fallback. Resource error reading file as XML (href='{href}'). Reason: {e}"
-            );
-            expand_fallback(text, include, fallback, base, lookup, stack, scope)
-        }
+        Some(fallback) => expand_fallback(text, include, fallback, base, lookup, stack, scope),
         None => Err(include_error(format!(
             "An include with href '{href}'failed, and no fallback element was found. ({e})"
         ))),

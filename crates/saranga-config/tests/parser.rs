@@ -431,11 +431,21 @@ fn missing_required_attributes() {
 }
 
 #[test]
-fn malformed_xml_is_an_error() {
-    assert!(matches!(
-        BrokerConfig::parse("<configuration><core>"),
-        Err(ConfigError::Xml(_))
-    ));
+fn malformed_xml_is_refused_as_the_dom_refuses_it() {
+    let Err(ConfigError::Decode(e)) = BrokerConfig::parse("<configuration>\n<core>") else {
+        panic!("not refused");
+    };
+    assert_eq!(
+        e.to_string(),
+        "org.xml.sax.SAXParseException; lineNumber: 2; columnNumber: 7; XML document structures must start and end within the same entity."
+    );
+    let Err(ConfigError::Decode(e)) = BrokerConfig::parse("<a>\n  <name>x</nam>\n</a>") else {
+        panic!("not refused");
+    };
+    assert_eq!(
+        e.message.as_deref(),
+        Some("The element type \"name\" must be terminated by the matching end-tag \"</name>\".")
+    );
 }
 
 #[test]

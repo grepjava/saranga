@@ -1036,7 +1036,13 @@ fn spawn_config_reloader(
                 });
             match reload {
                 Ok(reload) => current.get().reload(reload).await,
-                Err(e) => tracing::warn!("configuration not reloaded: {e:#}"),
+                Err(e) => match e.downcast_ref::<saranga_config::DecodeError>() {
+                    // What the parser threw: ReloadManagerImpl logs it.
+                    Some(d) => tracing::error!(
+                        "AMQ224069: Change detected in broker configuration file, but reload failed\n{d}"
+                    ),
+                    None => tracing::warn!("configuration not reloaded: {e:#}"),
+                },
             }
         }
     });
@@ -1645,7 +1651,7 @@ async fn run(
         instance
             .read_management_xml(management_required)
             .map_err(instance::run_failure)?;
-        instance.read_broker_xml()?;
+        instance.read_broker_xml().map_err(instance::run_failure)?;
     }
     tracing::info!("AMQ101000: Starting Saranga Server version {VERSION}");
     let instance = instance.map(Arc::new);
