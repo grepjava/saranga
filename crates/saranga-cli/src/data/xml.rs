@@ -28,6 +28,25 @@ pub struct Reader<R> {
     /// An empty element's `End`, still to give.
     pending_end: Option<String>,
     line: usize,
+    /// Characters read on the line.
+    column: usize,
+}
+
+/// An `XMLStreamException` as the JDK's parser reports it.
+#[derive(Debug)]
+pub struct ParseError(pub String);
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "javax.xml.stream.XMLStreamException: {}", self.0)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+/// XML's white space (`isWhiteSpace`).
+pub fn is_white_space(s: &str) -> bool {
+    s.chars().all(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
 }
 
 impl<R: BufRead> Reader<R> {
@@ -37,6 +56,7 @@ impl<R: BufRead> Reader<R> {
             peeked: None,
             pending_end: None,
             line: 1,
+            column: 0,
         }
     }
 
@@ -45,10 +65,45 @@ impl<R: BufRead> Reader<R> {
             Some(b) => Some(b),
             None => self.input.next().transpose().context("reading the input")?,
         };
-        if b == Some(b'\n') {
-            self.line += 1;
+        match b {
+            Some(b'\n') => {
+                self.line += 1;
+                self.column = 0;
+            }
+            Some(b) if b & 0xc0 != 0x80 => self.column += 1,
+            _ => {}
         }
         Ok(b)
+    }
+
+    /// A `ParseError` at the next character.
+    fn parse_error(&self, message: &str) -> ParseError {
+        ParseError(format!(
+            "ParseError at [row,col]:[{},{}]\nMessage: {message}",
+            self.line,
+            self.column + 1
+        ))
+    }
+
+    /// `XMLStreamReader.nextTag`: the next start or end tag, past white
+    /// space, comments and processing instructions.
+    pub fn next_tag(&mut self) -> anyhow::Result<Event> {
+        loop {
+            match self.next_event()? {
+                Event::Text(t) if is_white_space(&t) => {}
+                e @ (Event::Start { .. } | Event::End { .. }) => return Ok(e),
+                Event::Text(_) | Event::CData(_) => {
+                    return Err(self
+                        .parse_error("found: CHARACTERS, expected START_ELEMENT or END_ELEMENT")
+                        .into());
+                }
+                Event::Eof => {
+                    return Err(self
+                        .parse_error("found: END_DOCUMENT, expected START_ELEMENT or END_ELEMENT")
+                        .into());
+                }
+            }
+        }
     }
 
     fn peek(&mut self) -> anyhow::Result<Option<u8>> {
@@ -92,6 +147,13 @@ impl<R: BufRead> Reader<R> {
                         break;
                     }
                     text.push(self.expect_byte()?);
+                    if text.ends_with(b"]]>") {
+                        return Err(self
+                            .parse_error(
+                                "The character sequence \"]]>\" must not appear in content unless used to mark the end of a CDATA section.",
+                            )
+                            .into());
+                    }
                 }
                 return Ok(Event::Text(unescape(&utf8(text)?)?));
             }
@@ -249,6 +311,37 @@ mod tests {
                 Event::CData("<raw>".into()),
                 end("a"),
             ]
+        );
+    }
+
+    #[test]
+    fn a_cdata_end_in_content_is_the_jdks_parse_error() {
+        let xml = "<a>\r\n   <![CDATA[x ]]> é ]]>\r\n</a>";
+        let mut r = Reader::new(xml.as_bytes());
+        let e = loop {
+            match r.next_event() {
+                Ok(Event::Eof) => panic!("no error"),
+                Ok(_) => {}
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(
+            e.to_string(),
+            "javax.xml.stream.XMLStreamException: ParseError at [row,col]:[2,24]\nMessage: The character sequence \"]]>\" must not appear in content unless used to mark the end of a CDATA section."
+        );
+    }
+
+    #[test]
+    fn next_tag_skips_white_space() {
+        let mut r = Reader::new("<?xml version=\"1.0\"?>\r\n<m>\r\n <!-- c --> <n/>x".as_bytes());
+        assert!(matches!(r.next_tag().unwrap(), Event::Start { name, .. } if name == "m"));
+        assert!(matches!(r.next_tag().unwrap(), Event::Start { name, .. } if name == "n"));
+        assert!(matches!(r.next_tag().unwrap(), Event::End { name } if name == "n"));
+        assert!(
+            r.next_tag()
+                .unwrap_err()
+                .to_string()
+                .contains("found: CHARACTERS")
         );
     }
 }

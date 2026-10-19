@@ -155,6 +155,20 @@ pub fn date_at_offset(millis: i64, offset: i64) -> String {
     )
 }
 
+/// `new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date(millis))` in
+/// a zone `offset` seconds from UTC.
+pub fn simple_date_at_offset(millis: i64, offset: i64) -> String {
+    let secs = millis.div_euclid(1000) + offset;
+    let tod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        tod / 3600,
+        tod % 3600 / 60,
+        tod % 60
+    )
+}
+
 /// Days since 1970-01-01 to a proleptic Gregorian (year, month, day).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;

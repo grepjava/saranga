@@ -211,6 +211,5 @@ Each policy works with Artemis 2.57.0 on one side and Saranga on the other, eith
 - **Scale-down.** `<scale-down>` is read and logged as a warning. A backup becomes active on the primary's data, and a primary does not scale its messages down to another broker when it stops.
 - **Lock coordinators.** `<lock-coordinators>`, a technical preview in Artemis 2.57, is not implemented: it is ignored with a warning. An acceptor or broker connection that names a lock coordinator is not held back by it, and `listLockCoordinatorsAsJSON` answers with an empty list.
 - **The JDBC store,** and so a JDBC shared store. `<database-store>` stops the broker from starting.
-- **`artemis check cluster`** is not in Saranga's CLI.
 
 The full list of differences is in [Persistence differences](../../COMPAT.md#persistence-differences) and [Configuration differences](../../COMPAT.md#configuration-differences).

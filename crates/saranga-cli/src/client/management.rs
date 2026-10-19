@@ -197,3 +197,47 @@ async fn request_on(
     conn.close().await;
     reply
 }
+
+/// The exception `SimpleManagement` throws for an operation that failed:
+/// `Failed <result>`.
+#[derive(Debug)]
+pub struct SimpleFailure(pub String);
+
+impl std::fmt::Display for SimpleFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Failed {}", self.0)
+    }
+}
+
+impl std::error::Error for SimpleFailure {}
+
+/// `SimpleManagement.simpleManagement`: the operation's result, or, if it
+/// failed, the warning it logs and a [`SimpleFailure`].
+pub async fn simple_call(
+    args: &super::ConnectionArgs,
+    resource: &str,
+    operation: &str,
+    params: Vec<Json>,
+) -> anyhow::Result<String> {
+    let reply = perform_simple(args, async |r| r.invoke(resource, operation, params).await).await?;
+    if reply.succeeded {
+        return Ok(reply.string());
+    }
+    let result = reply.string();
+    tracing::warn!(
+        target: "org.apache.activemq.artemis.api.core.management.SimpleManagement",
+        "simple management operation failed:: {result}"
+    );
+    Err(SimpleFailure(result).into())
+}
+
+/// An exception a command does not catch, as Java's `main` reports it.
+pub fn uncaught(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast_ref::<SimpleFailure>() {
+        Some(f) => super::CliError(format!(
+            "Exception in thread \"main\" java.lang.Exception: {f}"
+        ))
+        .into(),
+        None => e,
+    }
+}

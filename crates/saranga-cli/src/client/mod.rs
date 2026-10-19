@@ -17,6 +17,7 @@ use saranga_transport::TlsConnector;
 pub mod address;
 pub mod check;
 pub mod jms;
+pub mod lock;
 pub mod management;
 pub mod messages;
 pub mod queue;
@@ -428,18 +429,39 @@ pub fn instance_url(name: Option<&str>) -> String {
         let instance =
             crate::instance::Instance::from_etc(&etc, crate::instance::Options::default())?;
         let config = instance.broker_config()?;
-        Ok(config
+        // `findTransportURI`: the acceptor of that name, else the connector.
+        let Some(a) = config
             .acceptors
             .iter()
+            .chain(&config.connectors)
             .find(|a| a.name.as_deref() == Some(name))
-            .map(|a| {
-                let scheme = a.param("scheme").unwrap_or("tcp");
-                let mut host = a.host.clone().unwrap_or_else(|| "localhost".to_owned());
-                if host == "0.0.0.0" || host == "::" || host == "[::]" {
-                    host = "localhost".to_owned();
-                }
-                format!("{scheme}://{host}:{}", a.port.unwrap_or(61616))
-            }))
+        else {
+            return Ok(None);
+        };
+        let scheme = a.param("scheme").unwrap_or("tcp");
+        let mut host = a.host.clone().unwrap_or_else(|| "localhost".to_owned());
+        let bare = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned();
+        // `InetAddress.getByName(host).isAnyLocalAddress()`.
+        let any_local = match bare.parse::<std::net::IpAddr>() {
+            Ok(ip) => ip.is_unspecified(),
+            Err(_) => std::net::ToSocketAddrs::to_socket_addrs(&(bare.as_str(), 0))
+                .map_err(|e| anyhow::anyhow!("{bare}: {e}"))?
+                .next()
+                .is_some_and(|s| s.ip().is_unspecified()),
+        };
+        if any_local {
+            host = "localhost".to_owned();
+        } else if bare.contains(':') {
+            // `new URI(scheme, null, host, port, ...)` brackets an IPv6 host.
+            host = format!("[{bare}]");
+        }
+        Ok(Some(format!(
+            "{scheme}://{host}:{}",
+            a.port.unwrap_or(61616)
+        )))
     })();
     match found {
         Ok(Some(url)) => url,

@@ -1595,9 +1595,11 @@ pub fn init_broker() {
 /// `log4j2-utility.properties`, found on the classpath through etc/. Run
 /// from the home, whose `bin/artemis` names no configuration, it is
 /// log4j2's default: errors only, so that what a command writes to
-/// standard output (`data exp`'s XML) is all there is.
+/// standard output (`data exp`'s XML) is all there is. So it is too for an
+/// instance without `log4j2-utility.properties`, where log4j2 finds none.
 pub fn init_utility(etc: Option<&Path>) {
     let env = EnvFilter::try_from_default_env().ok();
+    let etc = etc.filter(|etc| etc.join("log4j2-utility.properties").is_file());
     let config = match etc {
         Some(_) => Config::console(WARN, false),
         None => Config::log4j2_default(),

@@ -474,49 +474,83 @@ impl Exporter<'_> {
 
     /// `XMLMessageExporter.printSingleMessageAsXML`.
     fn print_message(&mut self, m: &Exported, queues: &[String]) -> anyhow::Result<()> {
-        let c = &m.message;
-        let x = &mut self.xml;
-        x.start("message")?;
-        x.attr("id", &c.message_id.to_string())?;
-        x.attr("priority", &(c.priority as i8).to_string())?;
-        x.attr("expiration", &c.expiration.to_string())?;
-        x.attr("timestamp", &c.timestamp.to_string())?;
-        x.attr("type", pretty_type(c.message_type))?;
-        if let Some(u) = &c.user_id {
-            x.attr("user-id", &java::uuid(u))?;
+        let large = m
+            .large
+            .as_ref()
+            .map(|file| std::fs::read(file).unwrap_or_default());
+        let body = match &large {
+            Some(b) => Body::Large(b),
+            None => Body::Base64(&m.message.body),
+        };
+        print_message(&mut self.xml, &m.message, m.decoded, Some(queues), body)
+    }
+}
+
+/// A message body as `printMessageBody` writes it.
+pub(super) enum Body<'a> {
+    /// Base64 in one CDATA.
+    Base64(&'a [u8]),
+    /// `isLarge`, Base64 in CDATAs of 1000 bytes each.
+    Large(&'a [u8]),
+    /// A text message's text in a CDATA, as is (`encodeTextUTF8`); none
+    /// fails as `readBodyText(...).toString()` does.
+    Text(Option<String>),
+}
+
+/// `XMLMessageExporter.printSingleMessageAsXML`: the message's attributes,
+/// its properties, its queues if any, its body.
+pub(super) fn print_message<W: Write>(
+    x: &mut Xml<W>,
+    c: &CoreMessage,
+    decoded: bool,
+    queues: Option<&[String]>,
+    body: Body,
+) -> anyhow::Result<()> {
+    x.start("message")?;
+    x.attr("id", &c.message_id.to_string())?;
+    x.attr("priority", &(c.priority as i8).to_string())?;
+    x.attr("expiration", &c.expiration.to_string())?;
+    x.attr("timestamp", &c.timestamp.to_string())?;
+    x.attr("type", pretty_type(c.message_type))?;
+    if let Some(u) = &c.user_id {
+        x.attr("user-id", &java::uuid(u))?;
+    }
+    x.start("properties")?;
+    for (key, value) in property_order(&c.properties, decoded) {
+        x.empty("property")?;
+        x.attr("name", &java::simple_string(key))?;
+        x.attr("value", &property_text(value))?;
+        if let Some(t) = property_type(value) {
+            x.attr("type", t)?;
         }
-        x.start("properties")?;
-        for (key, value) in property_order(&c.properties, m.decoded) {
-            x.empty("property")?;
-            x.attr("name", &java::simple_string(key))?;
-            x.attr("value", &property_text(value))?;
-            if let Some(t) = property_type(value) {
-                x.attr("type", t)?;
-            }
-        }
-        x.end()?;
+    }
+    x.end()?;
+    if let Some(queues) = queues {
         x.start("queues")?;
         for q in queues {
             x.empty("queue")?;
             x.attr("name", q)?;
         }
         x.end()?;
-        x.start("body")?;
-        match &m.large {
-            Some(file) => {
-                x.attr("isLarge", "true")?;
-                let body = std::fs::read(file).unwrap_or_default();
-                // LARGE_MESSAGE_CHUNK_SIZE
-                for chunk in body.chunks(1000) {
-                    x.cdata(&java::base64_url(chunk))?;
-                }
-            }
-            None => x.cdata(&java::base64_url(&c.body))?,
-        }
-        x.end()?;
-        x.end()?;
-        Ok(())
     }
+    x.start("body")?;
+    match body {
+        Body::Large(body) => {
+            x.attr("isLarge", "true")?;
+            // LARGE_MESSAGE_CHUNK_SIZE
+            for chunk in body.chunks(1000) {
+                x.cdata(&java::base64_url(chunk))?;
+            }
+        }
+        Body::Base64(body) => x.cdata(&java::base64_url(body))?,
+        Body::Text(Some(text)) => x.cdata(&text)?,
+        Body::Text(None) => {
+            anyhow::bail!("java.lang.RuntimeException: java.lang.NullPointerException")
+        }
+    }
+    x.end()?;
+    x.end()?;
+    Ok(())
 }
 
 /// `getMessagePrettyType`.
@@ -671,5 +705,27 @@ impl<W: Write> Xml<W> {
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.close_pending()?;
         self.out.flush()
+    }
+
+    /// Text written as is, past the handler (`writeStartDocument`).
+    pub fn raw(&mut self, text: &str) -> std::io::Result<()> {
+        self.close_pending()?;
+        self.out.write_all(text.as_bytes())
+    }
+
+    /// `writeEndDocument`: every element still open ended, with no line
+    /// between them.
+    pub fn end_document(&mut self) -> std::io::Result<()> {
+        self.close_pending()?;
+        while let Some(name) = self.open.pop() {
+            self.depth -= 1;
+            write!(self.out, "</{name}>")?;
+        }
+        Ok(())
+    }
+
+    /// The output, unflushed.
+    pub fn into_inner(self) -> W {
+        self.out
     }
 }

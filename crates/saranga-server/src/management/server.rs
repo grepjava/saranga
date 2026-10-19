@@ -1179,6 +1179,14 @@ pub(super) async fn invoke(
     if call.is("listLockCoordinatorsAsJSON", &[]).is_some() {
         return Some(Ok(Json::from("[]".to_owned())));
     }
+    for op in ["startLockCoordinator", "stopLockCoordinator"] {
+        if let Some(a) = call.is(op, &[S]) {
+            return Some(Err(format!(
+                "No lock coordinator found with name: {}",
+                a.s(0).as_deref().unwrap_or("null")
+            )));
+        }
+    }
     // Broker connections (`listBrokerConnections`, `startBrokerConnection`,
     // `stopBrokerConnection`).
     if call.is("listBrokerConnections", &[]).is_some() {

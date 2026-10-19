@@ -15,7 +15,7 @@ use saranga_client::{
 };
 use saranga_storage::java;
 
-use super::xml::{Event, Reader};
+use super::xml::{Event, Reader, is_white_space};
 use crate::client::management::Requestor;
 
 #[derive(Args)]
@@ -124,10 +124,10 @@ pub async fn run(args: ImportArgs) -> anyhow::Result<()> {
 }
 
 /// A message read from the file: its exported ID, its queues.
-struct MessageInfo {
-    id: i64,
-    queues: Vec<String>,
-    message: CoreMessage,
+pub(super) struct MessageInfo {
+    pub(super) id: i64,
+    pub(super) queues: Vec<String>,
+    pub(super) message: CoreMessage,
 }
 
 struct Importer<'a, R> {
@@ -188,96 +188,18 @@ impl<R: std::io::BufRead> Importer<'_, R> {
             eprintln!("Processed {} messages", self.message_nr);
             self.session.commit().await?;
         }
-        let info = self.read_message(attributes)?;
+        let info = read_message(
+            &mut self.reader,
+            attributes,
+            &self.old_prefix_translation,
+            false,
+        )?;
         if self.args.sort {
             self.sorted.push(info);
         } else {
             self.send(&info.queues, info.message).await?;
         }
         Ok(())
-    }
-
-    /// `XMLMessageImporter.readMessage`: a durable message of the exported
-    /// type, priority, expiration and timestamp, a new user ID if it had
-    /// one, its properties, queues and body.
-    fn read_message(&mut self, attributes: &[(String, String)]) -> anyhow::Result<MessageInfo> {
-        let get = |n| attribute(attributes, n);
-        let mut message = CoreMessage {
-            message_type: match get("type").unwrap_or("default") {
-                "bytes" => message_type::BYTES,
-                "map" => message_type::MAP,
-                "object" => message_type::OBJECT,
-                "stream" => message_type::STREAM,
-                "text" => message_type::TEXT,
-                _ => message_type::DEFAULT,
-            },
-            durable: true,
-            expiration: get("expiration").map_or(Ok(0), str::parse)?,
-            timestamp: get("timestamp").map_or(Ok(0), str::parse)?,
-            priority: get("priority").map_or(Ok(0), str::parse::<i8>)? as u8,
-            ..CoreMessage::default()
-        };
-        if get("user-id").is_some() {
-            message.set_new_user_id();
-        }
-        let id = get("id").map_or(Ok(0), str::parse)?;
-        let mut queues = Vec::new();
-        loop {
-            match self.reader.next_event()? {
-                Event::Start { name, attributes } => match name.as_str() {
-                    "body" => message.body = self.body()?.into(),
-                    "property" => property(&mut message, &attributes)?,
-                    "queue" => {
-                        if let Some(q) = attribute(&attributes, "name") {
-                            let q = self
-                                .old_prefix_translation
-                                .get(q)
-                                .cloned()
-                                .unwrap_or_else(|| q.to_owned());
-                            queues.push(q);
-                        }
-                    }
-                    _ => {}
-                },
-                Event::End { name } if name == "message" => break,
-                Event::Eof => bail!("the input ends inside a message"),
-                _ => {}
-            }
-        }
-        Ok(MessageInfo {
-            id,
-            queues,
-            message,
-        })
-    }
-
-    /// `getMessageBodyBytes`: each chunk of text (CDATA or not, trimmed)
-    /// up to whitespace is Base64, decoded and appended.
-    fn body(&mut self) -> anyhow::Result<Vec<u8>> {
-        let mut body = Vec::new();
-        let mut chunk = String::new();
-        let flush = |chunk: &mut String, body: &mut Vec<u8>| -> anyhow::Result<()> {
-            if !chunk.is_empty() {
-                body.extend(
-                    java::base64_url_decode(chunk)
-                        .map_err(anyhow::Error::msg)
-                        .context("a message body")?,
-                );
-                chunk.clear();
-            }
-            Ok(())
-        };
-        loop {
-            match self.reader.next_event()? {
-                Event::Text(t) if t.trim().is_empty() => flush(&mut chunk, &mut body)?,
-                Event::Text(t) | Event::CData(t) => chunk.push_str(t.trim()),
-                Event::End { .. } => break,
-                Event::Eof => bail!("the input ends inside a message body"),
-                Event::Start { .. } => {}
-            }
-        }
-        flush(&mut chunk, &mut body)?;
-        Ok(body)
     }
 
     /// `sendMessage`: to the address of its first queue (created as
@@ -468,4 +390,98 @@ fn property(message: &mut CoreMessage, a: &[(String, String)]) -> anyhow::Result
     };
     message.put_property(key, v);
     Ok(())
+}
+
+/// `XMLMessageImporter.readMessage`: a durable message of the exported
+/// type, priority, expiration and timestamp, a new user ID if it had one,
+/// its properties, queues (renamed by `translation`) and body; with
+/// `decode_text`, a text message's body is its text, as
+/// `XMLMessageSerializer` reads it.
+pub(super) fn read_message<R: std::io::BufRead>(
+    reader: &mut Reader<R>,
+    attributes: &[(String, String)],
+    translation: &HashMap<String, String>,
+    decode_text: bool,
+) -> anyhow::Result<MessageInfo> {
+    let get = |n| attribute(attributes, n);
+    let mut message = CoreMessage {
+        message_type: match get("type").unwrap_or("default") {
+            "bytes" => message_type::BYTES,
+            "map" => message_type::MAP,
+            "object" => message_type::OBJECT,
+            "stream" => message_type::STREAM,
+            "text" => message_type::TEXT,
+            _ => message_type::DEFAULT,
+        },
+        durable: true,
+        expiration: get("expiration").map_or(Ok(0), str::parse)?,
+        timestamp: get("timestamp").map_or(Ok(0), str::parse)?,
+        priority: get("priority").map_or(Ok(0), str::parse::<i8>)? as u8,
+        ..CoreMessage::default()
+    };
+    if get("user-id").is_some() {
+        message.set_new_user_id();
+    }
+    let id = get("id").map_or(Ok(0), str::parse)?;
+    let text = decode_text && message.message_type == message_type::TEXT;
+    let mut queues = Vec::new();
+    loop {
+        match reader.next_event()? {
+            Event::Start { name, attributes } => match name.as_str() {
+                "body" => message.body = body(reader, text)?.into(),
+                "property" => property(&mut message, &attributes)?,
+                "queue" => {
+                    if let Some(q) = attribute(&attributes, "name") {
+                        let q = translation.get(q).cloned().unwrap_or_else(|| q.to_owned());
+                        queues.push(q);
+                    }
+                }
+                _ => {}
+            },
+            Event::End { name } if name == "message" => break,
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(MessageInfo {
+        id,
+        queues,
+        message,
+    })
+}
+
+/// `getMessageBodyBytes`: the text (CDATA or not, each piece trimmed) up
+/// to white space is Base64, decoded and appended, or with `text` written
+/// as a text body (the text so far, each time). What follows the last
+/// white space is dropped, as Artemis drops it.
+fn body<R: std::io::BufRead>(reader: &mut Reader<R>, text: bool) -> anyhow::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut chunk = String::new();
+    loop {
+        match reader.next_event()? {
+            Event::Text(t) if is_white_space(&t) && !chunk.is_empty() => {
+                if text {
+                    let mut m = CoreMessage::default();
+                    m.set_text(Some(&chunk));
+                    body.extend_from_slice(&m.body);
+                } else {
+                    body.extend(
+                        java::base64_url_decode(&chunk)
+                            .map_err(anyhow::Error::msg)
+                            .context("a message body")?,
+                    );
+                    chunk.clear();
+                }
+            }
+            Event::Text(t) | Event::CData(t) => chunk.push_str(java_trim(&t)),
+            Event::End { .. } | Event::Eof => break,
+            Event::Start { .. } => {}
+        }
+    }
+    Ok(body)
+}
+
+/// `String.trim`: without the characters up to U+0020 at either end.
+fn java_trim(s: &str) -> &str {
+    s.trim_matches(|c: char| c <= ' ')
 }

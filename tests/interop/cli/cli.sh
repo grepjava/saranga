@@ -48,6 +48,12 @@ shell() {
   printf '%s\n' "$@" | cli 2>&1
   echo "--- exit $?"
 }
+# The file consumer --data wrote, its IDs and times left out.
+data_file() {
+  echo "=== file"
+  sed -E 's/ (id|timestamp)="[0-9]+"/ \1="#"/g' "$INSTANCE/messages.xml"
+  echo
+}
 # Commands without --url.
 run_bare() {
   echo "=== $*"
@@ -84,6 +90,29 @@ suite() {
   run producer --destination topic://clitopic --message-count 2
   run consumer --destination topic://clitopic --message-count 5 --receive-timeout 300 --durable --clientID cid --break-on-null
   run queue stat --queueName cid
+  # files of messages
+  DATA="$(native "$INSTANCE")/messages.xml"
+  run producer --destination queue://clidata --message-count 1 --message 'hi <&> "x"  ' --group g1 --properties '[{"type":"int","key":"k","value":"7"},{"type":"string","key":"s","value":"a&b<"},{"type":"double","key":"d","value":"1.5"}]'
+  run producer --destination queue://clidata --message-count 1 --message-size 10
+  run producer --destination queue://clidata --message-count 1 --object-size 5
+  run consumer --destination queue://clidata --message-count 3 --data "$DATA"
+  data_file
+  run producer --destination queue://clidata2 --data "$DATA"
+  run consumer --destination queue://clidata2 --message-count 5 --receive-timeout 300 --break-on-null --data "$DATA" --serializer foo.Bar
+  data_file
+  run producer --destination queue://clidata2 --data "$DATA" --serializer org.apache.activemq.artemis.cli.factory.serialize.XMLMessageSerializer
+  run consumer --destination queue://clidata2 --message-count 5 --receive-timeout 300 --break-on-null
+  run producer --destination queue://clidata2 --data nosuch.xml
+  run consumer --destination queue://clidata2 --message-count 1 --data nosuch/m.xml
+  printf '<?xml version="1.0"?>\n<messages>\n   <message type="text">\n      <body>\n         <![CDATA[a ]]> b ]]>\n      </body>\n   </message>\n</messages>' > "$INSTANCE/bad.xml"
+  run producer --destination queue://clidata2 --data "$(native "$INSTANCE")/bad.xml"
+  run queue stat --queueName clidata2
+  run queue delete --name clidata --autoDeleteAddress
+  run queue delete --name clidata2 --autoDeleteAddress
+  # lock (no lock coordinators)
+  run lock list
+  run lock start nosuch
+  run lock stop nosuch
   # transfer
   run producer --destination queue://cliq --message-count 4
   run_bare transfer --source-url "$URL" --target-url "$URL" --source-queue cliq --target-queue cliq2 --message-count 3 --silent
@@ -182,7 +211,10 @@ normalize() {
     -e 's/(Elapsed time in second :) [0-9]+ s/\1 # s/' \
     -e 's/(Elapsed time in milli second :) [0-9]+ milli/\1 # milli/' \
     -e 's/Time elapsed: [0-9.]+ sec/Time elapsed: # sec/' \
+    -e 's/^.*>> Lock list results for .*/LOCK LIST/' \
+    -e '/^\s+at [a-z]/d' -e '/^\s+\.\.\. [0-9]+ more$/d' \
     -e "s#$URL#URL#g" \
+    -e "s#$(native "$INSTANCE")#INSTANCE#g" \
     -e 's/"id":"[0-9]+"/"id":"#"/g' \
     -e 's/"id":[0-9]+/"id":#/g' \
     -e "s/$uuid/UUID/g" \

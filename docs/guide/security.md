@@ -80,7 +80,7 @@ On Windows, run the same commands as `bin\saranga.cmd user ...` from the instanc
 
 Passwords are stored as `ENC(...)` hashes unless you pass `--plaintext`. With the JAAS manager, the command edits the users and roles files named by the domain's `PropertiesLoginModule`, keeping their comments and order as Artemis does; with the basic manager, it changes the records in the journal. The management operations behind it (`addUser`, `listUser`, `resetUser`, `removeUser`) are also available over management messages, the REST API and Jolokia. See [management.md](management.md).
 
-The Artemis CLI's `artemis user` works against Saranga too. Saranga's CLI connects over plain Core only: a URL with `sslEnabled=true` is refused. See [cli.md](cli.md) and [COMPAT.md's CLI section](../../COMPAT.md#cli-differences).
+The Artemis CLI's `artemis user` works against Saranga too. Saranga's CLI connects over Core, over TLS when the URL has `sslEnabled=true`. See [cli.md](cli.md) and [COMPAT.md's CLI section](../../COMPAT.md#cli-differences).
 
 ## Authorisation with security settings
 

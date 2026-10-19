@@ -8,6 +8,7 @@ mod export;
 mod import;
 mod journal;
 mod recover;
+pub mod serialize;
 mod xml;
 
 use clap::{Args, Subcommand};

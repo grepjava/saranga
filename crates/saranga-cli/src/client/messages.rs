@@ -12,6 +12,7 @@ use saranga_server::management::json::Json;
 
 use super::jms::{Destination, JmsConnection, JmsSession, message, text_or_id};
 use super::{Common, ConnectionArgs, UsageError};
+use crate::data::serialize::{MessageReader, MessageWriter, XML_SERIALIZER};
 
 /// The text `--text-size` and `--object-size` messages are cut from
 /// (`Producer.DEMO_TEXT`).
@@ -43,9 +44,27 @@ pub struct DestArgs {
     #[arg(long, default_value_t = 1)]
     threads: i32,
     /// The class name of the custom serializer implementation to use
-    /// intead of the default (not supported by saranga).
+    /// intead of the default.
     #[arg(long)]
     serializer: Option<String>,
+}
+
+/// `DestAbstract.getMessageSerializer`: whether the XML serializer serves.
+/// No Java class can be loaded, so another named is reported and the XML
+/// one used, as Artemis does for a class it cannot load.
+fn message_serializer(dest: &DestArgs) -> bool {
+    if let Some(name) = dest.serializer.as_deref().filter(|n| *n != XML_SERIALIZER) {
+        eprintln!("Error: unable to instantiate serializer class: {name}");
+        eprintln!("Defaulting to: {XML_SERIALIZER}");
+    }
+    if !dest.conn.protocol.eq_ignore_ascii_case("core") {
+        eprintln!(
+            "Default Serializer does not support: {} protocol",
+            dest.conn.protocol.to_uppercase()
+        );
+        return false;
+    }
+    true
 }
 
 impl DestArgs {
@@ -60,9 +79,6 @@ impl DestArgs {
         if self.old_batch_size > 0 {
             println!("--txt-size is deprecated, please use --commit-interval");
             self.tx_batch_size = self.old_batch_size;
-        }
-        if self.serializer.is_some() {
-            bail!("saranga's CLI does not support --serializer");
         }
         Ok(())
     }
@@ -133,8 +149,7 @@ pub struct ProducerArgs {
     /// Message Group to be used.
     #[arg(long)]
     group: Option<String>,
-    /// Messages will be read from the specified file (not supported by
-    /// saranga).
+    /// Messages will be read from the specified file.
     #[arg(long)]
     data: Option<String>,
     /// The properties to set on the message in JSON, e.g.:
@@ -162,8 +177,11 @@ struct ProducerSpec {
 
 pub async fn producer(mut args: ProducerArgs) -> anyhow::Result<()> {
     args.dest.resolve()?;
-    if args.data.is_some() {
-        bail!("saranga's CLI does not read messages from a file (--data) yet");
+    if let Some(file) = args.data.clone() {
+        let conn = args.dest.connect().await?;
+        let r = produce_file(&conn, &args.dest, &file).await;
+        conn.close().await;
+        return r;
     }
     let properties = match args.properties.as_deref().filter(|p| !p.is_empty()) {
         Some(p) => match Json::parse(p) {
@@ -245,6 +263,48 @@ async fn produce(
     println!("{thread} Produced: {sent} messages");
     elapsed_lines(thread, started);
     producer.close();
+    Ok(())
+}
+
+/// `Producer.execute` with `--data`: the file's messages sent in order in
+/// one transaction, persistent, rolled back on the first failure.
+async fn produce_file(conn: &JmsConnection, args: &DestArgs, file: &str) -> anyhow::Result<()> {
+    let session = conn.session(true).await?;
+    let dest = Destination::parse(&args.destination);
+    let producer = session.producer(&dest).await?;
+    let r = async {
+        if !message_serializer(args) {
+            eprintln!("Error. Unable to instantiate serializer class: null");
+            return Ok(None);
+        }
+        let mut reader = match MessageReader::open(std::path::Path::new(file)) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Error: Unable to open file for reading\n{e}");
+                return Ok(None);
+            }
+        };
+        reader.start()?;
+        let mut count = 0;
+        while let Some(m) = reader.read()? {
+            session.send(&producer, &dest, m, true, 0).await?;
+            count += 1;
+        }
+        session.commit().await?;
+        anyhow::Ok(Some(count))
+    }
+    .await;
+    match r {
+        Ok(Some(count)) => println!("Sent {count} Messages."),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("Error occurred during import.  Rolling back.");
+            session.rollback().await?;
+            eprintln!("{e:#}");
+        }
+    }
+    producer.close();
+    session.close().await;
     Ok(())
 }
 
@@ -383,8 +443,7 @@ pub struct ConsumerArgs {
     /// The message filter.
     #[arg(long)]
     filter: Option<String>,
-    /// Serialize the messages to the specified file as they are consumed
-    /// (not supported by saranga).
+    /// Serialize the messages to the specified file as they are consumed.
     #[arg(long)]
     data: Option<String>,
     /// The subscription name to use for a durable consumer.
@@ -412,7 +471,11 @@ struct ConsumerSpec {
     batch: i64,
     verbose: bool,
     client_id: Option<String>,
+    /// `--data`'s file (the `SerialiserMessageListener`), until stopped.
+    writer: Option<SharedWriter>,
 }
+
+type SharedWriter = Arc<std::sync::Mutex<Option<MessageWriter>>>;
 
 pub async fn consumer(mut args: ConsumerArgs) -> anyhow::Result<()> {
     args.dest.resolve()?;
@@ -420,18 +483,48 @@ pub async fn consumer(mut args: ConsumerArgs) -> anyhow::Result<()> {
         "Consumer:: filter = {}",
         args.filter.as_deref().unwrap_or("null")
     );
-    if args.data.is_some() {
-        bail!("saranga's CLI does not write messages to a file (--data) yet");
+    let mut writer = None;
+    if let Some(file) = &args.data {
+        if !message_serializer(&args.dest) {
+            eprintln!(
+                "Error. Unable to instantiate serializer class: {}",
+                args.dest.serializer.as_deref().unwrap_or("null")
+            );
+            return Ok(());
+        }
+        let mut w = match MessageWriter::create(std::path::Path::new(file)) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("Error: Unable to open file for writing\n{e}");
+                return Ok(());
+            }
+        };
+        w.start()?;
+        writer = Some(w);
     }
     if let Some(name) = &args.subscription_name {
         if args.dest.threads != 1 {
             eprintln!(
                 "Error: Cannot assign a subscription name when multiple threads are also configured."
             );
+            // Returned before the `finally` that would stop the serializer.
+            if let Some(w) = writer {
+                w.abandon();
+            }
             return Ok(());
         }
         println!("Consumer:: subscription name = {name}");
     }
+    let writer: Option<SharedWriter> = writer.map(|w| Arc::new(std::sync::Mutex::new(Some(w))));
+    let r = consume_threads(&args, writer.clone()).await;
+    // finally: the serializer stopped, whatever its failure.
+    if let Some(w) = writer.and_then(|w| w.lock().ok()?.take()) {
+        let _ = w.stop();
+    }
+    r
+}
+
+async fn consume_threads(args: &ConsumerArgs, writer: Option<SharedWriter>) -> anyhow::Result<()> {
     let conn = Arc::new(args.dest.connect().await?);
     let spec = Arc::new(ConsumerSpec {
         durable: args.durable,
@@ -443,6 +536,7 @@ pub async fn consumer(mut args: ConsumerArgs) -> anyhow::Result<()> {
         batch: args.dest.tx_batch_size,
         verbose: args.dest.verbose(),
         client_id: conn.client_id.clone(),
+        writer,
     });
     let dest = Destination::parse(&args.dest.destination);
     let mut threads = tokio::task::JoinSet::new();
@@ -525,8 +619,17 @@ async fn consume_loop(
                             println!("Received {count}");
                         }
                     }
-                    if spec.verbose {
-                        verbose_received(&d.message);
+                    // `handle`: to the file, else the verbose details.
+                    match &spec.writer {
+                        Some(w) => {
+                            if let Some(w) =
+                                w.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.as_mut()
+                            {
+                                w.write(&d.message, d.is_large())?;
+                            }
+                        }
+                        None if spec.verbose => verbose_received(&d.message),
+                        None => {}
                     }
                     *received += 1;
                 }

@@ -148,6 +148,9 @@ enum Command {
     /// Check a node or a queue.
     #[command(subcommand)]
     Check(client::check::CheckCommand),
+    /// Lock coordinators group.
+    #[command(subcommand)]
+    Lock(client::lock::LockCommand),
     /// Stop the broker of an instance, as `artemis stop`: STOP_ME next to
     /// its broker.xml.
     Stop {
@@ -459,6 +462,7 @@ async fn execute(command: Command) -> bool {
             | Command::Browser(_)
             | Command::Transfer(_)
             | Command::Check(_)
+            | Command::Lock(_)
             | Command::Perf(_)
             | Command::PerfJournal(_)
             | Command::Stop { .. }
@@ -509,6 +513,7 @@ async fn run_client(command: Command) -> anyhow::Result<()> {
         Command::Browser(a) => client::messages::browser(a).await,
         Command::Transfer(a) => client::messages::transfer(a).await,
         Command::Check(c) => client::check::run(c).await,
+        Command::Lock(c) => client::lock::run(c).await,
         Command::Perf(c) => perf::run(c).await,
         Command::PerfJournal(a) => perf::journal::run(&a),
         Command::Stop {

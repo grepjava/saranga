@@ -19,7 +19,7 @@ const WIDTH: usize = 80;
 const LONG_OPTIONS_MAX_WIDTH: usize = 20;
 
 /// The commands of Artemis's command line that saranga does not have yet.
-const MISSING: [&str; 3] = ["lock", "properties", "check cluster"];
+const MISSING: [&str; 1] = ["properties"];
 
 /// Where the command line is: `buildCommand`'s choice of commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,9 +241,8 @@ impl Spec {
                         "shell" => !in_shell,
                         "connect" | "disconnect" => in_shell,
                         "run" => mode == Mode::Instance && !in_shell,
-                        "activation" | "user" | "stop" | "kill" | "perf-journal" => {
-                            mode == Mode::Instance
-                        }
+                        "lock" | "properties" | "activation" | "user" | "stop" | "kill"
+                        | "perf-journal" => mode == Mode::Instance,
                         "create" | "upgrade" => mode == Mode::Home,
                         _ => true,
                     }

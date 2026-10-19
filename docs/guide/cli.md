@@ -26,7 +26,7 @@ saranga <command> --help        # Saranga's help for a command, every option it 
 saranga help <command>          # Artemis's help text for the command
 ```
 
-`saranga help` prints Artemis's own usage message, laid out as Artemis's CLI lays it out, with the commands Artemis offers in the same place: from an instance's `bin` it lists `activation`, `user`, `run`, `stop`, `kill` and `perf-journal`, and from the binary it lists `create` and `upgrade` instead. Every command works in both places all the same. The commands Saranga does not have yet (`lock`, `properties` and `check cluster`) are left out. Every option `saranga help` lists is one Saranga takes; `--help` shows them in Saranga's words and adds Saranga's own, such as `run --config`.
+`saranga help` prints Artemis's own usage message, laid out as Artemis's CLI lays it out, with the commands Artemis offers in the same place: from an instance's `bin` it lists `activation`, `user`, `run`, `stop`, `kill` and `perf-journal`, and from the binary it lists `create` and `upgrade` instead. Every command works in both places all the same. The command Saranga does not have yet, `properties`, is left out. Every option `saranga help` lists is one Saranga takes; `--help` shows them in Saranga's words and adds Saranga's own, such as `run --config`.
 
 A mistake on the command line is reported as Artemis's CLI reports it, so scripts that check its output keep working: the message (`Unknown option: '--frob'`, `Invalid value for option '--message-count': 'abc' is not a long`) on standard error, then `help help`'s usage, with status 1.
 
@@ -38,17 +38,13 @@ The commands that talk to a running broker (`producer`, `consumer`, `browser`, `
 
 | Option | Does |
 |---|---|
-| `--url <url>` | The broker. Default: the URL of the acceptor called `artemis` in the instance's `broker.xml`, else `tcp://localhost:61616`. |
-| `--acceptor <name>` | Takes the default URL from this acceptor instead. |
+| `--url <url>` | The broker. Default: the URL of the acceptor called `artemis` in the instance's `broker.xml`, else of the connector of that name, else `tcp://localhost:61616`. |
+| `--acceptor <name>` | Takes the default URL from this acceptor (or connector) instead. |
 | `--user`, `--password` | The credentials. |
 | `--silent` | Asks nothing: no prompt for missing values, no retry after a failed connection. Use it in scripts. |
 | `--verbose` | Prints more. |
 
-The CLI connects over Core on plain TCP. These are the differences from Artemis's CLI:
-
-- `--protocol AMQP` is not supported, and a URL with `sslEnabled=true` is refused.
-- A URL can list several servers, `(tcp://a:61616,tcp://b:61616)?reconnectAttempts=5`, tried in turn as Artemis's client tries them, and takes the usual `ServerLocator` parameters (`ha`, `reconnectAttempts`, `retryInterval`, `callTimeout` and the like).
-- The default URL comes from an acceptor only; Artemis also looks for a connector of the same name.
+The CLI connects over Core, over TLS when the URL says `sslEnabled=true` (with `trustStorePath`, `keyStorePath` and the other TLS parameters a connector takes). A URL can list several servers, `(tcp://a:61616,tcp://b:61616)?reconnectAttempts=5`, tried in turn as Artemis's client tries them, and takes the usual `ServerLocator` parameters (`ha`, `reconnectAttempts`, `retryInterval`, `callTimeout` and the like). `--protocol AMQP` is not supported.
 
 When a connection fails, the CLI prints `Connection failed::<reason>` and, unless `--silent` is given, asks for the URL, user and password and tries once more, as Artemis's does.
 
@@ -147,7 +143,7 @@ saranga producer --url tcp://localhost:61616 --user admin --password admin \
   --destination queue://orders --message-count 100 --message "hello"
 ```
 
-Useful options: `--message-count` (default 1000), `--message` for the text of a `TextMessage`, `--message-size` or `--text-size` for generated bodies, `--properties` for message properties as JSON (`[{"type":"string","key":"region","value":"eu"}]`), `--non-persistent`, `--msgttl`, `--group`, `--commit-interval` to send in transactions, `--threads` and `--sleep`. `--data` (messages from a file) and `--serializer` are not supported yet.
+Useful options: `--message-count` (default 1000), `--message` for the text of a `TextMessage`, `--message-size` or `--text-size` for generated bodies, `--properties` for message properties as JSON (`[{"type":"string","key":"region","value":"eu"}]`), `--non-persistent`, `--msgttl`, `--group`, `--commit-interval` to send in transactions, `--threads` and `--sleep`. `--data <file>` sends the messages of a file `consumer --data` wrote, in order, persistent, in one transaction, and prints `Sent <n> Messages.`; a failure rolls them all back.
 
 ### consumer
 
@@ -158,7 +154,14 @@ saranga consumer --destination queue://orders --message-count 100 --receive-time
 saranga consumer --destination topic://news --durable --clientID c1 --subscriptionName s1
 ```
 
-Useful options: `--message-count`, `--receive-timeout` (milliseconds; -1 waits for ever), `--break-on-null` to stop at the first empty receive, `--filter` for a selector, `--durable` with `--subscriptionName` and `--clientID` for a durable subscription, and `--commit-interval`. `--data` and `--serializer` are not supported yet.
+Useful options: `--message-count`, `--receive-timeout` (milliseconds; -1 waits for ever), `--break-on-null` to stop at the first empty receive, `--filter` for a selector, `--durable` with `--subscriptionName` and `--clientID` for a durable subscription, and `--commit-interval`. `--data <file>` writes the messages received to the file, in Artemis's XML, as they are consumed:
+
+```bash
+saranga consumer --destination queue://orders --message-count 100 --data orders.xml
+saranga producer --destination queue://orders.replay --data orders.xml
+```
+
+The file holds each message's properties and body; a text message's body is its text. The ID, priority, expiry, timestamp and user ID are new when the messages are sent again, and leading and trailing white space of a text body is dropped, as Artemis reads it. `--serializer` names a Java class; Saranga reports any but Artemis's `XMLMessageSerializer` and uses the XML.
 
 ### browser
 
@@ -228,7 +231,13 @@ saranga check node --backup --peers 2
 saranga check queue --name orders --up --produce 1 --consume 1
 ```
 
-`check node` checks that the broker is started (`--up`, the default), its disk usage (`--diskUsage`, -1 for `max-disk-usage`) and memory usage, that it has a primary (`--primary`, or `--live`) or a backup (`--backup`), and how many peers it sees (`--peers`). `check queue` checks that a queue exists and is not paused, and can send (`--produce`), browse (`--browse`) or consume (`--consume`) messages. `--timeout` (default 30000 ms) and `--fail-at-end` apply to both. `check cluster` is not there yet.
+`check node` checks that the broker is started (`--up`, the default), its disk usage (`--diskUsage`, -1 for `max-disk-usage`) and memory usage, that it has a primary (`--primary`, or `--live`) or a backup (`--backup`), and how many peers it sees (`--peers`). `check queue` checks that a queue exists and is not paused, and can send (`--produce`), browse (`--browse`) or consume (`--consume`) messages. `--timeout` (default 30000 ms) and `--fail-at-end` apply to both.
+
+`check cluster` asks each primary in the broker's topology for its own topology, which must be the same, and for its time, which must be within `--variance` milliseconds (default 1000) of the others'; it prints a table of the nodes and their times and any mismatch, as Artemis's does.
+
+### lock
+
+`lock list`, `lock start <name>` and `lock stop <name>` list and start and stop the broker's lock coordinators. Saranga has none, so `lock list` prints `No Lock Coordinators configured` and the others fail with `No lock coordinator found with name: <name>`, as Artemis's do on a broker without them.
 
 ## Data tools
 
@@ -347,4 +356,4 @@ Prints Artemis's help text for a command. See [Getting help](#getting-help).
 
 ## Not there yet
 
-`artemis properties`, `artemis lock` (which goes with lock coordinators) and `artemis check cluster` have no Saranga counterpart yet, and `saranga help` leaves them out.
+`artemis properties` has no Saranga counterpart yet, and `saranga help` leaves it out.

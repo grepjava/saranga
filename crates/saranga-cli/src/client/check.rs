@@ -10,12 +10,28 @@ use super::jms::{Destination, JmsConnection};
 use super::management::Requestor;
 use super::{CliError, ConnectionArgs};
 
+mod cluster;
+
 #[derive(clap::Subcommand, Debug)]
 pub enum CheckCommand {
     /// Check a node.
     Node(NodeArgs),
     /// Check a queue.
     Queue(QueueArgs),
+    /// Verify if all the nodes on the cluster match the same topology and
+    /// time configuration.
+    Cluster(ClusterArgs),
+}
+
+/// `ClusterCheck`'s options.
+#[derive(clap::Args, Debug)]
+pub struct ClusterArgs {
+    #[command(flatten)]
+    conn: ConnectionArgs,
+    /// Allowed variance in milliseconds before considered a failure.
+    /// (default=1000)
+    #[arg(long, default_value_t = 1000, allow_negative_numbers = true)]
+    variance: i64,
 }
 
 /// `CheckAbstract`'s options.
@@ -180,6 +196,7 @@ enum Task {
 
 pub async fn run(cmd: CheckCommand) -> anyhow::Result<()> {
     let (check, kind, tasks) = match cmd {
+        CheckCommand::Cluster(args) => return cluster::run(args).await,
         CheckCommand::Node(mut args) => {
             args.check.conn.resolve(false)?;
             let tasks = node_tasks(&args)?;

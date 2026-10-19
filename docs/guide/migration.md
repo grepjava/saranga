@@ -192,7 +192,7 @@ Most operators will notice few differences. These are the ones most likely to sh
 - **Management.** `browse` through management messages answers `no operation`; `listMessages`, the REST API and Jolokia return the messages as JSON. Dates in management views are in UTC. ([Management differences](../../COMPAT.md#management-differences))
 - **Web.** A REST API at `/api` on every web binding, which Artemis does not have. No `console.war` ships with Saranga. ([Web server differences](../../COMPAT.md#web-server-differences))
 - **Logging.** Only the properties format of log4j 2 is read, and per-class logger levels have no effect. ([Logging differences](../../COMPAT.md#logging-differences))
-- **The CLI.** Its messaging commands connect over Core and plain TCP only, and `producer --data`, `consumer --data` and `--serializer` are not there yet. There is no Windows service wrapper. ([CLI differences](../../COMPAT.md#cli-differences))
+- **The CLI.** Its messaging commands connect over Core only, and `--serializer` cannot load a Java class. There is no Windows service wrapper. ([CLI differences](../../COMPAT.md#cli-differences))
 - **Failures.** A critical I/O error ends the `saranga run` process with status 1, where Artemis stops the broker and leaves the process up. ([Critical I/O error differences](../../COMPAT.md#critical-io-error-differences))
 - **Network checks.** A broker stopped by a network check comes back in the same process once the network answers. ([Network check differences](../../COMPAT.md#network-check-differences))
 - **Diagnostics.** The critical analyzer's "thread dump" lists the components in a critical path, not thread stacks. ([Critical analyzer differences](../../COMPAT.md#critical-analyzer-differences))
