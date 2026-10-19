@@ -1045,8 +1045,36 @@ impl BrokerConfig {
     /// expanding its `xi:include`s, relative ones against the working
     /// directory as Artemis does.
     pub fn parse_with(xml: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        Self::parse_validated(xml, lookup, crate::Validation::Deploy { jms: true })
+    }
+
+    /// Only validates `broker.xml` text against Artemis's schemas, as
+    /// `validation` says, its `${...}` and includes resolved first: the
+    /// first error, whichever the validation, as
+    /// [`ConfigError::Invalid`].
+    pub fn validate(
+        xml: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+        validation: crate::Validation,
+    ) -> Result<()> {
         let text = crate::substitute::replace_system_props(xml, &lookup);
         let text = crate::xinclude::expand(&text, None, &lookup)?;
+        match crate::parser::schema_error(&text, validation)? {
+            Some(message) => Err(ConfigError::Invalid(message)),
+            None => Ok(()),
+        }
+    }
+
+    /// [`parse_with`](Self::parse_with), validating against Artemis's
+    /// schemas as `validation` says.
+    pub fn parse_validated(
+        xml: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+        validation: crate::Validation,
+    ) -> Result<Self> {
+        let text = crate::substitute::replace_system_props(xml, &lookup);
+        let text = crate::xinclude::expand(&text, None, &lookup)?;
+        crate::parser::validate_document(&text, validation)?;
         crate::parser::parse_document(&text)
     }
 

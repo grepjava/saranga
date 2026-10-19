@@ -152,8 +152,8 @@ fn upstream(_: u16, _: u16) -> String {
              <policy ref="both"/>
            </upstream>
            <policy-set name="both"><policy ref="news"/><policy ref="orders"/></policy-set>
-           <address-policy name="news"><include address-match="news"/></address-policy>
            <queue-policy name="orders"><include queue-match="#" address-match="orders"/></queue-policy>
+           <address-policy name="news"><include address-match="news"/></address-policy>
          </federation>
        </federations>"##
         .to_owned()

@@ -22,7 +22,7 @@ The first release.
 
 ### Configuration and security
 
-- **Configuration**: Artemis's `broker.xml` schema, `broker.properties`, environment overrides and hot reload. Instances are made by `saranga create` with Artemis's templates.
+- **Configuration**: Artemis's `broker.xml` schema, validated as Artemis validates it with the same messages, `broker.properties`, environment overrides and hot reload. Instances are made by `saranga create` with Artemis's templates.
 - **TLS** with PEM, PKCS12 and JKS keystores, SNI and mutual TLS.
 - **Authentication**: JAAS login modules (properties file, LDAP, certificates and guest), and the basic security manager.
 - **Authorization**: security settings, and password masking.

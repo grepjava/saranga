@@ -154,15 +154,28 @@ The deprecated top-level `<queues>` element is ignored, with a warning: declare 
 
 See [COMPAT.md](../../COMPAT.md#queue-semantics-differences).
 
+## Schema validation
+
+As Artemis does, the broker validates `broker.xml` against Artemis's schemas before it reads it, once `${...}` and `xi:include` are resolved: `<core>` against `artemis-configuration.xsd` and the legacy `<jms>` against `artemis-jms.xsd`. The first error stops the broker before it starts, logged as Artemis logs it:
+
+```
+ERROR [org.apache.activemq.artemis.core.client] AMQ214019: Invalid configuration
+org.xml.sax.SAXParseException; cvc-datatype-valid.1.2.1: '100K' is not a valid value for 'integer'.
+```
+
+The messages are Xerces's, so an element out of place, a missing required attribute, a value that is not of its type (such as byte notation where the schema wants a plain number), a duplicate `name` where the schema makes it an ID, or a `discovery-group-ref` to a group that does not exist is reported in the same words. The CLI's commands that read `broker.xml` validate it the same way.
+
+A reload validates the whole file against `artemis-server.xsd` and, as Artemis does, only logs an error and reloads what it can read.
+
+As Artemis's XInclude processing does, an included element gets an `xml:base` attribute, and the schema allows it only on some elements: an included `<addresses>` or `<address-settings>` is valid, a lone `<acceptor>` is not.
+
 ## What Saranga ignores, and what stops it
 
 Saranga reads the whole `broker.xml` schema. Elements are matched by their local name, so a prefixed element that Java would miss is accepted.
 
 These are read and ignored, each with a warning in the log:
 
-- an element the schema does not define at that position;
-- `xi:include`, which is not expanded;
-- the legacy `<jms>` element;
+- an element the schema does not define at that position, in a file a reload reads (when the broker starts, it is an error);
 - `<connection-routers>`;
 - `<lock-coordinators>`;
 - `<metrics>` and `<metrics-plugin>` (the broker, address and queue metrics are still served where `bootstrap.xml` declares the metrics app; see [Management](management.md));

@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use saranga_config::{BootstrapConfig, BootstrapSecurity, BrokerConfig, broker_properties};
+use saranga_config::{
+    BootstrapConfig, BootstrapSecurity, BrokerConfig, Validation, broker_properties,
+};
 use saranga_security::jaas::{ControlFlag, ModuleEntry, ModuleFactory};
 use saranga_security::{
     BasicSecurityManager, JaasSecurityManager, LoginConfig, SecurityManager, SecurityStore,
@@ -203,11 +205,31 @@ impl Instance {
         Ok(bootstrap)
     }
 
-    pub fn broker_config(&self) -> anyhow::Result<BrokerConfig> {
+    /// `broker.xml` read and validated as the broker deploys it, its
+    /// warnings left for [`broker_config`](Self::broker_config).
+    pub fn read_broker_xml(&self) -> anyhow::Result<()> {
         let path = &self.broker_xml;
         let xml =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut config = BrokerConfig::parse_with(&xml, |n| self.lookup(n))
+        BrokerConfig::parse_with(&xml, |n| self.lookup(n))
+            .with_context(|| format!("reading {}", path.display()))?;
+        Ok(())
+    }
+
+    /// The broker configuration as the broker deploys it: `<core>` and
+    /// `<jms>` validated against their schemas.
+    pub fn broker_config(&self) -> anyhow::Result<BrokerConfig> {
+        self.broker_config_validated(Validation::Deploy { jms: true })
+    }
+
+    /// The broker configuration, `broker.xml` validated as `validation`
+    /// says: deployed by the broker or a tool (`FileDeploymentManager`), or
+    /// read again by a reload, which only logs what is not valid.
+    pub fn broker_config_validated(&self, validation: Validation) -> anyhow::Result<BrokerConfig> {
+        let path = &self.broker_xml;
+        let xml =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut config = BrokerConfig::parse_validated(&xml, |n| self.lookup(n), validation)
             .with_context(|| format!("reading {}", path.display()))?;
         for w in &config.warnings {
             tracing::warn!("{}: {w}", path.display());

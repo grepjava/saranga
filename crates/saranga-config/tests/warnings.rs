@@ -1,9 +1,12 @@
-//! Unknown or unsupported elements produce warnings, never errors.
+//! Unknown or unsupported elements produce warnings, never errors. Most of
+//! these documents are not valid against Artemis's schema, which a
+//! deployment refuses; they are read here as a reload reads them, the
+//! validation error only logged.
 
-use saranga_config::{BrokerConfig, HaPolicy, Warning};
+use saranga_config::{BrokerConfig, HaPolicy, Validation, Warning};
 
 fn parse(xml: &str) -> BrokerConfig {
-    BrokerConfig::parse_with(xml, |_| None).unwrap()
+    BrokerConfig::parse_validated(xml, |_| None, Validation::Reload).unwrap()
 }
 
 fn unknown(parent: &str, name: &str) -> Warning {
@@ -63,9 +66,10 @@ fn colocated_backups_and_jdbc_are_refused() {
         "<ha-policy><shared-store><colocated/></shared-store></ha-policy>",
         "<store><database-store><jdbc-connection-url>x</jdbc-connection-url></database-store></store>",
     ] {
-        let e = BrokerConfig::parse_with(
+        let e = BrokerConfig::parse_validated(
             &format!("<configuration><core>{xml}</core></configuration>"),
             |_| None,
+            Validation::Reload,
         )
         .unwrap_err();
         assert!(

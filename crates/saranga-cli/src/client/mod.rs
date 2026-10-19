@@ -428,7 +428,9 @@ pub fn instance_url(name: Option<&str>) -> String {
     let found = (|| -> anyhow::Result<Option<String>> {
         let instance =
             crate::instance::Instance::from_etc(&etc, crate::instance::Options::default())?;
-        let config = instance.broker_config()?;
+        // getBrokerConfiguration deploys only the core configuration.
+        let config =
+            instance.broker_config_validated(saranga_config::Validation::Deploy { jms: false })?;
         // `findTransportURI`: the acceptor of that name, else the connector.
         let Some(a) = config
             .acceptors

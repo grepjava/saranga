@@ -25,6 +25,7 @@ mod matcher;
 mod parser;
 pub mod properties;
 mod repository;
+mod schema;
 mod security;
 mod substitute;
 mod wildcard;
@@ -104,6 +105,24 @@ pub enum ConfigError {
     /// (`ActiveMQIllegalStateException`), its message given whole.
     #[error("{0}")]
     IllegalState(String),
+    /// `broker.xml` not valid against Artemis's schema
+    /// (`XMLUtil.validate`'s `IllegalStateException`), with the
+    /// `SAXParseException` it was caused by.
+    #[error("Invalid configuration: org.xml.sax.SAXParseException; {0}")]
+    Invalid(String),
+}
+
+/// How `broker.xml` is validated against Artemis's schemas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Validation {
+    /// `FileDeploymentManager.readConfiguration`: `<core>`, and `<jms>`
+    /// when its deployable is added, each against its schema; the first
+    /// error fails the configuration.
+    Deploy { jms: bool },
+    /// `FileConfigurationParser.parseMainConfig(InputStream)`, as a reload
+    /// reads the file: the whole document against `artemis-server.xsd`, an
+    /// error only logged.
+    Reload,
 }
 
 impl ConfigError {

@@ -1019,9 +1019,12 @@ fn spawn_config_reloader(
                 continue;
             }
             last = now;
-            let reload = instance.broker_config().and_then(|c| {
-                saranga_server::reload::Reload::from_file_config(&c).map_err(anyhow::Error::from)
-            });
+            let reload = instance
+                .broker_config_validated(saranga_config::Validation::Reload)
+                .and_then(|c| {
+                    saranga_server::reload::Reload::from_file_config(&c)
+                        .map_err(anyhow::Error::from)
+                });
             match reload {
                 Ok(reload) => current.get().reload(reload).await,
                 Err(e) => tracing::warn!("configuration not reloaded: {e:#}"),
@@ -1546,7 +1549,7 @@ fn announce(instance: Option<&Arc<instance::Instance>>, started: &Started) {
         let loader = instance.clone();
         broker.set_config_loader(Arc::new(move || {
             loader
-                .broker_config()
+                .broker_config_validated(saranga_config::Validation::Reload)
                 .and_then(|c| {
                     saranga_server::reload::Reload::from_file_config(&c)
                         .map_err(anyhow::Error::from)
@@ -1619,6 +1622,11 @@ async fn run(
     bind: Option<SocketAddr>,
     allow_kill: bool,
 ) -> anyhow::Result<()> {
+    // FileBroker.createComponents reads the configuration before start()
+    // says the server is starting: one that cannot be read never starts.
+    if let Some(instance) = &instance {
+        instance.read_broker_xml()?;
+    }
     tracing::info!("AMQ101000: Starting Saranga Server version {VERSION}");
     let instance = instance.map(Arc::new);
     let stop_dir = instance

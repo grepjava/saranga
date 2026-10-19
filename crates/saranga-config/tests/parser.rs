@@ -1,10 +1,12 @@
 //! `broker.xml` parsing. Several tests are ported from
 //! `FileConfigurationParserTest`; Java passes the snippets to
-//! `parseMainConfig` directly, here they are wrapped in `<core>`.
+//! `parseMainConfig(InputStream)` directly, which only logs what is not
+//! valid against the schema, here they are wrapped in `<core>` and
+//! validated as a reload validates them.
 
 use saranga_config::{
     AddressFullMessagePolicy, BrokerConfig, ConfigError, DiskFullMessagePolicy,
-    PageFullMessagePolicy, RoutingType, Warning,
+    PageFullMessagePolicy, RoutingType, Validation, Warning,
 };
 
 fn core(body: &str) -> String {
@@ -16,11 +18,11 @@ fn core(body: &str) -> String {
 }
 
 fn parse(body: &str) -> BrokerConfig {
-    BrokerConfig::parse_with(&core(body), |_| None).unwrap()
+    BrokerConfig::parse_validated(&core(body), |_| None, Validation::Reload).unwrap()
 }
 
 fn parse_err(body: &str) -> ConfigError {
-    BrokerConfig::parse_with(&core(body), |_| None).unwrap_err()
+    BrokerConfig::parse_validated(&core(body), |_| None, Validation::Reload).unwrap_err()
 }
 
 fn settings<'a>(c: &'a BrokerConfig, m: &str) -> &'a saranga_config::AddressSettings {
@@ -29,7 +31,13 @@ fn settings<'a>(c: &'a BrokerConfig, m: &str) -> &'a saranga_config::AddressSett
 
 #[test]
 fn minimal_xml() {
-    let c = BrokerConfig::parse("<configuration><core></core></configuration>").unwrap();
+    let xml = "<configuration><core></core></configuration>";
+    // Deployed, a <core> outside its namespace is not valid.
+    assert_eq!(
+        BrokerConfig::parse(xml).unwrap_err().to_string(),
+        "Invalid configuration: org.xml.sax.SAXParseException; cvc-elt.1.a: Cannot find the declaration of element 'core'."
+    );
+    let c = BrokerConfig::parse_validated(xml, |_| None, Validation::Reload).unwrap();
     assert_eq!(c, BrokerConfig::default());
     assert_eq!(c.name, "localhost");
     assert_eq!(c.large_messages_directory, "data/largemessages");

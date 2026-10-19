@@ -324,6 +324,76 @@ impl Settings<'_, '_> {
     }
 }
 
+/// The document validated as `validation` says: deployed, `<core>` and
+/// maybe `<jms>` (the first descendants so named, as
+/// `getElementsByTagName` finds them) each against its schema, the first
+/// error logged as `XMLUtil.validate` logs it and failing the
+/// configuration; reloaded, the whole document against
+/// `artemis-server.xsd`, an error logged by `FileConfigurationParser` and
+/// the configuration read all the same.
+pub(crate) fn validate_document(text: &str, validation: crate::Validation) -> Result<()> {
+    match schema_error(text, validation)? {
+        Some(message) if validation == crate::Validation::Reload => {
+            tracing::error!(
+                target: "org.apache.activemq.artemis.core.deployers.impl.FileConfigurationParser",
+                "{message}"
+            );
+            Ok(())
+        }
+        Some(message) => {
+            tracing::error!(
+                "AMQ214019: Invalid configuration\norg.xml.sax.SAXParseException; {message}"
+            );
+            Err(ConfigError::Invalid(message))
+        }
+        None => Ok(()),
+    }
+}
+
+/// The message of the first error validating the document as `validation`
+/// says, if there is one.
+pub(crate) fn schema_error(text: &str, validation: crate::Validation) -> Result<Option<String>> {
+    use crate::schema::{Xsd, validate};
+    let options = ParsingOptions {
+        allow_dtd: true,
+        ..ParsingOptions::default()
+    };
+    let doc = Document::parse_with_options(text, options)?;
+    let root = doc.root_element();
+    match validation {
+        crate::Validation::Deploy { jms } => {
+            let deployables = [("core", Xsd::Configuration, true), ("jms", Xsd::Jms, jms)];
+            for (name, xsd, deployed) in deployables {
+                // getElementsByTagName matches the qualified name: a
+                // prefixed <c:core> is not the deployable's.
+                let node = root
+                    .descendants()
+                    .skip(1)
+                    .find(|d| d.is_element() && qualified_name(text, *d) == name);
+                let Some(node) = node.filter(|_| deployed) else {
+                    continue;
+                };
+                if let Err(f) = validate(xsd, text, node) {
+                    return Ok(Some(f.message()));
+                }
+            }
+            Ok(None)
+        }
+        crate::Validation::Reload => {
+            Ok(validate(Xsd::Server, text, root).err().map(|f| f.message()))
+        }
+    }
+}
+
+/// An element's name as written, its prefix included.
+fn qualified_name<'t>(text: &'t str, n: Node<'_, '_>) -> &'t str {
+    let rest = &text[n.range().start + 1..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
 pub(crate) fn parse_document(text: &str) -> Result<BrokerConfig> {
     let options = ParsingOptions {
         allow_dtd: true,

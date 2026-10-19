@@ -118,7 +118,7 @@ fn recursive_expansion_and_self_reference() {
 
 #[test]
 fn substitution_applies_to_broker_xml() {
-    let xml = r#"<configuration><core>
+    let xml = r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
         <name>${BROKER_NAME:fallback}</name>
         <journal-directory>${DATA}/journal</journal-directory>
         <acceptors><acceptor name="a">tcp://${HOST:0.0.0.0}:${PORT}</acceptor></acceptors>

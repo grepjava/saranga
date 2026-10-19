@@ -1235,7 +1235,14 @@ mod tests {
               <cluster-connection-uri name="no-connector" address="static://(tcp://localhost:61618)"/>
             </cluster-connections>
         </core></configuration>"#;
-        let file = saranga_config::BrokerConfig::parse(xml).unwrap();
+        // The taken name and the missing group are not valid against the
+        // schema, which a deployment refuses: read as a reload reads it.
+        let file = saranga_config::BrokerConfig::parse_validated(
+            xml,
+            |_| None,
+            saranga_config::Validation::Reload,
+        )
+        .unwrap();
         let all = ClusterConfig::all_from_file(&file);
         let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["orders", "news", "by-uri"]);
