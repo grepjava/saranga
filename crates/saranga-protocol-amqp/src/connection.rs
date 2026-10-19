@@ -360,6 +360,11 @@ enum Event {
     /// A federation failed: a broker connection's is made again, a
     /// target's connection closes (`signalError`).
     LinkFailed(String),
+    /// An address a receiver sends to has room again: its credit is topped
+    /// up (`creditRunnable`, run once memory is freed).
+    TopUp { channel: u16, handle: u32, id: u64 },
+    /// A receiver's drain or stop took longer than its quiesce timeout.
+    Quiesce { channel: u16, handle: u32, id: u64 },
 }
 
 /// What a federation asks of one of its receivers.
@@ -602,6 +607,23 @@ struct ReceiverLink {
     /// The address its last message went to, kept for the next, which
     /// shares it rather than holding its own.
     last_address: Option<SimpleString>,
+    /// Told apart from a link attached later on the same handle.
+    id: u64,
+    /// A top-up waits for its address to have room.
+    flow_waiting: bool,
+    /// The drain's or the stop's timeout, while one runs.
+    quiesce: Option<tokio::task::AbortHandle>,
+    /// An anonymous relay's last address's policy, and whether a clash
+    /// with another's was logged (`lastAddressPolicy`,
+    /// `addressAlreadyClashed`).
+    last_policy: Option<saranga_server::settings::AddressFullPolicy>,
+    clashed: bool,
+}
+
+/// A receiving link's ID, unique in the broker.
+fn next_link_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// What a receiving link does with a message.
@@ -638,6 +660,12 @@ pub trait ManagedReceiver: Send + Sync {
     fn credits(&self) -> i32;
     fn credits_low(&self) -> i32;
     fn use_modified(&self) -> bool;
+    /// Whether an address-full failure drains its credit, and how long
+    /// the peer is given to drain it.
+    fn drain_on_transient_delivery_errors(&self) -> bool;
+    fn link_quiesce_timeout(&self) -> i32;
+    /// The timeout its stops are given (`receiverQuiesceTimeout`).
+    fn stop_timeout(&self) -> i32;
     fn large_threshold(&self) -> i32;
     fn is_closed(&self) -> bool;
     /// The peer answered the attach, taking the link or not.
@@ -653,6 +681,9 @@ pub trait ManagedReceiver: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReceiverState {
     Started,
+    /// Draining its credit after an address-full failure, to start again
+    /// once drained.
+    Draining,
     Stopping,
     Stopped,
 }
@@ -1909,6 +1940,11 @@ impl Conn {
             attach.handle,
             Link::Receiver(ReceiverLink {
                 last_address: None,
+                id: next_link_id(),
+                flow_waiting: false,
+                quiesce: None,
+                last_policy: None,
+                clashed: false,
                 name: attach.name.clone().into(),
                 target: Arc::new(ReceiverTarget {
                     address: Some(address),
@@ -2044,6 +2080,11 @@ impl Conn {
             attach.handle,
             Link::Receiver(ReceiverLink {
                 last_address: None,
+                id: next_link_id(),
+                flow_waiting: false,
+                quiesce: None,
+                last_policy: None,
+                clashed: false,
                 name: attach.name.clone().into(),
                 target: Arc::new(ReceiverTarget {
                     address: None,
@@ -2532,7 +2573,6 @@ impl Conn {
         let expiry = target.expiry_policy;
         reply.target = Some(TargetKind::Target(target));
         self.send(channel, Performative::Attach(reply));
-        let credits = self.settings.credits.max(0) as u32;
         let s = self.sessions.get_mut(&channel).expect("checked");
         s.server
             .add_producer(&attach.name, "AMQP", resolved.address.as_deref());
@@ -2541,10 +2581,15 @@ impl Conn {
             attach.handle,
             Link::Receiver(ReceiverLink {
                 last_address: None,
+                id: next_link_id(),
+                flow_waiting: false,
+                quiesce: None,
+                last_policy: None,
+                clashed: false,
                 name: attach.name.as_str().into(),
                 target: Arc::new(resolved),
                 source: attach.source.map(Arc::new),
-                credit: credits,
+                credit: 0,
                 delivery_count,
                 incoming: None,
                 dynamic_expiry: expiry,
@@ -2553,9 +2598,8 @@ impl Conn {
                 state: ReceiverState::Started,
             }),
         );
-        let s = &self.sessions[&channel];
-        let flow = self.link_flow(s, attach.handle, delivery_count, credits, false);
-        self.send(channel, Performative::Flow(flow));
+        // start: the credit once the address has room.
+        self.top_up(channel, attach.handle);
         Ok(())
     }
 
@@ -2887,13 +2931,17 @@ impl Conn {
                     );
                     return Ok(());
                 }
-                let credits = self.settings.credits.max(0) as u32;
                 let delivery_count = remote.initial_delivery_count.unwrap_or(0);
                 s.server.add_producer(&name, "AMQP", Some(&address));
                 s.links.insert(
                     handle,
                     Link::Receiver(ReceiverLink {
                         last_address: None,
+                        id: next_link_id(),
+                        flow_waiting: false,
+                        quiesce: None,
+                        last_policy: None,
+                        clashed: false,
                         name: name.into(),
                         target: Arc::new(ReceiverTarget {
                             address: Some(address),
@@ -2902,7 +2950,7 @@ impl Conn {
                             dynamic: false,
                         }),
                         source: link.attach.source.clone().map(Arc::new),
-                        credit: credits,
+                        credit: 0,
                         delivery_count,
                         incoming: None,
                         dynamic_expiry: TerminusExpiryPolicy::SessionEnd,
@@ -2911,9 +2959,7 @@ impl Conn {
                         state: ReceiverState::Started,
                     }),
                 );
-                let s = &self.sessions[&channel];
-                let flow = self.link_flow(s, handle, delivery_count, credits, false);
-                self.send(channel, Performative::Flow(flow));
+                self.top_up(channel, handle);
             }
             LocalLinkKind::Federation(_) | LocalLinkKind::Bridge(_) => {
                 unreachable!("handled above")
@@ -3169,6 +3215,11 @@ impl Conn {
                         handle,
                         Link::Receiver(ReceiverLink {
                             last_address: None,
+                            id: next_link_id(),
+                            flow_waiting: false,
+                            quiesce: None,
+                            last_policy: None,
+                            clashed: false,
                             name: name.into(),
                             target: Arc::new(ReceiverTarget {
                                 address: None,
@@ -3230,7 +3281,6 @@ impl Conn {
         let opened = remote.source.is_some();
         let address = c.destination().to_owned();
         let delivery_count = remote.initial_delivery_count.unwrap_or(0);
-        let credits = if opened { c.credits().max(0) as u32 } else { 0 };
         let s = self.sessions.get_mut(&channel).expect("checked");
         let implicit = link::implicit_routing_type(&s.server, &address);
         s.server
@@ -3239,6 +3289,11 @@ impl Conn {
             handle,
             Link::Receiver(ReceiverLink {
                 last_address: None,
+                id: next_link_id(),
+                flow_waiting: false,
+                quiesce: None,
+                last_policy: None,
+                clashed: false,
                 name: link.attach.name.clone().into(),
                 target: Arc::new(ReceiverTarget {
                     address: Some(address),
@@ -3247,7 +3302,7 @@ impl Conn {
                     dynamic: false,
                 }),
                 source: link.attach.source.clone().map(Arc::new),
-                credit: credits,
+                credit: 0,
                 delivery_count,
                 incoming: None,
                 dynamic_expiry: TerminusExpiryPolicy::SessionEnd,
@@ -3257,9 +3312,7 @@ impl Conn {
             }),
         );
         if opened {
-            let s = &self.sessions[&channel];
-            let flow = self.link_flow(s, handle, delivery_count, credits, false);
-            self.send(channel, Performative::Flow(flow));
+            self.top_up(channel, handle);
         }
         c.attached(opened);
     }
@@ -3787,7 +3840,12 @@ impl Conn {
                     tx.clone(),
                     now,
                     large_at,
-                    &mut rl.last_address,
+                    incoming.settled,
+                    &mut Anonymous {
+                        address: &mut rl.last_address,
+                        policy: &mut rl.last_policy,
+                        clashed: &mut rl.clashed,
+                    },
                 )
                 .await;
                 s.server.set_sender(None);
@@ -3795,14 +3853,32 @@ impl Conn {
             }
         };
         let wait = s.server.take_completion();
-        rl_topup(
-            s,
-            handle,
-            self.settings.credits,
-            self.settings.low_credits,
-            &self.out,
-            channel,
-        );
+        if let Err(e) = &result
+            && !matches!(mode, ReceiveMode::Mirror(_))
+        {
+            // actualDelivery's and inSessionSend's logger.warn
+            if !e.message.starts_with(MISSING_TO) {
+                tracing::warn!("{}", e.message);
+            }
+            if e.kind == ErrorType::AddressFull {
+                self.drain_on_full(channel, handle);
+            }
+        }
+        if matches!(mode, ReceiveMode::Mirror(_)) {
+            // AMQPMirrorControllerTarget.doCreditTopUpRun: no address to
+            // wait for.
+            let s = self.sessions.get_mut(&channel).expect("checked");
+            rl_topup(
+                s,
+                handle,
+                self.settings.credits,
+                self.settings.low_credits,
+                &self.out,
+                channel,
+            );
+        } else {
+            self.top_up(channel, handle);
+        }
         self.check_stopped(channel, handle);
         if incoming.settled {
             return Ok(());
@@ -4100,6 +4176,169 @@ impl Conn {
                 self.federation_failed(message);
                 Ok(())
             }
+            Event::TopUp {
+                channel,
+                handle,
+                id,
+            } => {
+                let (credits, low) = (self.settings.credits, self.settings.low_credits);
+                if let Some(s) = self.sessions.get_mut(&channel)
+                    && let Some(Link::Receiver(rl)) = s.links.get_mut(&handle)
+                    && rl.id == id
+                {
+                    rl.flow_waiting = false;
+                    rl_topup(s, handle, credits, low, &self.out, channel);
+                }
+                Ok(())
+            }
+            Event::Quiesce {
+                channel,
+                handle,
+                id,
+            } => {
+                self.quiesce_timed_out(channel, handle, id).await;
+                Ok(())
+            }
+        }
+    }
+
+    /// `topUpCreditIfNeeded` and `doCreditTopUpRun`: a started receiver
+    /// low on credit is topped up once its address has room
+    /// (`AMQPSessionCallback.flow`): an anonymous relay's last address, or
+    /// before it sent, the broker's memory (its disk when `#` pages).
+    fn top_up(&mut self, channel: u16, handle: u32) {
+        let (credits, low) = (self.settings.credits, self.settings.low_credits);
+        let Some(s) = self.sessions.get_mut(&channel) else {
+            return;
+        };
+        let Some(Link::Receiver(rl)) = s.links.get_mut(&handle) else {
+            return;
+        };
+        if rl.state != ReceiverState::Started || rl.flow_waiting {
+            return;
+        }
+        // Nothing the credit runnable would grant: no need to ask.
+        let (window, window_low) = rl.window.unwrap_or((credits, low));
+        let (window, window_low) = (window.max(0) as u32, window_low.max(0) as u32);
+        if rl.credit > window_low || window <= rl.credit {
+            return;
+        }
+        let address: Option<String> = match &rl.target.address {
+            Some(a) => Some(a.clone()),
+            None => rl.last_address.as_ref().map(|a| a.to_string_lossy()),
+        };
+        let gate = Gate::default();
+        let grant = gate.grant(
+            self.events.clone(),
+            Event::TopUp {
+                channel,
+                handle,
+                id: rl.id,
+            },
+        );
+        let broker = &self.broker;
+        match address {
+            None => {
+                let paging = broker.post_office().paging();
+                if broker.post_office().settings("#").address_full_policy
+                    == saranga_server::settings::AddressFullPolicy::Page
+                {
+                    paging.check_storage(grant);
+                } else {
+                    paging.check_memory(grant);
+                }
+            }
+            Some(a) => match broker.page_store(&a) {
+                Some(store) => {
+                    store.check_memory(true, grant, None, Some(s.server.blocked_runnables()));
+                }
+                None => grant(),
+            },
+        }
+        if gate.now() {
+            rl_topup(s, handle, credits, low, &self.out, channel);
+        } else if let Some(Link::Receiver(rl)) = s.links.get_mut(&handle) {
+            rl.flow_waiting = true;
+        }
+    }
+
+    /// `deliveryFailed` on an address-full failure: a started receiver
+    /// with credit drains it, and starts again once drained.
+    fn drain_on_full(&mut self, channel: u16, handle: u32) {
+        let fallback = (
+            self.settings.drain_on_transient_delivery_errors,
+            self.settings.link_quiesce_timeout,
+        );
+        let Some(s) = self.sessions.get_mut(&channel) else {
+            return;
+        };
+        let Some(Link::Receiver(rl)) = s.links.get_mut(&handle) else {
+            return;
+        };
+        let (drain, timeout) = match &rl.mode {
+            ReceiveMode::Managed(c) => (
+                c.drain_on_transient_delivery_errors(),
+                c.link_quiesce_timeout(),
+            ),
+            _ => fallback,
+        };
+        if !drain || rl.state != ReceiverState::Started || rl.credit == 0 {
+            return;
+        }
+        rl.state = ReceiverState::Draining;
+        let (count, credit, id) = (rl.delivery_count, rl.credit, rl.id);
+        if timeout > 0 {
+            rl.quiesce = Some(quiesce_timer(&self.events, channel, handle, id, timeout));
+        }
+        let s = &self.sessions[&channel];
+        let flow = self.link_flow(s, handle, count, credit, true);
+        self.send(channel, Performative::Flow(flow));
+    }
+
+    /// The drain's timeout: a stopping receiver reports its stop failed;
+    /// any other is closed with `detach-forced`.
+    async fn quiesce_timed_out(&mut self, channel: u16, handle: u32, id: u64) {
+        let Some(s) = self.sessions.get_mut(&channel) else {
+            return;
+        };
+        let Some(Link::Receiver(rl)) = s.links.get_mut(&handle) else {
+            return;
+        };
+        if rl.id != id || rl.quiesce.take().is_none() {
+            return;
+        }
+        match rl.state {
+            ReceiverState::Stopping => {
+                if let ReceiveMode::Managed(c) = &rl.mode {
+                    c.stopped(false);
+                }
+            }
+            ReceiverState::Draining => {
+                let error = Error::new(
+                    condition::DETACH_FORCED,
+                    Some("Timed out waiting for remote sender to drain".into()),
+                );
+                let mut s = self.sessions.remove(&channel).expect("found");
+                if let Some(l) = s.links.remove(&handle) {
+                    if let Link::Receiver(rl) = &l
+                        && let ReceiveMode::Managed(c) = &rl.mode
+                    {
+                        c.remote_closed(Some(&error));
+                    }
+                    self.close_link(&mut s, l, false).await;
+                    s.detaching.insert(handle);
+                    self.send(
+                        channel,
+                        Performative::Detach(Detach {
+                            handle,
+                            closed: true,
+                            error: Some(error),
+                        }),
+                    );
+                }
+                self.sessions.insert(channel, s);
+            }
+            _ => {}
         }
     }
 
@@ -4176,12 +4415,23 @@ impl Conn {
                 let Some(Link::Receiver(rl)) = s.links.get_mut(&handle) else {
                     return;
                 };
-                if rl.state != ReceiverState::Started {
-                    return;
-                }
+                let draining = match rl.state {
+                    ReceiverState::Started => false,
+                    ReceiverState::Draining => true,
+                    _ => return,
+                };
                 rl.state = ReceiverState::Stopping;
-                // receiver.drain(0): what credit there is, drained.
-                if rl.credit > 0 {
+                // A stop with its own timeout takes over a drain's.
+                if draining
+                    && let ReceiveMode::Managed(c) = &rl.mode
+                    && c.stop_timeout() > 0
+                    && let Some(t) = rl.quiesce.take()
+                {
+                    t.abort();
+                }
+                // receiver.drain(0): what credit there is, drained, unless
+                // it is draining already.
+                if rl.credit > 0 && !draining {
                     let (count, credit) = (rl.delivery_count, rl.credit);
                     let s = &self.sessions[&channel];
                     let flow = self.link_flow(s, handle, count, credit, true);
@@ -4198,14 +4448,7 @@ impl Conn {
                     return;
                 }
                 rl.state = ReceiverState::Started;
-                rl_topup(
-                    s,
-                    handle,
-                    self.settings.credits,
-                    self.settings.low_credits,
-                    &self.out,
-                    channel,
-                );
+                self.top_up(channel, handle);
             }
             LinkOp::Close => {
                 let mut s = self.sessions.remove(&channel).expect("found");
@@ -4235,11 +4478,27 @@ impl Conn {
         let Some(Link::Receiver(rl)) = s.links.get_mut(&handle) else {
             return;
         };
-        if rl.state == ReceiverState::Stopping && rl.credit == 0 && rl.incoming.is_none() {
-            rl.state = ReceiverState::Stopped;
-            if let ReceiveMode::Managed(c) = &rl.mode {
-                c.stopped(true);
+        if rl.credit != 0 || rl.incoming.is_some() {
+            return;
+        }
+        match rl.state {
+            ReceiverState::Stopping => {
+                rl.state = ReceiverState::Stopped;
+                if let Some(t) = rl.quiesce.take() {
+                    t.abort();
+                }
+                if let ReceiveMode::Managed(c) = &rl.mode {
+                    c.stopped(true);
+                }
             }
+            ReceiverState::Draining => {
+                rl.state = ReceiverState::Started;
+                if let Some(t) = rl.quiesce.take() {
+                    t.abort();
+                }
+                self.top_up(channel, handle);
+            }
+            _ => {}
         }
     }
 
@@ -4546,7 +4805,8 @@ async fn server_send(
     tx: Option<saranga_server::transaction::TxRef>,
     now: i64,
     large_at: usize,
-    last_address: &mut Option<SimpleString>,
+    settled: bool,
+    anonymous: &mut Anonymous<'_>,
 ) -> Result<(), BrokerError> {
     // At amqpMinLargeMessageSize the message goes to a file of its own.
     let large = large_at > 0 && payload.len() >= large_at;
@@ -4558,13 +4818,13 @@ async fn server_send(
         None => match msg.address() {
             Some(a) => a.to_string_lossy().into(),
             None => {
-                return Err(BrokerError::new(
-                    ErrorType::InternalError,
-                    "Missing 'to' field for message sent to an anonymous producer",
-                ));
+                return Err(BrokerError::new(ErrorType::InternalError, MISSING_TO));
             }
         },
     };
+    if target.address.is_none() {
+        validate_anonymous_address(server, &address, anonymous);
+    }
     // deduceRoutingType
     let routing = match target.explicit {
         Some(t) => Some(t),
@@ -4597,6 +4857,29 @@ async fn server_send(
         }
         return Err(e);
     }
+    // isRejectingMessages: past the address's reject threshold, a settled
+    // message is dropped and its transaction rolled back, any other
+    // refused.
+    if server
+        .broker()
+        .page_store(&address)
+        .is_some_and(|s| s.is_rejecting_messages())
+    {
+        let e = BrokerError::new(
+            ErrorType::AddressFull,
+            format!(
+                "Address is full: {}",
+                target.address.as_deref().unwrap_or("null")
+            ),
+        );
+        if !settled {
+            return Err(e);
+        }
+        if let Some(tx) = &tx {
+            saranga_server::transaction::lock(tx).mark_rollback_only(&e);
+        }
+        return Ok(());
+    }
     msg.set_connection_id(container);
     let body = match file {
         Some(bytes) => {
@@ -4620,15 +4903,132 @@ async fn server_send(
     if msg.message_id() == 0 {
         msg.set_message_id(server.broker().post_office().ids().next());
     }
-    let to = match last_address {
+    let to = match anonymous.address.as_ref() {
         Some(a) if a.eq_str(&address) => a.clone(),
-        _ => last_address.insert(SimpleString::from(&*address)).clone(),
+        _ => anonymous
+            .address
+            .insert(SimpleString::from(&*address))
+            .clone(),
     };
     msg.route_to(to);
     let native = AmqpNative::arc(msg);
     server
         .send_native_large_to(native, body, tx, Some(&address), routing)
         .await
+}
+
+/// What `serverSend` asks of an anonymous relay's last address.
+const MISSING_TO: &str = "Missing 'to' field for message sent to an anonymous producer";
+
+/// A receiver's last address, and for an anonymous relay that address's
+/// policy and whether a clash was logged.
+struct Anonymous<'a> {
+    address: &'a mut Option<SimpleString>,
+    policy: &'a mut Option<saranga_server::settings::AddressFullPolicy>,
+    clashed: &'a mut bool,
+}
+
+/// `validateAddressOnAnonymousLink`: an anonymous relay sending to an
+/// address of another full policy than the last's is warned about once.
+fn validate_anonymous_address(server: &ServerSession, address: &str, a: &mut Anonymous<'_>) {
+    if a.address.as_ref().is_some_and(|l| l.eq_str(address)) {
+        return;
+    }
+    let current = server
+        .broker()
+        .page_store(address)
+        .map(|s| s.address_full_policy());
+    if let (Some(last), Some(current)) = (*a.policy, current)
+        && last != current
+        && !*a.clashed
+    {
+        *a.clashed = true;
+        tracing::warn!(
+            "AMQ111004: AddressFullPolicy clash on an anonymous producer between destinations {}(addressFullPolicy={}) and {}(addressFullPolicy={}). This could lead to semantic inconsistencies on your clients. Notice you could have other instances of this scenario however this message will only be logged once. log.debug output would show all instances of this event.",
+            a.address
+                .as_ref()
+                .map_or_else(|| "null".to_owned(), |l| l.to_string_lossy()),
+            policy_name(last),
+            address,
+            policy_name(current)
+        );
+    }
+    *a.address = Some(SimpleString::from(address));
+    *a.policy = current;
+}
+
+/// Tells the connection's task when a drain has taken `timeout`
+/// milliseconds.
+fn quiesce_timer(
+    events: &mpsc::UnboundedSender<Event>,
+    channel: u16,
+    handle: u32,
+    id: u64,
+    timeout: i32,
+) -> tokio::task::AbortHandle {
+    let events = events.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(timeout.max(0) as u64)).await;
+        let _ = events.send(Event::Quiesce {
+            channel,
+            handle,
+            id,
+        });
+    })
+    .abort_handle()
+}
+
+/// `AddressFullMessagePolicy.name()`.
+fn policy_name(p: saranga_server::settings::AddressFullPolicy) -> &'static str {
+    use saranga_server::settings::AddressFullPolicy as P;
+    match p {
+        P::Page => "PAGE",
+        P::Block => "BLOCK",
+        P::Fail => "FAIL",
+        P::Drop => "DROP",
+    }
+}
+
+/// `AtomicRunnable` for a credit top-up: run where the check grants it at
+/// once, else sent to the connection's task once there is room.
+#[derive(Clone, Default)]
+struct Gate(Arc<Mutex<GateState>>);
+
+#[derive(Default)]
+enum GateState {
+    #[default]
+    Checking,
+    Now,
+    Later,
+}
+
+impl Gate {
+    fn grant(
+        &self,
+        events: mpsc::UnboundedSender<Event>,
+        ev: Event,
+    ) -> saranga_server::paging::Grant {
+        let gate = self.clone();
+        Box::new(move || {
+            let mut st = lock(&gate.0);
+            if matches!(*st, GateState::Checking) {
+                *st = GateState::Now;
+            } else {
+                drop(st);
+                let _ = events.send(ev);
+            }
+        })
+    }
+
+    /// After the check: whether it granted at once.
+    fn now(&self) -> bool {
+        let mut st = lock(&self.0);
+        if matches!(*st, GateState::Now) {
+            return true;
+        }
+        *st = GateState::Later;
+        false
+    }
 }
 
 /// Adds a transfer to the delivery it continues, or starts one; the

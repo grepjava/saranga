@@ -135,7 +135,10 @@ impl Configuration {
     }
 
     pub fn link_quiesce_timeout(&self) -> i32 {
-        self.int(RECEIVER_LINK_QUIESCE_TIMEOUT, DEFAULT_LINK_QUIESCE_TIMEOUT)
+        self.int(
+            RECEIVER_LINK_QUIESCE_TIMEOUT,
+            self.settings.link_quiesce_timeout,
+        )
     }
 
     /// `toConfigurationMap`: what the control link tells the target, in
@@ -299,6 +302,20 @@ impl ConsumerConfiguration {
         self.flag(
             USE_MODIFIED_FOR_TRANSIENT_DELIVERY_ERRORS,
             self.base.use_modified_for_transient_delivery_errors(),
+        )
+    }
+
+    pub fn drain_on_transient_delivery_errors(&self) -> bool {
+        self.flag(
+            RECEIVER_DRAIN_ON_TRANSIENT_DELIVERY_ERRORS,
+            self.base.drain_on_transient_delivery_errors(),
+        )
+    }
+
+    pub fn link_quiesce_timeout(&self) -> i32 {
+        self.int(
+            RECEIVER_LINK_QUIESCE_TIMEOUT,
+            self.base.link_quiesce_timeout(),
         )
     }
 }

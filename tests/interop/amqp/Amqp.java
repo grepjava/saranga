@@ -812,4 +812,105 @@ public class Amqp {
             eq("AMQP\u0000\u0001\u0000\u0000", text(header), "AMQP header");
         }
     }
+
+    // ------------------------------------------------------------ full addresses
+
+    static final String PAD = "x".repeat(1000);
+
+    static void takeInOrder(Connection c, String q, int n) throws JMSException {
+        try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+            MessageConsumer mc = s.createConsumer(s.createQueue(q));
+            for (int i = 0; i < n; i++) {
+                Message m = mc.receive(10000);
+                check(m != null, "message " + i);
+                eq(i, m.getIntProperty("i"), "in order");
+            }
+            none(mc);
+        }
+    }
+
+    /** Sends until a send fails or 300 are sent; the count and the failure. */
+    static Object[] sendUntilFailure(Connection c, String q) throws JMSException {
+        int sent = 0;
+        JMSException failed = null;
+        try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+            MessageProducer p = s.createProducer(s.createQueue(q));
+            for (int i = 0; i < 300 && failed == null; i++) {
+                TextMessage m = s.createTextMessage(i + "-" + PAD);
+                m.setIntProperty("i", i);
+                try {
+                    p.send(m);
+                    sent++;
+                } catch (JMSException e) {
+                    failed = e;
+                }
+            }
+        }
+        return new Object[] {sent, failed};
+    }
+
+    // A full BLOCK address gives its producers no more link credit until it
+    // has room (AMQPSessionCallback.flow): past the 1000 credits it starts
+    // with, the producer waits.
+    static void t_blockPolicy() throws Exception {
+        String q = unique("amqp.block.q");
+        try (Connection c = amqp()) {
+            java.util.concurrent.atomic.AtomicInteger sent = new java.util.concurrent.atomic.AtomicInteger();
+            java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+            Thread producer = new Thread(() -> {
+                try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                    MessageProducer p = s.createProducer(s.createQueue(q));
+                    for (int i = 0; i < 1500; i++) {
+                        TextMessage m = s.createTextMessage(i + "-" + PAD);
+                        m.setIntProperty("i", i);
+                        p.send(m);
+                        sent.incrementAndGet();
+                    }
+                } catch (Throwable e) {
+                    failure.set(e);
+                }
+            });
+            producer.start();
+            Thread.sleep(1500);
+            check(producer.isAlive(), "the producer is blocked");
+            check(sent.get() < 1500, "not everything was sent: " + sent.get());
+            takeInOrder(c, q, 1500);
+            producer.join(10000);
+            check(failure.get() == null, "producer failed: " + failure.get());
+            eq(1500, sent.get(), "all sent once unblocked");
+        }
+    }
+
+    // A full FAIL address rejects with resource-limit-exceeded; the link's
+    // credit is drained and comes back once the address has room.
+    static void t_failPolicy() throws Exception {
+        String q = unique("amqp.fail.q");
+        try (Connection c = amqp()) {
+            Object[] r = sendUntilFailure(c, q);
+            int sent = (Integer) r[0];
+            JMSException failed = (JMSException) r[1];
+            check(failed instanceof ResourceAllocationException, "a send failed: " + failed);
+            eq("AMQ229102: Address \"" + q + "\" is full. [condition = amqp:resource-limit-exceeded]", failed.getMessage(), "the failure");
+            check(sent > 10 && sent < 300, "sends before the address was full: " + sent);
+            takeInOrder(c, q, sent);
+            Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            s.createProducer(s.createQueue(q)).send(s.createTextMessage("again"));
+            eq("again", ((TextMessage) receive(s.createConsumer(s.createQueue(q)))).getText(), "sent after draining");
+        }
+    }
+
+    // Past max-size-bytes-reject-threshold a BLOCK address rejects sends
+    // (isRejectingMessages).
+    static void t_rejectThreshold() throws Exception {
+        String q = unique("amqp.reject.q");
+        try (Connection c = amqp()) {
+            Object[] r = sendUntilFailure(c, q);
+            int sent = (Integer) r[0];
+            JMSException failed = (JMSException) r[1];
+            check(failed instanceof ResourceAllocationException, "a send failed: " + failed);
+            eq("Address is full: " + q + " [condition = amqp:resource-limit-exceeded]", failed.getMessage(), "the failure");
+            check(sent > 10 && sent < 300, "sends before the threshold: " + sent);
+            takeInOrder(c, q, sent);
+        }
+    }
 }

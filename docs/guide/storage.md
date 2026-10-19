@@ -42,7 +42,7 @@ Never delete `server.lock` to move an instance between brokers: it holds the nod
 Paging works as in Artemis. Each address has a size limit (`max-size-bytes`, `max-size-messages`, and the broker-wide `global-max-size` and `global-max-messages`), and `address-full-policy` says what happens at the limit:
 
 - `PAGE` (the default) writes new messages to the address's page files, and queues read them back as they consume.
-- `BLOCK` gives producers no more credit until there is room.
+- `BLOCK` holds producers back until there is room: Core producers get no more credit, AMQP links no more link credit, and OpenWire sends wait or the connection stops being read, as on Artemis. With `max-size-bytes-reject-threshold`, AMQP sends past it are rejected. An address blocked through management (`block`) refuses Core producers' credit as `FAIL` does.
 - `FAIL` fails the send.
 - `DROP` drops the message.
 

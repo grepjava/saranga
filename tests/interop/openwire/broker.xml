@@ -19,6 +19,14 @@
             <auto-create-queues>false</auto-create-queues>
             <auto-create-addresses>false</auto-create-addresses>
          </address-setting>
+         <address-setting match="ow.block.#">
+            <max-size-bytes>200K</max-size-bytes>
+            <address-full-policy>BLOCK</address-full-policy>
+         </address-setting>
+         <address-setting match="ow.fail.#">
+            <max-size-bytes>200K</max-size-bytes>
+            <address-full-policy>FAIL</address-full-policy>
+         </address-setting>
          <address-setting match="redeliver.#">
             <dead-letter-address>DLQ</dead-letter-address>
             <max-delivery-attempts>3</max-delivery-attempts>

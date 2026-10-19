@@ -92,6 +92,10 @@ impl OwError {
         Self::new("java.io.IOException", message)
     }
 
+    fn resource_allocation(message: impl Into<String>) -> Self {
+        Self::new("javax.jms.ResourceAllocationException", message)
+    }
+
     fn is_invalid_destination(&self) -> bool {
         self.class == "javax.jms.InvalidDestinationException"
     }
@@ -312,6 +316,73 @@ enum Event {
         pending: AckPending,
         result: AckResult,
     },
+    /// An address that held producers' messages back has room: those
+    /// released are sent (`sendShouldBlockProducer`'s task).
+    Released,
+    /// An address that stopped the connection's reads has room
+    /// (`restoreAutoRead`).
+    RestoreAutoRead,
+}
+
+/// A message a full address held back, sent once it has room.
+struct BlockedSend {
+    session: SessionId,
+    message: CoreMessage,
+    tx: Option<TxRef>,
+    sender: Arc<str>,
+    /// Its send in [`Connection::producer_sends`].
+    send: u64,
+}
+
+/// A producer's send waiting for its destinations to take it: the last
+/// to answers the producer (`count`).
+struct ProducerSend {
+    remaining: usize,
+    command_id: i32,
+    /// A `ProducerAck` of `size` answers it, else a `Response`.
+    ack: Option<(ProducerId, i32)>,
+}
+
+/// Runs a grant where the check grants it at once, else sends `event` to
+/// the connection's task once there is room.
+#[derive(Clone, Default)]
+struct Gate(Arc<Mutex<GateState>>);
+
+#[derive(Default)]
+enum GateState {
+    #[default]
+    Checking,
+    Now,
+    Later,
+}
+
+impl Gate {
+    fn grant(
+        &self,
+        events: mpsc::UnboundedSender<Event>,
+        ev: Event,
+    ) -> saranga_server::paging::Grant {
+        let gate = self.clone();
+        Box::new(move || {
+            let mut st = lock(&gate.0);
+            if matches!(*st, GateState::Checking) {
+                *st = GateState::Now;
+            } else {
+                drop(st);
+                let _ = events.send(ev);
+            }
+        })
+    }
+
+    /// After the check: whether it granted at once.
+    fn now(&self) -> bool {
+        let mut st = lock(&self.0);
+        if matches!(*st, GateState::Now) {
+            return true;
+        }
+        *st = GateState::Later;
+        false
+    }
 }
 
 // ---------------------------------------------------------------- naming
@@ -552,6 +623,19 @@ struct Connection {
     no_local: Arc<AtomicBool>,
     dont_send_response: bool,
     destroyed: bool,
+    /// The socket is read (`autoRead`): a full address under BLOCK stops
+    /// the reads of a producer that does not wait for answers.
+    auto_read: bool,
+    /// The command being handled (`lastCommand`).
+    handling: Option<i32>,
+    /// The TTL is not checked while reads are stopped (`disableTtl`).
+    ttl_disabled: bool,
+    /// Sends held back by full addresses, by key.
+    producer_sends: HashMap<u64, ProducerSend>,
+    /// Those released, to be sent before anything the client sends after
+    /// (Artemis sends them as they are released).
+    released: Arc<Mutex<std::collections::VecDeque<BlockedSend>>>,
+    next_producer_send: u64,
     // keep-alive
     use_keep_alive: bool,
     max_inactivity: i64,
@@ -615,6 +699,12 @@ pub async fn serve(broker: Arc<Broker>, manager: Arc<Manager>, c: Accepted) {
         no_local: Arc::new(AtomicBool::new(false)),
         dont_send_response: false,
         destroyed: false,
+        auto_read: true,
+        handling: None,
+        ttl_disabled: false,
+        producer_sends: HashMap::new(),
+        released: Arc::default(),
+        next_producer_send: 0,
         use_keep_alive: settings.use_keep_alive,
         max_inactivity: settings.max_inactivity_duration,
         ttl: None,
@@ -635,6 +725,8 @@ pub async fn serve(broker: Arc<Broker>, manager: Arc<Manager>, c: Accepted) {
             event = events_rx.recv() => match event {
                 Some(Event::Stop) | None => break,
                 Some(Event::Acked { session, pending, result }) => conn.acked(&session, pending, result),
+                Some(Event::Released) => conn.send_released().await,
+                Some(Event::RestoreAutoRead) => conn.restore_auto_read(),
             },
             _ = tick.tick() => {
                 if !conn.check_ttl() {
@@ -642,7 +734,7 @@ pub async fn serve(broker: Arc<Broker>, manager: Arc<Manager>, c: Accepted) {
                 }
                 conn.check_inactivity();
             },
-            read = rd.read_buf(&mut buf) => match read {
+            read = rd.read_buf(&mut buf), if conn.auto_read => match read {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
                     conn.data_received = true;
@@ -844,9 +936,15 @@ impl Connection {
         if matches!(command, DataStructure::KeepAliveInfo(_)) {
             return true;
         }
+        // What was released before this command came is sent before it.
+        self.send_released().await;
         let is_connection_info = matches!(command, DataStructure::ConnectionInfo(_));
         let class = command.class_name();
-        let handled = match self.visit(command, command_id, response_required).await {
+        // setLastCommand
+        self.handling = Some(command_id);
+        let visited = self.visit(command, command_id, response_required).await;
+        self.handling = None;
+        let handled = match visited {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!("Errors occurred during the buffering operation of {class}: {e:?}");
@@ -1115,6 +1213,9 @@ impl Connection {
         let (Some(ttl), Some(from)) = (self.ttl, self.ttl_from) else {
             return true;
         };
+        if self.ttl_disabled {
+            return true;
+        }
         let now = Instant::now();
         if now < from {
             self.data_received = false;
@@ -1278,6 +1379,7 @@ impl Connection {
 
     /// The transport closed or failed (`fail`, `doFail`).
     async fn fail(&mut self) {
+        self.send_released().await;
         if self.info.is_some() {
             let client_id = self.client_id();
             self.manager
@@ -1714,8 +1816,22 @@ impl Connection {
         if should_block {
             self.dont_send_response = true;
         }
+        let sender: Arc<str> = convert::producer_id_string(&pid).into();
+        // The destinations still to take it (`count`), the last of which
+        // answers the producer.
+        let key = self.next_producer_send;
+        self.next_producer_send += 1;
+        if should_block {
+            self.producer_sends.insert(
+                key,
+                ProducerSend {
+                    remaining: targets.len(),
+                    command_id,
+                    ack: send_producer_ack.then(|| (pid.clone(), message_size(&msg) as i32)),
+                },
+            );
+        }
         let last = targets.len() - 1;
-        let mut failure = None;
         for (i, target) in targets.iter().enumerate() {
             let address = target.physical_name();
             let mut m = if i == last {
@@ -1725,44 +1841,173 @@ impl Connection {
             };
             m.address = Some(address.as_str().into());
             if target.is_queue() {
-                self.check_cached_existing_queue(&sid, &address, target.is_temporary())?;
+                if let Err(e) =
+                    self.check_cached_existing_queue(&sid, &address, target.is_temporary())
+                {
+                    self.producer_sends.remove(&key);
+                    return Err(e);
+                }
                 set_routing_type(&mut m, RoutingType::Anycast);
             } else {
                 set_routing_type(&mut m, RoutingType::Multicast);
             }
-            let session = self.sessions.get_mut(&sid).expect("checked");
-            session
-                .session
-                .set_sender(Some(convert::producer_id_string(&pid).into()));
-            let result = session.session.send_in(m, None, tx.clone()).await;
-            session.session.set_sender(None);
-            if let Err(e) = result {
-                if !should_block {
-                    return Err(e.into());
+            let store = self.broker.page_store(&address);
+            if should_block {
+                // sendShouldBlockProducer
+                let task = BlockedSend {
+                    session: sid.clone(),
+                    message: m,
+                    tx: tx.clone(),
+                    sender: sender.clone(),
+                    send: key,
+                };
+                match store {
+                    None => self.blocked_send(task).await,
+                    Some(store) => {
+                        let gate = Gate::default();
+                        let slot = Arc::new(Mutex::new(Some(task)));
+                        let grant = {
+                            let slot = slot.clone();
+                            let events = self.events.clone();
+                            let released = self.released.clone();
+                            let gate = gate.clone();
+                            Box::new(move || {
+                                let mut st = lock(&gate.0);
+                                if matches!(*st, GateState::Checking) {
+                                    *st = GateState::Now;
+                                } else {
+                                    drop(st);
+                                    if let Some(t) = lock(&slot).take() {
+                                        lock(&released).push_back(t);
+                                        let _ = events.send(Event::Released);
+                                    }
+                                }
+                            }) as saranga_server::paging::Grant
+                        };
+                        let list = self
+                            .sessions
+                            .get(&sid)
+                            .map(|s| s.session.blocked_runnables().clone());
+                        let granted = store.check_memory(false, grant, None, list.as_deref());
+                        let now = gate.now();
+                        if !granted {
+                            self.dont_send_response = false;
+                            self.ttl_disabled = false;
+                            // Blocked through management, the message is
+                            // still sent once unblocked, and answered.
+                            if !store.is_blocked_via_management() {
+                                self.producer_sends.remove(&key);
+                            }
+                            return Err(OwError::resource_allocation(format!(
+                                "Queue is full {address}"
+                            )));
+                        }
+                        let task = if now { lock(&slot).take() } else { None };
+                        if let Some(t) = task {
+                            self.blocked_send(t).await;
+                        }
+                    }
                 }
-                failure = Some(OwError::from(e));
-            }
-        }
-        if should_block {
-            if let Some(e) = failure {
-                // The failed blocking send: the exception at once, then
-                // (as act() still does) a plain response.
-                self.dont_send_response = false;
-                self.send_exception(command_id, &e);
-                return Ok(());
-            }
-            let reply = if send_producer_ack {
-                DataStructure::ProducerAck(ProducerAck {
-                    producer_id: Some(pid),
-                    size: message_size(&msg) as i32,
-                    ..Default::default()
-                })
             } else {
-                response(command_id)
-            };
-            self.reply(Some(reply), None);
+                if let Some(store) = store {
+                    let gate = Gate::default();
+                    let grant = gate.grant(self.events.clone(), Event::RestoreAutoRead);
+                    let blocked = std::cell::Cell::new(false);
+                    let list = self
+                        .sessions
+                        .get(&sid)
+                        .map(|s| s.session.blocked_runnables().clone());
+                    let granted = store.check_memory(
+                        true,
+                        grant,
+                        Some(&|| blocked.set(true)),
+                        list.as_deref(),
+                    );
+                    // blockConnection, then restoreAutoRead if granted at
+                    // once.
+                    if blocked.get() {
+                        self.auto_read = false;
+                        self.ttl_disabled = true;
+                    }
+                    if gate.now() || !granted {
+                        self.restore_auto_read();
+                    }
+                    if !granted {
+                        return Err(OwError::resource_allocation(format!(
+                            "Queue is full {address}"
+                        )));
+                    }
+                } else {
+                    self.restore_auto_read();
+                }
+                let session = self.sessions.get_mut(&sid).expect("checked");
+                session.session.set_sender(Some(sender.clone()));
+                let result = session.session.send_in(m, None, tx.clone()).await;
+                session.session.set_sender(None);
+                result?;
+            }
         }
         Ok(())
+    }
+
+    /// Sends what full addresses released, in the order released.
+    async fn send_released(&mut self) {
+        loop {
+            let next = lock(&self.released).pop_front();
+            let Some(t) = next else { break };
+            self.blocked_send(t).await;
+        }
+    }
+
+    /// `restoreAutoRead`: the socket is read again, and the TTL checked.
+    fn restore_auto_read(&mut self) {
+        if !self.auto_read {
+            self.auto_read = true;
+            self.ttl_disabled = false;
+        }
+    }
+
+    /// `sendShouldBlockProducer`'s task: the message is sent, and the last
+    /// of its destinations answers the producer, with this send's error if
+    /// it failed, else a `ProducerAck` or `Response` once it is written.
+    async fn blocked_send(&mut self, t: BlockedSend) {
+        let result = match self.sessions.get_mut(&t.session) {
+            Some(session) => {
+                session.session.set_sender(Some(t.sender));
+                let r = session.session.send_in(t.message, None, t.tx).await;
+                session.session.set_sender(None);
+                r.map_err(OwError::from)
+            }
+            None => Err(OwError::npe()),
+        };
+        self.ttl_disabled = false;
+        let Some(ps) = self.producer_sends.get_mut(&t.send) else {
+            return;
+        };
+        ps.remaining -= 1;
+        if ps.remaining > 0 {
+            return;
+        }
+        let ps = self.producer_sends.remove(&t.send).expect("present");
+        match result {
+            Err(e) => {
+                self.dont_send_response = false;
+                // sendException: the command being handled, if any.
+                let correlation = self.handling.unwrap_or(0);
+                self.send_exception(correlation, &e);
+            }
+            Ok(()) => {
+                let reply = match ps.ack {
+                    Some((producer_id, size)) => DataStructure::ProducerAck(ProducerAck {
+                        producer_id: Some(producer_id),
+                        size,
+                        ..Default::default()
+                    }),
+                    None => response(ps.command_id),
+                };
+                self.reply(Some(reply), None);
+            }
+        }
     }
 
     /// `checkCachedExistingQueues`.

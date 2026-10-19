@@ -121,6 +121,9 @@ pub struct Receiver {
     pub credits: i32,
     pub credits_low: i32,
     pub use_modified: bool,
+    pub drain_on_errors: bool,
+    pub quiesce_timeout: i32,
+    pub stop_timeout: i32,
     pub large_threshold: i32,
     state: LinkState,
 }
@@ -154,6 +157,18 @@ impl ManagedReceiver for Receiver {
 
     fn use_modified(&self) -> bool {
         self.use_modified
+    }
+
+    fn drain_on_transient_delivery_errors(&self) -> bool {
+        self.drain_on_errors
+    }
+
+    fn link_quiesce_timeout(&self) -> i32 {
+        self.quiesce_timeout
+    }
+
+    fn stop_timeout(&self) -> i32 {
+        self.stop_timeout
     }
 
     fn large_threshold(&self) -> i32 {

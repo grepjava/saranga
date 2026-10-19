@@ -1364,4 +1364,184 @@ public class OpenWire {
             }
         }
     }
+
+    // ------------------------------------------------------------ full addresses
+
+    static final String PAD = "x".repeat(1000);
+
+    /** Sends 300 texts of about 1K to q on its own thread, counting them. */
+    static Thread producing(Connection c, String q, int mode, AtomicInteger sent, AtomicReference<Throwable> failure) {
+        Thread t = new Thread(() -> {
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                MessageProducer p = s.createProducer(s.createQueue(q));
+                p.setDeliveryMode(mode);
+                for (int i = 0; i < 300; i++) {
+                    TextMessage m = s.createTextMessage(i + "-" + PAD);
+                    m.setIntProperty("i", i);
+                    p.send(m);
+                    sent.incrementAndGet();
+                }
+            } catch (Throwable e) {
+                failure.set(e);
+            }
+        });
+        t.start();
+        return t;
+    }
+
+    /** Takes n messages from q in order. */
+    static void takeInOrder(Connection c, String q, int n) throws JMSException {
+        try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+            MessageConsumer mc = s.createConsumer(s.createQueue(q));
+            for (int i = 0; i < n; i++) {
+                Message m = mc.receive(10000);
+                check(m != null, "message " + i);
+                eq(i, m.getIntProperty("i"), "in order");
+            }
+            noMore(mc);
+        }
+    }
+
+    // A sync send to a full BLOCK address waits for room (sendShouldBlockProducer).
+    static void t_blockSyncSend() throws Exception {
+        String q = unique("ow.block.sync");
+        try (Connection c = cf().createConnection()) {
+            c.start();
+            AtomicInteger sent = new AtomicInteger();
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            Thread producer = producing(c, q, DeliveryMode.PERSISTENT, sent, failure);
+            Thread.sleep(1500);
+            check(producer.isAlive(), "the producer is blocked");
+            check(sent.get() < 300, "not everything was sent: " + sent.get());
+            takeInOrder(c, q, 300);
+            producer.join(10000);
+            check(failure.get() == null, "producer failed: " + failure.get());
+            eq(300, sent.get(), "all sent once unblocked");
+        }
+    }
+
+    // Async sends with a producer window wait for their ProducerAcks, held
+    // back while the address is full. Those held back race the ones sent
+    // once there is room, so they may arrive out of order, as on Artemis,
+    // and are dropped if their session closes first (blockedRunnables), so
+    // the producer's session stays open until they are taken.
+    static void t_blockProducerWindow() throws Exception {
+        String q = unique("ow.block.window");
+        try (Connection c = cf("jms.producerWindowSize=65536").createConnection()) {
+            c.start();
+            AtomicInteger sent = new AtomicInteger();
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            CountDownLatch taken = new CountDownLatch(1);
+            Thread producer = new Thread(() -> {
+                try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                    MessageProducer p = s.createProducer(s.createQueue(q));
+                    p.setDeliveryMode(DeliveryMode.NON_PERSISTENT);
+                    for (int i = 0; i < 300; i++) {
+                        TextMessage m = s.createTextMessage(i + "-" + PAD);
+                        m.setIntProperty("i", i);
+                        p.send(m);
+                        sent.incrementAndGet();
+                    }
+                    taken.await(30, TimeUnit.SECONDS);
+                } catch (Throwable e) {
+                    failure.set(e);
+                }
+            });
+            producer.start();
+            Thread.sleep(1500);
+            check(producer.isAlive(), "the producer is blocked");
+            check(sent.get() < 300, "not everything was sent: " + sent.get());
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                MessageConsumer mc = s.createConsumer(s.createQueue(q));
+                Set<Integer> seen = new HashSet<>();
+                for (int i = 0; i < 300; i++) {
+                    Message m = mc.receive(10000);
+                    check(m != null, "message " + i);
+                    check(seen.add(m.getIntProperty("i")), "once each: " + m.getIntProperty("i"));
+                }
+                noMore(mc);
+                taken.countDown();
+            }
+            producer.join(10000);
+            check(failure.get() == null, "producer failed: " + failure.get());
+            eq(300, sent.get(), "all sent once unblocked");
+        }
+    }
+
+    // Async sends without a window are taken, but the connection is not read
+    // while the address is full: a sync send after them waits.
+    static void t_blockAsyncStopsReading() throws Exception {
+        String q = unique("ow.block.async");
+        String other = unique("ow.other");
+        try (Connection c = cf().createConnection()) {
+            c.start();
+            AtomicInteger sent = new AtomicInteger();
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            AtomicBoolean answered = new AtomicBoolean();
+            Thread producer = new Thread(() -> {
+                try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                    MessageProducer p = s.createProducer(s.createQueue(q));
+                    p.setDeliveryMode(DeliveryMode.NON_PERSISTENT);
+                    for (int i = 0; i < 300; i++) {
+                        TextMessage m = s.createTextMessage(i + "-" + PAD);
+                        m.setIntProperty("i", i);
+                        p.send(m);
+                        sent.incrementAndGet();
+                    }
+                    MessageProducer sync = s.createProducer(s.createQueue(other));
+                    sync.setDeliveryMode(DeliveryMode.PERSISTENT);
+                    sync.send(s.createTextMessage("after"));
+                    answered.set(true);
+                } catch (Throwable e) {
+                    failure.set(e);
+                }
+            });
+            producer.start();
+            Thread.sleep(1500);
+            check(failure.get() == null, "producer failed: " + failure.get());
+            check(!answered.get(), "the sync send after them waits");
+            try (Connection c2 = cf().createConnection()) {
+                c2.start();
+                takeInOrder(c2, q, 300);
+            }
+            producer.join(10000);
+            check(failure.get() == null, "producer failed: " + failure.get());
+            check(answered.get(), "the sync send was answered once the address had room");
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                eq("after", text(s.createConsumer(s.createQueue(other)).receive(5000)), "the sync send");
+            }
+        }
+    }
+
+    // A sync send to a full FAIL address fails with ResourceAllocationException.
+    static void t_failSyncSend() throws Exception {
+        String q = unique("ow.fail.sync");
+        try (Connection c = cf().createConnection()) {
+            c.start();
+            int sent = 0;
+            JMSException failed = null;
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                MessageProducer p = s.createProducer(s.createQueue(q));
+                p.setDeliveryMode(DeliveryMode.PERSISTENT);
+                for (int i = 0; i < 300 && failed == null; i++) {
+                    TextMessage m = s.createTextMessage(i + "-" + PAD);
+                    m.setIntProperty("i", i);
+                    try {
+                        p.send(m);
+                        sent++;
+                    } catch (JMSException e) {
+                        failed = e;
+                    }
+                }
+            }
+            check(failed instanceof ResourceAllocationException, "a send failed: " + failed);
+            eq("Queue is full " + q, failed.getMessage(), "the failure");
+            check(sent > 10 && sent < 300, "sends before the address was full: " + sent);
+            takeInOrder(c, q, sent);
+            try (Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+                s.createProducer(s.createQueue(q)).send(s.createTextMessage("again"));
+                eq("again", text(s.createConsumer(s.createQueue(q)).receive(5000)), "sent after draining");
+            }
+        }
+    }
 }

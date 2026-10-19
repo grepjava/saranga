@@ -57,6 +57,9 @@ pub struct Settings {
     pub use_modified_for_transient_delivery_errors: bool,
     /// `amqpDrainOnTransientDeliveryErrors`.
     pub drain_on_transient_delivery_errors: bool,
+    /// `amqpLinkQuiesceTimeout`: how long a receiver waits for the peer
+    /// to drain its credit, in milliseconds.
+    pub link_quiesce_timeout: i32,
     /// `amqpTreatRejectAsUnmodifiedDeliveryFailed`.
     pub treat_reject_as_unmodified_delivery_failed: bool,
     /// `maxFrameSize`.
@@ -97,6 +100,7 @@ impl Settings {
                 false,
             ),
             drain_on_transient_delivery_errors: flag("amqpDrainOnTransientDeliveryErrors", true),
+            link_quiesce_timeout: int("amqpLinkQuiesceTimeout", 600_000) as i32,
             treat_reject_as_unmodified_delivery_failed: flag(
                 "amqpTreatRejectAsUnmodifiedDeliveryFailed",
                 false,

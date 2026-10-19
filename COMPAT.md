@@ -132,7 +132,6 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
   - **SASL mechanisms:** SCRAM-SHA-256/512, GSSAPI, OAUTHBEARER and XOAUTH2. An acceptor's `saslMechanisms` that lists them gets outcome `sys` for them.
   - **Core-message tunnelling** (`AMQ_CORE_MESSAGE_TUNNELING`): Core messages always go out converted to AMQP.
   - **Connection routers and interceptors.**
-  - **Credit under an address-full policy:** credit is not withheld from producers to a full address under BLOCK. There is no reject threshold, no drain on transient errors, and no link quiesce timeout.
   - `maxTransfersPerDelivery`.
   - The `failover-server-list` connection property.
 - **Large messages:**
@@ -147,7 +146,6 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **Removal advisories** on connection close are sent for the temporary destinations the connection made. Artemis also sends them for the temporary subscription queues of its topic consumers, under `ActiveMQ.Advisory.TempQueue`.
 - **Dispatched properties** of messages that came from Core or the journal are marshalled in the order they were put, not in the order of a freshly decoded Java `HashMap`. Clients read them into a map.
 - **Not supported yet:**
-  - Address-full policies for OpenWire producers: BLOCK does not pause the connection's reads, and FAIL does not answer `ResourceAllocationException`.
   - The `ConsumerControl` that tells a client about `queue-prefetch` 0.
   - The slow-consumer advisory.
   - Marking advisory addresses and subscriptions internal (`suppressInternalManagementObjects`), and the DROP policy on advisory subscriptions.

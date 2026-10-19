@@ -167,6 +167,7 @@ fn resolve(s: &cfg::AddressSettings) -> AddressSettings {
             Some(cfg::DiskFullMessagePolicy::Block) | None => DiskFullPolicy::Block,
         },
         max_size_bytes: s.max_size_bytes(),
+        max_size_bytes_reject_threshold: s.max_size_bytes_reject_threshold(),
         max_size_messages: s.max_size_messages(),
         page_size_bytes: i64::from(s.page_size_bytes()),
         max_read_page_bytes: i64::from(s.max_read_page_bytes()),

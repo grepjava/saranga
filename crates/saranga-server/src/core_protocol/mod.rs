@@ -104,40 +104,39 @@ impl ConnShared {
 }
 
 /// `ServerSessionImpl.requestProducerCredits`: granted at once, or under
-/// BLOCK once a full address has room, or refused under FAIL.
+/// BLOCK once a full address has room; refused under FAIL or while the
+/// address is blocked through management, granted all the same once it
+/// has room. A grant waiting is cancelled with the session (`blocked`).
 pub(crate) fn producer_credits(
     broker: &Broker,
     conn: &Arc<ConnShared>,
     channel: i64,
     p: saranga_core_protocol::packets::session::SessionRequestProducerCreditsMessage,
+    blocked: &crate::paging::BlockedRunnables,
 ) {
     use saranga_core_protocol::packets::session::{
         SessionProducerCreditsFailMessage, SessionProducerCreditsMessage,
     };
     let raw = p.address.to_string_lossy();
     let addr = conn.client.strip_prefix(&raw).0;
-    let grant: Box<dyn FnOnce() + Send> = {
+    let grant: crate::paging::Grant = {
         let conn = conn.clone();
         let (credits, address) = (p.credits, p.address.clone());
         Box::new(move || conn.send(channel, SessionProducerCreditsMessage { credits, address }))
     };
-    // getPageStore: the management address has no store, so what is sent
-    // to it is never blocked.
-    let store_name = addr.split_once("::").map_or(addr, |(a, _)| a);
-    if store_name.starts_with(broker.management().address()) {
-        grant();
-    } else if let crate::paging::Credits::Failed = broker
-        .post_office()
-        .paging_store(addr)
-        .request_credits(grant)
-    {
-        conn.send(
-            channel,
-            SessionProducerCreditsFailMessage {
-                credits: p.credits,
-                address: p.address,
-            },
-        );
+    match broker.page_store(addr) {
+        None => grant(),
+        Some(store) => {
+            if !store.check_memory(true, grant, None, Some(blocked)) {
+                conn.send(
+                    channel,
+                    SessionProducerCreditsFailMessage {
+                        credits: p.credits,
+                        address: p.address,
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -443,6 +442,7 @@ const EARLY_CREDITS_BACKLOG: usize = 256 * 1024;
 struct SessionLink {
     tx: mpsc::UnboundedSender<SessionInput>,
     backlog: Arc<AtomicUsize>,
+    blocked: Arc<crate::paging::BlockedRunnables>,
 }
 
 struct Connection {
@@ -628,7 +628,13 @@ impl Connection {
                 // than its session handles what it sends.
                 if let Packet::SessionRequestProducerCreditsMessage(p) = packet {
                     if session.backlog.load(Ordering::Relaxed) <= EARLY_CREDITS_BACKLOG {
-                        producer_credits(&self.broker, &self.shared, channel_id, p);
+                        producer_credits(
+                            &self.broker,
+                            &self.shared,
+                            channel_id,
+                            p,
+                            &session.blocked,
+                        );
                         return Ok(());
                     }
                     return self.pass_to_session(
@@ -1079,12 +1085,19 @@ impl Connection {
         // and address (ActiveMQPacketHandler's AuditLogger thread locals).
         let context = crate::audit::Context::Connection(self.shared.client.clone());
         let backlog = Arc::new(AtomicUsize::new(0));
+        let blocked = session.blocked_runnables().clone();
         self.session_tasks.push(tokio::spawn(crate::audit::scoped(
             context,
             session.run(rx, backlog.clone()),
         )));
-        self.sessions
-            .insert(channel_id, SessionLink { tx, backlog });
+        self.sessions.insert(
+            channel_id,
+            SessionLink {
+                tx,
+                backlog,
+                blocked,
+            },
+        );
         self.shared.send(
             CHANNEL_SESSION,
             CreateSessionResponseMessage {

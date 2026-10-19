@@ -699,6 +699,9 @@ impl FromAddressManager {
             credits: config.receiver_credits(),
             credits_low: config.receiver_credits_low(),
             use_modified: config.is_use_modified_for_transient_delivery_errors(),
+            drain_on_errors: config.is_drain_on_transient_delivery_errors(),
+            quiesce_timeout: config.link_quiesce_timeout(),
+            stop_timeout: config.receiver_quiesce_timeout(),
             large_threshold: config.large_message_threshold(),
             state: LinkState::new(owner, address.to_owned()),
         });
@@ -1166,6 +1169,9 @@ impl FromQueueManager {
             credits,
             credits_low,
             use_modified: config.is_use_modified_for_transient_delivery_errors(),
+            drain_on_errors: config.is_drain_on_transient_delivery_errors(),
+            quiesce_timeout: config.link_quiesce_timeout(),
+            stop_timeout: config.receiver_quiesce_timeout(),
             large_threshold: config.large_message_threshold(),
             state: LinkState::new(owner, text.to_owned()),
         });

@@ -16,6 +16,19 @@
             <dead-letter-address>DLQ</dead-letter-address>
             <expiry-address>ExpiryQueue</expiry-address>
          </address-setting>
+         <address-setting match="amqp.block.#">
+            <max-size-bytes>200K</max-size-bytes>
+            <address-full-policy>BLOCK</address-full-policy>
+         </address-setting>
+         <address-setting match="amqp.fail.#">
+            <max-size-bytes>200K</max-size-bytes>
+            <address-full-policy>FAIL</address-full-policy>
+         </address-setting>
+         <address-setting match="amqp.reject.#">
+            <max-size-bytes>1M</max-size-bytes>
+            <max-size-bytes-reject-threshold>102400</max-size-bytes-reject-threshold>
+            <address-full-policy>BLOCK</address-full-policy>
+         </address-setting>
          <address-setting match="amqp.dlq.#">
             <dead-letter-address>DLQ</dead-letter-address>
             <expiry-address>ExpiryQueue</expiry-address>

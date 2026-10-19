@@ -307,7 +307,11 @@ impl CliLock {
 pub fn file_not_found(path: &Path, e: &std::io::Error) -> String {
     let reason = e.to_string();
     let reason = reason.split(" (os error").next().unwrap_or(&reason);
-    format!("{} ({})", java_file_path(path), reason.trim_end_matches('.'))
+    format!(
+        "{} ({})",
+        java_file_path(path),
+        reason.trim_end_matches('.')
+    )
 }
 
 /// `File.getPath`: the path as `java.io.File` normalizes it, with the

@@ -1303,6 +1303,17 @@ impl Broker {
         &self.post_office
     }
 
+    /// `PagingManager.getPageStore`: the address's store, created on first
+    /// use, but none for the management address, so that what is sent to
+    /// it is never held back. A fully qualified name is its address's.
+    pub fn page_store(&self, address: &str) -> Option<Arc<paging::PagingStore>> {
+        let name = address.split_once("::").map_or(address, |(a, _)| a);
+        if name.starts_with(self.management().address()) {
+            return None;
+        }
+        Some(self.post_office.paging_store(name))
+    }
+
     pub fn large_messages(&self) -> &Arc<large::LargeMessageStore> {
         &self.large_messages
     }

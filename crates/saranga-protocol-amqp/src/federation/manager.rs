@@ -16,7 +16,7 @@ use saranga_server::plugin::BrokerPlugin;
 use saranga_server::queue::ConsumerId;
 use saranga_server::registry::ConsumerEntry;
 
-use super::config::ConsumerConfiguration;
+use super::config::{ConsumerConfiguration, DEFAULT_LINK_QUIESCE_TIMEOUT};
 use super::constants::*;
 use super::policy::{AddressPolicy, QueuePolicy, address_filter, java_hash_order};
 use super::{Connection, FedLink, Federation, lock};
@@ -65,6 +65,9 @@ pub struct Consumer {
     pub credits: i32,
     pub credits_low: i32,
     pub use_modified: bool,
+    pub drain_on_errors: bool,
+    pub quiesce_timeout: i32,
+    pub stop_timeout: i32,
     pub large_threshold: i32,
     federation: Weak<Federation>,
     owner: Weak<dyn Owner>,
@@ -99,6 +102,18 @@ impl ManagedReceiver for Consumer {
 
     fn use_modified(&self) -> bool {
         self.use_modified
+    }
+
+    fn drain_on_transient_delivery_errors(&self) -> bool {
+        self.drain_on_errors
+    }
+
+    fn link_quiesce_timeout(&self) -> i32 {
+        self.quiesce_timeout
+    }
+
+    fn stop_timeout(&self) -> i32 {
+        self.stop_timeout
     }
 
     fn large_threshold(&self) -> i32 {
@@ -897,6 +912,10 @@ impl AddressManager {
             credits: config.map_or(1000, |c| c.receiver_credits()),
             credits_low: config.map_or(300, |c| c.receiver_credits_low()),
             use_modified: config.is_some_and(|c| c.use_modified_for_transient_delivery_errors()),
+            drain_on_errors: config.is_none_or(|c| c.drain_on_transient_delivery_errors()),
+            quiesce_timeout: config
+                .map_or(DEFAULT_LINK_QUIESCE_TIMEOUT, |c| c.link_quiesce_timeout()),
+            stop_timeout: config.map_or(0, |c| c.receiver_quiesce_timeout()),
             large_threshold: config.map_or(100 * 1024, |c| c.large_message_threshold()),
             federation: self.federation.clone(),
             owner,
@@ -1398,6 +1417,10 @@ impl QueueManager {
             credits: if credits > 0 { credits } else { 100 },
             credits_low: config.map_or(300, |c| c.receiver_credits_low()).max(0),
             use_modified: config.is_some_and(|c| c.use_modified_for_transient_delivery_errors()),
+            drain_on_errors: config.is_none_or(|c| c.drain_on_transient_delivery_errors()),
+            quiesce_timeout: config
+                .map_or(DEFAULT_LINK_QUIESCE_TIMEOUT, |c| c.link_quiesce_timeout()),
+            stop_timeout: config.map_or(0, |c| c.receiver_quiesce_timeout()),
             large_threshold: config.map_or(100 * 1024, |c| c.large_message_threshold()),
             federation: self.federation.clone(),
             owner,

@@ -569,6 +569,9 @@ pub struct ServerSession {
     mirroring: crate::mirror::Mirroring,
     /// The `sync` mirror waits the request so far lined up.
     replicated: Replicated,
+    /// Its grants waiting for an address to have room
+    /// (`blockedRunnables`), cancelled when it closes.
+    blocked: Arc<crate::paging::BlockedRunnables>,
 }
 
 /// What [`ServerSession::send_message`] sends besides the message.
@@ -635,6 +638,7 @@ impl ServerSession {
             entry,
             sender: None,
             last_address: None,
+            blocked: Arc::default(),
             name: options.name,
             auth: SecurityAuth {
                 username: options.username,
@@ -689,6 +693,7 @@ impl ServerSession {
             entry,
             sender: None,
             last_address: None,
+            blocked: Arc::default(),
             name: name.to_owned(),
             auth: SecurityAuth {
                 username: None,
@@ -837,6 +842,11 @@ impl ServerSession {
     /// What management sees of the session.
     pub fn entry(&self) -> &Arc<SessionEntry> {
         &self.entry
+    }
+
+    /// Its grants waiting for an address to have room (`blockedRunnables`).
+    pub fn blocked_runnables(&self) -> &Arc<crate::paging::BlockedRunnables> {
+        &self.blocked
     }
 
     /// `addProducer`: a producer the protocol names, to `address` or to
@@ -3045,6 +3055,7 @@ impl ServerSession {
             return;
         }
         self.closed = true;
+        self.blocked.cancel();
         let plugins = self.broker.post_office().plugins().clone();
         plugins.each(|p| p.before_close_session(&self.entry, failed));
         if failed {

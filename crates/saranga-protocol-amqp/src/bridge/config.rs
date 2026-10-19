@@ -96,6 +96,7 @@ impl Configuration {
             LARGE_MESSAGE_THRESHOLD => s.min_large_message_size as i64,
             LINK_ATTACH_TIMEOUT => i64::from(DEFAULT_LINK_ATTACH_TIMEOUT),
             RECEIVER_QUIESCE_TIMEOUT => i64::from(DEFAULT_RECEIVER_QUIESCE_TIMEOUT),
+            RECEIVER_LINK_QUIESCE_TIMEOUT => i64::from(s.link_quiesce_timeout),
             ADDRESS_RECEIVER_IDLE_TIMEOUT => i64::from(DEFAULT_ADDRESS_RECEIVER_IDLE_TIMEOUT),
             QUEUE_RECEIVER_IDLE_TIMEOUT => i64::from(DEFAULT_QUEUE_RECEIVER_IDLE_TIMEOUT),
             MAX_LINK_RECOVERY_ATTEMPTS => i64::from(DEFAULT_MAX_LINK_RECOVERY_ATTEMPTS),
@@ -226,6 +227,14 @@ impl LinkConfiguration {
 
     pub fn is_use_modified_for_transient_delivery_errors(&self) -> bool {
         self.flag(USE_MODIFIED_FOR_TRANSIENT_DELIVERY_ERRORS)
+    }
+
+    pub fn is_drain_on_transient_delivery_errors(&self) -> bool {
+        self.flag(RECEIVER_DRAIN_ON_TRANSIENT_DELIVERY_ERRORS)
+    }
+
+    pub fn link_quiesce_timeout(&self) -> i32 {
+        self.int(RECEIVER_LINK_QUIESCE_TIMEOUT) as i32
     }
 
     pub fn is_auto_delete_durable_subscriptions(&self) -> bool {

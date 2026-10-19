@@ -158,7 +158,7 @@ Clients need no change. They connect to the same acceptors on the same ports and
 
 A 1.x Artemis JMS client, which names queues `jms.queue.<name>` and topics `jms.topic.<name>`, works against an acceptor with those prefixes, as on Artemis (Phase 6 in [PHASES.md](https://github.com/grepjava/saranga/blob/main/PHASES.md#phase-6-config-and-security)).
 
-Messages sent with one protocol are received with another as on Artemis. The protocol features Saranga does not have yet are listed per protocol in COMPAT.md; the ones most likely to matter are the AMQP SASL mechanisms SCRAM, GSSAPI, OAUTHBEARER and XOAUTH2 ([AMQP differences](../../COMPAT.md#amqp-differences)), Core over HTTP and WebSocket compression ([WebSocket differences](../../COMPAT.md#websocket-differences)), and address-full policies for OpenWire producers ([OpenWire differences](../../COMPAT.md#openwire-differences)). See [protocols.md](protocols.md).
+Messages sent with one protocol are received with another as on Artemis. The protocol features Saranga does not have yet are listed per protocol in COMPAT.md; the ones most likely to matter are the AMQP SASL mechanisms SCRAM, GSSAPI, OAUTHBEARER and XOAUTH2 ([AMQP differences](../../COMPAT.md#amqp-differences)), and Core over HTTP and WebSocket compression ([WebSocket differences](../../COMPAT.md#websocket-differences)). See [protocols.md](protocols.md).
 
 A client that checks the broker's name sees Saranga's: the STOMP `server` header is `Saranga/<version>`, and the AMQP Open's `product` is `saranga`. Management's `getVersion` reports 2.57.0, so tools that check the version keep working.
 

@@ -73,6 +73,9 @@ pub struct AddressSettings {
     pub max_size_bytes: i64,
     /// `max-size-messages`; -1 for no limit.
     pub max_size_messages: i64,
+    /// `max-size-bytes-reject-threshold`: under BLOCK, AMQP sends past it
+    /// are refused; -1 for none.
+    pub max_size_bytes_reject_threshold: i64,
     /// `page-size-bytes`.
     pub page_size_bytes: i64,
     /// `max-read-page-bytes`: paged bytes a queue holds in memory.
@@ -203,6 +206,7 @@ impl Default for AddressSettings {
             disk_full_policy: DiskFullPolicy::Block,
             max_size_bytes: -1,
             max_size_messages: -1,
+            max_size_bytes_reject_threshold: -1,
             page_size_bytes: 10 * 1024 * 1024,
             max_read_page_bytes: 20 * 1024 * 1024,
             max_read_page_messages: -1,

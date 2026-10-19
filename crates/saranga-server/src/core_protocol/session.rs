@@ -272,6 +272,10 @@ impl CoreSession {
         self.session.entry()
     }
 
+    pub(crate) fn blocked_runnables(&self) -> &Arc<crate::paging::BlockedRunnables> {
+        self.session.blocked_runnables()
+    }
+
     /// Handles the session's packets; `backlog` counts the bytes of those
     /// read and not yet handled.
     pub(crate) async fn run(
@@ -605,7 +609,13 @@ impl CoreSession {
             Packet::SessionRequestProducerCreditsMessage(p) => {
                 // The connection answers these as it reads them; this is
                 // for any that reach the session all the same.
-                super::producer_credits(&self.broker, &self.conn, self.channel_id, p);
+                super::producer_credits(
+                    &self.broker,
+                    &self.conn,
+                    self.channel_id,
+                    p,
+                    self.session.blocked_runnables(),
+                );
                 (false, Ok(None), false)
             }
             Packet::SessionConsumerFlowCreditMessage(p) => {

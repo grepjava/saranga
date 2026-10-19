@@ -99,6 +99,8 @@ pub struct PagingManager {
     transactions: Mutex<HashMap<i64, Arc<PageTx>>>,
     /// Stores holding producers back until global memory is freed.
     blocked: Mutex<Vec<Weak<PagingStore>>>,
+    /// Grants waiting for global memory or the disk (`memoryCallback`).
+    memory_callbacks: Mutex<Vec<Grant>>,
     syncer: Mutex<Option<mpsc::Sender<SyncRequest>>>,
     /// Queues read their pages only once the cursors are recovered.
     loaded: AtomicBool,
@@ -138,6 +140,7 @@ impl PagingManager {
             stores: Mutex::default(),
             transactions: Mutex::default(),
             blocked: Mutex::default(),
+            memory_callbacks: Mutex::default(),
             syncer: Mutex::new(None),
             loaded: AtomicBool::new(false),
             replication: crate::replication::Slot::default(),
@@ -266,14 +269,55 @@ impl PagingManager {
     }
 
     /// `checkMemoryRelease`: below the limits, the blocked stores let their
-    /// producers go.
+    /// producers go, and with them what waits for the broker's memory.
     fn check_memory_release(&self) {
-        if !self.is_global_full() {
-            let blocked = std::mem::take(&mut *lock(&self.blocked));
-            for s in blocked.iter().filter_map(Weak::upgrade) {
-                s.check_released_memory();
-            }
+        if self.is_global_full() {
+            return;
         }
+        let blocked = std::mem::take(&mut *lock(&self.blocked));
+        if blocked.is_empty() {
+            return;
+        }
+        // memoryReleased
+        let callbacks = std::mem::take(&mut *lock(&self.memory_callbacks));
+        for grant in callbacks {
+            grant();
+        }
+        // Those still blocking stay (`removeIf`).
+        let still: Vec<_> = blocked
+            .into_iter()
+            .filter(|s| s.upgrade().is_some_and(|s| !s.check_released_memory()))
+            .collect();
+        for s in still {
+            self.add_blocked_store(&s);
+        }
+    }
+
+    /// `addBlockedStore`.
+    fn add_blocked_store(&self, store: &Weak<PagingStore>) {
+        let mut blocked = lock(&self.blocked);
+        if !blocked.iter().any(|s| s.ptr_eq(store)) {
+            blocked.push(store.clone());
+        }
+    }
+
+    /// `checkMemory`: `grant` runs now, or once the broker's memory is
+    /// below its limits.
+    pub fn check_memory(&self, grant: Grant) {
+        if self.is_global_full() {
+            lock(&self.memory_callbacks).push(grant);
+            return;
+        }
+        grant();
+    }
+
+    /// `checkStorage`: `grant` runs now, or once the disk has room.
+    pub fn check_storage(&self, grant: Grant) {
+        if self.is_disk_full() {
+            lock(&self.memory_callbacks).push(grant);
+            return;
+        }
+        grant();
     }
 
     /// `isDiskFull`.
@@ -653,13 +697,38 @@ pub enum Paged {
     Dropped,
 }
 
-/// What a producer's credit request gets (`checkMemory`).
-pub enum Credits {
-    Granted,
-    /// Granted later, once memory is freed (BLOCK).
-    Blocked,
-    /// Refused (FAIL).
-    Failed,
+/// What runs once an address or the broker has room again
+/// (`AtomicRunnable`).
+pub type Grant = Box<dyn FnOnce() + Send>;
+
+/// A session's grants waiting for memory, dropped from their stores when
+/// the session closes (`RunnableList`).
+#[derive(Default)]
+pub struct BlockedRunnables {
+    cancelled: Arc<AtomicBool>,
+    stores: Mutex<Vec<Weak<PagingStore>>>,
+}
+
+impl BlockedRunnables {
+    /// The stores a grant of this list waits in.
+    fn add(&self, store: &Weak<PagingStore>) {
+        let mut stores = lock(&self.stores);
+        if !stores.iter().any(|s| s.ptr_eq(store)) {
+            stores.push(store.clone());
+        }
+    }
+
+    /// `cancel`: the grants still waiting never run.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        for s in std::mem::take(&mut *lock(&self.stores))
+            .iter()
+            .filter_map(Weak::upgrade)
+        {
+            lock(&s.blocked)
+                .retain(|(c, _)| !c.as_ref().is_some_and(|c| Arc::ptr_eq(c, &self.cancelled)));
+        }
+    }
 }
 
 /// `PagingStoreImpl`: one address's memory accounting and pages.
@@ -670,8 +739,9 @@ pub struct PagingStore {
     size: AtomicI64,
     messages: AtomicI64,
     state: Mutex<StoreState>,
-    /// Credit grants waiting for memory (`onMemoryFreedRunnables`).
-    blocked: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+    /// Grants waiting for memory (`onMemoryFreedRunnables`), each with
+    /// its session's cancellation.
+    blocked: Mutex<Vec<(Option<Arc<AtomicBool>>, Grant)>>,
     blocking: AtomicBool,
     /// Past `page-limit-bytes` or `page-limit-messages` (`pageFull`).
     page_full: AtomicBool,
@@ -1195,93 +1265,148 @@ impl PagingStore {
         }
     }
 
-    /// `checkReleasedMemory`: below the limit, blocked producers get their
-    /// credits.
-    fn check_released_memory(&self) {
-        if self.is_full() || self.blocked_via_management.load(Ordering::SeqCst) {
-            return;
+    /// `checkReleasedMemory`: below the limit, what waits for memory runs.
+    /// False while the store still blocks its producers.
+    fn check_released_memory(&self) -> bool {
+        if !self.blocked_via_management.load(Ordering::SeqCst) && !self.is_full() {
+            // memoryReleased
+            let waiting = std::mem::take(&mut *lock(&self.blocked));
+            for (cancelled, grant) in waiting {
+                if !cancelled.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                    grant();
+                }
+            }
+            if self.blocking.swap(false, Ordering::SeqCst) {
+                tracing::info!(
+                    "AMQ221046: Unblocking message production on address '{}'; {}",
+                    self.address,
+                    self.page_info()
+                );
+                return true;
+            }
         }
-        let waiting = std::mem::take(&mut *lock(&self.blocked));
-        for grant in waiting {
-            grant();
-        }
-        if self.blocking.swap(false, Ordering::SeqCst) {
-            tracing::info!(
-                "AMQ221046: Unblocking message production on address '{}'; {}",
-                self.address,
-                self.page_info()
-            );
-        }
+        !self.blocking.load(Ordering::SeqCst)
     }
 
-    /// `checkMemory` for a producer's credit request: `grant` runs now, or
-    /// once memory is freed (BLOCK); FAIL refuses the credits.
-    pub fn request_credits(&self, grant: Box<dyn FnOnce() + Send>) -> Credits {
-        // `blockedViaAddressControl`: producers wait whatever the policy.
+    /// `addToBlockList`.
+    fn add_to_block_list(&self, grant: Grant, list: Option<&BlockedRunnables>) {
+        let cancelled = list.map(|l| {
+            l.add(&self.me);
+            l.cancelled.clone()
+        });
+        lock(&self.blocked).push((cancelled, grant));
+    }
+
+    /// `checkMemory`: `grant` runs now and true is returned; under BLOCK
+    /// (or a full disk's BLOCK) on a full address it runs once there is
+    /// room, `blocking` running first, still true; under FAIL, or blocked
+    /// through management, false, the grant waiting for room if
+    /// `run_on_failure` (always when blocked through management). A grant
+    /// left waiting is cancelled with `list`.
+    pub fn check_memory(
+        &self,
+        run_on_failure: bool,
+        grant: Grant,
+        blocking: Option<&dyn Fn()>,
+        list: Option<&BlockedRunnables>,
+    ) -> bool {
         if self.blocked_via_management.load(Ordering::SeqCst) {
-            lock(&self.blocked).push(grant);
-            if self.blocked_via_management.load(Ordering::SeqCst) {
-                return Credits::Blocked;
+            self.add_to_block_list(grant, list);
+            // Unblocked meanwhile: the grant runs.
+            if !self.blocked_via_management.load(Ordering::SeqCst) {
+                self.check_released_memory();
             }
-            self.check_released_memory();
-            return Credits::Blocked;
+            return false;
         }
         let s = self.settings();
-        if let Some(m) = self.manager.upgrade()
+        let manager = self.manager.upgrade();
+        if let Some(m) = &manager
             && m.is_disk_full()
         {
             match s.disk_full_policy {
-                DiskFullPolicy::Fail => return Credits::Failed,
+                DiskFullPolicy::Fail => {
+                    if run_on_failure {
+                        self.add_to_block_list(grant, list);
+                        m.add_blocked_store(&self.me);
+                    }
+                    return false;
+                }
                 DiskFullPolicy::Block => {
-                    lock(&self.blocked).push(grant);
+                    if let Some(b) = blocking {
+                        b();
+                    }
+                    self.add_to_block_list(grant, list);
                     // The disk may have room again meanwhile.
                     if !m.is_disk_full() {
                         self.check_released_memory();
-                        return Credits::Granted;
+                    } else {
+                        m.add_blocked_store(&self.me);
+                        if !self.blocking.swap(true, Ordering::SeqCst) {
+                            tracing::warn!(
+                                "AMQ222212: Disk Full! Blocking message production on address '{}'. Clients will report blocked.",
+                                self.address
+                            );
+                        }
                     }
-                    lock(&m.blocked).push(self.me.clone());
-                    if !self.blocking.swap(true, Ordering::SeqCst) {
-                        tracing::warn!(
-                            "AMQ222212: Disk Full! Blocking message production on address '{}'. Clients will report blocked.",
-                            self.address
-                        );
+                    return true;
+                }
+                DiskFullPolicy::Drop => {}
+            }
+        } else {
+            match s.address_full_policy {
+                AddressFullPolicy::Fail if self.has_limit(&s) && self.is_full() => {
+                    if run_on_failure {
+                        self.add_to_block_list(grant, list);
+                        if let Some(m) = &manager {
+                            m.add_blocked_store(&self.me);
+                        }
                     }
-                    return Credits::Blocked;
+                    return false;
                 }
-                DiskFullPolicy::Drop => {
-                    grant();
-                    return Credits::Granted;
+                AddressFullPolicy::Block if self.has_limit(&s) && self.is_full() => {
+                    if let Some(b) = blocking {
+                        b();
+                    }
+                    self.add_to_block_list(grant, list);
+                    // The memory may have been freed meanwhile.
+                    if !self.is_full() {
+                        self.check_released_memory();
+                    } else {
+                        // usingGlobalMaxSize
+                        if let Some(m) = &manager
+                            && m.global_max_size > 0
+                        {
+                            m.add_blocked_store(&self.me);
+                        }
+                        if !self.blocking.swap(true, Ordering::SeqCst) {
+                            tracing::warn!(
+                                "AMQ222183: Blocking message production on address '{}'; {}",
+                                self.address,
+                                self.page_info()
+                            );
+                        }
+                    }
+                    return true;
                 }
+                _ => {}
             }
         }
-        match s.address_full_policy {
-            AddressFullPolicy::Fail if self.has_limit(&s) && self.is_full() => Credits::Failed,
-            AddressFullPolicy::Block if self.has_limit(&s) && self.is_full() => {
-                lock(&self.blocked).push(grant);
-                if let Some(m) = self.manager.upgrade()
-                    && m.is_global_full()
-                {
-                    lock(&m.blocked).push(self.me.clone());
-                }
-                // The memory may have been freed meanwhile.
-                if !self.is_full() {
-                    self.check_released_memory();
-                    return Credits::Granted;
-                }
-                if !self.blocking.swap(true, Ordering::SeqCst) {
-                    tracing::warn!(
-                        "AMQ222183: Blocking message production on address '{}'; {}",
-                        self.address,
-                        self.page_info()
-                    );
-                }
-                Credits::Blocked
-            }
-            _ => {
-                grant();
-                Credits::Granted
-            }
-        }
+        grant();
+        true
+    }
+
+    /// `getAddressFullMessagePolicy`.
+    pub fn address_full_policy(&self) -> AddressFullPolicy {
+        self.settings().address_full_policy
+    }
+
+    /// `isRejectingMessages`: under BLOCK, past
+    /// `max-size-bytes-reject-threshold`.
+    pub fn is_rejecting_messages(&self) -> bool {
+        let s = self.settings();
+        s.address_full_policy == AddressFullPolicy::Block
+            && s.max_size_bytes_reject_threshold != -1
+            && self.size.load(Ordering::SeqCst) > s.max_size_bytes_reject_threshold
     }
 
     /// `pageStoreDropMessages`, once until paging stops.

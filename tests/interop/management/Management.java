@@ -13,6 +13,8 @@ import java.util.*;
 import javax.jms.*;
 import javax.jms.Queue;
 
+import org.apache.activemq.artemis.api.core.ActiveMQAddressFullException;
+import org.apache.activemq.artemis.api.core.ActiveMQException;
 import org.apache.activemq.artemis.api.core.JsonUtil;
 import org.apache.activemq.artemis.api.core.QueueConfiguration;
 import org.apache.activemq.artemis.api.core.RoutingType;
@@ -1324,6 +1326,29 @@ public class Management {
             eq(50L, count(q), "messages back on the queue");
         } finally {
             op("broker", "removeAddressSettings", q.substring(0, q.length() - 2) + ".#");
+        }
+    }
+
+    // An address blocked through management refuses a Core producer's
+    // credits, so its send fails as on a full FAIL address; once unblocked
+    // the credits come and sends go through (requestProducerCredits).
+    static void t_address_block_core_producer() throws Exception {
+        String q = newQueue("blocked");
+        op("address." + q, "block");
+        try (ClientSession s = factory.createSession(); ClientProducer p = s.createProducer(q)) {
+            ActiveMQException failed = null;
+            try {
+                p.send(s.createMessage(true));
+            } catch (ActiveMQException e) {
+                failed = e;
+            }
+            check(failed instanceof ActiveMQAddressFullException, "the send failed: " + failed);
+            check(failed.getMessage().startsWith("AMQ219058: Address \"" + q + "\" is full."), "the failure: " + failed.getMessage());
+            op("address." + q, "unblock");
+            p.send(s.createMessage(true));
+            waitCount(q, 1);
+        } finally {
+            op("address." + q, "unblock");
         }
     }
 }
