@@ -1,0 +1,38 @@
+=== artemis run (target, source)
+target: listening
+source: listening
+source: bridge br is connected
+source: tls-out is connected
+source: AMQ214016 (the untrusted connector)
+=== Bridge.java send src 0..5 (source)
+sent 5
+=== Bridge.java receive dst 5 (target)
+received m0 seq=0 duplicate-id=null
+received m1 seq=1 duplicate-id=null
+received m2 seq=2 duplicate-id=null
+received m3 seq=3 duplicate-id=null
+received m4 seq=4 duplicate-id=null
+no more
+=== Bridge.java send outbox 0..3 (source)
+sent 3
+=== Bridge.java receive outbox 3 (target)
+received m0 seq=0 duplicate-id=null
+received m1 seq=1 duplicate-id=null
+received m2 seq=2 duplicate-id=null
+no more
+=== artemis producer --url tcp://localhost:64917?<tls> (source's CLI)
+Produced: 3 messages
+=== artemis consumer --url tcp://localhost:64917?<tls> (source's CLI)
+Consumed: 3 messages
+Consumed: 3 messages
+=== Bridge.java send bad 10..12 (source)
+sent 2
+=== Bridge.java receive dst 0 (target)
+no more
+=== Bridge.java receive bad 2 (source)
+received m10 seq=10 duplicate-id=null
+received m11 seq=11 duplicate-id=null
+no more
+=== artemis stop (source, target)
+source: down
+target: down

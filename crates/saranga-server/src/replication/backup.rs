@@ -152,8 +152,8 @@ async fn try_locate(
     target: &saranga_core_protocol::transport::TransportConfiguration,
 ) -> Option<(Connection, String)> {
     let cluster = &cfg.cluster;
-    let (host, port) = crate::cluster::socket_address(target)?;
-    let conn = Connection::connect((host.as_str(), port), options(cluster))
+    let here = crate::cluster::dial(target)?;
+    let conn = Connection::connect_connector(here.clone(), options(cluster))
         .await
         .ok()?;
     // Saranga's client keeps no backup group names, so `group-name` does
@@ -172,12 +172,11 @@ async fn try_locate(
         return None;
     };
     // The primary itself, if the connector reached another broker.
-    let here = Connector::new(host.clone(), port);
     let conn = if primary.is_equivalent(&here) {
         conn
     } else {
         conn.close().await;
-        Connection::connect((primary.host.as_str(), primary.port), options(cluster))
+        Connection::connect_connector(primary.clone(), options(cluster))
             .await
             .ok()?
     };
@@ -214,13 +213,13 @@ pub async fn is_node_id_used(cluster: &ClusterConfig, node_id: &str) -> bool {
         .as_ref()
         .map_or(Duration::ZERO, |d| d.initial_wait_timeout);
     for target in &peers.targets(wait).await {
-        let Some((host, port)) = crate::cluster::socket_address(target) else {
+        let Some(connector) = crate::cluster::dial(target) else {
             continue;
         };
         // `listener.latch.await(5, SECONDS)`.
         let connected = tokio::time::timeout(
             Duration::from_secs(5),
-            Connection::connect((host.as_str(), port), options.clone()),
+            Connection::connect_connector(connector, options.clone()),
         )
         .await;
         let Ok(Ok(conn)) = connected else {
@@ -249,7 +248,7 @@ async fn is_active(cluster: &ClusterConfig, primary: &Connector) -> bool {
         ..ConnectionOptions::default()
     };
     let session = async {
-        let conn = Connection::connect((primary.host.as_str(), primary.port), options)
+        let conn = Connection::connect_connector(primary.clone(), options)
             .await
             .ok()?;
         let session = conn

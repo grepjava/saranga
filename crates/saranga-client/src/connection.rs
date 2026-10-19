@@ -35,6 +35,7 @@ use saranga_core_protocol::transport::{ParamValue, TransportConfiguration};
 use saranga_core_protocol::{
     Context, Direction, FRAME_HEADER_SIZE, HANDSHAKE, Packet, read_frame, types, version,
 };
+use saranga_transport::TlsConnector;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::{mpsc, watch};
@@ -168,6 +169,11 @@ async fn resolve(addr: impl ToSocketAddrs) -> std::io::Result<Vec<std::net::Sock
     Ok(addrs)
 }
 
+/// A transport connection: TCP, or TLS over it.
+pub trait Transport: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Transport for T {}
+
 /// `NettyConnector.createConnection`: a TCP connection to the host's
 /// addresses in that order.
 async fn connect_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
@@ -181,23 +187,57 @@ async fn connect_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
     Err(last.unwrap_or_else(|| std::io::Error::other(format!("{host} resolves to no address"))))
 }
 
-/// Where to connect: the host and port of a `TransportConfiguration`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Where to connect: the host and port of a `TransportConfiguration`, and
+/// its TLS if `sslEnabled`. Connectors are equal when their hosts and ports
+/// are.
+#[derive(Debug, Clone)]
 pub struct Connector {
     pub host: String,
     pub port: u16,
+    pub tls: Option<Arc<TlsConnector>>,
 }
+
+impl PartialEq for Connector {
+    fn eq(&self, other: &Self) -> bool {
+        self.host == other.host && self.port == other.port
+    }
+}
+
+impl Eq for Connector {}
 
 impl Connector {
     pub fn new(host: impl Into<String>, port: u16) -> Self {
         Self {
             host: host.into(),
             port,
+            tls: None,
         }
     }
 
+    /// The same connector with `tls`.
+    pub fn with_tls(mut self, tls: Option<Arc<TlsConnector>>) -> Self {
+        self.tls = tls;
+        self
+    }
+
+    /// `NettyConnector.createConnection`: a TCP connection, with the TLS
+    /// handshake on it if the connector has TLS, and the address it is
+    /// connected to. The TCP connection is given 10 seconds, the handshake
+    /// 30.
+    pub async fn connect(&self) -> std::io::Result<(Box<dyn Transport>, std::net::SocketAddr)> {
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, connect_tcp(&self.host, self.port))
+            .await
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+        let _ = stream.set_nodelay(true);
+        let peer = stream.peer_addr()?;
+        Ok(match &self.tls {
+            Some(tls) => (Box::new(tls.connect(&self.host, stream).await?), peer),
+            None => (Box::new(stream), peer),
+        })
+    }
+
     /// The host and port of a connector a broker announced, with Netty's
-    /// defaults (`localhost`, 61616).
+    /// defaults (`localhost`, 61616), and its TLS.
     pub fn from_transport(tc: &TransportConfiguration) -> Option<Self> {
         let param = |name: &str| {
             tc.params.iter().find_map(|(k, v)| {
@@ -214,7 +254,12 @@ impl Connector {
             Some(p) => p.parse().ok()?,
             None => 61616,
         };
-        Some(Self { host, port })
+        let tls = TlsConnector::from_uri_params(param);
+        Some(Self {
+            host,
+            port,
+            tls: tls.map(Arc::new),
+        })
     }
 
     /// `NettyConnector.isEquivalent`: the same port, and the same host or
@@ -945,7 +990,7 @@ impl Factory {
     /// Opens a TCP connection to the first of the current connector, the
     /// backup, the previous connector and the initial one that answers
     /// (`createTransportConnection`).
-    async fn create_transport_connection(&self) -> Option<TcpStream> {
+    async fn create_transport_connection(&self) -> Option<Box<dyn Transport>> {
         let candidates = {
             let st = self.state();
             let mut c: Vec<Connector> = Vec::new();
@@ -964,14 +1009,9 @@ impl Factory {
             c
         };
         for connector in candidates {
-            let connecting = connect_tcp(&connector.host, connector.port);
-            if let Ok(Ok(stream)) = tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
-                let _ = stream.set_nodelay(true);
+            if let Ok((stream, peer)) = connector.connect().await {
                 let mut st = self.state();
-                st.remote_address = stream
-                    .peer_addr()
-                    .ok()
-                    .map(|a| java_remote_address(&connector.host, a));
+                st.remote_address = Some(java_remote_address(&connector.host, peer));
                 st.previous = st.current.take();
                 st.current = Some(connector);
                 return Some(stream);
@@ -1410,6 +1450,23 @@ impl Connection {
         Err(last
             .unwrap_or_else(|| std::io::Error::other("no address to connect to"))
             .into())
+    }
+
+    /// As [`Connection::connect`], to a connector's host and port, with its
+    /// TLS if it has any.
+    pub async fn connect_connector(
+        connector: Connector,
+        options: ConnectionOptions,
+    ) -> Result<Self> {
+        let (stream, peer) = connector.connect().await?;
+        let factory = Factory::new(options, vec![connector.clone()]);
+        {
+            let mut st = factory.state();
+            st.remote_address = Some(java_remote_address(&connector.host, peer));
+            st.connector = Some(connector.clone());
+            st.current = Some(connector);
+        }
+        Self::start(factory, stream).await
     }
 
     /// Connects to the first of `connectors` that answers

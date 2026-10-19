@@ -186,7 +186,7 @@ impl TlsSettings {
             }
             let mut verifier =
                 WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
-                    .with_crls(self.crls()?);
+                    .with_crls(load_crls(self.crl_path.as_deref())?);
             if !self.need_client_auth {
                 verifier = verifier.allow_unauthenticated();
             }
@@ -210,30 +210,31 @@ impl TlsSettings {
         config.alpn_protocols = Vec::new();
         Ok(Arc::new(config))
     }
+}
 
-    /// `SSLSupport.loadCRL`: PEM or DER CRLs.
-    fn crls(&self) -> Result<Vec<CertificateRevocationListDer<'static>>, TlsError> {
-        use rustls::pki_types::pem::PemObject;
-        let Some(path) = &self.crl_path else {
-            return Ok(Vec::new());
-        };
-        let p = saranga_config::file_uri_path(path).unwrap_or_else(|| PathBuf::from(path));
-        let data =
-            std::fs::read(&p).map_err(|e| TlsError::Config(format!("crlPath {path}: {e}")))?;
-        let pem: Vec<_> = CertificateRevocationListDer::pem_slice_iter(&data)
-            .collect::<Result<_, _>>()
-            .map_err(|e| TlsError::Config(format!("crlPath {path}: {e}")))?;
-        Ok(if pem.is_empty() {
-            vec![CertificateRevocationListDer::from(data)]
-        } else {
-            pem
-        })
-    }
+/// `SSLSupport.loadCRL`: PEM or DER CRLs.
+pub(crate) fn load_crls(
+    path: Option<&str>,
+) -> Result<Vec<CertificateRevocationListDer<'static>>, TlsError> {
+    use rustls::pki_types::pem::PemObject;
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+    let p = saranga_config::file_uri_path(path).unwrap_or_else(|| PathBuf::from(path));
+    let data = std::fs::read(&p).map_err(|e| TlsError::Config(format!("crlPath {path}: {e}")))?;
+    let pem: Vec<_> = CertificateRevocationListDer::pem_slice_iter(&data)
+        .collect::<Result<_, _>>()
+        .map_err(|e| TlsError::Config(format!("crlPath {path}: {e}")))?;
+    Ok(if pem.is_empty() {
+        vec![CertificateRevocationListDer::from(data)]
+    } else {
+        pem
+    })
 }
 
 /// Java's protocol names to rustls versions; empty means the defaults
 /// (TLS 1.3 and 1.2).
-fn select_versions(
+pub(crate) fn select_versions(
     names: Option<&[String]>,
 ) -> Result<Vec<&'static SupportedProtocolVersion>, TlsError> {
     let Some(names) = names else {
@@ -264,7 +265,9 @@ pub fn suite_name(s: &SupportedCipherSuite) -> String {
     }
 }
 
-fn select_suites(names: Option<&[String]>) -> Result<Vec<SupportedCipherSuite>, TlsError> {
+pub(crate) fn select_suites(
+    names: Option<&[String]>,
+) -> Result<Vec<SupportedCipherSuite>, TlsError> {
     let all = rustls::crypto::ring::ALL_CIPHER_SUITES;
     let Some(names) = names else {
         return Ok(rustls::crypto::ring::DEFAULT_CIPHER_SUITES.to_vec());

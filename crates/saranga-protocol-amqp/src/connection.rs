@@ -419,6 +419,9 @@ pub struct Outgoing {
     pub password: Option<String>,
     /// The URI's `saslMechanisms`, when given: the only ones chosen.
     pub sasl_mechanisms: Option<Vec<String>>,
+    /// Whether the TLS handshake sent this end's certificate: SASL
+    /// EXTERNAL can then be chosen.
+    pub local_certificate: bool,
     /// Added to the Open's properties.
     pub properties: Fields,
     pub desired_capabilities: Option<Vec<Symbol>>,
@@ -1175,10 +1178,11 @@ impl Conn {
         }
     }
 
-    /// `SaslFactory.chooseMechanism`: among those offered (and allowed by
-    /// the URI's `saslMechanisms`), PLAIN with a user and password, then
-    /// XOAUTH2, then ANONYMOUS. EXTERNAL needs a client certificate and
-    /// SCRAM is not supported, so neither is chosen.
+    /// `ClientSASLFactoryImpl.chooseMechanism`: among those offered (and
+    /// allowed by the URI's `saslMechanisms`), EXTERNAL when the TLS
+    /// handshake sent this end's certificate, then PLAIN with a user and
+    /// password, then XOAUTH2, then ANONYMOUS. SCRAM is not supported, so
+    /// it is not chosen.
     fn choose_mechanism(&self, offered: &[String]) -> Option<(&'static str, Vec<u8>)> {
         let o = self.outgoing.as_ref()?;
         let allowed = |m: &str| {
@@ -1188,6 +1192,9 @@ impl Conn {
                     .filter(|e| !e.is_empty())
                     .is_none_or(|e| e.iter().any(|x| x == m))
         };
+        if o.local_certificate && allowed("EXTERNAL") {
+            return Some(("EXTERNAL", Vec::new()));
+        }
         let creds = match (&o.user, &o.password) {
             (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => Some((u, p)),
             _ => None,

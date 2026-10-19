@@ -15,6 +15,8 @@ use saranga_config::{AmqpBrokerConnectConfig, AmqpConnectionElement, AmqpMatchEl
 use saranga_server::Broker;
 use saranga_server::plugin::BrokerPlugin;
 use saranga_server::queue::Queue;
+use saranga_transport::TlsConnector;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
 use crate::bridge::BridgeManager;
@@ -41,13 +43,22 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Where a broker connection connects: one server of its URI.
-#[derive(Debug, Clone, PartialEq)]
+/// Where a broker connection connects: one server of its URI, with its TLS
+/// if `sslEnabled`. Endpoints are equal when their hosts, ports and
+/// parameters are.
+#[derive(Debug, Clone)]
 pub struct Endpoint {
     pub host: String,
     pub port: u16,
     /// The URI's parameters, the protocol's settings among them.
     pub params: HashMap<String, String>,
+    pub tls: Option<Arc<TlsConnector>>,
+}
+
+impl PartialEq for Endpoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.host == other.host && self.port == other.port && self.params == other.params
+    }
 }
 
 /// `ConnectorTransportConfigurationParser`: the servers of a URI,
@@ -65,14 +76,13 @@ pub fn parse_uri(uri: &str) -> Result<Vec<Endpoint>, String> {
         }
         None => (uri, ""),
     };
-    let params = |q: &str| -> Vec<(String, String)> {
-        q.split('&')
-            .filter(|p| !p.is_empty())
-            .map(|p| {
-                let (k, v) = p.split_once('=').unwrap_or((p, ""));
-                (k.to_owned(), v.to_owned())
-            })
-            .collect()
+    // `URISupport.parseQuery`: split on `&` and `;`, each name and value
+    // URL-decoded.
+    let params = |q: &str| -> Result<Vec<(String, String)>, String> {
+        Ok(saranga_config::query_params(q)?
+            .into_iter()
+            .map(|(k, v)| (k, v.unwrap_or_default()))
+            .collect())
     };
     let mut out = Vec::new();
     for item in list.split(',') {
@@ -92,8 +102,8 @@ pub fn parse_uri(uri: &str) -> Result<Vec<Endpoint>, String> {
             _ => (authority.to_owned(), 61616),
         };
         let host = host.trim_start_matches('[').trim_end_matches(']');
-        let mut p: HashMap<String, String> = params(query).into_iter().collect();
-        for (k, v) in params(shared) {
+        let mut p: HashMap<String, String> = params(query)?.into_iter().collect();
+        for (k, v) in params(shared)? {
             p.entry(k).or_insert(v);
         }
         out.push(Endpoint {
@@ -103,6 +113,7 @@ pub fn parse_uri(uri: &str) -> Result<Vec<Endpoint>, String> {
                 host.to_owned()
             },
             port,
+            tls: TlsConnector::from_uri_params(|k| p.get(k).cloned()).map(Arc::new),
             params: p,
         });
     }
@@ -324,7 +335,7 @@ impl AmqpBrokerConnection {
             }
             let endpoint = self.endpoints[retry_counter as usize % self.endpoints.len()].clone();
             let host_port = self.host_port(&endpoint);
-            if let Ok(stream) = connect_tcp(&endpoint.host, endpoint.port).await {
+            if let Ok(stream) = connect(&endpoint).await {
                 last_retry_counter = retry_counter;
                 retry_counter = 0;
                 let ended = self.connected(stream, &endpoint, last_retry_counter).await;
@@ -372,13 +383,16 @@ impl AmqpBrokerConnection {
 
     /// A connection is up: SASL, Open and Begin go out, then a link for
     /// each matching queue. Returns how it ended.
-    async fn connected(&self, stream: TcpStream, endpoint: &Endpoint, retries: i32) -> Ended {
+    async fn connected(&self, stream: Connected, endpoint: &Endpoint, retries: i32) -> Ended {
         let Some(broker) = self.broker.upgrade() else {
             return Ended::Stopped;
         };
-        let peer = stream.peer_addr().ok();
-        let local = stream.local_addr().ok();
-        let _ = stream.set_nodelay(true);
+        let Connected {
+            stream,
+            peer,
+            local,
+            local_certificate,
+        } = stream;
         let settings = Settings::from_params(&endpoint.params);
         let info = vec![
             ("connectionName", Value::string(self.config.name.clone())),
@@ -424,6 +438,7 @@ impl AmqpBrokerConnection {
                 .params
                 .contains_key("saslMechanisms")
                 .then(|| settings.sasl_mechanisms.clone()),
+            local_certificate,
             properties,
             desired_capabilities: (!self.bridges.is_empty())
                 .then(|| vec![Symbol::from(crate::link::capability::SHARED_SUBS)]),
@@ -717,4 +732,63 @@ async fn connect_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
         }
     }
     Err(last.unwrap_or_else(|| std::io::Error::other(format!("{host} resolves to no address"))))
+}
+
+trait Io: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Io for T {}
+
+/// A connection made, with its addresses.
+struct Connected {
+    stream: Box<dyn Io>,
+    peer: Option<std::net::SocketAddr>,
+    local: Option<std::net::SocketAddr>,
+    /// Whether the TLS handshake sent this end's certificate.
+    local_certificate: bool,
+}
+
+/// A TCP connection to the endpoint, with the TLS handshake on it if the
+/// URI has `sslEnabled`.
+async fn connect(endpoint: &Endpoint) -> std::io::Result<Connected> {
+    let stream = connect_tcp(&endpoint.host, endpoint.port).await?;
+    let peer = stream.peer_addr().ok();
+    let local = stream.local_addr().ok();
+    let _ = stream.set_nodelay(true);
+    let (stream, local_certificate): (Box<dyn Io>, bool) = match &endpoint.tls {
+        Some(tls) => {
+            let (s, sent) = tls.connect_reporting(&endpoint.host, stream).await?;
+            (Box::new(s), sent)
+        }
+        None => (Box::new(stream), false),
+    };
+    Ok(Connected {
+        stream,
+        peer,
+        local,
+        local_certificate,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uris_as_uri_support_parses_them() {
+        let e =
+            parse_uri("tcp://h:5672?sslEnabled=true;trustStorePath=a%20b.jks&saslMechanisms=PLAIN")
+                .unwrap();
+        assert_eq!((e[0].host.as_str(), e[0].port), ("h", 5672));
+        assert_eq!(e[0].params["sslEnabled"], "true");
+        assert_eq!(e[0].params["trustStorePath"], "a b.jks");
+        assert_eq!(e[0].params["saslMechanisms"], "PLAIN");
+        assert!(e[0].tls.is_some());
+
+        // The list's parameters apply to each server, its own first.
+        let e = parse_uri("(tcp://a:1?x=1,tcp://b:2)?x=2;y=3").unwrap();
+        assert_eq!(e[0].params["x"], "1");
+        assert_eq!(e[1].params["x"], "2");
+        assert_eq!(e[1].params["y"], "3");
+        assert!(e[1].tls.is_none());
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "saranga-transport"
-description = "Acceptors: TLS with Java keystores, client certificates and SNI"
+description = "Acceptors and connectors: TLS with Java keystores, client certificates and SNI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 regex = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
 saranga-config = { path = "../saranga-config" }
 saranga-security = { path = "../saranga-security" }
 sha1 = "0.10"
@@ -15,6 +16,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["net", "time", "io-util", "rt"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tracing = "0.1"
+x509-parser = "0.18"
 
 [dev-dependencies]
 tempfile = "3"

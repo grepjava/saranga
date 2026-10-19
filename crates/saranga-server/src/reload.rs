@@ -19,7 +19,11 @@ use crate::{AddressDeployment, Broker};
 pub struct Reload {
     pub address_settings: cfg::HierarchicalRepository<cfg::AddressSettings>,
     pub security_settings: cfg::HierarchicalRepository<cfg::SecuritySetting>,
+    /// The core's `<addresses>`: those of a legacy `<jms>` are not read
+    /// again, as `reloadConfigurationFile` reads only the core.
     pub addresses: Vec<AddressDeployment>,
+    /// The deprecated `<queues>`.
+    pub queues: Vec<crate::QueueSpec>,
     pub diverts: Vec<DivertDeployment>,
     pub bridges: Vec<cfg::BridgeConfig>,
     /// The connectors (and discovery groups) bridges may name.
@@ -40,6 +44,7 @@ impl Reload {
                 .iter()
                 .map(crate::config::deployment)
                 .collect(),
+            queues: crate::config::legacy_queues(config),
             diverts: config.diverts.iter().map(crate::config::divert).collect(),
             bridges: config.bridges.clone(),
             bridge_targets: crate::bridge::Targets::from_file(config),
@@ -73,6 +78,7 @@ impl Broker {
         reloading("addresses");
         undeploy_not_configured(&self.post_office, &reload.addresses);
         deploy_addresses(&self.post_office, &reload.addresses);
+        deploy_queue_specs(&self.post_office, &reload.queues);
 
         self.bridges.set_targets(reload.bridge_targets);
         self.reload_bridges(&reload.bridges).await;
@@ -112,9 +118,14 @@ pub(crate) fn deploy_addresses(post_office: &PostOffice, addresses: &[AddressDep
     }
 }
 
-/// `deployQueuesFromListQueueConfiguration`.
 fn deploy_queues(post_office: &PostOffice, a: &AddressDeployment) {
-    for spec in &a.queues {
+    deploy_queue_specs(post_office, &a.queues);
+}
+
+/// `deployQueuesFromListQueueConfiguration`: each queue is created on its
+/// address, made as needed, or updated if it exists there.
+pub(crate) fn deploy_queue_specs(post_office: &PostOffice, queues: &[crate::QueueSpec]) {
+    for spec in queues {
         let routing_type = spec.routing_type.map(|t| t.name()).unwrap_or("MULTICAST");
         tracing::info!(
             "AMQ221003: Deploying {routing_type} queue {} on address {}",

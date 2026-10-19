@@ -21,6 +21,7 @@ pub mod duplicate;
 pub mod error;
 pub mod federation;
 pub mod grouping;
+pub mod jvm;
 pub mod large;
 pub mod localtime;
 pub mod management;
@@ -210,6 +211,9 @@ pub struct BrokerConfig {
     /// `connection-ttl-override`; -1 lets clients choose.
     pub connection_ttl_override: i64,
     pub addresses: Vec<AddressDeployment>,
+    /// The deprecated `<queues>` of `<core>`, deployed after the addresses,
+    /// each on its own address.
+    pub legacy_queues: Vec<QueueSpec>,
     pub diverts: Vec<postoffice::DivertDeployment>,
     /// Divert transformers by the class name `broker.xml` refers to them by.
     pub transformers: HashMap<String, postoffice::TransformerFactory>,
@@ -297,6 +301,7 @@ impl BrokerConfig {
             wildcard: WildcardConfig::default(),
             connection_ttl_override: -1,
             addresses: Vec::new(),
+            legacy_queues: Vec::new(),
             diverts: Vec::new(),
             transformers: HashMap::new(),
             storage: None,
@@ -687,6 +692,8 @@ impl Broker {
             None => Default::default(),
         };
         reload::deploy_addresses(&post_office, &config.addresses);
+        // deployQueuesFromConfiguration.
+        reload::deploy_queue_specs(&post_office, &config.legacy_queues);
         // recoverStoredDiverts: a journaled divert no longer configured is
         // deployed again, or forgotten under config-delete-diverts FORCE.
         for d in &recovered.diverts {

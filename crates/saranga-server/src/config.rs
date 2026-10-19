@@ -197,38 +197,46 @@ pub(crate) fn deployment(a: &cfg::AddressConfig) -> AddressDeployment {
     a.routing_types
         .iter()
         .for_each(|&t| routing_types.add(routing_type(t)));
-    let queues = a
-        .queues
-        .iter()
-        .map(|q| {
-            let mut spec = QueueSpec::new(q.name.as_str(), a.name.as_str());
-            spec.routing_type = Some(routing_type(q.routing_type));
-            spec.filter_string = q.filter.clone();
-            spec.durable = q.durable;
-            spec.user = q.user.clone();
-            spec.configuration_managed = true;
-            spec.max_consumers = q.max_consumers;
-            spec.purge_on_no_consumers = Some(q.purge_on_no_consumers);
-            spec.exclusive = q.exclusive;
-            spec.group_rebalance = q.group_rebalance;
-            spec.group_rebalance_pause_dispatch = q.group_rebalance_pause_dispatch;
-            spec.group_buckets = q.group_buckets;
-            spec.group_first_key = q.group_first_key.clone();
-            spec.last_value = q.last_value;
-            spec.last_value_key = q.last_value_key.clone();
-            spec.non_destructive = q.non_destructive;
-            spec.consumers_before_dispatch = q.consumers_before_dispatch;
-            spec.delay_before_dispatch = q.delay_before_dispatch;
-            spec.ring_size = Some(q.ring_size);
-            spec.enabled = q.enabled;
-            spec
-        })
-        .collect();
+    let queues = a.queues.iter().map(|q| queue_spec(q, &a.name)).collect();
     AddressDeployment {
         name: a.name.clone(),
         routing_types,
         queues,
     }
+}
+
+/// A queue of the configuration, on `address`.
+pub(crate) fn queue_spec(q: &cfg::QueueConfig, address: &str) -> QueueSpec {
+    let mut spec = QueueSpec::new(q.name.as_str(), address);
+    spec.routing_type = Some(routing_type(q.routing_type));
+    spec.filter_string = q.filter.clone();
+    spec.durable = q.durable;
+    spec.user = q.user.clone();
+    spec.configuration_managed = true;
+    spec.max_consumers = q.max_consumers;
+    spec.purge_on_no_consumers = Some(q.purge_on_no_consumers);
+    spec.exclusive = q.exclusive;
+    spec.group_rebalance = q.group_rebalance;
+    spec.group_rebalance_pause_dispatch = q.group_rebalance_pause_dispatch;
+    spec.group_buckets = q.group_buckets;
+    spec.group_first_key = q.group_first_key.clone();
+    spec.last_value = q.last_value;
+    spec.last_value_key = q.last_value_key.clone();
+    spec.non_destructive = q.non_destructive;
+    spec.consumers_before_dispatch = q.consumers_before_dispatch;
+    spec.delay_before_dispatch = q.delay_before_dispatch;
+    spec.ring_size = Some(q.ring_size);
+    spec.enabled = q.enabled;
+    spec
+}
+
+/// The deprecated `<queues>` of `<core>`, each on its own address.
+pub(crate) fn legacy_queues(config: &cfg::BrokerConfig) -> Vec<QueueSpec> {
+    config
+        .queues
+        .iter()
+        .map(|q| queue_spec(q, &q.address))
+        .collect()
 }
 
 pub(crate) fn divert(d: &cfg::DivertConfig) -> DivertDeployment {
@@ -366,7 +374,15 @@ impl BrokerConfig {
                 single_word: w.single_word,
             },
             connection_ttl_override: -1,
-            addresses: config.addresses.iter().map(deployment).collect(),
+            // FileBroker deploys the legacy <jms> configuration after the
+            // core's addresses.
+            addresses: config
+                .addresses
+                .iter()
+                .chain(&config.jms_addresses)
+                .map(deployment)
+                .collect(),
+            legacy_queues: legacy_queues(config),
             diverts: config.diverts.iter().map(divert).collect(),
             transformers: HashMap::new(),
             storage: config
@@ -378,9 +394,15 @@ impl BrokerConfig {
             address_queue_scan_period: config.address_queue_scan_period,
             id_cache_size: config.id_cache_size,
             persist_id_cache: config.persist_id_cache,
-            // Artemis takes half the JVM heap when unset: 1 GiB with the
-            // 2 GiB heap of an instance `artemis create` makes.
-            global_max_size: config.global_max_size.unwrap_or(1 << 30),
+            // When unset, a share of the heap of the JVM Artemis would run
+            // in (`ConfigurationImpl.getGlobalMaxSize`): 1 GiB with the 2
+            // GiB of an instance `artemis create` makes.
+            global_max_size: config.global_max_size.unwrap_or_else(|| {
+                crate::jvm::percent_of(
+                    crate::jvm::max_memory(),
+                    config.global_max_size_percent_of_jvm_max_memory,
+                )
+            }),
             global_max_messages: config.global_max_messages,
             // The security manager comes from outside broker.xml
             // (`login.config`, `bootstrap.xml`): whoever starts the broker

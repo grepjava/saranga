@@ -208,8 +208,6 @@ pub struct AddressConfig {
 pub enum Warning {
     /// An element the schema does not define at this position.
     UnknownElement { parent: String, name: String },
-    /// `xi:include` is not supported; the referenced file was not read.
-    XIncludeUnsupported { href: Option<String> },
     /// No `<core>` element: every setting is the default.
     NoCoreElement,
     /// A second `<address-setting>` with the same match. Artemis keeps the
@@ -226,6 +224,10 @@ pub enum Warning {
         key: String,
         reason: String,
     },
+    /// `<queues>` in `<core>` (`AMQ222307`): deployed, but deprecated.
+    QueuesDeprecated,
+    /// A `<queue>` or `<topic>` of `<jms>` without a name, skipped.
+    JmsKeyMissing { element: String },
     /// A deprecated setting was given (`AMQ221038`).
     Deprecated {
         name: String,
@@ -248,12 +250,6 @@ impl fmt::Display for Warning {
             Self::UnknownElement { parent, name } => {
                 write!(f, "unknown element <{name}> in <{parent}> was ignored")
             }
-            Self::XIncludeUnsupported { href: Some(href) } => {
-                write!(f, "xi:include of {href:?} is not supported and was ignored")
-            }
-            Self::XIncludeUnsupported { href: None } => {
-                f.write_str("xi:include is not supported and was ignored")
-            }
             Self::NoCoreElement => f.write_str("no <core> element found; using defaults"),
             Self::DuplicateAddressSetting { r#match } => {
                 write!(
@@ -270,6 +266,12 @@ impl fmt::Display for Warning {
                 key,
                 reason,
             } => write!(f, "{source}: {key} was not applied: {reason}"),
+            Self::QueuesDeprecated => f.write_str(
+                "AMQ222307: The queues element is deprecated and replaced by the addresses element",
+            ),
+            Self::JmsKeyMissing { element } => {
+                write!(f, "Configuration missing jms key <{element}>")
+            }
             Self::Deprecated { name, alternative } => write!(
                 f,
                 "AMQ221038: Configuration option '{name}' is deprecated and will be removed in a future version. Use '{alternative}' instead. Consult the manual for details."
@@ -822,9 +824,11 @@ pub struct BrokerConfig {
     pub paging_directory: String,
     pub large_messages_directory: String,
     pub journal: JournalConfig,
-    /// `None` when unset or `-1`; Artemis then uses a share of the JVM heap
-    /// (`global-max-size-percent-of-jvm-max-memory`, 50% by default).
+    /// `None` when unset or `-1`; Artemis then uses a share of the JVM heap,
+    /// `global_max_size_percent_of_jvm_max_memory`.
     pub global_max_size: Option<i64>,
+    /// `global-max-size-percent-of-jvm-max-memory`: 50 by default.
+    pub global_max_size_percent_of_jvm_max_memory: i32,
     pub global_max_messages: i64,
     pub wildcard_addresses: WildcardConfiguration,
     /// `literal-match-markers`, e.g. `()`.
@@ -843,6 +847,15 @@ pub struct BrokerConfig {
     /// Match string and settings, in document order.
     pub address_settings: Vec<(String, AddressSettings)>,
     pub addresses: Vec<AddressConfig>,
+    /// `<queues>` in `<core>`, deprecated: queues deployed after the
+    /// addresses, each on its `<address>` (its name without one), created
+    /// as needed with the queue's routing type, multicast.
+    pub queues: Vec<QueueConfig>,
+    /// The addresses of the legacy `<jms>` element (`LegacyJMSConfiguration`):
+    /// an anycast address and queue for each `<queue>`, a multicast address
+    /// for each `<topic>`. Deployed after `addresses` when the broker
+    /// starts; a reload does not read them.
+    pub jms_addresses: Vec<AddressConfig>,
     pub diverts: Vec<DivertConfig>,
     /// `<bridges>`, in document order.
     pub bridges: Vec<BridgeConfig>,
@@ -1028,9 +1041,12 @@ impl BrokerConfig {
         Self::parse_with(xml, crate::substitute::env_lookup)
     }
 
-    /// Parses `broker.xml` text, resolving `${...}` through `lookup`.
+    /// Parses `broker.xml` text, resolving `${...}` through `lookup` and
+    /// expanding its `xi:include`s, relative ones against the working
+    /// directory as Artemis does.
     pub fn parse_with(xml: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
-        let text = crate::substitute::replace_system_props(xml, lookup);
+        let text = crate::substitute::replace_system_props(xml, &lookup);
+        let text = crate::xinclude::expand(&text, None, &lookup)?;
         crate::parser::parse_document(&text)
     }
 
@@ -1087,6 +1103,7 @@ impl Default for BrokerConfig {
             large_messages_directory: Self::DEFAULT_LARGE_MESSAGES_DIR.to_owned(),
             journal: JournalConfig::default(),
             global_max_size: None,
+            global_max_size_percent_of_jvm_max_memory: 50,
             global_max_messages: Self::DEFAULT_GLOBAL_MAX_MESSAGES,
             wildcard_addresses: WildcardConfiguration::default(),
             literal_match_markers: None,
@@ -1097,6 +1114,8 @@ impl Default for BrokerConfig {
             discovery_groups: Vec::new(),
             address_settings: Vec::new(),
             addresses: Vec::new(),
+            queues: Vec::new(),
+            jms_addresses: Vec::new(),
             diverts: Vec::new(),
             bridges: Vec::new(),
             grouping_handler: None,

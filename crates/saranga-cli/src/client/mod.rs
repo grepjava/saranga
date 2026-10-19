@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use saranga_client::{Connection, ConnectionOptions, Connector};
+use saranga_transport::TlsConnector;
 
 pub mod address;
 pub mod check;
@@ -450,13 +451,14 @@ pub fn instance_url(name: Option<&str>) -> String {
     }
 }
 
-/// A URL's servers (host and port) and its `ServerLocator` parameters.
-type ParsedUrl = (Vec<(String, u16)>, Vec<(String, String)>);
+/// A URL's servers and its `ServerLocator` parameters.
+type ParsedUrl = (Vec<Connector>, Vec<(String, String)>);
 
 /// Every server of a connection URL, `tcp://host:port?params` or
 /// `(tcp://a:1,tcp://b:2)?params`, `amqp://` taken as `tcp://`, with the
 /// parameters for the `ServerLocator`: those after the list, or the single
-/// server's.
+/// server's. A server's own parameters and then those after the list
+/// give its TLS.
 pub fn parse_url_list(url: &str) -> anyhow::Result<ParsedUrl> {
     let url = url.trim();
     let (list, locator_query) = match url.strip_prefix('(') {
@@ -477,11 +479,6 @@ pub fn parse_url_list(url: &str) -> anyhow::Result<ParsedUrl> {
             bail!("schema {scheme} not found");
         }
         let (authority, query) = rest.split_once('?').unwrap_or((rest, ""));
-        for (k, v) in params(query).chain(params(locator_query)) {
-            if k == "sslEnabled" && v.eq_ignore_ascii_case("true") {
-                bail!("saranga's CLI does not support TLS connections (sslEnabled) yet");
-            }
-        }
         let authority = authority.trim_end_matches('/');
         let (host, port) = match authority.rsplit_once(':') {
             Some((h, p)) if !h.ends_with(']') || authority.starts_with('[') => (
@@ -492,26 +489,28 @@ pub fn parse_url_list(url: &str) -> anyhow::Result<ParsedUrl> {
             _ => (authority.to_owned(), 61616),
         };
         let host = host.trim_start_matches('[').trim_end_matches(']');
-        servers.push((
-            if host.is_empty() {
-                "localhost".to_owned()
-            } else {
-                host.to_owned()
-            },
-            port,
-        ));
+        let host = if host.is_empty() { "localhost" } else { host };
+        let own = params(query)?;
+        let shared = params(locator_query)?;
+        let tls = TlsConnector::from_uri_params(|k| {
+            own.iter()
+                .chain(&shared)
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.clone())
+        });
+        servers.push(Connector::new(host, port).with_tls(tls.map(std::sync::Arc::new)));
     }
-    let locator = params(locator_query)
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
-        .collect();
-    Ok((servers, locator))
+    Ok((servers, params(locator_query)?))
 }
 
-fn params(query: &str) -> impl Iterator<Item = (&str, &str)> {
-    query
-        .split(['&', ';'])
-        .filter(|p| !p.is_empty())
-        .map(|p| p.split_once('=').unwrap_or((p, "")))
+/// A URL's parameters as `URISupport.parseQuery` reads them: split on `&`
+/// and `;`, each name and value URL-decoded.
+fn params(query: &str) -> anyhow::Result<Vec<(String, String)>> {
+    Ok(saranga_config::query_params(query)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .into_iter()
+        .map(|(k, v)| (k, v.unwrap_or_default()))
+        .collect())
 }
 
 /// The `ServerLocator` settings of a URL's parameters, as
@@ -591,13 +590,13 @@ pub fn discovery_url(
         .with_context(|| format!("invalid port in {url}"))?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
     let mut config = DiscoveryConfig::new(EndpointConfig::new(host, port));
-    for (k, v) in params(query) {
+    for (k, v) in &params(query)? {
         let millis = || {
             v.parse::<i64>()
                 .ok()
                 .map(|m| Duration::from_millis(m.max(0) as u64))
         };
-        match k {
+        match k.as_str() {
             "localBindAddress" => config.endpoint.local_bind_address = Some(v.to_owned()),
             "localBindPort" => {
                 if let Ok(p) = v.parse() {
@@ -635,9 +634,7 @@ pub async fn open(
     };
     if let Some(config) = discovery_url(url)? {
         let (_, query) = url.split_once('?').unwrap_or((url, ""));
-        let params: Vec<(String, String)> = params(query)
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect();
+        let params = params(query)?;
         locator_options(&params, &mut options);
         return Connection::connect_discovery(config, options)
             .await
@@ -647,11 +644,7 @@ pub async fn open(
     }
     let (servers, params) = parse_url_list(url)?;
     locator_options(&params, &mut options);
-    let connectors = servers
-        .into_iter()
-        .map(|(host, port)| Connector::new(host, port))
-        .collect();
-    Connection::connect_to(connectors, options)
+    Connection::connect_to(servers, options)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create session factory; nested exception is {e}"))
 }
@@ -660,7 +653,18 @@ pub async fn open(
 mod tests {
     /// The first server of a URL.
     fn parse_url(url: &str) -> anyhow::Result<(String, u16)> {
-        Ok(super::parse_url_list(url)?.0.remove(0))
+        let c = super::parse_url_list(url)?.0.remove(0);
+        Ok((c.host, c.port))
+    }
+
+    /// The TLS settings of each server of a URL.
+    fn tls(url: &str) -> Vec<Option<saranga_transport::ConnectorTlsSettings>> {
+        super::parse_url_list(url)
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|c| c.tls.map(|t| t.settings().unwrap().clone()))
+            .collect()
     }
 
     #[test]
@@ -676,17 +680,33 @@ mod tests {
         );
         assert_eq!(parse_url("amqp://h:5672").unwrap(), ("h".into(), 5672));
         assert_eq!(parse_url("tcp://[::1]:7").unwrap(), ("::1".into(), 7));
-        assert!(parse_url("tcp://h:1?sslEnabled=true").is_err());
         assert!(parse_url("vm://0").is_err());
-        assert!(parse_url("(tcp://a:1,tcp://b:2)?sslEnabled=true").is_err());
+    }
+
+    #[test]
+    fn tls_urls() {
+        assert_eq!(tls("tcp://h:1"), [None]);
+        let one = tls(
+            "tcp://h:1?sslEnabled=true&trustStorePath=t.jks&trustStorePassword=ENC(3a34fd21b82bf2a822fa49a8d8fa115d)&verifyHost=false",
+        );
+        let s = one[0].as_ref().unwrap();
+        assert_eq!(s.trust_store_path.as_deref(), Some("t.jks"));
+        assert_eq!(s.trust_store_password.as_deref(), Some("password"));
+        assert!(!s.verify_host);
+        // The list's parameters apply to each server, its own first.
+        let list = tls("(tcp://a:1,tcp://b:2?trustAll=false)?sslEnabled=true&trustAll=true");
+        assert!(list[0].as_ref().unwrap().trust_all);
+        assert!(!list[1].as_ref().unwrap().trust_all);
+        assert!(list[1].as_ref().unwrap().verify_host);
     }
 
     #[test]
     fn url_lists_and_locator_parameters() {
+        use saranga_client::Connector;
         let (servers, params) =
             super::parse_url_list("(tcp://a:1,tcp://b:2?x=y)?ha=true&reconnectAttempts=-1")
                 .unwrap();
-        assert_eq!(servers, [("a".into(), 1), ("b".into(), 2)]);
+        assert_eq!(servers, [Connector::new("a", 1), Connector::new("b", 2)]);
         let mut options = saranga_client::ConnectionOptions::default();
         super::locator_options(&params, &mut options);
         assert!(options.ha);
@@ -694,7 +714,7 @@ mod tests {
 
         let (servers, params) =
             super::parse_url_list("tcp://h:1?retryInterval=500&callFailoverTimeout=-1").unwrap();
-        assert_eq!(servers, [("h".into(), 1)]);
+        assert_eq!(servers, [Connector::new("h", 1)]);
         let mut options = saranga_client::ConnectionOptions::default();
         super::locator_options(&params, &mut options);
         assert_eq!(

@@ -28,8 +28,9 @@ mod repository;
 mod security;
 mod substitute;
 mod wildcard;
+mod xinclude;
 
-pub use acceptor::AcceptorConfig;
+pub use acceptor::{AcceptorConfig, query_params};
 pub use address_settings::{
     AddressFullMessagePolicy, AddressSettings, DeletionPolicy, DiskFullMessagePolicy,
     PageFullMessagePolicy, SettingValue, SlowConsumerPolicy, SlowConsumerThresholdMeasurementUnit,
@@ -96,6 +97,9 @@ pub enum ConfigError {
         element: String,
         reason: &'static str,
     },
+    /// An `xi:include` that cannot be processed: the parser's fatal error.
+    #[error("{0}")]
+    XInclude(String),
     /// A configuration the broker refuses to start with
     /// (`ActiveMQIllegalStateException`), its message given whole.
     #[error("{0}")]

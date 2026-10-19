@@ -266,6 +266,13 @@ fn parse_authority(authority: &str) -> std::result::Result<HostPort, String> {
     Ok((Some(host.to_owned()), port))
 }
 
+/// The parameters of a connector URI's query, as `ConfigurationUtils`
+/// reads them: `;` taken as `&`, then [`parse_query`]'s decoding. A name
+/// without `=` has no value.
+pub fn query_params(raw: &str) -> std::result::Result<Vec<(String, Option<String>)>, String> {
+    parse_query(&raw.replace(';', "&"))
+}
+
 /// `URI.getQuery()` (percent-decoding) followed by `URISchema.parseQuery`,
 /// which splits on `&` and URL-decodes each name and value a second time.
 fn parse_query(raw: &str) -> std::result::Result<Vec<(String, Option<String>)>, String> {

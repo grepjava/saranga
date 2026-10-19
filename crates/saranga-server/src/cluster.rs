@@ -157,7 +157,8 @@ fn connector(config: &saranga_config::BrokerConfig, name: &str) -> Option<Transp
 
 /// `TCPTransportConfigurationSchema`: a connector's URI as the
 /// `TransportConfiguration` announced for it. Every parameter is a string
-/// (`BeanSupport.setData`), in the order of the Java `HashMap` holding them.
+/// (`BeanSupport.setData`) but the broker's mask-password, a Boolean, in
+/// the order of the Java `HashMap` holding them.
 pub fn transport_configuration(
     name: &str,
     uri: &saranga_config::AcceptorConfig,
@@ -190,10 +191,13 @@ pub fn transport_configuration(
             .into_iter()
             .map(|i| {
                 let (k, v) = &params[i];
-                (
-                    JString::from(k.as_str()),
-                    ParamValue::String(v.as_str().into()),
-                )
+                // The broker's mask-password, put in as a Boolean.
+                let value = if k == "activemq.usemaskedpassword" {
+                    ParamValue::Bool(v == "true")
+                } else {
+                    ParamValue::String(v.as_str().into())
+                };
+                (JString::from(k.as_str()), value)
             })
             .collect(),
     }
@@ -247,6 +251,14 @@ pub(crate) fn socket_address(tc: &TransportConfiguration) -> Option<(String, u16
     let host = param("host").unwrap_or_else(|| "localhost".to_owned());
     let port = param("port")?.parse().ok()?;
     Some((host, port))
+}
+
+/// The connector to dial for a `TransportConfiguration`, its TLS included;
+/// `None` without a port.
+pub(crate) fn dial(tc: &TransportConfiguration) -> Option<saranga_client::Connector> {
+    let (host, port) = socket_address(tc)?;
+    let tls = saranga_client::Connector::from_transport(tc).and_then(|c| c.tls);
+    Some(saranga_client::Connector::new(host, port).with_tls(tls))
 }
 
 /// How a connector is shown in logs: `TransportConfiguration.toString`'s
@@ -957,7 +969,7 @@ async fn announce_loop(
         let target = &targets[next % targets.len()];
         next += 1;
         let attempt = async {
-            let (host, port) = socket_address(target)
+            let connector = dial(target)
                 .ok_or_else(|| format!("connector {} has no port", describe(target)))?;
             let options = ConnectionOptions {
                 client_failure_check_period: Some(config.check_period),
@@ -968,7 +980,7 @@ async fn announce_loop(
                 cluster_connection: true,
                 ..ConnectionOptions::default()
             };
-            let conn = Connection::connect((host.as_str(), port), options)
+            let conn = Connection::connect_connector(connector, options)
                 .await
                 .map_err(|e| e.to_string())?;
             // `ClusterControl.authorize`.

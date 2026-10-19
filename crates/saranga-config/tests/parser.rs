@@ -274,6 +274,7 @@ fn max_size() {
     );
     assert_eq!(c.global_max_size, Some(10 * 1024 * 1024));
     assert_eq!(c.global_max_messages, 1000);
+    assert_eq!(c.global_max_size_percent_of_jvm_max_memory, 30);
 }
 
 #[test]

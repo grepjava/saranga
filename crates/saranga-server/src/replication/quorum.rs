@@ -177,7 +177,7 @@ async fn ask(
     tc: &TransportConfiguration,
     question: &Question,
 ) -> Option<ServerConnectVote> {
-    let (host, port) = crate::cluster::socket_address(tc)?;
+    let connector = crate::cluster::dial(tc)?;
     let options = ConnectionOptions {
         client_failure_check_period: Some(cluster.check_period),
         connection_ttl: Some(cluster.connection_ttl),
@@ -187,7 +187,7 @@ async fn ask(
         cluster_connection: true,
         ..ConnectionOptions::default()
     };
-    let conn = Connection::connect((host.as_str(), port), options)
+    let conn = Connection::connect_connector(connector, options)
         .await
         .ok()?;
     let reply = async {

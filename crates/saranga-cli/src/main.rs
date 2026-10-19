@@ -116,6 +116,17 @@ enum Command {
         #[arg(long = "start-script", default_value = "./artemis")]
         start_script: String,
     },
+    /// Generates the auto complete script file to be used in bash or zsh.
+    /// This feature is deprecated in favor of ./artemis completion
+    #[command(name = "auto-complete", hide = true)]
+    AutoComplete {
+        /// the script used to start artemis. (default ./artemis)
+        #[arg(long = "start-script", default_value = "./artemis")]
+        start_script: String,
+        /// The generated auto-complete script
+        #[arg(default_value = "auto-complete-artemis.sh")]
+        file: String,
+    },
     /// Create a queue, or delete, update, purge or print stats of queues.
     #[command(subcommand)]
     Queue(client::queue::QueueCommand),
@@ -427,7 +438,9 @@ async fn main() -> std::process::ExitCode {
 async fn execute(command: Command) -> bool {
     // `run` adds its own -D options.
     if !matches!(command, Command::Run { .. }) {
-        apply_discovery_switch(&java_args_system_properties());
+        let system = java_args_system_properties();
+        apply_discovery_switch(&system);
+        saranga_transport::connector::set_system_properties(system);
     }
     if let Command::Help { args } = &command {
         print!(
@@ -455,6 +468,7 @@ async fn execute(command: Command) -> bool {
             | Command::Create(_)
             | Command::Upgrade(_)
             | Command::Completion { .. }
+            | Command::AutoComplete { .. }
             | Command::Connect(_)
             | Command::Disconnect(_)
     );
@@ -513,6 +527,21 @@ async fn run_client(command: Command) -> anyhow::Result<()> {
         Command::Disconnect(a) => shell::disconnect(a),
         Command::Completion { start_script } => {
             print!("{}", completion::script(&start_script));
+            Ok(())
+        }
+        Command::AutoComplete { start_script, file } => {
+            // AutoCompletion.run: the script written to the file, any
+            // failure printed rather than failing the command.
+            let path = java_absolute_path(&file);
+            match std::fs::write(&path, completion::script(&start_script)) {
+                Ok(()) => {
+                    println!("Type the following commands before you can use auto-complete:");
+                    println!("{}", "*".repeat(127));
+                    println!("source {path}");
+                    println!("{}", "*".repeat(127));
+                }
+                Err(e) => eprintln!("java.io.FileNotFoundException: {path} ({e})"),
+            }
             Ok(())
         }
         Command::Version { .. } => {
@@ -678,6 +707,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             let mut system = java_args_system_properties();
             system.extend(system_properties);
             apply_discovery_switch(&system);
+            saranga_transport::connector::set_system_properties(system.clone());
             let options = instance::Options {
                 system,
                 broker_properties: properties,
@@ -788,6 +818,26 @@ const ARTEMIS_PROTOCOLS: [&str; 6] = ["CORE", "AMQP", "STOMP", "HORNETQ", "MQTT"
 /// The configured acceptors, with their TLS settings (`NettyAcceptor`),
 /// security domain and protocols. `served` names the protocols Saranga
 /// has.
+/// Refuses a TLS connector naming a Java class or an online revocation
+/// check, which Saranga cannot honour: rather than connect without them.
+fn check_connectors(file: &saranga_config::BrokerConfig) -> anyhow::Result<()> {
+    for c in &file.connectors {
+        saranga_transport::connector::check_params(|k| c.param(k).map(str::to_owned))
+            .with_context(|| format!("connector {}", c.name.as_deref().unwrap_or_default()))?;
+    }
+    for c in &file.broker_connections {
+        // A URI that does not parse fails when the connection starts.
+        let Ok(endpoints) = saranga_protocol_amqp::broker_connection::parse_uri(&c.uri) else {
+            continue;
+        };
+        for e in endpoints {
+            saranga_transport::connector::check_params(|k| e.params.get(k).cloned())
+                .with_context(|| format!("broker connection {}", c.name))?;
+        }
+    }
+    Ok(())
+}
+
 fn acceptors(file: &saranga_config::BrokerConfig, served: &[&str]) -> anyhow::Result<Vec<Bind>> {
     let mut out = Vec::new();
     for a in &file.acceptors {
@@ -800,6 +850,24 @@ fn acceptors(file: &saranga_config::BrokerConfig, served: &[&str]) -> anyhow::Re
                     a.uri
                 );
             }
+        }
+        for (param, why) in [
+            (
+                "proxyProtocolEnabled",
+                "the PROXY protocol is not supported",
+            ),
+            ("httpEnabled", "Core over HTTP is not supported"),
+        ] {
+            if a.param(param)
+                .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            {
+                tracing::warn!("acceptor {name}: {param} was ignored: {why}");
+            }
+        }
+        if let Some(router) = a.param("router") {
+            tracing::warn!(
+                "acceptor {name}: router {router} was ignored: connection routers are not supported"
+            );
         }
         // No list (or none Artemis knows) means every protocol.
         let known: Vec<&str> = listed
@@ -1064,6 +1132,24 @@ fn java_args_system_properties() -> Vec<(String, String)> {
 }
 
 /// `-D name=value`; a bare `-D name` is the empty string, as in Java.
+/// `File.getAbsolutePath`: the path in the platform's separators, after
+/// the working directory unless already absolute; not normalised.
+fn java_absolute_path(path: &str) -> String {
+    let sep = std::path::MAIN_SEPARATOR;
+    let path = if sep == '\\' {
+        path.replace('/', "\\")
+    } else {
+        path.to_owned()
+    };
+    if Path::new(&path).is_absolute() {
+        return path;
+    }
+    let cwd = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    format!("{}{sep}{path}", cwd.trim_end_matches(sep))
+}
+
 fn parse_system_property(s: &str) -> Result<(String, String), String> {
     let (k, v) = s.split_once('=').unwrap_or((s, ""));
     if k.is_empty() {
@@ -1117,11 +1203,21 @@ async fn boot(
                 file.large_messages_directory,
                 file.paging_directory
             );
+            if file.global_max_size.is_none() {
+                tracing::info!(
+                    "AMQ221057: Global Max Size is being adjusted to 1/2 of the JVM max size (-Xmx). being defined as {}",
+                    saranga_server::jvm::percent_of(
+                        saranga_server::jvm::max_memory(),
+                        file.global_max_size_percent_of_jvm_max_memory
+                    )
+                );
+            }
             if file.persistence_enabled {
                 // Buffered file I/O on every platform: Artemis's NIO.
                 tracing::info!("AMQ221012: Using NIO Journal");
             }
             let binds = acceptors(&file, &served)?;
+            check_connectors(&file)?;
             let mut config = BrokerConfig::from_file_config(&file, filters, &instance.dir)?;
             let security = instance.security(&file)?;
             config.security = security.store;

@@ -333,26 +333,13 @@ pub(crate) fn parse_document(text: &str) -> Result<BrokerConfig> {
     let mut config = BrokerConfig::default();
     let mut warnings = Vec::new();
 
-    for include in doc
-        .descendants()
-        .filter(|n| n.is_element() && n.tag_name().namespace() == Some(XINCLUDE_NS))
-    {
-        warnings.push(Warning::XIncludeUnsupported {
-            href: include.attribute("href").map(str::to_owned),
-        });
-    }
-
     // The root itself is never taken as `<core>` (Artemis searches only its
     // descendants), so a root `<core>` yields defaults and a warning.
     let root = doc.root_element();
     let root_children = elements(root).filter(|_| root.tag_name().name() != "core");
     for child in root_children {
         match child.tag_name().name() {
-            "core" => {}
-            "jms" => warnings.push(Warning::Unsupported {
-                name: "jms".to_owned(),
-                reason: "legacy JMS configuration is not supported",
-            }),
+            "core" | "jms" => {}
             _ => warn_unknown(&mut warnings, root, child),
         }
     }
@@ -361,12 +348,20 @@ pub(crate) fn parse_document(text: &str) -> Result<BrokerConfig> {
         Some(core) => parse_core(core, &mut config, &mut warnings)?,
         None => warnings.push(Warning::NoCoreElement),
     }
+    // `FileBroker` deploys `LegacyJMSConfiguration` after the core: the
+    // first <jms> in the document.
+    if let Some(jms) = root
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "jms")
+    {
+        parse_jms(jms, &mut config, &mut warnings);
+    }
     config.warnings = warnings;
     Ok(config)
 }
 
-/// Element children, skipping text, comments and `xi:` elements (which are
-/// reported separately).
+/// Element children, skipping text, comments and any `xi:` element left
+/// (`xi:include`s are expanded before the document is parsed).
 fn elements<'a, 'input>(n: Node<'a, 'input>) -> impl Iterator<Item = Node<'a, 'input>> {
     n.children()
         .filter(|c| c.is_element() && c.tag_name().namespace() != Some(XINCLUDE_NS))
@@ -394,12 +389,7 @@ fn parse_core(
     warnings: &mut Vec<Warning>,
 ) -> Result<()> {
     warn_unknown_children(warnings, core, CORE_ELEMENTS);
-    if first(core, "queues").is_some() {
-        warnings.push(Warning::Unsupported {
-            name: "queues".to_owned(),
-            reason: "deprecated; declare queues under <addresses>",
-        });
-    }
+    parse_legacy_queues(core, config, warnings)?;
 
     check_unsupported(core, warnings)?;
     parse_ha_policy(core, config, warnings)?;
@@ -422,15 +412,34 @@ fn parse_core(
     Ok(())
 }
 
-/// `<core>` children Saranga reads but does not act on yet, and why.
+/// `<core>` children Saranga reads but does not act on, and why.
 const NOT_ACTED_ON: &[(&str, &str)] = &[
     ("connection-routers", "connection routers are not supported"),
+    ("lock-coordinators", "lock coordinators are not supported"),
     (
-        "lock-coordinators",
-        "lock coordinators are not supported yet",
+        "metrics",
+        "its settings are not applied; the web server's metrics app exports the broker, address and queue metrics",
     ),
-    ("metrics", "metrics are not supported yet"),
-    ("metrics-plugin", "metrics are not supported yet"),
+    (
+        "metrics-plugin",
+        "its settings are not applied; the web server's metrics app exports the broker, address and queue metrics",
+    ),
+    (
+        "remoting-interceptors",
+        "interceptors are Java classes, which Saranga cannot load",
+    ),
+    (
+        "remoting-incoming-interceptors",
+        "interceptors are Java classes, which Saranga cannot load",
+    ),
+    (
+        "remoting-outgoing-interceptors",
+        "interceptors are Java classes, which Saranga cannot load",
+    ),
+    (
+        "connector-services",
+        "connector services are Java classes, which Saranga cannot load",
+    ),
     (
         "resource-limit-settings",
         "resource limits are not enforced",
@@ -727,6 +736,9 @@ fn parse_scalars(
     }
     if let Some(v) = s.bool("security-enabled") {
         config.security_enabled = v;
+    }
+    if let Some(v) = s.i32("global-max-size-percent-of-jvm-max-memory", Check::GtZero)? {
+        config.global_max_size_percent_of_jvm_max_memory = v;
     }
     if let Some(v) = s.text_bytes("global-max-size", Check::MinusOneOrGtZero)?
         && v > 0
@@ -1101,6 +1113,7 @@ const SCALAR_ELEMENTS: &[&str] = &[
     "disk-scan-period",
     "global-max-messages",
     "global-max-size",
+    "global-max-size-percent-of-jvm-max-memory",
     "id-cache-size",
     "journal-buffer-size",
     "journal-buffer-timeout",
@@ -1233,9 +1246,33 @@ fn parse_connectors(
                 uri: String::new(),
                 reason: format!("connector {:?} has no URI", name.unwrap_or("")),
             })?;
-        config.connectors.push(AcceptorConfig::parse(name, uri)?);
+        let mut connector = AcceptorConfig::parse(name, uri)?;
+        // `parseConnectorTransportConfiguration`: the connector unmasks its
+        // passwords as the broker does.
+        if let Some(mask) = config.mask_password {
+            set_param(
+                &mut connector,
+                "activemq.usemaskedpassword",
+                mask.to_string(),
+            );
+            if mask && config.password_codec != crate::mask::DEFAULT_CODEC {
+                set_param(
+                    &mut connector,
+                    "activemq.passwordcodec",
+                    config.password_codec.clone(),
+                );
+            }
+        }
+        config.connectors.push(connector);
     }
     Ok(())
+}
+
+fn set_param(uri: &mut AcceptorConfig, key: &str, value: String) {
+    match uri.params.iter_mut().find(|(k, _)| k == key) {
+        Some(slot) => slot.1 = Some(value),
+        None => uri.params.push((key.to_owned(), Some(value))),
+    }
 }
 
 /// `parseClusterConnectionConfiguration` for each `<cluster-connection>`.
@@ -1897,6 +1934,82 @@ fn parse_addresses(
         config.addresses.push(parse_address(node, warnings)?);
     }
     Ok(())
+}
+
+/// `parseQueues`: the first `<queues>` under `<core>`, deprecated
+/// (`AMQ222307`); each `queue` in it, at any depth, multicast, on its
+/// `<address>` or else its name.
+fn parse_legacy_queues(
+    core: Node<'_, '_>,
+    config: &mut BrokerConfig,
+    warnings: &mut Vec<Warning>,
+) -> Result<()> {
+    let Some(list) = core
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "queues")
+    else {
+        return Ok(());
+    };
+    warnings.push(Warning::QueuesDeprecated);
+    for node in list
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "queue")
+    {
+        let mut q = parse_queue(node, "", RoutingType::Multicast, warnings)?;
+        q.address = elements(node)
+            .filter(|c| c.tag_name().name() == "address")
+            .last()
+            .map(trimmed_text)
+            .unwrap_or_else(|| q.name.clone());
+        config.queues.push(q);
+    }
+    Ok(())
+}
+
+/// `LegacyJMSConfiguration.parseConfiguration`: the `queue`s and then the
+/// `topic`s of a `<jms>` element, at any depth. A queue is an anycast
+/// address with an anycast queue of its name, durable unless `<durable>`
+/// says otherwise, with its `<selector string>` as the filter; a topic is
+/// a multicast address.
+fn parse_jms(jms: Node<'_, '_>, config: &mut BrokerConfig, warnings: &mut Vec<Warning>) {
+    for kind in ["queue", "topic"] {
+        for node in jms
+            .descendants()
+            .filter(|n| n.is_element() && n.tag_name().name() == kind)
+        {
+            let Some(name) = node.attribute("name") else {
+                warnings.push(Warning::JmsKeyMissing {
+                    element: kind.to_owned(),
+                });
+                continue;
+            };
+            let address = if kind == "topic" {
+                AddressConfig {
+                    name: name.to_owned(),
+                    routing_types: vec![RoutingType::Multicast],
+                    queues: Vec::new(),
+                }
+            } else {
+                let mut q = QueueConfig::new(name, name, RoutingType::Anycast);
+                // `XMLConfigurationUtil.getBoolean`: the first <durable> below.
+                q.durable = node
+                    .descendants()
+                    .find(|n| n.is_element() && n.tag_name().name() == "durable")
+                    .is_none_or(node_bool);
+                q.filter = elements(node)
+                    .filter(|c| c.tag_name().name() == "selector")
+                    .filter_map(|c| c.attribute("string"))
+                    .last()
+                    .map(str::to_owned);
+                AddressConfig {
+                    name: name.to_owned(),
+                    routing_types: vec![RoutingType::Anycast],
+                    queues: vec![q],
+                }
+            };
+            config.jms_addresses.push(address);
+        }
+    }
 }
 
 fn parse_diverts(

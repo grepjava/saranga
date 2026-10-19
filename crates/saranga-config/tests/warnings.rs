@@ -33,6 +33,8 @@ fn features_not_acted_on_are_reported() {
               <security-settings><security-setting match="#"><permission type="send" roles="amq"/></security-setting></security-settings>
               <connection-routers/>
               <critical-analyzer>true</critical-analyzer>
+              <remoting-incoming-interceptors><class-name>org.example.Check</class-name></remoting-incoming-interceptors>
+              <connector-services><connector-service><factory-class>org.example.F</factory-class></connector-service></connector-services>
            </core></configuration>"##,
     );
     let names: Vec<String> = c
@@ -44,7 +46,14 @@ fn features_not_acted_on_are_reported() {
         })
         .collect();
     // The critical analyzer only watches the broker; nothing to report.
-    assert_eq!(names, ["connection-routers"]);
+    assert_eq!(
+        names,
+        [
+            "connection-routers",
+            "remoting-incoming-interceptors",
+            "connector-services"
+        ]
+    );
 }
 
 #[test]
@@ -201,26 +210,7 @@ fn unknown_nested_elements() {
 #[test]
 fn unknown_sibling_of_core() {
     let c = parse("<configuration><core/><jms/><other/></configuration>");
-    assert_eq!(c.warnings.len(), 2);
-    assert!(matches!(&c.warnings[0], Warning::Unsupported { name, .. } if name == "jms"));
-    assert_eq!(c.warnings[1], unknown("configuration", "other"));
-}
-
-#[test]
-fn xinclude_is_reported() {
-    let c = parse(
-        r#"<configuration xmlns="urn:activemq" xmlns:xi="http://www.w3.org/2001/XInclude">
-              <core xmlns="urn:activemq:core">
-                 <xi:include href="addresses.xml"/>
-              </core>
-           </configuration>"#,
-    );
-    assert_eq!(
-        c.warnings,
-        [Warning::XIncludeUnsupported {
-            href: Some("addresses.xml".into())
-        }]
-    );
+    assert_eq!(c.warnings, [unknown("configuration", "other")]);
 }
 
 #[test]
@@ -243,15 +233,15 @@ fn deprecated_and_ignored_elements() {
            </core></configuration>"#,
     );
     assert!(c.wildcard_addresses.routing_enabled);
-    let names: Vec<_> = c
-        .warnings
-        .iter()
-        .map(|w| match w {
-            Warning::Unsupported { name, .. } => name.as_str(),
-            other => panic!("{other:?}"),
-        })
-        .collect();
-    assert_eq!(names, ["queues", "wild-card-routing-enabled"]);
+    assert_eq!(c.warnings.len(), 2);
+    assert_eq!(c.warnings[0], Warning::QueuesDeprecated);
+    assert_eq!(
+        c.warnings[0].to_string(),
+        "AMQ222307: The queues element is deprecated and replaced by the addresses element"
+    );
+    assert!(
+        matches!(&c.warnings[1], Warning::Unsupported { name, .. } if name == "wild-card-routing-enabled")
+    );
 }
 
 #[test]
@@ -363,4 +353,121 @@ fn pluggable_replication_policies() {
     };
     assert_eq!(r.coordination_id.as_deref(), Some("abc+"));
     assert!(r.manager.as_ref().unwrap().properties.is_empty());
+}
+
+#[test]
+fn legacy_queues_are_deployed() {
+    let c = parse(
+        r#"<configuration><core>
+              <queues>
+                 <queue name="q1"/>
+                 <queue name="q2" max-consumers="3" purge-on-no-consumers="true">
+                    <address>a2</address>
+                    <filter string="color='red'"/>
+                    <durable>false</durable>
+                    <user>bob</user>
+                 </queue>
+              </queues>
+           </core></configuration>"#,
+    );
+    assert_eq!(c.queues.len(), 2);
+    let (q1, q2) = (&c.queues[0], &c.queues[1]);
+    assert_eq!((q1.name.as_str(), q1.address.as_str()), ("q1", "q1"));
+    assert_eq!(q1.routing_type, saranga_config::RoutingType::Multicast);
+    assert!(q1.durable);
+    assert_eq!((q2.name.as_str(), q2.address.as_str()), ("q2", "a2"));
+    assert_eq!(q2.filter.as_deref(), Some("color='red'"));
+    assert!(!q2.durable);
+    assert_eq!(q2.user.as_deref(), Some("bob"));
+    assert_eq!(q2.max_consumers, Some(3));
+    assert!(q2.purge_on_no_consumers);
+    assert!(c.addresses.is_empty());
+}
+
+#[test]
+fn legacy_jms_configuration() {
+    let c = parse(
+        r#"<configuration xmlns="urn:activemq">
+              <core xmlns="urn:activemq:core"/>
+              <jms xmlns="urn:activemq:jms">
+                 <topic name="t1"/>
+                 <queue name="jq1"><selector string="x > 1"/><durable>false</durable></queue>
+                 <queue name="jq2"/>
+                 <queue/>
+              </jms>
+           </configuration>"#,
+    );
+    let shown: Vec<_> = c
+        .jms_addresses
+        .iter()
+        .map(|a| {
+            (
+                a.name.as_str(),
+                a.routing_types.clone(),
+                a.queues
+                    .iter()
+                    .map(|q| (q.name.clone(), q.filter.clone(), q.durable))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    use saranga_config::RoutingType::{Anycast, Multicast};
+    assert_eq!(
+        shown,
+        [
+            (
+                "jq1",
+                vec![Anycast],
+                vec![("jq1".to_owned(), Some("x > 1".to_owned()), false)]
+            ),
+            ("jq2", vec![Anycast], vec![("jq2".to_owned(), None, true)]),
+            ("t1", vec![Multicast], vec![]),
+        ]
+    );
+    assert_eq!(
+        c.warnings,
+        [Warning::JmsKeyMissing {
+            element: "queue".into()
+        }]
+    );
+    assert!(c.addresses.is_empty());
+}
+
+#[test]
+fn xinclude_brings_in_another_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("addresses.xml"),
+        r#"<addresses xmlns="urn:activemq:core">
+             <address name="${prefix}.q"><anycast><queue name="${prefix}.q"/></anycast></address>
+           </addresses>"#,
+    )
+    .unwrap();
+    let xml = format!(
+        r#"<configuration xmlns="urn:activemq" xmlns:xi="http://www.w3.org/2001/XInclude">
+              <core xmlns="urn:activemq:core">
+                 <name>${{name}}</name>
+                 <xi:include href="{}/addresses.xml"/>
+              </core>
+           </configuration>"#,
+        dir.path().display()
+    );
+    let lookup = |k: &str| match k {
+        "name" => Some("b1".to_owned()),
+        "prefix" => Some("orders".to_owned()),
+        _ => None,
+    };
+    let c = BrokerConfig::parse_with(&xml, lookup).unwrap();
+    assert_eq!(c.name, "b1");
+    assert_eq!(c.addresses.len(), 1);
+    assert_eq!(c.addresses[0].name, "orders.q");
+    assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+
+    let missing = r#"<configuration xmlns:xi="http://www.w3.org/2001/XInclude"><core>
+           <xi:include href="no-such-file.xml"/></core></configuration>"#;
+    let e = BrokerConfig::parse_with(missing, |_| None).unwrap_err();
+    assert!(
+        e.to_string().contains("no fallback element was found"),
+        "{e}"
+    );
 }

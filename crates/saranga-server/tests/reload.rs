@@ -136,3 +136,72 @@ async fn queue_update_is_recovered() {
     assert_eq!(orders.max_consumers, 1);
     assert_eq!(orders.filter_string.as_deref(), Some("colour = 'red'"));
 }
+
+/// The deprecated `<queues>` (`deployQueuesFromConfiguration`), at start
+/// and on reload, and the legacy `<jms>` (`LegacyJMSConfiguration`), at
+/// start only.
+#[tokio::test]
+async fn legacy_queues_and_jms() {
+    use saranga_server::RoutingType;
+    let dir = tempfile::tempdir().unwrap();
+    let file = cfg::BrokerConfig::parse(
+        r#"<configuration xmlns="urn:activemq">
+             <core xmlns="urn:activemq:core">
+               <persistence-enabled>false</persistence-enabled>
+               <queues>
+                 <queue name="q1"/>
+                 <queue name="q2"><address>a2</address><filter string="x = 1"/></queue>
+               </queues>
+             </core>
+             <jms xmlns="urn:activemq:jms">
+               <queue name="jq"><selector string="y = 2"/></queue>
+               <topic name="jt"/>
+             </jms>
+           </configuration>"#,
+    )
+    .unwrap();
+    let broker = start(&file, dir.path()).await;
+    let po = broker.post_office();
+    let q1 = po.queue("q1").unwrap();
+    assert_eq!(&*q1.config().address, "q1");
+    assert!(
+        po.address_info("q1")
+            .unwrap()
+            .routing_types
+            .contains(RoutingType::Multicast)
+    );
+    let q2 = po.queue("q2").unwrap();
+    assert_eq!(&*q2.config().address, "a2");
+    assert_eq!(q2.filter_string().as_deref(), Some("x = 1"));
+    assert!(
+        po.address_info("a2")
+            .unwrap()
+            .routing_types
+            .contains(RoutingType::Multicast)
+    );
+    let jq = po.queue("jq").unwrap();
+    assert_eq!(&*jq.config().address, "jq");
+    assert_eq!(jq.filter_string().as_deref(), Some("y = 2"));
+    assert!(
+        po.address_info("jq")
+            .unwrap()
+            .routing_types
+            .contains(RoutingType::Anycast)
+    );
+    let jt = po.address_info("jt").unwrap();
+    assert!(jt.routing_types.contains(RoutingType::Multicast));
+    assert!(!jt.routing_types.contains(RoutingType::Anycast));
+
+    broker
+        .reload(
+            Reload::from_file_config(&xml(
+                false,
+                "<queues><queue name=\"q3\"><address>a3</address></queue></queues>",
+            ))
+            .unwrap(),
+        )
+        .await;
+    assert_eq!(&*po.queue("q3").unwrap().config().address, "a3");
+    // Nothing is undeployed without config-delete-* FORCE.
+    assert!(po.queue("q1").is_some() && po.queue("jq").is_some());
+}

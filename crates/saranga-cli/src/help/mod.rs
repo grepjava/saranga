@@ -18,10 +18,8 @@ const WIDTH: usize = 80;
 /// option column.
 const LONG_OPTIONS_MAX_WIDTH: usize = 20;
 
-/// The commands of Artemis's command line that saranga does not have (the
-/// lock coordinators, `properties`, `check cluster` with clustering), and
-/// the deprecated `auto-complete`.
-const MISSING: [&str; 4] = ["lock", "properties", "check cluster", "auto-complete"];
+/// The commands of Artemis's command line that saranga does not have yet.
+const MISSING: [&str; 3] = ["lock", "properties", "check cluster"];
 
 /// Where the command line is: `buildCommand`'s choice of commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

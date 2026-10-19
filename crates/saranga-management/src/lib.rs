@@ -288,6 +288,10 @@ pub async fn start(
                 router = router
                     .route(&format!("/{url}"), get(handler.clone()))
                     .route(&format!("/{url}/"), get(handler));
+            } else {
+                tracing::warn!(
+                    "the web app {war} at /{url} is not served: Saranga runs no JVM and serves only the console and the metrics app"
+                );
             }
         }
         tokio::spawn(serve(listener, b.tls.clone(), router));
