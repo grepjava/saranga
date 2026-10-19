@@ -1259,7 +1259,7 @@ impl Broker {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if let Some(load) = loader {
-            self.reload(load()?).await;
+            self.reload(load()?).await?;
         }
         Ok(())
     }

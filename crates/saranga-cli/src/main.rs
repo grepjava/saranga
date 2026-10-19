@@ -819,11 +819,25 @@ fn protocol_managers(
     ]
 }
 
+/// `RemotingServiceImpl.startAcceptors`: the acceptors start in the order
+/// the HashMap of them by name iterates.
+fn start_order(binds: Vec<Bind>) -> Vec<Bind> {
+    let hashes: Vec<i32> = binds
+        .iter()
+        .map(|b| saranga_buffer::java_hash::string_hash(&b.name))
+        .collect();
+    let order = saranga_buffer::java_hash::hash_map_order(&hashes, None);
+    let mut slots: Vec<Option<Bind>> = binds.into_iter().map(Some).collect();
+    order.into_iter().filter_map(|i| slots[i].take()).collect()
+}
+
 /// An acceptor to open.
 struct Bind {
     name: String,
     address: String,
     acceptor: Acceptor,
+    /// `autoStart`: false leaves it for management to start.
+    auto_start: bool,
 }
 
 /// Every protocol Artemis has, by the name acceptors list it under.
@@ -855,6 +869,19 @@ fn check_connectors(file: &saranga_config::BrokerConfig) -> anyhow::Result<()> {
 fn acceptors(file: &saranga_config::BrokerConfig, served: &[&str]) -> anyhow::Result<Vec<Bind>> {
     let mut out = Vec::new();
     for a in &file.acceptors {
+        out.extend(acceptor(file, a, served)?);
+    }
+    Ok(out)
+}
+
+/// `createAcceptor` for one configured acceptor: `None` when Saranga
+/// serves none of its protocols.
+fn acceptor(
+    file: &saranga_config::BrokerConfig,
+    a: &saranga_config::AcceptorConfig,
+    served: &[&str],
+) -> anyhow::Result<Option<Bind>> {
+    {
         let name = a.name.clone().unwrap_or_default();
         let listed = a.protocols();
         for p in &listed {
@@ -904,7 +931,7 @@ fn acceptors(file: &saranga_config::BrokerConfig, served: &[&str]) -> anyhow::Re
                 "acceptor {name} was not opened: Saranga does not serve {} yet",
                 missing.join(", ")
             );
-            continue;
+            return Ok(None);
         }
         if !missing.is_empty() {
             tracing::warn!(
@@ -941,7 +968,7 @@ fn acceptors(file: &saranga_config::BrokerConfig, served: &[&str]) -> anyhow::Re
                 (secs > 0).then(|| std::time::Duration::from_secs(secs as u64))
             }
         };
-        out.push(Bind {
+        Ok(Some(Bind {
             name: name.clone(),
             address: format!("{host}:{port}"),
             acceptor: Acceptor {
@@ -966,9 +993,13 @@ fn acceptors(file: &saranga_config::BrokerConfig, served: &[&str]) -> anyhow::Re
                     .map(|(k, v)| (k.clone(), v.clone().unwrap_or_default()))
                     .collect(),
             },
-        });
+            // ConfigurationHelper.getBooleanProperty: a parameter without
+            // a value is the default.
+            auto_start: a
+                .param("autoStart")
+                .is_none_or(|v| v.eq_ignore_ascii_case("true")),
+        }))
     }
-    Ok(out)
 }
 
 /// A frame size acceptor parameter, in bytes.
@@ -1008,44 +1039,141 @@ async fn watch_stop_files(dir: PathBuf, allow_kill: bool) -> Stop {
     }
 }
 
-/// `configuration-file-refresh-period`: every period, if `broker.xml` or
-/// the broker properties changed, they are read again and the broker
-/// reloads what can change while it runs (`ReloadManagerImpl`).
+/// What a reload reads (`reloadConfigurationFile`): `broker.xml` and the
+/// broker properties again, validated, with the acceptors they configure.
+fn read_reload(
+    instance: &instance::Instance,
+    reload_period: std::time::Duration,
+    with_acceptors: bool,
+) -> anyhow::Result<saranga_server::reload::Reload> {
+    let file = instance.broker_config_validated(saranga_config::Validation::Reload)?;
+    let mut reload = saranga_server::reload::Reload::from_file_config(&file)?;
+    if with_acceptors {
+        reload.acceptors = Some(acceptor_plan(Arc::new(file), reload_period));
+    }
+    Ok(reload)
+}
+
+/// Every configured acceptor's name and parameters.
+fn configured_acceptors(
+    file: &saranga_config::BrokerConfig,
+) -> Vec<(String, saranga_config::TransportParams)> {
+    file.acceptors
+        .iter()
+        .map(|a| (a.name.clone().unwrap_or_default(), a.transport_params()))
+        .collect()
+}
+
+/// The acceptors of a configuration read again, made on demand as
+/// `updateAcceptors` makes the new and changed ones.
+fn acceptor_plan(
+    file: Arc<saranga_config::BrokerConfig>,
+    reload_period: std::time::Duration,
+) -> saranga_server::acceptors::AcceptorPlan {
+    saranga_server::acceptors::AcceptorPlan {
+        configured: configured_acceptors(&file),
+        create: Box::new(move |name| {
+            // The last of a name, as the map of them keeps it.
+            let Some(a) = file
+                .acceptors
+                .iter()
+                .rev()
+                .find(|a| a.name.as_deref().unwrap_or_default() == name)
+            else {
+                return Ok(None);
+            };
+            let bind = acceptor(&file, a, &SERVED_PROTOCOLS).map_err(|e| format!("{e:#}"))?;
+            Ok(bind.map(|b| {
+                if let Some(tls) = &b.acceptor.tls {
+                    tls.spawn_reloader(reload_period);
+                }
+                saranga_server::acceptors::NewAcceptor {
+                    address: b.address,
+                    acceptor: b.acceptor,
+                    auto_start: b.auto_start,
+                }
+            }))
+        }),
+    }
+}
+
+/// `File.lastModified`: milliseconds, 0 when the file is missing.
+fn last_modified(path: &std::path::Path) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// `configuration-file-refresh-period`: every period, each watched file
+/// whose modification time moved forward (or that appeared) reloads the
+/// configuration: `broker.xml` and the broker properties are read again
+/// and the broker reloads what can change while it runs
+/// (`ReloadManagerImpl.ReloadRegistry.check`). Two files changed reload
+/// twice, as Artemis's callbacks do.
 fn spawn_config_reloader(
     instance: Arc<instance::Instance>,
     current: Arc<saranga_server::Current>,
     period: std::time::Duration,
+    with_acceptors: bool,
 ) {
+    let mut registry: Vec<(PathBuf, i64)> = instance
+        .watched()
+        .into_iter()
+        .map(|path| {
+            if !path.exists() {
+                tracing::warn!("AMQ222219: File {} does not exist", path.display());
+            }
+            let modified = last_modified(&path);
+            (path, modified)
+        })
+        .collect();
     tokio::spawn(async move {
-        let mut last = instance.config_fingerprint();
         let mut tick = tokio::time::interval(period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
         loop {
             tick.tick().await;
-            let now = instance.config_fingerprint();
-            if now == last {
-                continue;
+            let mut due = 0;
+            for (path, last) in registry.iter_mut() {
+                let modified = last_modified(path);
+                if (*last > 0 && modified > *last) || (modified > 0 && *last == 0) {
+                    due += 1;
+                }
+                *last = modified;
             }
-            last = now;
-            let reload = instance
-                .broker_config_validated(saranga_config::Validation::Reload)
-                .and_then(|c| {
-                    saranga_server::reload::Reload::from_file_config(&c)
-                        .map_err(anyhow::Error::from)
-                });
-            match reload {
-                Ok(reload) => current.get().reload(reload).await,
-                Err(e) => match e.downcast_ref::<saranga_config::DecodeError>() {
-                    // What the parser threw: ReloadManagerImpl logs it.
-                    Some(d) => tracing::error!(
-                        "AMQ224069: Change detected in broker configuration file, but reload failed\n{d}"
-                    ),
-                    None => tracing::warn!("configuration not reloaded: {e:#}"),
-                },
+            for _ in 0..due {
+                reload_from_files(&instance, &current, period, with_acceptors).await;
             }
         }
     });
+}
+
+/// One reload callback: the configuration read again and reloaded, or why
+/// not logged.
+async fn reload_from_files(
+    instance: &instance::Instance,
+    current: &saranga_server::Current,
+    period: std::time::Duration,
+    with_acceptors: bool,
+) {
+    match read_reload(instance, period, with_acceptors) {
+        Ok(reload) => {
+            if let Err(e) = current.get().reload(reload).await {
+                tracing::error!(
+                    "AMQ224069: Change detected in broker configuration file, but reload failed\n{e}"
+                );
+            }
+        }
+        Err(e) => match e.downcast_ref::<saranga_config::DecodeError>() {
+            // What the parser threw: ReloadManagerImpl logs it.
+            Some(d) => tracing::error!(
+                "AMQ224069: Change detected in broker configuration file, but reload failed\n{d}"
+            ),
+            None => tracing::warn!("configuration not reloaded: {e:#}"),
+        },
+    }
 }
 
 /// `anycastPrefix` and `multicastPrefix`, each a comma-separated list
@@ -1200,6 +1328,9 @@ struct Started {
     backup: bool,
     /// Where `server.lock` is, with persistence.
     lock_dir: Option<PathBuf>,
+    /// Whether the configured acceptors are open, and so reloaded: not
+    /// with `--bind`.
+    acceptors_configured: bool,
 }
 
 /// `ActiveMQServerImpl.internalStart` as `run` does it: the configuration
@@ -1270,9 +1401,11 @@ async fn boot(
             name: "core".to_owned(),
             address: String::new(),
             acceptor: Acceptor::default(),
+            auto_start: true,
         });
         binds = vec![Bind {
             address: bind.to_string(),
+            auto_start: true,
             ..first
         }];
     } else if binds.is_empty() {
@@ -1280,6 +1413,7 @@ async fn boot(
             name: "artemis".to_owned(),
             address: "0.0.0.0:61616".to_owned(),
             acceptor: Acceptor::default(),
+            auto_start: true,
         }];
     }
     broker_config.protocols = protocol_managers(file_config.as_ref(), &binds);
@@ -1413,14 +1547,22 @@ async fn boot(
         _ => None,
     };
     let broker = Broker::start_activated(broker_config, backup.clone()).await?;
+    if let (Some(file), None) = (&file_config, bind) {
+        broker.set_configured_acceptors(configured_acceptors(file));
+    }
     for Bind {
         name,
         address,
         acceptor,
-    } in binds
+        auto_start,
+    } in start_order(binds)
     {
         if let Some(tls) = &acceptor.tls {
             tls.spawn_reloader(reload_period);
+        }
+        if !auto_start {
+            broker.add_stopped_acceptor(&name, &address, acceptor);
+            continue;
         }
         if let Err(e) = broker
             .add_acceptor(&name, &address, acceptor)
@@ -1442,6 +1584,7 @@ async fn boot(
         reload_period,
         backup: backup.is_some(),
         lock_dir,
+        acceptors_configured: bind.is_none(),
     })
 }
 
@@ -1568,14 +1711,10 @@ fn announce(instance: Option<&Arc<instance::Instance>>, started: &Started) {
     if let Some(instance) = instance {
         // reloadConfigurationFile through management.
         let loader = instance.clone();
+        let reload_period = started.reload_period;
+        let with_acceptors = started.acceptors_configured;
         broker.set_config_loader(Arc::new(move || {
-            loader
-                .broker_config_validated(saranga_config::Validation::Reload)
-                .and_then(|c| {
-                    saranga_server::reload::Reload::from_file_config(&c)
-                        .map_err(anyhow::Error::from)
-                })
-                .map_err(|e| format!("{e:#}"))
+            read_reload(&loader, reload_period, with_acceptors).map_err(|e| format!("{e:#}"))
         }));
     }
 }
@@ -1700,7 +1839,12 @@ async fn run(
     }
     announce(instance.as_ref(), &started);
     if let Some(instance) = &instance {
-        spawn_config_reloader(instance.clone(), current.clone(), started.reload_period);
+        spawn_config_reloader(
+            instance.clone(),
+            current.clone(),
+            started.reload_period,
+            started.acceptors_configured,
+        );
     }
     let mut network = match &started.file {
         Some(file) => network_monitor(file.clone()).await,

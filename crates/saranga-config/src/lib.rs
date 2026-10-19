@@ -33,7 +33,7 @@ mod wildcard;
 pub mod xerces;
 mod xinclude;
 
-pub use acceptor::{AcceptorConfig, query_params};
+pub use acceptor::{AcceptorConfig, TransportParams, query_params};
 pub use address_settings::{
     AddressFullMessagePolicy, AddressSettings, DeletionPolicy, DiskFullMessagePolicy,
     PageFullMessagePolicy, SettingValue, SlowConsumerPolicy, SlowConsumerThresholdMeasurementUnit,

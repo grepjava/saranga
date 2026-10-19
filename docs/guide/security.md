@@ -54,7 +54,7 @@ These login modules are supported, with Artemis's class names and options:
 
 `Krb5LoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not supported. An entry that names one gets a warning at startup, and logins that reach that module fail. Saranga also warns at startup when the domain `bootstrap.xml` names has no entry in `login.config`.
 
-`jaasConfigs` broker properties replace the realm of the same name in `login.config`, as in Artemis. Neither `login.config` nor `jaasConfigs` is reloaded while the broker runs.
+`jaasConfigs` broker properties replace the realm of the same name in `login.config`, as in Artemis. A configuration reload applies the `jaasConfigs` it reads, as Artemis's does. Artemis puts each reload's realms in front of the ones before them, so a realm that a later reload no longer names is still used, and Saranga does the same. Restart the broker to drop a realm. `login.config` itself is not reloaded while the broker runs, in either broker.
 
 An acceptor's `securityDomain` parameter makes its clients log in through another entry, as Artemis's per-acceptor security domains do.
 

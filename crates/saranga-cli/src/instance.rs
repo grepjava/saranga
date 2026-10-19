@@ -15,7 +15,7 @@ use saranga_config::{
     BootstrapConfig, BootstrapSecurity, BrokerConfig, ConfigError, DecodeError, Validation,
     broker_properties,
 };
-use saranga_security::jaas::{ControlFlag, ModuleEntry, ModuleFactory};
+use saranga_security::jaas::ModuleFactory;
 use saranga_security::{
     BasicSecurityManager, JaasSecurityManager, LoginConfig, SecurityManager, SecurityStore,
     SecurityStoreConfig,
@@ -99,6 +99,9 @@ pub struct Instance {
     pub system: Vec<(String, String)>,
     /// `--properties`: broker properties sources.
     broker_properties: Option<String>,
+    /// Whether `etc/broker.properties` existed when first looked for: `run`
+    /// decides it once, as it starts.
+    etc_properties: std::sync::OnceLock<bool>,
 }
 
 impl Instance {
@@ -193,6 +196,7 @@ impl Instance {
             properties,
             system: options.system,
             broker_properties: options.broker_properties,
+            etc_properties: std::sync::OnceLock::new(),
         }
     }
 
@@ -362,40 +366,19 @@ impl Instance {
     }
 
     /// What a change to reloads the configuration: `broker.xml` and the
-    /// broker properties sources (`ActiveMQServerImpl`'s reload callbacks).
-    fn watched(&self) -> Vec<PathBuf> {
+    /// broker properties sources, a directory among them watched as itself
+    /// (`ActiveMQServerImpl`'s reload callbacks), each once.
+    pub fn watched(&self) -> Vec<PathBuf> {
         let mut paths = vec![self.broker_xml.clone()];
         if let Some(sources) = self.broker_properties_sources() {
             for source in sources.split(',') {
-                let path = source.split_once('?').map_or(source, |(p, _)| p);
-                paths.push(PathBuf::from(path));
+                let path = PathBuf::from(source.split_once('?').map_or(source, |(p, _)| p));
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
             }
         }
         paths
-    }
-
-    /// The modification times of the watched files, and of the files in
-    /// watched directories: a reload is due when it changes.
-    pub fn config_fingerprint(&self) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
-        let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-        let mut out = Vec::new();
-        for path in self.watched() {
-            if path.is_dir() {
-                let mut files: Vec<PathBuf> = std::fs::read_dir(&path)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|e| Some(e.ok()?.path()))
-                    .collect();
-                files.sort();
-                out.extend(files.into_iter().map(|f| {
-                    let t = mtime(&f);
-                    (f, t)
-                }));
-            }
-            let t = mtime(&path);
-            out.push((path, t));
-        }
-        out
     }
 
     /// `Configuration.resolvePropertiesSources`: the `broker.properties`
@@ -406,8 +389,8 @@ impl Instance {
             .or_else(|| self.broker_properties.clone())
             .or_else(|| {
                 let default = self.etc.join("broker.properties");
-                default
-                    .exists()
+                self.etc_properties
+                    .get_or_init(|| default.exists())
                     .then(|| default.display().to_string().replace('\\', "/"))
             })
     }
@@ -440,7 +423,7 @@ impl Instance {
             }
         };
         let path = self.etc.join("login.config");
-        let mut login = if path.exists() {
+        let login = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             match LoginConfig::parse(&text, |n| self.lookup(n)) {
@@ -464,24 +447,14 @@ impl Instance {
             LoginConfig::default()
         };
         // `ConfigurationImpl.getAppConfigurationEntry`: a realm from broker
-        // properties replaces the one in login.config.
-        for (realm, modules) in &config.jaas_configs {
-            let entries = modules
-                .iter()
-                .map(|m| ModuleEntry {
-                    class_name: m.login_module_class.clone(),
-                    flag: if m.control_flag.is_empty() {
-                        ControlFlag::Required
-                    } else {
-                        ControlFlag::parse(&m.control_flag).unwrap_or(ControlFlag::Required)
-                    },
-                    options: m.params.clone(),
-                })
-                .collect();
-            login.entries.retain(|(n, _)| n != realm);
-            login.entries.push((realm.clone(), entries));
-        }
-        for (name, modules) in login.entries.iter().filter(|_| enabled) {
+        // properties is used over the one in login.config.
+        let realms = saranga_security::manager::realms(&config.jaas_configs);
+        let in_use = login
+            .entries
+            .iter()
+            .filter(|(n, _)| !realms.iter().any(|(r, _)| r == n))
+            .chain(realms.iter());
+        for (name, modules) in in_use.filter(|_| enabled) {
             for m in modules {
                 if !ModuleFactory::supports(&m.class_name) {
                     tracing::warn!(
@@ -496,6 +469,7 @@ impl Instance {
             if enabled
                 && (path.exists() || !config.jaas_configs.is_empty())
                 && login.entry(d).is_none()
+                && !realms.iter().any(|(r, _)| r == d)
             {
                 tracing::warn!(
                     "{}: no entry for the security domain {d}: logins through it fail",
@@ -504,6 +478,7 @@ impl Instance {
             }
         }
         let manager = JaasSecurityManager::new(login, Some(&self.etc), domain, certificate_domain);
+        manager.set_jaas_configs(realms);
         Ok(Security {
             store: Some(self.store(config, Arc::new(manager))?),
             ..Security::default()

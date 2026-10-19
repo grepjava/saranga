@@ -30,6 +30,10 @@ pub struct Reload {
     pub bridge_targets: crate::bridge::Targets,
     /// What the broker properties read reported (`setStatus`).
     pub status: saranga_buffer::json::Json,
+    /// The realms of `jaasConfigs`.
+    pub jaas_configs: saranga_security::manager::Realms,
+    /// The acceptors, when whoever read the configuration can make them.
+    pub acceptors: Option<crate::acceptors::AcceptorPlan>,
 }
 
 impl Reload {
@@ -49,6 +53,8 @@ impl Reload {
             bridges: config.bridges.clone(),
             bridge_targets: crate::bridge::Targets::from_file(config),
             status: config.status.clone(),
+            jaas_configs: saranga_security::manager::realms(&config.jaas_configs),
+            acceptors: None,
         })
     }
 }
@@ -58,8 +64,14 @@ fn reloading(what: &str) {
 }
 
 impl Broker {
-    /// `deployReloadableConfigFromConfiguration`.
-    pub async fn reload(self: &std::sync::Arc<Self>, reload: Reload) {
+    /// `updateReloadableConfigurationFrom` and
+    /// `deployReloadableConfigFromConfiguration`. An acceptor that fails to
+    /// start fails the reload, before `AMQ221087`.
+    pub async fn reload(self: &std::sync::Arc<Self>, reload: Reload) -> Result<(), String> {
+        // parseProperties and setJaasConfigs, before anything deploys.
+        if let Some(jaas) = self.security.as_ref().and_then(|s| s.manager().as_jaas()) {
+            jaas.reload_jaas_configs(reload.jaas_configs);
+        }
         saranga_buffer::status::update(
             saranga_buffer::status::CONFIGURATION_COMPONENT,
             reload.status,
@@ -83,7 +95,16 @@ impl Broker {
         self.bridges.set_targets(reload.bridge_targets);
         self.reload_bridges(&reload.bridges).await;
 
+        // Saranga has no connection routers to update.
+        reloading("connection routers");
+
+        reloading("protocol services");
+        if let Some(plan) = reload.acceptors {
+            self.update_acceptors(plan).await?;
+        }
+
         tracing::info!("AMQ221087: Configuration reload completed");
+        Ok(())
     }
 }
 

@@ -251,27 +251,27 @@ fn user_store(m: &Management, broker: &Broker) -> Result<UserStore, String> {
         .map(Path::to_path_buf)
         .ok_or("AMQ229218: Failed to locate broker configuration URL")?;
     let jaas = broker.security_store().and_then(|s| s.manager().as_jaas());
-    let parsed;
-    let (config, domain) = match jaas {
-        Some(j) => (j.config(), j.domain()),
-        None => {
-            let text = std::fs::read_to_string(etc.join("login.config"))
-                .map_err(|_| "AMQ229219: Failed to load security configuration".to_owned())?;
-            parsed = saranga_security::LoginConfig::parse(&text, |_| None)
-                .map_err(|_| "AMQ229219: Failed to load security configuration".to_owned())?;
-            (
-                &parsed,
-                saranga_security::JaasSecurityManager::DEFAULT_DOMAIN,
-            )
-        }
+    let domain = match jaas {
+        Some(j) => j.domain(),
+        None => saranga_security::JaasSecurityManager::DEFAULT_DOMAIN,
     };
     let domain = if domain.is_empty() {
         "activemq"
     } else {
         domain
     };
-    let entries = config
-        .entry(domain)
+    let entries = match jaas {
+        // Configuration.getConfiguration(), jaasConfigs included.
+        Some(j) => j.entry(domain),
+        None => {
+            let text = std::fs::read_to_string(etc.join("login.config"))
+                .map_err(|_| "AMQ229219: Failed to load security configuration".to_owned())?;
+            let parsed = saranga_security::LoginConfig::parse(&text, |_| None)
+                .map_err(|_| "AMQ229219: Failed to load security configuration".to_owned())?;
+            parsed.entry(domain).map(<[_]>::to_vec)
+        }
+    };
+    let entries = entries
         .filter(|e| !e.is_empty())
         .ok_or("AMQ229219: Failed to load security configuration")?;
     let entry = entries

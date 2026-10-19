@@ -78,7 +78,8 @@ async fn reload_reconciles() {
 
     broker
         .reload(Reload::from_file_config(&xml(false, AFTER)).unwrap())
-        .await;
+        .await
+        .unwrap();
 
     assert_eq!(
         po.settings("orders").max_delivery_attempts,
@@ -127,7 +128,8 @@ async fn queue_update_is_recovered() {
     let broker = start(&xml(true, BEFORE), dir.path()).await;
     broker
         .reload(Reload::from_file_config(&xml(true, AFTER)).unwrap())
-        .await;
+        .await
+        .unwrap();
     broker.stop().unwrap();
     drop(broker);
 
@@ -200,8 +202,127 @@ async fn legacy_queues_and_jms() {
             ))
             .unwrap(),
         )
-        .await;
+        .await
+        .unwrap();
     assert_eq!(&*po.queue("q3").unwrap().config().address, "a3");
     // Nothing is undeployed without config-delete-* FORCE.
     assert!(po.queue("q1").is_some() && po.queue("jq").is_some());
+}
+
+/// A port nothing listens on.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn listens(port: u16) -> bool {
+    std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+}
+
+/// An acceptor plan for `acceptors` (name and URI), making each as `run`
+/// does.
+fn plan(acceptors: &[(&str, String)]) -> saranga_server::acceptors::AcceptorPlan {
+    let configs: Vec<cfg::AcceptorConfig> = acceptors
+        .iter()
+        .map(|(name, uri)| cfg::AcceptorConfig::parse(Some(name), uri).unwrap())
+        .collect();
+    saranga_server::acceptors::AcceptorPlan {
+        configured: configs
+            .iter()
+            .map(|a| (a.name.clone().unwrap(), a.transport_params()))
+            .collect(),
+        create: Box::new(move |name| {
+            let a = configs
+                .iter()
+                .find(|a| a.name.as_deref() == Some(name))
+                .unwrap();
+            let port = a.port.unwrap();
+            Ok(Some(saranga_server::acceptors::NewAcceptor {
+                address: format!("127.0.0.1:{port}"),
+                acceptor: saranga_server::Acceptor {
+                    name: name.to_owned(),
+                    host: "127.0.0.1".to_owned(),
+                    port,
+                    ..Default::default()
+                },
+                auto_start: a.param("autoStart").is_none_or(|v| v == "true"),
+            }))
+        }),
+    }
+}
+
+/// `updateAcceptors`: a changed acceptor is made again, a removed one
+/// stops, a new one starts unless `autoStart` is false, and one whose
+/// parameters are only reordered is left alone.
+#[tokio::test]
+async fn acceptors_are_reconciled() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(&xml(false, ""), dir.path()).await;
+    let [kept, changed, moved, removed, added, manual] = std::array::from_fn(|_| free_port());
+    let uri = |port: u16, query: &str| format!("tcp://127.0.0.1:{port}?{query}");
+    let before = [
+        ("kept", uri(kept, "tcpNoDelay=true;protocols=CORE")),
+        ("changed", uri(changed, "protocols=CORE")),
+        ("removed", uri(removed, "protocols=CORE")),
+    ];
+    let p = plan(&before);
+    broker.set_configured_acceptors(p.configured.clone());
+    for (name, uri) in &before {
+        let a = cfg::AcceptorConfig::parse(Some(name), uri).unwrap();
+        let port = a.port.unwrap();
+        broker
+            .add_acceptor(
+                name,
+                &format!("127.0.0.1:{port}"),
+                saranga_server::Acceptor {
+                    name: name.to_string(),
+                    host: "127.0.0.1".to_owned(),
+                    port,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    assert!(listens(kept) && listens(changed) && listens(removed));
+
+    let mut reload = Reload::from_file_config(&xml(false, "")).unwrap();
+    reload.acceptors = Some(plan(&[
+        ("kept", uri(kept, "protocols=CORE;tcpNoDelay=true")),
+        ("changed", uri(moved, "protocols=CORE")),
+        ("added", uri(added, "protocols=CORE")),
+        ("manual", uri(manual, "protocols=CORE;autoStart=false")),
+    ]));
+    broker.reload(reload).await.unwrap();
+    assert!(listens(kept), "kept");
+    assert!(!listens(changed) && listens(moved), "changed");
+    assert!(!listens(removed), "removed");
+    assert!(listens(added), "added");
+    assert!(!listens(manual), "autoStart=false");
+    let mut names = broker.acceptor_names();
+    names.sort();
+    assert_eq!(names, ["added", "changed", "kept", "manual"]);
+    assert_eq!(broker.acceptor("manual").map(|(_, started)| started), Some(false));
+    broker.start_acceptor("manual").await.unwrap();
+    assert!(listens(manual));
+
+    // A new acceptor on a port in use fails the reload, after the others.
+    let mut reload = Reload::from_file_config(&xml(false, "")).unwrap();
+    reload.acceptors = Some(plan(&[
+        ("kept", uri(kept, "protocols=CORE;tcpNoDelay=true")),
+        ("changed", uri(moved, "protocols=CORE")),
+        ("added", uri(added, "protocols=CORE")),
+        ("manual", uri(manual, "protocols=CORE;autoStart=false")),
+        ("clash", uri(kept, "protocols=CORE")),
+    ]));
+    let e = broker.reload(reload).await.unwrap_err();
+    assert!(
+        e.starts_with(&format!(
+            "java.lang.IllegalStateException: AMQ229230: Failed to bind acceptor clash to 127.0.0.1:{kept}\nCaused by: java.net.BindException: Address already in use"
+        )),
+        "{e}"
+    );
 }

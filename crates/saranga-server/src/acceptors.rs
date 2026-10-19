@@ -2,8 +2,10 @@
 //! reaches them): each listens under its name until management stops it,
 //! and `reload` binds it again with its TLS stores read again.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use saranga_config::TransportParams;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -17,6 +19,30 @@ pub const FACTORY: &str =
 #[derive(Default)]
 pub(crate) struct Acceptors {
     running: Mutex<Vec<Arc<Running>>>,
+    /// Every configured acceptor's parameters by name, those Saranga does
+    /// not open included (`RemotingServiceImpl.acceptorsConfig`).
+    configured: Mutex<HashMap<String, TransportParams>>,
+}
+
+/// The acceptors of a configuration read again, for
+/// `RemotingServiceImpl.updateAcceptors`.
+pub struct AcceptorPlan {
+    /// Each configured acceptor's name and parameters, in the order
+    /// configured.
+    pub configured: Vec<(String, TransportParams)>,
+    /// `createAcceptor` for the acceptor of that name: `None` when Saranga
+    /// does not open it (with a warning), an error when it cannot be made.
+    #[allow(clippy::type_complexity)]
+    pub create: Box<dyn Fn(&str) -> Result<Option<NewAcceptor>, String> + Send + Sync>,
+}
+
+/// An acceptor made from the configuration.
+pub struct NewAcceptor {
+    /// Where it binds: `host:port`.
+    pub address: String,
+    pub acceptor: Acceptor,
+    /// `autoStart`: started as it is made, else only through management.
+    pub auto_start: bool,
 }
 
 struct Running {
@@ -31,6 +57,16 @@ struct Running {
 }
 
 impl Running {
+    fn new(name: &str, address: &str, acceptor: Acceptor) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.to_owned(),
+            address: address.to_owned(),
+            acceptor: Arc::new(acceptor),
+            listening: Mutex::new(None),
+            closing: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
     fn listening(&self) -> std::sync::MutexGuard<'_, Option<JoinHandle<()>>> {
         self.listening.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -51,6 +87,23 @@ impl Acceptors {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    fn remove(&self, name: &str) -> Option<Arc<Running>> {
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        let i = running.iter().position(|r| r.name == name)?;
+        Some(running.remove(i))
+    }
+
+    fn push(&self, running: Arc<Running>) {
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(running);
+    }
+
+    fn configured(&self) -> std::sync::MutexGuard<'_, HashMap<String, TransportParams>> {
+        self.configured.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -77,20 +130,126 @@ impl Broker {
         address: &str,
         acceptor: Acceptor,
     ) -> std::io::Result<()> {
-        let running = Arc::new(Running {
-            name: name.to_owned(),
-            address: address.to_owned(),
-            acceptor: Arc::new(acceptor),
-            listening: Mutex::new(None),
-            closing: Arc::new(tokio::sync::Notify::new()),
-        });
+        let running = Running::new(name, address, acceptor);
         self.listen(&running).await?;
-        self.acceptors
-            .running
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(running);
+        self.acceptors.push(running);
         Ok(())
+    }
+
+    /// Adds an acceptor called `name` without starting it, as an acceptor
+    /// with `autoStart=false` is: management can start it.
+    pub fn add_stopped_acceptor(&self, name: &str, address: &str, acceptor: Acceptor) {
+        self.acceptors.push(Running::new(name, address, acceptor));
+    }
+
+    /// The parameters of every configured acceptor, which a reload compares
+    /// with those it reads.
+    pub fn set_configured_acceptors(&self, configured: Vec<(String, TransportParams)>) {
+        *self.acceptors.configured() = configured.into_iter().collect();
+    }
+
+    /// `RemotingServiceImpl.updateAcceptors`: an acceptor whose parameters
+    /// changed is stopped and made again, one no longer configured is
+    /// stopped, and a new one is made; those made are started unless
+    /// `autoStart` is false. The first that fails to start is the error,
+    /// after every one was tried.
+    pub(crate) async fn update_acceptors(
+        self: &Arc<Self>,
+        plan: AcceptorPlan,
+    ) -> Result<(), String> {
+        // `Collectors.toMap` by name.
+        let mut updated: Vec<(String, TransportParams)> = Vec::new();
+        for (name, params) in plan.configured {
+            match updated.iter_mut().find(|(n, _)| *n == name) {
+                Some(entry) => entry.1 = params,
+                None => updated.push((name, params)),
+            }
+        }
+        // Walked as the HashMap of them by name is.
+        let names: Vec<i32> = updated
+            .iter()
+            .map(|(n, _)| saranga_buffer::java_hash::string_hash(n))
+            .collect();
+        let updated: Vec<(String, TransportParams)> =
+            saranga_buffer::java_hash::hash_map_order(&names, None)
+                .into_iter()
+                .map(|i| updated[i].clone())
+                .collect();
+        let mut to_stop = Vec::new();
+        let mut to_create = Vec::new();
+        {
+            let mut configured = self.acceptors.configured();
+            for (name, params) in &updated {
+                match configured.get(name) {
+                    None => to_create.push(name.clone()),
+                    Some(previous) if !previous.same(params) => {
+                        to_create.push(name.clone());
+                        to_stop.push(name.clone());
+                    }
+                    Some(_) => {}
+                }
+            }
+            for name in configured.keys() {
+                if !updated.iter().any(|(n, _)| n == name) {
+                    to_stop.push(name.clone());
+                }
+            }
+            *configured = updated.iter().cloned().collect();
+        }
+        // acceptorsToCreate is a HashSet of TransportConfigurations.
+        let hashes: Vec<i32> = to_create
+            .iter()
+            .map(|name: &String| {
+                updated
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map_or(0, |(n, p)| p.hash_code(n))
+            })
+            .collect();
+        let to_create: Vec<String> = saranga_buffer::java_hash::hash_map_order(&hashes, None)
+            .into_iter()
+            .map(|i| to_create[i].clone())
+            .collect();
+        for name in &to_stop {
+            // Unregistered from management as it leaves the list.
+            if let Some(r) = self.acceptors.remove(name) {
+                self.stop_running(&r).await;
+            }
+        }
+        let mut to_start = Vec::new();
+        for name in &to_create {
+            match (plan.create)(name) {
+                Ok(Some(n)) => {
+                    let running = Running::new(name, &n.address, n.acceptor);
+                    self.acceptors.push(running.clone());
+                    if n.auto_start {
+                        to_start.push(running);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("AMQ222080: Error creating acceptor: {name}\n{e}"),
+            }
+        }
+        let mut first_error = None;
+        for r in to_start {
+            if let Err(e) = self.listen(&r).await {
+                let params = updated
+                    .iter()
+                    .find(|(n, _)| *n == r.name)
+                    .map(|(_, p)| p.params_text())
+                    .unwrap_or_default();
+                tracing::error!("AMQ224104: Error starting the Acceptor {} {params}", r.name);
+                // The IllegalStateException NettyAcceptor.start throws.
+                first_error.get_or_insert_with(|| {
+                    format!(
+                        "java.lang.IllegalStateException: {}\nCaused by: {}",
+                        failed_to_bind(&r),
+                        bind_exception(&e)
+                    )
+                });
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// `NettyAcceptor.internalStart`: binds and accepts, unless already
@@ -139,13 +298,21 @@ impl Broker {
     /// `AcceptorControl.start`.
     pub async fn start_acceptor(self: &Arc<Self>, name: &str) -> Result<(), String> {
         let r = self.acceptors.find(name).ok_or_else(|| unknown(name))?;
-        self.listen(&r).await.map_err(|e| failed_to_bind(&r, &e))
+        self.listen(&r).await.map_err(|_| failed_to_bind(&r))
     }
 
     /// `AcceptorControl.stop`: ACCEPTOR_STOPPED, then no more connections,
     /// and those it accepted are closed.
     pub async fn stop_acceptor(&self, name: &str) -> Result<(), String> {
         let r = self.acceptors.find(name).ok_or_else(|| unknown(name))?;
+        self.stop_running(&r).await;
+        Ok(())
+    }
+
+    /// `notifyStop`, `pause` and `stop`: ACCEPTOR_STOPPED, then no more
+    /// connections, and those it accepted are closed.
+    async fn stop_running(&self, r: &Running) {
+        let name = r.name.as_str();
         let host = r.acceptor.host.clone();
         let port = i32::from(r.acceptor.port);
         self.post_office.notify(
@@ -159,8 +326,8 @@ impl Broker {
                 ]
             },
         );
-        if !unbind(&r).await {
-            return Ok(());
+        if !unbind(r).await {
+            return;
         }
         r.closing.notify_waiters();
         for c in self.registry().connections() {
@@ -168,7 +335,6 @@ impl Broker {
                 c.fail();
             }
         }
-        Ok(())
     }
 
     /// `AcceptorControl.reload` (`NettyAcceptor.reload`): unbinds, reads
@@ -180,7 +346,7 @@ impl Broker {
             tls.reload().map_err(|e| e.to_string())?;
         }
         if was_listening {
-            let listener = bind(&r.address).await.map_err(|e| failed_to_bind(&r, &e))?;
+            let listener = bind(&r.address).await.map_err(|_| failed_to_bind(&r))?;
             let task = tokio::spawn(self.clone().serve_shared(
                 listener,
                 r.acceptor.clone(),
@@ -223,10 +389,28 @@ fn unknown(name: &str) -> String {
     format!("AMQ229067: Cannot find resource with name acceptor.{name}")
 }
 
-/// `ActiveMQMessageBundle.failedToBind`.
-fn failed_to_bind(r: &Running, e: &std::io::Error) -> String {
+/// `ActiveMQMessageBundle.failedToBind`: the message, without its cause.
+fn failed_to_bind(r: &Running) -> String {
     format!(
-        "AMQ229230: Failed to bind acceptor {} to {}: {e}",
+        "AMQ229230: Failed to bind acceptor {} to {}",
         r.name, r.address
     )
+}
+
+/// The exception Java's `bind` throws for `e`.
+fn bind_exception(e: &std::io::Error) -> String {
+    // sun.nio.ch.Net names the call on Windows.
+    let call = if cfg!(windows) { ": bind" } else { "" };
+    match e.kind() {
+        std::io::ErrorKind::AddrInUse => {
+            format!("java.net.BindException: Address already in use{call}")
+        }
+        std::io::ErrorKind::AddrNotAvailable => {
+            format!("java.net.BindException: Cannot assign requested address{call}")
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            format!("java.net.SocketException: Permission denied{call}")
+        }
+        _ => format!("java.net.SocketException: {e}"),
+    }
 }

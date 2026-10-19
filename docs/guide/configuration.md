@@ -114,17 +114,23 @@ Artemis's documentation on broker properties is in its [configuration index](htt
 
 ## Configuration reload
 
-While the broker runs, Saranga checks `broker.xml` and the broker properties sources (the files, and the files in directories) every `configuration-file-refresh-period` milliseconds (5000 by default). When one has changed, it reads the configuration again and logs `AMQ221056: Reloading configuration: ...` for each part, then `AMQ221087: Configuration reload completed`. If the new configuration does not parse, it keeps the running one: a `broker.xml` that is not well formed logs `AMQ224069: Change detected in broker configuration file, but reload failed` with the parser's exception, as Artemis logs it, and other failures log `configuration not reloaded: <reason>`.
+While the broker runs, Saranga checks `broker.xml` and the broker properties sources every `configuration-file-refresh-period` milliseconds (5000 by default), as Artemis's reload manager does: a file is changed when its modification time moves forward, or when it appears, and a directory of properties files when its own modification time does. Each changed file reloads the configuration once, so `broker.xml` and `broker.properties` changed together reload twice, as in Artemis. `etc/broker.properties` is watched when it exists as the broker starts; one created later is not read until a restart, as in Artemis.
+
+A reload reads the configuration again and logs `AMQ221056: Reloading configuration: ...` for each part, then `AMQ221087: Configuration reload completed`. If the new configuration does not parse, it keeps the running one: a `broker.xml` that is not well formed logs `AMQ224069: Change detected in broker configuration file, but reload failed` with the parser's exception, as Artemis logs it, and other failures log `configuration not reloaded: <reason>`.
 
 A reload does what Artemis's does:
 
+- applies the `jaasConfigs` of the broker properties (see [Security](security.md));
 - swaps the security settings and the address settings;
 - reconciles the diverts with the configured ones;
 - deploys new addresses and queues and updates the queues that exist;
 - undeploys addresses and queues that left the configuration, where `config-delete-addresses` or `config-delete-queues` is `FORCE`;
-- deploys new bridges, deploys again bridges that changed, and destroys bridges no longer configured.
+- deploys new bridges, deploys again bridges that changed, and destroys bridges no longer configured;
+- updates the acceptors, by name: an acceptor whose parameters changed is stopped and started again with them, one no longer configured is stopped, and a new one is started. Parameters are compared as Artemis compares them, so writing the same ones in another order changes nothing. Stopping an acceptor closes the connections it accepted. An acceptor with `autoStart=false` is made but not started, at startup as on a reload, and management can start it.
 
-A reload does not change acceptors, connection routers, `jaasConfigs` or AMQP broker connections. `login.config` is not reloaded either, as in Artemis. Other settings take a restart. See [Artemis's configuration reload](https://activemq.apache.org/components/artemis/documentation/latest/config-reload.html) and [COMPAT.md](../../COMPAT.md#configuration-differences).
+An acceptor that cannot be started (its port is in use, say) logs `AMQ224104: Error starting the Acceptor <name> <parameters>`, and the reload then fails with `AMQ224069` and the bind exception, before `AMQ221087`, as in Artemis. What it changed before that stays changed.
+
+A reload does not change AMQP broker connections, which Artemis's does. Saranga has no connection routers. `login.config` is not reloaded, as in Artemis. Other settings take a restart. See [Artemis's configuration reload](https://activemq.apache.org/components/artemis/documentation/latest/config-reload.html) and [COMPAT.md](../../COMPAT.md#configuration-differences).
 
 When a reload changes a queue's filter, the record Saranga writes holds the new filter, where Artemis writes the old one. Either broker reads the other's record. See [COMPAT.md](../../COMPAT.md#persistence-differences).
 

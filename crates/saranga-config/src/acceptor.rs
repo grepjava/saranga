@@ -29,6 +29,150 @@ pub struct AcceptorConfig {
     pub params: Vec<(String, Option<String>)>,
     /// The `lock-coordinator` attribute.
     pub lock_coordinator: Option<String>,
+    /// Whether it was written as a URI, whose scheme, host and port are
+    /// parameters too, or given as parameters by broker properties.
+    pub from_uri: bool,
+}
+
+/// The parameters `TransportConfiguration` holds for an acceptor, as
+/// `TCPTransportConfigurationSchema` splits them: `params`, the keys
+/// `TransportConstants.ALLOWABLE_ACCEPTOR_KEYS` allows, and `extraProps`,
+/// the others. Each is in the order Java's `HashMap` iterates it; a
+/// parameter without `=` has no value (`null`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportParams {
+    pub params: Vec<(String, Option<String>)>,
+    pub extra: Vec<(String, Option<String>)>,
+}
+
+impl TransportParams {
+    /// `TransportConfiguration.equals`, for one name: both maps are equal.
+    pub fn same(&self, other: &Self) -> bool {
+        let map = |v: &[(String, Option<String>)]| {
+            v.iter()
+                .cloned()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        map(&self.params) == map(&other.params) && map(&self.extra) == map(&other.extra)
+    }
+
+    /// `TransportConfiguration.hashCode` for the acceptor called `name`:
+    /// `Objects.hash(name, factoryClassName, params)`.
+    pub fn hash_code(&self, name: &str) -> i32 {
+        use saranga_buffer::java_hash::string_hash;
+        const FACTORY: &str =
+            "org.apache.activemq.artemis.core.remoting.impl.netty.NettyAcceptorFactory";
+        // AbstractMap.hashCode: the sum of key ^ value.
+        let params = self.params.iter().fold(0i32, |h, (k, v)| {
+            h.wrapping_add(string_hash(k) ^ v.as_deref().map_or(0, string_hash))
+        });
+        [string_hash(name), string_hash(FACTORY), params]
+            .into_iter()
+            .fold(1i32, |h, x| h.wrapping_mul(31).wrapping_add(x))
+    }
+
+    /// `params` as `HashMap.toString` prints it: `{host=0.0.0.0, port=61616}`.
+    pub fn params_text(&self) -> String {
+        let entries: Vec<String> = self
+            .params
+            .iter()
+            .map(|(k, v)| format!("{k}={}", v.as_deref().unwrap_or("null")))
+            .collect();
+        format!("{{{}}}", entries.join(", "))
+    }
+}
+
+/// `TransportConstants.ALLOWABLE_ACCEPTOR_KEYS`.
+const ALLOWABLE_ACCEPTOR_KEYS: [&str; 70] = [
+    "sslEnabled",
+    "sslAutoReload",
+    "sslHandshakeTimeout",
+    "httpResponseTime",
+    "httpServerScanPeriod",
+    "httpUpgradeEnabled",
+    "useNio",
+    "useEpoll",
+    "useKQueue",
+    "useInvm",
+    "protocol",
+    "protocols",
+    "scheme",
+    "host",
+    "port",
+    "keyStoreProvider",
+    "keyStoreType",
+    "keyStorePath",
+    "keyStorePassword",
+    "keyPassword",
+    "keyStoreAlias",
+    "trustStoreProvider",
+    "trustStoreType",
+    "trustStorePath",
+    "trustStorePassword",
+    "enabledCipherSuites",
+    "enabledProtocols",
+    "needClientAuth",
+    "wantClientAuth",
+    "verifyHost",
+    "sniHost",
+    "tcpNoDelay",
+    "tcpSendBufferSize",
+    "tcpReceiveBufferSize",
+    "writeBufferHighWaterMark",
+    "writeBufferLowWaterMark",
+    "nioRemotingThreads",
+    "remotingThreads",
+    "batchDelay",
+    "directDeliver",
+    "clusterConnection",
+    "stompConsumerCredits",
+    "stompConsumerWindowSize",
+    "stomp-min-large-message-size",
+    "stompMinLargeMessageSize",
+    "connectionTtl",
+    "connectionTtlMax",
+    "connectionTtlMin",
+    "heartBeatToConnectionTtlModifier",
+    "stomp-enable-message-id",
+    "stompEnableMessageId",
+    "connectionsAllowed",
+    "stompMaxFramePayloadLength",
+    "webSocketMaxFramePayloadLength",
+    "webSocketCompressionSupported",
+    "activemq.usemaskedpassword",
+    "activemq.passwordcodec",
+    "backlog",
+    "crlPath",
+    "handshake-timeout",
+    "sslProvider",
+    "trustManagerFactoryPlugin",
+    "shutdownTimeout",
+    "quietPeriod",
+    "disableStompServerHeader",
+    "autoStart",
+    "router",
+    "proxyProtocolEnabled",
+    "crcOptions",
+    "ocspResponderURL",
+];
+
+/// Puts into a list kept as a Java `HashMap`: a key keeps its place.
+fn put(map: &mut Vec<(String, Option<String>)>, key: &str, value: Option<String>) {
+    match map.iter_mut().find(|(k, _)| k == key) {
+        Some(entry) => entry.1 = value,
+        None => map.push((key.to_owned(), value)),
+    }
+}
+
+/// The entries in the order a `new HashMap<>()` they were put into in this
+/// order iterates them.
+fn java_order(map: Vec<(String, Option<String>)>) -> Vec<(String, Option<String>)> {
+    let hashes: Vec<i32> = map
+        .iter()
+        .map(|(k, _)| saranga_buffer::java_hash::string_hash(k))
+        .collect();
+    let order = saranga_buffer::java_hash::hash_map_order(&hashes, None);
+    order.into_iter().map(|i| map[i].clone()).collect()
 }
 
 const SCHEMES: [&str; 2] = ["tcp", "vm"];
@@ -80,6 +224,7 @@ impl AcceptorConfig {
             port,
             params,
             lock_coordinator: None,
+            from_uri: true,
         };
         if let Some(Some(from_query)) = config.param_entry("name") {
             match &config.name {
@@ -103,6 +248,7 @@ impl AcceptorConfig {
             port: None,
             params: Vec::new(),
             lock_coordinator: None,
+            from_uri: false,
         };
         for (k, v) in params {
             config.set_param(&k, v.as_deref());
@@ -141,6 +287,45 @@ impl AcceptorConfig {
             if query.is_empty() { "" } else { "?" },
             query.join(";")
         );
+    }
+
+    /// The `TransportConfiguration` Artemis makes of it, which a reload
+    /// compares (`RemotingServiceImpl.updateAcceptors`). A URI gives
+    /// `scheme`, `host` and `port` (`"null"` and `"-1"` when absent), then
+    /// its query (`BeanSupport.setData`); broker properties put each
+    /// parameter into `params`.
+    pub fn transport_params(&self) -> TransportParams {
+        if !self.from_uri {
+            return TransportParams {
+                params: java_order(self.params.clone()),
+                extra: Vec::new(),
+            };
+        }
+        let mut params = Vec::new();
+        let mut extra = Vec::new();
+        put(&mut params, "scheme", Some(self.scheme.clone()));
+        put(
+            &mut params,
+            "host",
+            Some(self.host.clone().unwrap_or_else(|| "null".to_owned())),
+        );
+        put(
+            &mut params,
+            "port",
+            Some(self.port.map_or_else(|| "-1".to_owned(), |p| p.to_string())),
+        );
+        // `parseQuery` gives a HashMap, which setData walks.
+        for (k, v) in java_order(self.params.clone()) {
+            if ALLOWABLE_ACCEPTOR_KEYS.contains(&k.as_str()) {
+                put(&mut params, &k, v);
+            } else {
+                put(&mut extra, &k, v);
+            }
+        }
+        TransportParams {
+            params: java_order(params),
+            extra: java_order(extra),
+        }
     }
 
     fn param_entry(&self, key: &str) -> Option<Option<&str>> {
