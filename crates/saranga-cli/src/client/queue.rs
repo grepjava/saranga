@@ -485,8 +485,11 @@ async fn stat(mut args: StatArgs) -> anyhow::Result<()> {
         println!("filter is '{filter}'");
         println!("maxRows='{}'", args.max_rows);
     }
-    // `createConnectionFactory().close()`: its `tryConnect`.
-    args.conn.try_connect().await?;
+    // `createConnectionFactory().close()`: its `tryConnect`, by `--protocol`,
+    // the URL of a retry staying with the factory.
+    let url = args.conn.url.clone();
+    super::jmsapi::Conn::try_connect(&mut args.conn).await?;
+    args.conn.url = url;
     let params = || {
         vec![
             Json::from(filter.clone()),

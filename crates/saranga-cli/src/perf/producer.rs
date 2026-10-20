@@ -2,24 +2,26 @@
 //! `ProducerTargetRateLoadGenerator`) and `AsyncJms2ProducerFacade`: a task
 //! per producer sending `BytesMessage`s with a `time` property.
 //!
-//! The JMS producer sends with a `CompletionListener`, which with the
-//! default confirmation window of -1 sends without blocking and completes
-//! once the send is written; here each send is written without blocking
-//! and completed right after.
+//! The JMS producer sends with a `CompletionListener`. Artemis's Core
+//! client, with the default confirmation window of -1, completes a send
+//! once it is written; Qpid completes it when the broker's outcome comes.
+//! At most `--max-pending` sends wait for their completion (at least the
+//! commit interval when transacted), and a transaction is committed once
+//! as many sends as the interval have completed.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::bail;
-use saranga_buffer::{PropertyValue, SimpleString};
-use saranga_client::message::HDR_GROUP_ID;
-use saranga_client::{MessageExt, Producer, message_type};
+use saranga_buffer::PropertyValue;
 use tokio::task::JoinHandle;
 
 use super::Clock;
 use super::stats::ProducerStats;
-use crate::client::jms::{Destination, JmsConnection, JmsSession};
+use crate::client::jms::Destination;
+use crate::client::jmsapi::{Body, Completion, Conn, ConnFactory, Msg, Prod, Protocol, Sess};
 
 /// The producer side of `perf producer` and `perf client`.
 #[derive(Clone, Debug)]
@@ -36,6 +38,8 @@ pub struct ProducerConfig {
     pub message_count: i64,
     pub enable_message_id: bool,
     pub enable_timestamp: bool,
+    /// `--max-pending`: sends not yet completed, 0 or less for no limit.
+    pub max_pending: i64,
 }
 
 struct Generator {
@@ -49,7 +53,7 @@ pub struct ProducerBenchmark {
     generators: Vec<Generator>,
     /// The messages sent to each destination, by its producers.
     per_destination: Vec<(Destination, Vec<Arc<ProducerStats>>)>,
-    connections: Vec<Arc<JmsConnection>>,
+    connections: Vec<Arc<Conn>>,
     stop: Arc<AtomicBool>,
     closed: bool,
 }
@@ -59,7 +63,7 @@ impl ProducerBenchmark {
     /// thread when shared), a session and producer each, and the load
     /// generators running.
     pub async fn start(
-        args: &crate::client::ConnectionArgs,
+        factory: &ConnFactory,
         destinations: &[Destination],
         config: &ProducerConfig,
         clock: Clock,
@@ -70,12 +74,9 @@ impl ProducerBenchmark {
         } else {
             total
         };
-        // The producers' connection factory has no client ID.
-        let mut args = args.clone();
-        args.client_id = None;
         let mut connections = Vec::with_capacity(connection_count);
         for _ in 0..connection_count {
-            connections.push(Arc::new(args.connect().await?));
+            connections.push(Arc::new(factory.connect(None).await?));
         }
         let content = Arc::new(vec![1u8; config.message_size]);
         let stop = Arc::new(AtomicBool::new(false));
@@ -131,7 +132,7 @@ impl ProducerBenchmark {
                 let load = Load {
                     session,
                     producer,
-                    dest: dest.clone(),
+                    protocol: factory.protocol(),
                     config: config.clone(),
                     stats: stats.clone(),
                     count,
@@ -205,7 +206,8 @@ impl ProducerBenchmark {
     }
 
     /// `asyncClose`: no more sends; once the generators are done (their
-    /// open transactions committed), the connections are closed.
+    /// pending sends completed and their transactions committed), the
+    /// connections are closed.
     pub async fn close(&mut self) {
         if self.closed {
             return;
@@ -223,9 +225,9 @@ impl ProducerBenchmark {
 
 /// A load generator and the producer it drives.
 struct Load {
-    session: JmsSession,
-    producer: Producer,
-    dest: Destination,
+    session: Sess,
+    producer: Prod,
+    protocol: Protocol,
     config: ProducerConfig,
     stats: Arc<ProducerStats>,
     /// The messages to send, none for no limit.
@@ -235,6 +237,27 @@ struct Load {
     clock: Clock,
     stop: Arc<AtomicBool>,
     content: Arc<Vec<u8>>,
+}
+
+/// `AsyncJms2ProducerFacade`'s count of sends: those not yet completed, in
+/// order, with the time each message carries.
+struct Window {
+    pending: VecDeque<(i64, Completion)>,
+    max_pending: i64,
+    transaction_capacity: i64,
+    pending_in_transaction: i64,
+    completed_in_transaction: i64,
+    completed: i64,
+}
+
+impl Window {
+    /// `isAvailable`.
+    fn is_available(&self) -> bool {
+        if self.max_pending > 0 && self.pending.len() as i64 >= self.max_pending {
+            return false;
+        }
+        self.transaction_capacity == 0 || self.pending_in_transaction != self.transaction_capacity
+    }
 }
 
 impl Load {
@@ -247,14 +270,25 @@ impl Load {
     }
 
     /// `run` of the generator, until the count is sent or the benchmark
-    /// closes; the transaction left open is committed, as the producer
-    /// facade commits on closing once the last send completes.
+    /// closes, then the sends still pending completed (`requestClose`).
     async fn generate(&self) -> anyhow::Result<()> {
+        let capacity = self.config.commit_interval.max(0);
+        let mut window = Window {
+            pending: VecDeque::new(),
+            max_pending: if capacity > 0 && self.config.max_pending > 0 {
+                self.config.max_pending.max(capacity)
+            } else {
+                self.config.max_pending
+            },
+            transaction_capacity: capacity,
+            pending_in_transaction: 0,
+            completed_in_transaction: 0,
+            completed: 0,
+        };
         let us_period = self.period_ns.map(|ns| ns as f64 / 1000.0);
         let mut start = 0;
         let mut fire_time = 0;
         let mut fire_count = 0i64;
-        let mut in_transaction = 0i64;
         let mut sent = 0i64;
         while !self.stop.load(Ordering::Acquire) {
             let now = self.clock.now();
@@ -263,75 +297,137 @@ impl Load {
                 fire_time = now;
             }
             let expected = if us_period.is_some() { fire_time } else { now };
-            self.send(now).await?;
+            // `NotAvailable`: the send waits for a completion, and is tried
+            // again at the time it then is.
+            if !window.is_available() {
+                self.stats.not_available.fetch_add(1, Ordering::Relaxed);
+                while !window.is_available() {
+                    self.complete_next(&mut window, false).await?;
+                }
+            }
+            let time = self.clock.now().max(now);
+            let completion = self.send(time).await?;
+            window.pending.push_back((time, completion));
+            window.pending_in_transaction += 1;
             sent += 1;
             self.stats.sent.store(sent, Ordering::Relaxed);
             if let Some(w) = &self.stats.wait_latencies {
-                w.record(now - expected);
+                w.record(time - expected);
             }
-            // onCompletion
-            self.stats
-                .send_completed_latencies
-                .record(self.clock.now() - now);
-            self.stats.completed.store(sent, Ordering::Relaxed);
-            if self.config.commit_interval > 0 {
-                in_transaction += 1;
-                if in_transaction == self.config.commit_interval {
-                    self.session.commit().await?;
-                    in_transaction = 0;
-                }
-            }
+            self.complete_ready(&mut window).await?;
             if self.count.is_some_and(|c| sent >= c) {
                 break;
             }
             if let Some(us) = us_period {
                 fire_count += 1;
                 fire_time = start + (fire_count as f64 * us) as i64;
-                self.wait_until(fire_time).await;
+                self.wait_until(fire_time, &mut window).await?;
             }
         }
-        if in_transaction > 0 {
+        while !window.pending.is_empty() {
+            self.complete_next(&mut window, true).await?;
+        }
+        if window.transaction_capacity > 0 && window.completed_in_transaction > 0 {
+            self.session.commit().await?;
+        }
+        Ok(())
+    }
+
+    /// The completions that have come, in order.
+    async fn complete_ready(&self, window: &mut Window) -> anyhow::Result<()> {
+        loop {
+            let ready = match window.pending.front_mut() {
+                Some((_, c)) => poll_ready(c),
+                None => None,
+            };
+            let Some(r) = ready else {
+                return Ok(());
+            };
+            let (time, _) = window.pending.pop_front().expect("front");
+            self.completed(window, time, r, false).await?;
+        }
+    }
+
+    /// The next completion, waited for.
+    async fn complete_next(&self, window: &mut Window, closing: bool) -> anyhow::Result<()> {
+        if let Some((time, c)) = window.pending.pop_front() {
+            let r = c.await;
+            self.completed(window, time, r, closing).await?;
+        }
+        Ok(())
+    }
+
+    /// `onCompletion`, then `onSendCompleted`: the latency since the
+    /// message's time, and the commit once the transaction is complete.
+    async fn completed(
+        &self,
+        window: &mut Window,
+        time: i64,
+        result: anyhow::Result<()>,
+        closing: bool,
+    ) -> anyhow::Result<()> {
+        result?;
+        self.stats
+            .send_completed_latencies
+            .record(self.clock.now() - time);
+        window.completed += 1;
+        self.stats
+            .completed
+            .store(window.completed, Ordering::Relaxed);
+        window.completed_in_transaction += 1;
+        if window.transaction_capacity > 0
+            && (window.completed_in_transaction == window.transaction_capacity
+                || (closing && window.pending.is_empty()))
+        {
+            window.completed_in_transaction = 0;
+            window.pending_in_transaction = 0;
             self.session.commit().await?;
         }
         Ok(())
     }
 
     /// The microsecond the next send fires at, as the event loop schedules
-    /// it: a sleep to within the timer's resolution, then yields.
-    async fn wait_until(&self, fire_time: i64) {
+    /// it: a sleep to within the timer's resolution, then yields, the
+    /// completions handled meanwhile.
+    async fn wait_until(&self, fire_time: i64, window: &mut Window) -> anyhow::Result<()> {
         const TIMER_RESOLUTION_US: i64 = 16_000;
         let delay = fire_time - self.clock.now();
         if delay > TIMER_RESOLUTION_US {
             tokio::time::sleep(Duration::from_micros((delay - TIMER_RESOLUTION_US) as u64)).await;
         }
         while self.clock.now() < fire_time && !self.stop.load(Ordering::Acquire) {
+            self.complete_ready(window).await?;
             tokio::task::yield_now().await;
         }
+        self.complete_ready(window).await
     }
 
     /// `trySend`: a new `BytesMessage` of the content, its `time`, and the
     /// group as `JMSXGroupID`.
-    async fn send(&self, time: i64) -> anyhow::Result<()> {
-        let mut message = saranga_client::message::new_message(message_type::BYTES, true);
-        message.body = self.content.to_vec().into();
-        message.put_property("time", PropertyValue::Long(time));
+    async fn send(&self, time: i64) -> anyhow::Result<Completion> {
+        let mut message = Msg::create(self.protocol, Body::Bytes(self.content.to_vec()));
+        message.set_property("time", &PropertyValue::Long(time))?;
         if let Some(g) = &self.config.group {
-            message.put_property(
-                HDR_GROUP_ID,
-                PropertyValue::String(SimpleString::from(g.as_str())),
-            );
+            message.set_property("JMSXGroupID", &PropertyValue::String(g.as_str().into()))?;
         }
         self.session
-            .send_with(
+            .send_completion(
                 &self.producer,
-                &self.dest,
                 message,
                 self.config.persistent,
                 self.config.ttl,
                 self.config.enable_message_id,
                 self.config.enable_timestamp,
             )
-            .await?;
-        Ok(())
+            .await
+    }
+}
+
+/// The completion's result if it has come, without waiting.
+fn poll_ready(c: &mut Completion) -> Option<anyhow::Result<()>> {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match c.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(r) => Some(r),
+        std::task::Poll::Pending => None,
     }
 }

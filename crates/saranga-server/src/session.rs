@@ -2790,13 +2790,13 @@ impl ServerSession {
     }
 
     /// `ServerSessionImpl.deleteQueue`.
-    pub fn delete_queue(&mut self, name: &str) -> Result<()> {
-        self.delete_queue_with(name, true)
+    pub async fn delete_queue(&mut self, name: &str) -> Result<()> {
+        self.delete_queue_with(name, true).await
     }
 
     /// `deleteQueue(name, checkSecurity)`: without the check, the session's
     /// user need not be allowed to delete the queue or its address.
-    pub fn delete_queue_with(&mut self, name: &str, check_security: bool) -> Result<()> {
+    pub async fn delete_queue_with(&mut self, name: &str, check_security: bool) -> Result<()> {
         self.audit().delete_queue(name);
         let post_office = self.broker.post_office();
         let name = queue_name_of(self.remove_prefix(name));
@@ -2812,12 +2812,12 @@ impl ServerSession {
         if check_security {
             self.security_check(&address, Some(name), check)?;
         }
-        post_office.delete_queue_forcing(name, true, false, true)?;
+        let durable = post_office.delete_queue_reporting(name, true).await?;
         self.conn.remove_temp_queue(name);
         // `destroyQueue(forceAutoDeleteAddress)`: a client's delete takes an
         // auto-created address along whatever `auto-delete-addresses` says,
         // if the user may delete it.
-        if post_office.address_auto_deletable(&address) {
+        if post_office.address_auto_deletable(&address, durable) {
             if check_security {
                 self.security_check(&address, None, CheckType::DeleteAddress)?;
             }

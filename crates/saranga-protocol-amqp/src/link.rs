@@ -359,7 +359,7 @@ fn not_exists() -> LinkError {
 
 /// Resolves a sender link's source, changing it to what is echoed.
 /// `source` is `None` when the client recovers a subscription by link name.
-pub fn resolve_source(
+pub async fn resolve_source(
     session: &mut ServerSession,
     source: &mut Option<Source>,
     link_name: &str,
@@ -587,6 +587,7 @@ pub fn resolve_source(
                 if q.consumer_count == 0 {
                     session
                         .delete_queue(&queue)
+                        .await
                         .map_err(|e| consumer_error(&e))?;
                     create = true;
                 } else {

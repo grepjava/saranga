@@ -7,13 +7,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
-use saranga_buffer::PropertyValue;
-use saranga_client::{Consumer, MessageExt};
 use tokio::task::JoinHandle;
 
 use super::Clock;
 use super::stats::ListenerStats;
-use crate::client::jms::{Destination, JmsConnection, JmsSession};
+use crate::client::amqp::jms::ConsumerKind;
+use crate::client::jms::Destination;
+use crate::client::jmsapi::{Conn, ConnFactory, Cons, Sess};
 
 /// The consumer side of `perf consumer` and `perf client`.
 #[derive(Clone, Debug)]
@@ -44,9 +44,9 @@ impl Limiter {
 pub struct ListenerBenchmark {
     listeners: Vec<Arc<ListenerStats>>,
     tasks: Vec<JoinHandle<()>>,
-    connections: Vec<Arc<JmsConnection>>,
+    connections: Vec<Arc<Conn>>,
     /// The sessions of shared durable subscriptions and their names.
-    unsubscribe: Vec<(JmsSession, String)>,
+    unsubscribe: Vec<(Sess, String)>,
     limiter: Option<Arc<Limiter>>,
     fatal: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -57,7 +57,8 @@ impl ListenerBenchmark {
     /// `start`: the connections (with the client ID, numbered when more
     /// than one), then a session and consumer per listener.
     pub async fn start(
-        args: &crate::client::ConnectionArgs,
+        factory: &ConnFactory,
+        client_id: Option<&str>,
         destinations: &[Destination],
         config: &ConsumerConfig,
         clock: Clock,
@@ -65,13 +66,14 @@ impl ListenerBenchmark {
         let fatal = Arc::new(AtomicBool::new(false));
         let mut connections = Vec::with_capacity(config.connections);
         for i in 0..config.connections {
-            let mut a = args.clone();
-            if let Some(id) = &args.client_id
-                && config.connections > 1
-            {
-                a.client_id = Some(format!("{id}{i}"));
-            }
-            connections.push(Arc::new(a.connect().await?));
+            let id = client_id.map(|id| {
+                if config.connections > 1 {
+                    format!("{id}{i}")
+                } else {
+                    id.to_owned()
+                }
+            });
+            connections.push(Arc::new(factory.connect(id).await?));
         }
         let limiter = if config.message_count > 0 {
             Some(config.message_count)
@@ -109,16 +111,13 @@ impl ListenerBenchmark {
                         let Destination::Topic(topic) = dest else {
                             anyhow::bail!("{dest} cannot be cast to a topic");
                         };
-                        let name = format!("{topic}{index}");
-                        session
-                            .consumer(
-                                dest,
-                                None,
-                                Some((name.as_str(), connection.client_id.as_deref())),
-                            )
-                            .await?
+                        let kind = ConsumerKind::Durable {
+                            name: format!("{topic}{index}"),
+                            no_local: false,
+                        };
+                        session.consumer(dest, None, kind).await?
                     } else {
-                        session.consumer(dest, None, None).await?
+                        session.consumer(dest, None, ConsumerKind::Plain).await?
                     };
                     b.listen(session, consumer, &clock).await?;
                 }
@@ -129,20 +128,22 @@ impl ListenerBenchmark {
                 for subscription in 0..config.shared {
                     let name = format!("{topic}{subscription}");
                     let mut connection = None;
-                    if args.client_id.is_some() {
+                    if client_id.is_some() {
                         connection = Some(b.connections[sequence % count].clone());
                         sequence += 1;
                     }
                     for _ in 0..config.consumers {
-                        if args.client_id.is_none() {
+                        if client_id.is_none() {
                             connection = Some(b.connections[sequence % count].clone());
                             sequence += 1;
                         }
                         let connection = connection.clone().expect("connection");
                         let session = connection.session(config.transacted).await?;
-                        let consumer = session
-                            .shared_consumer(topic, &name, config.durable, None)
-                            .await?;
+                        let kind = ConsumerKind::Shared {
+                            name: name.clone(),
+                            durable: config.durable,
+                        };
+                        let consumer = session.consumer(dest, None, kind).await?;
                         let unsubscribe = config.durable.then(|| session.clone());
                         b.listen(session, consumer, &clock).await?;
                         if let Some(s) = unsubscribe {
@@ -157,12 +158,7 @@ impl ListenerBenchmark {
 
     /// A `RecordingMessageListener` on the consumer, its session started
     /// as the started connection starts the sessions made on it.
-    async fn listen(
-        &mut self,
-        session: JmsSession,
-        consumer: Consumer,
-        clock: &Clock,
-    ) -> anyhow::Result<()> {
+    async fn listen(&mut self, session: Sess, consumer: Cons, clock: &Clock) -> anyhow::Result<()> {
         session.start().await?;
         let stats = Arc::new(ListenerStats {
             received: AtomicI64::new(0),
@@ -171,7 +167,7 @@ impl ListenerBenchmark {
         });
         self.listeners.push(stats.clone());
         let listener = Listener {
-            _session: session,
+            session,
             consumer,
             stats,
             limiter: self.limiter.clone(),
@@ -194,7 +190,7 @@ impl ListenerBenchmark {
 
     /// The connections' exception listener.
     fn check_connections(&self) {
-        if self.connections.iter().any(|c| c.conn.failure().is_some()) {
+        if self.connections.iter().any(|c| c.failed()) {
             self.fatal.store(true, Ordering::Relaxed);
         }
     }
@@ -225,7 +221,11 @@ impl ListenerBenchmark {
         for (session, name) in std::mem::take(&mut self.unsubscribe) {
             if let Err(e) = session.unsubscribe(&name).await {
                 // A RuntimeException from close: the message and the usage.
-                result = Err(crate::client::UsageError(format!("{e:#}")).into());
+                let text = match e.downcast_ref::<crate::client::amqp::jms::JmsError>() {
+                    Some(j) => j.to_java_string(),
+                    None => format!("{e:#}"),
+                };
+                result = Err(crate::client::UsageError(text).into());
                 break;
             }
         }
@@ -242,9 +242,8 @@ impl ListenerBenchmark {
 
 /// A consumer and its `RecordingMessageListener`.
 struct Listener {
-    /// Kept open while the listener runs.
-    _session: JmsSession,
-    consumer: Consumer,
+    session: Sess,
+    consumer: Cons,
     stats: Arc<ListenerStats>,
     limiter: Option<Arc<Limiter>>,
     clock: Clock,
@@ -252,12 +251,16 @@ struct Listener {
 }
 
 impl Listener {
-    /// Each message: counted, its latency recorded, then acknowledged (in
-    /// the session's transaction when transacted, which is never
-    /// committed).
+    /// Each message: counted, its latency recorded, then acknowledged as
+    /// the session acknowledges after `onMessage` (in its transaction when
+    /// transacted, which is never committed).
     async fn run(self) {
         while !self.stop.load(Ordering::Acquire) {
-            let delivery = match self.consumer.receive(Duration::from_millis(100)).await {
+            let (message, ack) = match self
+                .session
+                .listened(&self.consumer, Duration::from_millis(100))
+                .await
+            {
                 Ok(Some(d)) => d,
                 Ok(None) => continue,
                 Err(_) => break,
@@ -266,13 +269,11 @@ impl Listener {
                 l.received.fetch_add(1, Ordering::Relaxed);
             }
             self.stats.received.fetch_add(1, Ordering::Relaxed);
-            match delivery.message.property("time") {
-                Some(PropertyValue::Long(start)) => {
-                    self.stats.latencies.record(self.clock.now() - start)
-                }
-                _ => self.stats.fatal.store(true, Ordering::Relaxed),
+            match message.long_property("time") {
+                Some(start) => self.stats.latencies.record(self.clock.now() - start),
+                None => self.stats.fatal.store(true, Ordering::Relaxed),
             }
-            if self.consumer.acknowledge(&delivery).await.is_err() {
+            if self.session.acknowledge(&self.consumer, ack).await.is_err() {
                 self.stats.fatal.store(true, Ordering::Relaxed);
             }
         }

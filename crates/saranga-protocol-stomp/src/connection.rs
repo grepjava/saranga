@@ -1756,7 +1756,7 @@ impl Connection {
             if sub.multicast
                 && durable_name.is_none()
                 && queue.is_some_and(|q| !q.is_durable())
-                && let Err(e) = session.session.delete_queue(&sub.queue)
+                && let Err(e) = session.session.delete_queue(&sub.queue).await
                 && e.kind != saranga_core_protocol::ErrorType::QueueDoesNotExist
             {
                 return Err(unsubscribing(e.message));
@@ -1769,6 +1769,7 @@ impl Connection {
                 session
                     .session
                     .delete_queue(&queue_name)
+                    .await
                     .map_err(|e| unsubscribing(e.message))?;
             }
             found = true;

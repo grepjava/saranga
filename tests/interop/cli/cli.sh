@@ -124,6 +124,46 @@ suite() {
   run queue delete --name cliq2
   run queue delete --name nosuch
   run queue delete --name clim --autoDeleteAddress
+  # AMQP (Qpid JMS): the same commands over --protocol amqp, transfers
+  # between the protocols, and the property names each client refuses.
+  local P='[{"type":"int","key":"k","value":"7"},{"type":"string","key":"JMSCorrelationID","value":"c1"},{"type":"string","key":"JMSType","value":"t"},{"type":"double","key":"d","value":"0x1.8p1"}]'
+  run producer --protocol amqp --destination queue://amqq --message-count 2 --verbose --group g1 --properties "$P"
+  run producer --protocol AMQP --destination queue://amqq --message-count 1 --message-size 10
+  run producer --protocol amqp --destination queue://amqq --message-count 1 --object-size 5 --non-persistent
+  run producer --protocol amqp --destination queue://amqq --message-count 2 --commit-interval 1 --message hi
+  run browser --protocol amqp --destination queue://amqq
+  run browser --protocol amqp --destination queue://amqq --filter "k = 7"
+  run browser --protocol amqp --destination topic://amqtopic
+  run browser --destination topic://amqtopic
+  run consumer --protocol amqp --destination queue://amqq --message-count 2 --verbose --filter "k = 7"
+  run consumer --protocol amqp --destination queue://amqq --message-count 4 --data "$DATA"
+  data_file
+  run producer --protocol amqp --destination queue://amqq --data "$DATA"
+  run consumer --destination queue://amqq --message-count 10 --receive-timeout 300 --break-on-null --verbose
+  run producer --protocol amqp --destination queue://amqq --message-count 1 --properties '[{"type":"string","key":"a b","value":"v"}]'
+  run producer --protocol amqp --destination queue://amqq --message-count 1 --properties '[{"type":"string","key":"JMSXGroupSeq","value":"v"}]'
+  run producer --protocol amqp --destination queue://amqq --message-count 1 --properties '[{"type":"string","key":"JMSDestination","value":"q"}]'
+  run producer --destination queue://amqq --message-count 1 --properties '[{"type":"string","key":"a b","value":"v"}]'
+  run producer --destination queue://amqq --message-count 1 --properties '[{"type":"long","key":"k","value":"x"}]'
+  run consumer --protocol amqp --destination topic://amqtopic --message-count 1 --receive-timeout 200 --durable --clientID amqcid --subscriptionName amqsub --break-on-null
+  run producer --protocol amqp --destination topic://amqtopic --message-count 2
+  run consumer --protocol amqp --destination topic://amqtopic --message-count 5 --receive-timeout 300 --durable --clientID amqcid --subscriptionName amqsub --break-on-null
+  run producer --destination queue://amqc --message-count 2 --group g2 --properties "$P"
+  run_bare transfer --source-url "$URL" --target-url "$URL" --source-protocol core --target-protocol amqp --source-queue amqc --target-queue amqa --silent
+  run_bare transfer --source-url "$URL" --target-url "$URL" --source-protocol amqp --target-protocol core --source-queue amqa --target-queue amqc2 --copy --silent
+  run_bare transfer --source-url "$URL" --target-url "$URL" --source-protocol amqp --target-protocol amqp --source-queue amqa --target-queue amqa2 --silent
+  run consumer --destination queue://amqc2 --message-count 2 --data "$DATA"
+  data_file
+  run consumer --protocol amqp --destination queue://amqa2 --message-count 5 --receive-timeout 300 --break-on-null --verbose
+  run check queue --name DLQ --produce 2 --browse 2 --consume 2 --protocol amqp
+  run producer --protocol amqp --destination queue://amqq --message-count 1 --user nobody --password nothing
+  run queue delete --name amqq --autoDeleteAddress
+  run queue delete --name amqc --autoDeleteAddress
+  run queue delete --name amqc2 --autoDeleteAddress
+  run queue delete --name amqa --autoDeleteAddress
+  run queue delete --name amqa2 --autoDeleteAddress
+  run queue delete --name amqcid.amqsub
+  run address delete --name amqtopic --force
   # address
   run address create --name cliaddr --multicast
   run address create --name cliaddr --multicast

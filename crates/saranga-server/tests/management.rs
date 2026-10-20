@@ -446,3 +446,53 @@ async fn security_violations_are_notified() {
     assert_eq!(denied.get("_AMQ_CheckType"), Some(&s("SEND")));
     assert_eq!(denied.get("_AMQ_User"), Some(&s("carol")));
 }
+
+/// `destroyQueue(name, removeConsumers, autoDeleteAddress)` takes an
+/// auto-created address along unless it is still bound when it looks:
+/// a journaled message the queue held is released only once the journal
+/// has its delete, so its size keeps the address, as in Artemis.
+#[tokio::test]
+async fn destroy_queue_keeps_an_address_its_journaled_messages_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(dir.path()).await;
+    // (queue, message to send: None for none, Some(durable))
+    let cases = [
+        ("empty", None),
+        ("nondurable", Some(false)),
+        ("durable", Some(true)),
+    ];
+    for (name, send) in cases {
+        let config = format!(
+            r#"{{"name":"{name}","address":"{name}","routing-type":"ANYCAST","durable":true,"auto-create-address":true}}"#
+        );
+        op(&broker, "broker", "createQueue", vec![s(&config)]).await;
+        if let Some(durable) = send {
+            op(
+                &broker,
+                &format!("queue.{name}"),
+                "sendMessage",
+                vec![
+                    Json::object(),
+                    Json::from(3i64),
+                    s("body"),
+                    Json::from(durable),
+                    Json::Null,
+                    Json::Null,
+                ],
+            )
+            .await;
+        }
+        op(
+            &broker,
+            "broker",
+            "destroyQueue",
+            vec![s(name), Json::from(false), Json::from(true)],
+        )
+        .await;
+    }
+    let po = broker.post_office();
+    assert!(po.address_info("empty").is_none());
+    assert!(po.address_info("nondurable").is_none());
+    assert!(po.address_info("durable").is_some());
+    broker.stop().unwrap();
+}

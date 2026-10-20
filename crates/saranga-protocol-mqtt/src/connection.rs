@@ -1130,7 +1130,9 @@ impl Core {
                     if queue.config().configuration_managed {
                         queue.delete_matching(None).await;
                     } else if !util::is_shared(topic) || queue.consumer_count() == 0 {
-                        self.session.delete_queue_with(&name, enforce_security)?;
+                        self.session
+                            .delete_queue_with(&name, enforce_security)
+                            .await?;
                     }
                 }
                 Ok(())

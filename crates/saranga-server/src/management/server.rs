@@ -1489,7 +1489,8 @@ async fn destroy_queue(
         broker.disconnect_consumers(&q).await;
     }
     // checkConsumerCount is !removeConsumers, as in Artemis.
-    po.delete_queue(name, !remove_consumers, auto_delete_address)
+    po.delete_queue_awaited(name, !remove_consumers, auto_delete_address)
+        .await
         .map(|()| Json::Null)
         .map_err(|e| e.message)
 }

@@ -2627,7 +2627,9 @@ impl Conn {
             attach.desired_capabilities.as_ref(),
             attach.properties.as_ref(),
             core_naming,
-        ) {
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 self.refuse_link(channel, reply, e);
@@ -2680,7 +2682,7 @@ impl Conn {
             };
             // A temporary subscription queue made for this link goes.
             if let Some(t) = &resolved.temp_queue {
-                let _ = s.server.delete_queue_with(t, false);
+                let _ = s.server.delete_queue_with(t, false).await;
             }
             self.refuse_link(channel, reply, le);
             return Ok(());
@@ -3497,13 +3499,13 @@ impl Conn {
                     // The command dispatcher's and event dispatcher's
                     // temporary queues go with their links.
                     Some(FedSenderKind::Control | FedSenderKind::Events) => {
-                        let _ = s.server.delete_queue_with(&sl.resolved.queue, false);
+                        let _ = s.server.delete_queue_with(&sl.resolved.queue, false).await;
                     }
                     // handleLinkRemotelyClosed: no more demand, so the
                     // federation binding goes.
                     Some(FedSenderKind::Address { queue, .. }) => {
                         if remote_close && s.server.queue_query(queue).exists {
-                            let _ = s.server.delete_queue_with(queue, false);
+                            let _ = s.server.delete_queue_with(queue, false).await;
                         }
                     }
                     Some(FedSenderKind::Queue { .. }) => {}
@@ -3517,12 +3519,12 @@ impl Conn {
                         }) = sl.bridge.as_ref().map(|b| &b.kind)
                             && s.server.queue_query(queue).exists
                         {
-                            let _ = s.server.delete_queue_with(queue, false);
+                            let _ = s.server.delete_queue_with(queue, false).await;
                         }
                     }
                     None => {
                         if remote_close {
-                            self.close_subscription(s, &sl);
+                            self.close_subscription(s, &sl).await;
                         }
                     }
                 }
@@ -3535,7 +3537,7 @@ impl Conn {
                     )
                     && let Some(a) = &rl.target.address
                 {
-                    let _ = s.server.delete_queue_with(a, false);
+                    let _ = s.server.delete_queue_with(a, false).await;
                     if self.temp_addresses.iter().any(|t| t == a) {
                         self.broker.post_office().remove_address(a);
                         self.temp_addresses.retain(|t| t != a);
@@ -3549,7 +3551,7 @@ impl Conn {
 
     /// `DefaultSenderController.close(true)`: unsubscribes a durable
     /// subscription whose last consumer left, removes temporary queues.
-    fn close_subscription(&mut self, s: &mut Session, sl: &SenderLink) {
+    async fn close_subscription(&mut self, s: &mut Session, sl: &SenderLink) {
         let Some(source) = &sl.source else { return };
         let r = &sl.resolved;
         let expiry_ends = matches!(
@@ -3559,7 +3561,7 @@ impl Conn {
         if r.multicast {
             if source.durable == TerminusDurability::None && expiry_ends {
                 if let Some(t) = &r.temp_queue {
-                    let _ = s.server.delete_queue_with(t, false);
+                    let _ = s.server.delete_queue_with(t, false).await;
                 }
                 return;
             }
@@ -3576,12 +3578,12 @@ impl Conn {
             if q.exists
                 && !r.is_volatile
                 && q.consumer_count == 0
-                && let Err(e) = s.server.delete_queue(&queue)
+                && let Err(e) = s.server.delete_queue(&queue).await
             {
                 tracing::warn!("Error on link close: {}", e.message);
             }
         } else if source.dynamic && expiry_ends {
-            let _ = s.server.delete_queue_with(&r.queue, false);
+            let _ = s.server.delete_queue_with(&r.queue, false).await;
         }
     }
 

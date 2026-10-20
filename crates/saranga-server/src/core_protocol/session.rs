@@ -746,6 +746,7 @@ impl CoreSession {
                 true,
                 self.session
                     .delete_queue(&p.queue_name.to_string_lossy())
+                    .await
                     .map(|()| None),
                 false,
             ),

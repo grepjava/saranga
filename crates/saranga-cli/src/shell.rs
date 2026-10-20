@@ -114,13 +114,15 @@ pub fn save_connection(url: &str, user: Option<&str>, password: Option<&str>) {
     });
 }
 
-/// `connect`: checks the connection, and keeps it for the shell's commands.
+/// `connect`: `createConnectionFactory().close()`, whose `tryConnect`
+/// checks the connection (asking for another URL, user and password when
+/// it fails, the retry's failure ignored) and keeps it for the shell's
+/// commands.
 pub async fn connect(mut args: ConnectionArgs) -> anyhow::Result<()> {
     args.resolve(false)?;
     *CONNECTION.lock().unwrap() = None;
-    match args.connect().await {
-        Ok(conn) => {
-            conn.close().await;
+    match crate::client::jmsapi::Conn::try_connect(&mut args).await {
+        Ok(()) => {
             println!("Connection Successful!");
             if in_shell() {
                 CONNECTED.store(true, Ordering::Relaxed);

@@ -1,5 +1,5 @@
 //! `saranga perf` (`PerfGroup`): `client`, `producer` and `consumer`, the
-//! Artemis load generator and its live report, over Core; and
+//! Artemis load generator and its live report, over Core or AMQP; and
 //! `perf-journal` (`PerfJournal`).
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -8,6 +8,7 @@ use anyhow::bail;
 
 use crate::client::ConnectionArgs;
 use crate::client::jms::Destination;
+use crate::client::jmsapi::ConnFactory;
 
 mod consumer;
 mod hdr;
@@ -100,8 +101,6 @@ pub struct SendArgs {
     #[arg(long, default_value_t = 1)]
     threads: i32,
     /// How many not yet completed messages can exists. Default is 1.
-    // Each send completes once written, so none are ever pending.
-    #[allow(dead_code)]
     #[arg(long = "max-pending", default_value_t = 1)]
     max_pending: i64,
     /// Enable setting JMS messageID per-message. Default: disabled.
@@ -147,7 +146,7 @@ pub struct ClientArgs {
     #[arg(long = "consumer-url")]
     consumer_url: Option<String>,
     /// The protocol used for MessageListener(s) connections. Default: same
-    /// as --protocol. Valid values are CORE.
+    /// as --protocol. Valid values are AMQP, CORE.
     #[arg(long = "consumer-protocol")]
     consumer_protocol: Option<String>,
 }
@@ -211,27 +210,20 @@ impl PerfArgs {
         Ok(())
     }
 
+    /// `createConnectionFactory(url, user, password, null, protocol)`.
+    async fn factory(&self, connection: &ConnectionArgs) -> anyhow::Result<ConnFactory> {
+        ConnFactory::create(connection).await
+    }
+
     /// `lookupDestinations`: each name, or each with the numbers
-    /// `0..--num-destinations` appended; `queue://TEST` by default.
-    async fn destinations(&self, connection: &ConnectionArgs) -> anyhow::Result<Vec<Destination>> {
+    /// `0..--num-destinations` appended; `queue://TEST` by default. A
+    /// connection and session of the factory are made, and closed.
+    async fn destinations(&self, factory: &ConnFactory) -> anyhow::Result<Vec<Destination>> {
         let names = if self.destinations.is_empty() {
             vec!["queue://TEST".to_owned()]
         } else {
             self.destinations.clone()
         };
-        // A connection (from a factory without the client ID) and session
-        // are made to create the destinations.
-        let mut connection = connection.clone();
-        connection.client_id = None;
-        // The connection factory's `tryConnect`, then `lookupDestinations`'.
-        connection.try_connect().await?;
-        let conn = connection.connect().await?;
-        let session = conn.session(false).await;
-        if let Ok(s) = &session {
-            s.close().await;
-        }
-        conn.close().await;
-        session?;
         // `new Destination[names * numDestinations]`: a negative size fails
         // with the size (`NegativeArraySizeException`).
         let size =
@@ -239,6 +231,13 @@ impl PerfArgs {
         if size < 0 {
             bail!(crate::client::UsageError(size.to_string()));
         }
+        let conn = factory.connect(None).await?;
+        let session = conn.session(false).await;
+        if let Ok(s) = &session {
+            s.close().await;
+        }
+        conn.close().await;
+        session?;
         let mut out = Vec::new();
         for name in names {
             if self.num_destinations == 1 {
@@ -288,6 +287,7 @@ impl SendArgs {
             message_count: perf.message_count,
             enable_message_id: self.enable_message_id,
             enable_timestamp: self.enable_timestamp,
+            max_pending: self.max_pending,
         })
     }
 
@@ -433,14 +433,15 @@ fn summary(
 /// `PerfProducerCommand`.
 async fn producer(mut a: ProducerArgs) -> anyhow::Result<()> {
     a.perf.prepare()?;
-    let destinations = a.perf.destinations(&a.perf.connection).await?;
+    let factory = a.perf.factory(&a.perf.connection).await?;
+    let destinations = a.perf.destinations(&factory).await?;
     if a.perf.connection.client_id.is_some() {
         eprintln!("ClientID configuration is not supported");
     }
     a.send.adjust_threads(destinations.len());
     let config = a.send.config(&a.perf)?;
     let mut benchmark =
-        ProducerBenchmark::start(&a.perf.connection, &destinations, &config, Clock::Wall).await?;
+        ProducerBenchmark::start(&factory, &destinations, &config, Clock::Wall).await?;
     let mut timing = Timing::new(&a.perf);
     let mut statistics = LiveStatistics::new(
         a.perf.report_file.as_deref(),
@@ -464,7 +465,8 @@ async fn producer(mut a: ProducerArgs) -> anyhow::Result<()> {
 /// `PerfConsumerCommand`.
 async fn consumer(mut a: ConsumerArgs) -> anyhow::Result<()> {
     a.perf.prepare()?;
-    let destinations = a.perf.destinations(&a.perf.connection).await?;
+    let factory = a.perf.factory(&a.perf.connection).await?;
+    let destinations = a.perf.destinations(&factory).await?;
     let config = ConsumerConfig {
         transacted: a.receive.transaction,
         // A negative count of shared subscriptions is none (`> 0`).
@@ -480,8 +482,14 @@ async fn consumer(mut a: ConsumerArgs) -> anyhow::Result<()> {
         message_count: a.perf.message_count,
         can_delay_message_count: false,
     };
-    let mut benchmark =
-        ListenerBenchmark::start(&a.perf.connection, &destinations, &config, Clock::Wall).await?;
+    let mut benchmark = ListenerBenchmark::start(
+        &factory,
+        a.perf.connection.client_id.as_deref(),
+        &destinations,
+        &config,
+        Clock::Wall,
+    )
+    .await?;
     let mut timing = Timing::new(&a.perf);
     let mut statistics = LiveStatistics::new(
         a.perf.report_file.as_deref(),
@@ -516,21 +524,19 @@ async fn client(mut a: ClientArgs) -> anyhow::Result<()> {
         ));
     }
     a.perf.prepare()?;
-    if let Some(p) = &a.consumer_protocol
-        && !p.eq_ignore_ascii_case("core")
-    {
-        bail!(crate::client::UsageError(format!(
-            "protocol {} not supported",
-            p.to_uppercase()
-        )));
-    }
-    let destinations = a.perf.destinations(&a.perf.connection).await?;
+    let factory = a.perf.factory(&a.perf.connection).await?;
+    let destinations = a.perf.destinations(&factory).await?;
+    // The listeners' factory: their URL and protocol, else the command's.
     let mut listener_args = a.perf.connection.clone();
     if let Some(url) = &a.consumer_url {
         listener_args.url = Some(url.clone());
     }
+    if let Some(p) = &a.consumer_protocol {
+        listener_args.protocol = p.clone();
+    }
+    let listener_factory = a.perf.factory(&listener_args).await?;
     let listener_destinations = if a.consumer_protocol.is_some() {
-        a.perf.destinations(&listener_args).await?
+        a.perf.destinations(&listener_factory).await?
     } else {
         destinations.clone()
     };
@@ -552,7 +558,8 @@ async fn client(mut a: ClientArgs) -> anyhow::Result<()> {
     a.send.adjust_threads(destinations.len());
     let clock = Clock::Monotonic(Instant::now());
     let mut listeners = ListenerBenchmark::start(
-        &listener_args,
+        &listener_factory,
+        a.perf.connection.client_id.as_deref(),
         &listener_destinations,
         &consumer_config,
         clock.clone(),
@@ -566,7 +573,7 @@ async fn client(mut a: ClientArgs) -> anyhow::Result<()> {
         }
     };
     let mut producers =
-        match ProducerBenchmark::start(&a.perf.connection, &destinations, &config, clock).await {
+        match ProducerBenchmark::start(&factory, &destinations, &config, clock).await {
             Ok(p) => p,
             Err(e) => {
                 let _ = listeners.close().await;

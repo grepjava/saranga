@@ -438,6 +438,354 @@ Failed to delete queue nosuch. Reason: AMQ229017: Queue nosuch does not exist
 Connection brokerURL = URL
 Queue clim deleted successfully.
 --- exit 0
+=== producer --protocol amqp --destination queue://amqq --message-count 2 --verbose --group g1 --properties [{"type":"int","key":"k","value":"7"},{"type":"string","key":"JMSCorrelationID","value":"c1"},{"type":"string","key":"JMSType","value":"t"},{"type":"double","key":"d","value":"0x1.8p1"}]
+Connection brokerURL = URL
+Producer amqq, thread=0 Started to calculate elapsed time ...
+
+Producer amqq, thread=0 Sent: test message: 0
+Producer amqq, thread=0 Sent: test message: 1
+Producer amqq, thread=0 Produced: 2 messages
+Producer amqq, thread=0 Elapsed time in second : # s
+Producer amqq, thread=0 Elapsed time in milli second : # milli seconds
+--- exit 0
+=== producer --protocol AMQP --destination queue://amqq --message-count 1 --message-size 10
+Connection brokerURL = URL
+Producer amqq, thread=0 Started to calculate elapsed time ...
+
+Producer amqq, thread=0 Produced: 1 messages
+Producer amqq, thread=0 Elapsed time in second : # s
+Producer amqq, thread=0 Elapsed time in milli second : # milli seconds
+--- exit 0
+=== producer --protocol amqp --destination queue://amqq --message-count 1 --object-size 5 --non-persistent
+Connection brokerURL = URL
+Producer amqq, thread=0 Started to calculate elapsed time ...
+
+Producer amqq, thread=0 Produced: 1 messages
+Producer amqq, thread=0 Elapsed time in second : # s
+Producer amqq, thread=0 Elapsed time in milli second : # milli seconds
+--- exit 0
+=== producer --protocol amqp --destination queue://amqq --message-count 2 --commit-interval 1 --message hi
+Connection brokerURL = URL
+Producer amqq, thread=0 Started to calculate elapsed time ...
+
+Producer amqq, thread=0 Committing transaction: 0
+Producer amqq, thread=0 Produced: 2 messages
+Producer amqq, thread=0 Elapsed time in second : # s
+Producer amqq, thread=0 Elapsed time in milli second : # milli seconds
+--- exit 0
+=== browser --protocol amqp --destination queue://amqq
+Connection brokerURL = URL
+Consumer:: filter = null
+Consumer amqq, thread=0 trying to browse 1000 messages
+Consumer amqq, thread=0 browsing test message: 0
+Consumer amqq, thread=0 browsing test message: 1
+Consumer amqq, thread=0 browsing ID:UUID:2:1:1-1
+Consumer amqq, thread=0 browsing ID:UUID:2:1:1-1
+Consumer amqq, thread=0 browsing hi
+Consumer amqq, thread=0 browsing hi
+Consumer amqq, thread=0 browsed: 6 messages
+Consumer amqq, thread=0 Browser thread finished
+--- exit 0
+=== browser --protocol amqp --destination queue://amqq --filter k = 7
+Connection brokerURL = URL
+Consumer:: filter = k = 7
+Consumer amqq, thread=0 trying to browse 1000 messages
+Consumer amqq, thread=0 browsing test message: 0
+Consumer amqq, thread=0 browsing test message: 1
+Consumer amqq, thread=0 browsed: 2 messages
+Consumer amqq, thread=0 Browser thread finished
+--- exit 0
+=== browser --protocol amqp --destination topic://amqtopic
+Connection brokerURL = URL
+Consumer:: filter = null
+Consumer amqtopic, thread=0 trying to browse 1000 messages
+java.lang.ClassCastException: class org.apache.qpid.jms.JmsTopic cannot be cast to class javax.jms.Queue (org.apache.qpid.jms.JmsTopic and javax.jms.Queue are in unnamed module of loader 'app')
+Consumer amqtopic, thread=0 Browser thread finished
+--- exit 0
+=== browser --destination topic://amqtopic
+Connection brokerURL = URL
+Consumer:: filter = null
+Consumer ActiveMQTopic[amqtopic], thread=0 trying to browse 1000 messages
+java.lang.ClassCastException: class org.apache.activemq.artemis.jms.client.ActiveMQTopic cannot be cast to class javax.jms.Queue (org.apache.activemq.artemis.jms.client.ActiveMQTopic and javax.jms.Queue are in unnamed module of loader 'app')
+Consumer ActiveMQTopic[amqtopic], thread=0 Browser thread finished
+--- exit 0
+=== consumer --protocol amqp --destination queue://amqq --message-count 2 --verbose --filter k = 7
+Connection brokerURL = URL
+Consumer:: filter = k = 7
+Consumer amqq, thread=0 wait 3000ms until 2 messages are consumed
+Consumer amqq, thread=0 Received test message: 0
+JMS Message ID:ID:UUID:2:1:1-1
+Received text sized at 15
+Consumer amqq, thread=0 Received test message: 1
+JMS Message ID:ID:UUID:2:1:1-2
+Received text sized at 15
+Consumer amqq, thread=0 Consumed: 2 messages
+Consumer amqq, thread=0 Elapsed time in second : # s
+Consumer amqq, thread=0 Elapsed time in milli second : # milli seconds
+Consumer amqq, thread=0 Consumed: 2 messages
+Consumer amqq, thread=0 Consumer thread finished
+--- exit 0
+=== consumer --protocol amqp --destination queue://amqq --message-count 4 --data INSTANCE/messages.xml
+Connection brokerURL = URL
+Consumer:: filter = null
+Default Serializer does not support: AMQP protocol
+Error. Unable to instantiate serializer class: null
+--- exit 0
+=== file
+<?xml version="1.0"?>
+<messages>
+   <message id="#" priority="4" expiration="0" timestamp="#" type="text" user-id="UUID">
+      <properties>
+         <property name="_AMQ_GROUP_ID" value="g1" type="simple-string"/>
+         <property name="__AMQ_CID" value="UUID" type="simple-string"/>
+         <property name="_AMQ_ROUTING_TYPE" value="1" type="byte"/>
+         <property name="count" value="0" type="long"/>
+         <property name="k" value="7" type="integer"/>
+         <property name="d" value="1.5" type="double"/>
+         <property name="s" value="a&amp;b&lt;" type="simple-string"/>
+         <property name="ThreadSent" value="Producer ActiveMQQueue[clidata], thread=0" type="simple-string"/>
+      </properties>
+      <body>
+         <![CDATA[hi <&> "x"]]>
+      </body>
+   </message>
+   <message id="#" priority="4" expiration="0" timestamp="#" type="bytes" user-id="UUID">
+      <properties>
+         <property name="__AMQ_CID" value="UUID" type="simple-string"/>
+         <property name="_AMQ_ROUTING_TYPE" value="1" type="byte"/>
+         <property name="count" value="0" type="long"/>
+         <property name="ThreadSent" value="Producer ActiveMQQueue[clidata], thread=0" type="simple-string"/>
+      </properties>
+      <body>
+         <![CDATA[Li4uLi4uLi4uLg==]]>
+      </body>
+   </message>
+   <message id="#" priority="4" expiration="0" timestamp="#" type="object" user-id="UUID">
+      <properties>
+         <property name="__AMQ_CID" value="UUID" type="simple-string"/>
+         <property name="_AMQ_ROUTING_TYPE" value="1" type="byte"/>
+         <property name="count" value="0" type="long"/>
+         <property name="ThreadSent" value="Producer ActiveMQQueue[clidata], thread=0" type="simple-string"/>
+      </properties>
+      <body>
+         <![CDATA[AAAADKztAAV0AAVMb3JlbQ==]]>
+      </body>
+   </message>
+</messages>
+=== producer --protocol amqp --destination queue://amqq --data INSTANCE/messages.xml
+Connection brokerURL = URL
+Default Serializer does not support: AMQP protocol
+Error. Unable to instantiate serializer class: null
+--- exit 0
+=== consumer --destination queue://amqq --message-count 10 --receive-timeout 300 --break-on-null --verbose
+Connection brokerURL = URL
+Consumer:: filter = null
+Consumer ActiveMQQueue[amqq], thread=0 wait 300ms until 10 messages are consumed
+Consumer ActiveMQQueue[amqq], thread=0 Received ID:UUID
+JMS Message ID:ID:UUID
+Consumer ActiveMQQueue[amqq], thread=0 Received ID:UUID
+JMS Message ID:ID:UUID
+Received object 5
+Consumer ActiveMQQueue[amqq], thread=0 Received hi
+JMS Message ID:ID:UUID
+Received text sized at 2
+Consumer ActiveMQQueue[amqq], thread=0 Received hi
+JMS Message ID:ID:UUID
+Received text sized at 2
+Consumer ActiveMQQueue[amqq], thread=0 Consumed: 10 messages
+Consumer ActiveMQQueue[amqq], thread=0 Elapsed time in second : # s
+Consumer ActiveMQQueue[amqq], thread=0 Elapsed time in milli second : # milli seconds
+Consumer ActiveMQQueue[amqq], thread=0 Consumed: 4 messages
+Consumer ActiveMQQueue[amqq], thread=0 Consumer thread finished
+--- exit 0
+=== producer --protocol amqp --destination queue://amqq --message-count 1 --properties [{"type":"string","key":"a b","value":"v"}]
+Connection brokerURL = URL
+Producer amqq, thread=0 Started to calculate elapsed time ...
+
+java.lang.IllegalArgumentException: Identifier contains invalid JMS identifier character ' ': 'a b' 
+--- exit 0
+=== producer --protocol amqp --destination queue://amqq --message-count 1 --properties [{"type":"string","key":"JMSXGroupSeq","value":"v"}]
+Connection brokerURL = URL
+Producer amqq, thread=0 Started to calculate elapsed time ...
+
+java.lang.NumberFormatException: For input string: "v"
+--- exit 0
+=== producer --protocol amqp --destination queue://amqq --message-count 1 --properties [{"type":"string","key":"JMSDestination","value":"q"}]
+Connection brokerURL = URL
+Producer amqq, thread=0 Started to calculate elapsed time ...
+
+javax.jms.JMSException: Cannot set JMS Destination as a property, use setJMSDestination() instead
+--- exit 0
+=== producer --destination queue://amqq --message-count 1 --properties [{"type":"string","key":"a b","value":"v"}]
+Connection brokerURL = URL
+Producer ActiveMQQueue[amqq], thread=0 Started to calculate elapsed time ...
+
+javax.jms.JMSRuntimeException: AMQ139012: The property name 'a b' is not a valid java identifier.
+--- exit 0
+=== producer --destination queue://amqq --message-count 1 --properties [{"type":"long","key":"k","value":"x"}]
+Connection brokerURL = URL
+Producer ActiveMQQueue[amqq], thread=0 Started to calculate elapsed time ...
+
+java.lang.NumberFormatException: For input string: "x"
+--- exit 0
+=== consumer --protocol amqp --destination topic://amqtopic --message-count 1 --receive-timeout 200 --durable --clientID amqcid --subscriptionName amqsub --break-on-null
+Connection brokerURL = URL
+Consumer:: filter = null
+Consumer:: subscription name = amqsub
+amqsub wait 200ms until 1 messages are consumed
+amqsub Consumed: 1 messages
+amqsub Elapsed time in second : # s
+amqsub Elapsed time in milli second : # milli seconds
+amqsub Consumed: 0 messages
+amqsub Consumer thread finished
+--- exit 0
+=== producer --protocol amqp --destination topic://amqtopic --message-count 2
+Connection brokerURL = URL
+Producer amqtopic, thread=0 Started to calculate elapsed time ...
+
+Producer amqtopic, thread=0 Produced: 2 messages
+Producer amqtopic, thread=0 Elapsed time in second : # s
+Producer amqtopic, thread=0 Elapsed time in milli second : # milli seconds
+--- exit 0
+=== consumer --protocol amqp --destination topic://amqtopic --message-count 5 --receive-timeout 300 --durable --clientID amqcid --subscriptionName amqsub --break-on-null
+Connection brokerURL = URL
+Consumer:: filter = null
+Consumer:: subscription name = amqsub
+amqsub wait 300ms until 5 messages are consumed
+amqsub Consumed: 5 messages
+amqsub Elapsed time in second : # s
+amqsub Elapsed time in milli second : # milli seconds
+amqsub Consumed: 2 messages
+amqsub Consumer thread finished
+--- exit 0
+=== producer --destination queue://amqc --message-count 2 --group g2 --properties [{"type":"int","key":"k","value":"7"},{"type":"string","key":"JMSCorrelationID","value":"c1"},{"type":"string","key":"JMSType","value":"t"},{"type":"double","key":"d","value":"0x1.8p1"}]
+Connection brokerURL = URL
+Producer ActiveMQQueue[amqc], thread=0 Started to calculate elapsed time ...
+
+Producer ActiveMQQueue[amqc], thread=0 Produced: 2 messages
+Producer ActiveMQQueue[amqc], thread=0 Elapsed time in second : # s
+Producer ActiveMQQueue[amqc], thread=0 Elapsed time in milli second : # milli seconds
+--- exit 0
+=== transfer --source-url URL --target-url URL --source-protocol core --target-protocol amqp --source-queue amqc --target-queue amqa --silent
+Connection brokerURL = URL
+Transferred a total of 2 messages
+--- exit 0
+=== transfer --source-url URL --target-url URL --source-protocol amqp --target-protocol core --source-queue amqa --target-queue amqc2 --copy --silent
+Connection brokerURL = URL
+Transferred a total of 2 messages
+--- exit 0
+=== transfer --source-url URL --target-url URL --source-protocol amqp --target-protocol amqp --source-queue amqa --target-queue amqa2 --silent
+Connection brokerURL = URL
+Transferred a total of 2 messages
+--- exit 0
+=== consumer --destination queue://amqc2 --message-count 2 --data INSTANCE/messages.xml
+Connection brokerURL = URL
+Consumer:: filter = null
+Consumer ActiveMQQueue[amqc2], thread=0 wait 3000ms until 2 messages are consumed
+Consumer ActiveMQQueue[amqc2], thread=0 Consumed: 2 messages
+Consumer ActiveMQQueue[amqc2], thread=0 Elapsed time in second : # s
+Consumer ActiveMQQueue[amqc2], thread=0 Elapsed time in milli second : # milli seconds
+Consumer ActiveMQQueue[amqc2], thread=0 Consumed: 2 messages
+Consumer ActiveMQQueue[amqc2], thread=0 Consumer thread finished
+--- exit 0
+=== file
+<?xml version="1.0"?>
+<messages>
+   <message id="#" priority="4" expiration="0" timestamp="#" type="text" user-id="UUID">
+      <properties>
+         <property name="_AMQ_GROUP_ID" value="g2" type="simple-string"/>
+         <property name="__AMQ_CID" value="UUID" type="simple-string"/>
+         <property name="_AMQ_ROUTING_TYPE" value="1" type="byte"/>
+         <property name="JMSXDeliveryCount" value="1" type="integer"/>
+         <property name="count" value="0" type="long"/>
+         <property name="k" value="7" type="integer"/>
+         <property name="JMSCorrelationID" value="c1" type="simple-string"/>
+         <property name="d" value="3.0" type="double"/>
+         <property name="JMSType" value="t" type="simple-string"/>
+         <property name="ThreadSent" value="Producer ActiveMQQueue[amqc], thread=0" type="simple-string"/>
+      </properties>
+      <body>
+         <![CDATA[test message: 0]]>
+      </body>
+   </message>
+   <message id="#" priority="4" expiration="0" timestamp="#" type="text" user-id="UUID">
+      <properties>
+         <property name="_AMQ_GROUP_ID" value="g2" type="simple-string"/>
+         <property name="__AMQ_CID" value="UUID" type="simple-string"/>
+         <property name="_AMQ_ROUTING_TYPE" value="1" type="byte"/>
+         <property name="JMSXDeliveryCount" value="1" type="integer"/>
+         <property name="count" value="1" type="long"/>
+         <property name="k" value="7" type="integer"/>
+         <property name="JMSCorrelationID" value="c1" type="simple-string"/>
+         <property name="d" value="3.0" type="double"/>
+         <property name="JMSType" value="t" type="simple-string"/>
+         <property name="ThreadSent" value="Producer ActiveMQQueue[amqc], thread=0" type="simple-string"/>
+      </properties>
+      <body>
+         <![CDATA[test message: 1]]>
+      </body>
+   </message>
+</messages>
+=== consumer --protocol amqp --destination queue://amqa2 --message-count 5 --receive-timeout 300 --break-on-null --verbose
+Connection brokerURL = URL
+Consumer:: filter = null
+Consumer amqa2, thread=0 wait 300ms until 5 messages are consumed
+Consumer amqa2, thread=0 Received test message: 0
+JMS Message ID:ID:UUID:2:1:1-1
+Received text sized at 15
+Consumer amqa2, thread=0 Received test message: 1
+JMS Message ID:ID:UUID:2:1:1-2
+Received text sized at 15
+Consumer amqa2, thread=0 Consumed: 5 messages
+Consumer amqa2, thread=0 Elapsed time in second : # s
+Consumer amqa2, thread=0 Elapsed time in milli second : # milli seconds
+Consumer amqa2, thread=0 Consumed: 2 messages
+Consumer amqa2, thread=0 Consumer thread finished
+--- exit 0
+=== check queue --name DLQ --produce 2 --browse 2 --consume 2 --protocol amqp
+Connection brokerURL = URL
+Running QueueCheck
+Checking that a producer can send 2 messages to the queue DLQ ... success
+Checking that a consumer can browse 2 messages from the queue DLQ ... success
+Checking that a consumer can consume 2 messages from the queue DLQ ... success
+Checks run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: # sec - QueueCheck
+--- exit 0
+=== producer --protocol amqp --destination queue://amqq --message-count 1 --user nobody --password nothing
+Connection brokerURL = URL
+Producer amqq, thread=0 Started to calculate elapsed time ...
+
+Producer amqq, thread=0 Produced: 1 messages
+Producer amqq, thread=0 Elapsed time in second : # s
+Producer amqq, thread=0 Elapsed time in milli second : # milli seconds
+--- exit 0
+=== queue delete --name amqq --autoDeleteAddress
+Connection brokerURL = URL
+Queue amqq deleted successfully.
+--- exit 0
+=== queue delete --name amqc --autoDeleteAddress
+Connection brokerURL = URL
+Queue amqc deleted successfully.
+--- exit 0
+=== queue delete --name amqc2 --autoDeleteAddress
+Connection brokerURL = URL
+Queue amqc2 deleted successfully.
+--- exit 0
+=== queue delete --name amqa --autoDeleteAddress
+Connection brokerURL = URL
+Queue amqa deleted successfully.
+--- exit 0
+=== queue delete --name amqa2 --autoDeleteAddress
+Connection brokerURL = URL
+Queue amqa2 deleted successfully.
+--- exit 0
+=== queue delete --name amqcid.amqsub
+Connection brokerURL = URL
+Queue amqcid.amqsub deleted successfully.
+--- exit 0
+=== address delete --name amqtopic --force
+Connection brokerURL = URL
+Address amqtopic deleted successfully.
+--- exit 0
 === address create --name cliaddr --multicast
 Connection brokerURL = URL
 Address [name=cliaddr, routingTypes={MULTICAST}, autoCreated=false] created successfully.
@@ -487,6 +835,7 @@ Connection brokerURL = URL
 $sys.mqtt.sessions
 activemq.management.UUID
 activemq.notifications
+amqq
 cliq2
 clitopic
 DLQ

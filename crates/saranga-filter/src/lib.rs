@@ -13,11 +13,15 @@
 //!
 //! Not supported: evaluating `XPATH` against the message body (`XPATH`
 //! parses but always evaluates to FALSE, and its expression is not
-//! validated as Artemis does at parse time); hexadecimal floating-point
-//! strings and non-ASCII digits in `convert_string_expressions:` conversions.
+//! validated as Artemis does at parse time).
 
 mod expr;
 mod java;
+pub use java::{
+    double_to_string as java_double_to_string, float_to_string as java_float_to_string,
+    parse_double as java_parse_double, parse_float as java_parse_float,
+    parse_int as java_parse_int,
+};
 mod lexer;
 mod like;
 mod message;

@@ -277,7 +277,11 @@ async fn hooks_follow_a_message() {
     wait_for(|| q.message_count() == 0).await;
     s.close(false).await;
     drop(registration);
-    broker.post_office().delete_queue("q", false, true).unwrap();
+    broker
+        .post_office()
+        .delete_queue_awaited("q", false, true)
+        .await
+        .unwrap();
     broker.stop().unwrap();
 
     let events = recorder.events();

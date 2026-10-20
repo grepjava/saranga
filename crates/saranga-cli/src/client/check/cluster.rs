@@ -49,8 +49,11 @@ const STARS: usize = 127;
 
 pub async fn run(mut args: ClusterArgs) -> anyhow::Result<()> {
     args.conn.resolve(false)?;
-    // `createConnectionFactory().close()`.
-    args.conn.try_connect().await?;
+    // `createConnectionFactory().close()`, by `--protocol`: the URL of a
+    // retry stays with the factory.
+    let url = args.conn.url.clone();
+    super::super::jmsapi::Conn::try_connect(&mut args.conn).await?;
+    args.conn.url = url;
     // `verify`'s result is the command's: a failed verification is printed,
     // the command does not fail.
     verify(&args.conn, args.variance).await.map_err(uncaught)?;

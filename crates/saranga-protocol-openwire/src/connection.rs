@@ -1081,7 +1081,7 @@ impl Connection {
                 t => return Err(OwError::io(format!("Unknown operation type: {t}"))),
             },
             DataStructure::RemoveSubscriptionInfo(info) => {
-                self.process_remove_subscription(&info)?;
+                self.process_remove_subscription(&info).await?;
                 Handled::Reply(None)
             }
             DataStructure::Message(msg) => {
@@ -1429,7 +1429,8 @@ impl Connection {
                     .address_info(&address)
                     .is_none_or(|a| a.temporary || a.auto_created);
                 if post_office
-                    .delete_queue(&r.name, false, auto_delete)
+                    .delete_queue_awaited(&r.name, false, auto_delete)
+                    .await
                     .is_ok()
                 {
                     self.temp_destination_deleted(Destination::new(TEMP_QUEUE, r.name.clone()))
@@ -2359,14 +2360,16 @@ impl Connection {
         }
         let destination_name = self.convert_wildcard(&member);
         let (queue_name, filter) = if member.is_topic() {
-            let q = self.create_topic_subscription(
-                sid,
-                info,
-                &destination_name,
-                selector.clone(),
-                dest_is_composite(info),
-                internal_address,
-            )?;
+            let q = self
+                .create_topic_subscription(
+                    sid,
+                    info,
+                    &destination_name,
+                    selector.clone(),
+                    dest_is_composite(info),
+                    internal_address,
+                )
+                .await?;
             let fqqn = split_fqqn(&destination_name).1.is_some();
             (q, if fqqn { selector } else { None })
         } else {
@@ -2442,7 +2445,7 @@ impl Connection {
     }
 
     /// `createTopicSubscription`.
-    fn create_topic_subscription(
+    async fn create_topic_subscription(
         &mut self,
         sid: &SessionId,
         info: &ConsumerInfo,
@@ -2479,7 +2482,7 @@ impl Connection {
                 let changed =
                     existing.filter_string != selector || *existing.address != *spec.address;
                 if changed && !configuration_managed {
-                    session.session.delete_queue(&name)?;
+                    session.session.delete_queue(&name).await?;
                     session.session.create_queue(spec)?;
                 }
             } else {
@@ -2756,7 +2759,7 @@ impl Connection {
     }
 
     /// `processRemoveSubscription`.
-    fn process_remove_subscription(&mut self, info: &RemoveSubscriptionInfo) -> OwResult<()> {
+    async fn process_remove_subscription(&mut self, info: &RemoveSubscriptionInfo) -> OwResult<()> {
         let invalid =
             || OwError::jms_ise("Rejecting remove subscription command with invalid data");
         let Some(state) = &self.info else {
@@ -2770,7 +2773,7 @@ impl Connection {
         let name =
             subscription_queue_name(info.client_id.as_deref(), info.subscription_name.as_deref());
         let internal = self.internal.as_mut().ok_or_else(OwError::npe)?;
-        match internal.delete_queue(&name) {
+        match internal.delete_queue(&name).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind == ErrorType::QueueDoesNotExist => Err(OwError {
                 class: "javax.jms.InvalidDestinationException".into(),

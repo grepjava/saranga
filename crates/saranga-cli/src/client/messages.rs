@@ -6,11 +6,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::bail;
-use saranga_client::message::{HDR_GROUP_ID, bytes_message, new_message, text_message};
-use saranga_client::{CoreMessage, MessageExt, PropertyValue, message_type};
+use saranga_client::PropertyValue;
 use saranga_server::management::json::Json;
 
-use super::jms::{Destination, JmsConnection, JmsSession, message, text_or_id};
+use super::amqp::jms::{ConsumerKind, JmsError};
+use super::jms::{Destination, JmsConnection};
+use super::jmsapi::{Body, Conn, Cons, Msg, Protocol, Sess};
 use super::{Common, ConnectionArgs, UsageError};
 use crate::data::serialize::{MessageReader, MessageWriter, XML_SERIALIZER};
 
@@ -99,14 +100,22 @@ impl DestArgs {
         u64::try_from(self.sleep).unwrap_or(0)
     }
 
-    /// The connection, with `Consumer:: clientID = ` first when there is
-    /// one (`createCoreConnectionFactory`).
-    async fn connect(&self) -> anyhow::Result<JmsConnection> {
-        connect(&self.conn).await
+    /// `createConnectionFactory()` and `createConnection()`, by
+    /// `--protocol`.
+    async fn connect(&self) -> anyhow::Result<Conn> {
+        Conn::connect(&self.conn).await
     }
 }
 
-async fn connect(conn: &ConnectionArgs) -> anyhow::Result<JmsConnection> {
+/// The first line `printStackTrace` prints of what a thread threw.
+fn exception_line(e: &anyhow::Error) -> String {
+    match e.downcast_ref::<JmsError>() {
+        Some(j) => j.to_java_string(),
+        None => format!("{e:#}"),
+    }
+}
+
+pub(crate) async fn connect(conn: &ConnectionArgs) -> anyhow::Result<JmsConnection> {
     if let Some(id) = &conn.client_id {
         println!("Consumer:: clientID = {id}");
     }
@@ -168,29 +177,24 @@ struct ProducerSpec {
     object_size: usize,
     ttl: i64,
     group: Option<String>,
-    properties: Option<Vec<Json>>,
+    /// `--properties`, read for each message.
+    properties: Option<String>,
     count: i64,
     sleep: u64,
     batch: i64,
     verbose: bool,
+    protocol: Protocol,
 }
 
 pub async fn producer(mut args: ProducerArgs) -> anyhow::Result<()> {
     args.dest.resolve()?;
+    let conn = args.dest.connect().await?;
     if let Some(file) = args.data.clone() {
-        let conn = args.dest.connect().await?;
         let r = produce_file(&conn, &args.dest, &file).await;
         conn.close().await;
         return r;
     }
-    let properties = match args.properties.as_deref().filter(|p| !p.is_empty()) {
-        Some(p) => match Json::parse(p) {
-            Ok(Json::Array(items)) => Some(items),
-            _ => bail!("Invalid --properties: {p}"),
-        },
-        None => None,
-    };
-    let conn = Arc::new(args.dest.connect().await?);
+    let conn = Arc::new(conn);
     let spec = Arc::new(ProducerSpec {
         persistent: !args.non_persistent,
         message_size: usize::try_from(args.message_size).unwrap_or(0),
@@ -199,23 +203,22 @@ pub async fn producer(mut args: ProducerArgs) -> anyhow::Result<()> {
         object_size: usize::try_from(args.object_size).unwrap_or(0),
         ttl: args.msgttl,
         group: args.group.clone(),
-        properties,
+        properties: args.properties.clone().filter(|p| !p.is_empty()),
         count: args.dest.message_count,
         sleep: args.dest.sleep_millis(),
         batch: args.dest.tx_batch_size,
         verbose: args.dest.verbose(),
+        protocol: conn.protocol(),
     });
     let dest = Destination::parse(&args.dest.destination);
     let mut threads = tokio::task::JoinSet::new();
     for i in 0..args.dest.threads()? {
         let session = conn.session(spec.batch > 0).await?;
         let (spec, dest) = (spec.clone(), dest.clone());
-        let name = format!("Producer {dest}, thread={i}");
+        let name = format!("Producer {}, thread={i}", conn.dest_text(&dest));
         threads.spawn(async move {
-            if let Err(e) = produce(&session, &dest, &name, &spec).await {
-                eprintln!("{e:#}");
-            }
-            session.close().await;
+            produce(&session, &dest, &name, &spec).await;
+            session.finish().await;
         });
     }
     while threads.join_next().await.is_some() {}
@@ -225,14 +228,27 @@ pub async fn producer(mut args: ProducerArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `ProducerThread.run`.
-async fn produce(
-    session: &JmsSession,
-    dest: &Destination,
+/// `ProducerThread.run`: what it throws printed, the producer closed.
+async fn produce(session: &Sess, dest: &Destination, thread: &str, spec: &ProducerSpec) {
+    let producer = match session.producer(dest).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}", exception_line(&e));
+            return;
+        }
+    };
+    if let Err(e) = produce_loop(session, &producer, thread, spec).await {
+        eprintln!("{}", exception_line(&e));
+    }
+    producer.close().await;
+}
+
+async fn produce_loop(
+    session: &Sess,
+    producer: &super::jmsapi::Prod,
     thread: &str,
     spec: &ProducerSpec,
 ) -> anyhow::Result<()> {
-    let producer = session.producer(dest).await?;
     let payload = (spec.message_size > 0).then(|| vec![b'.'; spec.message_size]);
     println!("{thread} Started to calculate elapsed time ...\n");
     let started = Instant::now();
@@ -240,12 +256,12 @@ async fn produce(
     let mut transactions = 0;
     let mut sent: i64 = 0;
     while sent < spec.count {
-        let m = create_message(spec, sent, thread, payload.as_deref(), &mut text_cache)?;
-        let m = session
-            .send(&producer, dest, m, spec.persistent, spec.ttl)
+        let mut m = create_message(spec, sent, thread, payload.as_deref(), &mut text_cache)?;
+        session
+            .send(producer, &mut m, spec.persistent, spec.ttl)
             .await?;
         if spec.verbose {
-            println!("{thread} Sent: {}", text_or_id(&m));
+            println!("{thread} Sent: {}", m.text_or_id());
         }
         if spec.batch > 0 && sent > 0 && sent % spec.batch == 0 {
             println!("{thread} Committing transaction: {transactions}");
@@ -257,18 +273,18 @@ async fn produce(
         }
         sent += 1;
     }
-    if session.transacted {
-        session.commit().await?;
+    // `try { session.commit() } catch (Throwable ignored)`.
+    if session.transacted() {
+        let _ = session.commit().await;
     }
     println!("{thread} Produced: {sent} messages");
     elapsed_lines(thread, started);
-    producer.close();
     Ok(())
 }
 
 /// `Producer.execute` with `--data`: the file's messages sent in order in
 /// one transaction, persistent, rolled back on the first failure.
-async fn produce_file(conn: &JmsConnection, args: &DestArgs, file: &str) -> anyhow::Result<()> {
+async fn produce_file(conn: &Conn, args: &DestArgs, file: &str) -> anyhow::Result<()> {
     let session = conn.session(true).await?;
     let dest = Destination::parse(&args.destination);
     let producer = session.producer(&dest).await?;
@@ -287,7 +303,11 @@ async fn produce_file(conn: &JmsConnection, args: &DestArgs, file: &str) -> anyh
         reader.start()?;
         let mut count = 0;
         while let Some(m) = reader.read()? {
-            session.send(&producer, &dest, m, true, 0).await?;
+            let mut m = Msg::Core {
+                message: m,
+                large: false,
+            };
+            session.send(&producer, &mut m, true, 0).await?;
             count += 1;
         }
         session.commit().await?;
@@ -300,24 +320,25 @@ async fn produce_file(conn: &JmsConnection, args: &DestArgs, file: &str) -> anyh
         Err(e) => {
             eprintln!("Error occurred during import.  Rolling back.");
             session.rollback().await?;
-            eprintln!("{e:#}");
+            eprintln!("{}", exception_line(&e));
         }
     }
-    producer.close();
-    session.close().await;
+    producer.close().await;
+    session.finish().await;
     Ok(())
 }
 
-/// `ProducerThread.createMessage`.
+/// `ProducerThread.createMessage`: the body, the group, `count` and
+/// `ThreadSent`, then `--properties`, each set as the client sets it.
 fn create_message(
     spec: &ProducerSpec,
     i: i64,
     thread: &str,
     payload: Option<&[u8]>,
     text_cache: &mut Option<String>,
-) -> anyhow::Result<CoreMessage> {
-    let mut m = if let Some(payload) = payload {
-        bytes_message(payload)
+) -> anyhow::Result<Msg> {
+    let body = if let Some(payload) = payload {
+        Body::Bytes(payload.to_vec())
     } else {
         let text = if spec.text_size > 0 || spec.object_size > 0 {
             let size = if spec.object_size > 0 {
@@ -332,42 +353,122 @@ fn create_message(
             format!("test message: {i}")
         };
         if spec.object_size > 0 {
-            object_message(&text)
+            Body::Object(text)
         } else {
-            text_message(&text)
+            Body::Text(text)
         }
     };
+    let mut m = Msg::create(spec.protocol, body);
     if let Some(group) = spec.group.as_deref().filter(|g| !g.is_empty()) {
-        m.put_string_property(HDR_GROUP_ID, group);
+        m.set_property("JMSXGroupID", &PropertyValue::String(group.into()))?;
     }
-    m.put_property("count", PropertyValue::Long(i));
-    m.put_string_property("ThreadSent", thread);
+    m.set_property("count", &PropertyValue::Long(i))?;
+    m.set_property("ThreadSent", &PropertyValue::String(thread.into()))?;
     if let Some(properties) = &spec.properties {
-        for p in properties {
-            let field = |k: &str| p.get(k).and_then(Json::as_str).unwrap_or("").to_owned();
-            let (kind, key, value) = (field("type"), field("key"), field("value"));
-            let parsed = match kind.to_lowercase().as_str() {
-                "boolean" => Some(PropertyValue::Bool(value.eq_ignore_ascii_case("true"))),
-                "int" => Some(PropertyValue::Int(value.parse()?)),
-                "long" => Some(PropertyValue::Long(value.parse()?)),
-                "byte" => Some(PropertyValue::Byte(value.parse()?)),
-                "short" => Some(PropertyValue::Short(value.parse()?)),
-                "float" => Some(PropertyValue::Float(value.parse()?)),
-                "double" => Some(PropertyValue::Double(value.parse()?)),
-                "string" => Some(PropertyValue::String(value.as_str().into())),
-                _ => None,
-            };
-            match parsed {
-                Some(v) => {
-                    m.put_property(&key, v);
-                }
-                None => eprintln!(
-                    "Unable to set property: {key}. Did not recognize type: {kind}. Supported types are: boolean, int, long, byte, short, float, double, string."
-                ),
-            }
-        }
+        apply_properties(&mut m, properties)?;
     }
     Ok(m)
+}
+
+const JSON_PARSING: &str =
+    "org.apache.activemq.artemis.commons.shaded.json.stream.JsonParsingException";
+
+/// `ProducerThread.applyProperties`: the JSON array read again for each
+/// message, each entry's value parsed for its type and set.
+fn apply_properties(m: &mut Msg, properties: &str) -> anyhow::Result<()> {
+    let items = match Json::parse(properties) {
+        Ok(Json::Array(items)) => items,
+        Ok(other) => bail!(JmsError {
+            class: JSON_PARSING,
+            message: format!(
+                "Expecting interface org.apache.activemq.artemis.commons.shaded.json.JsonArray but got {}",
+                other
+            ),
+        }),
+        Err(e) => bail!(JmsError {
+            class: JSON_PARSING,
+            message: e.to_string(),
+        }),
+    };
+    for item in &items {
+        if !matches!(item, Json::Object(_)) {
+            bail!(JmsError {
+                class: "java.lang.ClassCastException",
+                message: format!(
+                    "Cannot cast {} to org.apache.activemq.artemis.commons.shaded.json.JsonObject",
+                    johnzon_class(item)
+                ),
+            });
+        }
+        // `JsonObject.getString`: the entry must be there, and a string.
+        let field = |k: &str| -> anyhow::Result<String> {
+            match item.get(k) {
+                None => bail!(JmsError {
+                    class: "java.lang.NullPointerException",
+                    message: format!("no mapping for {k}"),
+                }),
+                Some(Json::String(s)) => Ok(s.clone()),
+                Some(other) => bail!(JmsError {
+                    class: "java.lang.ClassCastException",
+                    message: format!(
+                        "Cannot cast {} to org.apache.activemq.artemis.commons.shaded.json.JsonString",
+                        johnzon_class(other)
+                    ),
+                }),
+            }
+        };
+        let (kind, key, value) = (field("type")?, field("key")?, field("value")?);
+        use super::amqp::properties as jp;
+        let number = |e: JmsError| anyhow::Error::from(e);
+        let parsed = match kind.to_lowercase().as_str() {
+            "boolean" => Some(PropertyValue::Bool(value.eq_ignore_ascii_case("true"))),
+            "int" => Some(PropertyValue::Int(
+                saranga_filter::java_parse_int(&value).ok_or_else(|| number_format(&value))?,
+            )),
+            "long" => Some(PropertyValue::Long(
+                saranga_filter::java_parse_int(&value).ok_or_else(|| number_format(&value))?,
+            )),
+            "byte" => Some(PropertyValue::Byte(jp::parse_byte(&value).map_err(number)?)),
+            "short" => Some(PropertyValue::Short(
+                jp::parse_short(&value).map_err(number)?,
+            )),
+            "float" => Some(PropertyValue::Float(
+                jp::parse_float(&value).map_err(number)?,
+            )),
+            "double" => Some(PropertyValue::Double(
+                jp::parse_double(&value).map_err(number)?,
+            )),
+            "string" => Some(PropertyValue::String(value.as_str().into())),
+            _ => None,
+        };
+        match parsed {
+            Some(v) => m.set_property(&key, &v)?,
+            None => eprintln!(
+                "Unable to set property: {key}. Did not recognize type: {kind}. Supported types are: boolean, int, long, byte, short, float, double, string."
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn number_format(s: &str) -> JmsError {
+    JmsError {
+        class: "java.lang.NumberFormatException",
+        message: format!("For input string: \"{s}\""),
+    }
+}
+
+/// The johnzon class of a JSON value.
+fn johnzon_class(v: &Json) -> String {
+    let simple = match v {
+        Json::Object(_) => "JsonObjectImpl",
+        Json::Array(_) => "JsonArrayImpl",
+        Json::String(_) => "JsonStringImpl",
+        Json::Long(_) => "JsonLongImpl",
+        Json::Double(_) => "JsonNumberImpl",
+        _ => return "org.apache.activemq.artemis.commons.shaded.json.JsonValue$1".to_owned(),
+    };
+    format!("org.apache.activemq.artemis.commons.shaded.johnzon.core.{simple}")
 }
 
 /// The first `size` characters of the demo text, repeated whole until
@@ -383,41 +484,6 @@ fn demo_text(size: usize) -> String {
         out.push_str(&read);
     }
     out
-}
-
-/// An `ObjectMessage` of a `String`: the Java serialization of the string,
-/// after its length (`ActiveMQObjectMessage.doBeforeSend`).
-fn object_message(text: &str) -> CoreMessage {
-    let mut utf = Vec::new();
-    for c in text.encode_utf16() {
-        // Modified UTF-8, as `DataOutput.writeUTF` writes it.
-        match c {
-            0x0001..=0x007f => utf.push(c as u8),
-            0x0000 | 0x0080..=0x07ff => {
-                utf.push((0xc0 | ((c >> 6) & 0x1f)) as u8);
-                utf.push((0x80 | (c & 0x3f)) as u8);
-            }
-            _ => {
-                utf.push((0xe0 | ((c >> 12) & 0x0f)) as u8);
-                utf.push((0x80 | ((c >> 6) & 0x3f)) as u8);
-                utf.push((0x80 | (c & 0x3f)) as u8);
-            }
-        }
-    }
-    let mut data = vec![0xac, 0xed, 0x00, 0x05];
-    if utf.len() <= 0xffff {
-        data.push(0x74);
-        data.extend_from_slice(&(utf.len() as u16).to_be_bytes());
-    } else {
-        data.push(0x7c);
-        data.extend_from_slice(&(utf.len() as u64).to_be_bytes());
-    }
-    data.extend_from_slice(&utf);
-    let mut m = new_message(message_type::OBJECT, true);
-    let mut body = (data.len() as i32).to_be_bytes().to_vec();
-    body.extend_from_slice(&data);
-    m.body = body.into();
-    m
 }
 
 // ---------------------------------------------------------------- consumer
@@ -470,7 +536,6 @@ struct ConsumerSpec {
     sleep: u64,
     batch: i64,
     verbose: bool,
-    client_id: Option<String>,
     /// `--data`'s file (the `SerialiserMessageListener`), until stopped.
     writer: Option<SharedWriter>,
 }
@@ -535,7 +600,6 @@ async fn consume_threads(args: &ConsumerArgs, writer: Option<SharedWriter>) -> a
         sleep: args.dest.sleep_millis(),
         batch: args.dest.tx_batch_size,
         verbose: args.dest.verbose(),
-        client_id: conn.client_id.clone(),
         writer,
     });
     let dest = Destination::parse(&args.dest.destination);
@@ -547,10 +611,10 @@ async fn consume_threads(args: &ConsumerArgs, writer: Option<SharedWriter>) -> a
         let name = args
             .subscription_name
             .clone()
-            .unwrap_or_else(|| format!("Consumer {dest}, thread={i}"));
+            .unwrap_or_else(|| format!("Consumer {}, thread={i}", conn.dest_text(&dest)));
         threads.spawn(async move {
             consume(&session, &dest, &name, &spec).await;
-            session.close().await;
+            session.finish().await;
         });
     }
     while threads.join_next().await.is_some() {}
@@ -561,7 +625,7 @@ async fn consume_threads(args: &ConsumerArgs, writer: Option<SharedWriter>) -> a
 }
 
 /// `ConsumerThread.consume`.
-async fn consume(session: &JmsSession, dest: &Destination, thread: &str, spec: &ConsumerSpec) {
+async fn consume(session: &Sess, dest: &Destination, thread: &str, spec: &ConsumerSpec) {
     let wait = if spec.receive_timeout == -1 {
         "forever".to_owned()
     } else {
@@ -574,8 +638,9 @@ async fn consume(session: &JmsSession, dest: &Destination, thread: &str, spec: &
     let mut received: i64 = 0;
     let consumer = match consume_loop(session, dest, thread, spec, &mut received).await {
         Ok(c) => Some(c),
-        Err((c, e)) => {
-            eprintln!("{e:#}");
+        Err(failed) => {
+            let (c, e) = *failed;
+            eprintln!("{}", exception_line(&e));
             c
         }
     };
@@ -586,21 +651,28 @@ async fn consume(session: &JmsSession, dest: &Destination, thread: &str, spec: &
     println!("{thread} Consumer thread finished");
 }
 
-type LoopError = (Option<saranga_client::Consumer>, anyhow::Error);
+/// What failed, with the consumer when it was made.
+type LoopError = Box<(Option<Cons>, anyhow::Error)>;
 
 async fn consume_loop(
-    session: &JmsSession,
+    session: &Sess,
     dest: &Destination,
     thread: &str,
     spec: &ConsumerSpec,
     received: &mut i64,
-) -> Result<saranga_client::Consumer, LoopError> {
-    let subscription =
-        (spec.durable && !dest.is_queue()).then_some((thread, spec.client_id.as_deref()));
+) -> Result<Cons, LoopError> {
+    let kind = if spec.durable && !dest.is_queue() {
+        ConsumerKind::Durable {
+            name: thread.to_owned(),
+            no_local: false,
+        }
+    } else {
+        ConsumerKind::Plain
+    };
     let consumer = session
-        .consumer(dest, spec.filter.as_deref(), subscription)
+        .consumer(dest, spec.filter.as_deref(), kind)
         .await
-        .map_err(|e| (None, e))?;
+        .map_err(|e| Box::new((None, e)))?;
     let started = Instant::now();
     let mut count: i64 = 0;
     let mut transactions = 0;
@@ -610,9 +682,9 @@ async fn consume_loop(
     let r: anyhow::Result<()> = async {
         while *received < spec.count {
             match session.receive(&consumer, timeout).await? {
-                Some(d) => {
+                Some(m) => {
                     if spec.verbose {
-                        println!("{thread} Received {}", text_or_id(&d.message));
+                        println!("{thread} Received {}", m.text_or_id());
                     } else {
                         count += 1;
                         if count % 1000 == 0 {
@@ -624,11 +696,12 @@ async fn consume_loop(
                         Some(w) => {
                             if let Some(w) =
                                 w.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.as_mut()
+                                && let Msg::Core { message, large } = &m
                             {
-                                w.write(&d.message, d.is_large())?;
+                                w.write(message, *large)?;
                             }
                         }
-                        None if spec.verbose => verbose_received(&d.message),
+                        None if spec.verbose => m.print_verbose(),
                         None => {}
                     }
                     *received += 1;
@@ -639,7 +712,10 @@ async fn consume_loop(
                     }
                 }
             }
-            if session.transacted && spec.batch > 0 && *received > 0 && *received % spec.batch == 0
+            if session.transacted()
+                && spec.batch > 0
+                && *received > 0
+                && *received % spec.batch == 0
             {
                 println!("{thread} Committing transaction: {transactions}");
                 transactions += 1;
@@ -649,57 +725,19 @@ async fn consume_loop(
                 tokio::time::sleep(Duration::from_millis(spec.sleep)).await;
             }
         }
-        if session.transacted {
-            session.commit().await?;
+        // `try { session.commit() } catch (Throwable ignored)`.
+        if session.transacted() {
+            let _ = session.commit().await;
         }
         Ok(())
     }
     .await;
     if let Err(e) = r {
-        return Err((Some(consumer), e));
+        return Err(Box::new((Some(consumer), e)));
     }
     println!("{thread} Consumed: {} messages", spec.count);
     elapsed_lines(thread, started);
     Ok(consumer)
-}
-
-/// `ConsumerThread.handle` for a received message, with `--verbose`.
-fn verbose_received(m: &CoreMessage) {
-    println!(
-        "JMS Message ID:{}",
-        m.jms_message_id().unwrap_or_else(|| "null".to_owned())
-    );
-    match m.message_type {
-        message_type::TEXT => {
-            let text = m.text().ok().flatten().unwrap_or_default();
-            println!("Received text sized at {}", text.encode_utf16().count());
-        }
-        message_type::OBJECT => {
-            if let Some(len) = object_string_len(&m.body) {
-                println!("Received object {len}");
-            }
-        }
-        _ => {}
-    }
-}
-
-/// The length of a serialized `String` object body, in UTF-16 units.
-fn object_string_len(body: &[u8]) -> Option<usize> {
-    let data = body.get(4..)?;
-    let (start, len) = match data.get(4)? {
-        0x74 => (
-            7,
-            u16::from_be_bytes([*data.get(5)?, *data.get(6)?]) as usize,
-        ),
-        0x7c => (
-            13,
-            u64::from_be_bytes(data.get(5..13)?.try_into().ok()?) as usize,
-        ),
-        _ => return None,
-    };
-    let utf = data.get(start..start + len)?;
-    // Modified UTF-8: count the UTF-16 units.
-    Some(utf.iter().filter(|b| (**b & 0xc0) != 0x80).count())
 }
 
 pub async fn browser(mut args: BrowseArgs) -> anyhow::Result<()> {
@@ -710,26 +748,23 @@ pub async fn browser(mut args: BrowseArgs) -> anyhow::Result<()> {
     );
     let conn = Arc::new(args.dest.connect().await?);
     let dest = Destination::parse(&args.dest.destination);
-    let Destination::Queue(queue) = dest.clone() else {
-        bail!(
-            "class org.apache.activemq.artemis.jms.client.ActiveMQTopic cannot be cast to class jakarta.jms.Queue"
-        );
-    };
     let mut threads = tokio::task::JoinSet::new();
     for i in 0..args.dest.threads()? {
         let session = conn.session(args.dest.tx_batch_size > 0).await?;
         session.start().await?;
-        let thread = format!("Consumer {dest}, thread={i}");
-        let (queue, filter) = (queue.clone(), args.filter.clone());
+        let thread = format!("Consumer {}, thread={i}", conn.dest_text(&dest));
+        let (dest, filter) = (dest.clone(), args.filter.clone());
         let (count, sleep, verbose) = (
             args.dest.message_count,
             args.dest.sleep_millis(),
             args.dest.verbose(),
         );
+        let protocol = conn.protocol();
         threads.spawn(async move {
             browse(
                 &session,
-                &queue,
+                protocol,
+                &dest,
                 filter.as_deref(),
                 &thread,
                 count,
@@ -737,7 +772,7 @@ pub async fn browser(mut args: BrowseArgs) -> anyhow::Result<()> {
                 verbose,
             )
             .await;
-            session.close().await;
+            session.finish().await;
         });
     }
     while threads.join_next().await.is_some() {}
@@ -747,10 +782,12 @@ pub async fn browser(mut args: BrowseArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `ConsumerThread.browse`.
+/// `ConsumerThread.browse`: a topic fails the cast to `Queue`.
+#[allow(clippy::too_many_arguments)]
 async fn browse(
-    session: &JmsSession,
-    queue: &str,
+    session: &Sess,
+    protocol: Protocol,
+    dest: &Destination,
     filter: Option<&str>,
     thread: &str,
     count: i64,
@@ -759,29 +796,32 @@ async fn browse(
 ) {
     println!("{thread} trying to browse {count} messages");
     let mut received: i64 = 0;
-    let browser = match session.browser(queue, filter).await {
-        Ok(b) => Some(b),
-        Err(e) => {
-            eprintln!("{e:#}");
+    let browser = match dest {
+        Destination::Queue(queue) => match session.browser(queue, filter).await {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("{}", exception_line(&e));
+                None
+            }
+        },
+        Destination::Topic(_) => {
+            let class = match protocol {
+                Protocol::Core => "org.apache.activemq.artemis.jms.client.ActiveMQTopic",
+                Protocol::Amqp => "org.apache.qpid.jms.JmsTopic",
+            };
+            eprintln!(
+                "java.lang.ClassCastException: class {class} cannot be cast to class javax.jms.Queue ({class} and javax.jms.Queue are in unnamed module of loader 'app')"
+            );
             None
         }
     };
     if let Some(b) = &browser {
         loop {
-            match b.receive_immediate().await {
-                Ok(Some(d)) => {
-                    println!("{thread} browsing {}", text_or_id(&d.message));
+            match session.browse_next(b).await {
+                Ok(Some(m)) => {
+                    println!("{thread} browsing {}", m.text_or_id());
                     if verbose {
-                        let m = &d.message;
-                        println!(
-                            "...ActiveMQMessage[{}]:{}",
-                            m.jms_message_id().unwrap_or_else(|| "null".to_owned()),
-                            if m.durable {
-                                "PERSISTENT"
-                            } else {
-                                "NON-PERSISTENT"
-                            }
-                        );
+                        println!("...{}", m.browse_text());
                     }
                     received += 1;
                     if received >= count {
@@ -790,7 +830,7 @@ async fn browse(
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    eprintln!("{}", message(&e));
+                    eprintln!("{e:#}");
                     break;
                 }
             }
@@ -917,33 +957,6 @@ fn transfer_destination(
     }
 }
 
-async fn transfer_connection(
-    common: &Common,
-    role: &str,
-    protocol: &str,
-    url: &str,
-    user: Option<String>,
-    password: Option<String>,
-    client_id: Option<String>,
-) -> anyhow::Result<JmsConnection> {
-    if protocol != "core" {
-        bail!(UsageError(format!("protocol {protocol} not supported")));
-    }
-    if common.verbose {
-        println!("Creating {role} CORE Connection towards {url}");
-    }
-    let args = ConnectionArgs {
-        common: common.clone(),
-        url: Some(url.to_owned()),
-        user,
-        password,
-        client_id,
-        protocol: "CORE".to_owned(),
-        acceptor: None,
-    };
-    connect(&args).await
-}
-
 pub async fn transfer(args: TransferArgs) -> anyhow::Result<()> {
     let source_url = args
         .source_url
@@ -954,7 +967,7 @@ pub async fn transfer(args: TransferArgs) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| super::DEFAULT_BROKER_URL.to_owned());
     println!("Connection brokerURL = {source_url}");
-    let source_conn = transfer_connection(
+    let source_conn = Conn::connect_for_transfer(
         &args.common,
         "source",
         &args.source_protocol,
@@ -964,7 +977,27 @@ pub async fn transfer(args: TransferArgs) -> anyhow::Result<()> {
         args.source_client_id.clone(),
     )
     .await?;
-    let source = source_conn.session(true).await?;
+    let source = match source_conn.session(true).await {
+        Ok(s) => s,
+        Err(e) => {
+            source_conn.close().await;
+            return Err(e);
+        }
+    };
+    let r = transfer_from(&args, &source_url, &target_url, &source).await;
+    // The try-with-resources of the source's session and connection.
+    source.close().await;
+    source_conn.close().await;
+    r
+}
+
+/// `doTransfer` once the source's session is open.
+async fn transfer_from(
+    args: &TransferArgs,
+    source_url: &str,
+    target_url: &str,
+    source: &Sess,
+) -> anyhow::Result<()> {
     let source_dest = transfer_destination(
         "source",
         args.source_queue.as_ref(),
@@ -973,34 +1006,34 @@ pub async fn transfer(args: TransferArgs) -> anyhow::Result<()> {
     let consumer = match &source_dest {
         Destination::Queue(_) => {
             source
-                .consumer(&source_dest, args.filter.as_deref(), None)
+                .consumer(&source_dest, args.filter.as_deref(), ConsumerKind::Plain)
                 .await?
         }
-        Destination::Topic(topic) => {
+        Destination::Topic(_) => {
             if let Some(name) = &args.durable_consumer {
-                // A filter is dropped here, as `Transfer` drops it.
-                let selector = if args.filter.is_some() {
-                    None
-                } else if args.no_local {
-                    Some(format!("__AMQ_CID<>'{}'", source_conn.conn_id))
+                // `createDurableConsumer(topic, name)` when there is a
+                // filter, and the filter dropped, as `Transfer` drops it.
+                let (selector, no_local) = if args.filter.is_some() {
+                    (None, false)
                 } else {
-                    None
+                    (None, args.no_local)
                 };
-                source
-                    .consumer(
-                        &source_dest,
-                        selector.as_deref(),
-                        Some((name, source_conn.client_id.as_deref())),
-                    )
-                    .await?
+                let kind = ConsumerKind::Durable {
+                    name: name.clone(),
+                    no_local,
+                };
+                source.consumer(&source_dest, selector, kind).await?
             } else if let Some(name) = args
                 .shared_durable_subscription
                 .as_ref()
                 .or(args.shared_subscription.as_ref())
             {
-                let durable = args.shared_durable_subscription.is_some();
+                let kind = ConsumerKind::Shared {
+                    name: name.clone(),
+                    durable: args.shared_durable_subscription.is_some(),
+                };
                 source
-                    .shared_consumer(topic, name, durable, args.filter.as_deref())
+                    .consumer(&source_dest, args.filter.as_deref(), kind)
                     .await?
             } else {
                 bail!(UsageError(
@@ -1010,93 +1043,122 @@ pub async fn transfer(args: TransferArgs) -> anyhow::Result<()> {
             }
         }
     };
-    let target_conn = transfer_connection(
+    let target_conn = match Conn::connect_for_transfer(
         &args.common,
         "target",
         &args.target_protocol,
-        &target_url,
+        target_url,
         args.target_user.clone(),
         args.target_password.clone(),
         None,
     )
-    .await?;
-    let target = target_conn.session(true).await?;
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            consumer.close().await;
+            return Err(e);
+        }
+    };
+    let r = match target_conn.session(true).await {
+        Ok(target) => {
+            let r = transfer_to(
+                args,
+                source_url,
+                target_url,
+                source,
+                &source_dest,
+                &consumer,
+                &target,
+            )
+            .await;
+            target.close().await;
+            r
+        }
+        Err(e) => Err(e),
+    };
+    // The try-with-resources of the consumer and the target's connection,
+    // closed in reverse.
+    target_conn.close().await;
+    consumer.close().await;
+    r
+}
+
+/// The producer and the loop of `doTransfer`.
+async fn transfer_to(
+    args: &TransferArgs,
+    source_url: &str,
+    target_url: &str,
+    source: &Sess,
+    source_dest: &Destination,
+    consumer: &Cons,
+    target: &Sess,
+) -> anyhow::Result<()> {
     let target_dest = transfer_destination(
         "target",
         args.target_queue.as_ref(),
         args.target_topic.as_ref(),
     )?;
     let producer = target.producer(&target_dest).await?;
-    if source_url == target_url && source_dest == target_dest {
-        println!(
-            "You cannot transfer between {source_url}/{source_dest} and {target_url}/{target_dest}.\nThat would create an infinite recursion."
-        );
-        bail!(UsageError(format!(
-            "cannot use {source_dest} == {target_dest}"
-        )));
-    }
-    source.start().await?;
-    let timeout = match args.receive_timeout {
-        t if t < 0 => None,
-        t => Some(Duration::from_millis(t as u64)),
-    };
-    let (mut pending, mut total) = (0i64, 0i64);
-    while total < args.message_count {
-        let Some(d) = source.receive(&consumer, timeout).await? else {
-            if args.common.verbose {
-                println!("could not receive any more messages");
-            }
-            break;
-        };
-        let mut m = d.message;
-        m.message_id = 0;
-        target.send(&producer, &target_dest, m, true, 0).await?;
-        pending += 1;
-        total += 1;
-        if args.common.verbose {
-            println!("Received message {total} with {pending} messages pending to be commited");
+    let r = async {
+        if source_url == target_url && *source_dest == target_dest {
+            let (s, t) = (source.dest_text(source_dest), target.dest_text(&target_dest));
+            println!(
+                "You cannot transfer between {source_url}/{s} and {target_url}/{t}.\nThat would create an infinite recursion."
+            );
+            bail!(UsageError(format!("cannot use {s} == {t}")));
         }
-        if pending > args.commit_interval {
-            println!("Transferred {pending} messages of {total}");
-            pending = 0;
+        source.start().await?;
+        let timeout = match args.receive_timeout {
+            t if t < 0 => None,
+            t => Some(Duration::from_millis(t as u64)),
+        };
+        let (mut pending, mut total) = (0i64, 0i64);
+        while total < args.message_count {
+            let Some(m) = source.receive(consumer, timeout).await? else {
+                if args.common.verbose {
+                    println!("could not receive any more messages");
+                }
+                break;
+            };
+            target.send_received(&producer, m).await?;
+            pending += 1;
+            total += 1;
+            if args.common.verbose {
+                println!("Received message {total} with {pending} messages pending to be commited");
+            }
+            if pending > args.commit_interval {
+                println!("Transferred {pending} messages of {total}");
+                pending = 0;
+                target.commit().await?;
+                if !args.copy {
+                    source.commit().await?;
+                }
+            }
+        }
+        println!("Transferred a total of {total} messages");
+        if pending != 0 {
             target.commit().await?;
-            if !args.copy {
+            if args.copy {
+                source.rollback().await?;
+            } else {
                 source.commit().await?;
             }
         }
+        Ok(())
     }
-    println!("Transferred a total of {total} messages");
-    if pending != 0 {
-        target.commit().await?;
-        if args.copy {
-            source.rollback().await?;
-        } else {
-            source.commit().await?;
-        }
-    }
-    producer.close();
-    consumer.close().await;
-    target.close().await;
-    source.close().await;
-    target_conn.close().await;
-    source_conn.close().await;
-    Ok(())
+    .await;
+    producer.close().await;
+    r
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{demo_text, object_message, object_string_len};
+    use super::demo_text;
 
     #[test]
     fn demo_text_is_cut_and_repeated() {
         assert_eq!(demo_text(5), "Lorem");
         assert_eq!(demo_text(20), "Lorem ipsum dolor si");
-    }
-
-    #[test]
-    fn object_messages_hold_a_serialized_string() {
-        let m = object_message("héllo");
-        assert_eq!(&m.body[4..9], &[0xac, 0xed, 0x00, 0x05, 0x74]);
-        assert_eq!(object_string_len(&m.body), Some(5));
     }
 }

@@ -351,8 +351,9 @@ enum Cmd {
     /// A management operation, run by the actor
     /// ([`control`](self::control)).
     Manage(Box<dyn FnOnce(&mut Actor) + Send>),
-    /// The queue is deleted: its messages go with it.
-    Shutdown,
+    /// The queue is deleted: its messages go with it. The callback is told
+    /// whether journaled references were among them.
+    Shutdown(Option<Box<dyn FnOnce(bool) + Send>>),
     /// The broker stops: the actor ends, its messages left as stored.
     Stop,
 }
@@ -1061,7 +1062,17 @@ impl Queue {
     /// Stops the actor. Its messages are dropped.
     pub fn shutdown(&self) {
         self.0.deleted.store(true, Ordering::SeqCst);
-        self.send(Cmd::Shutdown);
+        self.send(Cmd::Shutdown(None));
+    }
+
+    /// [`Queue::shutdown`], then `then` is run by the actor once the
+    /// messages are dropped, told whether journaled ones were among them:
+    /// `deleteQueue` releases those only when the journal has their
+    /// deletes, so until then their size still binds the address. An actor
+    /// already stopped runs nothing.
+    pub fn shutdown_then(&self, then: Box<dyn FnOnce(bool) + Send>) {
+        self.0.deleted.store(true, Ordering::SeqCst);
+        self.send(Cmd::Shutdown(Some(then)));
     }
 
     /// Ends the actor as the broker stops, deleting nothing: its messages
@@ -2038,8 +2049,11 @@ impl Actor {
                 expired.into_iter().for_each(|r| self.expire(r));
             }
             Cmd::Manage(op) => op(self),
-            Cmd::Shutdown => {
-                self.delete_all_references();
+            Cmd::Shutdown(then) => {
+                let durable = self.delete_all_references();
+                if let Some(then) = then {
+                    then(durable);
+                }
                 return false;
             }
             Cmd::Stop => return false,
@@ -2428,8 +2442,8 @@ impl Actor {
     }
 
     /// `deleteAllReferences`: the deleted queue's durable messages are
-    /// acknowledged so their records go.
-    fn delete_all_references(&mut self) {
+    /// acknowledged so their records go. Returns whether any was journaled.
+    fn delete_all_references(&mut self) -> bool {
         let queue = Queue(self.shared.clone());
         let storage = self.shared.ids.storage().cloned();
         let mut refs: Vec<MessageRef> = std::mem::take(&mut self.scheduled).into_values().collect();
@@ -2445,13 +2459,16 @@ impl Actor {
             let tx_id = self.shared.ids.next();
             crate::audit::removed(&self.shared.name, &messages, tx_id);
         }
+        let mut durable = false;
         for mut r in refs {
             // A paged message's cursor goes with the queue's subscription.
             if r.paged.is_none() {
                 let _ = queue.store_ack(&mut r);
             }
+            durable |= queue.is_durable_ref(&r);
             queue.post_acknowledge(&r);
         }
+        durable
     }
 
     /// Browsers see every message without taking it (`BrowserDeliverer`).

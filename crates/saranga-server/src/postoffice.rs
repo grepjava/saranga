@@ -15,6 +15,12 @@ use crate::settings::{AddressSettings, SettingsRepository};
 use crate::wildcard::WildcardConfig;
 use crate::{IdGenerator, Name, RoutingType};
 use saranga_config::MessageLoadBalancing;
+use tokio::sync::oneshot;
+
+/// What [`PostOffice::remove_queue`] runs once the queue's messages are
+/// dropped, given the queue's address and whether journaled messages were
+/// among them.
+type AfterDelete = Box<dyn FnOnce(&PostOffice, &str, bool) + Send>;
 
 /// `CompositeAddress.SEPARATOR`: `address::queue` is a fully qualified
 /// queue name (FQQN).
@@ -1486,13 +1492,78 @@ impl PostOffice {
     }
 
     /// [`PostOffice::delete_queue`] for a caller that removes the address
-    /// itself (`forceAutoDeleteAddress`, as the plugins are told).
+    /// itself (`forceAutoDeleteAddress`, as the plugins are told). The
+    /// address is looked at once the queue's actor has dropped its
+    /// messages, by the actor.
     pub fn delete_queue_forcing(
         &self,
         name: &str,
         check_consumers: bool,
         auto_delete_address: bool,
         force_auto_delete_address: bool,
+    ) -> Result<()> {
+        let then: Option<AfterDelete> = auto_delete_address.then(|| {
+            Box::new(|po: &PostOffice, address: &str, durable: bool| {
+                if po.address_auto_deletable(address, durable) {
+                    po.remove_address(address);
+                }
+            }) as AfterDelete
+        });
+        self.remove_queue(name, check_consumers, force_auto_delete_address, then)
+    }
+
+    /// [`PostOffice::delete_queue`], returning once the queue's messages are
+    /// gone and its address removed when `auto_delete_address` takes it,
+    /// as `destroyQueue` returns.
+    pub async fn delete_queue_awaited(
+        &self,
+        name: &str,
+        check_consumers: bool,
+        auto_delete_address: bool,
+    ) -> Result<()> {
+        let (done, wait) = oneshot::channel();
+        self.remove_queue(
+            name,
+            check_consumers,
+            auto_delete_address,
+            Some(Box::new(
+                move |po: &PostOffice, address: &str, durable: bool| {
+                    if auto_delete_address && po.address_auto_deletable(address, durable) {
+                        po.remove_address(address);
+                    }
+                    let _ = done.send(());
+                },
+            )),
+        )?;
+        let _ = wait.await;
+        Ok(())
+    }
+
+    /// Deletes a queue (`forceAutoDeleteAddress`) for a caller that removes
+    /// the address itself: returns, once the queue's messages are gone,
+    /// whether journaled ones were among them, for
+    /// [`PostOffice::address_auto_deletable`].
+    pub async fn delete_queue_reporting(&self, name: &str, check_consumers: bool) -> Result<bool> {
+        let (done, wait) = oneshot::channel();
+        self.remove_queue(
+            name,
+            check_consumers,
+            true,
+            Some(Box::new(move |_: &PostOffice, _: &str, durable: bool| {
+                let _ = done.send(durable);
+            })),
+        )?;
+        Ok(wait.await.unwrap_or(false))
+    }
+
+    /// The queue's binding goes and its actor drops its messages, then
+    /// runs `then` (`deleteQueue` and what `destroyQueue` does after it).
+    fn remove_queue(
+        &self,
+        name: &str,
+        check_consumers: bool,
+        force_auto_delete_address: bool,
+        then: Option<AfterDelete>,
     ) -> Result<()> {
         let queue = self
             .queue(name)
@@ -1529,24 +1600,47 @@ impl PostOffice {
             &queue,
         );
         queue.unsubscribe();
-        queue.shutdown();
+        match then {
+            None => queue.shutdown(),
+            Some(then) => {
+                let me = self.me.clone();
+                let address = address.clone();
+                queue.shutdown_then(Box::new(move |durable| {
+                    if let Some(po) = me.upgrade() {
+                        then(&po, &address, durable);
+                    }
+                }));
+            }
+        }
         self.plugins.each(|p| {
             p.after_remove_binding(name, &address);
             p.after_destroy_queue(&queue, check_consumers, force_auto_delete_address);
         });
-        if auto_delete_address && self.address_auto_deletable(&address) {
-            self.remove_address(&address);
-        }
         Ok(())
     }
 
-    /// Whether deleting a queue takes its address along: the address was
-    /// auto-created, nothing is bound to it any more and it is not to wait
-    /// (`auto-delete-addresses-delay` 0).
-    pub fn address_auto_deletable(&self, address: &str) -> bool {
+    /// Whether deleting a queue takes its address along, its messages
+    /// dropped: the address was auto-created, is not bound any more and is
+    /// not to wait (`auto-delete-addresses-delay` 0). `durable` says the
+    /// queue had journaled messages, whose size `deleteQueue` releases only
+    /// once the journal has their deletes, so they still bind the address
+    /// when `destroyQueue` looks.
+    pub fn address_auto_deletable(&self, address: &str, durable: bool) -> bool {
         self.address_info(address).is_some_and(|i| i.auto_created)
-            && !self.has_bindings(address)
+            && !durable
+            && !self.is_address_bound(address)
             && self.settings(address).auto_delete_addresses_delay == 0
+    }
+
+    /// `PostOfficeImpl.isAddressBound`: something is bound to the address,
+    /// or messages sent to it are still held (by queues of other addresses,
+    /// such as wildcard ones), its size above 0.
+    pub fn is_address_bound(&self, address: &str) -> bool {
+        self.has_bindings(address)
+            || self
+                .paging
+                .existing_store(address)
+                .is_some_and(|s| s.address_size() > 0)
     }
 
     /// `PostOfficeImpl.reapAddresses`: removes the auto-delete queues and
@@ -1599,6 +1693,11 @@ impl PostOffice {
         let names: Vec<Name> = self.read().addresses.keys().cloned().collect();
         for name in names {
             let s = self.settings(&name);
+            // isAddressBound's size half; the bindings are looked at below.
+            let held = self
+                .paging
+                .existing_store(&name)
+                .is_some_and(|s| s.address_size() > 0);
             let remove = {
                 let mut state = self.write();
                 let Some(entry) = state.addresses.get_mut(&name) else {
@@ -1615,6 +1714,7 @@ impl PostOffice {
                     && entry.info.auto_created
                     && entry.queues.is_empty()
                     && entry.diverts.is_empty()
+                    && !held
                     && (initial || used)
                     && (initial || delay_passed);
                 if !removable {

@@ -15,8 +15,12 @@ use saranga_client::{Connection, ConnectionOptions, Connector};
 use saranga_transport::TlsConnector;
 
 pub mod address;
+pub mod amqp;
 pub mod check;
+pub mod foreign;
+pub mod java_chars;
 pub mod jms;
+pub mod jmsapi;
 pub mod lock;
 pub mod management;
 pub mod messages;
@@ -266,8 +270,7 @@ pub struct ConnectionArgs {
     /// ClientID set on the connection.
     #[arg(long = "clientID")]
     pub client_id: Option<String>,
-    /// Protocol used. Valid values are CORE (AMQP is not supported by
-    /// saranga's CLI).
+    /// Protocol used. Valid values are AMQP, CORE.
     #[arg(long, default_value = "CORE")]
     pub protocol: String,
 }
@@ -277,7 +280,7 @@ impl ConnectionArgs {
     /// instance's acceptor without `--url`, printed unless `quiet`.
     pub fn resolve(&mut self, quiet: bool) -> anyhow::Result<()> {
         crate::shell::recover(self);
-        if !self.protocol.eq_ignore_ascii_case("core") {
+        if jmsapi::Protocol::parse(&self.protocol).is_none() {
             bail!(UsageError(format!(
                 "protocol {} not supported",
                 self.protocol.to_uppercase()
@@ -315,8 +318,8 @@ impl ConnectionArgs {
     /// closed at once. When it fails, `Connection failed::<reason>`, then
     /// (unless the broker refused the user) a URL for the retry, and the
     /// user and password when there are none, are asked for; the retry's
-    /// failure is ignored, and the command goes on with its own URL and
-    /// the user and password given.
+    /// failure is ignored, and the command goes on with the factory made
+    /// for the retry: its URL, user and password.
     pub async fn try_connect(&mut self) -> anyhow::Result<()> {
         crate::shell::recover(self);
         let failed = match self.connect().await {
@@ -361,6 +364,7 @@ impl ConnectionArgs {
         if let Ok(conn) = retry.connect().await {
             conn.close().await;
         }
+        self.url = retry.url;
         Ok(())
     }
 

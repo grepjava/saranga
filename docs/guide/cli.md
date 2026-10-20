@@ -44,7 +44,9 @@ The commands that talk to a running broker (`producer`, `consumer`, `browser`, `
 | `--silent` | Asks nothing: no prompt for missing values, no retry after a failed connection. Use it in scripts. |
 | `--verbose` | Prints more. |
 
-The CLI connects over Core, over TLS when the URL says `sslEnabled=true` (with `trustStorePath`, `keyStorePath` and the other TLS parameters a connector takes). A URL can list several servers, `(tcp://a:61616,tcp://b:61616)?reconnectAttempts=5`, tried in turn as Artemis's client tries them, and takes the usual `ServerLocator` parameters (`ha`, `reconnectAttempts`, `retryInterval`, `callTimeout` and the like). `--protocol AMQP` is not supported.
+The CLI connects over Core, over TLS when the URL says `sslEnabled=true` (with `trustStorePath`, `keyStorePath` and the other TLS parameters a connector takes). A URL can list several servers, `(tcp://a:61616,tcp://b:61616)?reconnectAttempts=5`, tried in turn as Artemis's client tries them, and takes the usual `ServerLocator` parameters (`ha`, `reconnectAttempts`, `retryInterval`, `callTimeout` and the like).
+
+With `--protocol AMQP`, `producer`, `consumer`, `browser`, `transfer` and `perf` send and receive over AMQP 1.0 as Artemis's CLI does through Qpid JMS: `tcp://` URLs become `amqp://` (`ssl://` becomes `amqps://`), Qpid's URL options apply (`amqp.saslMechanisms`, `jms.prefetchPolicy.all` and the like), and the password is always asked for again after a refused login. `queue stat`, `check cluster` and the shell's `connect` try the connection over AMQP, as Artemis's do, then manage the broker over Core; `check queue` and the other management commands use Core.
 
 When a connection fails, the CLI prints `Connection failed::<reason>` and, unless `--silent` is given, asks for the URL, user and password and tries once more, as Artemis's does.
 
@@ -176,7 +178,7 @@ saranga transfer --source-url tcp://old:61616 --source-queue orders \
                  --target-url tcp://new:61616 --target-queue orders
 ```
 
-Useful options: `--source-queue` or `--source-topic` (with `--durable-consumer`, `--shared-subscription` or `--shared-durable-subscription`), `--target-queue` or `--target-topic`, `--source-filter`, `--message-count`, `--copy` to leave the source messages in place, and `--source-user`, `--source-password`, `--target-user`, `--target-password`. Only Core is supported: `--source-protocol amqp` and `--target-protocol amqp` are not.
+Useful options: `--source-queue` or `--source-topic` (with `--durable-consumer`, `--shared-subscription` or `--shared-durable-subscription`), `--target-queue` or `--target-topic`, `--source-filter`, `--message-count`, `--copy` to leave the source messages in place, and `--source-user`, `--source-password`, `--target-user`, `--target-password`. `--source-protocol amqp` and `--target-protocol amqp` read or write over AMQP, converting the messages as Artemis's client and Qpid JMS convert them between the protocols.
 
 ## Administration
 
@@ -282,7 +284,7 @@ saranga perf producer --rate 10000 --duration 60 --hdr producer.hdr queue://perf
 saranga perf consumer --duration 60 --show-latency queue://perf
 ```
 
-A send completes as soon as it is written, so `--max-pending` never holds a send back and `total blocked` stays 0. See [Artemis's perf tools](https://activemq.apache.org/components/artemis/documentation/latest/perf-tools.html).
+A Core send completes as soon as it is written, so over Core `--max-pending` never holds a send back and `blocked` stays 0; over AMQP (`--protocol AMQP`, and `--consumer-protocol` for the consumers) a send completes when the broker settles it, and at most `--max-pending` sends wait for that, as with Qpid JMS. See [Artemis's perf tools](https://activemq.apache.org/components/artemis/documentation/latest/perf-tools.html).
 
 ### perf-journal
 

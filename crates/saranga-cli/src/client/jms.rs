@@ -7,7 +7,8 @@
 use std::time::Duration;
 
 use anyhow::bail;
-use saranga_client::message::{CONNECTION_ID, DEFAULT_PRIORITY};
+use saranga_client::PropertyValue;
+use saranga_client::message::{CONNECTION_ID, DEFAULT_PRIORITY, HDR_GROUP_ID};
 use saranga_client::{
     Connection, Consumer, ConsumerOptions, CoreMessage, Delivery, Error, ErrorType, MessageExt,
     Producer, QueueConfiguration, RoutingType, Session, SessionOptions,
@@ -384,6 +385,19 @@ impl JmsSession {
         Ok(message)
     }
 
+    pub fn client_id(&self) -> Option<String> {
+        self.client_id.clone()
+    }
+
+    /// The filter `noLocal` adds: the connection's client ID, else its ID,
+    /// against the connection ID producers set.
+    pub fn no_local_filter(&self) -> String {
+        format!(
+            "{CONNECTION_ID}<>'{}'",
+            self.client_id.as_deref().unwrap_or(&self.conn_id)
+        )
+    }
+
     /// `ActiveMQSession.createSharedConsumer` / `createSharedDurableConsumer`:
     /// the subscription's queue, made shared when it is missing or
     /// different.
@@ -646,6 +660,115 @@ pub fn now_millis() -> i64 {
 
 /// The text of a JMS message for the CLI's output: a TEXT body's text, else
 /// the JMS message ID.
+/// Which `ActiveMQMessage` setter sets a property: the typed one for the
+/// value's class, or `setObjectProperty`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Setter {
+    Typed,
+    Object,
+}
+
+/// `ActiveMQMessage.checkProperty` then the setter, through `MessageUtil`'s
+/// mapping of `JMSXGroupID`, `JMSXGroupSeq` and `JMSXUserID` to the
+/// message's group and validated user.
+pub fn set_core_property(
+    m: &mut CoreMessage,
+    name: &str,
+    value: &PropertyValue,
+    setter: Setter,
+) -> Result<(), crate::client::amqp::jms::JmsError> {
+    use crate::client::amqp::jms::JmsError;
+    use crate::client::java_chars::{is_java_identifier_part, is_java_identifier_start};
+    let units: Vec<u16> = name.encode_utf16().collect();
+    if units.is_empty() {
+        return Err(JmsError {
+            class: "java.lang.IllegalArgumentException",
+            message: "The name of a property must not be an empty String.".to_owned(),
+        });
+    }
+    let runtime = |message: String| JmsError {
+        class: "javax.jms.JMSRuntimeException",
+        message,
+    };
+    if !is_java_identifier_start(units[0])
+        || !units[1..].iter().all(|u| is_java_identifier_part(*u))
+    {
+        return Err(runtime(format!(
+            "AMQ139012: The property name '{name}' is not a valid java identifier."
+        )));
+    }
+    if matches!(
+        name,
+        "NULL"
+            | "TRUE"
+            | "FALSE"
+            | "NOT"
+            | "AND"
+            | "OR"
+            | "BETWEEN"
+            | "LIKE"
+            | "IN"
+            | "IS"
+            | "ESCAPE"
+    ) {
+        return Err(runtime(format!(
+            "The property name '{name}' is reserved due to selector syntax."
+        )));
+    }
+    if name.starts_with("JMS_ACTIVEMQ") {
+        return Err(runtime(format!(
+            "The property name '{name}' is illegal since it starts with JMS_ACTIVEMQ"
+        )));
+    }
+    // `MessageUtil.getInteger`: a number's int value, else the string's.
+    let integer = |v: &PropertyValue| -> Result<i32, JmsError> {
+        Ok(match v {
+            PropertyValue::Byte(b) => i32::from(*b),
+            PropertyValue::Short(s) => i32::from(*s),
+            PropertyValue::Int(i) => *i,
+            PropertyValue::Long(l) => *l as i32,
+            // `(int)` of a float or double saturates, NaN is 0.
+            PropertyValue::Float(f) => *f as i32,
+            PropertyValue::Double(d) => *d as i32,
+            other => {
+                let text = crate::client::amqp::properties::java_to_string(other)
+                    .unwrap_or_else(|| "null".to_owned());
+                saranga_filter::java_parse_int::<i32>(&text).ok_or_else(|| JmsError {
+                    class: "java.lang.NumberFormatException",
+                    message: format!("For input string: \"{text}\""),
+                })?
+            }
+        })
+    };
+    let text = |v: &PropertyValue| crate::client::amqp::properties::java_to_string(v);
+    let as_string = |v: &PropertyValue| {
+        text(v).map_or(PropertyValue::Null, |t| {
+            PropertyValue::String(t.as_str().into())
+        })
+    };
+    let (key, v) = match (setter, value) {
+        (Setter::Typed, PropertyValue::Int(i)) if name == "JMSXGroupSeq" => {
+            (HDR_GROUP_SEQUENCE, PropertyValue::Int(*i))
+        }
+        (Setter::Typed, PropertyValue::Long(l)) if name == "JMSXGroupSeq" => {
+            (HDR_GROUP_SEQUENCE, PropertyValue::Int(*l as i32))
+        }
+        (Setter::Typed, PropertyValue::String(_)) | (Setter::Object, _) => match name {
+            "JMSXGroupID" => (HDR_GROUP_ID, as_string(value)),
+            "JMSXGroupSeq" => (HDR_GROUP_SEQUENCE, PropertyValue::Int(integer(value)?)),
+            "JMSXUserID" => (HDR_VALIDATED_USER, as_string(value)),
+            _ => (name, value.clone()),
+        },
+        (Setter::Typed, _) => (name, value.clone()),
+    };
+    m.put_property(key, v);
+    Ok(())
+}
+
+/// `Message.HDR_GROUP_SEQUENCE` and `HDR_VALIDATED_USER`.
+const HDR_GROUP_SEQUENCE: &str = "_AMQ_GROUP_SEQUENCE";
+const HDR_VALIDATED_USER: &str = "_AMQ_VALIDATED_USER";
+
 pub fn text_or_id(m: &CoreMessage) -> String {
     if m.message_type == saranga_client::message_type::TEXT {
         m.text().ok().flatten().unwrap_or_else(|| "null".to_owned())
