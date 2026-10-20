@@ -246,3 +246,165 @@ async fn a_queue_made_later_gets_its_link_and_stop_and_start_reconnect() {
     stop(me).await;
     stop(peer).await;
 }
+
+/// A reload with `connections` as the `<amqp-connection>`s, the peer's
+/// port as `{pp}`.
+async fn reload(me: &Node, pp: u16, connections: &str) {
+    let file = saranga_config::BrokerConfig::parse(&format!(
+        r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+             {ADDRESSES}
+             {}
+           </core></configuration>"#,
+        if connections.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<broker-connections>{}</broker-connections>",
+                connections.replace("{pp}", &pp.to_string())
+            )
+        }
+    ))
+    .unwrap();
+    let r = saranga_server::reload::Reload::from_file_config(&file).unwrap();
+    me.broker.reload(r).await.unwrap();
+}
+
+fn consumers(n: &Node, queue: &str) -> i32 {
+    n.broker
+        .post_office()
+        .queue(queue)
+        .map_or(0, |q| q.consumer_count())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reload_remakes_changed_broker_connections_and_keeps_mirrors() {
+    let d = dirs();
+    let (peer, me) = pair(&d, r#"<receiver queue-name="in"/>"#).await;
+    let pp = peer.port;
+    wait_until("the peer's in has a consumer", || {
+        consumers(&peer, "in") == 1
+    })
+    .await;
+    let first = connection(&me);
+
+    // The same configuration leaves the connection as it is.
+    reload(
+        &me,
+        pp,
+        r#"<amqp-connection uri="tcp://127.0.0.1:{pp}" name="to-peer" retry-interval="100">
+             <receiver queue-name="in"/>
+           </amqp-connection>"#,
+    )
+    .await;
+    assert!(Arc::ptr_eq(&first, &connection(&me)));
+
+    // A changed one is shut down and made again; a new one is made, not
+    // started without auto-start.
+    reload(
+        &me,
+        pp,
+        r#"<amqp-connection uri="tcp://127.0.0.1:{pp}" name="to-peer" retry-interval="100">
+             <receiver queue-name="out"/>
+           </amqp-connection>
+           <amqp-connection uri="tcp://127.0.0.1:{pp}" name="second" auto-start="false">
+             <receiver queue-name="in"/>
+           </amqp-connection>"#,
+    )
+    .await;
+    let second = connection(&me);
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert!(!first.is_started());
+    wait_until("in lost its consumer", || consumers(&peer, "in") == 0).await;
+    wait_until("out has a consumer", || consumers(&peer, "out") == 1).await;
+    let other = me
+        .broker
+        .broker_connection_registry()
+        .get("second")
+        .expect("registered");
+    assert!(!other.is_started());
+
+    // A started connection is started again whatever auto-start says; a
+    // stopped one only with auto-start.
+    other.start();
+    wait_until("in has a consumer", || consumers(&peer, "in") == 1).await;
+    connection(&me).stop();
+    wait_until("out lost its consumer", || consumers(&peer, "out") == 0).await;
+    reload(
+        &me,
+        pp,
+        r#"<amqp-connection uri="tcp://127.0.0.1:{pp}" name="to-peer" retry-interval="200" auto-start="false">
+             <receiver queue-name="out"/>
+           </amqp-connection>
+           <amqp-connection uri="tcp://127.0.0.1:{pp}" name="second" auto-start="false" retry-interval="200">
+             <receiver queue-name="in"/>
+           </amqp-connection>"#,
+    )
+    .await;
+    assert!(!connection(&me).is_started());
+    let restarted = me
+        .broker
+        .broker_connection_registry()
+        .get("second")
+        .unwrap();
+    assert!(!Arc::ptr_eq(&other, &restarted));
+    assert!(restarted.is_started());
+    wait_until("in has a consumer again", || consumers(&peer, "in") == 1).await;
+
+    // One no longer configured is shut down and unregistered; the manager
+    // goes with the last.
+    reload(&me, pp, "").await;
+    assert!(me.broker.broker_connections().is_empty());
+    wait_until("in lost its consumer again", || consumers(&peer, "in") == 0).await;
+
+    // Configured again, the manager is made and started.
+    reload(
+        &me,
+        pp,
+        r#"<amqp-connection uri="tcp://127.0.0.1:{pp}" name="to-peer" retry-interval="100">
+             <mirror/>
+           </amqp-connection>"#,
+    )
+    .await;
+    wait_until("mirroring", || connection(&me).is_connected()).await;
+    let mirror = connection(&me);
+
+    // A connection with a mirror is neither changed nor removed.
+    reload(
+        &me,
+        pp,
+        r#"<amqp-connection uri="tcp://127.0.0.1:{pp}" name="to-peer" retry-interval="300">
+             <mirror/>
+           </amqp-connection>"#,
+    )
+    .await;
+    assert!(Arc::ptr_eq(&mirror, &connection(&me)));
+    reload(&me, pp, "").await;
+    assert!(Arc::ptr_eq(&mirror, &connection(&me)));
+    assert!(mirror.is_started());
+    stop(me).await;
+    stop(peer).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reload_with_a_name_given_twice_fails() {
+    let d = dirs();
+    let (peer, me) = pair(&d, r#"<receiver queue-name="in"/>"#).await;
+    let file = saranga_config::BrokerConfig::parse(&format!(
+        r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+             <broker-connections>
+               <amqp-connection uri="tcp://127.0.0.1:{0}" name="to-peer"><receiver queue-name="in"/></amqp-connection>
+               <amqp-connection uri="tcp://127.0.0.1:{0}" name="to-peer" auto-start="false"><receiver queue-name="in"/></amqp-connection>
+             </broker-connections>
+           </core></configuration>"#,
+        peer.port
+    ))
+    .unwrap();
+    let r = saranga_server::reload::Reload::from_file_config(&file).unwrap();
+    let e = me.broker.reload(r).await.unwrap_err();
+    assert!(
+        e.starts_with("java.lang.IllegalStateException: Duplicate key to-peer (attempted merging values org.apache.activemq.artemis.core.config.amqpBrokerConnectivity.AMQPBrokerConnectConfiguration@"),
+        "{e}"
+    );
+    stop(me).await;
+    stop(peer).await;
+}

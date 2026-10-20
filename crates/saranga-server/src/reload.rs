@@ -6,7 +6,8 @@
 //! diverts with the configured ones, undeploys the addresses and queues
 //! that left the configuration where `config-delete-addresses` or
 //! `config-delete-queues` is `FORCE`, and deploys the configured addresses
-//! and queues, updating the queues that exist.
+//! and queues, updating the queues that exist, then the acceptors and the
+//! protocols' services (AMQP's broker connections).
 
 use std::collections::HashMap;
 
@@ -34,6 +35,8 @@ pub struct Reload {
     pub jaas_configs: saranga_security::manager::Realms,
     /// The acceptors, when whoever read the configuration can make them.
     pub acceptors: Option<crate::acceptors::AcceptorPlan>,
+    /// `<broker-connections>`, for the protocols' services.
+    pub broker_connections: Vec<cfg::AmqpBrokerConnectConfig>,
 }
 
 impl Reload {
@@ -55,6 +58,7 @@ impl Reload {
             status: config.status.clone(),
             jaas_configs: saranga_security::manager::realms(&config.jaas_configs),
             acceptors: None,
+            broker_connections: config.broker_connections.clone(),
         })
     }
 }
@@ -101,6 +105,9 @@ impl Broker {
         reloading("protocol services");
         if let Some(plan) = reload.acceptors {
             self.update_acceptors(plan).await?;
+        }
+        for p in self.protocols.clone() {
+            p.update_services(self, &reload.broker_connections)?;
         }
 
         tracing::info!("AMQ221087: Configuration reload completed");

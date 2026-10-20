@@ -440,6 +440,17 @@ pub trait ProtocolManager: Send + Sync + 'static {
 
     /// Called as the broker stops, after the cluster: the services stop.
     fn stop_services(&self, _broker: &Broker) {}
+
+    /// Called by a configuration reload after the acceptors
+    /// (`updateProtocolServices`): the services take the reloaded
+    /// configuration's broker connections.
+    fn update_services(
+        &self,
+        _broker: &Arc<Broker>,
+        _broker_connections: &[saranga_config::AmqpBrokerConnectConfig],
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The Core protocol (`CoreProtocolManager`).

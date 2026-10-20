@@ -29,7 +29,7 @@ The startup log names each acceptor and the protocols it serves, with Artemis's 
 
     AMQ221020: Started NIO Acceptor at 0.0.0.0:61616 for protocols [CORE,HORNETQ,STOMP,MQTT,AMQP,OPENWIRE]
 
-Acceptors can be stopped, started and reloaded through management, as in Artemis. A configuration reload does not change them; restart the broker. See [Configuration](configuration.md#configuration-reload).
+Acceptors can be stopped, started and reloaded through management, as in Artemis. A configuration reload updates them, and AMQP broker connections, as Artemis's does. See [Configuration](configuration.md#configuration-reload).
 
 ## The ports `saranga create` sets up
 

@@ -45,7 +45,7 @@ The first release.
 
 - **Clusters**: discovery by UDP broadcast and static lists, cluster connections with Artemis's load balancing, redistribution and grouping. Clusters can mix Java and Saranga nodes.
 - **Bridges and federation**: Core bridges, and Core federation of addresses and queues.
-- **AMQP broker connections**: federation, bridges and mirroring.
+- **AMQP broker connections**: federation, bridges and mirroring, updated by a configuration reload as Artemis updates them.
 
 ### Verified
 

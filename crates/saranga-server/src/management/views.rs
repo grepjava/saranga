@@ -859,6 +859,44 @@ pub(super) async fn consumers_json(
     )
 }
 
+/// `QueueControl.listConsumersAsJSON`: the queue's consumers that a
+/// session made (`ServerConsumer`s; a bridge's or a cluster connection's
+/// are left out), in the queue's order.
+pub(super) async fn queue_consumers_json(broker: &Broker, q: &crate::queue::Queue) -> Json {
+    let mine: Vec<_> = all_consumers(broker)
+        .into_iter()
+        .filter(|(_, _, c)| c.queue.id() == q.id())
+        .collect();
+    Json::Array(
+        q.consumers()
+            .await
+            .into_iter()
+            .filter_map(|info| {
+                let (conn, s, c) = mine.iter().find(|(_, _, c)| c.sequential_id == info.id)?;
+                let m = &c.metrics;
+                Some(
+                    Json::object()
+                        .with("consumerID", c.id)
+                        .with("sequentialId", c.sequential_id as i64)
+                        .with("connectionID", conn.id())
+                        .with("sessionID", s.name.clone())
+                        .with("browseOnly", c.browse_only)
+                        .with("creationTime", c.created)
+                        .with("messagesInTransit", info.delivering as i32)
+                        .with("messagesInTransitSize", m.in_transit_size())
+                        .with("messagesDelivered", m.delivered())
+                        .with("messagesDeliveredSize", m.delivered_size())
+                        .with("messagesAcknowledged", m.acknowledged())
+                        .with("messagesAcknowledgedAwaitingCommit", m.awaiting_commit())
+                        .with("lastDeliveredTime", m.last_delivered())
+                        .with("lastAcknowledgedTime", m.last_acknowledged())
+                        .with("status", consumer_status(conn)),
+                )
+            })
+            .collect(),
+    )
+}
+
 /// Every producer, with its session and connection.
 pub(super) fn all_producers(
     broker: &Broker,

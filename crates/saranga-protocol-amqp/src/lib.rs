@@ -142,6 +142,14 @@ pub struct AmqpProtocol {
 }
 
 impl AmqpProtocol {
+    fn context<'a>(&'a self, broker: &'a Arc<Broker>) -> broker_connection::Context<'a> {
+        broker_connection::Context {
+            broker,
+            amqp: &self.config,
+            containers: &self.containers,
+        }
+    }
+
     pub fn new(config: AmqpConfig) -> Self {
         Self {
             config,
@@ -182,15 +190,22 @@ impl ProtocolManager for AmqpProtocol {
 
     /// `loadProtocolServices`: the broker connections start.
     fn start_services(&self, broker: &Arc<Broker>) {
-        self.broker_connections.start(
-            broker,
-            &self.config.broker_connections,
-            &self.config,
-            &self.containers,
-        );
+        self.broker_connections
+            .start(&self.context(broker), &self.config.broker_connections);
     }
 
     fn stop_services(&self, broker: &Broker) {
         self.broker_connections.stop(broker);
+    }
+
+    /// `updateProtocolServices`: the broker connections take the reloaded
+    /// configuration.
+    fn update_services(
+        &self,
+        broker: &Arc<Broker>,
+        broker_connections: &[saranga_config::AmqpBrokerConnectConfig],
+    ) -> Result<(), String> {
+        self.broker_connections
+            .update(&self.context(broker), broker_connections)
     }
 }

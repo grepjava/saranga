@@ -408,6 +408,16 @@ public class Management {
             eq(1L, longAttr(queue(q), "ConsumerCount"), "ConsumerCount");
             String consumers = (String) op(queue(q), "listConsumersAsJSON");
             eq(1, JsonUtil.readJsonArray(consumers).size(), "consumers");
+            JsonObject consumer = JsonUtil.readJsonArray(consumers).getJsonObject(0);
+            eq(new TreeSet<>(List.of("consumerID", "sequentialId", "connectionID", "sessionID", "browseOnly",
+                    "creationTime", "messagesInTransit", "messagesInTransitSize", "messagesDelivered",
+                    "messagesDeliveredSize", "messagesAcknowledged", "messagesAcknowledgedAwaitingCommit",
+                    "lastDeliveredTime", "lastAcknowledgedTime", "status")),
+                new TreeSet<>(consumer.keySet()), "consumer fields");
+            eq(3, consumer.getInt("messagesInTransit"), "messagesInTransit");
+            eq(5, consumer.getInt("messagesDelivered"), "messagesDelivered");
+            eq(2, consumer.getInt("messagesAcknowledged"), "messagesAcknowledged");
+            eq("OK", consumer.getString("status"), "status");
         }
         s.close();
         eq(2L, longAttr(queue(q), "MessagesAcknowledged"), "MessagesAcknowledged");

@@ -222,3 +222,172 @@ pub fn add_unique<T: PartialEq>(set: &mut Vec<T>, item: T) {
         set.push(item);
     }
 }
+
+impl AmqpBrokerConnectConfig {
+    /// `AMQPBrokerConnectConfiguration.equals`: whether a reload leaves the
+    /// connection as it is. The lock coordinator is not compared, and the
+    /// policies, matches and properties held in `HashSet`s and `HashMap`s
+    /// compare as sets.
+    pub fn same_as(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.auto_start == other.auto_start
+            && self.password == other.password
+            && self.reconnect_attempts == other.reconnect_attempts
+            && self.retry_interval == other.retry_interval
+            && self.uri == other.uri
+            && self.user == other.user
+            && self.elements.len() == other.elements.len()
+            && self
+                .elements
+                .iter()
+                .zip(&other.elements)
+                .all(|(a, b)| a.same_as(b))
+    }
+}
+
+impl AmqpConnectionElement {
+    /// The `equals` of the element's class.
+    fn same_as(&self, other: &Self) -> bool {
+        use AmqpConnectionElement as E;
+        match (self, other) {
+            (E::Sender(a), E::Sender(b))
+            | (E::Receiver(a), E::Receiver(b))
+            | (E::Peer(a), E::Peer(b)) => a == b,
+            // `AMQPMirrorBrokerConnectionElement.equals` leaves out the
+            // properties.
+            (E::Mirror(a), E::Mirror(b)) => {
+                a.address_filter == b.address_filter
+                    && a.durable == b.durable
+                    && a.message_acknowledgements == b.message_acknowledgements
+                    && a.queue_creation == b.queue_creation
+                    && a.queue_removal == b.queue_removal
+                    && a.sync == b.sync
+            }
+            (E::Federation(a), E::Federation(b)) => {
+                a.name == b.name
+                    && same_set(
+                        &a.local_address_policies,
+                        &b.local_address_policies,
+                        |x, y| x.same_as(y),
+                    )
+                    && same_set(&a.local_queue_policies, &b.local_queue_policies, |x, y| {
+                        x.same_as(y)
+                    })
+                    && same_set(&a.properties, &b.properties, PartialEq::eq)
+                    && same_set(
+                        &a.remote_address_policies,
+                        &b.remote_address_policies,
+                        |x, y| x.same_as(y),
+                    )
+                    && same_set(
+                        &a.remote_queue_policies,
+                        &b.remote_queue_policies,
+                        |x, y| x.same_as(y),
+                    )
+            }
+            (E::Bridge(a), E::Bridge(b)) => {
+                a.name == b.name
+                    && same_set(
+                        &a.from_address_policies,
+                        &b.from_address_policies,
+                        |x, y| x.same_as(y),
+                    )
+                    && same_set(&a.from_queue_policies, &b.from_queue_policies, |x, y| {
+                        x.same_as(y)
+                    })
+                    && same_set(&a.properties, &b.properties, PartialEq::eq)
+                    && same_set(&a.to_address_policies, &b.to_address_policies, |x, y| {
+                        x.same_as(y)
+                    })
+                    && same_set(&a.to_queue_policies, &b.to_queue_policies, |x, y| {
+                        x.same_as(y)
+                    })
+            }
+            _ => false,
+        }
+    }
+}
+
+impl AmqpFederationAddressPolicy {
+    /// `AMQPFederationAddressPolicyElement.equals`.
+    fn same_as(&self, o: &Self) -> bool {
+        self.name == o.name
+            && same_set(&self.includes, &o.includes, PartialEq::eq)
+            && same_set(&self.excludes, &o.excludes, PartialEq::eq)
+            && same_set(&self.properties, &o.properties, PartialEq::eq)
+            && self.auto_delete == o.auto_delete
+            && self.auto_delete_delay == o.auto_delete_delay
+            && self.auto_delete_message_count == o.auto_delete_message_count
+            && self.enable_divert_bindings == o.enable_divert_bindings
+            && self.allow_wildcard_groupings == o.allow_wildcard_groupings
+            && same_transformer(&self.transformer, &o.transformer)
+            && self.max_hops == o.max_hops
+    }
+}
+
+impl AmqpFederationQueuePolicy {
+    /// `AMQPFederationQueuePolicyElement.equals`.
+    fn same_as(&self, o: &Self) -> bool {
+        self.include_federated == o.include_federated
+            && self.name == o.name
+            && same_set(&self.includes, &o.includes, PartialEq::eq)
+            && same_set(&self.excludes, &o.excludes, PartialEq::eq)
+            && same_set(&self.properties, &o.properties, PartialEq::eq)
+            && same_transformer(&self.transformer, &o.transformer)
+            && self.priority_adjustment == o.priority_adjustment
+    }
+}
+
+impl AmqpBridgeAddressPolicy {
+    /// `AMQPBridgeAddressPolicyElement.equals`.
+    fn same_as(&self, o: &Self) -> bool {
+        self.name == o.name
+            && same_set(&self.includes, &o.includes, PartialEq::eq)
+            && same_set(&self.excludes, &o.excludes, PartialEq::eq)
+            && same_set(&self.properties, &o.properties, PartialEq::eq)
+            && self.priority == o.priority
+            && self.include_divert_bindings == o.include_divert_bindings
+            && self.use_durable_subscriptions == o.use_durable_subscriptions
+            && self.filter == o.filter
+            && same_transformer(&self.transformer, &o.transformer)
+            && self.remote_address == o.remote_address
+            && self.remote_address_prefix == o.remote_address_prefix
+            && self.remote_address_suffix == o.remote_address_suffix
+            && self.remote_terminus_capabilities == o.remote_terminus_capabilities
+    }
+}
+
+impl AmqpBridgeQueuePolicy {
+    /// `AMQPBridgeQueuePolicyElement.equals`.
+    fn same_as(&self, o: &Self) -> bool {
+        self.name == o.name
+            && same_set(&self.includes, &o.includes, PartialEq::eq)
+            && same_set(&self.excludes, &o.excludes, PartialEq::eq)
+            && same_set(&self.properties, &o.properties, PartialEq::eq)
+            && same_transformer(&self.transformer, &o.transformer)
+            && self.priority == o.priority
+            && self.priority_adjustment == o.priority_adjustment
+            && self.filter == o.filter
+            && self.remote_address == o.remote_address
+            && self.remote_address_prefix == o.remote_address_prefix
+            && self.remote_address_suffix == o.remote_address_suffix
+            && self.remote_terminus_capabilities == o.remote_terminus_capabilities
+    }
+}
+
+/// `TransformerConfiguration.equals`: the class and the map of properties.
+fn same_transformer(a: &Option<TransformerConfig>, b: &Option<TransformerConfig>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.class_name == b.class_name && same_set(&a.properties, &b.properties, PartialEq::eq)
+        }
+        _ => false,
+    }
+}
+
+/// `AbstractSet.equals` (and `AbstractMap.equals` over the entries) of
+/// collections kept without repeats.
+fn same_set<T>(a: &[T], b: &[T], eq: impl Fn(&T, &T) -> bool) -> bool {
+    a.len() == b.len() && a.iter().all(|x| b.iter().any(|y| eq(x, y)))
+}

@@ -185,13 +185,13 @@ An `<amqp-connection>` makes the broker connect out to another AMQP endpoint, wh
 </broker-connections>
 ```
 
-The connection retries with Artemis's counts and logs (`AMQ111001`, `AMQ111002`, `AMQ111003`) and connects again when the peer closes one of its links. `BrokerConnectionControl` and the server's `listBrokerConnections`, `startBrokerConnection` and `stopBrokerConnection` work. See Artemis's [broker connections chapter](https://activemq.apache.org/components/artemis/documentation/latest/amqp-broker-connections.html).
+The connection retries with Artemis's counts and logs (`AMQ111001`, `AMQ111002`, `AMQ111003`) and connects again when the peer closes one of its links. `BrokerConnectionControl` and the server's `listBrokerConnections`, `startBrokerConnection` and `stopBrokerConnection` work. A configuration reload makes again the connections whose configuration changed, makes new ones and shuts down those no longer configured, leaving a connection with a `<mirror>` as it is, as Artemis's does (see [Configuration](configuration.md#configuration-reload)). See Artemis's [broker connections chapter](https://activemq.apache.org/components/artemis/documentation/latest/amqp-broker-connections.html).
 
 Differences:
 
 - SASL: PLAIN (with a user and password), XOAUTH2 and ANONYMOUS are chosen in Artemis's order. SCRAM and EXTERNAL are not, so a peer that offers only SCRAM refuses the connection.
 - TLS (`sslEnabled` in the URI) is not supported.
-- `AMQPConnections` broker properties are not supported, and a configuration reload does not update broker connections.
+- `AMQPConnections` broker properties are not supported.
 - The `lock-coordinator` attribute is not acted on (see [High availability](ha.md#what-is-not-supported)).
 
 ### AMQP federation

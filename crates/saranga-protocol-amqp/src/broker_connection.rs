@@ -120,85 +120,358 @@ pub fn parse_uri(uri: &str) -> Result<Vec<Endpoint>, String> {
     Ok(out)
 }
 
-/// The broker connections of a broker (`AMQPBrokerConnectionManager`).
+/// The broker connections of a broker: `AMQPBrokerConnectionManager`, as
+/// `ProtonProtocolManagerFactory` holds it (made when there are broker
+/// connections, dropped when a reload leaves none).
 #[derive(Default)]
-pub struct BrokerConnectionManager {
-    connections: Mutex<Vec<Arc<AmqpBrokerConnection>>>,
+pub struct BrokerConnectionManager(Mutex<Manager>);
+
+#[derive(Default)]
+struct Manager {
+    /// `brokerConnectionManager != null`.
+    present: bool,
+    started: bool,
+    /// `amqpConnectionsConfig`, a `HashMap` by name.
+    configs: JavaMap,
+    /// `amqpBrokerConnections`, by name.
+    connections: HashMap<String, Arc<AmqpBrokerConnection>>,
+}
+
+/// What a broker connection is made with.
+pub struct Context<'a> {
+    pub broker: &'a Arc<Broker>,
+    pub amqp: &'a AmqpConfig,
+    pub containers: &'a Arc<ContainerIds>,
+}
+
+/// A `java.util.HashMap` of configurations by name: kept in the order they
+/// were put (one put again keeps its place), with its table's capacity,
+/// which grows and never shrinks, so that it is walked in Java's order.
+struct JavaMap {
+    entries: Vec<AmqpBrokerConnectConfig>,
+    capacity: usize,
+}
+
+impl Default for JavaMap {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            capacity: 16,
+        }
+    }
+}
+
+impl JavaMap {
+    /// `Collectors.toMap(c -> c.getName(), identity())`: a name given twice
+    /// throws its `IllegalStateException`.
+    fn collect(configs: &[AmqpBrokerConnectConfig]) -> Result<Self, String> {
+        let mut map = Self::default();
+        for c in configs {
+            if let Some(previous) = map.get(&c.name) {
+                return Err(format!(
+                    "java.lang.IllegalStateException: Duplicate key {} (attempted merging values {} and {})",
+                    c.name,
+                    identity(previous),
+                    identity(c)
+                ));
+            }
+            map.put(c.clone());
+        }
+        Ok(map)
+    }
+
+    fn get(&self, name: &str) -> Option<&AmqpBrokerConnectConfig> {
+        self.entries.iter().find(|c| c.name == name)
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    fn put(&mut self, config: AmqpBrokerConnectConfig) {
+        match self.entries.iter_mut().find(|c| c.name == config.name) {
+            Some(slot) => *slot = config,
+            None => {
+                self.entries.push(config);
+                // `resize`: past three quarters of the table.
+                while self.entries.len() * 4 > self.capacity * 3 {
+                    self.capacity *= 2;
+                }
+            }
+        }
+    }
+
+    fn remove(&mut self, name: &str) {
+        self.entries.retain(|c| c.name != name);
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// `values()`, in the order the table walks them.
+    fn values(&self) -> Vec<AmqpBrokerConnectConfig> {
+        let hashes: Vec<i32> = self
+            .entries
+            .iter()
+            .map(|c| saranga_buffer::java_hash::string_hash(&c.name))
+            .collect();
+        saranga_buffer::java_hash::hash_map_order(&hashes, Some((self.capacity, 0.75)))
+            .into_iter()
+            .map(|i| self.entries[i].clone())
+            .collect()
+    }
+}
+
+/// `Object.toString` of an `AMQPBrokerConnectConfiguration`: its class and
+/// `hashCode`, here `BrokerConnectConfiguration`'s part of it (Java's adds
+/// the elements', whose types hash by identity, and the transports').
+fn identity(c: &AmqpBrokerConnectConfig) -> String {
+    use saranga_buffer::java_hash::string_hash;
+    let s = |v: Option<&str>| v.map_or(0, string_hash);
+    // Objects.hash(autostart, name, password, reconnectAttempts,
+    // retryInterval, uri, user)
+    let hash = [
+        if c.auto_start { 1231 } else { 1237 },
+        string_hash(&c.name),
+        s(c.password.as_deref()),
+        c.reconnect_attempts,
+        c.retry_interval,
+        string_hash(&c.uri),
+        s(c.user.as_deref()),
+    ]
+    .iter()
+    .fold(1i32, |h, v| h.wrapping_mul(31).wrapping_add(*v));
+    format!(
+        "org.apache.activemq.artemis.core.config.amqpBrokerConnectivity.AMQPBrokerConnectConfiguration@{:x}",
+        hash as u32
+    )
+}
+
+/// `AMQPBrokerConnectionManager`'s logger.
+const MANAGER_LOGGER: &str =
+    "org.apache.activemq.artemis.protocol.amqp.connect.AMQPBrokerConnectionManager";
+
+/// Whether a configuration has a `<mirror>`, which a reload neither
+/// changes nor removes.
+fn contains_mirror(c: &AmqpBrokerConnectConfig) -> bool {
+    c.elements
+        .iter()
+        .any(|e| matches!(e, AmqpConnectionElement::Mirror(_)))
+}
+
+fn lock_manager(m: &BrokerConnectionManager) -> std::sync::MutexGuard<'_, Manager> {
+    lock(&m.0)
 }
 
 impl BrokerConnectionManager {
-    /// `start`: each configured connection is made, registered and, with
-    /// `auto-start`, started.
-    pub fn start(
-        &self,
-        broker: &Arc<Broker>,
-        configs: &[AmqpBrokerConnectConfig],
-        amqp: &AmqpConfig,
-        containers: &Arc<ContainerIds>,
-    ) {
-        for c in configs {
-            let endpoints = match parse_uri(&c.uri) {
-                Ok(e) if !e.is_empty() => e,
-                Ok(_) => continue,
-                Err(e) => {
-                    tracing::warn!("broker connection {}: {e}", c.name);
-                    continue;
-                }
-            };
-            let mut federation = None;
-            let mut bridges = Vec::new();
-            for e in &c.elements {
-                match e {
-                    // installFederation: the last one is the connection's.
-                    AmqpConnectionElement::Federation(f) => {
-                        federation = Some(Federation::source(broker, f));
-                    }
-                    // installBridgeManager
-                    AmqpConnectionElement::Bridge(b) => {
-                        bridges.push(BridgeManager::new(broker, b));
-                    }
-                    _ => {}
-                }
-            }
-            let connection = Arc::new(AmqpBrokerConnection {
-                config: c.clone(),
-                endpoints,
-                broker: Arc::downgrade(broker),
-                amqp: amqp.clone(),
-                containers: containers.clone(),
-                state: Mutex::new(State::default()),
-                plugin: Mutex::new(None),
-                me: Mutex::new(Weak::new()),
-                federation,
-                bridges,
-                mirrors: Mutex::new(None),
-            });
-            *lock(&connection.me) = Arc::downgrade(&connection);
-            // initialize: registered, with management.
-            broker
-                .broker_connection_registry()
-                .register(connection.clone());
-            if c.auto_start {
-                connection.start_inner();
-            }
-            lock(&self.connections).push(connection);
+    /// `loadProtocolServices` and `start`: with broker connections
+    /// configured, the manager is made and each connection made,
+    /// registered and, with `auto-start`, started.
+    pub fn start(&self, cx: &Context<'_>, configs: &[AmqpBrokerConnectConfig]) {
+        if configs.is_empty() {
+            return;
         }
+        let map = match JavaMap::collect(configs) {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!(
+                    target: "org.apache.activemq.artemis.core.server.impl.ActiveMQServerImpl",
+                    "Unable to load protocol services for: [AMQP]\n{e}"
+                );
+                return;
+            }
+        };
+        let mut m = lock_manager(self);
+        m.present = true;
+        m.configs = map;
+        m.start(cx);
+    }
+
+    /// `updateProtocolServices`, on a configuration reload: with no manager
+    /// yet one is made and started for the configured connections
+    /// (`checkAddNewBrokerConnectionManager`); otherwise each new or
+    /// changed connection is shut down and made again and each one no
+    /// longer configured shut down (`updateConfiguration`), and the manager
+    /// stops and goes when none are left.
+    pub fn update(
+        &self,
+        cx: &Context<'_>,
+        configs: &[AmqpBrokerConnectConfig],
+    ) -> Result<(), String> {
+        // As at startup, a TLS setting Saranga cannot honour is refused
+        // rather than connected without.
+        for c in configs {
+            for e in parse_uri(&c.uri).unwrap_or_default() {
+                saranga_transport::connector::check_params(|k| e.params.get(k).cloned())
+                    .map_err(|err| format!("broker connection {}: {err}", c.name))?;
+            }
+        }
+        let mut m = lock_manager(self);
+        if !m.present {
+            if configs.is_empty() {
+                return Ok(());
+            }
+            m.configs = JavaMap::collect(configs)?;
+            m.present = true;
+            m.start(cx);
+            return Ok(());
+        }
+        m.update_configuration(cx, configs)?;
+        if m.configs.len() == 0 {
+            m.stop(cx.broker);
+            *m = Manager::default();
+        }
+        Ok(())
     }
 
     /// `stop`: each connection shuts down.
     pub fn stop(&self, broker: &Broker) {
-        for c in lock(&self.connections).drain(..) {
-            c.stop_inner();
-            if let Some(f) = &c.federation {
-                f.shutdown();
-            }
-            for b in &c.bridges {
-                b.shutdown();
-            }
-            broker
-                .broker_connection_registry()
-                .unregister(&c.config.name);
+        lock_manager(self).stop(broker);
+    }
+}
+
+impl Manager {
+    fn start(&mut self, cx: &Context<'_>) {
+        if self.started {
+            return;
         }
+        self.started = true;
+        for c in self.configs.values() {
+            let auto_start = c.auto_start;
+            self.create(cx, c, auto_start);
+        }
+    }
+
+    fn stop(&mut self, broker: &Broker) {
+        if !self.started {
+            return;
+        }
+        self.started = false;
+        for (_, c) in self.connections.drain() {
+            c.shutdown(broker);
+        }
+    }
+
+    /// `updateConfiguration`. Connections are all shut down before any is
+    /// made, so that an old and a new one never connect to the same peer
+    /// together.
+    fn update_configuration(
+        &mut self,
+        cx: &Context<'_>,
+        configs: &[AmqpBrokerConnectConfig],
+    ) -> Result<(), String> {
+        let mut new_connections: Vec<(AmqpBrokerConnectConfig, bool)> = Vec::new();
+        for c in configs {
+            let previous = self.configs.get(&c.name);
+            if previous.is_some_and(|p| c.same_as(p)) {
+                continue;
+            }
+            if let Some(p) = previous.filter(|p| contains_mirror(p)) {
+                tracing::info!(
+                    target: MANAGER_LOGGER,
+                    "Skipping update of broker connection {} which contains a mirror configuration which are not reloadable.",
+                    p.name
+                );
+                continue;
+            }
+            self.configs.put(c.clone());
+            let connection = self.connections.remove(&c.name);
+            // A connection that was started is started again.
+            let auto_start = match &connection {
+                None => c.auto_start,
+                Some(old) => old.is_started_now() || c.auto_start,
+            };
+            if let Some(old) = connection {
+                old.shutdown(cx.broker);
+            }
+            if self.started {
+                // A HashMap keyed by the configuration: an equal one is
+                // made once.
+                match new_connections.iter_mut().find(|(n, _)| n.same_as(c)) {
+                    Some(slot) => slot.1 = auto_start,
+                    None => new_connections.push((c.clone(), auto_start)),
+                }
+            }
+        }
+        let configured = JavaMap::collect(configs)?;
+        let removed: Vec<_> = self
+            .configs
+            .values()
+            .into_iter()
+            .filter(|c| !configured.contains(&c.name))
+            .collect();
+        for c in removed {
+            if contains_mirror(&c) {
+                tracing::info!(
+                    target: MANAGER_LOGGER,
+                    "Skipping remove of broker connection {} which contains a mirror configuration which are not reloadable.",
+                    c.name
+                );
+                continue;
+            }
+            self.configs.remove(&c.name);
+            if let Some(old) = self.connections.remove(&c.name) {
+                old.shutdown(cx.broker);
+            }
+        }
+        for (c, auto_start) in new_connections {
+            self.create(cx, c, auto_start);
+        }
+        Ok(())
+    }
+
+    /// `createBrokerConnection`: the connection is made, registered with
+    /// management and its federation and bridges installed
+    /// (`initialize`), and started if asked.
+    fn create(&mut self, cx: &Context<'_>, c: AmqpBrokerConnectConfig, start: bool) {
+        let broker = cx.broker;
+        let endpoints = match parse_uri(&c.uri) {
+            Ok(e) if !e.is_empty() => e,
+            Ok(_) => return,
+            Err(e) => {
+                tracing::warn!("broker connection {}: {e}", c.name);
+                return;
+            }
+        };
+        let mut federation = None;
+        let mut bridges = Vec::new();
+        for e in &c.elements {
+            match e {
+                // installFederation: the last one is the connection's.
+                AmqpConnectionElement::Federation(f) => {
+                    federation = Some(Federation::source(broker, f));
+                }
+                // installBridgeManager
+                AmqpConnectionElement::Bridge(b) => {
+                    bridges.push(BridgeManager::new(broker, b));
+                }
+                _ => {}
+            }
+        }
+        let name = c.name.clone();
+        let connection = Arc::new(AmqpBrokerConnection {
+            config: c,
+            endpoints,
+            broker: Arc::downgrade(broker),
+            amqp: cx.amqp.clone(),
+            containers: cx.containers.clone(),
+            state: Mutex::new(State::default()),
+            plugin: Mutex::new(None),
+            me: Mutex::new(Weak::new()),
+            federation,
+            bridges,
+            mirrors: Mutex::new(None),
+        });
+        *lock(&connection.me) = Arc::downgrade(&connection);
+        // initialize: registered, with management.
+        broker
+            .broker_connection_registry()
+            .register(connection.clone());
+        if start {
+            connection.start_inner();
+        }
+        self.connections.insert(name, connection);
     }
 }
 
@@ -314,6 +587,21 @@ impl AmqpBrokerConnection {
                 t.abort();
             });
         }
+    }
+
+    /// `shutdown`: stopped, its federation and bridges shut down, and
+    /// unregistered from management.
+    fn shutdown(&self, broker: &Broker) {
+        self.stop_inner();
+        if let Some(f) = &self.federation {
+            f.shutdown();
+        }
+        for b in &self.bridges {
+            b.shutdown();
+        }
+        broker
+            .broker_connection_registry()
+            .unregister(&self.config.name);
     }
 
     fn is_started_now(&self) -> bool {

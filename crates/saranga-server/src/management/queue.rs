@@ -441,19 +441,8 @@ pub(super) async fn invoke(broker: &Arc<Broker>, q: &Queue, call: &Call<'_>) -> 
         return Some(Ok(Json::from(Json::Array(items).to_string())));
     }
     if call.is("listConsumersAsJSON", &[]).is_some() {
-        let consumers = q.consumers().await;
-        let items: Vec<Json> = consumers
-            .into_iter()
-            .map(|c| {
-                Json::object()
-                    .with("consumerID", c.client_id)
-                    .with("sequentialID", c.id as i64)
-                    .with("browseOnly", c.browse_only)
-                    .with("messagesInTransit", c.delivering)
-                    .with("messagesInTransitSize", c.delivering_size)
-            })
-            .collect();
-        return Some(Ok(Json::from(Json::Array(items).to_string())));
+        let items = super::views::queue_consumers_json(broker, q).await;
+        return Some(Ok(Json::from(items.to_string())));
     }
     if call.is("resetMessagesAdded", &[]).is_some() {
         q.reset_messages_added();
