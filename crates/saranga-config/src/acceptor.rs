@@ -156,6 +156,283 @@ const ALLOWABLE_ACCEPTOR_KEYS: [&str; 70] = [
     "ocspResponderURL",
 ];
 
+/// `TransportConstants.ALLOWABLE_CONNECTOR_KEYS`.
+const ALLOWABLE_CONNECTOR_KEYS: [&str; 60] = [
+    "activemqServerName",
+    "sslEnabled",
+    "httpEnabled",
+    "httpClientIdleTime",
+    "httpClientIdleScanPeriod",
+    "httpRequiresSessionId",
+    "httpUpgradeEnabled",
+    "httpUpgradeEndpoint",
+    "useServlet",
+    "servletPath",
+    "useNio",
+    "useNioGlobalWorkerPool",
+    "useEpoll",
+    "useKQueue",
+    "useGlobalWorkerPool",
+    "host",
+    "port",
+    "localAddress",
+    "localPort",
+    "keyStoreProvider",
+    "keyStoreType",
+    "keyStorePath",
+    "keyStorePassword",
+    "keyPassword",
+    "keyStoreAlias",
+    "trustStoreProvider",
+    "trustStoreType",
+    "trustStorePath",
+    "trustStorePassword",
+    "enabledCipherSuites",
+    "enabledProtocols",
+    "verifyHost",
+    "trustAll",
+    "forceSSLParameters",
+    "sniHost",
+    "tcpNoDelay",
+    "tcpSendBufferSize",
+    "tcpReceiveBufferSize",
+    "writeBufferHighWaterMark",
+    "writeBufferLowWaterMark",
+    "nioRemotingThreads",
+    "remotingThreads",
+    "batchDelay",
+    "socksEnabled",
+    "socksHost",
+    "socksPort",
+    "socksVersion",
+    "socksUsername",
+    "socksPassword",
+    "socksRemoteDNS",
+    "connect-timeout-millis",
+    "useDefaultSslContext",
+    "sslProvider",
+    "trustManagerFactoryPlugin",
+    "handshake-timeout",
+    "crlPath",
+    "crcOptions",
+    "ocspResponderURL",
+    "activemq.usemaskedpassword",
+    "activemq.passwordcodec",
+];
+
+/// One `TransportConfiguration` a URI schema makes: its name, factory and
+/// `params` and `extraProps`, each in the order Java's `HashMap` walks it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UriTransport {
+    pub name: Option<String>,
+    pub factory_class_name: String,
+    pub params: Vec<(String, Option<String>)>,
+    pub extra: Vec<(String, Option<String>)>,
+}
+
+const NETTY_ACCEPTOR_FACTORY: &str =
+    "org.apache.activemq.artemis.core.remoting.impl.netty.NettyAcceptorFactory";
+const NETTY_CONNECTOR_FACTORY: &str =
+    "org.apache.activemq.artemis.core.remoting.impl.netty.NettyConnectorFactory";
+const HORNETQ_CONNECTOR_FACTORY: &str =
+    "org.hornetq.core.remoting.impl.netty.NettyConnectorFactory";
+const INVM_ACCEPTOR_FACTORY: &str =
+    "org.apache.activemq.artemis.core.remoting.impl.invm.InVMAcceptorFactory";
+const INVM_CONNECTOR_FACTORY: &str =
+    "org.apache.activemq.artemis.core.remoting.impl.invm.InVMConnectorFactory";
+
+/// `ConfigurationUtils.parseAcceptorURI` (`connector` false) or
+/// `parseConnectorURI`: the `TransportConfiguration`s the URI's schema
+/// makes, `TCPTransportConfigurationSchema.getTransportConfigurations` or
+/// `InVMTransportConfigurationSchema.createTransportConfiguration`. A TCP
+/// URI's fragment (the further URIs of `(uri1,uri2)`) gives one more each.
+/// Without `invm` the `vm` schema is not registered, as
+/// `new ConnectorTransportConfigurationParser(false)` leaves it out.
+pub fn transport_configurations(
+    name: Option<&str>,
+    uri: &str,
+    connector: bool,
+    invm: bool,
+) -> Result<Vec<UriTransport>> {
+    let fail = |reason: &str| ConfigError::InvalidUri {
+        uri: uri.to_owned(),
+        reason: reason.to_owned(),
+    };
+    let compact: String = uri.chars().filter(|c| !is_java_space(*c)).collect();
+    let normalised = normalise(&compact).replace(';', "&");
+    let (without_fragment, fragment) = split_once_or_all(&normalised, '#');
+    let colon = without_fragment
+        .find(':')
+        .ok_or_else(|| fail("no scheme"))?;
+    let scheme = &without_fragment[..colon];
+    if !is_valid_scheme(scheme) {
+        return Err(fail("invalid scheme"));
+    }
+    if !SCHEMES.contains(&scheme) || (scheme == "vm" && !invm) {
+        return Err(fail(&format!("Schema {scheme} not found")));
+    }
+    let parts = uri_parts(Some(scheme), &without_fragment[colon + 1..]).map_err(|r| fail(&r))?;
+
+    if scheme == "vm" {
+        // `createTransportConfiguration`: the host as `serverId`, and one of
+        // `connectionsAllowed` or `securityDomain`; the name as given.
+        let mut params = Vec::new();
+        put(&mut params, "serverId", parts.host.clone());
+        for key in ["connectionsAllowed", "securityDomain"] {
+            if let Some((_, v)) = parts.query.iter().find(|(k, _)| k == key) {
+                put(&mut params, key, v.clone());
+                break;
+            }
+        }
+        return Ok(vec![UriTransport {
+            name: name.map(str::to_owned),
+            factory_class_name: if connector {
+                INVM_CONNECTOR_FACTORY
+            } else {
+                INVM_ACCEPTOR_FACTORY
+            }
+            .to_owned(),
+            params: java_order(params),
+            extra: Vec::new(),
+        }]);
+    }
+
+    let allowable: &[&str] = if connector {
+        &ALLOWABLE_CONNECTOR_KEYS
+    } else {
+        &ALLOWABLE_ACCEPTOR_KEYS
+    };
+    let factory = if !connector {
+        NETTY_ACCEPTOR_FACTORY
+    } else if parts.path.contains("hornetq") {
+        HORNETQ_CONNECTOR_FACTORY
+    } else {
+        NETTY_CONNECTOR_FACTORY
+    };
+    let query = java_order(parts.query.clone());
+    let name_from_query = match query.iter().find(|(k, _)| k == "name") {
+        Some((_, v)) => v.clone(),
+        None => name.map(str::to_owned),
+    };
+    if let Some(n) = name
+        && name_from_query.as_deref() != Some(n)
+    {
+        return Err(fail("Name doesn't match query param"));
+    }
+    let (params, extra) = set_data(&parts, allowable, &query, Vec::new(), Vec::new());
+    let mut out = vec![UriTransport {
+        name: name_from_query,
+        factory_class_name: factory.to_owned(),
+        params: java_order(params),
+        extra: java_order(extra),
+    }];
+    // `uri.getFragment()` is decoded; each of its URIs is read again.
+    if let Some(fragment) = fragment {
+        let connectors = percent_decode(fragment, false).map_err(|r| fail(&r))?;
+        if !crate::java_trim(&connectors).is_empty() {
+            for s in java_split(&connectors, ',') {
+                let (extra_scheme, rest) = match s.find(':') {
+                    Some(i) if is_valid_scheme(&s[..i]) => (Some(&s[..i]), &s[i + 1..]),
+                    _ => (None, s),
+                };
+                let extra_parts = uri_parts(extra_scheme, rest).map_err(|r| fail(&r))?;
+                let (params, extra) =
+                    set_data(&extra_parts, allowable, &query, Vec::new(), Vec::new());
+                let extra_query = java_order(extra_parts.query.clone());
+                let (params, extra) =
+                    set_data(&extra_parts, allowable, &extra_query, params, extra);
+                let extra_name = match extra_query.iter().find(|(k, _)| k == "name") {
+                    Some((_, v)) => v.clone(),
+                    None => Some(format!("{}:{s}", name.unwrap_or("null"))),
+                };
+                out.push(UriTransport {
+                    name: extra_name,
+                    factory_class_name: factory.to_owned(),
+                    params: java_order(params),
+                    extra: java_order(extra),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// What `java.net.URI` gives of a URI after its scheme: host, port, path
+/// and the query `URISchema.parseQuery` reads.
+struct UriParts {
+    scheme: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
+    path: String,
+    query: Vec<(String, Option<String>)>,
+}
+
+fn uri_parts(scheme: Option<&str>, rest: &str) -> std::result::Result<UriParts, String> {
+    let mut parts = UriParts {
+        scheme: scheme.map(str::to_owned),
+        host: None,
+        port: None,
+        path: String::new(),
+        query: Vec::new(),
+    };
+    // An opaque URI (`tcp:x`) has no authority, path or query in Java.
+    if let Some(hier) = rest.strip_prefix("//") {
+        let (hier, query) = split_once_or_all(hier, '?');
+        let slash = hier.find('/').unwrap_or(hier.len());
+        (parts.host, parts.port) = parse_authority(&hier[..slash])?;
+        parts.path = percent_decode(&hier[slash..], false)?;
+        if let Some(query) = query {
+            parts.query = parse_query(query)?;
+        }
+    }
+    Ok(parts)
+}
+
+/// `BeanSupport.setData`: `scheme`, `host` and `port`, those allowed, as
+/// the URI gives them (`"null"`, `"-1"` when absent), then the query split between the
+/// allowed keys and `extraProps`.
+fn set_data(
+    parts: &UriParts,
+    allowable: &[&str],
+    query: &[(String, Option<String>)],
+    mut params: Params,
+    mut extra: Params,
+) -> (Params, Params) {
+    if allowable.contains(&"scheme") {
+        put(
+            &mut params,
+            "scheme",
+            Some(parts.scheme.clone().unwrap_or_else(|| "null".to_owned())),
+        );
+    }
+    if allowable.contains(&"host") {
+        put(
+            &mut params,
+            "host",
+            Some(parts.host.clone().unwrap_or_else(|| "null".to_owned())),
+        );
+    }
+    if allowable.contains(&"port") {
+        put(
+            &mut params,
+            "port",
+            Some(
+                parts
+                    .port
+                    .map_or_else(|| "-1".to_owned(), |p| p.to_string()),
+            ),
+        );
+    }
+    for (k, v) in query {
+        if allowable.contains(&k.as_str()) {
+            put(&mut params, k, v.clone());
+        } else {
+            put(&mut extra, k, v.clone());
+        }
+    }
+    (params, extra)
+}
+
 /// Puts into a list kept as a Java `HashMap`: a key keeps its place.
 fn put(map: &mut Vec<(String, Option<String>)>, key: &str, value: Option<String>) {
     match map.iter_mut().find(|(k, _)| k == key) {
@@ -407,6 +684,9 @@ fn is_valid_scheme(s: &str) -> bool {
 }
 
 type HostPort = (Option<String>, Option<u16>);
+
+/// Parameters in the order given, a key without `=` holding `None`.
+type Params = Vec<(String, Option<String>)>;
 
 fn parse_authority(authority: &str) -> std::result::Result<HostPort, String> {
     let server = match authority.rfind('@') {

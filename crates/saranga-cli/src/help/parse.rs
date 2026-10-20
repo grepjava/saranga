@@ -846,10 +846,6 @@ mod tests {
     fn clap_takes_what_picocli_takes() {
         use clap::FromArgMatches;
         let text = include_str!("../../../../tests/golden/cli/parse.txt");
-        let missing: Vec<Vec<&str>> = super::super::MISSING
-            .iter()
-            .map(|m| m.split(' ').collect())
-            .collect();
         let commands = [crate::command_line(false), crate::command_line(true)];
         let mut failures = Vec::new();
         let mut checked = 0;
@@ -864,12 +860,6 @@ mod tests {
                 Some((_, args)) => args.split('\u{1f}').map(str::to_owned).collect(),
                 None => Vec::new(),
             };
-            if missing
-                .iter()
-                .any(|m| words.len() >= m.len() && words[..m.len()] == m[..])
-            {
-                continue;
-            }
             let parsed = parse(&words, in_shell).expect("parsed as picocli parses it");
             // A group prints its help; clap is not asked.
             if parsed.is_group() {
@@ -904,8 +894,7 @@ mod tests {
     /// Artemis's picocli command line: saranga's parser must make the same
     /// of each. A command only the other mode's command line has is taken
     /// as the other mode takes it, as saranga takes every command in both
-    /// (COMPAT.md); the lines through commands saranga does not have are
-    /// left out.
+    /// (COMPAT.md).
     #[test]
     fn parses_as_picocli_parses() {
         let text = include_str!("../../../../tests/golden/cli/parse.txt");
@@ -921,10 +910,6 @@ mod tests {
             golden.insert((mode, args), outcome);
             lines.push((mode, args, outcome));
         }
-        let missing: Vec<Vec<&str>> = super::super::MISSING
-            .iter()
-            .map(|m| m.split(' ').collect())
-            .collect();
         let mut failures = Vec::new();
         let mut checked = 0;
         for (mode, args, outcome) in lines {
@@ -932,12 +917,6 @@ mod tests {
                 None => Vec::new(),
                 Some(args) => args.split('\u{1f}').map(str::to_owned).collect(),
             };
-            if missing
-                .iter()
-                .any(|m| words.len() >= m.len() && words[..m.len()] == m[..])
-            {
-                continue;
-            }
             let in_shell = mode.starts_with("shell");
             let other = match mode {
                 "instance" => "home",
@@ -990,15 +969,12 @@ mod tests {
                 (Some(e), Some(g)) => (e, g),
                 _ => (expected.to_owned(), got),
             };
-            // Nor does saranga suggest a command it does not have, and it
-            // may suggest options of its own (`run --etc`).
+            // Saranga may suggest options of its own (`run --etc`).
             let suggests = |s: &str, names: &[&str]| {
                 s.split_once("  ?  ")
                     .is_some_and(|(_, x)| names.iter().any(|n| x.contains(n)))
             };
-            let (expected, got) = if suggests(&expected, &super::super::MISSING)
-                || suggests(&got, &["--config", "--etc", "--bind", "-D"])
-            {
+            let (expected, got) = if suggests(&got, &["--config", "--etc", "--bind", "-D"]) {
                 let message = |s: &str| {
                     s.split_once("  ?  ")
                         .map_or(s.to_owned(), |(m, _)| m.to_owned())

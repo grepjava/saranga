@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+<core xmlns="urn:activemq:core">
+<ha-policy><shared-store><primary><failover-on-shutdown>true</failover-on-shutdown></primary></shared-store></ha-policy>
+</core>
+</configuration>

@@ -1227,7 +1227,7 @@ impl Default for BrokerConfig {
 /// refuses fails as it does, after what its error handler printed (printed
 /// as it went, warnings too when `print_warnings`); the text with XML 1.1's
 /// line ends as XML 1.0's for the reader that builds the tree.
-fn well_formed(text: &str, print_warnings: bool) -> Result<String> {
+pub(crate) fn well_formed(text: &str, print_warnings: bool) -> Result<String> {
     let base = std::env::current_dir().unwrap_or_default();
     match crate::xerces::check_dom(text, base) {
         Ok(checked) => {

@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+<core xmlns="urn:activemq:core">
+<federations><federation name="f1" user="u" password="p"><upstream name="up1" priority-adjustment="3"><share-connection>true</share-connection><retry-interval>700</retry-interval><static-connectors><connector-ref>c1</connector-ref></static-connectors><policy ref="pa"/><policy ref="pq"/><policy ref="ps"/></upstream><downstream name="dn"><static-connectors><connector-ref>c1</connector-ref></static-connectors><policy ref="pa"/><upstream-connector-ref>c1</upstream-connector-ref></downstream><policy-set name="ps"><policy ref="pa"/></policy-set><queue-policy name="pq"><include queue-match="q" address-match="a"/></queue-policy><address-policy name="pa" max-hops="2"><include address-match="x"/></address-policy><transformer name="t1"><class-name>org.T</class-name></transformer></federation></federations><connectors><connector name="c1">tcp://h:1</connector></connectors>
+</core>
+</configuration>

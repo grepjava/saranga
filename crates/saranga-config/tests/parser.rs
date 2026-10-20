@@ -134,14 +134,26 @@ fn custom_wildcards_drive_the_repository() {
 
 #[test]
 fn parsing_overflow_page_size() {
-    for body in [
-        r##"<address-settings><address-setting match="#"><page-size-bytes>2147483648</page-size-bytes></address-setting></address-settings>"##,
-        "<journal-file-size>2147483648</journal-file-size>",
-        "<journal-buffer-size>2147483648</journal-buffer-size>",
+    // `Validators.POSITIVE_INT`'s `IllegalArgumentException`.
+    for (name, body) in [
+        (
+            "page-size-bytes",
+            r##"<address-settings><address-setting match="#"><page-size-bytes>2147483648</page-size-bytes></address-setting></address-settings>"##,
+        ),
+        (
+            "journal-file-size",
+            "<journal-file-size>2147483648</journal-file-size>",
+        ),
+        (
+            "journal-buffer-size",
+            "<journal-buffer-size>2147483648</journal-buffer-size>",
+        ),
     ] {
-        assert!(
-            matches!(parse_err(body), ConfigError::InvalidValue { .. }),
-            "{body}"
+        assert_eq!(
+            parse_err(body).to_string(),
+            format!(
+                "AMQ229226: {name}  must be greater than 0 and less than or equal to Integer.MAX_VALUE (actual value: 2147483648)"
+            )
         );
     }
 }
@@ -524,7 +536,8 @@ fn broadcast_group_defaults_and_jgroups() {
              <broadcast-period>0</broadcast-period>
            </broadcast-group></broadcast-groups>"#,
     );
-    assert!(matches!(e, ConfigError::InvalidValue { ref name, .. } if name == "broadcast-period"));
+    assert!(matches!(e, ConfigError::Runtime(ref m)
+        if m == "AMQ229039: broadcast-period  must be greater than 0 (actual value: 0)"));
 }
 
 #[test]
@@ -635,7 +648,8 @@ fn bridges() {
     let e = parse_err(
         r#"<bridges><bridge name="b"><queue-name>q</queue-name><concurrency>0</concurrency></bridge></bridges>"#,
     );
-    assert!(matches!(e, ConfigError::InvalidValue { ref name, .. } if name == "concurrency"));
+    assert!(matches!(e, ConfigError::Runtime(ref m)
+        if m == "AMQ229039: concurrency  must be greater than 0 (actual value: 0)"));
 }
 
 #[test]

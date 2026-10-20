@@ -11,6 +11,13 @@ use crate::{AcceptorConfig, ClusterConnectionConfig, ConfigError, MessageLoadBal
 /// `multicast://<discovery group>?<properties>` finds them through the
 /// group; a composite `multicast://(...)` is a `static://` one.
 pub fn from_uri(name: &str, uri: &str) -> Result<ClusterConnectionConfig> {
+    from_uri_parts(name, uri).map(|(c, _)| c)
+}
+
+/// [`from_uri`], with the query of a static (composite) URI as the
+/// `CompositeData` the schema keeps (`compositeMembers`): its parameters,
+/// in the order given.
+pub fn from_uri_parts(name: &str, uri: &str) -> Result<(ClusterConnectionConfig, Option<Params>)> {
     let fail = |reason: String| ConfigError::InvalidUri {
         uri: uri.to_owned(),
         reason,
@@ -30,6 +37,7 @@ pub fn from_uri(name: &str, uri: &str) -> Result<ClusterConnectionConfig> {
     let ssp = ssp.strip_prefix("//").unwrap_or(ssp).trim();
     let mut c = ClusterConnectionConfig::new(name, "");
     let composite = ssp.starts_with('(') && balanced(ssp);
+    let static_schema = scheme == "static" || composite;
     let params = if scheme == "static" || composite {
         // `ClusterConnectionStaticSchema`: `URISupport.parseComposite`.
         let (members, params) = parse_composite(ssp).map_err(fail)?;
@@ -58,7 +66,7 @@ pub fn from_uri(name: &str, uri: &str) -> Result<ClusterConnectionConfig> {
     }
     // `setName` comes after the URI's own properties.
     c.name = name.to_owned();
-    Ok(c)
+    Ok((c, static_schema.then_some(params)))
 }
 
 /// `URISupport.checkParenthesis`: as many `(` as `)`.

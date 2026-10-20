@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+<core xmlns="urn:activemq:core">
+<security-settings><security-setting match="a.#"><permission type="send" roles="r1,r2,r3"/><permission type="consume" roles="r2"/><permission type="view" roles="x.y"/></security-setting><security-setting match="b"><permission type="manage" roles="m"/></security-setting><role-mapping from="cn=a" to="r1"/></security-settings>
+</core>
+</configuration>

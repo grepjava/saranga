@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+<core xmlns="urn:activemq:core">
+<connection-routers><connection-router name="r1"><key-type>CLIENT_ID</key-type><local-target-filter>x</local-target-filter><cache><persisted>true</persisted><timeout>5</timeout></cache><policy name="CONSISTENT_HASH_MODULO"><property key="MODULO" value="3"/></policy><pool><username>u</username><password>p</password><cluster-connection>cc</cluster-connection></pool></connection-router></connection-routers>
+</core>
+</configuration>

@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+<core xmlns="urn:activemq:core">
+<resource-limit-settings><resource-limit-setting match="u1"><max-queues>3</max-queues></resource-limit-setting></resource-limit-settings><connector-services><connector-service name="cs"><factory-class>org.F</factory-class><param key="k" value="v"/><param key="k2" value="v2"/></connector-service></connector-services><grouping-handler name="gh"><type>LOCAL</type><address>a</address></grouping-handler><diverts><divert name="d1"><address>a</address><forwarding-address>b</forwarding-address></divert></diverts><network-check-NIC>eth0</network-check-NIC><node-manager-lock-directory>nm</node-manager-lock-directory><literal-match-markers>()</literal-match-markers><mask-password>false</mask-password><journal-type>NIO</journal-type><journal-pool-files>3</journal-pool-files><global-max-messages>9</global-max-messages><critical-analyzer-check-period>7</critical-analyzer-check-period>
+</core>
+</configuration>

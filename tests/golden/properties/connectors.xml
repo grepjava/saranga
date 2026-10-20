@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+<core xmlns="urn:activemq:core">
+<connectors><connector name="c1">(tcp://h1:1,tcp://h2:2?x=y)?trustAll=true;foo=bar</connector><connector name="c2">tcp://h/hornetq?host=over</connector><connector name="c3">vm://3?securityDomain=sd;x=1</connector><connector name="c4">tcp://[::1]:5?name=c4;localPort=7</connector></connectors><acceptors><acceptor>tcp://0.0.0.0:1?name=named</acceptor><acceptor name="v">vm://9?connectionsAllowed=3;securityDomain=q</acceptor></acceptors>
+</core>
+</configuration>

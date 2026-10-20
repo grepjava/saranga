@@ -19,6 +19,7 @@ mod broker_connection;
 pub mod broker_properties;
 mod bytes;
 mod cluster_uri;
+pub mod configuration;
 mod dto;
 mod federation;
 pub mod mask;
@@ -118,6 +119,17 @@ pub enum ConfigError {
     /// `bootstrap.xml` or `management.xml` that `XmlUtil.decode` fails on.
     #[error("{0}")]
     Decode(#[from] DecodeError),
+    /// A `RuntimeException` the parser throws, as its `getMessage` gives
+    /// it: a validator's `IllegalArgumentException`, a class not found.
+    #[error("{0}")]
+    Runtime(String),
+    /// A `NullPointerException` the parser throws, as its `toString`
+    /// gives it.
+    #[error("{0}")]
+    NullPointer(String),
+    /// A checked exception the parser throws, as its `toString` gives it.
+    #[error("{0}")]
+    Checked(String),
 }
 
 /// How `broker.xml` is validated against Artemis's schemas.

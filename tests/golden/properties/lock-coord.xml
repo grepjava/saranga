@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+<core xmlns="urn:activemq:core">
+<lock-coordinators><lock-coordinator name="lc1"><class-name>org.foo.L</class-name><lock-id>id1</lock-id><check-period>99</check-period><properties><property key="a" value="b"/></properties></lock-coordinator></lock-coordinators><acceptors><acceptor name="a1" lock-coordinator="lc1">tcp://0.0.0.0:61616</acceptor></acceptors>
+</core>
+</configuration>

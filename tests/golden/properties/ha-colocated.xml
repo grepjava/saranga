@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+<core xmlns="urn:activemq:core">
+<ha-policy><shared-store><colocated><backup-port-offset>100</backup-port-offset><primary/><backup><scale-down/></backup></colocated></shared-store></ha-policy>
+</core>
+</configuration>

@@ -26,7 +26,7 @@ saranga <command> --help        # Saranga's help for a command, every option it 
 saranga help <command>          # Artemis's help text for the command
 ```
 
-`saranga help` prints Artemis's own usage message, laid out as Artemis's CLI lays it out, with the commands Artemis offers in the same place: from an instance's `bin` it lists `activation`, `user`, `run`, `stop`, `kill` and `perf-journal`, and from the binary it lists `create` and `upgrade` instead. Every command works in both places all the same. The command Saranga does not have yet, `properties`, is left out. Every option `saranga help` lists is one Saranga takes; `--help` shows them in Saranga's words and adds Saranga's own, such as `run --config`.
+`saranga help` prints Artemis's own usage message, laid out as Artemis's CLI lays it out, with the commands Artemis offers in the same place: from an instance's `bin` it lists `activation`, `user`, `run`, `stop`, `kill` and `perf-journal`, and from the binary it lists `create` and `upgrade` instead. Every command works in both places all the same. Every option `saranga help` lists is one Saranga takes; `--help` shows them in Saranga's words and adds Saranga's own, such as `run --config`.
 
 A mistake on the command line is reported as Artemis's CLI reports it, so scripts that check its output keep working: the message (`Unknown option: '--frob'`, `Invalid value for option '--message-count': 'abc' is not a long`) on standard error, then `help help`'s usage, with status 1.
 
@@ -352,10 +352,20 @@ source <(./artemis completion)
 saranga completion --start-script saranga > /etc/bash_completion.d/saranga
 ```
 
+### properties
+
+Writes the instance's configuration as broker properties, as `artemis properties` does: every setting of `broker.xml`, the defaults included, one `key=value` line each, in the file `--output` names (`broker.properties` by default). Passwords are written as `**redacted**`.
+
+```bash
+saranga properties --output exported.properties
+```
+
+```
+Exporting configuration as exported.properties
+```
+
+`--broker` reads another `broker.xml`, and the configuration URI another `bootstrap.xml`, as for `run`. Outside an instance, the file holds the defaults. The file is the one Artemis writes, but for what Artemis itself makes up as it runs; see [COMPAT.md, CLI differences](../../COMPAT.md#cli-differences).
+
 ### help
 
 Prints Artemis's help text for a command. See [Getting help](#getting-help).
-
-## Not there yet
-
-`artemis properties` has no Saranga counterpart yet, and `saranga help` leaves it out.

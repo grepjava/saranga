@@ -24,6 +24,7 @@ mod instance;
 mod logging;
 mod network;
 mod perf;
+mod properties;
 mod shell;
 mod upgrade;
 mod web;
@@ -157,6 +158,21 @@ enum Command {
         /// Override the broker configuration from the bootstrap.xml.
         #[arg(long)]
         broker: Option<PathBuf>,
+        /// Broker Configuration URI. Default:
+        /// xml:${ARTEMIS_INSTANCE}/etc/bootstrap.xml.
+        configuration: Option<String>,
+        /// Print additional information.
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Export the broker's configuration as a properties file.
+    Properties {
+        /// Override the broker configuration from the bootstrap.xml.
+        #[arg(long)]
+        broker: Option<String>,
+        /// Output name for the file.
+        #[arg(long, default_value = "broker.properties")]
+        output: PathBuf,
         /// Broker Configuration URI. Default:
         /// xml:${ARTEMIS_INSTANCE}/etc/bootstrap.xml.
         configuration: Option<String>,
@@ -766,6 +782,12 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             run(instance, bind, allow_kill, management_required).await
         }
         Command::Data(cmd) => data::run(cmd).await,
+        Command::Properties {
+            broker,
+            output,
+            configuration,
+            ..
+        } => properties::run(broker, configuration, output),
         Command::Activation(cmd) => activation::run(cmd).await,
         Command::Mask {
             password,

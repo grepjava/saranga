@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+<core xmlns="urn:activemq:core">
+<ha-policy><replication><primary><manager><class-name>org.foo.Mgr</class-name><properties><property key="a" value="1"/><property key="b" value="2"/></properties></manager><coordination-id>cid</coordination-id></primary></replication></ha-policy>
+</core>
+</configuration>

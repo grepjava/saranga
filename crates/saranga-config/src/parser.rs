@@ -166,7 +166,7 @@ const CORE_ELEMENTS: &[&str] = &[
 
 /// `Validators`: the range checks Artemis applies to numeric settings.
 #[derive(Clone, Copy)]
-enum Check {
+pub(crate) enum Check {
     Any,
     GtZero,
     GeZero,
@@ -181,49 +181,78 @@ enum Check {
 }
 
 impl Check {
-    fn apply(self, name: &str, v: i64) -> Result<i64> {
+    /// The validator, failing with the `IllegalArgumentException`
+    /// `ActiveMQMessageBundle` makes.
+    pub(crate) fn apply(self, name: &str, v: i64) -> Result<i64> {
         let int_max = i32::MAX as i64;
         let pct = v as i32; // `Number.intValue()`
-        let (ok, reason) = match self {
+        let (ok, message) = match self {
             Check::Any => (true, ""),
-            Check::GtZero => (v > 0, "must be greater than 0"),
-            Check::GeZero => (v >= 0, "must be greater than or equal to 0"),
-            Check::MinusOneOrGtZero => (v == -1 || v > 0, "must be -1 or greater than 0"),
-            Check::MinusOneOrGeZero => (v >= -1, "must be -1 or greater than or equal to 0"),
-            Check::PositiveInt => (v > 0 && v <= int_max, "must be a positive int"),
+            Check::GtZero => (
+                v > 0,
+                "AMQ229039: {}  must be greater than 0 (actual value: {})",
+            ),
+            // `GE_ZERO` throws `greaterThanZero` too.
+            Check::GeZero => (
+                v >= 0,
+                "AMQ229039: {}  must be greater than 0 (actual value: {})",
+            ),
+            Check::MinusOneOrGtZero => (
+                v == -1 || v > 0,
+                "AMQ229041: {}  must be equals to -1 or greater than 0 (actual value: {})",
+            ),
+            Check::MinusOneOrGeZero => (
+                v >= -1,
+                "AMQ229042: {}  must be equals to -1 or greater or equals to 0 (actual value: {})",
+            ),
+            Check::PositiveInt => (
+                v > 0 && v <= int_max,
+                "AMQ229226: {}  must be greater than 0 and less than or equal to Integer.MAX_VALUE (actual value: {})",
+            ),
             Check::MinusOneOrPositiveInt => (
                 v == -1 || (v > 0 && v <= int_max),
-                "must be -1 or a positive int",
+                "AMQ229227: {}  must be equals to -1 or greater than 0 and less than or equal to Integer.MAX_VALUE (actual value: {})",
             ),
-            Check::Percentage => ((0..=100).contains(&pct), "must be a percentage (0 to 100)"),
+            Check::Percentage => (
+                (0..=100).contains(&pct),
+                "AMQ229040: {} must be a valid percentual value between 0 and 100 (actual value: {})",
+            ),
             Check::PercentageOrMinusOne => (
                 (0..=100).contains(&pct) || pct == -1,
-                "must be a percentage (0 to 100) or -1",
+                "AMQ229214: {} must be a valid percentage value between 0 and 100 or -1 (actual value: {})",
             ),
-            Check::PositivePowerOfTwo => {
-                (v > 0 && v & (v - 1) == 0, "must be a positive power of two")
-            }
-            Check::MaxQueueConsumers => (pct >= -1, "must be -1 or greater"),
+            Check::PositivePowerOfTwo => (
+                v > 0 && v & (v - 1) == 0,
+                "AMQ229256: {} must be a positive power of 2 (actual value: {})",
+            ),
+            Check::MaxQueueConsumers => (
+                pct >= -1,
+                "AMQ229206: Queue {} has invalid max consumer setting: {}",
+            ),
         };
         if ok {
             Ok(v)
         } else {
-            Err(ConfigError::invalid(name, v, reason))
+            Err(ConfigError::Runtime(
+                message
+                    .replacen("{}", name, 1)
+                    .replacen("{}", &v.to_string(), 1),
+            ))
         }
     }
 }
 
-fn is_named(n: &Node<'_, '_>, name: &str) -> bool {
+pub(crate) fn is_named(n: &Node<'_, '_>, name: &str) -> bool {
     n.is_element() && n.tag_name().name() == name
 }
 
 /// `getElementsByTagName(name).item(0)`: the first descendant (not `n`
 /// itself) with that local name, in document order.
-fn first<'a, 'input>(n: Node<'a, 'input>, name: &str) -> Option<Node<'a, 'input>> {
+pub(crate) fn first<'a, 'input>(n: Node<'a, 'input>, name: &str) -> Option<Node<'a, 'input>> {
     n.descendants().skip(1).find(|d| is_named(d, name))
 }
 
-fn all<'a, 'input>(
+pub(crate) fn all<'a, 'input>(
     n: Node<'a, 'input>,
     name: &'a str,
 ) -> impl Iterator<Item = Node<'a, 'input>> + 'a {
@@ -231,39 +260,39 @@ fn all<'a, 'input>(
 }
 
 /// `Node.getTextContent()`: every descendant text node, concatenated.
-fn text_content(n: Node<'_, '_>) -> String {
+pub(crate) fn text_content(n: Node<'_, '_>) -> String {
     n.descendants()
         .filter(|d| d.is_text())
         .filter_map(|d| d.text())
         .collect()
 }
 
-fn trimmed_text(n: Node<'_, '_>) -> String {
+pub(crate) fn trimmed_text(n: Node<'_, '_>) -> String {
     java_trim(&text_content(n)).to_owned()
 }
 
-fn parse_num<T: std::str::FromStr>(name: &str, text: &str) -> Result<T> {
+pub(crate) fn parse_num<T: std::str::FromStr>(name: &str, text: &str) -> Result<T> {
     text.parse()
         .map_err(|_| ConfigError::invalid(name, text, "not a valid number"))
 }
 
-fn node_i32(n: Node<'_, '_>) -> Result<i32> {
+pub(crate) fn node_i32(n: Node<'_, '_>) -> Result<i32> {
     parse_num(n.tag_name().name(), java_trim(&text_content(n)))
 }
 
-fn node_i64(n: Node<'_, '_>) -> Result<i64> {
+pub(crate) fn node_i64(n: Node<'_, '_>) -> Result<i64> {
     parse_num(n.tag_name().name(), java_trim(&text_content(n)))
 }
 
-fn node_f64(n: Node<'_, '_>) -> Result<f64> {
+pub(crate) fn node_f64(n: Node<'_, '_>) -> Result<f64> {
     parse_num(n.tag_name().name(), java_trim(&text_content(n)))
 }
 
-fn node_bool(n: Node<'_, '_>) -> bool {
+pub(crate) fn node_bool(n: Node<'_, '_>) -> bool {
     java_parse_bool(java_trim(&text_content(n)))
 }
 
-fn node_text_bytes(n: Node<'_, '_>) -> Result<i64> {
+pub(crate) fn node_text_bytes(n: Node<'_, '_>) -> Result<i64> {
     let text = trimmed_text(n);
     convert_text_bytes(&text)
         .map_err(|_| ConfigError::invalid(n.tag_name().name(), &text, "not a byte size"))
@@ -281,27 +310,27 @@ fn node_enum<T: std::str::FromStr<Err = ConfigError>>(n: Node<'_, '_>) -> Result
 
 /// Typed lookups of top-level settings, in the style of
 /// `XMLConfigurationUtil`.
-struct Settings<'a, 'input> {
-    core: Node<'a, 'input>,
+pub(crate) struct Settings<'a, 'input> {
+    pub(crate) core: Node<'a, 'input>,
 }
 
 impl Settings<'_, '_> {
-    fn string(&self, name: &str) -> Option<String> {
+    pub(crate) fn string(&self, name: &str) -> Option<String> {
         first(self.core, name).map(trimmed_text)
     }
 
-    fn non_empty_string(&self, name: &str) -> Result<Option<String>> {
+    pub(crate) fn non_empty_string(&self, name: &str) -> Result<Option<String>> {
         match self.string(name) {
             Some(s) if s.is_empty() => Err(ConfigError::invalid(name, "", "must not be empty")),
             other => Ok(other),
         }
     }
 
-    fn bool(&self, name: &str) -> Option<bool> {
+    pub(crate) fn bool(&self, name: &str) -> Option<bool> {
         first(self.core, name).map(node_bool)
     }
 
-    fn i32(&self, name: &str, check: Check) -> Result<Option<i32>> {
+    pub(crate) fn i32(&self, name: &str, check: Check) -> Result<Option<i32>> {
         first(self.core, name)
             .map(|n| {
                 node_i32(n)
@@ -311,13 +340,13 @@ impl Settings<'_, '_> {
             .transpose()
     }
 
-    fn i64(&self, name: &str, check: Check) -> Result<Option<i64>> {
+    pub(crate) fn i64(&self, name: &str, check: Check) -> Result<Option<i64>> {
         first(self.core, name)
             .map(|n| node_i64(n).and_then(|v| check.apply(name, v)))
             .transpose()
     }
 
-    fn text_bytes(&self, name: &str, check: Check) -> Result<Option<i64>> {
+    pub(crate) fn text_bytes(&self, name: &str, check: Check) -> Result<Option<i64>> {
         first(self.core, name)
             .map(|n| node_text_bytes(n).and_then(|v| check.apply(name, v)))
             .transpose()
@@ -432,7 +461,7 @@ pub(crate) fn parse_document(text: &str) -> Result<BrokerConfig> {
 
 /// Element children, skipping text, comments and any `xi:` element left
 /// (`xi:include`s are expanded before the document is parsed).
-fn elements<'a, 'input>(n: Node<'a, 'input>) -> impl Iterator<Item = Node<'a, 'input>> {
+pub(crate) fn elements<'a, 'input>(n: Node<'a, 'input>) -> impl Iterator<Item = Node<'a, 'input>> {
     n.children()
         .filter(|c| c.is_element() && c.tag_name().namespace() != Some(XINCLUDE_NS))
 }
@@ -1597,8 +1626,36 @@ fn set_value<T>(slot: &mut T, value: Option<T>) {
     }
 }
 
-fn mask_error(name: &str, value: &str, e: MaskError) -> ConfigError {
-    ConfigError::invalid(name, value, e.to_string())
+/// What `PasswordMaskingUtil.resolveMask` throws: a codec it cannot make
+/// or a codec property it cannot read as Java's do, anything else named
+/// with the value.
+pub(crate) fn mask_error(name: &str, value: &str, e: MaskError) -> ConfigError {
+    match e {
+        MaskError::UnknownCodec(class) => {
+            ConfigError::Runtime(format!("AMQ209003: Error instantiating codec {class}"))
+        }
+        MaskError::InvalidProperty(part) => ConfigError::Checked(format!(
+            "org.apache.activemq.artemis.api.core.ActiveMQIllegalStateException: [errorType=ILLEGAL_STATE message=AMQ209000: invalid property: {part}]"
+        )),
+        e => ConfigError::invalid(name, value, e.to_string()),
+    }
+}
+
+/// What `PasswordMaskingUtil.resolveMask` takes from the configuration:
+/// `mask-password` and `password-codec`.
+pub(crate) trait MaskSettings {
+    fn mask_password(&self) -> Option<bool>;
+    fn password_codec(&self) -> &str;
+}
+
+impl MaskSettings for BrokerConfig {
+    fn mask_password(&self) -> Option<bool> {
+        self.mask_password
+    }
+
+    fn password_codec(&self) -> &str {
+        &self.password_codec
+    }
 }
 
 /// The security options of `<core>`, in the order `parseMainConfig` reads
@@ -1637,7 +1694,7 @@ fn parse_security_options(s: &Settings<'_, '_>, config: &mut BrokerConfig) -> Re
     Ok(())
 }
 
-fn required_attribute(n: Node<'_, '_>, attribute: &str) -> Result<String> {
+pub(crate) fn required_attribute(n: Node<'_, '_>, attribute: &str) -> Result<String> {
     n.attribute(attribute)
         .map(str::to_owned)
         .ok_or_else(|| ConfigError::MissingAttribute {
@@ -1821,7 +1878,7 @@ fn parse_address_settings(
 
 /// `FileConfigurationParser.parseAddressSettings(Node)`. Child names are
 /// compared ignoring case, as in Java.
-fn parse_address_setting(
+pub(crate) fn parse_address_setting(
     node: Node<'_, '_>,
     warnings: &mut Vec<Warning>,
 ) -> Result<AddressSettings> {
@@ -2261,10 +2318,14 @@ fn parse_broker_connections(core: Node<'_, '_>, config: &mut BrokerConfig) -> Re
 
 /// An attribute that may be masked (`ENC(...)`), resolved as
 /// `PasswordMaskingUtil.resolveMask` resolves it.
-fn enc_attribute(node: Node<'_, '_>, name: &str, config: &BrokerConfig) -> Result<Option<String>> {
+fn enc_attribute(
+    node: Node<'_, '_>,
+    name: &str,
+    config: &impl MaskSettings,
+) -> Result<Option<String>> {
     match node.attribute(name) {
         Some(text) if mask::is_enc_masked(text) => Ok(Some(
-            mask::resolve_mask(config.mask_password, text, Some(&config.password_codec))
+            mask::resolve_mask(config.mask_password(), text, Some(config.password_codec()))
                 .map_err(|e| mask_error(name, text, e))?,
         )),
         v => Ok(v.map(str::to_owned)),
@@ -2272,7 +2333,12 @@ fn enc_attribute(node: Node<'_, '_>, name: &str, config: &BrokerConfig) -> Resul
 }
 
 /// `getAttributeInteger`: an empty or absent attribute is the default.
-fn int_attribute_or(node: Node<'_, '_>, name: &str, default: i32, check: Check) -> Result<i32> {
+pub(crate) fn int_attribute_or(
+    node: Node<'_, '_>,
+    name: &str,
+    default: i32,
+    check: Check,
+) -> Result<i32> {
     match node.attribute(name).filter(|v| !v.is_empty()) {
         Some(v) => Ok(check.apply(name, i64::from(int_attribute(name, java_trim(v))?))? as i32),
         None => Ok(default),
@@ -2280,7 +2346,7 @@ fn int_attribute_or(node: Node<'_, '_>, name: &str, default: i32, check: Check) 
 }
 
 /// `getBooleanAttribute`.
-fn bool_attribute_or(node: Node<'_, '_>, name: &str, default: bool) -> bool {
+pub(crate) fn bool_attribute_or(node: Node<'_, '_>, name: &str, default: bool) -> bool {
     match node.attribute(name).filter(|v| !v.is_empty()) {
         Some(v) => java_parse_bool(v),
         None => default,
@@ -2288,9 +2354,9 @@ fn bool_attribute_or(node: Node<'_, '_>, name: &str, default: bool) -> bool {
 }
 
 /// `parseAMQPBrokerConnections`.
-fn parse_amqp_connection(
+pub(crate) fn parse_amqp_connection(
     node: Node<'_, '_>,
-    config: &BrokerConfig,
+    config: &impl MaskSettings,
 ) -> Result<crate::AmqpBrokerConnectConfig> {
     use crate::broker_connection::{add_property, add_unique};
     use crate::{AmqpConnectionElement as E, AmqpMatchElement};
@@ -2615,10 +2681,10 @@ fn parse_amqp_bridge_queue_policy(node: Node<'_, '_>) -> Result<crate::AmqpBridg
 
 /// A password attribute, resolved as `PasswordMaskingUtil.resolveMask`
 /// resolves it; an empty one is none.
-fn password_attribute(node: Node<'_, '_>, config: &BrokerConfig) -> Result<Option<String>> {
+fn password_attribute(node: Node<'_, '_>, config: &impl MaskSettings) -> Result<Option<String>> {
     match node.attribute("password") {
         Some(text) if !text.is_empty() => Ok(Some(
-            mask::resolve_mask(config.mask_password, text, Some(&config.password_codec))
+            mask::resolve_mask(config.mask_password(), text, Some(config.password_codec()))
                 .map_err(|e| mask_error("password", text, e))?,
         )),
         _ => Ok(None),
@@ -2626,16 +2692,19 @@ fn password_attribute(node: Node<'_, '_>, config: &BrokerConfig) -> Result<Optio
 }
 
 /// `Integer.parseInt` of an attribute.
-fn int_attribute(name: &str, text: &str) -> Result<i32> {
+pub(crate) fn int_attribute(name: &str, text: &str) -> Result<i32> {
     parse_num(name, text)
 }
 
-fn long_attribute(name: &str, text: &str, check: Check) -> Result<i64> {
+pub(crate) fn long_attribute(name: &str, text: &str, check: Check) -> Result<i64> {
     parse_num::<i64>(name, text).and_then(|v| check.apply(name, v))
 }
 
 /// `parseFederationConfiguration`.
-fn parse_federation(node: Node<'_, '_>, config: &BrokerConfig) -> Result<crate::FederationConfig> {
+pub(crate) fn parse_federation(
+    node: Node<'_, '_>,
+    config: &impl MaskSettings,
+) -> Result<crate::FederationConfig> {
     let mut f = crate::FederationConfig {
         name: node.attribute("name").unwrap_or_default().to_owned(),
         user: Some(node.attribute("user").unwrap_or_default().to_owned()),
@@ -2786,7 +2855,7 @@ fn parse_address_policy(node: Node<'_, '_>) -> Result<crate::FederationAddressPo
 /// 2.57, `share-connection` is not read.
 fn parse_federation_stream(
     node: Node<'_, '_>,
-    config: &BrokerConfig,
+    config: &impl MaskSettings,
 ) -> Result<crate::FederationStreamConfig> {
     use crate::FederationConnectionConfig as C;
     let s = Settings { core: node };
@@ -2876,7 +2945,7 @@ fn parse_federation_stream(
 
 /// `getTransformerConfiguration`: `<class-name>` and the `<property>`
 /// children.
-fn transformer(t: Node<'_, '_>) -> TransformerConfig {
+pub(crate) fn transformer(t: Node<'_, '_>) -> TransformerConfig {
     TransformerConfig {
         class_name: first(t, "class-name").map(trimmed_text).unwrap_or_default(),
         properties: all(t, "property")
@@ -2949,7 +3018,10 @@ fn parse_divert(node: Node<'_, '_>, warnings: &mut Vec<Warning>) -> Result<Diver
 }
 
 /// `parseAddressConfiguration`.
-fn parse_address(node: Node<'_, '_>, warnings: &mut Vec<Warning>) -> Result<AddressConfig> {
+pub(crate) fn parse_address(
+    node: Node<'_, '_>,
+    warnings: &mut Vec<Warning>,
+) -> Result<AddressConfig> {
     let name = node
         .attribute("name")
         .ok_or_else(|| ConfigError::MissingAttribute {

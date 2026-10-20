@@ -18,9 +18,6 @@ const WIDTH: usize = 80;
 /// option column.
 const LONG_OPTIONS_MAX_WIDTH: usize = 20;
 
-/// The commands of Artemis's command line that saranga does not have yet.
-const MISSING: [&str; 1] = ["properties"];
-
 /// Where the command line is: `buildCommand`'s choice of commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -131,29 +128,8 @@ pub fn artemis() -> &'static Spec {
     static SPEC: OnceLock<Spec> = OnceLock::new();
     SPEC.get_or_init(|| {
         let json = Json::parse(include_str!("artemis-cli.json")).expect("artemis-cli.json");
-        let mut root = spec(&json);
-        prune(&mut root, "");
-        root
+        spec(&json)
     })
-}
-
-fn prune(spec: &mut Spec, path: &str) {
-    spec.commands.retain(|c| {
-        let p = if path.is_empty() {
-            c.name.clone()
-        } else {
-            format!("{path} {}", c.name)
-        };
-        !MISSING.contains(&p.as_str())
-    });
-    for c in &mut spec.commands {
-        let p = if path.is_empty() {
-            c.name.clone()
-        } else {
-            format!("{path} {}", c.name)
-        };
-        prune(c, &p);
-    }
 }
 
 fn strings(json: Option<&Json>) -> Vec<String> {

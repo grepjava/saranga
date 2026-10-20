@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+<core xmlns="urn:activemq:core">
+<store><database-store><jdbc-connection-url>jdbc:derby:x</jdbc-connection-url><jdbc-user>u</jdbc-user><jdbc-password>p</jdbc-password><data-source-properties><data-source-property key="k1" value="v1"/><data-source-property key="k2" value="v2"/></data-source-properties><message-table-name>M</message-table-name><bindings-table-name>B</bindings-table-name><large-message-table-name>L</large-message-table-name><page-store-table-name>P</page-store-table-name></database-store></store>
+</core>
+</configuration>
