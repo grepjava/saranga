@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use saranga_config::Validation;
 use saranga_config::configuration::{
-    ExportContext, ExportError, export_as_properties, read_configuration,
+    ExportContext, ExportError, default_ping_commands, export_as_properties, read_configuration,
 };
 
 fn golden_dir() -> PathBuf {
@@ -23,12 +23,29 @@ fn line_value(expected: &str, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The golden files carry NetworkHealthCheck's Windows default ping
+/// commands, where Artemis wrote them; elsewhere it writes its own
+/// platform's, as the export does.
+fn platform_ping_defaults(expected: String) -> String {
+    let (ipv4, ipv6) = default_ping_commands();
+    expected
+        .replace(
+            "networkCheckPingCommand=cmd /C ping -n 1 -w %d000 %s | findstr /i TTL\n",
+            &format!("networkCheckPingCommand={ipv4}\n"),
+        )
+        .replace(
+            "networkCheckPing6Command=ping -n 1 -w %d000 %s\n",
+            &format!("networkCheckPing6Command={ipv6}\n"),
+        )
+}
+
 fn export(case: &str) -> (String, String, Option<ExportError>) {
     let dir = golden_dir();
     let xml = std::fs::read_to_string(dir.join(format!("{case}.xml"))).unwrap();
     let expected = std::fs::read_to_string(dir.join(format!("{case}.properties")))
         .unwrap()
         .replace("\r\n", "\n");
+    let expected = platform_ping_defaults(expected);
     let url = line_value(&expected, "configurationUrl");
     let config = read_configuration(
         &xml,
