@@ -776,20 +776,17 @@ fn configuration(c: &Configuration, ctx: &ExportContext) -> Node {
         .v("wildcardRoutingEnabled", c.wildcard_routing_enabled);
 
     // One identity per plugin object, the same in every list it is in.
-    let plugins: Vec<(String, Node)> = c
+    let plugins: Vec<(String, Node, bool)> = c
         .broker_plugins
         .iter()
         .filter_map(|p| broker_plugin(p, ctx))
         .collect();
     for (list, holds) in BROKER_PLUGIN_LISTS {
-        let entries = if holds {
-            plugins
-                .iter()
-                .map(|(k, n)| (k.clone(), n.clone()))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let entries = plugins
+            .iter()
+            .filter(|(_, _, server_plugin)| holds && (*server_plugin || list == "brokerPlugins"))
+            .map(|(k, n, _)| (k.clone(), n.clone()))
+            .collect();
         bean = bean.n(list, self::entries(entries));
     }
     bean.node()
@@ -1646,9 +1643,9 @@ fn security_setting_plugin_bean(p: &SecuritySettingPlugin) -> Option<Bean> {
     )
 }
 
-/// The broker plugin lists. Every plugin the parser makes is an
-/// `ActiveMQServerPlugin`, which is in each list but
-/// `brokerAMQPFederationPlugins`.
+/// The broker plugin lists. An `ActiveMQServerPlugin` is in each but
+/// `brokerAMQPFederationPlugins`; an `ActiveMQServerBasePlugin` only
+/// (`ConnectionPeriodicExpiryPlugin`) is in `brokerPlugins` alone.
 const BROKER_PLUGIN_LISTS: [(&str, bool); 13] = [
     ("brokerAddressPlugins", true),
     ("brokerAMQPFederationPlugins", false),
@@ -1668,10 +1665,30 @@ const BROKER_PLUGIN_LISTS: [(&str, bool); 13] = [
 const NOTIFICATION_PLUGIN: &str =
     "org.apache.activemq.artemis.core.server.plugin.impl.NotificationActiveMQServerPlugin";
 
-/// A broker plugin keyed as `extractName` keys it (no `getName()`: its
-/// `Object.toString`), with what its getters give; `None` when it exports
+/// A broker plugin keyed as `extractName` keys it (its `getName()`, or
+/// without one its `Object.toString`), with what its getters give, and
+/// whether it is an `ActiveMQServerPlugin`; `None` when it exports
 /// nothing.
-fn broker_plugin(p: &BrokerPlugin, ctx: &ExportContext) -> Option<(String, Node)> {
+fn broker_plugin(p: &BrokerPlugin, ctx: &ExportContext) -> Option<(String, Node, bool)> {
+    if p.class_name == super::parse::CONNECTION_PERIODIC_EXPIRY_PLUGIN {
+        // `init`, the parser having checked the numbers.
+        let name = p.properties.get("name").cloned();
+        let number = |k: &str, default: i64| {
+            p.properties
+                .get(k)
+                .and_then(|v| saranga_filter::java_parse_int::<i64>(v))
+                .unwrap_or(default)
+        };
+        let bean = Bean::new()
+            .o(
+                "acceptorMatchRegex",
+                p.properties.get("acceptorMatchRegex").map(String::as_str),
+            )
+            .v("accuracyWindowSeconds", number("accuracyWindowSeconds", 30))
+            .o("name", name.as_deref())
+            .v("periodSeconds", number("periodSeconds", 15 * 60));
+        return Some((element_name(name.as_deref()), bean.node(), false));
+    }
     if p.class_name != NOTIFICATION_PLUGIN {
         // `LoggingActiveMQServerPlugin` and
         // `BrokerMessageAuthorizationPlugin` have no property to export.
@@ -1700,7 +1717,7 @@ fn broker_plugin(p: &BrokerPlugin, ctx: &ExportContext) -> Option<(String, Node)
             "sendExpiredNotifications",
             flag("SEND_EXPIRED_NOTIFICATIONS"),
         );
-    Some(((ctx.identity)(&p.class_name), bean.node()))
+    Some(((ctx.identity)(&p.class_name), bean.node(), true))
 }
 
 /// A `HAPolicyConfiguration`: its type first, then its properties.

@@ -1831,6 +1831,7 @@ dependencies = [
  "regex",
  "roxmltree",
  "saranga-buffer",
+ "saranga-filter",
  "sha1 0.10.7",
  "tempfile",
  "thiserror",

@@ -2126,7 +2126,7 @@ fn parse_broker_plugins(e: Node<'_, '_>, config: &mut Configuration) -> Result<(
     for node in all(list, "broker-plugin") {
         let class_name = attribute(node, "class-name").unwrap_or_default();
         let properties = child_properties(node);
-        check_broker_plugin(&class_name)?;
+        check_broker_plugin(&class_name, &properties)?;
         config.broker_plugins.push(BrokerPlugin {
             class_name,
             properties,
@@ -2143,18 +2143,42 @@ const BROKER_PLUGINS: [&str; 3] = [
     "org.apache.activemq.artemis.core.server.plugin.impl.BrokerMessageAuthorizationPlugin",
 ];
 
-/// `ClassloadingUtil.newInstanceFromClassLoader(..., ActiveMQServerPlugin)`:
-/// `ConnectionPeriodicExpiryPlugin` is only an `ActiveMQServerBasePlugin`,
-/// and a class Artemis does not have is not found.
-fn check_broker_plugin(class_name: &str) -> Result<()> {
+/// `ConnectionPeriodicExpiryPlugin`, an `ActiveMQServerBasePlugin` only.
+pub(crate) const CONNECTION_PERIODIC_EXPIRY_PLUGIN: &str =
+    "org.apache.activemq.artemis.core.server.plugin.impl.ConnectionPeriodicExpiryPlugin";
+
+/// `ClassloadingUtil.newInstanceFromClassLoader` and `init`: a class
+/// Artemis does not have is not found. `ConnectionPeriodicExpiryPlugin`
+/// is taken as Artemis's manual configures it, though Artemis 2.57's
+/// parser refuses it for not being an `ActiveMQServerPlugin`
+/// (docs/upstream/artemis-issues.md, issue 20); its `init` checks its
+/// settings.
+fn check_broker_plugin(class_name: &str, properties: &JavaMap<String>) -> Result<()> {
     if BROKER_PLUGINS.contains(&class_name) {
         Ok(())
-    } else if class_name
-        == "org.apache.activemq.artemis.core.server.plugin.impl.ConnectionPeriodicExpiryPlugin"
-    {
-        Err(ConfigError::Runtime(format!(
-            "clazz [{class_name}] is not assignable from expected type: interface org.apache.activemq.artemis.core.server.plugin.ActiveMQServerPlugin"
-        )))
+    } else if class_name == CONNECTION_PERIODIC_EXPIRY_PLUGIN {
+        let number_format = |v: &str| ConfigError::Runtime(format!("For input string: \"{v}\""));
+        if let Some(v) = properties.get("periodSeconds")
+            && saranga_filter::java_parse_int::<i64>(v).is_none()
+        {
+            return Err(number_format(v));
+        }
+        let accuracy = match properties.get("accuracyWindowSeconds") {
+            Some(v) => saranga_filter::java_parse_int::<i32>(v).ok_or_else(|| number_format(v))?,
+            None => 30,
+        };
+        // `sanityCheckConfig`.
+        if accuracy <= 0 {
+            return Err(ConfigError::Runtime(
+                "accuracyWindowSeconds must be > 0".to_owned(),
+            ));
+        }
+        if properties.get("acceptorMatchRegex").is_none() {
+            return Err(ConfigError::Runtime(
+                "acceptorMatchRegex must be configured".to_owned(),
+            ));
+        }
+        Ok(())
     } else {
         Err(class_not_found(class_name))
     }

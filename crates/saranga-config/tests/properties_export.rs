@@ -137,3 +137,81 @@ fn terminus_capabilities_stop_the_export() {
     assert!(matches!(failed, Some(ExportError::NullPointer(_))));
     assert_eq!(actual, expected);
 }
+
+/// The broker plugin lines of `<broker-plugins>` holding the logging plugin
+/// and a `ConnectionPeriodicExpiryPlugin` with `properties`.
+fn expiry_plugin(properties: &str) -> Result<Vec<String>, saranga_config::ConfigError> {
+    let xml = format!(
+        r#"<?xml version='1.0'?>
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+   <core xmlns="urn:activemq:core">
+      <broker-plugins>
+         <broker-plugin class-name="org.apache.activemq.artemis.core.server.plugin.impl.LoggingActiveMQServerPlugin"/>
+         <broker-plugin class-name="org.apache.activemq.artemis.core.server.plugin.impl.ConnectionPeriodicExpiryPlugin">{properties}</broker-plugin>
+      </broker-plugins>
+   </core>
+</configuration>"#
+    );
+    let config = read_configuration(&xml, |_| None, Validation::Deploy { jms: true }, None)?;
+    let ctx = ExportContext {
+        max_memory: 1 << 30,
+        broker_instance: String::new(),
+        uuid: || "not-used".to_owned(),
+        identity: |class| format!("{class}@0"),
+    };
+    let (text, failed) = export_as_properties(&config, &ctx);
+    assert_eq!(failed, None);
+    Ok(text
+        .lines()
+        .filter(|l| l.contains("Plugins."))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// `ConnectionPeriodicExpiryPlugin` as Artemis's manual configures it,
+/// which Artemis 2.57's parser refuses (docs/upstream/artemis-issues.md,
+/// issue 20): exported as `exportAsProperties` exports the plugin made and
+/// `init`ed so (scratchpad probe `CpeExport.java` on 2.57), in
+/// `brokerPlugins` alone, as an `ActiveMQServerBasePlugin`.
+#[test]
+fn a_connection_expiry_plugin_as_the_manual_configures_it() {
+    let regex = r#"<property key="acceptorMatchRegex" value="netty-client-acceptor"/><property key="periodSeconds" value="60"/>"#;
+    assert_eq!(
+        expiry_plugin(regex).unwrap(),
+        [
+            "brokerPlugins.name-attribute-must-be-set-for-properties-key-export.acceptorMatchRegex=netty-client-acceptor",
+            "brokerPlugins.name-attribute-must-be-set-for-properties-key-export.accuracyWindowSeconds=30",
+            "brokerPlugins.name-attribute-must-be-set-for-properties-key-export.periodSeconds=60",
+        ]
+    );
+    assert_eq!(
+        expiry_plugin(&format!(r#"{regex}<property key="name" value="exp"/>"#)).unwrap(),
+        [
+            "brokerPlugins.exp.acceptorMatchRegex=netty-client-acceptor",
+            "brokerPlugins.exp.accuracyWindowSeconds=30",
+            "brokerPlugins.exp.name=exp",
+            "brokerPlugins.exp.periodSeconds=60",
+        ]
+    );
+    // `init`'s exceptions.
+    for (properties, message) in [
+        (
+            r#"<property key="acceptorMatchRegex" value="a"/><property key="accuracyWindowSeconds" value="0"/>"#,
+            "accuracyWindowSeconds must be > 0",
+        ),
+        (
+            r#"<property key="acceptorMatchRegex" value="a"/><property key="periodSeconds" value="x"/>"#,
+            "For input string: \"x\"",
+        ),
+        (
+            r#"<property key="acceptorMatchRegex" value="a"/><property key="accuracyWindowSeconds" value="y"/>"#,
+            "For input string: \"y\"",
+        ),
+        ("", "acceptorMatchRegex must be configured"),
+    ] {
+        match expiry_plugin(properties) {
+            Err(saranga_config::ConfigError::Runtime(m)) => assert_eq!(m, message),
+            other => panic!("{properties}: {other:?}"),
+        }
+    }
+}

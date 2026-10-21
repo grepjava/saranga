@@ -569,28 +569,40 @@ impl BrokerPlugin for MessageAuthorization {
 
 // ---------------------------------------------------------------------------
 
+/// `RandomUtil.randomMax`: `Math.abs` of a random `int`, modulo `max`, 0
+/// taken as `max`. `Math.abs(Integer.MIN_VALUE)` stays negative, which
+/// the scheduler runs at once.
+fn random_max(max: u64) -> u64 {
+    let b = uuid::Uuid::new_v4();
+    let b = b.as_bytes();
+    let value = i32::from_be_bytes([b[0], b[1], b[2], b[3]]).wrapping_abs() % max as i32;
+    match value {
+        0 => max,
+        v if v < 0 => 0,
+        v => v as u64,
+    }
+}
+
 /// `ConnectionPeriodicExpiryPlugin`.
 pub struct ConnectionPeriodicExpiry {
-    period: std::time::Duration,
+    /// `TimeUnit.SECONDS.toMillis(periodSeconds)`.
+    period_ms: i64,
     accuracy_window_seconds: u64,
     acceptor_match: regex::Regex,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ConnectionPeriodicExpiry {
+    /// `init`: `Long.parseLong` of `periodSeconds` and `Integer.parseInt`
+    /// of `accuracyWindowSeconds`, then `sanityCheckConfig`.
     pub fn new(properties: &HashMap<String, String>) -> Result<Self, String> {
-        let period_seconds: u64 = match properties.get("periodSeconds") {
-            Some(v) => v
-                .trim()
-                .parse()
-                .map_err(|_| format!("periodSeconds: {v}"))?,
+        let number_format = |v: &str| format!("For input string: \"{v}\"");
+        let period_seconds: i64 = match properties.get("periodSeconds") {
+            Some(v) => saranga_filter::java_parse_int(v).ok_or_else(|| number_format(v))?,
             None => 15 * 60,
         };
-        let accuracy: i64 = match properties.get("accuracyWindowSeconds") {
-            Some(v) => v
-                .trim()
-                .parse()
-                .map_err(|_| format!("accuracyWindowSeconds: {v}"))?,
+        let accuracy: i32 = match properties.get("accuracyWindowSeconds") {
+            Some(v) => saranga_filter::java_parse_int(v).ok_or_else(|| number_format(v))?,
             None => 30,
         };
         // sanityCheckConfig
@@ -603,7 +615,8 @@ impl ConnectionPeriodicExpiry {
         let acceptor_match = regex::Regex::new(&format!("^(?:{pattern})$"))
             .map_err(|e| format!("acceptorMatchRegex: {e}"))?;
         Ok(Self {
-            period: std::time::Duration::from_secs(period_seconds),
+            // `TimeUnit.SECONDS.toMillis`, which saturates.
+            period_ms: period_seconds.saturating_mul(1000),
             accuracy_window_seconds: accuracy as u64,
             acceptor_match,
             task: Mutex::new(None),
@@ -615,7 +628,7 @@ impl BrokerPlugin for ConnectionPeriodicExpiry {
     fn registered(&self, broker: &Arc<Broker>) {
         let weak = Arc::downgrade(broker);
         let window = std::time::Duration::from_secs(self.accuracy_window_seconds);
-        let period_ms = self.period.as_millis() as i64;
+        let period_ms = self.period_ms;
         let pattern = self.acceptor_match.clone();
         let accuracy = self.accuracy_window_seconds;
         let task = tokio::spawn(async move {
@@ -624,16 +637,17 @@ impl BrokerPlugin for ConnectionPeriodicExpiry {
                 let Some(broker) = weak.upgrade() else { return };
                 let now = crate::message::now_millis();
                 for c in broker.registry().connections() {
+                    // `currentTime > creationTime + periodMillis`, the sum
+                    // wrapping as Java's does.
                     if !c.acceptor().is_some_and(|a| pattern.is_match(a))
-                        || now <= c.created() + period_ms
+                        || now <= c.created().wrapping_add(period_ms)
                     {
                         continue;
                     }
-                    // A random moment within the window, so the clients do
-                    // not all come back at once.
-                    let delay = std::time::Duration::from_millis(
-                        u64::from(uuid::Uuid::new_v4().as_bytes()[0]) * accuracy * 1000 / 256,
-                    );
+                    // `RandomUtil.randomMax(accuracyWindowSeconds)` seconds,
+                    // 1 to the window, so the clients do not all come back
+                    // at once.
+                    let delay = std::time::Duration::from_secs(random_max(accuracy));
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
                         tracing::debug!(
