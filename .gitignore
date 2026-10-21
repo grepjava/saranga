@@ -3,3 +3,7 @@
 /.claude
 tests/golden/data/
 /dist
+
+# Drafts of Artemis upstream issues and PRs, kept local: they include
+# reports not yet disclosed.
+docs/upstream/
