@@ -210,6 +210,8 @@ These are read and ignored, each with a warning in the log:
 - `<lock-coordinators>`;
 - `<metrics>` and `<metrics-plugin>` (the broker, address and queue metrics are still served where `bootstrap.xml` declares the metrics app; see [Management](management.md));
 - `<resource-limit-settings>`, which are not enforced;
+- `<remoting-interceptors>`, `<remoting-incoming-interceptors>`, `<remoting-outgoing-interceptors>` and `<connector-services>`, which name Java classes;
+- an acceptor's `proxyProtocolEnabled`, `httpEnabled` and `router`;
 - `scale-down` in an HA policy;
 - `<security-setting-plugin>` (see [Security](security.md));
 - in `bootstrap.xml`, `<component>`s and every `<web>` after the first: Artemis starts each as a Java component, and Saranga runs one web server and no Java code;

@@ -9,6 +9,9 @@
 #
 #   PRIMARY=saranga|artemis BACKUP=saranga|artemis tests/interop/ha/replication.sh
 #
+# CLUSTER_NAME=1 puts a decoy cluster connection first and names the real
+# one in cluster-name (Saranga only; see below).
+#
 # Each defaults to saranga. UPDATE=1 rewrites the expected output instead of
 # comparing.
 #
@@ -145,6 +148,17 @@ suite() {
   # Failback both ways.
   perl -0pi -e 's|(<vote-on-replication-failure>true</vote-on-replication-failure>)|$1\n               <check-for-active-server>true</check-for-active-server>|' "$P/etc/broker.xml"
   perl -0pi -e 's|<backup/>|<backup>\n               <allow-failback>true</allow-failback>\n            </backup>|' "$B/etc/broker.xml"
+  # CLUSTER_NAME=1: a decoy cluster connection, to a port nothing listens
+  # on, comes first, and both nodes' cluster-name names the real one, which
+  # the manual says replication uses. Artemis 2.57's backup takes the first
+  # cluster connection whatever cluster-name says, and waits for good
+  # (docs/upstream/artemis-issues.md, issue 21), so this runs with Saranga
+  # on both nodes only.
+  if [[ -n "${CLUSTER_NAME:-}" ]]; then
+    for f in "$P/etc/broker.xml" "$B/etc/broker.xml"; do
+      perl -0pi -e 's|<cluster-connections>|<cluster-connections>\n         <cluster-connection name="decoy">\n            <connector-ref>artemis</connector-ref>\n            <initial-connect-attempts>1</initial-connect-attempts>\n            <static-connectors>\n               <connector-ref>decoy</connector-ref>\n            </static-connectors>\n         </cluster-connection>|; s|</connectors>|   <connector name="decoy">tcp://localhost:1</connector>\n    </connectors>|; s|<primary>|<primary>\n               <cluster-name>my-cluster</cluster-name>|; s|<backup>|<backup>\n               <cluster-name>my-cluster</cluster-name>|' "$f"
+    done
+  fi
 
   # 1. Data before the backup.
   step "artemis run (primary)"

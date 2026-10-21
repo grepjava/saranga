@@ -1435,7 +1435,9 @@ async fn boot(
         let m = policy.manager.as_ref().expect("a manager");
         let manager = saranga_ha::lockmanager::LockManager::new(&m.class_name, &m.properties)
             .map_err(|e| anyhow::anyhow!("AMQ224000: Failure in initialisation: {e}"))?;
-        let Some(cluster) = broker_config.cluster().cloned() else {
+        let Some(cluster) =
+            replication_cluster(&broker_config, policy.cluster_name.as_deref())?.cloned()
+        else {
             anyhow::bail!("a replicating broker needs a cluster-connection to find its peer");
         };
         let primary = !file.ha_policy.is_backup();
@@ -1479,10 +1481,22 @@ async fn boot(
     if broker_config.ha.coordination.is_none()
         && let (Some(storage), Some(dir), Some(file)) =
             (&broker_config.storage, &lock_dir, file_config.as_ref())
-        && let Some((backup_policy, fail_back, active_policy)) =
-            replica_role(&file.ha_policy, as_backup, dir, broker_config.cluster()).await?
+        && let Some((backup_policy, fail_back, active_policy)) = replica_role(
+            &file.ha_policy,
+            as_backup,
+            dir,
+            replication_cluster(
+                &broker_config,
+                file.ha_policy
+                    .replication()
+                    .and_then(|r| r.cluster_name.as_deref()),
+            )?,
+        )
+        .await?
     {
-        let Some(cluster) = broker_config.cluster().cloned() else {
+        let Some(cluster) =
+            replication_cluster(&broker_config, backup_policy.cluster_name.as_deref())?.cloned()
+        else {
             anyhow::bail!("a replicating backup needs a cluster-connection to find its primary");
         };
         // The node manager's start: `server.lock` is there before the data
@@ -1631,6 +1645,25 @@ async fn replica_role(
         Ok(Some((replica, true, primary.clone())))
     } else {
         Ok(None)
+    }
+}
+
+/// `ConfigurationUtils.getReplicationClusterConfiguration`: the cluster
+/// connection replication uses, the one `cluster-name` names, else the
+/// first. A name no cluster connection has fails the activation, as the
+/// `ActiveMQIllegalStateException` does.
+fn replication_cluster<'a>(
+    config: &'a BrokerConfig,
+    name: Option<&str>,
+) -> anyhow::Result<Option<&'a saranga_server::cluster::ClusterConfig>> {
+    match name.filter(|n| !n.is_empty()) {
+        None => Ok(config.cluster()),
+        Some(n) => match config.clusters.iter().find(|c| c.name == n) {
+            Some(c) => Ok(Some(c)),
+            None => anyhow::bail!(
+                "AMQ224000: Failure in initialisation: org.apache.activemq.artemis.api.core.ActiveMQIllegalStateException: Missing cluster-configuration for replication-clustername '{n}'."
+            ),
+        },
     }
 }
 
