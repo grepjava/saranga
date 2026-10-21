@@ -39,7 +39,7 @@ Never delete `server.lock` to move an instance between brokers: it holds the nod
 
 ## Paging
 
-Paging works as in Artemis. Each address has a size limit (`max-size-bytes`, `max-size-messages`, and the broker-wide `global-max-size` and `global-max-messages`), and `address-full-policy` says what happens at the limit:
+Paging works as in Artemis. Each address has a size limit (`max-size-bytes`, `max-size-messages`, and the broker-wide `global-max-size` and `global-max-messages`), and `address-full-policy` says what happens at the limit. When `global-max-size` is not set, it is `global-max-size-percent-of-jvm-max-memory` (50% by default) of the heap Artemis's JVM would have: the `-Xmx` (or `-XX:MaxHeapSize`) of the profile's `JAVA_ARGS`, else the JVM's default, a quarter of the memory. An instance `create` makes has `-Xmx2G`, so 1 GiB.
 
 - `PAGE` (the default) writes new messages to the address's page files, and queues read them back as they consume.
 - `BLOCK` holds producers back until there is room: Core producers get no more credit, AMQP links no more link credit, and OpenWire sends wait or the connection stops being read, as on Artemis. With `max-size-bytes-reject-threshold`, AMQP sends past it are rejected. An address blocked through management (`block`) refuses Core producers' credit as `FAIL` does.
@@ -51,8 +51,6 @@ Paging works as in Artemis. Each address has a size limit (`max-size-bytes`, `ma
 Where Saranga differs (see [COMPAT.md, Paging differences](../../COMPAT.md#paging-differences)):
 
 - **Paging needs persistence.** With `persistence-enabled` set to `false`, Saranga writes no page files and keeps every message in memory; only `BLOCK`, `FAIL` and `DROP` limit an address. Artemis still pages in that case.
-- **`global-max-size`** defaults to 1 GiB. Artemis defaults to half the JVM's maximum heap, which Saranga does not have. Set it explicitly if you rely on the default.
-- **Transactions** count against the address size when they commit, not as their messages are routed, so under transactional producers an address fills a little later.
 - **Queue browsers** see the messages in memory, including those read in from the pages up to `max-read-page-messages` and `max-read-page-bytes`, but not the rest of a longer backlog.
 - **Page counters** are rebuilt from the page files at every start. The counter records Artemis writes are deleted when Saranga loads them; Artemis rebuilds its counters when they are missing, so the data directory still moves back.
 

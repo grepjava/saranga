@@ -27,8 +27,7 @@ Where Saranga differs:
 
 - `getVersion` reports 2.57.0, the Artemis release whose interface Saranga answers, so version checks keep working.
 - `browse` answers `no operation`. Artemis returns Java-serialized objects that only a Java client can read. Use `listMessages`, `listMessagesAsJSON`, the REST API or Jolokia instead.
-- Dates in the `list*` views and message counters are in UTC.
-- Some notifications are not sent yet.
+- Dates of the prepared transactions and message counters are in the `en_US` locale, whatever the machine's.
 
 The full list is in [COMPAT.md, Management differences](../../COMPAT.md#management-differences).
 
@@ -189,4 +188,4 @@ saranga check queue --name orders --up
 
 From an instance, run them as `bin/artemis queue stat` (`bin\artemis.cmd` on Windows), or as `saranga shell` to keep one connection for several commands. `saranga help <command>` prints Artemis's help.
 
-Where the `saranga` CLI differs: it connects over Core on plain TCP only, so `--protocol AMQP` and `sslEnabled=true` are not supported. `queue stat --loop` prints times in UTC. See [cli.md](cli.md) and [COMPAT.md, CLI differences](../../COMPAT.md#cli-differences).
+The `saranga` CLI's management commands work as Artemis's do. See [cli.md](cli.md) and [COMPAT.md, CLI differences](../../COMPAT.md#cli-differences).

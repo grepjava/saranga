@@ -141,7 +141,6 @@ When a reload changes a queue's filter, the record Saranga writes holds the new 
 
 - A second `<address-setting>` with the same match is reported, and the first is kept, as Artemis keeps it.
 - An element Saranga does not know inside an `<address-setting>` is reported and ignored.
-- `global-max-size` defaults to 1 GiB. Artemis defaults to half the JVM's maximum heap, which Saranga does not have.
 - Paging needs persistence. Without `persistence-enabled`, only `BLOCK`, `FAIL` and `DROP` limit an address. See [Storage](storage.md).
 
 The queue behaviours that address settings turn on (dead letters, expiry, redelivery, last-value, ring, non-destructive and exclusive queues, message groups and the like) follow Artemis. The small differences in timing are listed in [COMPAT.md](../../COMPAT.md#queue-semantics-differences).

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use super::Json;
-use super::transactions::{short_date, short_medium};
+use super::transactions::{short_day, short_medium};
 use crate::Broker;
 use crate::message::now_millis;
 use crate::queue::Queue;
@@ -261,11 +261,8 @@ impl MessageCounter {
         };
         if initialize {
             let now = now_millis();
-            self.day_counters.push(DayCounter::new(
-                now.div_euclid(MILLIS_PER_DAY),
-                hour_of(now),
-                true,
-            ));
+            self.day_counters
+                .push(DayCounter::new(day_of(now), hour_of(now), true));
         }
     }
 
@@ -283,7 +280,7 @@ impl MessageCounter {
             return;
         }
         let now = now_millis();
-        let today = now.div_euclid(MILLIS_PER_DAY);
+        let today = day_of(now);
         let last_day = self.day_counters.last().map_or(today, |c| c.day);
         let delta = today - last_day;
         if delta > 0 {
@@ -332,12 +329,10 @@ impl MessageCounter {
             .history()
             .into_iter()
             .map(|d| {
-                Json::object()
-                    .with("date", short_date(d.day * MILLIS_PER_DAY))
-                    .with(
-                        "counters",
-                        Json::Array(d.counters.iter().map(|&c| Json::from(c)).collect()),
-                    )
+                Json::object().with("date", short_day(d.day)).with(
+                    "counters",
+                    Json::Array(d.counters.iter().map(|&c| Json::from(c)).collect()),
+                )
             })
             .collect();
         Json::object().with("dayCounters", Json::Array(days))
@@ -399,7 +394,7 @@ impl MessageCounter {
             let bg = if j % 2 == 0 { "FFFFFF" } else { "F0F0F0" };
             s.push_str(&format!(
                 "<tr bgcolor=\"#{bg}\"><td>{}</td>",
-                short_date(day.day * MILLIS_PER_DAY)
+                short_day(day.day)
             ));
             let mut total = 0i32;
             for &v in &day.counters {
@@ -418,15 +413,27 @@ impl MessageCounter {
     }
 }
 
+/// The time in the local zone, which `GregorianCalendar` counts days and
+/// hours in.
+fn local(millis: i64) -> i64 {
+    millis + crate::localtime::offset_millis(millis)
+}
+
+/// The local day, in days since 1970-01-01.
+fn day_of(millis: i64) -> i64 {
+    local(millis).div_euclid(MILLIS_PER_DAY)
+}
+
+/// `Calendar.HOUR_OF_DAY`.
 fn hour_of(millis: i64) -> usize {
-    (millis.rem_euclid(MILLIS_PER_DAY) / 3_600_000) as usize
+    (local(millis).rem_euclid(MILLIS_PER_DAY) / 3_600_000) as usize
 }
 
 /// `MessageCounter.DayCounter`: a day's messages, hour by hour; -1 for an
 /// hour not counted.
 #[derive(Clone)]
 struct DayCounter {
-    /// Days since the epoch.
+    /// The local day, in days since 1970-01-01.
     day: i64,
     counters: [i64; HOURS],
 }

@@ -12,10 +12,15 @@ use crate::Broker;
 use crate::transaction::{self, TxRef, Xid, xid_base64, xid_string};
 
 /// `DateFormat.getDateTimeInstance(SHORT, MEDIUM)` in the `en_US` locale
-/// of JDK 20 and later, in UTC: `10/11/26, 11:33:10 AM` (a narrow no-break
-/// space before the marker).
+/// of JDK 20 and later, in the local time zone: `10/11/26, 11:33:10 AM` (a
+/// narrow no-break space before the marker).
 pub(super) fn short_medium(millis: i64) -> String {
-    let (y, m, d, tod) = civil(millis);
+    short_medium_at(millis + crate::localtime::offset_millis(millis))
+}
+
+/// [`short_medium`] of a time already moved to its zone.
+fn short_medium_at(local: i64) -> String {
+    let (y, m, d, tod) = civil(local);
     let h = tod / 3600;
     let h12 = if h % 12 == 0 { 12 } else { h % 12 };
     format!(
@@ -27,15 +32,15 @@ pub(super) fn short_medium(millis: i64) -> String {
     )
 }
 
-/// `DateFormat.getDateInstance(SHORT)` in the `en_US` locale, in UTC:
-/// `10/11/26`.
-pub(super) fn short_date(millis: i64) -> String {
-    let (y, m, d, _) = civil(millis);
+/// `DateFormat.getDateInstance(SHORT)` in the `en_US` locale of a day,
+/// counted in days since 1970-01-01 in its zone: `10/11/26`.
+pub(super) fn short_day(day: i64) -> String {
+    let (y, m, d, _) = civil(day * 86_400_000);
     format!("{m}/{d}/{:02}", y.rem_euclid(100))
 }
 
-/// Year, month, day and second of the day of an epoch time in UTC
-/// (Howard Hinnant's algorithm).
+/// Year, month, day and second of the day of an epoch time, in UTC or as
+/// moved to a zone (Howard Hinnant's algorithm).
 fn civil(millis: i64) -> (i64, i64, i64, i64) {
     let secs = millis.div_euclid(1000);
     let z = secs.div_euclid(86_400) + 719_468;
@@ -239,16 +244,16 @@ pub(super) async fn invoke(broker: &Arc<Broker>, call: &Call<'_>) -> Option<Outc
 
 #[cfg(test)]
 mod tests {
-    use super::{short_date, short_medium};
+    use super::{short_day, short_medium_at};
 
     #[test]
     fn short_medium_dates() {
-        assert_eq!(short_medium(0), "1/1/70, 12:00:00\u{202f}AM");
-        // 2026-10-11 13:05:09 UTC
+        assert_eq!(short_medium_at(0), "1/1/70, 12:00:00\u{202f}AM");
+        // 2026-10-11 13:05:09
         assert_eq!(
-            short_medium(1_791_723_909_000),
+            short_medium_at(1_791_723_909_000),
             "10/11/26, 1:05:09\u{202f}PM"
         );
-        assert_eq!(short_date(1_791_723_909_000), "10/11/26");
+        assert_eq!(short_day(1_791_723_909_000 / 86_400_000), "10/11/26");
     }
 }

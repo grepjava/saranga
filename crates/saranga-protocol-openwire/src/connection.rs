@@ -22,6 +22,7 @@ use saranga_server::queue::AckResult;
 use saranga_server::session::{
     AckPending, ClientConnection, Completion, ServerSession, SessionOptions, Transport,
 };
+use saranga_server::settings::AddressFullPolicy;
 use saranga_server::transaction::{self, TxError, TxRef, TxState, xa_code};
 use saranga_server::{Broker, BrokerError, RoutingType};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -2128,6 +2129,9 @@ impl Connection {
             }
             _ => false,
         };
+        if created && advisory && self.manager.settings.suppress_internal_management_objects {
+            self.broker.post_office().set_address_internal(&name);
+        }
         if created && temporary {
             self.temp_resources.push(TempResource {
                 name: name.clone(),
@@ -2507,6 +2511,14 @@ impl Connection {
         spec.temporary = true;
         spec.internal = internal;
         session.session.create_queue(spec)?;
+        // Advisory queues cannot be paged: `AMQConsumer` enforces DROP on
+        // their store.
+        if bare.starts_with(ADVISORY_TOPIC_PREFIX) {
+            self.broker
+                .post_office()
+                .paging_store(bare)
+                .enforce_policy(AddressFullPolicy::Drop);
+        }
         Ok(name)
     }
 

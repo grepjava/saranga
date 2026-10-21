@@ -27,6 +27,10 @@
             <max-size-bytes>200K</max-size-bytes>
             <address-full-policy>FAIL</address-full-policy>
          </address-setting>
+         <address-setting match="ActiveMQ.Advisory.TempTopic">
+            <max-size-bytes>1</max-size-bytes>
+            <address-full-policy>PAGE</address-full-policy>
+         </address-setting>
          <address-setting match="redeliver.#">
             <dead-letter-address>DLQ</dead-letter-address>
             <max-delivery-attempts>3</max-delivery-attempts>

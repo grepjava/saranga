@@ -1273,6 +1273,51 @@ public class OpenWire {
         }
     }
 
+    static Object coreAttribute(String resource, String attribute) throws Exception {
+        try (org.apache.activemq.artemis.api.core.client.ServerLocator locator =
+                 org.apache.activemq.artemis.api.core.client.ActiveMQClient.createServerLocator(url);
+             org.apache.activemq.artemis.api.core.client.ClientSessionFactory sf = locator.createSessionFactory();
+             org.apache.activemq.artemis.api.core.client.ClientSession cs = sf.createSession()) {
+            cs.start();
+            org.apache.activemq.artemis.api.core.client.ClientRequestor requestor =
+                new org.apache.activemq.artemis.api.core.client.ClientRequestor(cs, "activemq.management");
+            org.apache.activemq.artemis.api.core.client.ClientMessage m = cs.createMessage(false);
+            org.apache.activemq.artemis.api.core.management.ManagementHelper.putAttribute(m, resource, attribute);
+            org.apache.activemq.artemis.api.core.client.ClientMessage reply = requestor.request(m, 5000);
+            check(reply != null && org.apache.activemq.artemis.api.core.management.ManagementHelper.hasOperationSucceeded(reply),
+                "management " + resource + " " + attribute);
+            return org.apache.activemq.artemis.api.core.management.ManagementHelper.getResult(reply);
+        }
+    }
+
+    // An advisory subscription is internal (AMQSession, with
+    // suppressInternalManagementObjects on by default), and its
+    // address's store drops what does not fit rather than paging it
+    // (AMQConsumer): broker.xml pages the temp topic advisories at 1 byte.
+    // The connections watch no advisories themselves, so the test's
+    // subscription is the only one.
+    static void t_advisorySubscriptionIsInternalAndNeverPages() throws Exception {
+        String advisory = AdvisorySupport.TEMP_TOPIC_ADVISORY_TOPIC.getPhysicalName();
+        ActiveMQConnectionFactory f = cf();
+        f.setWatchTopicAdvisories(false);
+        try (Connection c = f.createConnection(); Connection other = f.createConnection()) {
+            c.start();
+            Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            MessageConsumer advisories = s.createConsumer(AdvisorySupport.TEMP_TOPIC_ADVISORY_TOPIC);
+            Session os = other.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            for (int i = 0; i < 5; i++) {
+                os.createTemporaryTopic().delete();
+            }
+            check(advisories.receive(2000) != null, "a temp topic advisory");
+            // The queue is made internal; the address it auto-creates is not.
+            eq(false, coreAttribute("address." + advisory, "internal"), "address internal");
+            eq(0L, ((Number) coreAttribute("address." + advisory, "numberOfPages")).longValue(), "pages");
+            Object[] queues = (Object[]) coreAttribute("address." + advisory, "queueNames");
+            eq(1, queues.length, "subscriptions");
+            eq(true, coreAttribute("queue." + queues[0], "internalQueue"), "subscription internal");
+        }
+    }
+
     // ---------------------------------------------------------------- mixed protocols
 
     static void t_openWireToCore() throws Exception {

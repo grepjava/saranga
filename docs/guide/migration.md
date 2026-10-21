@@ -142,7 +142,7 @@ To move a cluster, take one node at a time: stop it, `saranga upgrade` it, start
 | `artemis-users.properties`, `artemis-roles.properties` | Read as Artemis reads them, masked passwords (`ENC(...)`) included. |
 | `management.xml` | Its `<authorisation>` decides who may call what through Jolokia and the console, as Artemis's guard applies it. Saranga has no JMX, so no JMX connector is opened. |
 | `jolokia-access.xml` | Its CORS rules are applied. |
-| `log4j2.properties`, `log4j2-utility.properties` | Read and written in Artemis's format, codes and logger names, so `log/artemis.log` looks as it did. Only the properties format is supported, with `Console`, `File` and `RollingFile` appenders and `PatternLayout`. A level set for a single Artemis class has no effect. See [Logging differences](../../COMPAT.md#logging-differences) and [operations.md](operations.md). |
+| `log4j2.properties`, `log4j2-utility.properties` | Read and written in Artemis's format, codes and logger names, so `log/artemis.log` looks as it did. Only the properties format is supported, with the console, file and rolling file appenders and `PatternLayout`. A level set for a single Artemis class has no effect. See [Logging differences](../../COMPAT.md#logging-differences) and [operations.md](operations.md). |
 
 ## Clients
 
@@ -185,11 +185,10 @@ A few records differ in ways Artemis handles:
 
 Most operators will notice few differences. These are the ones most likely to show:
 
-- **Memory.** There is no JVM heap. `global-max-size` defaults to 1 GiB, where Artemis defaults to half the maximum heap; set it explicitly if you relied on the default. ([Paging differences](../../COMPAT.md#paging-differences))
 - **Paging needs persistence.** With `persistence-enabled` false, Saranga writes no page files and keeps every message in memory. ([Paging differences](../../COMPAT.md#paging-differences))
 - **Queue browsers** see the messages a queue holds in memory, not the whole paged backlog. ([Paging differences](../../COMPAT.md#paging-differences))
 - **Journal tuning.** `journal-buffer-timeout` has no effect, and appends wait while the journal compacts. ([Persistence differences](../../COMPAT.md#persistence-differences))
-- **Management.** `browse` through management messages answers `no operation`; `listMessages`, the REST API and Jolokia return the messages as JSON. Dates in management views are in UTC. ([Management differences](../../COMPAT.md#management-differences))
+- **Management.** `browse` through management messages answers `no operation`; `listMessages`, the REST API and Jolokia return the messages as JSON. ([Management differences](../../COMPAT.md#management-differences))
 - **Web.** A REST API at `/api` on every web binding, which Artemis does not have. No `console.war` ships with Saranga. ([Web server differences](../../COMPAT.md#web-server-differences))
 - **Logging.** Only the properties format of log4j 2 is read, and per-class logger levels have no effect. ([Logging differences](../../COMPAT.md#logging-differences))
 - **The CLI.** Its messaging commands connect over Core only, and `--serializer` cannot load a Java class. There is no Windows service wrapper. ([CLI differences](../../COMPAT.md#cli-differences))

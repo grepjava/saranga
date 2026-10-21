@@ -190,7 +190,6 @@ The connection retries with Artemis's counts and logs (`AMQ111001`, `AMQ111002`,
 Differences:
 
 - SASL: PLAIN (with a user and password), XOAUTH2 and ANONYMOUS are chosen in Artemis's order. SCRAM and EXTERNAL are not, so a peer that offers only SCRAM refuses the connection.
-- TLS (`sslEnabled` in the URI) is not supported.
 - `AMQPConnections` broker properties are not supported.
 - The `lock-coordinator` attribute is not acted on (see [High availability](ha.md#what-is-not-supported)).
 

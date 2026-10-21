@@ -183,7 +183,7 @@ Producer ActiveMQQueue[orders], thread=0 Produced: 10 messages
 Consumer ActiveMQQueue[orders], thread=0 Consumed: 10 messages
 ```
 
-The address and queue `orders` are created on first use, as the default address settings allow. The CLI connects over Core on plain TCP; any Artemis or Saranga CLI, and any Artemis client, can talk to the broker. [Protocols](protocols.md) covers the other protocols and their clients.
+The address and queue `orders` are created on first use, as the default address settings allow. The CLI connects over Core (over TLS with `sslEnabled=true` in the URL, or over AMQP with `--protocol AMQP`); any Artemis or Saranga CLI, and any Artemis client, can talk to the broker. [Protocols](protocols.md) covers the other protocols and their clients.
 
 If the producer stops with `AMQ212054: Destination address=orders is blocked`, look in the broker's log for `AMQ222210`: the disk is fuller than `max-disk-usage` (90% in the `broker.xml` that `create` writes), and the broker blocks producers until there is room, as Artemis does. Free some space, or raise `max-disk-usage` in `broker.xml`. See [Storage](storage.md#full-disks).
 

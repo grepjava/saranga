@@ -27,14 +27,14 @@ Each message is logged under the logger of the Artemis message bundle its code b
 
 Of log4j 2, Saranga supports the properties format with these parts:
 
-- `Console`, `File` and `RollingFile` appenders;
+- `Console`, `File`, `RandomAccessFile`, `MemoryMappedFile`, `RollingFile` and `RollingRandomAccessFile` appenders, rolling on time, a cron schedule, size and startup, with the default rollover strategy's `max` and `.gz` archives compressed;
 - `PatternLayout` and `ThresholdFilter`;
 - levels, appender references and additivity;
 - `${sys:}`, `${env:}` and `property.` lookups.
 
 XML, JSON and YAML configurations, other appenders and layouts, async loggers and colours are not supported. A line Saranga does not understand is logged as a warning.
 
-`RUST_LOG`, when set, chooses what is logged in place of the configured levels. Loggers set to `OFF` stay off. The CLI's other commands log as Artemis's do, WARN to the console, configured by `etc/log4j2-utility.properties` when there is one.
+`RUST_LOG`, when set, chooses what is logged in place of the configured levels. Loggers set to `OFF` stay off. The CLI's other commands log as Artemis's do, WARN to the console, configured by `etc/log4j2-utility.properties` when there is one. From the home, whose `bin/artemis` names no configuration, and in an instance without that file, it is log4j2's default, as in Artemis: errors only, to standard output.
 
 See [COMPAT.md, Logging differences](../../COMPAT.md#logging-differences) and Artemis's [logging](https://activemq.apache.org/components/artemis/documentation/latest/logging.html) chapter.
 
@@ -52,7 +52,7 @@ Saranga logs Artemis's codes, texts and callers (`user(roles)@address`). Each ma
 
 Where Saranga differs:
 
-- Objects in messages are shown in their Java classes' `toString` layout with Saranga's values. Identity hash codes are not Java's, and dates are in UTC.
+- Objects in messages are shown in their Java classes' `toString` layout with Saranga's values. Identity hash codes are not Java's.
 - MBean registration and the JMX guard are not logged. Neither are acknowledgements made without a consumer, the end of XA branches, or the broker's own sends.
 - Security failures (601264) have no stack trace.
 
@@ -169,6 +169,6 @@ The same command moves an Artemis instance to Saranga, and `artemis upgrade` fro
 
 ## Resource use
 
-Saranga is a native process with no JVM. Of the profile's `JAVA_ARGS`, only the `-D` options are read, so `-Xmx` and the other Java options have no effect. Memory for messages is bounded by `global-max-size`, which defaults to 1 GiB. Artemis defaults to half the JVM's maximum heap. See [storage.md](storage.md) for paging.
+Saranga is a native process with no JVM. Of the profile's `JAVA_ARGS`, the `-D` options are read, and `-Xmx` sizes `global-max-size` as it does in Artemis; the other Java options have no effect. Memory for messages is bounded by `global-max-size`. When `global-max-size` is not set, it is `global-max-size-percent-of-jvm-max-memory` (50% by default) of the heap Artemis's JVM would have: the `-Xmx` (or `-XX:MaxHeapSize`) of the profile's `JAVA_ARGS`, else the JVM's default, a quarter of the memory. An instance `create` makes has `-Xmx2G`, so 1 GiB. See [storage.md](storage.md) for paging.
 
 On the benchmark machine Saranga reached its acceptor in 145 ms with 36 MiB resident, against 2,717 ms and 209 MiB for Artemis. It used less CPU per message in 12 of 13 scenarios. Peak memory depends on the backlog a run builds up. [docs/benchmarks.md](../benchmarks.md) gives the method, the machine and every result. `saranga perf` and `saranga perf-journal` measure your own setup, as Artemis's [perf tools](https://activemq.apache.org/components/artemis/documentation/latest/perf-tools.html) do.

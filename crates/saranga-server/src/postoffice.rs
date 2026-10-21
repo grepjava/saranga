@@ -1089,6 +1089,14 @@ impl PostOffice {
         self.read().addresses.get(name).map(|e| e.info.clone())
     }
 
+    /// `AddressInfo.setInternal(true)` on the address bound under `name`:
+    /// in memory, its binding record left as it is.
+    pub fn set_address_internal(&self, name: &str) {
+        if let Some(e) = self.write().addresses.get_mut(name) {
+            e.info.internal = true;
+        }
+    }
+
     pub fn has_address(&self, name: &str) -> bool {
         self.read().addresses.contains_key(name)
     }
