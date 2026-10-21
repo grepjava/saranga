@@ -5,6 +5,22 @@ node 1: bridged to node 2
 node 2: bridged to node 1
 === Cluster.java topology (node 1)
 topology: 2 nodes, 2 with a primary
+=== artemis check cluster (node 1)
+<log time> WARN  [org.apache.activemq.artemis.logs] AMQ202017: Algorithm two-way is deprecated and will be removed from the default codec in a future version. Use a custom codec instead. Consult the manual for details.
+Connection brokerURL = tcp://localhost:64816
+*******************************************************************************************************************************
+nodeID                                   | primary                   | primary local time  | backup                   
+node@64816                               | tcp://localhost:64816     | <time>              | null                     
+node@64916                               | tcp://localhost:64916     | <time>              | null                     
+Time variance in the cluster is <n> milliseconds
+*******************************************************************************************************************************
+--> Verifying Topology for NodeID node@64816, primary = tcp://localhost:64816, backup = null
+   verification on primary tcp://localhost:64816
+   ok!
+--> Verifying Topology for NodeID node@64916, primary = tcp://localhost:64916, backup = null
+   verification on primary tcp://localhost:64916
+   ok!
+exit 0
 === Cluster.java on-demand orders 10
 node 2 received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
 no more
@@ -20,6 +36,18 @@ sent 3
 === Cluster.java receive orders 3 (node 1)
 received [m0, m1, m2]
 no more
+=== artemis check cluster (node 1)
+<log time> WARN  [org.apache.activemq.artemis.logs] AMQ202017: Algorithm two-way is deprecated and will be removed from the default codec in a future version. Use a custom codec instead. Consult the manual for details.
+Connection brokerURL = tcp://localhost:64816
+*******************************************************************************************************************************
+nodeID                                   | primary                   | primary local time  | backup                   
+node@64816                               | tcp://localhost:64816     | <time>              | null                     
+Time variance in the cluster is <n> milliseconds
+*******************************************************************************************************************************
+--> Verifying Topology for NodeID node@64816, primary = tcp://localhost:64816, backup = null
+   verification on primary tcp://localhost:64816
+   ok!
+exit 0
 === artemis run (node 2)
 node 2: listening
 node 1: bridged to node 2
@@ -29,6 +57,22 @@ node 2 received [m0, m1, m2, m3]
 no more
 === Cluster.java topology (node 1)
 topology: 2 nodes, 2 with a primary
+=== artemis check cluster (node 2)
+<log time> WARN  [org.apache.activemq.artemis.logs] AMQ202017: Algorithm two-way is deprecated and will be removed from the default codec in a future version. Use a custom codec instead. Consult the manual for details.
+Connection brokerURL = tcp://localhost:64916
+*******************************************************************************************************************************
+nodeID                                   | primary                   | primary local time  | backup                   
+node@64816                               | tcp://localhost:64816     | <time>              | null                     
+node@64916                               | tcp://localhost:64916     | <time>              | null                     
+Time variance in the cluster is <n> milliseconds
+*******************************************************************************************************************************
+--> Verifying Topology for NodeID node@64816, primary = tcp://localhost:64816, backup = null
+   verification on primary tcp://localhost:64816
+   ok!
+--> Verifying Topology for NodeID node@64916, primary = tcp://localhost:64916, backup = null
+   verification on primary tcp://localhost:64916
+   ok!
+exit 0
 === Cluster.java control (node 1)
 clusterConnectionNames = [my-cluster]
 name = my-cluster

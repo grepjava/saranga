@@ -11,12 +11,13 @@
 # comparing.
 #
 #   1. Each node bridges to the other; a client is given both in the
-#      topology.
+#      topology, and "artemis check cluster" verifies it.
 #   2. ON_DEMAND: messages sent to node 1 reach a consumer on node 2; with
 #      a consumer on each node they are shared out; a topic's subscribers
 #      on both nodes each receive everything.
-#   3. Node 2 stops: node 1 keeps its messages; node 2 comes back and the
-#      nodes bridge to each other again.
+#   3. Node 2 stops: node 1 keeps its messages and checks a cluster of one;
+#      node 2 comes back, the nodes bridge to each other again and node 2
+#      checks the cluster.
 #   4. Each node's ClusterConnectionControl, and node 1's cluster
 #      connection stopped and started through it.
 set -uo pipefail
@@ -104,6 +105,16 @@ client() {
 
 U1="tcp://localhost:$PORT1" U2="tcp://localhost:$PORT2"
 
+# "artemis check cluster" through the node's own bin/artemis, normalized by
+# check-cluster.pl, then its exit status.
+check_cluster() {
+  local out rc
+  out="$(instance "$1" check cluster --user admin --password admin)"
+  rc=$?
+  printf '%s\n' "$out" | perl "$HERE/check-cluster.pl"
+  echo "exit $rc"
+}
+
 suite() {
   make_instance "$NODE1" "$N1" 3200 "$PORT2"
   make_instance "$NODE2" "$N2" 3300 "$PORT1"
@@ -118,6 +129,8 @@ suite() {
   wait_for "$N2/log/artemis.log" AMQ221027 && echo "node 2: bridged to node 1"
   step "Cluster.java topology (node 1)"
   client topology "$U1"
+  step "artemis check cluster (node 1)"
+  check_cluster "$N1"
 
   # 2. Load balancing.
   step "Cluster.java on-demand orders 10"
@@ -136,6 +149,8 @@ suite() {
   client send "$U1" orders 3
   step "Cluster.java receive orders 3 (node 1)"
   client receive "$U1" orders 3
+  step "artemis check cluster (node 1)"
+  check_cluster "$N1"
   step "artemis run (node 2)"
   launch "$N2"
   wait_up "$PORT2" && echo "node 2: listening"
@@ -145,6 +160,8 @@ suite() {
   client on-demand "$U1" "$U2" orders 4
   step "Cluster.java topology (node 1)"
   client topology "$U1"
+  step "artemis check cluster (node 2)"
+  check_cluster "$N2"
 
   # 4. Management: the cluster connection's control on each node, then a
   #    stop and start through it.
