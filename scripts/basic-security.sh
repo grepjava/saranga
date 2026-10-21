@@ -23,6 +23,9 @@ WORK="$(mktemp -d)"
 INSTANCE="$WORK/instance"
 mkdir -p "$INSTANCE/etc"
 cp "$ROOT/tests/golden/etc/broker.xml" "$INSTANCE/etc/broker.xml"
+# run requires management.xml, as artemis run does; this is what create
+# writes for the role amq.
+cp "$ROOT/tests/interop/basic/management.xml" "$INSTANCE/etc/management.xml"
 BROKER_PID=""
 cleanup() {
   [[ -n "$BROKER_PID" ]] && kill "$BROKER_PID" 2>/dev/null || true
