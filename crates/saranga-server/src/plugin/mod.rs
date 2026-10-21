@@ -10,7 +10,8 @@
 //! An embedding application registers its plugins in
 //! `BrokerConfig::plugins` or with [`Plugins::register`]. `broker.xml`'s
 //! `<broker-plugins>` name Java classes: those of Artemis's own plugins
-//! get their Rust ports ([`builtin`]); others are reported and left out.
+//! get their Rust ports ([`builtin`]); any other stops the broker from
+//! starting.
 
 pub mod builtin;
 

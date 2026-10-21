@@ -41,14 +41,14 @@ The commands that talk to a running broker (`producer`, `consumer`, `browser`, `
 | `--url <url>` | The broker. Default: the URL of the acceptor called `artemis` in the instance's `broker.xml`, else of the connector of that name, else `tcp://localhost:61616`. |
 | `--acceptor <name>` | Takes the default URL from this acceptor (or connector) instead. |
 | `--user`, `--password` | The credentials. |
-| `--silent` | Asks nothing: no prompt for missing values, no retry after a failed connection. Use it in scripts. |
+| `--silent` | Asks nothing: no prompt for missing values, and a failed connection is tried once more as it was. Use it in scripts. |
 | `--verbose` | Prints more. |
 
-The CLI connects over Core, over TLS when the URL says `sslEnabled=true` (with `trustStorePath`, `keyStorePath` and the other TLS parameters a connector takes). A URL can list several servers, `(tcp://a:61616,tcp://b:61616)?reconnectAttempts=5`, tried in turn as Artemis's client tries them, and takes the usual `ServerLocator` parameters (`ha`, `reconnectAttempts`, `retryInterval`, `callTimeout` and the like).
+The CLI connects over Core, over TLS when the URL says `sslEnabled=true` (with `trustStorePath`, `keyStorePath` and the other TLS parameters a connector takes). A URL can list several servers, `(tcp://a:61616,tcp://b:61616)?reconnectAttempts=5`, tried in turn as Artemis's client tries them, and takes the usual `ServerLocator` parameters (`ha`, `reconnectAttempts`, `retryInterval`, `callTimeout` and the like). A `udp://` URL finds the brokers through their broadcast groups, once discovery is turned on (see [Clustering](clustering.md#discovery)).
 
 With `--protocol AMQP`, `producer`, `consumer`, `browser`, `transfer` and `perf` send and receive over AMQP 1.0 as Artemis's CLI does through Qpid JMS: `tcp://` URLs become `amqp://` (`ssl://` becomes `amqps://`), Qpid's URL options apply (`amqp.saslMechanisms`, `jms.prefetchPolicy.all` and the like), and the password is always asked for again after a refused login. `queue stat`, `check cluster` and the shell's `connect` try the connection over AMQP, as Artemis's do, then manage the broker over Core; `check queue` and the other management commands use Core.
 
-When a connection fails, the CLI prints `Connection failed::<reason>` and, unless `--silent` is given, asks for the URL, user and password and tries once more, as Artemis's does.
+When a connection fails, the CLI prints `Connection failed::<reason>` and tries once more, as Artemis's does. Before it does, unless `--silent` is given, it asks for the URL (unless the broker refused the login) and for the user and password not given.
 
 ## Instance lifecycle
 
@@ -75,7 +75,7 @@ saranga create /tmp/b2 --silent --user admin --password admin --allow-anonymous 
 | `--force` | Overwrites an existing instance's configuration. |
 | `--windows`, `--cygwin` (or `--linux`) | Which scripts to write. Default: those of the system you run on. |
 
-Where it differs from `artemis create`: the journal type is `NIO` unless `--aio`, `--nio` or `--mapped` is given, and the auto-tuning of `journal-buffer-timeout` measures NIO writes; `--jdbc` is refused; Windows gets no `artemis-service.exe`. The Java options (`--java-options`, `--java-memory`) are written to the profiles, for an Artemis that later runs the instance, and are not used by Saranga. See [Getting started](getting-started.md#creating-an-instance) for the layout of an instance.
+Where it differs from `artemis create`: the journal type is `NIO` unless `--aio`, `--nio` or `--mapped` is given, and the auto-tuning of `journal-buffer-timeout` measures NIO writes; `--jdbc` is refused; Windows gets no `artemis-service.exe`. The Java options (`--java-options`, `--java-memory`) are written to the profiles. Saranga reads their `-D` options, and `-Xmx` for the default `global-max-size`; the others are for an Artemis that later runs the instance. `--encoding` takes only UTF-8. See [Getting started](getting-started.md#creating-an-instance) for the layout of an instance.
 
 ### upgrade
 
@@ -345,7 +345,7 @@ The shell answers a mistake as Artemis's does. It prints `Unknown command: <word
 
 ### completion
 
-Prints the bash and zsh completion script `artemis completion` prints. For the commands Saranga has, it is the same script.
+Prints the bash and zsh completion script `artemis completion` prints, the same script.
 
 ```bash
 source <(./artemis completion)

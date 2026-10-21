@@ -65,7 +65,7 @@ What is supported:
 - **Passwords** can be masked (`ENC(...)`), with the broker's `mask-password` and `password-codec` or the acceptor's own `activemq.usemaskedpassword` and `activemq.passwordcodec`. See [Security](security.md).
 - **Client certificates:** `needClientAuth` and `wantClientAuth`, with a truststore, and a certificate revocation list (`crlPath`).
 - **SNI:** `sniHost`, a regular expression matched against the host name a client asks for. A client that asks for no name is let in, as in Java.
-- **Protocols and ciphers:** `enabledProtocols` takes `TLSv1.2` and `TLSv1.3`; `enabledCipherSuites` takes the standard names of the suites rustls has (for example `TLS_AES_128_GCM_SHA256` or `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`). A name Saranga does not have is logged and skipped. If none is left, the acceptor fails.
+- **Protocols and ciphers:** `enabledProtocols` takes `TLSv1.2` and `TLSv1.3`; `enabledCipherSuites` takes the standard names of the suites rustls has (for example `TLS_AES_128_GCM_SHA256` or `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`). A name Saranga does not have is logged and skipped. If none is left, the acceptor cannot be made and the broker does not start.
 - **Reloading the stores:** `sslAutoReload=true`, or management's acceptor `reload`.
 - **Handshake timeout:** `sslHandshakeTimeout`, in seconds (10 by default).
 
@@ -108,7 +108,7 @@ A HornetQ client uses only queues and topics that exist, so create them in `brok
 
 ## AMQP 1.0
 
-AMQP clients connect as they do to Artemis: SASL PLAIN, ANONYMOUS and EXTERNAL, links and their credit, anonymous relay, dynamic and FQQN sources and targets, durable and shared subscriptions named as Artemis names them, selectors, every outcome, and transactions. AMQP messages are kept in their own encoding in queues, the journal and pages, as Artemis keeps them, so either broker reads the other's data. The acceptor parameters are Artemis's, for example `amqpCredits`, `amqpLowCredits`, `amqpMinLargeMessageSize`, `amqpDuplicateDetection`, `amqpIdleTimeout` and `saslMechanisms`. A full address holds producers back as on Artemis: under `BLOCK` a link gets no more credit until there is room, past `max-size-bytes-reject-threshold` sends are rejected, and a send refused because the address is full drains the link's credit (`amqpDrainOnTransientDeliveryErrors`, `amqpLinkQuiesceTimeout`, `amqpUseModifiedForTransientDeliveryErrors`). See [Artemis's AMQP documentation](https://activemq.apache.org/components/artemis/documentation/latest/amqp.html).
+AMQP clients connect as they do to Artemis: SASL PLAIN, ANONYMOUS and, where the acceptor's `saslMechanisms` lists it, EXTERNAL, links and their credit, anonymous relay, dynamic and FQQN sources and targets, durable and shared subscriptions named as Artemis names them, selectors, every outcome, and transactions. AMQP messages are kept in their own encoding in queues, the journal and pages, as Artemis keeps them, so either broker reads the other's data. The acceptor parameters are Artemis's, for example `amqpCredits`, `amqpLowCredits`, `amqpMinLargeMessageSize`, `amqpDuplicateDetection`, `amqpIdleTimeout` and `saslMechanisms`. A full address holds producers back as on Artemis: under `BLOCK` a link gets no more credit until there is room, past `max-size-bytes-reject-threshold` sends are rejected, and a send refused because the address is full drains the link's credit (`amqpDrainOnTransientDeliveryErrors`, `amqpLinkQuiesceTimeout`, `amqpUseModifiedForTransientDeliveryErrors`). See [Artemis's AMQP documentation](https://activemq.apache.org/components/artemis/documentation/latest/amqp.html).
 
 The main differences:
 
@@ -125,7 +125,7 @@ ActiveMQ 5 clients connect as they do to Artemis: every wire-format version, tig
 
 The main differences:
 
-- `brokerName` defaults to the host name from `HOSTNAME`, `COMPUTERNAME` or `/etc/hostname`, then to the node ID.
+- `brokerName` defaults to the host name from `HOSTNAME`, `COMPUTERNAME` or `/etc/hostname`, lowercased, then to the node ID. Artemis asks the JVM for the local host name.
 - A queue browser gets a snapshot of the queue when it is created.
 - The slow-consumer advisory, `ConsumerControl` for prefetch 0, cluster client updates, and the `openwireMaxPacketChunkSize` back-pressure are not there.
 

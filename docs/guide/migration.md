@@ -8,7 +8,7 @@ Saranga is inspired by Apache ActiveMQ Artemis 2.57.0 and works interchangeably 
 
 **Back up.** Stop the broker and copy the whole instance directory, `etc` and `data` included, before you change anything. Data directories outside the instance (an absolute `journal-directory`, `paging-directory`, `bindings-directory` or `large-messages-directory` in `broker.xml`) need copying too.
 
-**Check what Saranga does not have yet.** Read the list under [Configuration differences](../../COMPAT.md#configuration-differences). Some features stop the broker from starting, with a reason, because starting without them would pretend to be something Saranga is not. Others are read and then ignored with a warning in the log.
+**Check what Saranga does not have.** Read the list under [Configuration differences](../../COMPAT.md#configuration-differences). Some features stop the broker from starting, with a reason, because starting without them would pretend to be something Saranga is not. Others are read and then ignored with a warning in the log.
 
 These stop the broker from starting:
 
@@ -17,18 +17,16 @@ These stop the broker from starting:
 - a JGroups discovery group or broadcast group (`jgroups-file`);
 - a `<broker-plugin>` naming a class other than the four plugins Saranga ports (see [Plugins and extensions](#plugins-and-extensions));
 - a `<security-manager>` class other than `ActiveMQBasicSecurityManager` (the JAAS manager, `<jaas-security>`, is supported);
-- a `password-codec` other than `DefaultSensitiveStringCodec`.
+- a masked password (`ENC(...)`, or with `mask-password`) that needs a `password-codec` other than `DefaultSensitiveStringCodec`.
 
 These are read but not acted on, each with a warning:
 
 - `scale-down`, `<connection-routers>`, `<metrics>` and `<resource-limit-settings>` in `broker.xml`;
-- `xi:include`: the included file is not read, so move its contents into `broker.xml`;
 - `<security-setting-plugin>`, so security settings that such a plugin would load are missing;
 - a `login.config` entry naming a login module Saranga does not have: logins that reach that module fail (see [security.md](security.md));
-- an acceptor protocol Saranga does not have: an acceptor that lists only such protocols is not opened;
 - a divert whose transformer is not registered: the divert is not deployed.
 
-Lock coordinators (`<lock-coordinators>`, a technical preview in Artemis) are not there yet: they are ignored with a warning.
+Lock coordinators (`<lock-coordinators>`, a technical preview in Artemis) are not implemented: they are ignored with a warning.
 
 After the first start on Saranga, read the log for `WARN` lines. Each one names what Saranga did not act on.
 
@@ -158,7 +156,7 @@ Clients need no change. They connect to the same acceptors on the same ports and
 
 A 1.x Artemis JMS client, which names queues `jms.queue.<name>` and topics `jms.topic.<name>`, works against an acceptor with those prefixes, as on Artemis (Phase 6 in [PHASES.md](https://github.com/grepjava/saranga/blob/main/PHASES.md#phase-6-config-and-security)).
 
-Messages sent with one protocol are received with another as on Artemis. The protocol features Saranga does not have yet are listed per protocol in COMPAT.md; the ones most likely to matter are the AMQP SASL mechanisms SCRAM, GSSAPI, OAUTHBEARER and XOAUTH2 ([AMQP differences](../../COMPAT.md#amqp-differences)), and Core over HTTP and WebSocket compression ([WebSocket differences](../../COMPAT.md#websocket-differences)). See [protocols.md](protocols.md).
+Messages sent with one protocol are received with another as on Artemis. The protocol features Saranga does not have are listed per protocol in COMPAT.md; the ones most likely to matter are the AMQP SASL mechanisms SCRAM, GSSAPI, OAUTHBEARER and XOAUTH2 ([AMQP differences](../../COMPAT.md#amqp-differences)), and Core over HTTP and WebSocket compression ([WebSocket differences](../../COMPAT.md#websocket-differences)). See [protocols.md](protocols.md).
 
 A client that checks the broker's name sees Saranga's: the STOMP `server` header is `Saranga/<version>`, and the AMQP Open's `product` is `saranga`. Management's `getVersion` reports 2.57.0, so tools that check the version keep working.
 

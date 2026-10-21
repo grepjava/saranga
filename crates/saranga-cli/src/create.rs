@@ -120,8 +120,8 @@ pub struct InstallArgs {
     /// system.
     #[arg(long, alias = "linux")]
     pub(crate) cygwin: bool,
-    /// Extra Java options to be passed to the profile (written to it; not
-    /// used by saranga).
+    /// Extra Java options to be passed to the profile (written to it;
+    /// saranga reads its -D options and -Xmx).
     #[arg(long = "java-options", allow_hyphen_values = true)]
     pub(crate) java_options: Vec<String>,
     /// Extra Java options to be passed to the utility profile.

@@ -149,7 +149,7 @@ bin/saranga data exp --output export.xml
 saranga data imp --input export.xml --url tcp://newhost:61616 --user admin --password admin
 ```
 
-`data imp` sends over Core only. On the data directories of the golden corpus, `data exp` writes Artemis's XML byte for byte, and `data encode` its text. Differences from Artemis's tools, such as `--jdbc` being refused and failures being reported as `Error:<message>` with status 0, are listed in [COMPAT.md, CLI differences](../../COMPAT.md#cli-differences). Artemis's [data tools](https://activemq.apache.org/components/artemis/documentation/latest/data-tools.html) page describes the formats. See [cli.md](cli.md) for the rest of the command line.
+`data imp` sends over Core only. On the data directories of the golden corpus, `data exp` writes Artemis's XML byte for byte, and `data encode` its text. Failures are reported as Artemis's tools report them, `Error:<message>` with status 0. The differences, such as `--jdbc` being refused, are listed in [COMPAT.md, CLI differences](../../COMPAT.md#cli-differences). Artemis's [data tools](https://activemq.apache.org/components/artemis/documentation/latest/data-tools.html) page describes the formats. See [cli.md](cli.md) for the rest of the command line.
 
 ## Moving data between Artemis and Saranga
 

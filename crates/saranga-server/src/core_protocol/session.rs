@@ -933,13 +933,11 @@ impl CoreSession {
                 self.session.set_sender(None);
                 (p.requires_response, result, false)
             }
+            // `slowPacketHandler` has no case for it: confirmed, with no
+            // response.
             other => {
-                tracing::warn!(session = %self.session.name(), "unsupported packet {}", other.name());
-                let e = BrokerError::new(
-                    ErrorType::UnsupportedPacket,
-                    format!("{} is not supported yet", other.name()),
-                );
-                (true, Err(e), false)
+                tracing::debug!(session = %self.session.name(), "ignored packet {}", other.name());
+                (false, Ok(None), false)
             }
         };
         let response = self.outcome(request, requires_response, result);

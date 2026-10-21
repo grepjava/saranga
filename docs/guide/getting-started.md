@@ -67,7 +67,7 @@ An instance is a directory holding one broker's configuration, data and logs. `s
 saranga create /var/lib/mybroker --user admin --password admin --require-login
 ```
 
-Without `--user`, `--password` and `--allow-anonymous` or `--require-login`, it asks for them; `--silent` makes it take a best guess instead. It then tunes `journal-buffer-timeout` by timing a few writes, and prints how to start the broker:
+Without `--user`, `--password` and `--allow-anonymous` or `--require-login`, it asks for them; `--silent` makes it take a best guess instead. It then tunes `journal-buffer-timeout` by timing a few writes, as Artemis's does (Saranga's own journal does not use it; see [Storage](storage.md)), and prints how to start the broker:
 
 ```
 Creating Saranga broker instance at: /var/lib/mybroker
@@ -157,7 +157,7 @@ For example, to run an instance's configuration on another port, on the loopback
 saranga run --etc /var/lib/mybroker/etc --bind 127.0.0.1:61617
 ```
 
-Through `bin/artemis`, the `-D` options in the profile's `JAVA_ARGS` (`etc/artemis.profile`) are passed to `saranga run` too, before those on the command line, which win. The other Java options in the profile are ignored. [Configuration](configuration.md) covers system and broker properties in full.
+Through `bin/artemis`, the `-D` options in the profile's `JAVA_ARGS` (`etc/artemis.profile`) are passed to `saranga run` too, before those on the command line, which win. `-Xmx` sizes the default `global-max-size`, as in Artemis; the other Java options in the profile are ignored. [Configuration](configuration.md) covers system and broker properties in full.
 
 ## Sending and receiving
 

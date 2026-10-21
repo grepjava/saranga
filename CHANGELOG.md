@@ -18,7 +18,7 @@ The first release.
 
 - **On-disk compatible with Artemis**: the message and bindings journals, paging and large messages are in Artemis's formats. A data directory moves between Artemis and Saranga in both directions.
 - **Paging and large messages**: the PAGE, BLOCK, FAIL and DROP address-full policies, and large messages streamed in chunks and compressed.
-- **Storage faults**: a full disk refuses sends with Artemis's error, and a critical I/O error stops the broker as Artemis does.
+- **Storage faults**: past `max-disk-usage`, producers are held back, refused or their messages dropped as `disk-full-policy` says, with Artemis's messages, and a critical I/O error stops the broker.
 
 ### Configuration and security
 
@@ -49,9 +49,9 @@ The first release.
 
 ### Verified
 
-- **Interoperability**: every feature is tested against Artemis 2.57.0, with Java and Saranga brokers in each role.
+- **Interoperability**: interop suites run the protocols, storage, HA, clustering, management and the CLI against Artemis 2.57.0, with Java and Saranga brokers in each role.
 - **Chaos and HA checks**: chaos soaks under network faults, and linearizability checks of HA pairs.
-- **Fuzzing and benchmarks**: every codec is fuzzed, and benchmarks against Artemis are in [docs/benchmarks.md](docs/benchmarks.md).
+- **Fuzzing and benchmarks**: the protocol codecs (Core, AMQP, MQTT, STOMP, OpenWire, WebSocket), the journal, page and storage records, `broker.xml` and filters are fuzzed, and benchmarks against Artemis are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ### Distribution
 

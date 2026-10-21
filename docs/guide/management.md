@@ -17,7 +17,7 @@ Every way in is audited the same way (see [operations.md](operations.md#the-audi
 
 ## Management messages
 
-A message sent to the management address is a request, as in Artemis. The resource, attribute or operation are in the `_AMQ_ResourceName`, `_AMQ_Attribute` and `_AMQ_OperationName` properties, and the parameters are a JSON array in the body. The reply goes to the request's reply-to address with its correlation ID, and `_AMQ_OperationSucceeded` says whether it worked. The resources are `broker`, `address.<name>`, `queue.<name>` and `divert.<name>`.
+A message sent to the management address is a request, as in Artemis. The resource, attribute or operation are in the `_AMQ_ResourceName`, `_AMQ_Attribute` and `_AMQ_OperationName` properties, and the parameters are a JSON array in the body. The reply goes to the request's reply-to address with its correlation ID, and `_AMQ_OperationSucceeded` says whether it worked. The resources are `broker`, `address.<name>`, `queue.<name>`, `divert.<name>`, `acceptor.<name>`, `broadcastgroup.<name>`, `bridge.<name>`, `brokerconnection.<name>` and `clusterconnection.<name>`.
 
 Clients that already manage Artemis this way work unchanged: `ClientRequestor` and `ManagementHelper` over Core, `JMSManagementHelper` with a `QueueRequestor`, and AMQP clients such as Qpid JMS. See Artemis's [management](https://activemq.apache.org/components/artemis/documentation/latest/management.html) chapter for the resources and operations.
 
@@ -33,7 +33,7 @@ The full list is in [COMPAT.md, Management differences](../../COMPAT.md#manageme
 
 ## The REST API
 
-Every `<web>` binding serves a REST API at `/api`. Artemis has no such API. It is management messages over HTTP: the same resources, operations, parameter conversion and security, as plain JSON.
+Every `<web>` binding serves a REST API at `/api`. Artemis has no such API. It is management messages over HTTP for the broker, addresses, queues and diverts: the same operations, parameter conversion and security, as plain JSON.
 
 | Request | Does |
 |---|---|
@@ -112,7 +112,7 @@ There is no JMX connector. `management.xml`'s `<connector>` opens nothing, and t
 Where Saranga differs:
 
 - Only Artemis's MBeans exist, plus hawtio's permission checks and five platform MBeans (see below). There are no other `java.lang`, `java.nio`, `JMImplementation`, `jdk.management`, `com.sun.management` or `jolokia` MBeans.
-- A failed operation answers status 500 with the error type Artemis's message bundles give its AMQ code. A failure without an AMQ code answers `java.lang.Exception`.
+- A failed operation answers status 500 with the error type Artemis's message bundles give its AMQ code. A failure without an AMQ code answers `java.lang.Exception`. `sendMessage`, and `deleteAddress`, `createQueue`, `addAddressSettings` and `createBridge` failing with an ActiveMQ exception, answer `java.lang.IllegalStateException`, as those methods rethrow it.
 - `listCache` is ignored.
 
 See [COMPAT.md, Web server differences](../../COMPAT.md#web-server-differences).
@@ -144,7 +144,7 @@ The REST API and management messages do not read `management.xml`. They use the 
 
 ## The web console
 
-Saranga serves Artemis's own web console. It ships no console of its own. Where `bootstrap.xml` declares the console's app (`<app url="console" war="console.war"/>`, which `create` writes), Saranga looks for a `console.war` directory in the instance's `<web path>` (`web` by default), then in the home's (`ARTEMIS_HOME`). Copy it from an Artemis 2.57.0 distribution, unpacked:
+Saranga serves Artemis's own web console. It ships no console of its own. Where `bootstrap.xml` declares the console's app (`<app url="console" war="console.war"/>`, which `create` writes), Saranga looks for a `console.war` directory in the instance's `<web path>` (`web` by default), then in the home's (`ARTEMIS_HOME`). Copy it from an Artemis 2.57.0 distribution, unpacked (built from its tag, as [Migrating](migration.md) explains):
 
 ```bash
 cp -r apache-artemis-2.57.0/web/console.war /var/lib/mybroker/web/

@@ -866,8 +866,7 @@ struct Bind {
 const ARTEMIS_PROTOCOLS: [&str; 6] = ["CORE", "AMQP", "STOMP", "HORNETQ", "MQTT", "OPENWIRE"];
 
 /// The configured acceptors, with their TLS settings (`NettyAcceptor`),
-/// security domain and protocols. `served` names the protocols Saranga
-/// has.
+/// security domain and protocols.
 /// Refuses a TLS connector naming a Java class or an online revocation
 /// check, which Saranga cannot honour: rather than connect without them.
 fn check_connectors(file: &saranga_config::BrokerConfig) -> anyhow::Result<()> {
@@ -888,21 +887,19 @@ fn check_connectors(file: &saranga_config::BrokerConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn acceptors(file: &saranga_config::BrokerConfig, served: &[&str]) -> anyhow::Result<Vec<Bind>> {
+fn acceptors(file: &saranga_config::BrokerConfig) -> anyhow::Result<Vec<Bind>> {
     let mut out = Vec::new();
     for a in &file.acceptors {
-        out.extend(acceptor(file, a, served)?);
+        out.push(acceptor(file, a)?);
     }
     Ok(out)
 }
 
-/// `createAcceptor` for one configured acceptor: `None` when Saranga
-/// serves none of its protocols.
+/// `createAcceptor` for one configured acceptor.
 fn acceptor(
     file: &saranga_config::BrokerConfig,
     a: &saranga_config::AcceptorConfig,
-    served: &[&str],
-) -> anyhow::Result<Option<Bind>> {
+) -> anyhow::Result<Bind> {
     {
         let name = a.name.clone().unwrap_or_default();
         let listed = a.protocols();
@@ -930,35 +927,6 @@ fn acceptor(
         if let Some(router) = a.param("router") {
             tracing::warn!(
                 "acceptor {name}: router {router} was ignored: connection routers are not supported"
-            );
-        }
-        // No list (or none Artemis knows) means every protocol.
-        let known: Vec<&str> = listed
-            .iter()
-            .map(String::as_str)
-            .filter(|p| ARTEMIS_PROTOCOLS.contains(p))
-            .collect();
-        let wanted: Vec<&str> = if known.is_empty() {
-            ARTEMIS_PROTOCOLS.to_vec()
-        } else {
-            known
-        };
-        let missing: Vec<&str> = wanted
-            .iter()
-            .copied()
-            .filter(|p| !served.contains(p))
-            .collect();
-        if missing.len() == wanted.len() {
-            tracing::warn!(
-                "acceptor {name} was not opened: Saranga does not serve {} yet",
-                missing.join(", ")
-            );
-            return Ok(None);
-        }
-        if !missing.is_empty() {
-            tracing::warn!(
-                "acceptor {name} does not serve {}: Saranga does not serve them yet",
-                missing.join(", ")
             );
         }
         let host = a.host.as_deref().unwrap_or("localhost");
@@ -990,7 +958,7 @@ fn acceptor(
                 (secs > 0).then(|| std::time::Duration::from_secs(secs as u64))
             }
         };
-        Ok(Some(Bind {
+        Ok(Bind {
             name: name.clone(),
             address: format!("{host}:{port}"),
             acceptor: Acceptor {
@@ -1020,7 +988,7 @@ fn acceptor(
             auto_start: a
                 .param("autoStart")
                 .is_none_or(|v| v.eq_ignore_ascii_case("true")),
-        }))
+        })
     }
 }
 
@@ -1104,16 +1072,14 @@ fn acceptor_plan(
             else {
                 return Ok(None);
             };
-            let bind = acceptor(&file, a, &SERVED_PROTOCOLS).map_err(|e| format!("{e:#}"))?;
-            Ok(bind.map(|b| {
-                if let Some(tls) = &b.acceptor.tls {
-                    tls.spawn_reloader(reload_period);
-                }
-                saranga_server::acceptors::NewAcceptor {
-                    address: b.address,
-                    acceptor: b.acceptor,
-                    auto_start: b.auto_start,
-                }
+            let b = acceptor(&file, a).map_err(|e| format!("{e:#}"))?;
+            if let Some(tls) = &b.acceptor.tls {
+                tls.spawn_reloader(reload_period);
+            }
+            Ok(Some(saranga_server::acceptors::NewAcceptor {
+                address: b.address,
+                acceptor: b.acceptor,
+                auto_start: b.auto_start,
             }))
         }),
     }
@@ -1367,7 +1333,6 @@ async fn boot(
     let at = std::time::Instant::now();
     *BOOT_STARTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(at);
     let filters = Arc::new(SelectorFilters);
-    let served = SERVED_PROTOCOLS;
     let mut file_config = None;
     let (mut broker_config, mut binds, reload_period) = match instance {
         Some(instance) => {
@@ -1398,7 +1363,7 @@ async fn boot(
                 // Buffered file I/O on every platform: Artemis's NIO.
                 tracing::info!("AMQ221012: Using NIO Journal");
             }
-            let binds = acceptors(&file, &served)?;
+            let binds = acceptors(&file)?;
             check_connectors(&file)?;
             let mut config = BrokerConfig::from_file_config(&file, filters, &instance.dir)?;
             let security = instance.security(&file)?;
@@ -1430,7 +1395,9 @@ async fn boot(
             auto_start: true,
             ..first
         }];
-    } else if binds.is_empty() {
+    } else if binds.is_empty() && file_config.is_none() {
+        // Outside an instance, Artemis's default acceptor. An instance
+        // whose broker.xml has none opens none, as Artemis's does.
         binds = vec![Bind {
             name: "artemis".to_owned(),
             address: "0.0.0.0:61616".to_owned(),

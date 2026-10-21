@@ -62,7 +62,7 @@ Authentication and authorisation results are cached as in Artemis: `authenticati
 
 ### Protocol notes
 
-Every protocol logs in through the same security manager. AMQP clients use SASL: Saranga offers `PLAIN` and `ANONYMOUS` by default and accepts `EXTERNAL` with a client certificate; SCRAM-SHA-256/512, GSSAPI, OAUTHBEARER and XOAUTH2 are not supported. See [protocols.md](protocols.md) and [COMPAT.md's AMQP section](../../COMPAT.md#amqp-differences).
+Every protocol logs in through the same security manager. AMQP clients use SASL: Saranga offers `PLAIN` and `ANONYMOUS` by default, as Artemis does, and `EXTERNAL`, for a client with a certificate, when the acceptor's `saslMechanisms` lists it; SCRAM-SHA-256/512, GSSAPI, OAUTHBEARER and XOAUTH2 are not supported. See [protocols.md](protocols.md) and [COMPAT.md's AMQP section](../../COMPAT.md#amqp-differences).
 
 ## Managing users
 
@@ -116,8 +116,8 @@ TLS is set on an acceptor's URL with Artemis's parameters, and works on any acce
 Saranga reads `keyStorePath`, `keyStoreType`, `keyStorePassword`, `keyPassword`, `keyStoreAlias`, `trustStorePath`, `trustStoreType`, `trustStorePassword`, `crlPath`, `needClientAuth`, `wantClientAuth`, `enabledProtocols`, `enabledCipherSuites`, `sniHost`, `sslAutoReload` and `sslHandshakeTimeout`.
 
 - **Keystores.** `JKS` (the default, which also reads a PKCS#12 file, as Java does), `PKCS12`, and the PEM types of the `pem-keystore` provider Artemis ships: `PEM`, `PEMCA` and `PEMCFG`. Existing Artemis keystores can be used as they are.
-- **Protocols and suites.** TLS 1.2 and 1.3 only. Name cipher suites by their IANA names, as Java does (`TLS_AES_128_GCM_SHA256`). Names Saranga does not support are ignored with a warning; if none is left, the acceptor fails to start.
-- **Not supported.** `trustManagerFactoryPlugin`, `sslContext`, `crcOptions`, `ocspResponderURL` and `useDefaultSslContext` stop the acceptor from starting. `verifyHost` is ignored on acceptors, with a warning.
+- **Protocols and suites.** TLS 1.2 and 1.3 only. Name cipher suites by their IANA names, as Java does (`TLS_AES_128_GCM_SHA256`). Names Saranga does not support are ignored with a warning; if none is left, the broker does not start.
+- **Not supported.** `trustManagerFactoryPlugin`, `sslContext`, `crcOptions`, `ocspResponderURL` and `useDefaultSslContext` stop the broker from starting. `verifyHost` is ignored on acceptors, with a warning.
 - **Reload.** With `sslAutoReload=true`, the keystore, truststore and CRL files are watched and reloaded when they change.
 
 Artemis's [transport chapter](https://activemq.apache.org/components/artemis/documentation/latest/configuring-transports.html) describes the parameters.

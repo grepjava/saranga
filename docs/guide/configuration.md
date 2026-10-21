@@ -76,7 +76,7 @@ Some system properties have a meaning of their own:
 - `brokerconfig.<key>` is a broker property (see below). `<system-property-prefix>` in `broker.xml` changes the prefix.
 - `broker.properties` names the broker properties sources, over `--properties`.
 - `webconfig.` properties change `bootstrap.xml`'s `<web>`, and `securityconfig.` properties choose the security manager, as in Artemis. See [Management](management.md) and [Security](security.md).
-- `artemis.discovery.enabled` turns on UDP discovery. See [Clustering](clustering.md).
+- `artemis.discovery.enabled` (or the `ARTEMIS_DISCOVERY_ENABLED` environment variable) turns on UDP discovery. See [Clustering](clustering.md).
 - `log4j2.configurationFile` names another logging configuration.
 
 ## Broker properties
@@ -222,7 +222,7 @@ These stop the broker from starting, with a reason. Starting anyway would make i
 - a colocated backup (`<colocated>` in the HA policy);
 - the JDBC store (`<database-store>`);
 - a JGroups broadcast or discovery group (`jgroups-file`): discovery is over UDP only;
-- broadcast or discovery groups while the `artemis.discovery.enabled` system property is not `true` (`AMQ229262`, `AMQ229263`), as in Artemis 2.57;
+- broadcast or discovery groups while neither the `artemis.discovery.enabled` system property nor the `ARTEMIS_DISCOVERY_ENABLED` environment variable is `true` (`AMQ229262`, `AMQ229263`), as in Artemis 2.57;
 - a `<security-manager>` class other than `ActiveMQBasicSecurityManager`;
 - a `<broker-plugin>` class Saranga has no port of;
 - an acceptor with TLS settings Saranga cannot honour (see [Protocols](protocols.md#tls)).
