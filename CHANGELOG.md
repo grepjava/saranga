@@ -2,7 +2,7 @@
 
 Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Artemis 2.57.0 and works interchangeably with it. [COMPAT.md](COMPAT.md) lists where the two differ.
 
-## 1.0.0 (2026-10-19)
+## 1.0.0 (2026-10-21)
 
 The first release.
 
