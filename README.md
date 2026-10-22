@@ -28,6 +28,16 @@ Saranga combines the established messaging capabilities of Apache ActiveMQ Artem
 
 The binary is `target/release/saranga`. `saranga create <dir>` makes an instance as `artemis create` does, and `<dir>/bin/artemis run` starts it.
 
+## The Saranga console
+
+Saranga has a web console of its own at `http://localhost:8161/saranga/`, built into the binary, so it needs no `console.war`, no JVM and no Node.js at run time. It takes the same users, console roles and permissions as Artemis's console, and every call goes through the same guard and audit as Jolokia.
+
+- **What Artemis's console does.** The overview, the connections, sessions, consumers, producers, addresses and queues, with closes, creates and deletes. Browsing a queue's messages and moving, copying, retrying, resending or deleting them. Sending a message. The explorer of every management resource, the diagram and the preferences.
+- **Live data.** The pages follow the broker over one server-sent-events stream instead of polling, the charts open on the last hour of the broker's own history, and the events page shows the management notifications as they come.
+- **A typed API** at `/saranga/api/v1`, described as OpenAPI 3.1 at `/saranga/api/v1/openapi.json`.
+
+It is being built in stages, set out in [docs/console-design.md](docs/console-design.md). Stages 1 to 4 are done. Cluster and HA views, the configuration editors and the dead-letter workbench come next. It is not in Saranga 1.0.0. To include it in a build from source, run `npm ci && npm run build` in `console/` (Node.js is needed only for this step) before `cargo build`; without that, `/saranga/` serves a page that says how. [Management](docs/guide/management.md#the-saranga-console) in the guide describes it in full. Artemis's own console can still be served alongside it.
+
 ## Performance against Artemis
 
 Both brokers ran on the same machine, with the same clients, in instances made by their own `create`, each on an empty NIO journal with `journal-datasync` on. Messages are 1 KiB except in the large-message rows, which are 1 MiB.
