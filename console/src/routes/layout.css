@@ -125,4 +125,15 @@
 	body {
 		@apply bg-background text-foreground antialiased;
 	}
+	/* The browser draws native controls (a select's list, scroll bars) in the theme's scheme. */
+	:root {
+		color-scheme: light;
+	}
+	:root.dark {
+		color-scheme: dark;
+	}
+	select option {
+		background-color: var(--popover);
+		color: var(--popover-foreground);
+	}
 }
