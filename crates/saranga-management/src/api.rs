@@ -26,6 +26,10 @@
 //! - `PUT    /resources/{resource}/attributes/{name}` `{"value"}` writes an
 //!   attribute; `POST /resources/{resource}/operations` `{"operation",
 //!   "arguments"}` calls an operation, by signature when it is overloaded.
+//! - `GET    /events`: the live data, as server-sent events; `PUT
+//!   /events/{stream}` sets what a stream watches. `GET /history`: the last
+//!   hour of some resources' counters. `GET /notifications`: the last
+//!   management notifications. See [`crate::live`].
 //! - `GET    /openapi.json`: this API, as OpenAPI 3.1.
 //!
 //! A request that changes something must carry `X-Saranga-Console: 1`, which
@@ -47,6 +51,7 @@ use saranga_server::management::view_fields;
 
 use crate::console::{self, Auth, Console};
 use crate::jolokia::{Agent, Caller, Failure};
+use crate::live::{self, Live};
 use crate::mbean::{Bean, ObjectName};
 use crate::rbac::Guard;
 use crate::{Peer, percent_decode};
@@ -127,6 +132,8 @@ pub(crate) struct ApiState {
     pub broker: Arc<Current>,
     pub console_roles: Vec<String>,
     pub sessions: Console,
+    /// The history and notifications every binding shares.
+    pub live: Arc<Live>,
 }
 
 pub(crate) fn router(state: Arc<ApiState>) -> Router {
@@ -146,6 +153,10 @@ pub(crate) fn router(state: Arc<ApiState>) -> Router {
         .route("/resources/{resource}/attributes", get(attributes))
         .route("/resources/{resource}/attributes/{name}", put(write))
         .route("/resources/{resource}/operations", post(invoke))
+        .route("/events", get(live::events))
+        .route("/events/{stream}", put(live::watch))
+        .route("/history", get(live::history))
+        .route("/notifications", get(live::notifications))
         .fallback(no_such_api)
         .with_state(state);
     Router::new().nest(API, api)
@@ -165,11 +176,11 @@ fn reply(status: StatusCode, body: &Json) -> Response {
     )
 }
 
-fn ok(body: &Json) -> Response {
+pub(crate) fn ok(body: &Json) -> Response {
     reply(StatusCode::OK, body)
 }
 
-fn error(status: StatusCode, message: impl Into<String>) -> Response {
+pub(crate) fn error(status: StatusCode, message: impl Into<String>) -> Response {
     reply(
         status,
         &Json::object()
@@ -181,12 +192,44 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
 /// A failed call: the guard's refusals are 403, what is not there 404, bad
 /// parameters 400, and an operation that failed 400 with its message.
 fn failure(f: Failure) -> Response {
-    let status = match f.status {
-        403 => StatusCode::FORBIDDEN,
-        404 => StatusCode::NOT_FOUND,
-        _ => StatusCode::BAD_REQUEST,
-    };
-    error(status, f.message)
+    Problem::from(f).response()
+}
+
+/// Why a request failed, for an answer or for a view of the live stream.
+pub(crate) struct Problem {
+    pub status: StatusCode,
+    pub message: String,
+}
+
+impl Problem {
+    pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    pub fn response(self) -> Response {
+        error(self.status, self.message)
+    }
+
+    /// As a view of the live stream gives it.
+    pub fn json(&self) -> Json {
+        Json::object()
+            .with("error", self.message.as_str())
+            .with("status", self.status.as_u16() as i64)
+    }
+}
+
+impl From<Failure> for Problem {
+    fn from(f: Failure) -> Self {
+        let status = match f.status {
+            403 => StatusCode::FORBIDDEN,
+            404 => StatusCode::NOT_FOUND,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        Self::new(status, f.message)
+    }
 }
 
 async fn no_such_api() -> Response {
@@ -194,14 +237,19 @@ async fn no_such_api() -> Response {
 }
 
 /// A logged-in user.
-struct User {
-    name: String,
-    caller: Caller,
+#[derive(Clone)]
+pub(crate) struct User {
+    pub name: String,
+    pub caller: Caller,
 }
 
 /// The user a request runs as: its session's, unless an `Authorization:
 /// Basic` header names another user, as for Jolokia.
-fn user(state: &ApiState, headers: &HeaderMap, peer: SocketAddr) -> Result<User, Box<Response>> {
+pub(crate) fn user(
+    state: &ApiState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Result<User, Box<Response>> {
     let remote = Some(format!("{}:{}", peer.ip(), peer.port()));
     let basic = console::basic(headers);
     if let Some((id, s)) = state.sessions.session(headers) {
@@ -266,7 +314,7 @@ fn throttled(wait: i64) -> Response {
 }
 
 /// A request that changes something must say the console sent it.
-fn marked(headers: &HeaderMap) -> Result<(), Box<Response>> {
+pub(crate) fn marked(headers: &HeaderMap) -> Result<(), Box<Response>> {
     match headers.get(MARK).and_then(|v| v.to_str().ok()) {
         Some("1") => Ok(()),
         _ => Err(Box::new(error(
@@ -303,6 +351,31 @@ async fn on_broker(
         .call(&user.caller, name, operation, arguments)
         .await
         .map_err(|f| Box::new(failure(f)))
+}
+
+/// An operation on the broker's MBean answering JSON text, parsed.
+pub(crate) async fn broker_json(
+    state: &ApiState,
+    user: &User,
+    operation: &str,
+    arguments: Vec<Json>,
+) -> Result<Json, Problem> {
+    let Some((name, _)) = state.agent.bean_of("broker") else {
+        return Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the broker is not running",
+        ));
+    };
+    match state
+        .agent
+        .call(&user.caller, name, operation, arguments)
+        .await?
+    {
+        Json::String(text) => {
+            Json::parse(&text).map_err(|e| Problem::new(StatusCode::INTERNAL_SERVER_ERROR, e))
+        }
+        other => Ok(other),
+    }
 }
 
 async fn login(
@@ -506,8 +579,20 @@ async fn broker(
         Ok(u) => u,
         Err(r) => return *r,
     };
+    match status(&state, &u).await {
+        Ok(s) => ok(&s),
+        Err(p) => p.response(),
+    }
+}
+
+/// The broker's status attributes the user may read, and those they may
+/// not.
+pub(crate) async fn status(state: &ApiState, u: &User) -> Result<Json, Problem> {
     let Some((name, bean)) = state.agent.bean_of("broker") else {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "the broker is not running");
+        return Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the broker is not running",
+        ));
     };
     let control = bean.control();
     let mut attributes = Json::object();
@@ -520,23 +605,23 @@ async fn broker(
             Err(_) => {}
         }
     }
-    ok(&Json::object()
+    Ok(Json::object()
         .with("attributes", attributes)
         .with("denied", Json::Array(denied)))
 }
 
 /// A listing's query: its filters, sort and page.
-#[derive(Debug, PartialEq)]
-struct ListQuery {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ListQuery {
     filters: Vec<(String, String, String)>,
     sort: Option<(String, bool)>,
-    page: i64,
-    size: i64,
+    pub page: i64,
+    pub size: i64,
 }
 
 /// `filter=field:OPERATION:value` (repeated), `sort`, `order`, `page` (from
 /// 1) and `size`.
-fn list_query(query: Option<&str>) -> Result<ListQuery, String> {
+pub(crate) fn list_query(query: Option<&str>) -> Result<ListQuery, String> {
     let mut q = ListQuery {
         filters: Vec::new(),
         sort: None,
@@ -606,7 +691,7 @@ fn view_options(q: &ListQuery) -> String {
     o.to_string()
 }
 
-fn list_operation(kind: &str) -> Option<&'static str> {
+pub(crate) fn list_operation(kind: &str) -> Option<&'static str> {
     Some(match kind {
         "connections" => "listConnections(java.lang.String,int,int)",
         "sessions" => "listSessions(java.lang.String,int,int)",
@@ -636,26 +721,29 @@ async fn listing(
         Ok(q) => q,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
     };
+    match list(&state, &u, operation, &q).await {
+        Ok(page) => ok(&page),
+        Err(p) => p.response(),
+    }
+}
+
+/// One page of a listing, by its operation.
+pub(crate) async fn list(
+    state: &ApiState,
+    u: &User,
+    operation: &str,
+    q: &ListQuery,
+) -> Result<Json, Problem> {
     let arguments = vec![
-        Json::from(view_options(&q)),
+        Json::from(view_options(q)),
         Json::Long(q.page),
         Json::Long(q.size),
     ];
-    let answer = match on_broker(&state, &u, operation, arguments).await {
-        Ok(a) => a,
-        Err(r) => return *r,
-    };
     // The views answer JSON text.
-    let mut page = match &answer {
-        Json::String(text) => match Json::parse(text) {
-            Ok(j) => j,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
-        },
-        other => other.clone(),
-    };
+    let mut page = broker_json(state, u, operation, arguments).await?;
     page.put("page", q.page);
     page.put("size", q.size);
-    ok(&page)
+    Ok(page)
 }
 
 async fn close(
@@ -785,7 +873,7 @@ fn visible_resource(
 }
 
 /// One attribute's value, or why it could not be read.
-async fn attribute_value(
+pub(crate) async fn attribute_value(
     state: &ApiState,
     user: &User,
     name: &ObjectName,

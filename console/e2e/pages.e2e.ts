@@ -47,7 +47,7 @@ test('admin sends, browses, moves and deletes messages', async ({ page }) => {
 	await expect(page.getByText(/^Sent message \d+$/)).toBeVisible();
 
 	// Browsed, and seen whole.
-	const messages = page.getByRole('table').first();
+	const messages = page.getByRole('table', { name: 'Messages' });
 	await expect(messages.getByRole('row')).toHaveCount(2);
 	await messages.getByRole('button', { name: /^\d+$/ }).click();
 	const sheet = page.getByRole('dialog');
@@ -66,7 +66,7 @@ test('admin sends, browses, moves and deletes messages', async ({ page }) => {
 
 	// Deleted there, chosen in the table.
 	await page.goto(`/saranga/#/n/local/queues/${to}`);
-	const moved = page.getByRole('table').first();
+	const moved = page.getByRole('table', { name: 'Messages' });
 	await expect(moved.getByRole('button', { name: /^\d+$/ })).toHaveCount(1);
 	await moved.getByRole('checkbox', { name: /^Select message/ }).check();
 	await page.getByRole('button', { name: 'Delete', exact: true }).click();
@@ -89,7 +89,7 @@ test('admin purges a queue', async ({ page }) => {
 		await page.getByRole('dialog').getByRole('button', { name: 'Send' }).click();
 		await expect(page.getByRole('dialog')).toHaveCount(0);
 	}
-	await expect(page.getByRole('table').first().getByRole('row')).toHaveCount(3);
+	await expect(page.getByRole('table', { name: 'Messages' }).getByRole('row')).toHaveCount(3);
 	await page.getByRole('button', { name: 'More actions' }).click();
 	await page.getByRole('menuitem', { name: 'Purge' }).click();
 	await page.getByRole('alertdialog').getByRole('button', { name: 'Purge' }).click();
@@ -139,7 +139,7 @@ test('the explorer reads, charts and calls a resource', async ({ page }) => {
 	await page.getByLabel('Find an operation').fill('countMessages');
 	await page.getByRole('button', { name: /^countMessages\(\)/ }).click();
 	await page.getByRole('button', { name: 'Run' }).click();
-	await expect(page.getByRole('status')).toHaveText(/^\d+$/);
+	await expect(page.getByRole('tabpanel').getByRole('status')).toHaveText(/^\d+$/);
 });
 
 test('the diagram draws the broker, its addresses and its queues', async ({ page }) => {
@@ -181,7 +181,7 @@ test('a viewer browses but changes nothing', async ({ page }) => {
 	await login(page, 'viewer', 'viewer');
 	await page.goto('/saranga/#/n/local/queues/orders.us');
 	await expect(page.getByRole('heading', { level: 1 })).toHaveText('orders.us');
-	const messages = page.getByRole('table').first();
+	const messages = page.getByRole('table', { name: 'Messages' });
 	await expect(messages.getByRole('row').nth(1)).toBeVisible();
 	await expect(page.getByRole('button', { name: 'Send' })).toHaveCount(0);
 	await messages

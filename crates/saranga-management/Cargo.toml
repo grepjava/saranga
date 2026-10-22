@@ -14,11 +14,13 @@ flate2 = "1"
 httpdate = "1"
 rand = "0.9"
 roxmltree = "0.21"
+saranga-buffer = { path = "../saranga-buffer" }
 saranga-config = { path = "../saranga-config" }
 saranga-security = { path = "../saranga-security" }
 saranga-server = { path = "../saranga-server" }
 saranga-transport = { path = "../saranga-transport" }
 tokio = { version = "1", features = ["net", "rt", "macros", "time", "sync"] }
+tokio-stream = "0.1"
 tracing = "0.1"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 

@@ -14,8 +14,10 @@ import { LISTINGS } from '#lib/listings.js';
 import NetworkIcon from '@lucide/svelte/icons/network';
 import FolderTreeIcon from '@lucide/svelte/icons/folder-tree';
 import CpuIcon from '@lucide/svelte/icons/cpu';
+import BellIcon from '@lucide/svelte/icons/bell';
 import {
 	diagramHref,
+	eventsHref,
 	explorerHref,
 	listingHref,
 	overviewHref,
@@ -72,6 +74,12 @@ export const NAVIGATION: NavGroup[] = [
 				href: diagramHref,
 				needs: 'listAddresses',
 				keywords: ['topology', 'graph', 'cluster']
+			},
+			{
+				title: 'Events',
+				icon: BellIcon,
+				href: (node) => eventsHref(node),
+				keywords: ['notifications', 'feed', 'activemq.notifications']
 			}
 		]
 	},

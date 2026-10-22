@@ -163,3 +163,29 @@ export const resources = {
 			})
 		).then((r) => r.result as T)
 };
+
+export type View = Schemas['View'];
+export type Notification = Schemas['Notification'];
+export type ResourceHistory = Schemas['ResourceHistory'];
+
+/** The live data: the stream's views, the history and the notifications. */
+export const live = {
+	/** The stream, which EventSource opens: it takes no client. */
+	eventsUrl: (since: number) => `/saranga/api/v1/events?since=${since}`,
+
+	watch: (stream: string, views: Record<string, View>) =>
+		call(
+			client.PUT('/saranga/api/v1/events/{stream}', {
+				params: { path: { stream }, header: mark },
+				body: { views }
+			})
+		),
+
+	history: (resource: string[]) =>
+		call(client.GET('/saranga/api/v1/history', { params: { query: { resource } } })).then(
+			(r) => r.history
+		),
+
+	notifications: (since = 0) =>
+		call(client.GET('/saranga/api/v1/notifications', { params: { query: { since } } }))
+};

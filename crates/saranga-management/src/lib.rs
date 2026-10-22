@@ -23,6 +23,7 @@ mod catalog;
 pub mod console;
 mod exceptions;
 mod jolokia;
+mod live;
 mod mbean;
 pub mod metrics;
 mod pages;
@@ -193,6 +194,10 @@ pub async fn start(
 ) -> std::io::Result<()> {
     let mut agent_id = None;
     let process = Arc::new(platform::Process::new(options.system_properties.clone()));
+    // The console's history and notifications, one for every binding.
+    let live = options
+        .saranga_console
+        .then(|| live::Live::start(broker.clone()));
     for (index, b) in bindings.into_iter().enumerate() {
         // Java resolves a host name to its IPv4 address first.
         let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((b.host.as_str(), b.port))
@@ -319,7 +324,7 @@ pub async fn start(
                 );
             }
         }
-        if options.saranga_console {
+        if let Some(live) = &live {
             tracing::info!("Saranga console available at {}{}/", b.uri, api::BASE);
             tracing::info!("Saranga console API available at {}{}", b.uri, api::API);
             router = router.merge(pages::router(Arc::new(pages::PagesState::new(
@@ -347,6 +352,7 @@ pub async fn start(
                     b.tls.is_some(),
                     options.session_timeout,
                 ),
+                live: live.clone(),
             });
             router = router.merge(api::router(state));
         }

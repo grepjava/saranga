@@ -16,12 +16,14 @@
 	import AttributeTable from '#lib/components/AttributeTable.svelte';
 	import SendMessage from '#lib/components/SendMessage.svelte';
 	import CreateQueue from '#lib/components/CreateQueue.svelte';
-	import { resources, type Resource } from '#lib/api/index.js';
+	import LiveChart from '#lib/components/LiveChart.svelte';
+	import { resources, type Resource, type View } from '#lib/api/index.js';
 	import { address as ops, addressResource, broker } from '#lib/broker.js';
 	import { allowed, type Allowed } from '#lib/can.js';
-	import { formatBytes, formatNumber } from '#lib/format.js';
+	import { formatBytes, formatNumber, formatRate } from '#lib/format.js';
 	import { explorerHref, listingHref } from '#lib/nav.js';
 	import { session } from '#lib/state/session.svelte.js';
+	import { attributeValues, live } from '#lib/state/live.svelte.js';
 	import type { PageProps } from './$types';
 
 	let { params }: PageProps = $props();
@@ -45,33 +47,21 @@
 		'AutoCreated'
 	];
 
-	let stats = $state<Record<string, unknown> | null>(null);
-	let missing = $state<string | null>(null);
 	let detail = $state<Resource | null>(null);
 	let may = $state<Allowed>({});
 	let tick = $state(0);
 	let tab = $state('queues');
 	let filter = $state('');
 
+	// The counters, as the live stream reads them every tick.
+	const view = $derived<View>({ kind: 'attributes', resource, names: STATS });
+	$effect(() => live.watch(view));
+	const stats = $derived(attributeValues(live.value(view)));
+	const missing = $derived(live.value(view)?.error ?? null);
+	// After an action, at once.
 	$effect(() => {
-		const r = resource;
 		void tick;
-		let stale = false;
-		const read = () =>
-			resources
-				.attributes(r, STATS)
-				.then((a) => {
-					if (stale) return;
-					stats = Object.fromEntries(Object.entries(a).map(([k, v]) => [k, v.value]));
-					missing = null;
-				})
-				.catch((e: Error) => !stale && (missing = e.message));
-		read();
-		const timer = setInterval(read, 5000);
-		return () => {
-			stale = true;
-			clearInterval(timer);
-		};
+		live.refresh();
 	});
 
 	$effect(() => {
@@ -216,6 +206,37 @@
 				</Card.Content>
 			</Card.Root>
 		{/each}
+	</section>
+
+	<section class="grid gap-3 md:grid-cols-2" aria-label="Charts">
+		<Card.Root class="gap-2 py-3">
+			<Card.Header class="px-3"
+				><Card.Title class="text-sm">Routed per second</Card.Title></Card.Header
+			>
+			<Card.Content class="px-3">
+				<LiveChart
+					{resource}
+					series={[
+						{ name: 'RoutedMessageCount', label: 'Routed' },
+						{ name: 'UnRoutedMessageCount', label: 'Not routed' }
+					]}
+					rate
+					format={formatRate}
+					height={110}
+				/>
+			</Card.Content>
+		</Card.Root>
+		<Card.Root class="gap-2 py-3">
+			<Card.Header class="px-3"><Card.Title class="text-sm">Size</Card.Title></Card.Header>
+			<Card.Content class="px-3">
+				<LiveChart
+					{resource}
+					series={[{ name: 'AddressSize', label: 'Size' }]}
+					format={formatBytes}
+					height={110}
+				/>
+			</Card.Content>
+		</Card.Root>
 	</section>
 
 	<Tabs.Root bind:value={tab}>

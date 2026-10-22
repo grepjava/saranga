@@ -1,9 +1,12 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
+	import { untrack } from 'svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { toast } from 'svelte-sonner';
 	import { Button } from '#lib/components/ui/button/index.js';
+	import { Label } from '#lib/components/ui/label/index.js';
+	import { Switch } from '#lib/components/ui/switch/index.js';
 	import * as AlertDialog from '#lib/components/ui/alert-dialog/index.js';
 	import DataTable, { type Column, type Row } from '#lib/components/DataTable.svelte';
 	import { api, type Listing } from '#lib/api/index.js';
@@ -15,6 +18,7 @@
 	import { listingViews } from '#lib/views.js';
 	import { prefs } from '#lib/state/prefs.svelte.js';
 	import { session } from '#lib/state/session.svelte.js';
+	import { live, listingPage, listingView } from '#lib/state/live.svelte.js';
 	import type { PageProps } from './$types';
 
 	let { params }: PageProps = $props();
@@ -66,6 +70,28 @@
 		return () => {
 			stale = true;
 		};
+	});
+
+	// Live, the page as the stream reads it every tick.
+	const liveView = $derived(kind && prefs.liveTables ? listingView(kind, query) : null);
+	$effect(() => {
+		const v = liveView;
+		if (v) return live.watch(v);
+	});
+	$effect(() => {
+		const v = liveView;
+		const listing = kind;
+		if (!v || !listing) return;
+		const p = listingPage(live.value(v));
+		if (!p) return;
+		untrack(() => {
+			loaded = { kind: listing, rows: p.data as unknown as Row[], count: p.count };
+			error = null;
+		});
+	});
+	$effect(() => {
+		void tick;
+		live.refresh();
 	});
 
 	const shown = $derived(kind ? prefs.columns(kind) : []);
@@ -147,9 +173,19 @@
 	<div class="flex flex-col gap-4">
 		<div class="flex items-center justify-between gap-3">
 			<h1 class="text-xl font-semibold">{info.title}</h1>
-			{#if mayCreate}
-				<Button size="sm" onclick={() => (creating = true)}>Create {info.noun}</Button>
-			{/if}
+			<div class="flex items-center gap-4">
+				<div class="flex items-center gap-2">
+					<Switch
+						id="live-table"
+						checked={prefs.liveTables}
+						onCheckedChange={(c) => (prefs.liveTables = c)}
+					/>
+					<Label for="live-table">Live</Label>
+				</div>
+				{#if mayCreate}
+					<Button size="sm" onclick={() => (creating = true)}>Create {info.noun}</Button>
+				{/if}
+			</div>
 		</div>
 		<DataTable
 			label={info.title}

@@ -65,3 +65,7 @@ export function linkHref(
 		new URLSearchParams({ filter: `${link.field}:EQUALS:${value}` })
 	);
 }
+
+export function eventsHref(node: string, params?: URLSearchParams): string {
+	return withQuery(resolve('/n/[node]/events', { node }), params);
+}

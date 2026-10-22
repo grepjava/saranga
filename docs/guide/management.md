@@ -174,10 +174,12 @@ See [COMPAT.md, Web server differences](../../COMPAT.md#web-server-differences) 
 Saranga has a console of its own at `/saranga/` on every `<web>` binding, built into the binary: it needs no `console.war` and no Node.js. It does what Artemis's console does, and it is gaining more in stages (see [the design](../console-design.md)). So far it has:
 
 - the login, with the same users, console roles and throttling as Artemis's console;
-- the broker's overview: its status, memory and disk, its acceptors and cluster connections, its lock coordinators, and the topology's live and backup brokers;
+- the broker's overview: its status, memory and disk, charts of its connections, consumers, messages, message rates and address memory, its acceptors and cluster connections, its lock coordinators, and the topology's live and backup brokers;
+- live data: the pages follow the broker as it changes, without being reloaded. The broker reads what each page shows every two seconds, as the logged-in user, and sends what changed over one stream. The charts start from the broker's own history, the last hour of the counters `/metrics` reads, so they have data the moment they open;
+- the events page: the management notifications (`activemq.notifications`) as they come, by type and searchable, with each one's properties, for a user who may consume from that address. The header says when new ones came;
 - the connections, sessions, consumers, producers, addresses and queues, as tables the broker pages, sorts and filters, with a column chooser, CSV export and links between them. An admin may close connections, sessions (of any protocol) and consumers, create and delete addresses and queues, from them;
-- a page for each queue: its counters, its consumers, its attributes, and its messages. The messages are browsed a page at a time, filtered by a selector, each with its headers, properties and body (bytes as hex, decimal or text). Messages can be moved, copied, expired, sent to the dead-letter address, deleted, and on a dead-letter or expiry queue retried, one at a time or a selection. A queue can be purged, paused, disabled, and its counters reset;
-- a page for each address: its counters, queues, producers and attributes, pausing, and creating a queue on it;
+- a page for each queue: its counters and their charts, its consumers, its attributes, and its messages. The messages are browsed a page at a time, filtered by a selector, each with its headers, properties and body (bytes as hex, decimal or text). Messages can be moved, copied, expired, sent to the dead-letter address, deleted, and on a dead-letter or expiry queue retried, one at a time or a selection. A queue can be purged, paused, disabled, and its counters reset;
+- a page for each address: its counters and their charts, queues, producers and attributes, pausing, and creating a queue on it;
 - sending a message to an address or a queue, with string properties and a body editor that highlights and formats JSON and XML, as the logged-in user or as another; and resending one;
 - the explorer: every management resource with its attributes and operations, as Artemis's console shows the JMX tree. Writable attributes can be edited, numeric ones charted, and any operation called from a form typed by its parameters;
 - the diagram of the broker, its topology, its addresses and their queues;
@@ -210,6 +212,10 @@ It calls the same MBeans as Jolokia and checks them the same way. The login is t
 | `GET /resources/{resource}/attributes?name=A&name=B` | some of its attributes' values |
 | `PUT /resources/{resource}/attributes/{name}` with `{"value"}` | writes an attribute, and answers its previous value |
 | `POST /resources/{resource}/operations` with `{"operation", "arguments"}` | calls an operation, named by its signature (`browse(int,int,java.lang.String)`) when it is overloaded, and answers `{"result"}` |
+| `GET /events?since=N` | the live stream, as server-sent events: `hello` names it, `stats` brings the views it watches that changed, every two seconds, `notification` each management notification after the `N`th (when the user may consume from the notification address), and `end` comes when the session ends |
+| `PUT /events/{stream}` with `{"views": {"key": view}}` | sets what the stream watches: `{"kind": "broker"}` (the status), `{"kind": "topology"}`, `{"kind": "attributes", "resource", "names"}` or `{"kind": "listing", "listing", "query"}` (a page of a listing, its query as above) |
+| `GET /history?resource=broker&resource=queue.orders` | the last hour of the resources' counters: the broker's every two seconds, an address's or a queue's every 30 seconds |
+| `GET /notifications?since=N` | the last 1,000 management notifications, or those after the `N`th |
 | `GET /openapi.json` | the API as OpenAPI 3.1, without a login |
 
 A filter's `OPERATION` is one of `EQUALS`, `NOT_EQUALS`, `CONTAINS`, `NOT_CONTAINS`, `GREATER_THAN` and `LESS_THAN`, as in the `list*` operations. A request may log in with HTTP Basic instead of the session. A request that changes something, including the login, must carry the header `X-Saranga-Console: 1`, which a cross-site form cannot send. A failure comes back as `{"error", "status"}`, with status 401 (no login, or a wrong one), 403 (not permitted, or no header), 404 (nothing there), 429 (too many failed logins) or 400.
@@ -228,6 +234,15 @@ curl -s -u admin:admin -X POST -H 'X-Saranga-Console: 1' -H 'Content-Type: appli
   -d '{"operation": "browse(int,int,java.lang.String)", "arguments": [1, 10, "color = '"'red'"'"]}' \
   http://localhost:8161/saranga/api/v1/resources/queue.orders/operations
 ```
+
+```bash
+# Watch a queue's depth: a hello, then a stats event every two seconds
+curl -sN -u admin:admin http://localhost:8161/saranga/api/v1/events
+# ...and, with the stream's name from its hello:
+curl -s -u admin:admin -X PUT -H 'X-Saranga-Console: 1' -H 'Content-Type: application/json'   -d '{"views": {"depth": {"kind": "attributes", "resource": "queue.orders", "names": ["MessageCount"]}}}'   http://localhost:8161/saranga/api/v1/events/<stream>
+```
+
+The history samples the broker's addresses and queues whose address settings enable metrics, as `/metrics` does, the first 1,000 of each by name. A stream's views are read through the guard and audited as any call is; the stream does not keep its session from idling out.
 
 A resource is named as for management messages: `broker`, `address.<name>`, `queue.<name>`, `divert.<name>`, `acceptor.<name>`, `bridge.<name>`, `clusterconnection.<name>` and so on, with the process's as `java.lang.Runtime`, `java.lang.Memory`, `java.lang.OperatingSystem`, `java.lang.Threading` and `java.lang.ClassLoading`. Arguments are converted to the parameters' types as Jolokia converts them, so a string serves for any of them.
 

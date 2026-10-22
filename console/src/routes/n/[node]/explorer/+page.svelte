@@ -16,11 +16,19 @@
 	import AttributeTable from '#lib/components/AttributeTable.svelte';
 	import OperationForm from '#lib/components/OperationForm.svelte';
 	import Chart from '#lib/components/Chart.svelte';
-	import { resources, type Resource, type ResourceSummary } from '#lib/api/index.js';
+	import {
+		live as history,
+		resources,
+		type Resource,
+		type ResourceSummary,
+		type View
+	} from '#lib/api/index.js';
 	import { GROUPS, isInternal, numeric, shortName } from '#lib/explorer.js';
 	import { formatNumber } from '#lib/format.js';
 	import { addressHref, explorerHref, hashQuery, queueHref } from '#lib/nav.js';
 	import { prefs } from '#lib/state/prefs.svelte.js';
+	import { attributeValues, live } from '#lib/state/live.svelte.js';
+	import { prepend } from '#lib/series.js';
 	import { cn } from '#lib/utils.js';
 	import type { PageProps } from './$types';
 
@@ -28,8 +36,8 @@
 
 	/** The most of a group the tree lists; a search finds the others. */
 	const LISTED = 200;
-	/** The points a chart keeps, every two seconds. */
-	const POINTS = 150;
+	/** The points a chart keeps, every tick, after the broker's history. */
+	const POINTS = 2000;
 
 	const selected = $derived(hashQuery(page.url).get('r'));
 
@@ -110,34 +118,58 @@
 		series = [[], ...[...charted].map(() => [])];
 	}
 
+	// The charted attributes, as the live stream reads them every tick.
+	const chartView = $derived<View | null>(
+		selected && charted.size
+			? { kind: 'attributes', resource: selected, names: [...charted] }
+			: null
+	);
 	$effect(() => {
-		const r = selected;
-		const names = [...charted];
-		if (!r || names.length === 0) return;
+		const v = chartView;
+		if (v) return live.watch(v);
+	});
+
+	$effect(() => {
+		const v = chartView;
+		if (!v) return;
+		const names = v.names ?? [];
 		let stale = false;
-		const sample = () =>
-			resources
-				.attributes(r, names)
-				.then((values) => {
-					if (stale) return;
-					const now = Date.now() / 1000;
-					// The samples so far, which the next one does not depend on.
-					const series0 = untrack(() => series);
-					const next = [
-						[...(series0[0] ?? []), now],
-						...names.map((n, i) => {
-							const v = values[n]?.value;
-							return [...(series0[i + 1] ?? []), numeric(v) ? v : NaN];
-						})
-					];
-					series = next.map((s) => s.slice(-POINTS));
+		// The broker's history of those it keeps, before what comes now.
+		history
+			.history([v.resource ?? ''])
+			.then((h) => {
+				const past = h[v.resource ?? ''];
+				if (stale || !past?.times?.length) return;
+				const now = untrack(() => series);
+				const merged = prepend(
+					{ times: past.times, attributes: past.attributes ?? {} },
+					names,
+					(now[0] ?? []).map((t) => t * 1000),
+					now.slice(1)
+				);
+				series = [
+					merged.times.map((t) => t / 1000),
+					...merged.values.map((s) => s.map((x) => x ?? NaN))
+				];
+			})
+			.catch(() => {});
+		const off = live.onTick((t) => {
+			const values = attributeValues(untrack(() => live.value(v)));
+			if (!values) return;
+			// The samples so far, which the next one does not depend on.
+			const series0 = untrack(() => series);
+			const next = [
+				[...(series0[0] ?? []), t / 1000],
+				...names.map((n, i) => {
+					const x = values[n];
+					return [...(series0[i + 1] ?? []), numeric(x) ? x : NaN];
 				})
-				.catch(() => {});
-		sample();
-		const timer = setInterval(sample, 2000);
+			];
+			series = next.map((s) => s.slice(-POINTS));
+		});
 		return () => {
 			stale = true;
-			clearInterval(timer);
+			off();
 		};
 	});
 

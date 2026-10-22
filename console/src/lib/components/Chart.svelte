@@ -56,6 +56,8 @@
 			data as uPlot.AlignedData,
 			host
 		);
+		// The legend is a table to uPlot, not one of the page's.
+		plot.root.querySelector('.u-legend')?.setAttribute('role', 'presentation');
 	}
 
 	onMount(() => {
@@ -86,5 +88,5 @@
 <div
 	bind:this={host}
 	class="w-full text-xs"
-	style:height="{height + (labels.length > 1 ? 32 : 0)}px"
+	style:min-height="{height + (labels.length > 1 ? 32 : 0)}px"
 ></div>

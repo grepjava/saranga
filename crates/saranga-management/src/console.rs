@@ -177,6 +177,13 @@ impl Console {
         Some((id, s.clone()))
     }
 
+    /// Whether a session is still there, without using it: the live
+    /// stream does not keep its session from idling out.
+    pub fn alive(&self, id: &str) -> bool {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.get(id).is_some_and(|s| !self.expired(s))
+    }
+
     pub fn invalidate(&self, id: &str) {
         self.sessions.lock().unwrap().remove(id);
     }

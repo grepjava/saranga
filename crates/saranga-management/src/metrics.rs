@@ -156,7 +156,7 @@ fn escape_help(v: &str) -> String {
     v.replace('\\', "\\\\").replace('\n', "\\n")
 }
 
-fn number(v: &Json) -> Option<f64> {
+pub(crate) fn number(v: &Json) -> Option<f64> {
     match v {
         Json::Long(n) => Some(*n as f64),
         Json::Double(d) => Some(*d),

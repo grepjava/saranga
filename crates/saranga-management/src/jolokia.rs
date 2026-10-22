@@ -17,6 +17,7 @@ use crate::mbean::{Bean, Control, ObjectName, Op, registered};
 use crate::rbac::Guard;
 
 /// Who is asking, and what they may do.
+#[derive(Clone)]
 pub struct Caller {
     pub roles: Vec<String>,
     /// The subject the login gave, for the audit log.

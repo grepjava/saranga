@@ -127,11 +127,11 @@ browser ──HTTPS── saranga (the node you logged into)
   - Every action is written to the audit log under the user.
 - **Capabilities.** `GET /me` gives the user, their roles, and the guard's answer for each kind of action. `POST /me/can` checks particular operations on particular resources. This plays the part of `canInvoke`.
 - **Events.** `GET /events` is an SSE stream:
-  - a stats tick every 2 s, carrying only the views the page subscribed to;
+  - a stats tick every 2 s, carrying only the views the page subscribed to (`PUT /events/{stream}`), and of those only the ones that changed;
   - management notifications;
-  - topology changes.
+  - topology changes, as a `topology` view.
 
-  The history ring buffer is sampled from the same counters `/metrics` reads.
+  The history ring buffer is sampled from the same counters `/metrics` reads (`GET /history`).
 - **The API is typed.** `api_schema.rs` describes the API as OpenAPI 3.1, built from tables in the crate's own style. It uses no serde or utoipa: the crate has its own `Json` type and keeps its dependencies few. The listings' field enums come from the broker's views (`view_fields`), so they cannot drift. Each listing's row has exact types (`<Kind>Row`: mostly strings, as Artemis's views write `toString`), and the console suite checks every live row against them. The document is committed as `console/src/lib/api/openapi.json`, which a Rust test keeps current, and `openapi-typescript` generates the TypeScript client from it, so building the console needs no running broker.
 - **Embedding.** `build.rs` embeds `console/build`, each file gzipped, with its ETag (no `rust-embed`: `flate2` and `sha2` are already in the workspace).
   - `pages.rs` serves `/saranga/`: gzip when the browser takes it, 304 for a current ETag, `_app/immutable/` cached for good and the rest revalidated. Its Content-Security-Policy allows the app's own scripts and the hashes of SvelteKit's inline start-up script, which `build.rs` computes.
@@ -230,6 +230,13 @@ Each stage is committed on its own, with its tests.
   - Found on the way: shadcn-svelte's components style `data-checked`, `data-open`, `data-active` and `data-horizontal`, which bits-ui 2 does not set; `shadcn-svelte init` imports `shadcn-svelte/tailwind.css`, whose custom variants map them to `data-state` and `data-orientation`. Stage 2 skipped `init`, so checked, open and active states were unstyled; the import is now there, and Stage 2's patch of the sidebar is undone.
   - The tests: unit tests of the body formats and the explorer's types, component tests of the operation form and the queue picker, and 18 Playwright tests, 8 of them new: sending, browsing, moving and deleting messages; purging; creating and deleting an address; the explorer; the diagram; the runtime; the preferences; and what a viewer may not do. `api.sh` adds checks of the resources as admin and viewer, of sending as oneself, and of closing a STOMP session.
   - It passes on Windows (96 checks, 18 browser tests) and against the FreeBSD jail (95, and 18).
+- **Stage 4 (live data) is done.**
+  - `crates/saranga-management/src/live.rs`: `GET /events`, a stream of server-sent events, one per browser tab. Its `hello` names it; `PUT /events/{stream}` sets the views it watches (the broker's status, the topology, some attributes of a resource, a page of a listing); every two seconds the broker reads each view as the user, through the guard and audit as a request is, and sends those that changed. It also brings each management notification, when the user may consume from the notification address (the same check a client subscribing makes), and `end` when the session ends; the stream does not keep its session from idling out. A browser coming back sends the last notification it saw (`Last-Event-ID`) and gets those it missed.
+  - The history: the broker's counters every two seconds for an hour, and those of its addresses and queues every 30 seconds (the ones whose settings enable metrics, as `/metrics` scrapes them, the first 1,000 of each by name), one time line per kind with a series per resource and attribute. `GET /history` answers the series the guard lets the user read.
+  - The notifications: the console listens to the broker's (`ManagementService.addNotificationListener`, which `saranga-server` already had for MQTT), keeps the last 1,000, and `GET /notifications` answers them.
+  - The console: one `EventSource` while logged in (`state/live.svelte.ts`), whose views the pages watch for as long as they show them; the overview, the queue and address pages, the runtime, the explorer's charts, the mini-listings and the listings (with a Live switch, on by default) now follow it instead of polling. `LiveChart` draws a resource's history then each tick: the overview charts connections and consumers, messages, message rates and address memory; a queue its depth, its rates and its consumers; an address its routing rates and its size. The events page lists the notifications, by type (in the URL) and searchable, each with its properties and links to its queue and address, with pause and clear; the header shows whether the stream is live and how many notifications came since the feed was looked at.
+  - The tests: unit tests of the rates, the history's merge with the live samples and the feed's descriptions, five Playwright tests (the overview, a listing and a queue page following the broker, the events page, a viewer), and 30 `api.sh` checks of the stream (its views, its notifications, its replay, its end), the history and the notifications, as admin, viewer and nobody.
+  - It passes on Windows (126 checks, 23 browser tests) and against the FreeBSD jail (125, and 23).
 
 ## Decisions (confirmed 2026-10-22)
 

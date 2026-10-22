@@ -28,7 +28,7 @@ test('the overview shows the broker', async ({ page }) => {
 	await login(page);
 	await expect(page).toHaveURL(/#\/n\/local$/);
 	await expect(page.getByRole('region', { name: 'Counters' })).toContainText('Connections');
-	await expect(page.getByText('Address memory')).toBeVisible();
+	await expect(page.getByRole('meter', { name: 'Address memory' })).toBeVisible();
 	await expect(page.getByRole('button', { name: 'Node' })).toBeVisible();
 	// The acceptors and the cluster, as Artemis's status page shows them.
 	await expect(page.getByRole('link', { name: 'artemis', exact: true })).toBeVisible();

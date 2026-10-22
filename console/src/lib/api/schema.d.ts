@@ -328,6 +328,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/saranga/api/v1/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The live stream: the views it watches every tick, and the notifications */
+        get: operations["events"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/saranga/api/v1/events/{stream}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Set the views a stream watches */
+        put: operations["watch"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/saranga/api/v1/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The last hour of some resources' counters */
+        get: operations["history"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/saranga/api/v1/notifications": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The last management notifications */
+        get: operations["notifications"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -651,6 +719,50 @@ export interface components {
         };
         Result: {
             result: unknown;
+        };
+        View: {
+            /** @enum {string} */
+            kind: "broker" | "topology" | "attributes" | "listing";
+            resource?: string;
+            names?: string[];
+            /** @enum {string} */
+            listing?: "connections" | "sessions" | "consumers" | "producers" | "addresses" | "queues";
+            query?: string;
+        };
+        Watch: {
+            views: {
+                [key: string]: components["schemas"]["View"];
+            };
+        };
+        Watched: {
+            views: number;
+        };
+        ResourceHistory: {
+            interval?: number;
+            times?: number[];
+            attributes?: {
+                [key: string]: (number | null)[];
+            };
+            denied?: string[];
+            error?: string;
+            status?: number;
+        };
+        History: {
+            history: {
+                [key: string]: components["schemas"]["ResourceHistory"];
+            };
+        };
+        Notification: {
+            seq: number;
+            type: string;
+            timestamp: number;
+            properties: {
+                [key: string]: unknown;
+            };
+        };
+        Notifications: {
+            data: components["schemas"]["Notification"][];
+            last: number;
         };
     };
     responses: never;
@@ -1638,6 +1750,203 @@ export interface operations {
             };
             /** @description Not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    events: {
+        parameters: {
+            query?: {
+                /** @description The sequence number of the last notification seen */
+                since?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Server-sent events: hello, stats, notification and end */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            /** @description Bad parameters, or the operation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not logged in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    watch: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Marks a request the console sent */
+                "X-Saranga-Console": "1";
+            };
+            path: {
+                stream: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Watch"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Watched"];
+                };
+            };
+            /** @description Bad parameters, or the operation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not logged in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not permitted, or the X-Saranga-Console header is missing */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    history: {
+        parameters: {
+            query?: {
+                /** @description A resource: broker, queue.<name>, address.<name> */
+                resource?: string[];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["History"];
+                };
+            };
+            /** @description Bad parameters, or the operation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not logged in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    notifications: {
+        parameters: {
+            query?: {
+                /** @description The sequence number of the last notification seen */
+                since?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Notifications"];
+                };
+            };
+            /** @description Bad parameters, or the operation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not logged in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not permitted, or the X-Saranga-Console header is missing */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

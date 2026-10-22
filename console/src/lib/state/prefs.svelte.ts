@@ -17,6 +17,8 @@ interface Stored {
 	diagramAddresses: number;
 	/** Whether the diagram and the explorer show the broker's internal addresses. */
 	showInternal: boolean;
+	/** Whether the listings follow the broker as it changes. */
+	liveTables: boolean;
 }
 
 export const DEFAULTS: Omit<Stored, 'columns'> = {
@@ -25,7 +27,8 @@ export const DEFAULTS: Omit<Stored, 'columns'> = {
 	expiryPattern: '^ExpiryQueue$',
 	bytesFormat: 'hex-text',
 	diagramAddresses: 100,
-	showInternal: false
+	showInternal: false,
+	liveTables: true
 };
 
 const positive = (n: unknown, d: number) =>
@@ -46,7 +49,8 @@ function load(): Stored {
 		expiryPattern: text(s.expiryPattern, DEFAULTS.expiryPattern),
 		bytesFormat: isBytesFormat(s.bytesFormat) ? s.bytesFormat : DEFAULTS.bytesFormat,
 		diagramAddresses: positive(s.diagramAddresses, DEFAULTS.diagramAddresses),
-		showInternal: typeof s.showInternal === 'boolean' ? s.showInternal : DEFAULTS.showInternal
+		showInternal: typeof s.showInternal === 'boolean' ? s.showInternal : DEFAULTS.showInternal,
+		liveTables: typeof s.liveTables === 'boolean' ? s.liveTables : DEFAULTS.liveTables
 	};
 }
 
@@ -102,6 +106,13 @@ class Prefs {
 	}
 	set showInternal(b: boolean) {
 		this.#set('showInternal', b);
+	}
+
+	get liveTables() {
+		return this.#stored.liveTables;
+	}
+	set liveTables(b: boolean) {
+		this.#set('liveTables', b);
 	}
 
 	/** A queue whose messages can be retried: a dead-letter or an expiry queue. */

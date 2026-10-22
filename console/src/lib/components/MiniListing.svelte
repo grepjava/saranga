@@ -1,14 +1,16 @@
 <!--
 	The rows of a listing that belong to something, such as a queue's
-	consumers: the first page, with its links and a way to the whole listing.
+	consumers: the first page, live, with its links and a way to the whole
+	listing.
 -->
 <script lang="ts" generics="K extends Listing">
 	import * as Table from '#lib/components/ui/table/index.js';
-	import { api, type Listing, type Rows } from '#lib/api/index.js';
+	import type { Listing, Rows } from '#lib/api/index.js';
 	import { LISTINGS, label, type ListingInfo } from '#lib/listings.js';
 	import { formatNumber, kindOf } from '#lib/format.js';
 	import { linkHref, listingHref } from '#lib/nav.js';
 	import type { Filter } from '#lib/query.js';
+	import { live, listingPage, listingView } from '#lib/state/live.svelte.js';
 
 	let {
 		node,
@@ -27,22 +29,18 @@
 
 	const SIZE = 50;
 	const info = $derived(LISTINGS[kind] as unknown as ListingInfo<K>);
-	let rows = $state<Rows[K][]>([]);
-	let count = $state(0);
-	let error = $state<string | null>(null);
-
+	const view = $derived(
+		listingView(kind, { filters: [filter], order: 'asc', page: 1, size: SIZE })
+	);
+	$effect(() => live.watch(view));
 	$effect(() => {
 		void tick;
-		const f = filter;
-		api
-			.list(kind, { filters: [f], order: 'asc', page: 1, size: SIZE })
-			.then((p) => {
-				rows = p.data as Rows[K][];
-				count = p.count;
-				error = null;
-			})
-			.catch((e: Error) => (error = e.message));
+		live.refresh();
 	});
+	const page = $derived(listingPage<K>(live.value(view)));
+	const rows = $derived((page?.data ?? []) as Rows[K][]);
+	const count = $derived(page?.count ?? 0);
+	const error = $derived(live.value(view)?.error ?? null);
 
 	const numeric = $derived(
 		Object.fromEntries(
@@ -94,7 +92,7 @@
 				{:else}
 					<Table.Row>
 						<Table.Cell colspan={columns.length} class="py-6 text-center text-muted-foreground">
-							None.
+							{page ? 'None.' : 'Loading…'}
 						</Table.Cell>
 					</Table.Row>
 				{/each}

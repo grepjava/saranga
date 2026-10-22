@@ -22,6 +22,13 @@ export function formatNumber(value: unknown): string {
 	return Number.isSafeInteger(n) ? grouped.format(n) : String(value);
 }
 
+const tenths = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
+
+/** A rate: to a tenth below ten. */
+export function formatRate(value: number): string {
+	return Math.abs(value) < 10 ? tenths.format(value) : grouped.format(value);
+}
+
 const UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
 
 /** Bytes in binary units: 1536 is "1.5 KiB". */

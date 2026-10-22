@@ -1437,6 +1437,257 @@
 					}
 				}
 			}
+		},
+		"/saranga/api/v1/events": {
+			"get": {
+				"operationId": "events",
+				"summary": "The live stream: the views it watches every tick, and the notifications",
+				"parameters": [
+					{
+						"name": "since",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "integer"
+						},
+						"description": "The sequence number of the last notification seen"
+					}
+				],
+				"responses": {
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"200": {
+						"description": "Server-sent events: hello, stats, notification and end",
+						"content": {
+							"text/event-stream": {
+								"schema": {
+									"type": "string"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/events/{stream}": {
+			"put": {
+				"operationId": "watch",
+				"summary": "Set the views a stream watches",
+				"parameters": [
+					{
+						"name": "stream",
+						"in": "path",
+						"required": true,
+						"schema": {
+							"type": "string"
+						},
+						"description": ""
+					},
+					{
+						"name": "X-Saranga-Console",
+						"in": "header",
+						"required": true,
+						"schema": {
+							"type": "string",
+							"const": "1"
+						},
+						"description": "Marks a request the console sent"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Watched"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"404": {
+						"description": "Not found",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				},
+				"requestBody": {
+					"required": true,
+					"content": {
+						"application/json": {
+							"schema": {
+								"$ref": "#/components/schemas/Watch"
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/history": {
+			"get": {
+				"operationId": "history",
+				"summary": "The last hour of some resources' counters",
+				"parameters": [
+					{
+						"name": "resource",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "array",
+							"items": {
+								"type": "string"
+							}
+						},
+						"style": "form",
+						"explode": true,
+						"description": "A resource: broker, queue.<name>, address.<name>"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/History"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/notifications": {
+			"get": {
+				"operationId": "notifications",
+				"summary": "The last management notifications",
+				"parameters": [
+					{
+						"name": "since",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "integer"
+						},
+						"description": "The sequence number of the last notification seen"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Notifications"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
 		}
 	},
 	"components": {
@@ -2826,6 +3077,166 @@
 				},
 				"required": [
 					"result"
+				]
+			},
+			"View": {
+				"type": "object",
+				"properties": {
+					"kind": {
+						"type": "string",
+						"enum": [
+							"broker",
+							"topology",
+							"attributes",
+							"listing"
+						]
+					},
+					"resource": {
+						"type": "string"
+					},
+					"names": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"listing": {
+						"type": "string",
+						"enum": [
+							"connections",
+							"sessions",
+							"consumers",
+							"producers",
+							"addresses",
+							"queues"
+						]
+					},
+					"query": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"kind"
+				]
+			},
+			"Watch": {
+				"type": "object",
+				"properties": {
+					"views": {
+						"type": "object",
+						"additionalProperties": {
+							"$ref": "#/components/schemas/View"
+						}
+					}
+				},
+				"required": [
+					"views"
+				]
+			},
+			"Watched": {
+				"type": "object",
+				"properties": {
+					"views": {
+						"type": "integer"
+					}
+				},
+				"required": [
+					"views"
+				]
+			},
+			"ResourceHistory": {
+				"type": "object",
+				"properties": {
+					"interval": {
+						"type": "integer"
+					},
+					"times": {
+						"type": "array",
+						"items": {
+							"type": "integer"
+						}
+					},
+					"attributes": {
+						"type": "object",
+						"additionalProperties": {
+							"type": "array",
+							"items": {
+								"type": [
+									"number",
+									"null"
+								]
+							}
+						}
+					},
+					"denied": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"error": {
+						"type": "string"
+					},
+					"status": {
+						"type": "integer"
+					}
+				},
+				"required": []
+			},
+			"History": {
+				"type": "object",
+				"properties": {
+					"history": {
+						"type": "object",
+						"additionalProperties": {
+							"$ref": "#/components/schemas/ResourceHistory"
+						}
+					}
+				},
+				"required": [
+					"history"
+				]
+			},
+			"Notification": {
+				"type": "object",
+				"properties": {
+					"seq": {
+						"type": "integer"
+					},
+					"type": {
+						"type": "string"
+					},
+					"timestamp": {
+						"type": "integer"
+					},
+					"properties": {
+						"type": "object",
+						"additionalProperties": {}
+					}
+				},
+				"required": [
+					"seq",
+					"type",
+					"timestamp",
+					"properties"
+				]
+			},
+			"Notifications": {
+				"type": "object",
+				"properties": {
+					"data": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/Notification"
+						}
+					},
+					"last": {
+						"type": "integer"
+					}
+				},
+				"required": [
+					"data",
+					"last"
 				]
 			}
 		},

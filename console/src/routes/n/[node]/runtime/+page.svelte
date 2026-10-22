@@ -6,7 +6,8 @@
 	import * as Alert from '#lib/components/ui/alert/index.js';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import { Input } from '#lib/components/ui/input/index.js';
-	import { resources, type AttributeValue } from '#lib/api/index.js';
+	import { resources, type AttributeValue, type View } from '#lib/api/index.js';
+	import { live } from '#lib/state/live.svelte.js';
 	import { display } from '#lib/explorer.js';
 	import { formatBytes, formatDuration, formatNumber } from '#lib/format.js';
 
@@ -44,38 +45,29 @@
 		]
 	};
 
-	let values = $state<Record<string, Record<string, AttributeValue>>>({});
-	let error = $state<string | null>(null);
 	let tick = $state(0);
 	let tab = $state('metrics');
 
+	// Each as the live stream reads it every tick.
+	const VIEWS = Object.entries(READ).map(
+		([resource, names]) => [resource, { kind: 'attributes', resource, names } as View] as const
+	);
+	$effect(() => {
+		const stop = VIEWS.map(([, v]) => live.watch(v));
+		return () => stop.forEach((f) => f());
+	});
 	$effect(() => {
 		void tick;
-		let stale = false;
-		const read = () =>
-			Promise.all(
-				Object.entries(READ).map(([r, names]) =>
-					resources
-						.attributes(r, names)
-						.then((a) => [r, a] as const)
-						.catch(() => [r, {}] as const)
-				)
-			)
-				.then((all) => {
-					if (stale) return;
-					values = Object.fromEntries(all);
-					error = Object.values(values).every((v) => Object.keys(v).length === 0)
-						? 'The process cannot be read.'
-						: null;
-				})
-				.catch((e: Error) => !stale && (error = e.message));
-		read();
-		const timer = setInterval(read, 5000);
-		return () => {
-			stale = true;
-			clearInterval(timer);
-		};
+		live.refresh();
 	});
+	const values = $derived(
+		Object.fromEntries(
+			VIEWS.map(([r, v]) => [r, (live.value(v)?.value ?? {}) as Record<string, AttributeValue>])
+		)
+	);
+	const error = $derived(
+		VIEWS.every(([, v]) => live.value(v)?.error) ? 'The process cannot be read.' : null
+	);
 
 	const v = (r: string, a: string) => values[`java.lang.${r}`]?.[a]?.value;
 	const n = (r: string, a: string) => {

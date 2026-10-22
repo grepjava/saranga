@@ -118,6 +118,53 @@ def until(client, kind, query, ready, timeout=5):
         time.sleep(0.1)
 
 
+class Events:
+    """The live stream (GET /events), read an event at a time."""
+
+    def __init__(self, client, query="", basic=None):
+        h = {}
+        if client.cookies:
+            h["Cookie"] = "; ".join(f"{k}={v}" for k, v in client.cookies.items())
+        if basic:
+            h["Authorization"] = "Basic " + base64.b64encode(basic.encode()).decode()
+        req = urllib.request.Request(API + "/events" + query, headers=h)
+        try:
+            self.r = urllib.request.urlopen(req, timeout=10)
+            self.status, self.headers = self.r.status, self.r.headers
+        except urllib.error.HTTPError as e:
+            self.r, self.status, self.headers = None, e.code, e.headers
+
+    def next(self, kind=None, timeout=10):
+        """The next event (of a kind): its name, data and id."""
+        end = time.time() + timeout
+        while time.time() < end:
+            event, data, ident = None, [], None
+            while True:
+                line = self.r.readline().decode()
+                if line == "":
+                    return None, None, None
+                line = line.rstrip("\r\n")
+                if line == "":
+                    break
+                if line.startswith(":"):
+                    continue
+                k, _, value = line.partition(":")
+                value = value[1:] if value.startswith(" ") else value
+                if k == "event":
+                    event = value
+                elif k == "data":
+                    data.append(value)
+                elif k == "id":
+                    ident = value
+            if event and (kind is None or event == kind):
+                return event, json.loads("\n".join(data)), ident
+        return None, None, None
+
+    def close(self):
+        if self.r:
+            self.r.close()
+
+
 def fetch(path, headers=None):
     """A page of the console: its status, headers and bytes as sent."""
     req = urllib.request.Request(WEB + path, headers=headers or {})
@@ -370,6 +417,129 @@ check("the attribute has its new value", body.get("attributes", {}).get("Message
 c.request("PUT", "/resources/broker/attributes/MessageCounterMaxDayCount", {"value": previous}, MARK)
 status, body, _ = v.request("PUT", "/resources/broker/attributes/MessageCounterMaxDayCount", {"value": 9}, MARK)
 check("viewer may not write it", status == 403, (status, body))
+
+# The live data: the stream, the history and the notifications.
+e = Events(c)
+check("the stream is served as server-sent events",
+      e.status == 200 and e.headers.get("Content-Type", "").startswith("text/event-stream")
+      and "no-cache" in e.headers.get("Cache-Control", ""), (e.status, dict(e.headers)))
+_, hello, _ = e.next("hello")
+stream = (hello or {}).get("stream")
+check("the stream says hello, its tick and that admin sees notifications",
+      bool(stream) and hello.get("interval") == 2000 and hello.get("notifications") is True
+      and hello.get("address") == "activemq.notifications", hello)
+views = {
+    "status": {"kind": "broker"},
+    "q2": {"kind": "attributes", "resource": "queue.console.q2", "names": ["MessageCount"]},
+    "queues": {"kind": "listing", "listing": "queues", "query": "filter=name:EQUALS:console.q2"},
+    "gone": {"kind": "attributes", "resource": "queue.nosuchqueue", "names": ["MessageCount"]},
+}
+status, body, _ = c.request("PUT", f"/events/{stream}", {"views": views})
+check("setting the views without X-Saranga-Console is 403", status == 403, (status, body))
+status, body, _ = v.request("PUT", f"/events/{stream}", {"views": views}, MARK)
+check("viewer may not set the views of admin's stream", status == 404, (status, body))
+status, body, _ = c.request("PUT", f"/events/{stream}", {"views": {"x": {"kind": "nope"}}}, MARK)
+check("a view of no such kind is 400", status == 400, (status, body))
+status, body, _ = c.request("PUT", f"/events/{stream}", {"views": views}, MARK)
+check("admin sets the stream's views", status == 200 and body.get("views") == 4, (status, body))
+_, stats, _ = e.next("stats")
+for _ in range(3):
+    if stats and "q2" in stats.get("views", {}):
+        break
+    _, stats, _ = e.next("stats")
+got = (stats or {}).get("views", {})
+check("the next tick has every view",
+      sorted(got) == sorted(views) and isinstance(stats.get("time"), int), stats)
+check("the broker view is the status",
+      got.get("status", {}).get("value", {}).get("attributes", {}).get("Version"), got.get("status"))
+check("an attributes view reads them",
+      got.get("q2", {}).get("value", {}).get("MessageCount", {}).get("value") == 1, got.get("q2"))
+check("a listing view is the page",
+      got.get("queues", {}).get("value", {}).get("count") == 1, got.get("queues"))
+check("a view that cannot be read says why", got.get("gone", {}).get("status") == 404, got.get("gone"))
+_, stats, _ = e.next("stats")
+check("a view that did not change is not sent again", "q2" not in (stats or {}).get("views", {}), stats)
+status, body, _ = invoke(c, "address.console.q2", send, [{"live": "yes"}, 3, "live", True, None, None, True])
+for _ in range(3):
+    _, stats, _ = e.next("stats")
+    if "q2" in (stats or {}).get("views", {}):
+        break
+check("a view that changed is sent",
+      (stats or {}).get("views", {}).get("q2", {}).get("value", {}).get("MessageCount", {}).get("value") == 2, stats)
+status, body, _ = invoke(c, "queue.console.q2", "removeMessages(java.lang.String)", ["live = 'yes'"])
+check("admin removes the message the stream saw", status == 200 and body.get("result") == 1, (status, body))
+
+status, kept, _ = c.request("GET", "/notifications")
+last = (kept or {}).get("last", 0)
+check("the broker keeps the last notifications",
+      status == 200 and last > 0 and any(n.get("type") == "SESSION_CREATED" for n in kept.get("data", [])),
+      (status, kept and kept.get("last")))
+check("a notification has its properties",
+      all(isinstance(n.get("properties"), dict) and n.get("seq") > 0 and n.get("timestamp") > 0
+          for n in kept.get("data", [])), kept.get("data", [])[:1])
+status, body, _ = c.request("GET", f"/notifications?since={last}")
+check("since the last, there is none", status == 200 and body.get("data") == [], (status, body))
+def note_after(stream, seq, kind):
+    """The next notification of a kind after `seq`: the stream first replays those kept."""
+    end = time.time() + 10
+    while time.time() < end:
+        _, note, ident = stream.next("notification", timeout=end - time.time())
+        if note is None:
+            break
+        if note.get("seq") > seq and note.get("type") == kind:
+            return note, ident
+    return None, None
+
+
+client = Stomp("admin", "secret")
+note, ident = note_after(e, last, "SESSION_CREATED")
+check("a new session is notified on the stream", note and ident == str(note.get("seq")), note)
+client.close()
+note, _ = note_after(e, last, "SESSION_CLOSED")
+check("and its end", note is not None, note)
+e.close()
+again = Events(c, f"?since={last}")
+again.next("hello")
+_, note, _ = again.next("notification")
+check("a stream since a notification starts after it", (note or {}).get("seq") == last + 1, note)
+again.close()
+
+ve = Events(v)
+_, hello, _ = ve.next("hello")
+check("viewer's stream says they see no notifications", (hello or {}).get("notifications") is False, hello)
+ve.close()
+status, body, _ = v.request("GET", "/notifications")
+check("viewer may not read the notifications", status == 403, (status, body))
+check("the stream needs a login", Events(Client()).status == 401)
+check("the stream takes Authorization: Basic", Events(Client(), basic="viewer:viewer").status == 200)
+
+status, body, _ = c.request("GET", "/history?resource=broker&resource=queue.nosuchqueue")
+broker_history = (body or {}).get("history", {}).get("broker", {})
+times = broker_history.get("times", [])
+check("the history has the broker's samples, every tick",
+      status == 200 and len(times) >= 2 and broker_history.get("interval") == 2000
+      and all(b > a for a, b in zip(times, times[1:])), broker_history)
+check("each of its series has a sample at each time",
+      all(len(s) == len(times) for s in broker_history.get("attributes", {}).values())
+      and "ConnectionCount" in broker_history.get("attributes", {}), broker_history.get("attributes"))
+check("the history of no such resource says so",
+      body.get("history", {}).get("queue.nosuchqueue", {}).get("status") == 404, body.get("history"))
+status, body, _ = v.request("GET", "/history?resource=broker")
+check("viewer reads the history too",
+      status == 200 and body.get("history", {}).get("broker", {}).get("attributes", {}).get("ConnectionCount"),
+      (status, body))
+status, body, _ = c.request("GET", "/history?" + "&".join(["resource=broker"] * 101))
+check("at most 100 resources at a time", status == 400, (status, body))
+
+# The stream ends with its session.
+s = Client()
+s.login("admin", "secret")
+se = Events(s)
+se.next("hello")
+s.request("DELETE", "/session", headers=MARK)
+name, body, _ = se.next("end", timeout=5)
+check("logging out ends the stream", name == "end", (name, body))
+se.close()
 
 # Closing.
 session_id, consumer_id = consumer_row.get("session"), consumer_row.get("id")

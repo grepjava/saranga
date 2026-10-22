@@ -3,38 +3,26 @@
 	import * as Alert from '#lib/components/ui/alert/index.js';
 	import { Badge } from '#lib/components/ui/badge/index.js';
 	import { Skeleton } from '#lib/components/ui/skeleton/index.js';
-	import { api } from '#lib/api/index.js';
-	import { formatBytes, formatDuration, formatNumber } from '#lib/format.js';
+	import { formatBytes, formatDuration, formatNumber, formatRate } from '#lib/format.js';
 	import { listingHref } from '#lib/nav.js';
 	import BrokerParts from '#lib/components/BrokerParts.svelte';
+	import LiveChart from '#lib/components/LiveChart.svelte';
+	import { live } from '#lib/state/live.svelte.js';
+	import type { View } from '#lib/api/index.js';
 	import type { PageProps } from './$types';
 
 	let { params }: PageProps = $props();
 
-	let attributes = $state<Record<string, unknown> | null>(null);
-	let denied = $state<string[]>([]);
-	let error = $state<string | null>(null);
-
-	// Until the live stream, the status is read every five seconds.
-	$effect(() => {
-		let stale = false;
-		const read = () =>
-			api
-				.broker()
-				.then((b) => {
-					if (stale) return;
-					attributes = b.attributes;
-					denied = b.denied;
-					error = null;
-				})
-				.catch((e: Error) => !stale && (error = e.message));
-		read();
-		const timer = setInterval(read, 5000);
-		return () => {
-			stale = true;
-			clearInterval(timer);
-		};
-	});
+	// The status, as the live stream reads it every tick.
+	const STATUS: View = { kind: 'broker' };
+	$effect(() => live.watch(STATUS));
+	const status = $derived(live.value(STATUS));
+	const broker = $derived(
+		status?.value as { attributes: Record<string, unknown>; denied: string[] } | undefined
+	);
+	const attributes = $derived(broker?.attributes ?? null);
+	const denied = $derived(broker?.denied ?? []);
+	const error = $derived(status?.error ?? null);
 
 	const a = (k: string) => attributes?.[k];
 	const yes = (k: string) => a(k) === true;
@@ -170,6 +158,30 @@
 		</Card.Root>
 	</div>
 
+	<section class="grid gap-3 lg:grid-cols-2" aria-label="Charts">
+		{@render chart('Connections and consumers', 'broker', [
+			{ name: 'ConnectionCount', label: 'Connections' },
+			{ name: 'TotalConsumerCount', label: 'Consumers' }
+		])}
+		{@render chart('Messages', 'broker', [{ name: 'TotalMessageCount', label: 'Messages' }])}
+		{@render chart(
+			'Messages per second',
+			'broker',
+			[
+				{ name: 'TotalMessagesAdded', label: 'Added' },
+				{ name: 'TotalMessagesAcknowledged', label: 'Acknowledged' }
+			],
+			true
+		)}
+		{@render chart(
+			'Address memory',
+			'broker',
+			[{ name: 'AddressMemoryUsage', label: 'Address memory' }],
+			false,
+			formatBytes
+		)}
+	</section>
+
 	<BrokerParts node={params.node} />
 
 	{#if denied.length}
@@ -178,6 +190,23 @@
 		</p>
 	{/if}
 </div>
+
+{#snippet chart(
+	title: string,
+	resource: string,
+	series: { name: string; label: string }[],
+	rate = false,
+	format: (v: number) => string = rate ? formatRate : formatNumber
+)}
+	<Card.Root class="gap-2 py-4">
+		<Card.Header class="px-4">
+			<Card.Title class="text-sm">{title}</Card.Title>
+		</Card.Header>
+		<Card.Content class="px-4">
+			<LiveChart {resource} {series} {rate} {format} height={140} />
+		</Card.Content>
+	</Card.Root>
+{/snippet}
 
 {#snippet meter(name: string, percent: number | undefined, detail: string | undefined)}
 	<div class="grid gap-1.5">

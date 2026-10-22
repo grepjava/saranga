@@ -3,11 +3,15 @@
 	import { Button } from '#lib/components/ui/button/index.js';
 	import { Separator } from '#lib/components/ui/separator/index.js';
 	import SearchIcon from '@lucide/svelte/icons/search';
+	import BellIcon from '@lucide/svelte/icons/bell';
+	import * as Tooltip from '#lib/components/ui/tooltip/index.js';
 	import AppSidebar from '#lib/components/AppSidebar.svelte';
 	import CommandPalette from '#lib/components/CommandPalette.svelte';
 	import ThemeMenu from '#lib/components/ThemeMenu.svelte';
 	import UserMenu from '#lib/components/UserMenu.svelte';
 	import { nodes } from '#lib/state/nodes.svelte.js';
+	import { live } from '#lib/state/live.svelte.js';
+	import { eventsHref } from '#lib/nav.js';
 	import type { LayoutProps } from './$types';
 
 	let { children, params }: LayoutProps = $props();
@@ -18,6 +22,12 @@
 		nodes.load().catch(() => {
 			// The pages say what they cannot read; the picker keeps its default.
 		});
+	});
+
+	// The live stream, while the user is logged in.
+	$effect(() => {
+		live.start();
+		return () => live.stop();
 	});
 
 	const known = $derived(nodes.find(params.node) !== undefined);
@@ -45,6 +55,48 @@
 				>
 			</Button>
 			<div class="ml-auto flex items-center gap-1">
+				<Tooltip.Root>
+					<Tooltip.Trigger>
+						{#snippet child({ props })}
+							<span
+								{...props}
+								class="mr-1 flex items-center gap-1.5 text-xs text-muted-foreground"
+								role="status"
+								aria-label={live.connected ? 'Live' : 'Not live'}
+							>
+								<span
+									class="size-2 rounded-full {live.connected
+										? 'bg-success'
+										: 'bg-muted-foreground/40'}"
+								></span>
+								<span class="hidden sm:inline">{live.connected ? 'Live' : 'Not live'}</span>
+							</span>
+						{/snippet}
+					</Tooltip.Trigger>
+					<Tooltip.Content>
+						{live.connected
+							? `The broker sends its counters every ${live.interval / 1000} s`
+							: 'Reconnecting to the broker…'}
+					</Tooltip.Content>
+				</Tooltip.Root>
+				{#if live.notifying}
+					<Button
+						variant="ghost"
+						size="icon-sm"
+						class="relative"
+						href={eventsHref(params.node)}
+						aria-label={live.unseen ? `Notifications, ${live.unseen} new` : 'Notifications'}
+					>
+						<BellIcon />
+						{#if live.unseen}
+							<span
+								class="absolute -top-0.5 -right-0.5 min-w-4 rounded-full bg-primary px-1 text-[0.6rem] leading-4 font-medium text-primary-foreground tabular-nums"
+							>
+								{live.unseen > 99 ? '99+' : live.unseen}
+							</span>
+						{/if}
+					</Button>
+				{/if}
 				<ThemeMenu />
 				<UserMenu />
 			</div>

@@ -480,6 +480,58 @@ fn schemas() -> Json {
         object_with_optional(&[("operation", string())], &[("arguments", array(any()))]),
     );
     s.put("Result", object(&[("result", any())]));
+    s.put(
+        "View",
+        object_with_optional(
+            &[(
+                "kind",
+                enumeration(&["broker", "topology", "attributes", "listing"]),
+            )],
+            &[
+                ("resource", string()),
+                ("names", array(string())),
+                ("listing", enumeration(&LISTINGS)),
+                ("query", string()),
+            ],
+        ),
+    );
+    s.put("Watch", object(&[("views", map_of(schema_ref("View")))]));
+    s.put("Watched", object(&[("views", integer())]));
+    let sample = obj().with("type", Json::Array(vec!["number".into(), "null".into()]));
+    s.put(
+        "ResourceHistory",
+        object_with_optional(
+            &[],
+            &[
+                ("interval", integer()),
+                ("times", array(integer())),
+                ("attributes", map_of(array(sample))),
+                ("denied", array(string())),
+                ("error", string()),
+                ("status", integer()),
+            ],
+        ),
+    );
+    s.put(
+        "History",
+        object(&[("history", map_of(schema_ref("ResourceHistory")))]),
+    );
+    s.put(
+        "Notification",
+        object(&[
+            ("seq", integer()),
+            ("type", string()),
+            ("timestamp", integer()),
+            ("properties", map_of(any())),
+        ]),
+    );
+    s.put(
+        "Notifications",
+        object(&[
+            ("data", array(schema_ref("Notification"))),
+            ("last", integer()),
+        ]),
+    );
     s
 }
 
@@ -710,6 +762,92 @@ fn paths() -> Json {
             ),
         ),
     );
+    let since = param(
+        "since",
+        "query",
+        integer(),
+        false,
+        "The sequence number of the last notification seen",
+    );
+    let mut stream = responses(None, &[400, 401]);
+    stream.put(
+        "200",
+        obj()
+            .with(
+                "description",
+                "Server-sent events: hello, stats, notification and end",
+            )
+            .with(
+                "content",
+                obj().with("text/event-stream", obj().with("schema", string())),
+            ),
+    );
+    if let Json::Object(members) = &mut stream {
+        members.retain(|(k, _)| k != "204");
+    }
+    paths.put(
+        &p("/events"),
+        obj().with(
+            "get",
+            operation(
+                "events",
+                "The live stream: the views it watches every tick, and the notifications",
+                vec![since.clone()],
+                stream,
+            ),
+        ),
+    );
+    paths.put(
+        &p("/events/{stream}"),
+        obj().with(
+            "put",
+            with_body(
+                operation(
+                    "watch",
+                    "Set the views a stream watches",
+                    vec![path_param("stream"), mark()],
+                    responses(Some((200, schema_ref("Watched"))), &[400, 401, 403, 404]),
+                ),
+                schema_ref("Watch"),
+            ),
+        ),
+    );
+    paths.put(
+        &p("/history"),
+        obj().with(
+            "get",
+            operation(
+                "history",
+                "The last hour of some resources' counters",
+                vec![
+                    obj()
+                        .with("name", "resource")
+                        .with("in", "query")
+                        .with("required", false)
+                        .with("schema", array(string()))
+                        .with("style", "form")
+                        .with("explode", true)
+                        .with(
+                            "description",
+                            "A resource: broker, queue.<name>, address.<name>",
+                        ),
+                ],
+                responses(Some((200, schema_ref("History"))), &[400, 401]),
+            ),
+        ),
+    );
+    paths.put(
+        &p("/notifications"),
+        obj().with(
+            "get",
+            operation(
+                "notifications",
+                "The last management notifications",
+                vec![since],
+                responses(Some((200, schema_ref("Notifications"))), &[400, 401, 403]),
+            ),
+        ),
+    );
     paths
 }
 
@@ -771,8 +909,8 @@ mod tests {
             }
         }
         // Six of the session and the user, six listings, three closes, five
-        // of the resources.
-        assert_eq!(ids.len(), 20);
+        // of the resources, four of the live data.
+        assert_eq!(ids.len(), 24);
     }
 
     #[test]

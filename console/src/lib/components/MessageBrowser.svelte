@@ -242,7 +242,7 @@
 	{/if}
 
 	<div class="overflow-x-auto rounded-lg border">
-		<Table.Root>
+		<Table.Root aria-label="Messages">
 			<Table.Header>
 				<Table.Row>
 					<Table.Head class="w-8">
