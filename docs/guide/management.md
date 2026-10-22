@@ -11,7 +11,7 @@ Saranga answers Artemis's management interface. Management messages sent to `act
 | Prometheus metrics | the metrics app's URL, `/metrics` | `<app url="metrics" war="metrics.war"/>` in `bootstrap.xml` |
 | Jolokia | `/console/jolokia` | the console's app, and a user with a console role |
 | Web console | `/console` | the console's app, and a `console.war` from Artemis |
-| Saranga console API (Saranga only) | `/saranga/api/v1` on every `<web>` binding | a user with a console role |
+| Saranga console (Saranga only) | `/saranga/`, and its API at `/saranga/api/v1`, on every `<web>` binding | a user with a console role |
 | CLI | `saranga queue`, `address`, `user`, `check` | a Core connection to an acceptor |
 
 Every way in is audited the same way (see [operations.md](operations.md#the-audit-log)).
@@ -145,7 +145,7 @@ The REST API and management messages do not read `management.xml`. They use the 
 
 ## The web console
 
-Saranga serves Artemis's own web console. It ships no console of its own. Where `bootstrap.xml` declares the console's app (`<app url="console" war="console.war"/>`, which `create` writes), Saranga looks for a `console.war` directory in the instance's `<web path>` (`web` by default), then in the home's (`ARTEMIS_HOME`). Copy it from an Artemis 2.57.0 distribution, unpacked (built from its tag, as [Migrating](migration.md) explains):
+Saranga serves Artemis's own web console too, besides [its own](#the-saranga-console), but does not ship it. Where `bootstrap.xml` declares the console's app (`<app url="console" war="console.war"/>`, which `create` writes), Saranga looks for a `console.war` directory in the instance's `<web path>` (`web` by default), then in the home's (`ARTEMIS_HOME`). Copy it from an Artemis 2.57.0 distribution, unpacked (built from its tag, as [Migrating](migration.md) explains):
 
 ```bash
 cp -r apache-artemis-2.57.0/web/console.war /var/lib/mybroker/web/
@@ -169,9 +169,21 @@ Where Saranga differs:
 
 See [COMPAT.md, Web server differences](../../COMPAT.md#web-server-differences) and Artemis's [management console](https://activemq.apache.org/components/artemis/documentation/latest/management-console.html) chapter.
 
-## The Saranga console API
+## The Saranga console
 
-Saranga is getting a console of its own, served at `/saranga` (see [the design](../console-design.md)). Its pages are not built yet. Its API is served at `/saranga/api/v1` on every `<web>` binding, and it can be scripted.
+Saranga has a console of its own at `/saranga/` on every `<web>` binding, built into the binary: it needs no `console.war` and no Node.js. It is being built in stages (see [the design](../console-design.md)). So far it has:
+
+- the login, with the same users, console roles and throttling as Artemis's console;
+- the broker's overview;
+- the connections, sessions, consumers, producers, addresses and queues, as tables the broker pages, sorts and filters, with a column chooser, CSV export and links between them; an admin may close connections, sessions and consumers from them;
+- a command palette (Ctrl+K) that goes to any page, queue or address;
+- light and dark themes, and preferences kept in the browser.
+
+What a user sees and may do follows the guard, as below: a page or an action the guard refuses is not offered. Each page's URL holds its filters and sort (`/saranga/#/n/local/queues?filter=name:CONTAINS:orders`), so it can be bookmarked or shared. Where Artemis's `console.war` is not installed, `/` goes to `/saranga/`.
+
+### Its API
+
+The console's API is served at `/saranga/api/v1`, and it can be scripted.
 
 It calls the same MBeans as Jolokia and checks them the same way. The login is the console's: a user of the broker's JAAS domain who holds a console role (`HAWTIO_ROLES`). Then `management.xml`'s `<authorisation>`, or the RBAC guard, decides each call. Failed logins are throttled as on the Artemis console. Every call is audited.
 

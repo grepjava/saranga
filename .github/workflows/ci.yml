@@ -27,6 +27,41 @@ jobs:
           for _ in $(seq 1 50); do (echo > /dev/tcp/127.0.0.1/61616) 2>/dev/null && break; sleep 0.2; done
           SARANGA_TEST_BROKER=127.0.0.1:61616 cargo test -p saranga-client --test broker
 
+  # The console (console/): its formatting, types, unit and component
+  # tests, and that its client is generated from the API's document; then
+  # a broker with the pages built in, checked by the console suite with
+  # Playwright driving the pages.
+  console:
+    runs-on: ubuntu-latest
+    env:
+      SARANGA_CONSOLE_REQUIRED: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        working-directory: console
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Check
+        working-directory: console
+        run: |
+          npm run lint
+          npm run check
+          npm run api && git diff --exit-code src/lib/api/schema.d.ts
+          npm test
+          npm run build
+      - run: bash tests/interop/console/api.sh
+
   # Phase 9's exit check: a Java broker and a Saranga broker as each
   # other's backup, failing over and back under load without losing a
   # committed message. Artemis 2.57.0 is tagged but not published, so its

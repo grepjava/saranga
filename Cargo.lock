@@ -1917,6 +1917,7 @@ name = "saranga-management"
 version = "1.0.0"
 dependencies = [
  "axum",
+ "flate2",
  "httpdate",
  "hyper",
  "hyper-util",
@@ -1926,6 +1927,7 @@ dependencies = [
  "saranga-security",
  "saranga-server",
  "saranga-transport",
+ "sha2 0.10.9",
  "sysinfo",
  "tokio",
  "tower",

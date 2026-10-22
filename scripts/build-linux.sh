@@ -23,6 +23,7 @@ docker run --rm \
   -v saranga-cargo-registry:/usr/local/cargo/registry \
   -v saranga-linux-target:/target \
   -e CARGO_TARGET_DIR=/target \
+  -e SARANGA_CONSOLE_REQUIRED \
   "rust:$TOOLCHAIN-bookworm" bash -euc "
     apt-get -qq update && apt-get -qq install -y python3-pip > /dev/null
     pip3 install -q --break-system-packages ziglang==0.15.2 cargo-zigbuild==0.23.4

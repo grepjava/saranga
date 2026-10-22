@@ -12,9 +12,9 @@
 //!   the console roles (`HAWTIO_ROLES`), and every attribute and operation
 //!   is checked against `management.xml`'s `<authorisation>`. Without that
 //!   app neither is served.
-//! - Saranga's own console at `/saranga`, with its API at
-//!   `/saranga/api/v1` (see [`api`]), unless `saranga.console.enabled` is
-//!   `false`.
+//! - Saranga's own console at `/saranga` (its pages are embedded at build
+//!   time), with its API at `/saranga/api/v1` (see [`api`]), unless
+//!   `saranga.console.enabled` is `false`.
 
 mod access;
 pub mod api;
@@ -25,6 +25,7 @@ mod exceptions;
 mod jolokia;
 mod mbean;
 pub mod metrics;
+mod pages;
 mod platform;
 mod rbac;
 pub mod rest;
@@ -216,8 +217,24 @@ pub async fn start(
         tracing::info!("AMQ241001: HTTP Server started at {}", b.uri);
         tracing::info!("Saranga REST API available at {}/api", b.uri);
         let mut router = rest::router(broker.clone());
-        if let Some(redirect) = &options.root_redirect {
-            let location = format!("/{}", redirect.trim_start_matches('/'));
+        // `saranga create` writes Artemis's redirect to its console; without
+        // Artemis's console.war, `/` goes to Saranga's own.
+        let to_missing_console = options.root_redirect.as_deref().is_some_and(|r| {
+            b.apps.iter().any(|(url, war)| {
+                url.trim_matches('/') == r.trim_matches('/')
+                    && war.starts_with("console")
+                    && console::find_war(&options.web_dirs, war).is_none()
+            })
+        });
+        let root = if to_missing_console && options.saranga_console {
+            Some(format!("{}/", api::BASE))
+        } else {
+            options
+                .root_redirect
+                .as_deref()
+                .map(|r| format!("/{}", r.trim_start_matches('/')))
+        };
+        if let Some(location) = root {
             router =
                 router.route(
                     "/",
@@ -303,7 +320,14 @@ pub async fn start(
             }
         }
         if options.saranga_console {
+            tracing::info!("Saranga console available at {}{}/", b.uri, api::BASE);
             tracing::info!("Saranga console API available at {}{}", b.uri, api::API);
+            router = router.merge(pages::router(Arc::new(pages::PagesState::new(
+                options
+                    .strict_transport_security
+                    .as_deref()
+                    .and_then(|v| HeaderValue::from_str(v).ok()),
+            ))));
             let state = Arc::new(api::ApiState {
                 agent: jolokia::Agent {
                     broker: broker.clone(),

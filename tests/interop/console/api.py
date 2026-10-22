@@ -10,7 +10,11 @@ producer. Prints a line per check and ends with the number that failed.
 """
 
 import base64
+import gzip
+import hashlib
 import json
+import os
+import re
 import socket
 import sys
 import time
@@ -114,6 +118,61 @@ def until(client, kind, query, ready, timeout=5):
         time.sleep(0.1)
 
 
+def fetch(path, headers=None):
+    """A page of the console: its status, headers and bytes as sent."""
+    req = urllib.request.Request(WEB + path, headers=headers or {})
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        with opener.open(req, timeout=10) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        return None
+
+
+# The pages, which need no login. `/` goes to Artemis's console where its
+# console.war is, and to Saranga's otherwise.
+artemis_console = fetch("/console/index.html")[0] == 200
+status, h, _ = fetch("/")
+want = "/console" if artemis_console else "/saranga/"
+check(f"/ redirects to {want}", status == 302 and h.get("Location") == want, (status, dict(h)))
+status, h, _ = fetch("/saranga")
+check("/saranga redirects to /saranga/", status == 301 and h.get("Location") == "/saranga/", (status, dict(h)))
+status, h, index = fetch("/saranga/")
+check("the console's page is served", status == 200 and h.get("Content-Type", "").startswith("text/html"), (status, dict(h)))
+check("the page is not cached unchecked", "no-cache" in h.get("Cache-Control", "") and h.get("ETag"), dict(h))
+check("the page has the security headers", h.get("X-Frame-Options") == "DENY" and h.get("X-Content-Type-Options") == "nosniff", dict(h))
+csp = h.get("Content-Security-Policy", "")
+html = index.decode()
+inline = [m.group(1) for m in re.finditer(r"<script>(.*?)</script>", html, re.S)]
+hashes = ["'sha256-" + base64.b64encode(hashlib.sha256(s.encode()).digest()).decode() + "'" for s in inline]
+check("the CSP allows exactly the page's inline scripts", all(x in csp for x in hashes) and csp.count("'sha256-") == len(hashes) and "'unsafe-inline'" not in csp.split("script-src", 1)[1].split(";", 1)[0], (csp, hashes))
+check("the CSP forbids framing", "frame-ancestors 'none'" in csp, csp)
+status, h2, _ = fetch("/saranga/", {"If-None-Match": h.get("ETag", "")})
+check("a page the browser holds is 304", status == 304, status)
+status, h2, gz = fetch("/saranga/", {"Accept-Encoding": "gzip, br"})
+check("the page is sent gzipped when the browser takes it", h2.get("Content-Encoding") == "gzip" and gzip.decompress(gz) == index, dict(h2))
+check("the page says it varies by encoding", h2.get("Vary") == "Accept-Encoding", dict(h2))
+status, _, _ = fetch("/saranga/no-such-file.js")
+check("a file the console lacks is 404", status == 404, status)
+assets = sorted(set(re.findall(r'"/saranga/(_app/immutable/[^"]+)"', html)))
+if os.environ.get("SARANGA_CONSOLE_STUB") == "1":
+    check("the stub page says how to build the console", "npm run build" in html, html[:200])
+else:
+    check("the page loads the console's scripts", len(assets) > 3, html[:400])
+    for a in assets:
+        status, ah, body = fetch("/saranga/" + a)
+        want = "text/css" if a.endswith(".css") else "text/javascript"
+        if not (status == 200 and ah.get("Content-Type", "").startswith(want) and "immutable" in ah.get("Cache-Control", "") and body):
+            check(f"{a} is served, typed and cached for good", False, (status, dict(ah)))
+            break
+    else:
+        check(f"its {len(assets)} scripts and styles are served, typed and cached for good", True)
+
 anon = Client()
 status, doc, _ = anon.request("GET", "/openapi.json")
 check("openapi.json is served without a login", status == 200 and doc.get("openapi") == "3.1.0", status)
@@ -198,6 +257,22 @@ status, page = rows(c, "addresses", "?filter=name:CONTAINS:console.q")
 check("both addresses are listed", status == 200 and page.get("count") == 2, page)
 status, page = rows(c, "producers")
 check("the producers listing answers", status == 200 and "count" in page, (status, page))
+
+# Every row is exactly as the document says: the console's types come from it.
+TYPES = {"string": str, "integer": int}
+for kind in ["connections", "sessions", "consumers", "producers", "addresses", "queues"]:
+    schema = doc["components"]["schemas"][kind[0].upper() + kind[1:] + "Row"]
+    status, page = rows(c, kind, "?size=10000")
+    data = page.get("data", []) if status == 200 else []
+    wrong = []
+    for r in data:
+        if set(r) != set(schema["properties"]):
+            wrong.append(("members", sorted(set(r) ^ set(schema["properties"]))))
+        for k, p in schema["properties"].items():
+            t = TYPES[p["type"]]
+            if k in r and (not isinstance(r[k], t) or isinstance(r[k], bool)):
+                wrong.append((k, repr(r[k])))
+    check(f"the {len(data)} {kind} rows have the documented members and types", data and not wrong, wrong[:5] or page)
 
 status, page = rows(c, "queues", "?sort=name&order=desc&size=1")
 check("a page of one", status == 200 and len(page.get("data", [])) == 1 and page.get("count", 0) > 1, page)

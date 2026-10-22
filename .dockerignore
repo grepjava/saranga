@@ -8,3 +8,6 @@ fuzz/corpus
 fuzz/artifacts
 fuzz/*.log
 tests/interop/clients/dotnet/obj
+console/node_modules
+console/.svelte-kit
+console/test-results

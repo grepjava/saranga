@@ -1,0 +1,8 @@
+# shadcn-svelte's components, kept as the registry writes them.
+src/lib/components/ui/
+# Written by the broker's test (api_schema.rs) and by openapi-typescript.
+src/lib/api/openapi.json
+src/lib/api/schema.d.ts
+package-lock.json
+build/
+.svelte-kit/

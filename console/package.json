@@ -1,0 +1,61 @@
+{
+	"name": "saranga-console",
+	"private": true,
+	"version": "1.1.0",
+	"type": "module",
+	"scripts": {
+		"dev": "vite dev",
+		"build": "vite build",
+		"preview": "vite preview",
+		"prepare": "svelte-kit sync || echo ''",
+		"api": "openapi-typescript src/lib/api/openapi.json -o src/lib/api/schema.d.ts",
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+		"format": "prettier --write .",
+		"lint": "prettier --check .",
+		"test:unit": "vitest",
+		"test": "vitest run",
+		"test:e2e": "playwright test"
+	},
+	"devDependencies": {
+		"@internationalized/date": "3.12.4",
+		"@lucide/svelte": "1.61.0",
+		"@playwright/test": "1.64.1",
+		"@sveltejs/adapter-static": "4.0.0",
+		"@sveltejs/kit": "3.1.0",
+		"@sveltejs/vite-plugin-svelte": "7.3.1",
+		"@tailwindcss/vite": "4.3.3",
+		"@types/node": "24.19.2",
+		"@vitest/browser-playwright": "5.0.5",
+		"bits-ui": "2.20.0",
+		"cn": "0.3.3",
+		"mode-watcher": "1.1.0",
+		"openapi-typescript": "7.13.0",
+		"playwright": "1.64.1",
+		"prettier": "3.9.10",
+		"prettier-plugin-svelte": "4.1.1",
+		"prettier-plugin-tailwindcss": "0.8.1",
+		"svelte": "5.57.2",
+		"svelte-check": "4.7.7",
+		"svelte-sonner": "1.2.1",
+		"tailwind-variants": "3.3.1",
+		"tailwindcss": "4.3.3",
+		"tw-animate-css": "1.4.0",
+		"typescript": "6.0.3",
+		"vite": "8.3.5",
+		"vitest": "5.0.5",
+		"vitest-browser-svelte": "3.1.0"
+	},
+	"imports": {
+		"#lib": "./src/lib/index.js",
+		"#lib/*": "./src/lib/*"
+	},
+	"overrides": {
+		"openapi-typescript": {
+			"typescript": "$typescript"
+		}
+	},
+	"dependencies": {
+		"openapi-fetch": "0.17.0"
+	}
+}

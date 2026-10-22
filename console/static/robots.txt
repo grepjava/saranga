@@ -1,0 +1,3 @@
+# The console of a message broker: nothing to index.
+User-agent: *
+Disallow: /

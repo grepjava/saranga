@@ -130,14 +130,15 @@ browser ──HTTPS── saranga (the node you logged into)
   - topology changes.
 
   The history ring buffer is sampled from the same counters `/metrics` reads.
-- **The API is typed.** `api_schema.rs` describes the API as OpenAPI 3.1, built from tables in the crate's own style. It uses no serde or utoipa: the crate has its own `Json` type and keeps its dependencies few. The listings' field enums come from the broker's views (`view_fields`), so they cannot drift. `openapi-typescript` generates the TypeScript client from the served `/openapi.json`. A row of a listing is typed loosely for now. Stage 2 gives each row exact types, with a test that checks live rows against them.
-- **Embedding.** `build.rs` embeds `console/build` with `rust-embed`, compressed.
-  - A build without the built pages (a Rust-only build, with no Node) embeds a stub page that says how to build the console, and prints a warning. Release builds and CI require the real pages.
+- **The API is typed.** `api_schema.rs` describes the API as OpenAPI 3.1, built from tables in the crate's own style. It uses no serde or utoipa: the crate has its own `Json` type and keeps its dependencies few. The listings' field enums come from the broker's views (`view_fields`), so they cannot drift. Each listing's row has exact types (`<Kind>Row`: mostly strings, as Artemis's views write `toString`), and the console suite checks every live row against them. The document is committed as `console/src/lib/api/openapi.json`, which a Rust test keeps current, and `openapi-typescript` generates the TypeScript client from it, so building the console needs no running broker.
+- **Embedding.** `build.rs` embeds `console/build`, each file gzipped, with its ETag (no `rust-embed`: `flate2` and `sha2` are already in the workspace).
+  - `pages.rs` serves `/saranga/`: gzip when the browser takes it, 304 for a current ETag, `_app/immutable/` cached for good and the rest revalidated. Its Content-Security-Policy allows the app's own scripts and the hashes of SvelteKit's inline start-up script, which `build.rs` computes.
+  - A build without the built pages (a Rust-only build, with no Node) embeds a stub page that says how to build the console, and prints a warning. `SARANGA_CONSOLE_REQUIRED=1` makes that an error; the release builds and CI set it.
   - Running the console needs no Node.js.
 
 ### Client side (`console/`, latest Svelte)
 
-- **Svelte 5 with runes** (`$state`, `$derived`, `$effect`, `$props`, snippets) and SvelteKit 2. The build uses `adapter-static` as a single-page app (`ssr = false`, with an `index.html` fallback), plus TypeScript and Vite. The exact versions are pinned to the latest stable releases when the shell stage starts.
+- **Svelte 5 with runes** (`$state`, `$derived`, `$effect`, `$props`, snippets) and SvelteKit 3, which was released on 2026-10-01 (SvelteKit 2 was current when this was planned). The build uses `adapter-static` with hash routing, so every page is `index.html` and the broker needs no fallback, plus TypeScript 6 and Vite 8. Every version is pinned exactly: Svelte 5.57, SvelteKit 3.1, Tailwind 4.3, bits-ui 2.20, shadcn-svelte 1.7, Vitest 5 and Playwright 1.64.
 - **State.** Shared state lives in `.svelte.ts` modules made of runes classes: the session, the selected node, preferences and the event stream. No legacy stores.
 - **The UI kit is shadcn-svelte** (bits-ui on Tailwind CSS 4), with its components copied into the repo (see decision 2). The theme's tokens are CSS variables, for light and dark.
 - **Tables.** One `DataTable` component holds:
@@ -207,6 +208,13 @@ Each stage is committed on its own, with its tests.
   - Every call goes through the Jolokia agent's guard, parameter conversion and audit. The login is the Artemis console's (`console::login_user`), with its own cookie on `/saranga`.
   - `-Dsaranga.console.enabled=false` turns it off.
   - `tests/interop/console/api.sh` checks every endpoint as admin, viewer and a user without a console role: 56 checks, plus the off switch. It passes on Windows, and against the `saranga` podman jail on FreeBSD 15.1, checked from another host on the LAN.
+- **Stage 2 (the shell) is done.**
+  - `console/` is the SvelteKit 3 project: the login, the layout with the sidebar and the node picker (one node until Stage 5), light and dark themes, the command palette (Ctrl+K: pages, queues and addresses, the theme, logging out) and preferences.
+  - `DataTable` pages, sorts and filters on the broker, with the URL holding the query. It has a column chooser (remembered), selection with bulk actions, CSV export of the page or of every matching row, and virtual scrolling past 150 rows. The six listings use it, with links between them and the closes for connections, sessions and consumers. The overview shows the broker's status, read every 5 s until Stage 4's stream.
+  - The rows have exact types, and the suite checks every live row against them.
+  - The broker embeds the pages (`build.rs`, `pages.rs`) and serves them at `/saranga/`. Where Artemis's `console.war` is missing, `/` goes there.
+  - The tests: unit tests (Node), component tests (Chromium), and ten Playwright tests against a running broker, which `api.sh` runs after its checks. CI's `console` job runs them all, and the release builds the pages once and embeds them in every binary and image.
+  - It passes on Windows (76 checks, 10 browser tests) and against the FreeBSD jail (75, with Artemis's `console.war` mounted, and 10).
 
 ## Decisions (confirmed 2026-10-22)
 
@@ -216,4 +224,4 @@ Each stage is committed on its own, with its tests.
      - Call each peer's web API. This needs every node's web URL, which the topology does not carry, so it would need configuration.
      - Use the cluster user. This is simpler, but every user would act with the cluster's rights.
 2. **The UI kit.** Chosen: shadcn-svelte on Tailwind 4. Its components are copied into the repo rather than linked as a dependency, and it is accessible. The alternative is plain CSS with our own components: fewer dependencies, but slower to build.
-3. **The URL and whether it is on by default.** Chosen: the console is served at `/saranga` on the first `<web>` binding, on by default. A system property, `saranga.console.enabled=false`, turns it off. `saranga create` makes it the root redirect.
+3. **The URL and whether it is on by default.** Chosen: the console is served at `/saranga` on the first `<web>` binding, on by default. A system property, `saranga.console.enabled=false`, turns it off. `saranga create` still writes Artemis's redirect of `/` to `console`, so the instance's files stay Artemis's; where Artemis's `console.war` is missing, `/` goes to `/saranga/` instead.

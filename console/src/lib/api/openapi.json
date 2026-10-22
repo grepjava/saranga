@@ -1,0 +1,2222 @@
+{
+	"openapi": "3.1.0",
+	"info": {
+		"title": "Saranga console API",
+		"version": "2.57.0"
+	},
+	"paths": {
+		"/saranga/api/v1/session": {
+			"post": {
+				"operationId": "login",
+				"summary": "Log in: the broker's JAAS domain, with a console role",
+				"parameters": [
+					{
+						"name": "X-Saranga-Console",
+						"in": "header",
+						"required": true,
+						"schema": {
+							"type": "string",
+							"const": "1"
+						},
+						"description": "Marks a request the console sent"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Me"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"429": {
+						"description": "Too many failed logins",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				},
+				"requestBody": {
+					"required": true,
+					"content": {
+						"application/json": {
+							"schema": {
+								"$ref": "#/components/schemas/Login"
+							}
+						}
+					}
+				}
+			},
+			"delete": {
+				"operationId": "logout",
+				"summary": "Log out",
+				"parameters": [
+					{
+						"name": "X-Saranga-Console",
+						"in": "header",
+						"required": true,
+						"schema": {
+							"type": "string",
+							"const": "1"
+						},
+						"description": "Marks a request the console sent"
+					}
+				],
+				"responses": {
+					"204": {
+						"description": "Done"
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/me": {
+			"get": {
+				"operationId": "me",
+				"summary": "The user, their roles, and the broker operations they may call",
+				"parameters": [],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Me"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/me/can": {
+			"post": {
+				"operationId": "can",
+				"summary": "Whether the user may call each method on each resource",
+				"parameters": [],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/CheckResults"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				},
+				"requestBody": {
+					"required": true,
+					"content": {
+						"application/json": {
+							"schema": {
+								"$ref": "#/components/schemas/Checks"
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/views": {
+			"get": {
+				"operationId": "views",
+				"summary": "The fields each listing filters and sorts by",
+				"parameters": [],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Views"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/broker": {
+			"get": {
+				"operationId": "broker",
+				"summary": "The broker's status attributes the user may read",
+				"parameters": [],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Broker"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/connections": {
+			"get": {
+				"operationId": "list_connections",
+				"summary": "One page of the connections",
+				"parameters": [
+					{
+						"name": "filter",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "array",
+							"items": {
+								"type": "string"
+							}
+						},
+						"style": "form",
+						"explode": true,
+						"description": "field:OPERATION:value, OPERATION one of EQUALS, NOT_EQUALS, CONTAINS, NOT_CONTAINS, GREATER_THAN, LESS_THAN"
+					},
+					{
+						"name": "sort",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"$ref": "#/components/schemas/ConnectionsField"
+						},
+						"description": "The field to sort by"
+					},
+					{
+						"name": "order",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "string",
+							"enum": [
+								"asc",
+								"desc"
+							]
+						},
+						"description": ""
+					},
+					{
+						"name": "page",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "integer"
+						},
+						"description": "From 1"
+					},
+					{
+						"name": "size",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "integer"
+						},
+						"description": "1 to 10000; 100 by default"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/ConnectionsPage"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/sessions": {
+			"get": {
+				"operationId": "list_sessions",
+				"summary": "One page of the sessions",
+				"parameters": [
+					{
+						"name": "filter",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "array",
+							"items": {
+								"type": "string"
+							}
+						},
+						"style": "form",
+						"explode": true,
+						"description": "field:OPERATION:value, OPERATION one of EQUALS, NOT_EQUALS, CONTAINS, NOT_CONTAINS, GREATER_THAN, LESS_THAN"
+					},
+					{
+						"name": "sort",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"$ref": "#/components/schemas/SessionsField"
+						},
+						"description": "The field to sort by"
+					},
+					{
+						"name": "order",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "string",
+							"enum": [
+								"asc",
+								"desc"
+							]
+						},
+						"description": ""
+					},
+					{
+						"name": "page",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "integer"
+						},
+						"description": "From 1"
+					},
+					{
+						"name": "size",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "integer"
+						},
+						"description": "1 to 10000; 100 by default"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/SessionsPage"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/consumers": {
+			"get": {
+				"operationId": "list_consumers",
+				"summary": "One page of the consumers",
+				"parameters": [
+					{
+						"name": "filter",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "array",
+							"items": {
+								"type": "string"
+							}
+						},
+						"style": "form",
+						"explode": true,
+						"description": "field:OPERATION:value, OPERATION one of EQUALS, NOT_EQUALS, CONTAINS, NOT_CONTAINS, GREATER_THAN, LESS_THAN"
+					},
+					{
+						"name": "sort",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"$ref": "#/components/schemas/ConsumersField"
+						},
+						"description": "The field to sort by"
+					},
+					{
+						"name": "order",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "string",
+							"enum": [
+								"asc",
+								"desc"
+							]
+						},
+						"description": ""
+					},
+					{
+						"name": "page",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "integer"
+						},
+						"description": "From 1"
+					},
+					{
+						"name": "size",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "integer"
+						},
+						"description": "1 to 10000; 100 by default"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/ConsumersPage"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/producers": {
+			"get": {
+				"operationId": "list_producers",
+				"summary": "One page of the producers",
+				"parameters": [
+					{
+						"name": "filter",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "array",
+							"items": {
+								"type": "string"
+							}
+						},
+						"style": "form",
+						"explode": true,
+						"description": "field:OPERATION:value, OPERATION one of EQUALS, NOT_EQUALS, CONTAINS, NOT_CONTAINS, GREATER_THAN, LESS_THAN"
+					},
+					{
+						"name": "sort",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"$ref": "#/components/schemas/ProducersField"
+						},
+						"description": "The field to sort by"
+					},
+					{
+						"name": "order",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "string",
+							"enum": [
+								"asc",
+								"desc"
+							]
+						},
+						"description": ""
+					},
+					{
+						"name": "page",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "integer"
+						},
+						"description": "From 1"
+					},
+					{
+						"name": "size",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "integer"
+						},
+						"description": "1 to 10000; 100 by default"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/ProducersPage"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/addresses": {
+			"get": {
+				"operationId": "list_addresses",
+				"summary": "One page of the addresses",
+				"parameters": [
+					{
+						"name": "filter",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "array",
+							"items": {
+								"type": "string"
+							}
+						},
+						"style": "form",
+						"explode": true,
+						"description": "field:OPERATION:value, OPERATION one of EQUALS, NOT_EQUALS, CONTAINS, NOT_CONTAINS, GREATER_THAN, LESS_THAN"
+					},
+					{
+						"name": "sort",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"$ref": "#/components/schemas/AddressesField"
+						},
+						"description": "The field to sort by"
+					},
+					{
+						"name": "order",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "string",
+							"enum": [
+								"asc",
+								"desc"
+							]
+						},
+						"description": ""
+					},
+					{
+						"name": "page",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "integer"
+						},
+						"description": "From 1"
+					},
+					{
+						"name": "size",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "integer"
+						},
+						"description": "1 to 10000; 100 by default"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/AddressesPage"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/queues": {
+			"get": {
+				"operationId": "list_queues",
+				"summary": "One page of the queues",
+				"parameters": [
+					{
+						"name": "filter",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "array",
+							"items": {
+								"type": "string"
+							}
+						},
+						"style": "form",
+						"explode": true,
+						"description": "field:OPERATION:value, OPERATION one of EQUALS, NOT_EQUALS, CONTAINS, NOT_CONTAINS, GREATER_THAN, LESS_THAN"
+					},
+					{
+						"name": "sort",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"$ref": "#/components/schemas/QueuesField"
+						},
+						"description": "The field to sort by"
+					},
+					{
+						"name": "order",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "string",
+							"enum": [
+								"asc",
+								"desc"
+							]
+						},
+						"description": ""
+					},
+					{
+						"name": "page",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "integer"
+						},
+						"description": "From 1"
+					},
+					{
+						"name": "size",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "integer"
+						},
+						"description": "1 to 10000; 100 by default"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/QueuesPage"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/connections/{id}": {
+			"delete": {
+				"operationId": "closeConnection",
+				"summary": "Close a connection",
+				"parameters": [
+					{
+						"name": "id",
+						"in": "path",
+						"required": true,
+						"schema": {
+							"type": "string"
+						},
+						"description": ""
+					},
+					{
+						"name": "X-Saranga-Console",
+						"in": "header",
+						"required": true,
+						"schema": {
+							"type": "string",
+							"const": "1"
+						},
+						"description": "Marks a request the console sent"
+					}
+				],
+				"responses": {
+					"204": {
+						"description": "Done"
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"404": {
+						"description": "Not found",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/sessions/{connection}/{id}": {
+			"delete": {
+				"operationId": "closeSession",
+				"summary": "Close a session",
+				"parameters": [
+					{
+						"name": "connection",
+						"in": "path",
+						"required": true,
+						"schema": {
+							"type": "string"
+						},
+						"description": ""
+					},
+					{
+						"name": "id",
+						"in": "path",
+						"required": true,
+						"schema": {
+							"type": "string"
+						},
+						"description": ""
+					},
+					{
+						"name": "X-Saranga-Console",
+						"in": "header",
+						"required": true,
+						"schema": {
+							"type": "string",
+							"const": "1"
+						},
+						"description": "Marks a request the console sent"
+					}
+				],
+				"responses": {
+					"204": {
+						"description": "Done"
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"404": {
+						"description": "Not found",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/consumers/{session}/{id}": {
+			"delete": {
+				"operationId": "closeConsumer",
+				"summary": "Close a consumer",
+				"parameters": [
+					{
+						"name": "session",
+						"in": "path",
+						"required": true,
+						"schema": {
+							"type": "string"
+						},
+						"description": ""
+					},
+					{
+						"name": "id",
+						"in": "path",
+						"required": true,
+						"schema": {
+							"type": "string"
+						},
+						"description": ""
+					},
+					{
+						"name": "X-Saranga-Console",
+						"in": "header",
+						"required": true,
+						"schema": {
+							"type": "string",
+							"const": "1"
+						},
+						"description": "Marks a request the console sent"
+					}
+				],
+				"responses": {
+					"204": {
+						"description": "Done"
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"404": {
+						"description": "Not found",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	},
+	"components": {
+		"schemas": {
+			"Error": {
+				"type": "object",
+				"properties": {
+					"error": {
+						"type": "string"
+					},
+					"status": {
+						"type": "integer"
+					}
+				},
+				"required": [
+					"error",
+					"status"
+				]
+			},
+			"Login": {
+				"type": "object",
+				"properties": {
+					"user": {
+						"type": "string"
+					},
+					"password": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"user",
+					"password"
+				]
+			},
+			"Me": {
+				"type": "object",
+				"properties": {
+					"user": {
+						"type": "string"
+					},
+					"roles": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"guard": {
+						"type": "string",
+						"enum": [
+							"management.xml",
+							"rbac"
+						]
+					},
+					"broker": {
+						"type": "object",
+						"additionalProperties": {
+							"type": "boolean"
+						}
+					}
+				},
+				"required": [
+					"user",
+					"roles",
+					"guard",
+					"broker"
+				]
+			},
+			"Checks": {
+				"type": "object",
+				"properties": {
+					"checks": {
+						"type": "array",
+						"items": {
+							"type": "object",
+							"properties": {
+								"resource": {
+									"type": "string"
+								},
+								"method": {
+									"type": "string"
+								}
+							},
+							"required": [
+								"resource",
+								"method"
+							]
+						}
+					}
+				},
+				"required": [
+					"checks"
+				]
+			},
+			"CheckResults": {
+				"type": "object",
+				"properties": {
+					"results": {
+						"type": "array",
+						"items": {
+							"type": "boolean"
+						}
+					}
+				},
+				"required": [
+					"results"
+				]
+			},
+			"Broker": {
+				"type": "object",
+				"properties": {
+					"attributes": {
+						"type": "object",
+						"additionalProperties": {}
+					},
+					"denied": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					}
+				},
+				"required": [
+					"attributes",
+					"denied"
+				]
+			},
+			"ConnectionsField": {
+				"type": "string",
+				"enum": [
+					"connectionID",
+					"clientID",
+					"users",
+					"protocol",
+					"sessionCount",
+					"remoteAddress",
+					"localAddress",
+					"sessionID",
+					"creationTime",
+					"implementation",
+					"proxyAddress",
+					"proxyProtocolVersion"
+				]
+			},
+			"ConnectionsRow": {
+				"type": "object",
+				"properties": {
+					"connectionID": {
+						"type": "string"
+					},
+					"remoteAddress": {
+						"type": "string"
+					},
+					"users": {
+						"type": "string"
+					},
+					"creationTime": {
+						"type": "string"
+					},
+					"implementation": {
+						"type": "string"
+					},
+					"protocol": {
+						"type": "string"
+					},
+					"clientID": {
+						"type": "string"
+					},
+					"localAddress": {
+						"type": "string"
+					},
+					"sessionCount": {
+						"type": "integer"
+					},
+					"proxyAddress": {
+						"type": "string"
+					},
+					"proxyProtocolVersion": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"connectionID",
+					"remoteAddress",
+					"users",
+					"creationTime",
+					"implementation",
+					"protocol",
+					"clientID",
+					"localAddress",
+					"sessionCount",
+					"proxyAddress",
+					"proxyProtocolVersion"
+				],
+				"additionalProperties": false
+			},
+			"ConnectionsPage": {
+				"type": "object",
+				"properties": {
+					"data": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/ConnectionsRow"
+						}
+					},
+					"count": {
+						"type": "integer"
+					},
+					"page": {
+						"type": "integer"
+					},
+					"size": {
+						"type": "integer"
+					}
+				},
+				"required": [
+					"data",
+					"count",
+					"page",
+					"size"
+				]
+			},
+			"SessionsField": {
+				"type": "string",
+				"enum": [
+					"id",
+					"connectionID",
+					"consumerCount",
+					"producerCount",
+					"user",
+					"validatedUser",
+					"protocol",
+					"clientID",
+					"localAddress",
+					"remoteAddress",
+					"creationTime"
+				]
+			},
+			"SessionsRow": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"user": {
+						"type": "string"
+					},
+					"validatedUser": {
+						"type": "string"
+					},
+					"creationTime": {
+						"type": "string"
+					},
+					"consumerCount": {
+						"type": "integer"
+					},
+					"producerCount": {
+						"type": "integer"
+					},
+					"connectionID": {
+						"type": "string"
+					},
+					"clientID": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"id",
+					"user",
+					"validatedUser",
+					"creationTime",
+					"consumerCount",
+					"producerCount",
+					"connectionID",
+					"clientID"
+				],
+				"additionalProperties": false
+			},
+			"SessionsPage": {
+				"type": "object",
+				"properties": {
+					"data": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/SessionsRow"
+						}
+					},
+					"count": {
+						"type": "integer"
+					},
+					"page": {
+						"type": "integer"
+					},
+					"size": {
+						"type": "integer"
+					}
+				},
+				"required": [
+					"data",
+					"count",
+					"page",
+					"size"
+				]
+			},
+			"ConsumersField": {
+				"type": "string",
+				"enum": [
+					"id",
+					"sequentialId",
+					"session",
+					"connection",
+					"queue",
+					"filter",
+					"address",
+					"user",
+					"validatedUser",
+					"protocol",
+					"clientID",
+					"localAddress",
+					"remoteAddress",
+					"queueType",
+					"browseOnly",
+					"creationTime",
+					"messagesInTransit",
+					"messagesInTransitSize",
+					"messagesDelivered",
+					"messagesDeliveredSize",
+					"messagesAcknowledged",
+					"messagesAcknowledgedAwaitingCommit",
+					"lastDeliveredTime",
+					"lastAcknowledgedTime",
+					"status"
+				]
+			},
+			"ConsumersRow": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"session": {
+						"type": "string"
+					},
+					"clientID": {
+						"type": "string"
+					},
+					"user": {
+						"type": "string"
+					},
+					"validatedUser": {
+						"type": "string"
+					},
+					"protocol": {
+						"type": "string"
+					},
+					"queue": {
+						"type": "string"
+					},
+					"queueType": {
+						"type": "string"
+					},
+					"filter": {
+						"type": "string"
+					},
+					"address": {
+						"type": "string"
+					},
+					"localAddress": {
+						"type": "string"
+					},
+					"remoteAddress": {
+						"type": "string"
+					},
+					"creationTime": {
+						"type": "string"
+					},
+					"messagesInTransit": {
+						"type": "string"
+					},
+					"messagesInTransitSize": {
+						"type": "string"
+					},
+					"messagesDelivered": {
+						"type": "string"
+					},
+					"messagesDeliveredSize": {
+						"type": "string"
+					},
+					"messagesAcknowledged": {
+						"type": "string"
+					},
+					"messagesAcknowledgedAwaitingCommit": {
+						"type": "string"
+					},
+					"lastDeliveredTime": {
+						"type": "integer"
+					},
+					"lastAcknowledgedTime": {
+						"type": "integer"
+					},
+					"status": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"id",
+					"session",
+					"clientID",
+					"user",
+					"validatedUser",
+					"protocol",
+					"queue",
+					"queueType",
+					"filter",
+					"address",
+					"localAddress",
+					"remoteAddress",
+					"creationTime",
+					"messagesInTransit",
+					"messagesInTransitSize",
+					"messagesDelivered",
+					"messagesDeliveredSize",
+					"messagesAcknowledged",
+					"messagesAcknowledgedAwaitingCommit",
+					"lastDeliveredTime",
+					"lastAcknowledgedTime",
+					"status"
+				],
+				"additionalProperties": false
+			},
+			"ConsumersPage": {
+				"type": "object",
+				"properties": {
+					"data": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/ConsumersRow"
+						}
+					},
+					"count": {
+						"type": "integer"
+					},
+					"page": {
+						"type": "integer"
+					},
+					"size": {
+						"type": "integer"
+					}
+				},
+				"required": [
+					"data",
+					"count",
+					"page",
+					"size"
+				]
+			},
+			"ProducersField": {
+				"type": "string",
+				"enum": [
+					"id",
+					"name",
+					"session",
+					"connectionID",
+					"address",
+					"user",
+					"validatedUser",
+					"protocol",
+					"clientID",
+					"localAddress",
+					"remoteAddress",
+					"creationTime",
+					"msgSent",
+					"msgSizeSent",
+					"lastProducedMessageID"
+				]
+			},
+			"ProducersRow": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"name": {
+						"type": "string"
+					},
+					"session": {
+						"type": "string"
+					},
+					"clientID": {
+						"type": "string"
+					},
+					"user": {
+						"type": "string"
+					},
+					"validatedUser": {
+						"type": "string"
+					},
+					"protocol": {
+						"type": "string"
+					},
+					"address": {
+						"type": "string"
+					},
+					"localAddress": {
+						"type": "string"
+					},
+					"remoteAddress": {
+						"type": "string"
+					},
+					"creationTime": {
+						"type": "string"
+					},
+					"msgSent": {
+						"type": "integer"
+					},
+					"msgSizeSent": {
+						"type": "integer"
+					},
+					"lastProducedMessageID": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"id",
+					"name",
+					"session",
+					"clientID",
+					"user",
+					"validatedUser",
+					"protocol",
+					"address",
+					"localAddress",
+					"remoteAddress",
+					"creationTime",
+					"msgSent",
+					"msgSizeSent",
+					"lastProducedMessageID"
+				],
+				"additionalProperties": false
+			},
+			"ProducersPage": {
+				"type": "object",
+				"properties": {
+					"data": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/ProducersRow"
+						}
+					},
+					"count": {
+						"type": "integer"
+					},
+					"page": {
+						"type": "integer"
+					},
+					"size": {
+						"type": "integer"
+					}
+				},
+				"required": [
+					"data",
+					"count",
+					"page",
+					"size"
+				]
+			},
+			"AddressesField": {
+				"type": "string",
+				"enum": [
+					"id",
+					"name",
+					"routingTypes",
+					"queueCount",
+					"internal",
+					"temporary",
+					"autoCreated",
+					"paused",
+					"currentDuplicateIdCacheSize",
+					"retroactiveResource",
+					"unroutedMessageCount",
+					"routedMessageCount",
+					"messageCount",
+					"numberOfBytesPerPage",
+					"addressLimitPercent",
+					"paging",
+					"numberOfPages",
+					"addressSize",
+					"maxPageReadBytes",
+					"maxPageReadMessages",
+					"prefetchPageBytes",
+					"prefetchPageMessages"
+				]
+			},
+			"AddressesRow": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"name": {
+						"type": "string"
+					},
+					"routingTypes": {
+						"type": "string"
+					},
+					"queueCount": {
+						"type": "string"
+					},
+					"internal": {
+						"type": "string"
+					},
+					"temporary": {
+						"type": "string"
+					},
+					"autoCreated": {
+						"type": "string"
+					},
+					"paused": {
+						"type": "string"
+					},
+					"currentDuplicateIdCacheSize": {
+						"type": "string"
+					},
+					"retroactiveResource": {
+						"type": "string"
+					},
+					"unroutedMessageCount": {
+						"type": "string"
+					},
+					"routedMessageCount": {
+						"type": "string"
+					},
+					"messageCount": {
+						"type": "string"
+					},
+					"addressLimitPercent": {
+						"type": "string"
+					},
+					"numberOfPages": {
+						"type": "string"
+					},
+					"addressSize": {
+						"type": "string"
+					},
+					"maxPageReadBytes": {
+						"type": "string"
+					},
+					"maxPageReadMessages": {
+						"type": "string"
+					},
+					"prefetchPageBytes": {
+						"type": "string"
+					},
+					"prefetchPageMessages": {
+						"type": "string"
+					},
+					"numberOfBytesPerPage": {
+						"type": "string"
+					},
+					"paging": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"id",
+					"name",
+					"routingTypes",
+					"queueCount",
+					"internal",
+					"temporary",
+					"autoCreated",
+					"paused",
+					"currentDuplicateIdCacheSize",
+					"retroactiveResource",
+					"unroutedMessageCount",
+					"routedMessageCount",
+					"messageCount",
+					"addressLimitPercent",
+					"numberOfPages",
+					"addressSize",
+					"maxPageReadBytes",
+					"maxPageReadMessages",
+					"prefetchPageBytes",
+					"prefetchPageMessages",
+					"numberOfBytesPerPage",
+					"paging"
+				],
+				"additionalProperties": false
+			},
+			"AddressesPage": {
+				"type": "object",
+				"properties": {
+					"data": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/AddressesRow"
+						}
+					},
+					"count": {
+						"type": "integer"
+					},
+					"page": {
+						"type": "integer"
+					},
+					"size": {
+						"type": "integer"
+					}
+				},
+				"required": [
+					"data",
+					"count",
+					"page",
+					"size"
+				]
+			},
+			"QueuesField": {
+				"type": "string",
+				"enum": [
+					"id",
+					"name",
+					"consumerID",
+					"address",
+					"maxConsumers",
+					"filter",
+					"messageCount",
+					"consumerCount",
+					"deliveringCount",
+					"messagesAdded",
+					"messagesAcked",
+					"messagesExpired",
+					"routingType",
+					"user",
+					"autoCreated",
+					"durable",
+					"paused",
+					"persistedPause",
+					"temporary",
+					"purgeOnNoConsumers",
+					"messagesKilled",
+					"directDeliver",
+					"lastValue",
+					"exclusive",
+					"scheduledCount",
+					"lastValueKey",
+					"groupRebalance",
+					"groupRebalancePauseDispatch",
+					"groupBuckets",
+					"groupFirstKey",
+					"enabled",
+					"ringSize",
+					"consumersBeforeDispatch",
+					"delayBeforeDispatch",
+					"autoDelete",
+					"internalQueue"
+				]
+			},
+			"QueuesRow": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"name": {
+						"type": "string"
+					},
+					"address": {
+						"type": "string"
+					},
+					"filter": {
+						"type": "string"
+					},
+					"durable": {
+						"type": "string"
+					},
+					"paused": {
+						"type": "string"
+					},
+					"persistedPause": {
+						"type": "string"
+					},
+					"temporary": {
+						"type": "string"
+					},
+					"purgeOnNoConsumers": {
+						"type": "string"
+					},
+					"consumerCount": {
+						"type": "string"
+					},
+					"maxConsumers": {
+						"type": "string"
+					},
+					"autoCreated": {
+						"type": "string"
+					},
+					"user": {
+						"type": "string"
+					},
+					"routingType": {
+						"type": "string"
+					},
+					"messagesAdded": {
+						"type": "string"
+					},
+					"messageCount": {
+						"type": "string"
+					},
+					"messagesAcked": {
+						"type": "string"
+					},
+					"messagesExpired": {
+						"type": "string"
+					},
+					"deliveringCount": {
+						"type": "string"
+					},
+					"messagesKilled": {
+						"type": "string"
+					},
+					"directDeliver": {
+						"type": "string"
+					},
+					"exclusive": {
+						"type": "string"
+					},
+					"lastValue": {
+						"type": "string"
+					},
+					"lastValueKey": {
+						"type": "string"
+					},
+					"scheduledCount": {
+						"type": "string"
+					},
+					"groupRebalance": {
+						"type": "string"
+					},
+					"groupRebalancePauseDispatch": {
+						"type": "string"
+					},
+					"groupBuckets": {
+						"type": "string"
+					},
+					"groupFirstKey": {
+						"type": "string"
+					},
+					"enabled": {
+						"type": "string"
+					},
+					"ringSize": {
+						"type": "string"
+					},
+					"consumersBeforeDispatch": {
+						"type": "string"
+					},
+					"delayBeforeDispatch": {
+						"type": "string"
+					},
+					"autoDelete": {
+						"type": "string"
+					},
+					"internalQueue": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"id",
+					"name",
+					"address",
+					"filter",
+					"durable",
+					"paused",
+					"persistedPause",
+					"temporary",
+					"purgeOnNoConsumers",
+					"consumerCount",
+					"maxConsumers",
+					"autoCreated",
+					"user",
+					"routingType",
+					"messagesAdded",
+					"messageCount",
+					"messagesAcked",
+					"messagesExpired",
+					"deliveringCount",
+					"messagesKilled",
+					"directDeliver",
+					"exclusive",
+					"lastValue",
+					"lastValueKey",
+					"scheduledCount",
+					"groupRebalance",
+					"groupRebalancePauseDispatch",
+					"groupBuckets",
+					"groupFirstKey",
+					"enabled",
+					"ringSize",
+					"consumersBeforeDispatch",
+					"delayBeforeDispatch",
+					"autoDelete",
+					"internalQueue"
+				],
+				"additionalProperties": false
+			},
+			"QueuesPage": {
+				"type": "object",
+				"properties": {
+					"data": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/QueuesRow"
+						}
+					},
+					"count": {
+						"type": "integer"
+					},
+					"page": {
+						"type": "integer"
+					},
+					"size": {
+						"type": "integer"
+					}
+				},
+				"required": [
+					"data",
+					"count",
+					"page",
+					"size"
+				]
+			},
+			"Views": {
+				"type": "object",
+				"properties": {
+					"connections": {
+						"type": "object",
+						"properties": {
+							"fields": {
+								"type": "array",
+								"items": {
+									"type": "object",
+									"properties": {
+										"name": {
+											"type": "string"
+										},
+										"constant": {
+											"type": "string"
+										}
+									},
+									"required": [
+										"name",
+										"constant"
+									]
+								}
+							},
+							"defaultSort": {
+								"type": "string",
+								"const": "connectionID"
+							}
+						},
+						"required": [
+							"fields",
+							"defaultSort"
+						]
+					},
+					"sessions": {
+						"type": "object",
+						"properties": {
+							"fields": {
+								"type": "array",
+								"items": {
+									"type": "object",
+									"properties": {
+										"name": {
+											"type": "string"
+										},
+										"constant": {
+											"type": "string"
+										}
+									},
+									"required": [
+										"name",
+										"constant"
+									]
+								}
+							},
+							"defaultSort": {
+								"type": "string",
+								"const": "id"
+							}
+						},
+						"required": [
+							"fields",
+							"defaultSort"
+						]
+					},
+					"consumers": {
+						"type": "object",
+						"properties": {
+							"fields": {
+								"type": "array",
+								"items": {
+									"type": "object",
+									"properties": {
+										"name": {
+											"type": "string"
+										},
+										"constant": {
+											"type": "string"
+										}
+									},
+									"required": [
+										"name",
+										"constant"
+									]
+								}
+							},
+							"defaultSort": {
+								"type": "string",
+								"const": "id"
+							}
+						},
+						"required": [
+							"fields",
+							"defaultSort"
+						]
+					},
+					"producers": {
+						"type": "object",
+						"properties": {
+							"fields": {
+								"type": "array",
+								"items": {
+									"type": "object",
+									"properties": {
+										"name": {
+											"type": "string"
+										},
+										"constant": {
+											"type": "string"
+										}
+									},
+									"required": [
+										"name",
+										"constant"
+									]
+								}
+							},
+							"defaultSort": {
+								"type": "string",
+								"const": "id"
+							}
+						},
+						"required": [
+							"fields",
+							"defaultSort"
+						]
+					},
+					"addresses": {
+						"type": "object",
+						"properties": {
+							"fields": {
+								"type": "array",
+								"items": {
+									"type": "object",
+									"properties": {
+										"name": {
+											"type": "string"
+										},
+										"constant": {
+											"type": "string"
+										}
+									},
+									"required": [
+										"name",
+										"constant"
+									]
+								}
+							},
+							"defaultSort": {
+								"type": "string",
+								"const": "id"
+							}
+						},
+						"required": [
+							"fields",
+							"defaultSort"
+						]
+					},
+					"queues": {
+						"type": "object",
+						"properties": {
+							"fields": {
+								"type": "array",
+								"items": {
+									"type": "object",
+									"properties": {
+										"name": {
+											"type": "string"
+										},
+										"constant": {
+											"type": "string"
+										}
+									},
+									"required": [
+										"name",
+										"constant"
+									]
+								}
+							},
+							"defaultSort": {
+								"type": "string",
+								"const": "name"
+							}
+						},
+						"required": [
+							"fields",
+							"defaultSort"
+						]
+					}
+				},
+				"required": [
+					"connections",
+					"sessions",
+					"consumers",
+					"producers",
+					"addresses",
+					"queues"
+				]
+			}
+		},
+		"securitySchemes": {
+			"session": {
+				"type": "apiKey",
+				"in": "cookie",
+				"name": "SARANGA_SESSION",
+				"description": "SARANGA_SESSION_<binding>_<port>, which POST /session sets"
+			},
+			"basic": {
+				"type": "http",
+				"scheme": "basic"
+			}
+		}
+	},
+	"security": [
+		{
+			"session": []
+		},
+		{
+			"basic": []
+		}
+	]
+}

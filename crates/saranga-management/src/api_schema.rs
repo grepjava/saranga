@@ -128,6 +128,185 @@ fn with_body(mut op: Json, schema: Json) -> Json {
     op
 }
 
+/// How a listing writes a member of its rows.
+#[derive(Clone, Copy)]
+enum T {
+    /// A string, as most are: Artemis's views write `toString`.
+    S,
+    I,
+}
+
+use T::{I, S};
+
+/// The members of each listing's rows and their types, as the views'
+/// `toJson` writes them (`views.rs`). The console suite checks live rows
+/// against them.
+const ROWS: &[(&str, &[(&str, T)])] = &[
+    (
+        "connections",
+        &[
+            ("connectionID", S),
+            ("remoteAddress", S),
+            ("users", S),
+            ("creationTime", S),
+            ("implementation", S),
+            ("protocol", S),
+            ("clientID", S),
+            ("localAddress", S),
+            ("sessionCount", I),
+            ("proxyAddress", S),
+            ("proxyProtocolVersion", S),
+        ],
+    ),
+    (
+        "sessions",
+        &[
+            ("id", S),
+            ("user", S),
+            ("validatedUser", S),
+            ("creationTime", S),
+            ("consumerCount", I),
+            ("producerCount", I),
+            ("connectionID", S),
+            ("clientID", S),
+        ],
+    ),
+    (
+        "consumers",
+        &[
+            ("id", S),
+            ("session", S),
+            ("clientID", S),
+            ("user", S),
+            ("validatedUser", S),
+            ("protocol", S),
+            ("queue", S),
+            ("queueType", S),
+            ("filter", S),
+            ("address", S),
+            ("localAddress", S),
+            ("remoteAddress", S),
+            ("creationTime", S),
+            ("messagesInTransit", S),
+            ("messagesInTransitSize", S),
+            ("messagesDelivered", S),
+            ("messagesDeliveredSize", S),
+            ("messagesAcknowledged", S),
+            ("messagesAcknowledgedAwaitingCommit", S),
+            ("lastDeliveredTime", I),
+            ("lastAcknowledgedTime", I),
+            ("status", S),
+        ],
+    ),
+    (
+        "producers",
+        &[
+            ("id", S),
+            ("name", S),
+            ("session", S),
+            ("clientID", S),
+            ("user", S),
+            ("validatedUser", S),
+            ("protocol", S),
+            ("address", S),
+            ("localAddress", S),
+            ("remoteAddress", S),
+            ("creationTime", S),
+            ("msgSent", I),
+            ("msgSizeSent", I),
+            ("lastProducedMessageID", S),
+        ],
+    ),
+    (
+        "addresses",
+        &[
+            ("id", S),
+            ("name", S),
+            ("routingTypes", S),
+            ("queueCount", S),
+            ("internal", S),
+            ("temporary", S),
+            ("autoCreated", S),
+            ("paused", S),
+            ("currentDuplicateIdCacheSize", S),
+            ("retroactiveResource", S),
+            ("unroutedMessageCount", S),
+            ("routedMessageCount", S),
+            ("messageCount", S),
+            ("addressLimitPercent", S),
+            ("numberOfPages", S),
+            ("addressSize", S),
+            ("maxPageReadBytes", S),
+            ("maxPageReadMessages", S),
+            ("prefetchPageBytes", S),
+            ("prefetchPageMessages", S),
+            ("numberOfBytesPerPage", S),
+            ("paging", S),
+        ],
+    ),
+    (
+        "queues",
+        &[
+            ("id", S),
+            ("name", S),
+            ("address", S),
+            ("filter", S),
+            ("durable", S),
+            ("paused", S),
+            ("persistedPause", S),
+            ("temporary", S),
+            ("purgeOnNoConsumers", S),
+            ("consumerCount", S),
+            ("maxConsumers", S),
+            ("autoCreated", S),
+            ("user", S),
+            ("routingType", S),
+            ("messagesAdded", S),
+            ("messageCount", S),
+            ("messagesAcked", S),
+            ("messagesExpired", S),
+            ("deliveringCount", S),
+            ("messagesKilled", S),
+            ("directDeliver", S),
+            ("exclusive", S),
+            ("lastValue", S),
+            ("lastValueKey", S),
+            ("scheduledCount", S),
+            ("groupRebalance", S),
+            ("groupRebalancePauseDispatch", S),
+            ("groupBuckets", S),
+            ("groupFirstKey", S),
+            ("enabled", S),
+            ("ringSize", S),
+            ("consumersBeforeDispatch", S),
+            ("delayBeforeDispatch", S),
+            ("autoDelete", S),
+            ("internalQueue", S),
+        ],
+    ),
+];
+
+/// A listing's row: exactly its members.
+fn row(kind: &str) -> Json {
+    let members = ROWS
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map_or(&[][..], |(_, m)| *m);
+    let props: Vec<(&str, Json)> = members
+        .iter()
+        .map(|(n, t)| {
+            (
+                *n,
+                match t {
+                    S => string(),
+                    I => integer(),
+                },
+            )
+        })
+        .collect();
+    object(&props).with("additionalProperties", false)
+}
+
 fn listing_name(kind: &str) -> String {
     let mut c = kind.chars();
     let upper: String = c
@@ -187,10 +366,12 @@ fn schemas() -> Json {
             &format!("{}Field", listing_name(kind).trim_end_matches("Page")),
             field,
         );
+        let row_name = format!("{}Row", listing_name(kind).trim_end_matches("Page"));
+        s.put(&row_name, row(kind));
         s.put(
             &listing_name(kind),
             object(&[
-                ("data", array(map_of(obj()))),
+                ("data", array(schema_ref(&row_name))),
                 ("count", integer()),
                 ("page", integer()),
                 ("size", integer()),
@@ -412,5 +593,77 @@ mod tests {
         }
         // Six of the session and the user, six listings, three closes.
         assert_eq!(ids.len(), 15);
+    }
+
+    #[test]
+    fn every_listing_has_rows() {
+        for kind in crate::api::LISTINGS {
+            assert!(
+                super::ROWS.iter().any(|(k, m)| *k == kind && !m.is_empty()),
+                "no rows for {kind}"
+            );
+        }
+    }
+
+    /// The JSON indented as `JSON.stringify(v, null, '\t')` writes it, so
+    /// the committed copy reads well in a diff.
+    fn pretty(v: &Json, depth: usize, out: &mut String) {
+        let indent = |out: &mut String, d: usize| {
+            out.push('\n');
+            out.extend(std::iter::repeat_n('\t', d));
+        };
+        match v {
+            Json::Array(items) if !items.is_empty() => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    indent(out, depth + 1);
+                    pretty(item, depth + 1, out);
+                }
+                indent(out, depth);
+                out.push(']');
+            }
+            Json::Object(members) if !members.is_empty() => {
+                out.push('{');
+                for (i, (k, item)) in members.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    indent(out, depth + 1);
+                    out.push_str(&Json::from(k.as_str()).to_string());
+                    out.push_str(": ");
+                    pretty(item, depth + 1, out);
+                }
+                indent(out, depth);
+                out.push('}');
+            }
+            other => out.push_str(&other.to_string()),
+        }
+    }
+
+    use saranga_server::management::json::Json;
+
+    /// The console generates its client from `console/src/lib/api/openapi.json`,
+    /// so it must be this document. `SARANGA_UPDATE_OPENAPI=1` rewrites it.
+    #[test]
+    fn the_console_has_this_document() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../console/src/lib/api/openapi.json");
+        let mut text = String::new();
+        pretty(&super::document(), 0, &mut text);
+        text.push('\n');
+        if std::env::var_os("SARANGA_UPDATE_OPENAPI").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &text).unwrap();
+            return;
+        }
+        let committed = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            committed.replace("\r\n", "\n") == text,
+            "{} is not the API's document: run SARANGA_UPDATE_OPENAPI=1 cargo test -p saranga-management the_console_has_this_document, then npm run api in console/",
+            path.display()
+        );
     }
 }

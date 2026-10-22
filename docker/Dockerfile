@@ -6,10 +6,13 @@
 #   docker build -f docker/Dockerfile -t saranga .
 #   docker run -p 8161:8161 -p 61616:61616 saranga
 #
-# Saranga ships no web console: mount Artemis's console.war at
-# /opt/saranga/web/console.war to have it.
+# The binary serves Saranga's own console at /saranga/ when console/build
+# (npm run build in console/) was there to embed; the release builds it
+# first and passes SARANGA_CONSOLE_REQUIRED=1. Artemis's console is not
+# shipped: mount its console.war at /opt/saranga/web/console.war to have it.
 
 FROM rust:1.98.1-slim-trixie AS build
+ARG SARANGA_CONSOLE_REQUIRED
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p saranga-cli

@@ -2,6 +2,8 @@
 # The console API suite: a Saranga instance (saranga create) with the
 # suite's management.xml and three users, checked by api.py; then the same
 # instance with -Dsaranga.console.enabled=false, which serves no console.
+# With the console's packages installed (npm ci in console/), Playwright
+# then drives its pages in Chromium (console/e2e).
 #
 #   tests/interop/console/api.sh
 #
@@ -64,17 +66,41 @@ CORE_CONSUMER=$!
 RESULT=$?
 kill "$CORE_CONSUMER" 2>/dev/null
 
-# Turned off, the console's API is not there, and Jolokia still is.
+# The console's pages in a browser (console/e2e), when the console's
+# packages are installed: SARANGA_E2E=0 skips them.
+CONSOLE="$ROOT/console"
+if [[ "${SARANGA_E2E:-1}" != 0 && -d "$CONSOLE/node_modules" ]]; then
+  for q in orders.eu orders.us invoices; do
+    "$SARANGA" producer --destination "queue://$q" --url "tcp://127.0.0.1:$CORE_PORT" \
+      --user admin --password secret --message-count 20 --silent > /dev/null 2>&1
+  done
+  "$SARANGA" consumer --destination queue://invoices --url "tcp://127.0.0.1:$CORE_PORT" \
+    --user admin --password secret --message-count 1 --receive-timeout 600000 --sleep 600000 \
+    > /dev/null 2>&1 &
+  E2E_CONSUMER=$!
+  for _ in $(seq 1 50); do
+    curl -s -u admin:secret "http://127.0.0.1:$WEB_PORT/saranga/api/v1/consumers" | grep -q invoices && break
+    sleep 0.2
+  done
+  (cd "$CONSOLE" && SARANGA_URL="http://127.0.0.1:$WEB_PORT" npx playwright test) || RESULT=1
+  kill "$E2E_CONSUMER" 2>/dev/null
+else
+  echo "skip the console's pages in a browser (no console/node_modules, or SARANGA_E2E=0)"
+fi
+
+# Turned off, the console and its API are not there, and Jolokia still is.
 stop
 # bin/artemis exports the profile's JAVA_ARGS; run takes their -D options.
 JAVA_ARGS_APPEND="-Dsaranga.console.enabled=false" start
-code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$WEB_PORT/saranga/api/v1/openapi.json")
-if [[ "$code" == 404 ]]; then
-  echo "ok   with saranga.console.enabled=false the API is not served"
-else
-  echo "FAIL with saranga.console.enabled=false the API answers $code"
-  RESULT=1
-fi
+for path in /saranga/api/v1/openapi.json /saranga/; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$WEB_PORT$path")
+  if [[ "$code" == 404 ]]; then
+    echo "ok   with saranga.console.enabled=false $path is not served"
+  else
+    echo "FAIL with saranga.console.enabled=false $path answers $code"
+    RESULT=1
+  fi
+done
 code=$(curl -s -o /dev/null -w '%{http_code}' -u admin:secret -H "Origin: http://localhost" \
   "http://127.0.0.1:$WEB_PORT/console/jolokia/version")
 if [[ "$code" == 200 ]]; then
