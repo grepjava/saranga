@@ -2538,6 +2538,11 @@ impl ServerSession {
         }
         let filter_string = filter.clone().filter(|f| !f.trim().is_empty());
         let filter = post_office.filters().create(filter.as_deref())?;
+        // Management closed the session (`closeSessionWithID`) while its
+        // protocol still holds it.
+        if self.closed {
+            return Err(BrokerError::consumer_on_closed_session(queue_name));
+        }
         let c = queue.config();
         if !browse_only && c.max_consumers != -1 && queue.consumer_count() >= c.max_consumers {
             return Err(BrokerError::max_consumer_limit_reached(&c.address, &c.name));

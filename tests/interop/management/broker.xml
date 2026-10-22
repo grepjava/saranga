@@ -8,7 +8,7 @@
       <persistence-enabled>true</persistence-enabled>
       <security-enabled>false</security-enabled>
       <acceptors>
-         <acceptor name="artemis">tcp://0.0.0.0:61616?protocols=CORE,AMQP</acceptor>
+         <acceptor name="artemis">tcp://0.0.0.0:61616?protocols=CORE,AMQP,STOMP,MQTT,OPENWIRE</acceptor>
       </acceptors>
       <address-settings>
          <address-setting match="#">

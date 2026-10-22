@@ -217,6 +217,8 @@ enum Event {
     /// The broker closed a subscription's consumer
     /// (`StompSession.disconnect`).
     Disconnected { consumer: i64 },
+    /// Management closed a session (`closeSessionWithID`).
+    CloseSession { name: String },
 }
 
 /// A reply, sent once the journal writes before it are done
@@ -471,7 +473,8 @@ impl DeliverySink for StompSink {
     }
 
     /// `StompSession.disconnect`: the client gets an ERROR frame and the
-    /// subscription goes.
+    /// subscription goes. A 1.2 ERROR closes the connection once sent
+    /// (`replySent`).
     fn disconnect(&self, consumer_id: i64, _reason: &str) {
         if self.subscription.closed.swap(true, Ordering::SeqCst) {
             return;
@@ -481,10 +484,13 @@ impl DeliverySink for StompSink {
         frame.set_body(format!(
             "consumer with ID {consumer_id} disconnected by server"
         ));
-        self.out.send(&frame);
+        let sent = self.out.send(&frame);
         let _ = self.events.send(Event::Disconnected {
             consumer: consumer_id,
         });
+        if sent && frame.needs_disconnect {
+            let _ = self.events.send(Event::Close);
+        }
     }
 }
 
@@ -609,6 +615,7 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
                 Some(Event::AutoAck { consumer, message }) => conn.auto_ack(consumer, message).await,
                 Some(Event::AutoAcked { tx, pending, result }) => conn.auto_acked(tx, pending, result),
                 Some(Event::Disconnected { consumer }) => conn.disconnected(consumer).await,
+                Some(Event::CloseSession { name }) => conn.close_session(&name).await,
                 Some(Event::Close) | None => break,
             },
             () = tokio::time::sleep_until(deadline), if !conn.closing => {
@@ -939,6 +946,7 @@ impl Connection {
         let broker = self.broker.clone();
         let client = self.client.clone();
         let (login, passcode) = (self.login.clone(), self.passcode.clone());
+        let events = self.events.clone();
         async move {
             let authenticated = match broker.security().cloned() {
                 None => Authenticated::default(),
@@ -967,6 +975,10 @@ impl Connection {
                 },
                 authenticated,
             );
+            let name = session.name().to_owned();
+            session.entry().set_closer(Box::new(move |_force| {
+                let _ = events.send(Event::CloseSession { name: name.clone() });
+            }));
             Ok(StompSession {
                 session,
                 sender: None,
@@ -1462,6 +1474,22 @@ impl Connection {
                     session.no_local -= 1;
                 }
                 session.session.close_consumer(consumer, false).await;
+            }
+        }
+    }
+
+    /// `ServerSessionImpl.close(failed = true)` for management: its
+    /// transaction rolls back and its consumers close. The connection keeps
+    /// the closed session, as `StompProtocolManager` does, so a later
+    /// SUBSCRIBE on it is refused (AMQ229232).
+    async fn close_session(&mut self, name: &str) {
+        for session in self.main.iter_mut().chain(self.transacted.values_mut()) {
+            if session.session.name() == name {
+                for sub in std::mem::take(&mut session.subscriptions).into_values() {
+                    sub.closed.store(true, Ordering::SeqCst);
+                }
+                session.no_local = 0;
+                session.session.close(true).await;
             }
         }
     }

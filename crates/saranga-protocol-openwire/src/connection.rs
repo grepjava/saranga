@@ -323,6 +323,8 @@ enum Event {
     /// An address that stopped the connection's reads has room
     /// (`restoreAutoRead`).
     RestoreAutoRead,
+    /// Management closed a session (`closeSessionWithID`).
+    CloseSession { name: String },
 }
 
 /// A message a full address held back, sent once it has room.
@@ -728,6 +730,7 @@ pub async fn serve(broker: Arc<Broker>, manager: Arc<Manager>, c: Accepted) {
                 Some(Event::Acked { session, pending, result }) => conn.acked(&session, pending, result),
                 Some(Event::Released) => conn.send_released().await,
                 Some(Event::RestoreAutoRead) => conn.restore_auto_read(),
+                Some(Event::CloseSession { name }) => conn.close_server_session(&name).await,
             },
             _ = tick.tick() => {
                 if !conn.check_ttl() {
@@ -1325,7 +1328,9 @@ impl Connection {
     }
 
     fn new_session(&self, name: String, info: &ConnectionInfo) -> ServerSession {
-        ServerSession::new(
+        let events = self.events.clone();
+        let closed = name.clone();
+        let session = ServerSession::new(
             self.broker.clone(),
             self.client.clone(),
             SessionOptions {
@@ -1339,7 +1344,26 @@ impl Connection {
                 default_address: None,
             },
             self.authenticated.clone(),
-        )
+        );
+        session.entry().set_closer(Box::new(move |_force| {
+            let _ = events.send(Event::CloseSession {
+                name: closed.clone(),
+            });
+        }));
+        session
+    }
+
+    /// `ServerSessionImpl.close(failed = true)` for management: its
+    /// transaction rolls back and its consumers close (their disconnect
+    /// already failed the connection). `AMQSession.close` adds nothing, and
+    /// the connection keeps the closed session, so a later consumer on it is
+    /// refused (AMQ229232).
+    async fn close_server_session(&mut self, name: &str) {
+        for s in self.sessions.values_mut() {
+            if s.session.name() == name {
+                s.session.close(true).await;
+            }
+        }
     }
 
     fn connection_id(&self) -> Option<ConnectionId> {

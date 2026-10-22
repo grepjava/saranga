@@ -931,6 +931,269 @@ public class Management {
         }
     }
 
+    /** The session and connection of the one consumer on a queue. */
+    static String[] consumerSession(String q) throws Exception {
+        waitFor(() -> view("listConsumers", "queue", q).getInt("count") == 1, "the consumer on " + q);
+        String s = only(view("listConsumers", "queue", q), "consumer").getString("session");
+        String c = only(view("listSessions", "id", s), "session").getString("connectionID");
+        return new String[] {c, s};
+    }
+
+    /** Closes a session by management, and waits for it to go. */
+    static void closeSession(String[] cs) throws Exception {
+        eq(true, op("broker", "closeSessionWithID", cs[0], cs[1]), "closed");
+        waitFor(() -> view("listSessions", "id", cs[1]).getInt("count") == 0, "session gone");
+    }
+
+    static long messageCount(String q) throws Exception {
+        return longAttr("queue." + q, "MessageCount");
+    }
+
+    // AMQPSessionCallback.close: the consumer's link is detached
+    // (amqp:resource-deleted), then the session ended; the connection stays.
+    static void t_close_session_with_id_amqp() throws Exception {
+        String q = newQueue("close-session-amqp");
+        ConnectionFactory cf = new org.apache.qpid.jms.JmsConnectionFactory("amqp://" + host + ":" + port);
+        try (Connection c = cf.createConnection()) {
+            c.start();
+            Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            Queue queue = s.createQueue(q);
+            MessageConsumer consumer = s.createConsumer(queue);
+            closeSession(consumerSession(q));
+            // The detach and the end are on their way.
+            Thread.sleep(500);
+            try {
+                consumer.receiveNoWait();
+                throw new AssertionError("the client consumer is open");
+            } catch (javax.jms.IllegalStateException e) {
+                // Closed.
+            }
+            try {
+                s.createProducer(queue);
+                throw new AssertionError("the client session is open");
+            } catch (javax.jms.IllegalStateException e) {
+                // Closed.
+            }
+            Session again = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            again.createProducer(queue).send(again.createTextMessage("after"));
+            Message m = again.createConsumer(queue).receive(5000);
+            check(m != null, "the connection works after its session closed");
+        }
+    }
+
+    // AMQSession: closing a session with a consumer fails the connection
+    // (AMQSession.disconnect), so a client can fail over.
+    static void t_close_session_with_id_openwire_consumer() throws Exception {
+        String q = newQueue("close-session-ow");
+        java.util.concurrent.CountDownLatch failed = new java.util.concurrent.CountDownLatch(1);
+        ConnectionFactory cf = new org.apache.activemq.ActiveMQConnectionFactory("tcp://" + host + ":" + port);
+        Connection c = cf.createConnection();
+        try {
+            c.setExceptionListener(e -> failed.countDown());
+            c.start();
+            Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            s.createConsumer(s.createQueue(q));
+            closeSession(consumerSession(q));
+            check(failed.await(10, java.util.concurrent.TimeUnit.SECONDS), "the client saw no failure");
+        } finally {
+            try {
+                c.close();
+            } catch (JMSException e) {
+                // Failed already.
+            }
+        }
+    }
+
+    // Without consumers the connection stays; the closed session takes no
+    // consumer (AMQ229232) but still sends.
+    static void t_close_session_with_id_openwire() throws Exception {
+        String q = newQueue("close-session-ow");
+        String cid = name("cid");
+        ConnectionFactory cf = new org.apache.activemq.ActiveMQConnectionFactory("tcp://" + host + ":" + port);
+        try (Connection c = cf.createConnection()) {
+            c.setClientID(cid);
+            c.start();
+            Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            Queue queue = s.createQueue(q);
+            s.createProducer(queue).send(s.createTextMessage("before"));
+            String id = connectionId(cid);
+            String victim = null;
+            for (Object n : (Object[]) op("broker", "listSessions", id)) {
+                // The client's own: not the connection's (-1), nor Artemis's internal one.
+                if (((String) n).startsWith("ID:") && !((String) n).endsWith(":-1")) victim = (String) n;
+            }
+            check(victim != null, "no client session");
+            closeSession(new String[] {id, victim});
+            try {
+                s.createConsumer(queue);
+                throw new AssertionError("a consumer on the closed session");
+            } catch (JMSException e) {
+                check(String.valueOf(e.getMessage()).contains("AMQ229232"), "the refusal: " + e);
+            }
+            Session again = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            check(again.createConsumer(queue).receive(5000) != null, "the connection works after its session closed");
+        }
+    }
+
+    /** A STOMP 1.2 frame: its command, headers and body. */
+    record Frame(String command, Map<String, String> headers, String body) {}
+
+    static void stompWrite(java.io.OutputStream out, String command, String... headers) throws Exception {
+        StringBuilder b = new StringBuilder(command).append('\n');
+        for (String h : headers) b.append(h).append('\n');
+        b.append('\n').append('\0');
+        out.write(b.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        out.flush();
+    }
+
+    static Frame stompRead(java.io.InputStream in) throws Exception {
+        java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
+        int c;
+        while ((c = in.read()) != 0) {
+            if (c < 0) throw new java.io.EOFException("the connection closed");
+            if (b.size() == 0 && (c == '\n' || c == '\r')) continue;
+            b.write(c);
+        }
+        String[] parts = b.toString(java.nio.charset.StandardCharsets.UTF_8).split("\r?\n\r?\n", 2);
+        String[] lines = parts[0].split("\r?\n");
+        Map<String, String> h = new HashMap<>();
+        for (int i = 1; i < lines.length; i++) {
+            int colon = lines[i].indexOf(':');
+            h.putIfAbsent(lines[i].substring(0, colon), lines[i].substring(colon + 1));
+        }
+        return new Frame(lines[0], h, parts.length > 1 ? parts[1] : "");
+    }
+
+    // StompSession.disconnect: each subscription gets an ERROR, which in
+    // STOMP 1.2 closes the connection (replySent).
+    static void t_close_session_with_id_stomp() throws Exception {
+        stompCloseSession("1.2");
+    }
+
+    // In 1.1 the connection keeps the closed session, which still sends
+    // but takes no subscription (AMQ229232).
+    static void t_close_session_with_id_stomp11() throws Exception {
+        stompCloseSession("1.1");
+    }
+
+    static void stompCloseSession(String version) throws Exception {
+        String q = newQueue("close-session-stomp");
+        try (java.net.Socket sock = new java.net.Socket(host, port)) {
+            sock.setSoTimeout(10_000);
+            var in = new java.io.BufferedInputStream(sock.getInputStream());
+            var out = sock.getOutputStream();
+            stompWrite(out, "CONNECT", "accept-version:" + version, "host:localhost");
+            eq("CONNECTED", stompRead(in).command(), "connected");
+            stompWrite(out, "SUBSCRIBE", "id:1", "destination:" + q, "destination-type:ANYCAST", "receipt:sub");
+            eq("RECEIPT", stompRead(in).command(), "subscribed");
+            closeSession(consumerSession(q));
+            Frame error = stompRead(in);
+            eq("ERROR", error.command(), "the subscription's end");
+            check(error.body().startsWith("consumer with ID "), "the error: " + error.body());
+            if (version.equals("1.2")) {
+                try {
+                    Frame f = stompRead(in);
+                    throw new AssertionError("the connection is open: " + f);
+                } catch (java.io.EOFException | java.net.SocketException e) {
+                    return;
+                }
+            }
+            stompWrite(out, "SEND", "destination:" + q, "destination-type:ANYCAST", "receipt:send");
+            eq("RECEIPT", stompRead(in).command(), "sent on the closed session");
+            waitFor(() -> messageCount(q) == 1, "the message sent");
+            stompWrite(out, "SUBSCRIBE", "id:2", "destination:" + q, "destination-type:ANYCAST", "receipt:again");
+            Frame refused = stompRead(in);
+            // The cause (AMQ229232) is not sent.
+            eq("ERROR", refused.command(), "subscribing on the closed session");
+            eq("AMQ339016 Error creating subscription 2", refused.headers().get("message"), "the refusal");
+        }
+    }
+
+    static void mqttWrite(java.io.OutputStream out, int type, byte[] body) throws Exception {
+        java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
+        b.write(type);
+        int n = body.length;
+        do {
+            int d = n % 128;
+            n /= 128;
+            b.write(n > 0 ? d | 0x80 : d);
+        } while (n > 0);
+        b.write(body);
+        out.write(b.toByteArray());
+        out.flush();
+    }
+
+    /** The next packet: its type byte, then its body. */
+    static byte[] mqttRead(java.io.InputStream in) throws Exception {
+        int type = in.read();
+        if (type < 0) throw new java.io.EOFException("the connection closed");
+        int n = 0, shift = 0, d;
+        do {
+            d = in.read();
+            n |= (d & 0x7f) << shift;
+            shift += 7;
+        } while ((d & 0x80) != 0);
+        byte[] p = new byte[n + 1];
+        p[0] = (byte) type;
+        int at = 1;
+        while (at < p.length) at += in.read(p, at, p.length - at);
+        return p;
+    }
+
+    static byte[] mqttString(String s) {
+        byte[] u = s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] b = new byte[u.length + 2];
+        b[0] = (byte) (u.length >> 8);
+        b[1] = (byte) u.length;
+        System.arraycopy(u, 0, b, 2, u.length);
+        return b;
+    }
+
+    static byte[] mqttSubscribe(int packetId, String topic) throws Exception {
+        java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
+        b.write(packetId >> 8);
+        b.write(packetId);
+        b.write(mqttString(topic));
+        b.write(1);
+        return b.toByteArray();
+    }
+
+    // MQTTSessionCallback: the subscription's consumer goes and the client
+    // is not told, until it sends anything.
+    static void t_close_session_with_id_mqtt() throws Exception {
+        String topic = name("close-session-mqtt");
+        String cid = name("mqtt").replace('.', '-');
+        try (java.net.Socket sock = new java.net.Socket(host, port)) {
+            sock.setSoTimeout(10_000);
+            var in = new java.io.BufferedInputStream(sock.getInputStream());
+            var out = sock.getOutputStream();
+            java.io.ByteArrayOutputStream connect = new java.io.ByteArrayOutputStream();
+            connect.write(mqttString("MQTT"));
+            connect.write(new byte[] {4, 2, 0, 60});
+            connect.write(mqttString(cid));
+            mqttWrite(out, 0x10, connect.toByteArray());
+            eq(0x20, mqttRead(in)[0] & 0xff, "CONNACK");
+            mqttWrite(out, 0x82, mqttSubscribe(1, topic));
+            byte[] suback = mqttRead(in);
+            eq(0x90, suback[0] & 0xff, "SUBACK");
+            eq(1, (int) suback[3], "granted QoS");
+            waitFor(() -> view("listConsumers", "clientID", cid).getInt("count") == 1, "the subscription's consumer");
+            String s = only(view("listConsumers", "clientID", cid), "consumer").getString("session");
+            String c = only(view("listSessions", "id", s), "session").getString("connectionID");
+            closeSession(new String[] {c, s});
+            eq(0, view("listConsumers", "clientID", cid).getInt("count"), "consumers left");
+            // MQTTProtocolHandler.channelRead: any packet on a closed
+            // session disconnects (AMQ834015).
+            mqttWrite(out, 0xc0, new byte[0]);
+            try {
+                byte[] p = mqttRead(in);
+                throw new AssertionError("a packet after the session closed: " + (p[0] & 0xff));
+            } catch (java.io.EOFException | java.net.SocketException e) {
+                // Disconnected.
+            }
+        }
+    }
+
     /** A JMS connection that reports its failure. */
     static Connection failing(String clientId, String user, java.util.concurrent.CountDownLatch failed) throws Exception {
         Connection c = user == null ? coreJms().createConnection() : coreJms().createConnection(user, "p");

@@ -168,6 +168,8 @@ enum Event {
     /// The broker disconnected a consumer (`MQTTSessionCallback.disconnect`):
     /// it goes (`removeItself`).
     Disconnect { consumer: i64 },
+    /// Management closed the session (`closeSessionWithID`).
+    CloseSession { name: String },
 }
 
 /// A packet handler's failure.
@@ -1647,6 +1649,19 @@ impl Conn {
                     }
                     self.disconnect(true).await;
                 }
+                // Management closed the session (`closeSessionWithID`).
+                Ok(packet) if self.core.as_ref().is_some_and(|c| c.session.is_closed()) => {
+                    let client_id = self.core.as_ref().map(|c| c.client_id.clone());
+                    tracing::error!(
+                        "AMQ834015: Unable to handle MQTT packet [{}] from {}. Internal session is closed.",
+                        packet.name(),
+                        client_id.as_deref().unwrap_or("null")
+                    );
+                    if self.v5() {
+                        self.send_disconnect(reason::IMPLEMENTATION_SPECIFIC_ERROR);
+                    }
+                    self.disconnect(true).await;
+                }
                 Ok(Packet::PingReq) => self.send(codec::pingresp()),
                 Ok(packet) => self.act(packet).await,
             }
@@ -1857,6 +1872,13 @@ impl Conn {
             }
             Event::Discard { packet_id } => core.acknowledge_delivery(packet_id, false).await,
             Event::Disconnect { consumer } => core.session.close_consumer(consumer, false).await,
+            // `ServerSessionImpl.close(failed = true)`: the client is not
+            // told (`MQTTSessionCallback` has no close) until it sends a
+            // packet, which disconnects it (AMQ834015).
+            Event::CloseSession { name } if core.session.name() == name => {
+                core.session.close(true).await;
+            }
+            Event::CloseSession { .. } => {}
         }
         core.flush();
     }
@@ -2048,6 +2070,10 @@ impl Conn {
             },
             authenticated,
         );
+        let (events, name) = (self.events.clone(), session.name().to_owned());
+        session.entry().set_closer(Box::new(move |_force| {
+            let _ = events.send(Event::CloseSession { name: name.clone() });
+        }));
         session.set_started(true).await;
         let props = &connect.properties;
         let receive_maximum = if version == Version::V5 {

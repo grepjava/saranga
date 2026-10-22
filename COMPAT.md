@@ -173,7 +173,6 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **Connection IDs** are eight random hex digits, as Netty's short channel IDs look, but not Netty's.
 - **Dates** of the prepared transactions and the message counters are written as `DateFormat`'s short date and medium time write them in the `en_US` locale, where Artemis uses the JVM's locale. They are in the local time zone, as Artemis's are.
 - **`proxyAddress` and `proxyProtocolVersion`** are always empty: Saranga does not take the PROXY protocol.
-- **`closeSessionWithID`** closes Core sessions only. For a session of another protocol it returns false; Artemis closes the server side of any session.
 - **A STOMP consumer closed by management** is removed from its session after the `ERROR` frame. Artemis drops the subscription but leaves the server consumer in place.
 - **`getRoles` and `getRolesAsJSON`** list roles in the order the setting gives them. Artemis lists them in `HashSet` order.
 - **`listUser`** lists users and each user's roles in the order Java's `HashMap` and `HashSet` iterate them, as Artemis does. For a basic security manager the users are first put in name order; Artemis puts them in the order of its own map of the journal's users, so a long list can come out in a different order.

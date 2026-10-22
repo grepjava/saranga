@@ -116,6 +116,15 @@ impl BrokerError {
         )
     }
 
+    /// `cannotCreateConsumerOnClosedSession`.
+    pub fn consumer_on_closed_session(queue: &str) -> Self {
+        Self::bundle(
+            ErrorType::IllegalState,
+            229232,
+            format!("Cannot create consumer on {queue}. Session is closed."),
+        )
+    }
+
     pub fn duplicate_metadata(key: &str, data: &str) -> Self {
         Self::bundle(
             ErrorType::DuplicateMetadata,

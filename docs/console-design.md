@@ -26,7 +26,11 @@ The pieces the console builds on are already there:
   - `addConnector` and `removeConnector`.
 
   A page that needs one of these gets it implemented as Artemis implements it, in the same stage. No button is ever shown for something the broker cannot do.
-- **Gaps found while building.** `closeSessionWithID` closes only Core sessions: for STOMP, AMQP, MQTT and OpenWire it answers false (COMPAT.md), while Artemis closes the server side of any session. Artemis's console can close any session, so Stage 3 implements it for every protocol.
+- **Gaps found while building.** `closeSessionWithID` closed only Core sessions: for STOMP, AMQP, MQTT and OpenWire it answered false, while Artemis closes the server side of any session. Artemis's console can close any session, so Stage 3 implemented it for every protocol, as Artemis does: the session's consumers are disconnected and it closes as failed, then
+  - AMQP ends the session (End), after detaching its consumers' links with `amqp:resource-deleted`; the connection stays;
+  - STOMP sends each subscription an ERROR, which closes a 1.2 connection; a 1.0 or 1.1 connection keeps the closed session, which still sends but refuses a SUBSCRIBE (AMQ229232, under AMQ339016);
+  - MQTT tells the client nothing, and disconnects it at its next packet (AMQ834015);
+  - OpenWire fails the connection if the session had consumers; otherwise the closed session refuses new consumers (AMQ229232).
 
 ## What Artemis's console does (parity checklist)
 

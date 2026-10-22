@@ -365,6 +365,8 @@ enum Event {
     TopUp { channel: u16, handle: u32, id: u64 },
     /// A receiver's drain or stop took longer than its quiesce timeout.
     Quiesce { channel: u16, handle: u32, id: u64 },
+    /// Management closed a session (`closeSessionWithID`).
+    CloseSession { name: String },
 }
 
 /// What a federation asks of one of its receivers.
@@ -862,6 +864,10 @@ struct Conn {
     sessions: HashMap<u16, Session>,
     /// The peer's channels, and this end's for them.
     channels: HashMap<u16, u16>,
+    /// This end's channels whose sessions it ended (management closed
+    /// them), waiting for the peer's End: what else comes on them is
+    /// dropped, and they are not reused until then.
+    ending: std::collections::HashSet<u16>,
     txns: HashMap<Vec<u8>, Txn>,
     /// Temporary addresses of dynamic targets, removed with their links.
     temp_addresses: Vec<String>,
@@ -997,6 +1003,7 @@ where
         last_write: Instant::now(),
         sessions: HashMap::new(),
         channels: HashMap::new(),
+        ending: std::collections::HashSet::new(),
         txns: HashMap::new(),
         temp_addresses: Vec::new(),
         closed: false,
@@ -1265,9 +1272,7 @@ impl Conn {
 
     /// Begins a session from this end, on the lowest free channel.
     async fn begin_local(&mut self) -> u16 {
-        let channel = (0..=CHANNEL_MAX)
-            .find(|c| !self.sessions.contains_key(c))
-            .unwrap_or(CHANNEL_MAX);
+        let channel = self.free_channel();
         let mut session = self.new_session(0, WINDOW);
         session.server.set_started(true).await;
         self.sessions.insert(channel, session);
@@ -1501,6 +1506,14 @@ impl Conn {
         // The peer's channel, and this end's for it.
         let remote = f.channel;
         let local = self.channels.get(&remote).copied();
+        if let Some(ch) = local.filter(|ch| self.ending.contains(ch)) {
+            // A session this end ended: only the peer's End counts.
+            if matches!(perf, Performative::End(_)) {
+                self.channels.remove(&remote);
+                self.ending.remove(&ch);
+            }
+            return Ok(());
+        }
         let unknown = |what: &str| {
             Fatal::new(
                 condition::ILLEGAL_STATE,
@@ -1669,6 +1682,10 @@ impl Conn {
         if self.outgoing.is_some() {
             server.set_internal();
         }
+        let (events, name) = (self.events.clone(), server.name().to_owned());
+        server.entry().set_closer(Box::new(move |_force| {
+            let _ = events.send(Event::CloseSession { name: name.clone() });
+        }));
         Session {
             server,
             next_outgoing_id: 1,
@@ -1707,9 +1724,7 @@ impl Conn {
             self.channels.insert(remote, local);
             return Ok(());
         }
-        let channel = (0..=CHANNEL_MAX)
-            .find(|c| !self.sessions.contains_key(c))
-            .unwrap_or(CHANNEL_MAX);
+        let channel = self.free_channel();
         let mut session = self.new_session(begin.next_outgoing_id, begin.incoming_window);
         // AMQPSessionCallback.init starts the session.
         session.server.set_started(true).await;
@@ -1727,6 +1742,43 @@ impl Conn {
             }),
         );
         Ok(())
+    }
+
+    /// The lowest channel with no session, nor one ending.
+    fn free_channel(&self) -> u16 {
+        (0..=CHANNEL_MAX)
+            .find(|c| !self.sessions.contains_key(c) && !self.ending.contains(c))
+            .unwrap_or(CHANNEL_MAX)
+    }
+
+    /// `AMQPSessionCallback.close` for management (`closeSessionWithID`,
+    /// after its consumers' links were detached): `AMQPSessionContext.close`
+    /// closes the session's links here without detaching them, its server
+    /// session closes as failed, and the peer is sent End.
+    async fn close_session(&mut self, name: &str) {
+        let Some(channel) = self
+            .sessions
+            .iter()
+            .find(|(_, s)| s.server.name() == name)
+            .map(|(c, _)| *c)
+        else {
+            return;
+        };
+        let Some(mut s) = self.sessions.remove(&channel) else {
+            return;
+        };
+        let handles: Vec<u32> = s.links.keys().copied().collect();
+        for h in handles {
+            if let Some(l) = s.links.remove(&h) {
+                self.close_link(&mut s, l, false).await;
+            }
+        }
+        s.server.close(true).await;
+        if self.closed {
+            return;
+        }
+        self.ending.insert(channel);
+        self.send(channel, Performative::End(End::default()));
     }
 
     async fn on_end(&mut self, channel: u16, _end: End) -> Handled {
@@ -4157,6 +4209,10 @@ impl Conn {
             }
             Event::Open(link) => {
                 self.open_local(*link);
+                Ok(())
+            }
+            Event::CloseSession { name } => {
+                self.close_session(&name).await;
                 Ok(())
             }
             Event::Fail(reason) => {
