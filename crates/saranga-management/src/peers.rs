@@ -8,6 +8,12 @@
 //! [`IDLE`], or when its connection fails. Requests on a link go one at a
 //! time, each with a correlation ID, so a reply that comes after its request
 //! gave up is not taken for the next one's.
+//!
+//! A queue's messages are browsed with a browser on the link's session, as
+//! a client browses them: management messages have no `browse` whose answer
+//! is not Java-serialized (`CompositeData`), so this is how a page of them,
+//! with their bodies, comes from an Artemis node too. The user then needs
+//! the `browse` permission on that queue there.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -20,6 +26,7 @@ use saranga_core_protocol::transport::TransportConfiguration;
 use saranga_server::Broker;
 use saranga_server::management::json::Json;
 use saranga_server::management::requestor::{RequestError, Requestor};
+use saranga_server::management::{Composed, composite};
 use sha2::{Digest, Sha256};
 
 use crate::api::Problem;
@@ -168,7 +175,19 @@ pub(crate) enum Request<'a> {
         resource: &'a str,
         name: &'a str,
     },
+    /// The messages of a queue after the first `skip`, at most `take`, as
+    /// `QueueControl.browse` writes them.
+    Browse {
+        queue: &'a str,
+        filter: Option<&'a str>,
+        skip: usize,
+        take: usize,
+    },
 }
+
+/// How long a browser waits for a message more before it takes the queue
+/// to have no more.
+const BROWSE_WAIT: Duration = Duration::from_secs(1);
 
 impl Peers {
     /// One request to a node, as the user: its result, or why there is
@@ -194,6 +213,25 @@ impl Peers {
                 arguments,
             } => r.invoke(resource, operation, arguments, TIMEOUT).await,
             Request::Attribute { resource, name } => r.attribute(resource, name, TIMEOUT).await,
+            Request::Browse {
+                queue,
+                filter,
+                skip,
+                take,
+            } => {
+                let browsed = browse(r.session(), queue, filter, skip, take).await;
+                drop(guard);
+                *link.used.lock().unwrap() = Instant::now();
+                return browsed.map_err(|e| match e.kind() {
+                    Some(ErrorType::SecurityException) => client_problem(node, &e, false),
+                    Some(ErrorType::QueueDoesNotExist) => Problem::new(
+                        StatusCode::NOT_FOUND,
+                        format!("no such resource: queue.{queue}"),
+                    ),
+                    Some(_) => Problem::new(StatusCode::BAD_REQUEST, e.to_string()),
+                    None => unreachable(node, e),
+                });
+            }
         };
         drop(guard);
         *link.used.lock().unwrap() = Instant::now();
@@ -340,6 +378,50 @@ impl Peers {
         });
     }
 }
+
+/// A page of a queue's messages, as a client browses them, each written as
+/// the queue's `browse` writes a message.
+async fn browse(
+    session: &saranga_client::Session,
+    queue: &str,
+    filter: Option<&str>,
+    skip: usize,
+    take: usize,
+) -> saranga_client::Result<Json> {
+    let browser = session.create_consumer(queue, filter, true).await?;
+    let mut out = Vec::new();
+    let mut seen = 0;
+    let read = async {
+        while out.len() < take {
+            let Some(d) = browser.receive(BROWSE_WAIT).await? else {
+                break;
+            };
+            seen += 1;
+            if seen <= skip {
+                continue;
+            }
+            out.push(composite(
+                &d.message,
+                &Composed {
+                    protocol: None,
+                    redelivered: d.delivery_count > 1,
+                    large: d.is_large(),
+                    persistent_size: i64::from(d.encode_size()),
+                },
+                MESSAGE_ATTRIBUTE_LIMIT,
+            ));
+        }
+        saranga_client::Result::Ok(())
+    }
+    .await;
+    browser.close().await;
+    read?;
+    Ok(Json::Array(out))
+}
+
+/// `management-message-attribute-size-limit`'s default: how much of a body
+/// or a property a browsed message shows.
+const MESSAGE_ATTRIBUTE_LIMIT: i32 = 256;
 
 fn unreachable(node: &str, why: impl std::fmt::Display) -> Problem {
     Problem::of_node(

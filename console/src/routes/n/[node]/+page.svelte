@@ -8,14 +8,23 @@
 	import BrokerParts from '#lib/components/BrokerParts.svelte';
 	import LiveChart from '#lib/components/LiveChart.svelte';
 	import { live } from '#lib/state/live.svelte.js';
-	import type { View } from '#lib/api/index.js';
+	import { ALL, type View } from '#lib/api/index.js';
+	import { goto } from '$app/navigation';
+	import { clusterHref } from '#lib/nav.js';
 	import type { PageProps } from './$types';
 
 	let { params }: PageProps = $props();
 
+	// Every node's overview is the cluster's page.
+	$effect(() => {
+		if (params.node === ALL) goto(clusterHref(ALL), { replaceState: true });
+	});
+
 	// The status, as the live stream reads it every tick.
 	const STATUS: View = { kind: 'broker' };
-	$effect(() => live.watch(STATUS));
+	$effect(() => {
+		if (params.node !== ALL) return live.watch(STATUS);
+	});
 	const status = $derived(live.value(STATUS));
 	const broker = $derived(
 		status?.value as { attributes: Record<string, unknown>; denied: string[] } | undefined
@@ -73,164 +82,167 @@
 	<title>Overview · Saranga console</title>
 </svelte:head>
 
-<div class="flex flex-col gap-6">
-	<div class="flex flex-wrap items-center gap-3">
-		<h1 class="text-xl font-semibold">{(a('Name') as string) ?? 'Overview'}</h1>
-		{#if attributes}
-			{#if yes('Backup')}
-				<Badge variant="secondary">Backup{yes('ReplicaSync') ? ', in sync' : ''}</Badge>
-			{:else if yes('Active')}
-				<Badge>Live</Badge>
-			{:else if a('Started') === false}
-				<Badge variant="destructive">Stopped</Badge>
+<!-- Every node's overview is the cluster's page, which the effect above goes to. -->
+{#if params.node !== ALL}
+	<div class="flex flex-col gap-6">
+		<div class="flex flex-wrap items-center gap-3">
+			<h1 class="text-xl font-semibold">{(a('Name') as string) ?? 'Overview'}</h1>
+			{#if attributes}
+				{#if yes('Backup')}
+					<Badge variant="secondary">Backup{yes('ReplicaSync') ? ', in sync' : ''}</Badge>
+				{:else if yes('Active')}
+					<Badge>Live</Badge>
+				{:else if a('Started') === false}
+					<Badge variant="destructive">Stopped</Badge>
+				{/if}
+				{#if num('UptimeMillis') !== undefined}
+					<span class="text-sm text-muted-foreground">
+						up {formatDuration(num('UptimeMillis')!)}
+					</span>
+				{/if}
 			{/if}
-			{#if num('UptimeMillis') !== undefined}
-				<span class="text-sm text-muted-foreground">
-					up {formatDuration(num('UptimeMillis')!)}
-				</span>
-			{/if}
+		</div>
+
+		{#if error}
+			<Alert.Root variant="destructive"><Alert.Description>{error}</Alert.Description></Alert.Root>
+		{/if}
+
+		<section class="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6" aria-label="Counters">
+			{#each counters as c (c.label)}
+				<Card.Root class="gap-1 py-4">
+					<Card.Header class="px-4">
+						<Card.Description>{c.label}</Card.Description>
+					</Card.Header>
+					<Card.Content class="px-4">
+						{#if !attributes}
+							<Skeleton class="h-7 w-16" />
+						{:else if c.value === undefined}
+							<span class="text-sm text-muted-foreground">Not permitted</span>
+						{:else if c.href}
+							<a class="text-2xl font-semibold tabular-nums hover:underline" href={c.href}>
+								{formatNumber(c.value)}
+							</a>
+						{:else}
+							<span class="text-2xl font-semibold tabular-nums">{formatNumber(c.value)}</span>
+						{/if}
+					</Card.Content>
+				</Card.Root>
+			{/each}
+		</section>
+
+		<div class="grid gap-3 lg:grid-cols-2">
+			<Card.Root>
+				<Card.Header>
+					<Card.Title>Memory and disk</Card.Title>
+				</Card.Header>
+				<Card.Content class="grid gap-4">
+					{@render meter(
+						'Address memory',
+						memoryPercent,
+						num('AddressMemoryUsage') !== undefined
+							? `${formatBytes(num('AddressMemoryUsage'))}${(num('GlobalMaxSize') ?? -1) > 0 ? ` of ${formatBytes(num('GlobalMaxSize'))}` : ''}`
+							: undefined
+					)}
+					{@render meter(
+						'Disk',
+						disk === undefined ? undefined : disk * 100,
+						num('MaxDiskUsage') !== undefined
+							? `blocks producers at ${num('MaxDiskUsage')}%`
+							: undefined
+					)}
+				</Card.Content>
+			</Card.Root>
+			<Card.Root>
+				<Card.Header>
+					<Card.Title>Broker</Card.Title>
+				</Card.Header>
+				<Card.Content>
+					<dl class="grid grid-cols-[auto_1fr] gap-x-6 gap-y-1.5 text-sm">
+						{#each facts as [k, v] (k)}
+							<dt class="text-muted-foreground">{k}</dt>
+							<dd class="truncate font-medium" title={v === undefined ? '' : String(v)}>
+								{#if !attributes}<Skeleton class="h-4 w-32" />{:else}{v ?? '—'}{/if}
+							</dd>
+						{/each}
+					</dl>
+				</Card.Content>
+			</Card.Root>
+		</div>
+
+		<section class="grid gap-3 lg:grid-cols-2" aria-label="Charts">
+			{@render chart('Connections and consumers', 'broker', [
+				{ name: 'ConnectionCount', label: 'Connections' },
+				{ name: 'TotalConsumerCount', label: 'Consumers' }
+			])}
+			{@render chart('Messages', 'broker', [{ name: 'TotalMessageCount', label: 'Messages' }])}
+			{@render chart(
+				'Messages per second',
+				'broker',
+				[
+					{ name: 'TotalMessagesAdded', label: 'Added' },
+					{ name: 'TotalMessagesAcknowledged', label: 'Acknowledged' }
+				],
+				true
+			)}
+			{@render chart(
+				'Address memory',
+				'broker',
+				[{ name: 'AddressMemoryUsage', label: 'Address memory' }],
+				false,
+				formatBytes
+			)}
+		</section>
+
+		<BrokerParts node={params.node} />
+
+		{#if denied.length}
+			<p class="text-xs text-muted-foreground">
+				Your role may not read: {denied.join(', ')}.
+			</p>
 		{/if}
 	</div>
 
-	{#if error}
-		<Alert.Root variant="destructive"><Alert.Description>{error}</Alert.Description></Alert.Root>
-	{/if}
-
-	<section class="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6" aria-label="Counters">
-		{#each counters as c (c.label)}
-			<Card.Root class="gap-1 py-4">
-				<Card.Header class="px-4">
-					<Card.Description>{c.label}</Card.Description>
-				</Card.Header>
-				<Card.Content class="px-4">
-					{#if !attributes}
-						<Skeleton class="h-7 w-16" />
-					{:else if c.value === undefined}
-						<span class="text-sm text-muted-foreground">Not permitted</span>
-					{:else if c.href}
-						<a class="text-2xl font-semibold tabular-nums hover:underline" href={c.href}>
-							{formatNumber(c.value)}
-						</a>
-					{:else}
-						<span class="text-2xl font-semibold tabular-nums">{formatNumber(c.value)}</span>
-					{/if}
-				</Card.Content>
-			</Card.Root>
-		{/each}
-	</section>
-
-	<div class="grid gap-3 lg:grid-cols-2">
-		<Card.Root>
-			<Card.Header>
-				<Card.Title>Memory and disk</Card.Title>
+	{#snippet chart(
+		title: string,
+		resource: string,
+		series: { name: string; label: string }[],
+		rate = false,
+		format: (v: number) => string = rate ? formatRate : formatNumber
+	)}
+		<Card.Root class="gap-2 py-4">
+			<Card.Header class="px-4">
+				<Card.Title class="text-sm">{title}</Card.Title>
 			</Card.Header>
-			<Card.Content class="grid gap-4">
-				{@render meter(
-					'Address memory',
-					memoryPercent,
-					num('AddressMemoryUsage') !== undefined
-						? `${formatBytes(num('AddressMemoryUsage'))}${(num('GlobalMaxSize') ?? -1) > 0 ? ` of ${formatBytes(num('GlobalMaxSize'))}` : ''}`
-						: undefined
-				)}
-				{@render meter(
-					'Disk',
-					disk === undefined ? undefined : disk * 100,
-					num('MaxDiskUsage') !== undefined
-						? `blocks producers at ${num('MaxDiskUsage')}%`
-						: undefined
-				)}
+			<Card.Content class="px-4">
+				<LiveChart {resource} {series} {rate} {format} height={140} />
 			</Card.Content>
 		</Card.Root>
-		<Card.Root>
-			<Card.Header>
-				<Card.Title>Broker</Card.Title>
-			</Card.Header>
-			<Card.Content>
-				<dl class="grid grid-cols-[auto_1fr] gap-x-6 gap-y-1.5 text-sm">
-					{#each facts as [k, v] (k)}
-						<dt class="text-muted-foreground">{k}</dt>
-						<dd class="truncate font-medium" title={v === undefined ? '' : String(v)}>
-							{#if !attributes}<Skeleton class="h-4 w-32" />{:else}{v ?? '—'}{/if}
-						</dd>
-					{/each}
-				</dl>
-			</Card.Content>
-		</Card.Root>
-	</div>
+	{/snippet}
 
-	<section class="grid gap-3 lg:grid-cols-2" aria-label="Charts">
-		{@render chart('Connections and consumers', 'broker', [
-			{ name: 'ConnectionCount', label: 'Connections' },
-			{ name: 'TotalConsumerCount', label: 'Consumers' }
-		])}
-		{@render chart('Messages', 'broker', [{ name: 'TotalMessageCount', label: 'Messages' }])}
-		{@render chart(
-			'Messages per second',
-			'broker',
-			[
-				{ name: 'TotalMessagesAdded', label: 'Added' },
-				{ name: 'TotalMessagesAcknowledged', label: 'Acknowledged' }
-			],
-			true
-		)}
-		{@render chart(
-			'Address memory',
-			'broker',
-			[{ name: 'AddressMemoryUsage', label: 'Address memory' }],
-			false,
-			formatBytes
-		)}
-	</section>
-
-	<BrokerParts node={params.node} />
-
-	{#if denied.length}
-		<p class="text-xs text-muted-foreground">
-			Your role may not read: {denied.join(', ')}.
-		</p>
-	{/if}
-</div>
-
-{#snippet chart(
-	title: string,
-	resource: string,
-	series: { name: string; label: string }[],
-	rate = false,
-	format: (v: number) => string = rate ? formatRate : formatNumber
-)}
-	<Card.Root class="gap-2 py-4">
-		<Card.Header class="px-4">
-			<Card.Title class="text-sm">{title}</Card.Title>
-		</Card.Header>
-		<Card.Content class="px-4">
-			<LiveChart {resource} {series} {rate} {format} height={140} />
-		</Card.Content>
-	</Card.Root>
-{/snippet}
-
-{#snippet meter(name: string, percent: number | undefined, detail: string | undefined)}
-	<div class="grid gap-1.5">
-		<div class="flex items-baseline justify-between text-sm">
-			<span class="font-medium">{name}</span>
-			<span class="text-muted-foreground tabular-nums">
-				{percent === undefined ? '—' : `${percent.toFixed(percent < 10 ? 1 : 0)}%`}
-			</span>
-		</div>
-		<div
-			class="h-2 overflow-hidden rounded-full bg-muted"
-			role="meter"
-			aria-label={name}
-			aria-valuemin={0}
-			aria-valuemax={100}
-			aria-valuenow={percent ?? 0}
-		>
+	{#snippet meter(name: string, percent: number | undefined, detail: string | undefined)}
+		<div class="grid gap-1.5">
+			<div class="flex items-baseline justify-between text-sm">
+				<span class="font-medium">{name}</span>
+				<span class="text-muted-foreground tabular-nums">
+					{percent === undefined ? '—' : `${percent.toFixed(percent < 10 ? 1 : 0)}%`}
+				</span>
+			</div>
 			<div
-				class="h-full rounded-full bg-primary transition-[width] duration-500"
-				class:bg-warning={(percent ?? 0) >= 75}
-				class:bg-destructive={(percent ?? 0) >= 90}
-				style:width="{Math.min(100, Math.max(0, percent ?? 0))}%"
-			></div>
+				class="h-2 overflow-hidden rounded-full bg-muted"
+				role="meter"
+				aria-label={name}
+				aria-valuemin={0}
+				aria-valuemax={100}
+				aria-valuenow={percent ?? 0}
+			>
+				<div
+					class="h-full rounded-full bg-primary transition-[width] duration-500"
+					class:bg-warning={(percent ?? 0) >= 75}
+					class:bg-destructive={(percent ?? 0) >= 90}
+					style:width="{Math.min(100, Math.max(0, percent ?? 0))}%"
+				></div>
+			</div>
+			{#if detail}<span class="text-xs text-muted-foreground">{detail}</span>{/if}
 		</div>
-		{#if detail}<span class="text-xs text-muted-foreground">{detail}</span>{/if}
-	</div>
-{/snippet}
+	{/snippet}
+{/if}

@@ -7,7 +7,8 @@ describe('listings', () => {
 		const schemas = doc.components.schemas as Record<string, { properties?: object }>;
 		for (const kind of LISTING_KINDS) {
 			const name = kind.charAt(0).toUpperCase() + kind.slice(1) + 'Row';
-			const members = Object.keys(schemas[name].properties ?? {});
+			// A row's node, across every node, is a column of that table only.
+			const members = Object.keys(schemas[name].properties ?? {}).filter((m) => m !== 'node');
 			expect([...LISTINGS[kind].columns].sort(), kind).toEqual(members.sort());
 		}
 	});

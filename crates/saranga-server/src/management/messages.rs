@@ -131,6 +131,31 @@ fn property_text(v: &PropertyValue, limit: i32) -> String {
 pub(super) fn to_composite(r: &MessageRef, limit: i32) -> Json {
     let m = &r.message;
     let core = full_core(m);
+    composite(
+        &core,
+        &Composed {
+            protocol: Some(if m.native().is_some() { "AMQP" } else { "CORE" }),
+            redelivered: r.delivery_count > 1,
+            large: m.is_large(),
+            persistent_size: m.encode_size() as i64,
+        },
+        limit,
+    )
+}
+
+/// What a composite says of a message beside its content.
+pub struct Composed {
+    /// Its protocol, when known: a message a client received is Core
+    /// whatever it was sent as.
+    pub protocol: Option<&'static str>,
+    pub redelivered: bool,
+    pub large: bool,
+    pub persistent_size: i64,
+}
+
+/// A Core message as [`to_composite`] writes a queue's: for messages a
+/// client browsed, as the console browses another node's queue.
+pub fn composite(core: &CoreMessage, about: &Composed, limit: i32) -> Json {
     let names: Vec<String> = core
         .properties
         .entries()
@@ -167,10 +192,7 @@ pub(super) fn to_composite(r: &MessageRef, limit: i32) -> Json {
     };
     let mut items: Vec<(&str, Json)> = vec![
         ("messageID", Json::from(core.message_id.to_string())),
-        (
-            "protocol",
-            Json::from(if m.native().is_some() { "AMQP" } else { "CORE" }),
-        ),
+        ("protocol", about.protocol.map_or(Json::Null, Json::from)),
         (
             "userID",
             Json::from(
@@ -192,9 +214,9 @@ pub(super) fn to_composite(r: &MessageRef, limit: i32) -> Json {
         ("expiration", Json::from(core.expiration)),
         ("timestamp", Json::from(core.timestamp)),
         ("priority", Json::from(i32::from(core.priority))),
-        ("redelivered", Json::from(r.delivery_count > 1)),
-        ("largeMessage", Json::from(m.is_large())),
-        ("persistentSize", Json::from(m.encode_size() as i64)),
+        ("redelivered", Json::from(about.redelivered)),
+        ("largeMessage", Json::from(about.large)),
+        ("persistentSize", Json::from(about.persistent_size)),
         (
             "PropertiesText",
             Json::from(truncate(format!("{{{text}}}"), limit)),
@@ -261,7 +283,7 @@ pub(super) fn to_composite(r: &MessageRef, limit: i32) -> Json {
         ("type", Json::from(i32::from(core.message_type))),
     ];
     if core.message_type == message_type::TEXT {
-        let body = if m.is_large() {
+        let body = if about.large {
             "[large message]".to_owned()
         } else if core
             .properties
@@ -280,7 +302,7 @@ pub(super) fn to_composite(r: &MessageRef, limit: i32) -> Json {
         };
         items.push(("text", Json::from(body)));
     } else {
-        let body: &[u8] = if m.is_large() { &[] } else { &core.body };
+        let body: &[u8] = if about.large { &[] } else { &core.body };
         let n = if limit >= 0 {
             body.len().min(limit as usize)
         } else {

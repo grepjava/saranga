@@ -5,6 +5,8 @@
 
 import {
 	live as api,
+	currentNode,
+	LOCAL,
 	type Listing,
 	type Notification,
 	type Page,
@@ -26,8 +28,14 @@ export const KEPT = 1000;
 /** How long to wait before opening a stream the broker closed. */
 const RETRY_MS = 5000;
 
+/** A view of the node the pages show, unless it names one. */
+function scoped(view: View): View {
+	const node = currentNode();
+	return view.node !== undefined || node === LOCAL ? view : { ...view, node };
+}
+
 export function viewKey(view: View): string {
-	return JSON.stringify(view);
+	return JSON.stringify(scoped(view));
 }
 
 class Live {
@@ -159,7 +167,7 @@ class Live {
 		const w = this.#views.get(key);
 		if (w) w.count++;
 		else {
-			this.#views.set(key, { view, count: 1 });
+			this.#views.set(key, { view: scoped(view), count: 1 });
 			this.#schedule();
 		}
 		let done = false;

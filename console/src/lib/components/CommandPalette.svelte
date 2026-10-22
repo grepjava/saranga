@@ -11,12 +11,13 @@
 	import { api } from '#lib/api/index.js';
 	import { NAVIGATION } from '#lib/navigation.js';
 	import { addressHref, queueHref } from '#lib/nav.js';
+	import { nodes, ALL } from '#lib/state/nodes.svelte.js';
 	import { session } from '#lib/state/session.svelte.js';
 
 	let { node, open = $bindable(false) }: { node: string; open?: boolean } = $props();
 
 	let search = $state('');
-	let found = $state<{ kind: 'queues' | 'addresses'; name: string }[]>([]);
+	let found = $state<{ kind: 'queues' | 'addresses'; name: string; node: string }[]>([]);
 
 	function onkeydown(e: KeyboardEvent) {
 		if (e.key === 'k' && (e.metaKey || e.ctrlKey)) {
@@ -46,9 +47,19 @@
 				session.may('listAddresses') ? api.list('addresses', query).catch(() => null) : null
 			]);
 			if (stale) return;
+			// Across every node, each found on its node.
+			const at = (r: { node?: string }) => (r.node ? nodes.idOf(r.node) : node);
 			found = [
-				...(queues?.data ?? []).map((r) => ({ kind: 'queues' as const, name: r.name })),
-				...(addresses?.data ?? []).map((r) => ({ kind: 'addresses' as const, name: r.name }))
+				...(queues?.data ?? []).map((r) => ({
+					kind: 'queues' as const,
+					name: r.name,
+					node: at(r)
+				})),
+				...(addresses?.data ?? []).map((r) => ({
+					kind: 'addresses' as const,
+					name: r.name,
+					node: at(r)
+				}))
 			];
 		}, 200);
 		return () => {
@@ -63,8 +74,8 @@
 		f();
 	}
 
-	function show(kind: 'queues' | 'addresses', name: string) {
-		run(() => goto(kind === 'queues' ? queueHref(node, name) : addressHref(node, name)));
+	function show(kind: 'queues' | 'addresses', name: string, at: string) {
+		run(() => goto(kind === 'queues' ? queueHref(at, name) : addressHref(at, name)));
 	}
 </script>
 
@@ -76,23 +87,27 @@
 		<Command.Empty>Nothing matches.</Command.Empty>
 		{#if found.length}
 			<Command.Group heading="Found">
-				{#each found as f (f.kind + f.name)}
+				{#each found as f (f.kind + f.node + f.name)}
 					<Command.Item
-						value={`${f.kind} ${f.name}`}
+						value={`${f.kind} ${f.node} ${f.name}`}
 						keywords={[search]}
-						onSelect={() => show(f.kind, f.name)}
+						onSelect={() => show(f.kind, f.name, f.node)}
 					>
 						{#if f.kind === 'queues'}<InboxIcon />{:else}<WaypointsIcon />{/if}
 						<span class="truncate">{f.name}</span>
 						<span class="ml-auto text-xs text-muted-foreground">
-							{f.kind === 'queues' ? 'Queue' : 'Address'}
+							{f.kind === 'queues' ? 'Queue' : 'Address'}{node === ALL
+								? ` · ${nodes.find(f.node)?.name ?? f.node}`
+								: ''}
 						</span>
 					</Command.Item>
 				{/each}
 			</Command.Group>
 		{/if}
 		{#each NAVIGATION as group (group.label)}
-			{@const items = group.items.filter((i) => !i.needs || session.may(i.needs))}
+			{@const items = group.items.filter(
+				(i) => (!i.needs || session.may(i.needs)) && (node !== ALL || i.everyNode)
+			)}
 			{#if items.length}
 				<Command.Group heading={group.label}>
 					{#each items as item (item.title)}

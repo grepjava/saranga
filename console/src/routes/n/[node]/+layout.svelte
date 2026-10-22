@@ -9,12 +9,24 @@
 	import CommandPalette from '#lib/components/CommandPalette.svelte';
 	import ThemeMenu from '#lib/components/ThemeMenu.svelte';
 	import UserMenu from '#lib/components/UserMenu.svelte';
-	import { nodes } from '#lib/state/nodes.svelte.js';
+	import { nodes, ALL } from '#lib/state/nodes.svelte.js';
 	import { live } from '#lib/state/live.svelte.js';
-	import { eventsHref } from '#lib/nav.js';
+	import { setNode } from '#lib/api/index.js';
+	import { eventsHref, overviewHref } from '#lib/nav.js';
+	import { EVERY_NODE } from '#lib/navigation.js';
+	import { page } from '$app/state';
+	import { untrack } from 'svelte';
 	import type { LayoutProps } from './$types';
 
 	let { children, params }: LayoutProps = $props();
+
+	// The pages' calls go to the node they show: set before they are made,
+	// and the pages made again for another node.
+	setNode(untrack(() => params.node));
+	$effect.pre(() => setNode(params.node));
+	const node = $derived(nodes.find(params.node));
+	/** Across every node, only some pages have anything to show. */
+	const spans = $derived(params.node !== ALL || EVERY_NODE.includes(page.route.id ?? ''));
 
 	let palette = $state(false);
 
@@ -30,7 +42,7 @@
 		return () => live.stop();
 	});
 
-	const known = $derived(nodes.find(params.node) !== undefined);
+	const known = $derived(node !== undefined || !nodes.loaded);
 </script>
 
 <Sidebar.Provider>
@@ -102,8 +114,25 @@
 			</div>
 		</header>
 		<main class="min-w-0 flex-1 p-4 md:p-6">
-			{#if known}
-				{@render children()}
+			{#if known && spans}
+				{#if node?.error}
+					<p
+						class="mb-4 rounded-md border border-destructive/40 px-3 py-2 text-sm text-destructive"
+					>
+						{node.name} cannot be asked: {node.error}
+					</p>
+				{/if}
+				{#key params.node}
+					{@render children()}
+				{/key}
+			{:else if known}
+				<h1 class="text-lg font-semibold">This page shows one node</h1>
+				<p class="mt-1 text-sm text-muted-foreground">
+					Pick a node from the list on the left, or see <a
+						class="underline"
+						href={overviewHref(ALL)}>every node</a
+					>.
+				</p>
 			{:else}
 				<h1 class="text-lg font-semibold">No node {params.node}</h1>
 				<p class="mt-1 text-sm text-muted-foreground">Pick a node from the list on the left.</p>

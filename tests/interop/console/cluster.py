@@ -153,6 +153,17 @@ status, r = request("GET", f"/nodes/{N2}/resources/queue.only.node2/attributes?n
 check("some attributes of node 2's queue",
       status == 200 and r["attributes"]["MessageCount"].get("value") == 3
       and r["attributes"]["Paused"].get("value") is False, r)
+for node, name, count in ((N2, "only.node2", 3), (N3, "only.node3", 5)):
+    status, r = invoke(node, f"queue.{name}", "browse(int,int,java.lang.String)", [1, 10, ""])
+    check(f"browsing {ids[node]}'s queue, as its page does",
+          status == 200 and isinstance(r.get("result"), list) and len(r["result"]) == count, (status, r))
+    first = (r.get("result") or [{}])[0] if status == 200 else {}
+    check(f"with each message's body and properties",
+          bool(first.get("text")) and first.get("address") == name and "PropertiesText" in first, first)
+    status, r = invoke(node, f"queue.{name}", "countMessages()")
+    check(f"counting {ids[node]}'s queue", status == 200 and r.get("result") == count, (status, r))
+    status, r = invoke(node, f"queue.{name}", "countMessages(java.lang.String)", ["AMQPriority >= 0"])
+    check(f"counting {ids[node]}'s queue with a filter", status == 200 and r.get("result") == count, (status, r))
 status, r = invoke(N3, "queue.only.node3", "removeAllMessages()")
 check("an operation on node 3's queue", status == 200 and r["result"] == 5, r)
 status, r = request("GET", f"/nodes/{N3}/resources/queue.only.node3/attributes?name=MessageCount")

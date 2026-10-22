@@ -66,6 +66,18 @@ export function linkHref(
 	);
 }
 
+export function clusterHref(node: string): string {
+	return resolve('/n/[node]/cluster', { node });
+}
+
+export function haHref(node: string): string {
+	return resolve('/n/[node]/ha', { node });
+}
+
+export function federationHref(node: string): string {
+	return resolve('/n/[node]/federation', { node });
+}
+
 export function eventsHref(node: string, params?: URLSearchParams): string {
 	return withQuery(resolve('/n/[node]/events', { node }), params);
 }

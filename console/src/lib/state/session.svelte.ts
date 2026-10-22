@@ -1,6 +1,6 @@
 // Who is logged in, and what the broker's guard lets them do.
 
-import { api, onUnauthorized, ApiError, type Me } from '#lib/api/index.js';
+import { api, onUnauthorized, ApiError, currentNode, ALL, LOCAL, type Me } from '#lib/api/index.js';
 
 export type SessionState = 'unknown' | 'out' | 'in';
 
@@ -44,9 +44,17 @@ class Session {
 		}
 	}
 
-	/** Whether the guard lets the user call a broker operation. */
+	/**
+	 * Whether the guard lets the user call a broker operation. Another node's
+	 * guard decides when the operation is called, so the console offers it;
+	 * across every node, only the listings are offered.
+	 */
 	may(operation: string): boolean {
-		return this.me?.broker[operation] === true;
+		const node = currentNode();
+		const here = this.me?.broker[operation] === true;
+		if (node === LOCAL) return here;
+		if (node === ALL) return here && operation.startsWith('list');
+		return this.me !== null;
 	}
 }
 

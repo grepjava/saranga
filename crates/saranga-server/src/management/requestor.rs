@@ -186,6 +186,11 @@ impl Requestor {
         Ok(Reply { succeeded, result })
     }
 
+    /// The requestor's session, for what is not a management request.
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
     /// `ClientRequestor.close`: the reply queue is deleted.
     pub async fn close(self) {
         self.consumer.close().await;

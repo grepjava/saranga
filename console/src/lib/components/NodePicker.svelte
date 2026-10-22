@@ -2,11 +2,12 @@
 	import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js';
 	import * as Sidebar from '#lib/components/ui/sidebar/index.js';
 	import ServerIcon from '@lucide/svelte/icons/server';
+	import ServersIcon from '@lucide/svelte/icons/server-cog';
 	import ChevronsUpDownIcon from '@lucide/svelte/icons/chevrons-up-down';
 	import CheckIcon from '@lucide/svelte/icons/check';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { nodes } from '#lib/state/nodes.svelte.js';
+	import { nodes, ALL } from '#lib/state/nodes.svelte.js';
 
 	let { node }: { node: string } = $props();
 
@@ -38,7 +39,13 @@
 						<div class="grid flex-1 text-left text-sm leading-tight">
 							<span class="truncate font-medium">{shown?.name ?? node}</span>
 							<span class="truncate text-xs text-muted-foreground">
-								{shown?.backup ? 'Backup' : 'Live'}{shown?.version ? ` · ${shown.version}` : ''}
+								{#if node === ALL}
+									{nodes.members.length} nodes
+								{:else if shown?.error}
+									Not reachable
+								{:else}
+									{shown?.backup ? 'Backup' : 'Live'}{shown?.version ? ` · ${shown.version}` : ''}
+								{/if}
 							</span>
 						</div>
 						<ChevronsUpDownIcon class="ml-auto" />
@@ -48,12 +55,17 @@
 			<DropdownMenu.Content class="min-w-56" align="start">
 				<DropdownMenu.Label class="text-xs text-muted-foreground">Nodes</DropdownMenu.Label>
 				{#each nodes.list as n (n.id)}
+					{#if n.id === ALL}<DropdownMenu.Separator />{/if}
 					<DropdownMenu.Item onSelect={() => pick(n.id)}>
-						<ServerIcon />
+						{#if n.id === ALL}<ServersIcon />{:else}<ServerIcon />{/if}
 						<div class="grid">
-							<span>{n.name}</span>
-							{#if n.nodeID}
-								<span class="font-mono text-[0.7rem] text-muted-foreground">{n.nodeID}</span>
+							<span>{n.name}{n.local && nodes.members.length > 1 ? ' (this broker)' : ''}</span>
+							{#if n.error}
+								<span class="text-[0.7rem] text-destructive">Not reachable</span>
+							{:else if n.primary || n.nodeID}
+								<span class="font-mono text-[0.7rem] text-muted-foreground"
+									>{n.primary ?? n.nodeID}</span
+								>
 							{/if}
 						</div>
 						{#if n.id === node}<CheckIcon class="ml-auto" />{/if}

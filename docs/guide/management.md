@@ -184,12 +184,26 @@ Saranga has a console of its own at `/saranga/` on every `<web>` binding, built 
 - the explorer: every management resource with its attributes and operations, as Artemis's console shows the JMX tree. Writable attributes can be edited, numeric ones charted, and any operation called from a form typed by its parameters;
 - the diagram of the broker, its topology, its addresses and their queues;
 - the runtime: the process, its system properties and its threads;
+- the cluster: every node of this broker's cluster topology, Artemis or Saranga, is in the node picker, and every page shows the node picked. The pages ask that node as the logged-in user (see [The other nodes](#the-other-nodes)). **Every node** shows the six listings across the nodes, each row with its node;
+- the nodes' page: each node's status, read live, this broker's cluster connections, and each queue's messages and consumers on each node, where load balancing and redistribution show;
+- high availability: each node's HA policy, its backup and whether the backup is in sync, the lock coordinators, and forcing a node to fail over or freezing its replication (`forceFailover`, `freezeReplication`, as Artemis implements them);
+- bridges and connections: a node's broker connections (AMQP, with their bridges, federation and mirrors), core bridges and cluster connections, with their counters, each started or stopped;
 - a command palette (Ctrl+K) that goes to any page, queue or address;
 - light and dark themes, and preferences kept in the browser: the page size, which queues hold dead letters and expired messages (`^DLQ$` and `^ExpiryQueue$` by default, as in Artemis's console), how bytes read, the diagram's size and whether internal addresses show.
 
 A message sent with no user given is sent as the logged-in user, as on Artemis: management takes the caller's own login (`SecurityStoreImpl`), so the user needs the `send` permission on the address.
 
 What a user sees and may do follows the guard, as below: a page or an action the guard refuses is not offered. Each page's URL holds its filters and sort (`/saranga/#/n/local/queues?filter=name:CONTAINS:orders`), so it can be bookmarked or shared. Where Artemis's `console.war` is not installed, `/` goes to `/saranga/`.
+
+### The other nodes
+
+The console reaches the other nodes of the cluster as the cluster topology gives them, through the connector each one announces. It sends them management messages over Core (the `activemq.management` address), as `artemis queue stat --clustered` does, so an Artemis node answers them as a Saranga one does. It logs in to each node as the user logged in to the console, with the same password, which the console's session keeps in memory for as long as it lasts. Each node then checks that user itself: the user must exist there and be allowed to manage (`manage` on the management address, or the RBAC permissions of `management-message-rbac`). A node that does not know the user, or cannot be reached, says so on the page, and the other nodes go on.
+
+A queue's messages on another node are browsed as a client browses them, with a browser on the user's connection to it, so the user needs the `browse` permission on that queue there.
+
+So what another node lets the user do is known only when it is asked: the console offers its actions, and shows that node's error when it refuses one. The live data of another node comes every two seconds as this broker's does, but its charts start from the moment a page opens: the hour of history is this broker's only. The notifications on the events page are this broker's.
+
+Management messages do not give a resource's MBean name, and they cannot list a node's acceptors or broadcast groups, so the explorer of another node has neither.
 
 ### Its API
 
@@ -216,11 +230,19 @@ It calls the same MBeans as Jolokia and checks them the same way. The login is t
 | `PUT /events/{stream}` with `{"views": {"key": view}}` | sets what the stream watches: `{"kind": "broker"}` (the status), `{"kind": "topology"}`, `{"kind": "attributes", "resource", "names"}` or `{"kind": "listing", "listing", "query"}` (a page of a listing, its query as above) |
 | `GET /history?resource=broker&resource=queue.orders` | the last hour of the resources' counters: the broker's every two seconds, an address's or a queue's every 30 seconds |
 | `GET /notifications?since=N` | the last 1,000 management notifications, or those after the `N`th |
+| `GET /nodes` | this broker and the other nodes its cluster connections' topology has, with their node IDs, connectors, backups and cluster connections |
 | `GET /openapi.json` | the API as OpenAPI 3.1, without a login |
+
+Every request above but `/session`, `/views`, `/nodes`, `/events`, `/history`, `/notifications` and `/openapi.json` is served for another node too, at `/saranga/api/v1/nodes/{node}/...`, where `{node}` is a node ID from `GET /nodes` (`local` is this broker). It is sent to that node as management messages, as the user, and that node allows or refuses it: there, `/me` and `/me/can` answer `null` for what it decides when asked, and an operation's `allowed` is `null`. A node that is not in the topology is 404, one that cannot be reached 502 (504 when it does not answer), and one that refuses the user 403. At `/saranga/api/v1/nodes/all/{listing}` a listing spans every node: each row has its `node`, the rows are sorted and paged across the nodes, and `errors` names those that could not answer. A view of the live stream may name a `node` too, or `all` for a listing.
 
 A filter's `OPERATION` is one of `EQUALS`, `NOT_EQUALS`, `CONTAINS`, `NOT_CONTAINS`, `GREATER_THAN` and `LESS_THAN`, as in the `list*` operations. A request may log in with HTTP Basic instead of the session. A request that changes something, including the login, must carry the header `X-Saranga-Console: 1`, which a cross-site form cannot send. A failure comes back as `{"error", "status"}`, with status 401 (no login, or a wrong one), 403 (not permitted, or no header), 404 (nothing there), 429 (too many failed logins) or 400.
 
 ```bash
+# The cluster's nodes, then the queues of every node, fullest first
+curl -s -u admin:admin http://localhost:8161/saranga/api/v1/nodes
+curl -s -u admin:admin \
+  'http://localhost:8161/saranga/api/v1/nodes/all/queues?sort=messageCount&order=desc'
+
 # The queues that have consumers, busiest first
 curl -s -u admin:admin \
   'http://localhost:8161/saranga/api/v1/queues?filter=consumerCount:GREATER_THAN:0&sort=messageCount&order=desc'

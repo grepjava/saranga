@@ -284,6 +284,7 @@ fn failure(f: Failure) -> Response {
 }
 
 /// Why a request failed, for an answer or for a view of the live stream.
+#[derive(Debug)]
 pub(crate) struct Problem {
     pub status: StatusCode,
     pub message: String,
@@ -492,6 +493,25 @@ async fn peer_call(
     operation: &str,
     arguments: Vec<Json>,
 ) -> Result<Json, Problem> {
+    if let Some(queue) = resource.strip_prefix("queue.")
+        && bare(operation) == "browse"
+    {
+        let (filter, skip, take) = browse_arguments(&arguments)?;
+        return state
+            .peers
+            .request(
+                &state.broker.get(),
+                node,
+                &u.credentials(),
+                PeerRequest::Browse {
+                    queue,
+                    filter: filter.as_deref(),
+                    skip,
+                    take,
+                },
+            )
+            .await;
+    }
     state
         .peers
         .request(
@@ -505,6 +525,46 @@ async fn peer_call(
             },
         )
         .await
+}
+
+/// `management-browse-page-size`'s default: what `browse()` and
+/// `browse(filter)` show.
+const BROWSE_PAGE_SIZE: usize = 200;
+/// The most messages browsing another node's queue reads through.
+const MAX_BROWSE: usize = 100_000;
+
+/// A `browse` of another node's queue: its filter, and how many messages
+/// to skip and take, from `browse()`, `browse(filter)`, `browse(page,
+/// pageSize)` or `browse(page, pageSize, filter)`, pages from 1.
+fn browse_arguments(arguments: &[Json]) -> Result<(Option<String>, usize, usize), Problem> {
+    let bad = |m: &str| Problem::new(StatusCode::BAD_REQUEST, m);
+    let filter = |j: Option<&Json>| match j {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(Json::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(bad("a filter is a string")),
+    };
+    let number = |j: &Json| {
+        j.as_i64()
+            .or_else(|| j.as_str().and_then(|s| s.parse().ok()))
+            .filter(|n| *n >= 1)
+            .map(|n| n as usize)
+            .ok_or_else(|| bad("a page and its size are numbers from 1"))
+    };
+    let (filter, page, size) = match arguments {
+        [] => (None, 1, BROWSE_PAGE_SIZE),
+        [f] => (filter(Some(f))?, 1, BROWSE_PAGE_SIZE),
+        [p, s] => (None, number(p)?, number(s)?),
+        [p, s, f] => (filter(Some(f))?, number(p)?, number(s)?),
+        _ => return Err(bad("browse takes at most three arguments")),
+    };
+    let skip = (page - 1).saturating_mul(size);
+    if skip.saturating_add(size) > MAX_BROWSE {
+        return Err(bad(&format!(
+            "another node's queue is browsed through its first {MAX_BROWSE} messages"
+        )));
+    }
+    Ok((filter, skip, size))
 }
 
 /// An attribute of another node's resource, as the user.
@@ -1734,6 +1794,27 @@ mod tests {
         assert!(list_query(Some("filter=name")).is_err());
         assert!(list_query(Some("order=up")).is_err());
         assert!(list_query(Some("bogus=1")).is_err());
+    }
+
+    #[test]
+    fn browsing_another_node() {
+        let s = |v: &str| Json::from(v);
+        assert_eq!(browse_arguments(&[]).unwrap(), (None, 0, 200));
+        assert_eq!(
+            browse_arguments(&[s("a = 1")]).unwrap(),
+            (Some("a = 1".into()), 0, 200)
+        );
+        assert_eq!(
+            browse_arguments(&[Json::Long(3), Json::Long(10)]).unwrap(),
+            (None, 20, 10)
+        );
+        assert_eq!(
+            browse_arguments(&[Json::Long(2), Json::Long(5), s(" ")]).unwrap(),
+            (None, 5, 5)
+        );
+        assert!(browse_arguments(&[Json::Long(0), Json::Long(5)]).is_err());
+        assert!(browse_arguments(&[Json::Long(1000), Json::Long(1000)]).is_err());
+        assert_eq!(bare("browse(int,int,java.lang.String)"), "browse");
     }
 
     #[test]

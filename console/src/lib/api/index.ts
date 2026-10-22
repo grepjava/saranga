@@ -1,6 +1,10 @@
 // The console's API, typed from openapi.json (the broker's own document; see
 // api_schema.rs). Every call goes through `call`, which turns an error into
 // an ApiError and tells the session when the user is no longer logged in.
+//
+// The pages show one node, or every node: their calls go to it, at
+// /saranga/api/v1/nodes/{node}/..., unless they name another. The session,
+// the live stream, the history and the notifications are this broker's.
 
 import createClient from 'openapi-fetch';
 import type { components, paths } from './schema.js';
@@ -27,6 +31,8 @@ export interface Page<K extends Listing> {
 	count: number;
 	page: number;
 	size: number;
+	/** Across every node, those that could not answer. */
+	errors?: Schemas['NodeError'][];
 }
 
 export class ApiError extends Error {
@@ -39,6 +45,65 @@ export class ApiError extends Error {
 }
 
 const client = createClient<paths>({ baseUrl: '', credentials: 'same-origin' });
+
+const PREFIX = '/saranga/api/v1/';
+/** This broker, in the URL. */
+export const LOCAL = 'local';
+/** Every node, in the URL: only the listings span them. */
+export const ALL = 'all';
+/** The paths that are this broker's whatever node the pages show. */
+const UNSCOPED =
+	/^(?:(?:session|me|views|nodes|events|history|notifications|openapi\.json)$|events\/)/;
+/** A call names its node with this header, which never reaches the broker. */
+const NODE_HEADER = 'x-saranga-node';
+
+let shown = LOCAL;
+
+/** The node the pages show, which their calls go to. */
+export function setNode(node: string) {
+	shown = node;
+}
+
+export function currentNode(): string {
+	return shown;
+}
+
+/** The options of a call to another node than the one shown. */
+export function onNode(node: string | undefined): { headers?: Record<string, string> } {
+	return node === undefined ? {} : { headers: { [NODE_HEADER]: node } };
+}
+
+/** Where a call to an API path goes for a node: the same path for this broker. */
+export function scopedPath(path: string, node: string): string {
+	if (node === LOCAL || !path.startsWith(PREFIX)) return path;
+	const rest = path.slice(PREFIX.length);
+	if (UNSCOPED.test(rest)) return path;
+	return `${PREFIX}nodes/${encodeURIComponent(node)}/${rest}`;
+}
+
+client.use({
+	async onRequest({ request }) {
+		const node = request.headers.get(NODE_HEADER) ?? shown;
+		request.headers.delete(NODE_HEADER);
+		const url = new URL(request.url);
+		const path = scopedPath(url.pathname, node);
+		if (path === url.pathname) return request;
+		url.pathname = path;
+		// The body as bytes: a request copied with its body would stream it,
+		// which a browser does over HTTP/2 only.
+		const body =
+			request.method === 'GET' || request.method === 'HEAD'
+				? undefined
+				: await request.arrayBuffer();
+		return new Request(url, {
+			method: request.method,
+			headers: request.headers,
+			body,
+			credentials: request.credentials,
+			signal: request.signal
+		});
+	}
+});
 
 /** The header every request that changes something carries. */
 const mark = { 'X-Saranga-Console': '1' } as const;
@@ -80,14 +145,18 @@ export const api = {
 
 	me: () => call(client.GET('/saranga/api/v1/me')),
 
-	can: (checks: { resource: string; method: string }[]) =>
-		call(client.POST('/saranga/api/v1/me/can', { body: { checks } })).then((r) => r.results),
+	can: (checks: { resource: string; method: string }[], node?: string) =>
+		call(client.POST('/saranga/api/v1/me/can', { body: { checks }, ...onNode(node) })).then(
+			(r) => r.results
+		),
 
 	views: () => call(client.GET('/saranga/api/v1/views')),
 
-	broker: () => call(client.GET('/saranga/api/v1/broker')),
+	nodes: () => call(client.GET('/saranga/api/v1/nodes')),
 
-	list: <K extends Listing>(kind: K, q: ListQuery): Promise<Page<K>> =>
+	broker: (node?: string) => call(client.GET('/saranga/api/v1/broker', onNode(node))),
+
+	list: <K extends Listing>(kind: K, q: ListQuery, node?: string): Promise<Page<K>> =>
 		call(
 			// The six listings share one shape; the path's kind picks the row.
 			client.GET(`/saranga/api/v1/${kind}` as '/saranga/api/v1/queues', {
@@ -99,7 +168,8 @@ export const api = {
 						page: q.page,
 						size: q.size
 					}
-				}
+				},
+				...onNode(node)
 			})
 		) as Promise<Page<K>>,
 
@@ -125,6 +195,8 @@ export const api = {
 		)
 };
 
+export type Node = Schemas['Node'];
+export type NodeError = Schemas['NodeError'];
 export type ResourceSummary = Schemas['ResourceSummary'];
 export type Resource = Schemas['Resource'];
 export type Attribute = Schemas['Attribute'];
@@ -134,15 +206,17 @@ export type ResourceType = ResourceSummary['type'];
 
 /** The management resources (MBeans) and their operations. */
 export const resources = {
-	list: () => call(client.GET('/saranga/api/v1/resources')).then((r) => r.data),
+	list: (node?: string) =>
+		call(client.GET('/saranga/api/v1/resources', onNode(node))).then((r) => r.data),
 
 	get: (resource: string) =>
 		call(client.GET('/saranga/api/v1/resources/{resource}', { params: { path: { resource } } })),
 
-	attributes: (resource: string, names: string[]) =>
+	attributes: (resource: string, names: string[], node?: string) =>
 		call(
 			client.GET('/saranga/api/v1/resources/{resource}/attributes', {
-				params: { path: { resource }, query: { name: names } }
+				params: { path: { resource }, query: { name: names } },
+				...onNode(node)
 			})
 		).then((r) => r.attributes),
 
@@ -154,12 +228,21 @@ export const resources = {
 			})
 		).then((r) => r.previous),
 
-	/** An operation, by its signature when it is overloaded: `browse(int,int,java.lang.String)`. */
-	invoke: <T = unknown>(resource: string, operation: string, args: unknown[] = []): Promise<T> =>
+	/**
+	 * An operation, by its signature when it is overloaded:
+	 * `browse(int,int,java.lang.String)`; on the node shown, or another.
+	 */
+	invoke: <T = unknown>(
+		resource: string,
+		operation: string,
+		args: unknown[] = [],
+		node?: string
+	): Promise<T> =>
 		call(
 			client.POST('/saranga/api/v1/resources/{resource}/operations', {
 				params: { path: { resource }, header: mark },
-				body: { operation, arguments: args }
+				body: { operation, arguments: args },
+				...onNode(node)
 			})
 		).then((r) => r.result as T)
 };
@@ -181,10 +264,13 @@ export const live = {
 			})
 		),
 
+	/** The last hour of resources' counters: this broker keeps its own only. */
 	history: (resource: string[]) =>
-		call(client.GET('/saranga/api/v1/history', { params: { query: { resource } } })).then(
-			(r) => r.history
-		),
+		shown === LOCAL
+			? call(client.GET('/saranga/api/v1/history', { params: { query: { resource } } })).then(
+					(r) => r.history
+				)
+			: Promise.resolve<Record<string, Schemas['ResourceHistory']>>({}),
 
 	notifications: (since = 0) =>
 		call(client.GET('/saranga/api/v1/notifications', { params: { query: { since } } }))

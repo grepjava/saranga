@@ -15,8 +15,14 @@ import NetworkIcon from '@lucide/svelte/icons/network';
 import FolderTreeIcon from '@lucide/svelte/icons/folder-tree';
 import CpuIcon from '@lucide/svelte/icons/cpu';
 import BellIcon from '@lucide/svelte/icons/bell';
+import ServerCogIcon from '@lucide/svelte/icons/server-cog';
+import ShieldCheckIcon from '@lucide/svelte/icons/shield-check';
+import CableIcon from '@lucide/svelte/icons/cable';
 import {
+	clusterHref,
 	diagramHref,
+	federationHref,
+	haHref,
 	eventsHref,
 	explorerHref,
 	listingHref,
@@ -32,6 +38,8 @@ export interface NavItem {
 	/** The broker operation the page needs; without it the page is not offered. */
 	needs?: string;
 	keywords?: string[];
+	/** It shows every node at once: offered across every node. */
+	everyNode?: boolean;
 }
 
 export interface NavGroup {
@@ -54,9 +62,13 @@ function listing(kind: Listing, icon: Component, keywords: string[] = []): NavIt
 		icon,
 		href: (node) => listingHref(node, kind),
 		needs: LIST_OPERATIONS[kind],
-		keywords
+		keywords,
+		everyNode: true
 	};
 }
+
+/** The routes that show every node at once, which `all` offers. */
+export const EVERY_NODE = ['/n/[node]', '/n/[node]/[listing]', '/n/[node]/cluster', '/n/[node]/ha'];
 
 export const NAVIGATION: NavGroup[] = [
 	{
@@ -66,7 +78,8 @@ export const NAVIGATION: NavGroup[] = [
 				title: 'Overview',
 				icon: LayoutDashboardIcon,
 				href: overviewHref,
-				keywords: ['status', 'home']
+				keywords: ['status', 'home'],
+				everyNode: true
 			},
 			{
 				title: 'Diagram',
@@ -80,6 +93,31 @@ export const NAVIGATION: NavGroup[] = [
 				icon: BellIcon,
 				href: (node) => eventsHref(node),
 				keywords: ['notifications', 'feed', 'activemq.notifications']
+			}
+		]
+	},
+	{
+		label: 'Cluster',
+		items: [
+			{
+				title: 'Nodes',
+				icon: ServerCogIcon,
+				href: clusterHref,
+				keywords: ['cluster', 'topology', 'redistribution', 'load balancing'],
+				everyNode: true
+			},
+			{
+				title: 'High availability',
+				icon: ShieldCheckIcon,
+				href: haHref,
+				keywords: ['ha', 'backup', 'replication', 'failover', 'shared store', 'lock'],
+				everyNode: true
+			},
+			{
+				title: 'Bridges and connections',
+				icon: CableIcon,
+				href: federationHref,
+				keywords: ['bridges', 'federation', 'broker connections', 'mirror', 'amqp']
 			}
 		]
 	},

@@ -4,7 +4,8 @@
 # through their own bin/artemis. Node 1 is Saranga and serves the console;
 # node 2 is Saranga and node 3 Artemis 2.57.0 (Saranga where no Artemis
 # distribution is built). cluster.py checks the console's API on node 1 for
-# the other nodes: /nodes, /nodes/{node}/... and /nodes/all/....
+# the other nodes: /nodes, /nodes/{node}/... and /nodes/all/...; then, with
+# the console's packages installed, Playwright drives its cluster pages.
 #
 #   NODE3=saranga|artemis tests/interop/console/cluster.sh
 #
@@ -108,5 +109,14 @@ echo "the cluster formed (node 3 is $NODE3)"
 "$PYTHON" -I "$(native "$ROOT/tests/interop/console/cluster.py")" \
   "http://localhost:$WEB1" "$(native "$SARANGA")" "$U1" "$U2" "$U3"
 RESULT=$?
+
+# The console's cluster pages in a browser (console/e2e/cluster.e2e.ts), when
+# the console's packages are installed: SARANGA_E2E=0 skips them.
+CONSOLE="$ROOT/console"
+if [[ "${SARANGA_E2E:-1}" != 0 && -d "$CONSOLE/node_modules" ]]; then
+  (cd "$CONSOLE" && SARANGA_URL="http://localhost:$WEB1" SARANGA_CLUSTER=1     npx playwright test e2e/cluster.e2e.ts) || RESULT=1
+else
+  echo "skip the console's cluster pages in a browser (no console/node_modules, or SARANGA_E2E=0)"
+fi
 [[ $RESULT == 0 ]] || for i in "$N1" "$N2" "$N3"; do echo "--- $i"; tail -15 "$i/log/artemis.log"; done
 exit $RESULT

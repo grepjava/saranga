@@ -16,6 +16,7 @@
 	import type { Notification } from '#lib/api/index.js';
 	import { addressHref, eventsHref, hashQuery, queueHref } from '#lib/nav.js';
 	import { live } from '#lib/state/live.svelte.js';
+	import { nodes, LOCAL } from '#lib/state/nodes.svelte.js';
 	import { describe, typeTone } from '#lib/events.js';
 	import type { PageProps } from './$types';
 
@@ -80,6 +81,12 @@
 </svelte:head>
 
 <div class="flex flex-col gap-4">
+	{#if params.node !== LOCAL}
+		<p class="text-sm text-muted-foreground">
+			These are the notifications of {nodes.find(LOCAL)?.name ?? 'this broker'}, the broker you
+			logged in to: each broker sends its own.
+		</p>
+	{/if}
 	<div class="flex flex-wrap items-center justify-between gap-3">
 		<h1 class="text-xl font-semibold">Events</h1>
 		<div class="flex items-center gap-2">

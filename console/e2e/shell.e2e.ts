@@ -94,7 +94,7 @@ test('the command palette goes to pages and queues', async ({ page }) => {
 	await page.keyboard.press('Control+k');
 	const palette = page.getByRole('dialog');
 	await palette.getByRole('combobox').fill('connect');
-	await palette.getByRole('option', { name: 'Connections' }).click();
+	await palette.getByRole('option', { name: 'Connections', exact: true }).click();
 	await expect(page).toHaveURL(/#\/n\/local\/connections$/);
 
 	await page.keyboard.press('Control+k');
@@ -119,16 +119,16 @@ test('the theme follows the choice', async ({ page }) => {
 
 test('a viewer sees no close actions', async ({ page }) => {
 	await login(page, 'viewer', 'viewer');
-	await page.getByRole('link', { name: 'Connections' }).click();
-	const table = page.getByRole('table', { name: 'Connections' });
+	await page.getByRole('link', { name: 'Connections', exact: true }).click();
+	const table = page.getByRole('table', { name: 'Connections', exact: true });
 	await expect(table.getByRole('row').nth(1)).toBeVisible();
 	await expect(table.getByRole('checkbox')).toHaveCount(0);
 });
 
 test('admin closes a connection, once confirmed', async ({ page }) => {
 	await login(page);
-	await page.getByRole('link', { name: 'Connections' }).click();
-	const table = page.getByRole('table', { name: 'Connections' });
+	await page.getByRole('link', { name: 'Connections', exact: true }).click();
+	const table = page.getByRole('table', { name: 'Connections', exact: true });
 	const id = (await table.getByRole('row').nth(1).getByRole('cell').nth(1).textContent())!.trim();
 	await page.goto(`/saranga/#/n/local/connections?filter=connectionID:EQUALS:${id}`);
 	await expect(table.getByRole('row')).toHaveCount(2);

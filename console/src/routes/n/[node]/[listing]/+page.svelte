@@ -9,9 +9,11 @@
 	import { Switch } from '#lib/components/ui/switch/index.js';
 	import * as AlertDialog from '#lib/components/ui/alert-dialog/index.js';
 	import DataTable, { type Column, type Row } from '#lib/components/DataTable.svelte';
-	import { api, type Listing } from '#lib/api/index.js';
+	import * as Alert from '#lib/components/ui/alert/index.js';
+	import { api, ALL, type Listing, type NodeError } from '#lib/api/index.js';
 	import { LISTINGS, isListing, label, type ListingInfo } from '#lib/listings.js';
-	import { listingHref, linkHref, hashQuery } from '#lib/nav.js';
+	import { listingHref, linkHref, hashQuery, overviewHref } from '#lib/nav.js';
+	import { nodes } from '#lib/state/nodes.svelte.js';
 	import CreateAddress from '#lib/components/CreateAddress.svelte';
 	import CreateQueue from '#lib/components/CreateQueue.svelte';
 	import { MAX_PAGE_SIZE, parseQuery, queryParams, type ListQuery } from '#lib/query.js';
@@ -27,12 +29,32 @@
 	const info = $derived(kind ? (LISTINGS[kind] as unknown as ListingInfo<Listing>) : undefined);
 	const query = $derived(parseQuery(hashQuery(page.url), prefs.pageSize));
 
+	/** Across every node, each row names its node. */
+	const every = $derived(params.node === ALL);
+
 	let fields = $state<string[]>([]);
 	// The page loaded last, and the listing it is of: another listing's rows
 	// do not have this one's keys.
-	let loaded = $state<{ kind: Listing; rows: Row[]; count: number } | null>(null);
+	let loaded = $state<{
+		kind: Listing;
+		rows: Row[];
+		count: number;
+		errors: NodeError[];
+	} | null>(null);
 	const rows = $derived(loaded && loaded.kind === kind ? loaded.rows : []);
 	const count = $derived(loaded && loaded.kind === kind ? loaded.count : 0);
+	const nodeErrors = $derived(loaded && loaded.kind === kind ? loaded.errors : []);
+
+	/** A page's rows, a row's node shown by its name and kept by its ID. */
+	function received(p: { data: unknown[]; errors?: NodeError[] }): {
+		rows: Row[];
+		errors: NodeError[];
+	} {
+		const rows = (p.data as Row[]).map((r) =>
+			typeof r.node === 'string' ? { ...r, node: nodes.nameOf(r.node), nodeID: r.node } : r
+		);
+		return { rows, errors: p.errors ?? [] };
+	}
 	let loading = $state(false);
 	let error = $state<string | null>(null);
 	let tick = $state(0);
@@ -56,7 +78,7 @@
 			.list(kind, q)
 			.then((p) => {
 				if (stale) return;
-				loaded = { kind: listing, rows: p.data as unknown as Row[], count: p.count };
+				loaded = { kind: listing, count: p.count, ...received(p) };
 				error = null;
 			})
 			.catch((e: Error) => {
@@ -85,7 +107,7 @@
 		const p = listingPage(live.value(v));
 		if (!p) return;
 		untrack(() => {
-			loaded = { kind: listing, rows: p.data as unknown as Row[], count: p.count };
+			loaded = { kind: listing, count: p.count, ...received(p) };
 			error = null;
 		});
 	});
@@ -95,21 +117,28 @@
 	});
 
 	const shown = $derived(kind ? prefs.columns(kind) : []);
-	const columns = $derived<Column[]>(
-		shown.map((key) => ({
+	const NODE: Column = { key: 'node', label: 'Node', sortable: false };
+	const columns = $derived<Column[]>([
+		...(every ? [NODE] : []),
+		...shown.map((key) => ({
 			key,
 			label: label(key),
 			sortable: fields.includes(key),
 			identifier: key === 'id' || /ID$/.test(key)
 		}))
-	);
+	]);
 
-	/** A linked value leads to its page, or to the listing it names, filtered to it. */
+	/**
+	 * A linked value leads to its page, or to the listing it names, filtered
+	 * to it, on the row's node; a row's node to that node.
+	 */
 	function href(row: Row, column: Column): string | undefined {
+		const node = every && typeof row.nodeID === 'string' ? nodes.idOf(row.nodeID) : params.node;
+		if (column.key === 'node') return every ? overviewHref(node) : undefined;
 		const link = info?.links?.[column.key as never] as { kind: Listing; field: string } | undefined;
 		const value = row[column.key];
 		if (!link || value === '' || value === undefined || value === null) return undefined;
-		return linkHref(params.node, link, String(value));
+		return linkHref(node, link, String(value));
 	}
 	const allColumns = $derived(
 		(info?.columns ?? []).map((key) => ({ key, label: label(key as string) }))
@@ -126,7 +155,7 @@
 		const all: Row[] = [];
 		for (let p = 1; ; p++) {
 			const r = await api.list(kind, { ...query, page: p, size: MAX_PAGE_SIZE });
-			all.push(...(r.data as unknown as Row[]));
+			all.push(...received(r).rows);
 			if (all.length >= r.count || r.data.length === 0) return all;
 		}
 	}
@@ -187,13 +216,20 @@
 				{/if}
 			</div>
 		</div>
+		{#each nodeErrors as e (e.node)}
+			<Alert.Root variant="destructive">
+				<Alert.Description>
+					{nodes.nameOf(e.node)} could not answer: {e.error}
+				</Alert.Description>
+			</Alert.Root>
+		{/each}
 		<DataTable
 			label={info.title}
 			{columns}
 			{allColumns}
 			onColumns={(keys) => prefs.setColumns(kind, keys)}
 			{rows}
-			rowKey={(r) => info.key(r as never)}
+			rowKey={(r) => `${every ? `${r.nodeID}/` : ''}${info.key(r as never)}`}
 			{count}
 			{query}
 			{onquery}

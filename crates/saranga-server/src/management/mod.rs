@@ -15,6 +15,7 @@ mod connections;
 mod counters;
 pub use saranga_buffer::json;
 mod messages;
+pub use messages::{Composed, composite};
 mod queue;
 pub mod requestor;
 pub(crate) use queue::internal_prefix;
