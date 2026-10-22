@@ -56,6 +56,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/saranga/api/v1/nodes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** This broker and the others its cluster topology has */
+        get: operations["nodes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/saranga/api/v1/views": {
         parameters: {
             query?: never;
@@ -412,9 +429,9 @@ export interface components {
             user: string;
             roles: string[];
             /** @enum {string} */
-            guard: "management.xml" | "rbac";
+            guard: "management.xml" | "rbac" | "node";
             broker: {
-                [key: string]: boolean;
+                [key: string]: boolean | null;
             };
         };
         Checks: {
@@ -424,7 +441,24 @@ export interface components {
             }[];
         };
         CheckResults: {
-            results: boolean[];
+            results: (boolean | null)[];
+        };
+        NodeError: {
+            error: string;
+            status: number;
+            node: string;
+        };
+        Node: {
+            nodeID: string;
+            local: boolean;
+            primary: string | null;
+            backup: string | null;
+            backupGroup: string | null;
+            clusters: string[];
+        };
+        Nodes: {
+            local: string;
+            data: components["schemas"]["Node"][];
         };
         Broker: {
             attributes: {
@@ -446,12 +480,14 @@ export interface components {
             sessionCount: number;
             proxyAddress: string;
             proxyProtocolVersion: string;
+            node?: string;
         };
         ConnectionsPage: {
             data: components["schemas"]["ConnectionsRow"][];
             count: number;
             page: number;
             size: number;
+            errors?: components["schemas"]["NodeError"][];
         };
         /** @enum {string} */
         SessionsField: "id" | "connectionID" | "consumerCount" | "producerCount" | "user" | "validatedUser" | "protocol" | "clientID" | "localAddress" | "remoteAddress" | "creationTime";
@@ -464,12 +500,14 @@ export interface components {
             producerCount: number;
             connectionID: string;
             clientID: string;
+            node?: string;
         };
         SessionsPage: {
             data: components["schemas"]["SessionsRow"][];
             count: number;
             page: number;
             size: number;
+            errors?: components["schemas"]["NodeError"][];
         };
         /** @enum {string} */
         ConsumersField: "id" | "sequentialId" | "session" | "connection" | "queue" | "filter" | "address" | "user" | "validatedUser" | "protocol" | "clientID" | "localAddress" | "remoteAddress" | "queueType" | "browseOnly" | "creationTime" | "messagesInTransit" | "messagesInTransitSize" | "messagesDelivered" | "messagesDeliveredSize" | "messagesAcknowledged" | "messagesAcknowledgedAwaitingCommit" | "lastDeliveredTime" | "lastAcknowledgedTime" | "status";
@@ -496,12 +534,14 @@ export interface components {
             lastDeliveredTime: number;
             lastAcknowledgedTime: number;
             status: string;
+            node?: string;
         };
         ConsumersPage: {
             data: components["schemas"]["ConsumersRow"][];
             count: number;
             page: number;
             size: number;
+            errors?: components["schemas"]["NodeError"][];
         };
         /** @enum {string} */
         ProducersField: "id" | "name" | "session" | "connectionID" | "address" | "user" | "validatedUser" | "protocol" | "clientID" | "localAddress" | "remoteAddress" | "creationTime" | "msgSent" | "msgSizeSent" | "lastProducedMessageID";
@@ -520,12 +560,14 @@ export interface components {
             msgSent: number;
             msgSizeSent: number;
             lastProducedMessageID: string;
+            node?: string;
         };
         ProducersPage: {
             data: components["schemas"]["ProducersRow"][];
             count: number;
             page: number;
             size: number;
+            errors?: components["schemas"]["NodeError"][];
         };
         /** @enum {string} */
         AddressesField: "id" | "name" | "routingTypes" | "queueCount" | "internal" | "temporary" | "autoCreated" | "paused" | "currentDuplicateIdCacheSize" | "retroactiveResource" | "unroutedMessageCount" | "routedMessageCount" | "messageCount" | "numberOfBytesPerPage" | "addressLimitPercent" | "paging" | "numberOfPages" | "addressSize" | "maxPageReadBytes" | "maxPageReadMessages" | "prefetchPageBytes" | "prefetchPageMessages";
@@ -552,12 +594,14 @@ export interface components {
             prefetchPageMessages: string;
             numberOfBytesPerPage: string;
             paging: string;
+            node?: string;
         };
         AddressesPage: {
             data: components["schemas"]["AddressesRow"][];
             count: number;
             page: number;
             size: number;
+            errors?: components["schemas"]["NodeError"][];
         };
         /** @enum {string} */
         QueuesField: "id" | "name" | "consumerID" | "address" | "maxConsumers" | "filter" | "messageCount" | "consumerCount" | "deliveringCount" | "messagesAdded" | "messagesAcked" | "messagesExpired" | "routingType" | "user" | "autoCreated" | "durable" | "paused" | "persistedPause" | "temporary" | "purgeOnNoConsumers" | "messagesKilled" | "directDeliver" | "lastValue" | "exclusive" | "scheduledCount" | "lastValueKey" | "groupRebalance" | "groupRebalancePauseDispatch" | "groupBuckets" | "groupFirstKey" | "enabled" | "ringSize" | "consumersBeforeDispatch" | "delayBeforeDispatch" | "autoDelete" | "internalQueue";
@@ -597,12 +641,14 @@ export interface components {
             delayBeforeDispatch: string;
             autoDelete: string;
             internalQueue: string;
+            node?: string;
         };
         QueuesPage: {
             data: components["schemas"]["QueuesRow"][];
             count: number;
             page: number;
             size: number;
+            errors?: components["schemas"]["NodeError"][];
         };
         Views: {
             connections: {
@@ -691,7 +737,7 @@ export interface components {
                 type: string;
                 description: string;
             }[];
-            allowed: boolean;
+            allowed: boolean | null;
         };
         Resource: {
             resource: string;
@@ -728,6 +774,7 @@ export interface components {
             /** @enum {string} */
             listing?: "connections" | "sessions" | "consumers" | "producers" | "addresses" | "queues";
             query?: string;
+            node?: string;
         };
         Watch: {
             views: {
@@ -915,6 +962,35 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not logged in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    nodes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Nodes"];
                 };
             };
             /** @description Not logged in */

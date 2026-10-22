@@ -4,50 +4,18 @@
 
 use std::time::Duration;
 
-use anyhow::Context;
-use saranga_client::message::{JMS_REPLY_TO, new_message};
-use saranga_client::{
-    Consumer, MessageExt, PropertyValue, QueueConfiguration, Session, SessionOptions, message_type,
-};
+use saranga_client::SessionOptions;
 use saranga_server::management::json::Json;
+use saranga_server::management::requestor;
+pub use saranga_server::management::requestor::Reply;
 
 use super::jms::JmsConnection;
 
-/// `ManagementHelper.HDR_RESOURCE_NAME`.
-const HDR_RESOURCE_NAME: &str = "_AMQ_ResourceName";
-/// `ManagementHelper.HDR_OPERATION_NAME`.
-const HDR_OPERATION_NAME: &str = "_AMQ_OperationName";
-/// `ManagementHelper.HDR_ATTRIBUTE`.
-const HDR_ATTRIBUTE: &str = "_AMQ_Attribute";
-/// `ManagementHelper.HDR_OPERATION_SUCCEEDED`.
-const HDR_OPERATION_SUCCEEDED: &str = "_AMQ_OperationSucceeded";
-/// The management address the CLI uses.
-const MANAGEMENT_ADDRESS: &str = "activemq.management";
-
-/// A management reply: whether it succeeded, and its result.
-#[derive(Debug)]
-pub struct Reply {
-    pub succeeded: bool,
-    pub result: Option<Json>,
-}
-
-impl Reply {
-    /// `ManagementHelper.getResult(reply, String.class)`.
-    pub fn string(&self) -> String {
-        match &self.result {
-            None | Some(Json::Null) => "null".to_owned(),
-            Some(Json::String(s)) => s.clone(),
-            Some(other) => other.to_string(),
-        }
-    }
-}
+/// `ClientRequestor.request` waits for its reply as long as it takes.
+const FOREVER: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
 
 /// A session with a requestor on it.
-pub struct Requestor {
-    session: Session,
-    consumer: Consumer,
-    reply_queue: String,
-}
+pub struct Requestor(requestor::Requestor);
 
 impl Requestor {
     /// `doManagement`'s session (non-transacted, auto-acked) and
@@ -58,25 +26,8 @@ impl Requestor {
     }
 
     /// `ClientRequestor` on a session of its own.
-    pub async fn on(session: Session) -> anyhow::Result<Self> {
-        session.start().await?;
-        let reply_queue = format!(
-            "{MANAGEMENT_ADDRESS}.{}",
-            saranga_client::uuid::to_string(&saranga_client::uuid::time_based())
-        );
-        session
-            .create_queue(
-                QueueConfiguration::new(&reply_queue)
-                    .durable(false)
-                    .temporary(true),
-            )
-            .await?;
-        let consumer = session.create_consumer(&reply_queue, None, false).await?;
-        Ok(Self {
-            session,
-            consumer,
-            reply_queue,
-        })
+    pub async fn on(session: saranga_client::Session) -> anyhow::Result<Self> {
+        Ok(Self(requestor::Requestor::on(session).await?))
     }
 
     /// `putOperationInvocation`: the parameters, a JSON array, as the body.
@@ -86,7 +37,7 @@ impl Requestor {
         operation: &str,
         params: Vec<Json>,
     ) -> anyhow::Result<Reply> {
-        self.invoke_raw(resource, operation, Some(params)).await
+        Ok(self.0.invoke(resource, operation, params, FOREVER).await?)
     }
 
     /// An operation whose parameters may be `null` (no body text at all).
@@ -96,59 +47,20 @@ impl Requestor {
         operation: &str,
         params: Option<Vec<Json>>,
     ) -> anyhow::Result<Reply> {
-        let mut m = new_message(message_type::DEFAULT, false);
-        m.put_string_property(HDR_RESOURCE_NAME, resource)
-            .put_string_property(HDR_OPERATION_NAME, operation)
-            .set_text(params.map(|p| Json::Array(p).to_string()).as_deref());
-        self.request(m).await
+        Ok(self
+            .0
+            .invoke_raw(resource, operation, params, FOREVER)
+            .await?)
     }
 
     /// `putAttribute`.
     pub async fn attribute(&self, resource: &str, attribute: &str) -> anyhow::Result<Reply> {
-        let mut m = new_message(message_type::DEFAULT, false);
-        m.put_string_property(HDR_RESOURCE_NAME, resource)
-            .put_string_property(HDR_ATTRIBUTE, attribute)
-            .set_text(None);
-        self.request(m).await
-    }
-
-    async fn request(&self, mut m: saranga_client::CoreMessage) -> anyhow::Result<Reply> {
-        m.put_string_property(JMS_REPLY_TO, &self.reply_queue);
-        let producer = self
-            .session
-            .create_producer(Some(MANAGEMENT_ADDRESS))
-            .await?;
-        producer.send(m).await?;
-        producer.close();
-        let reply = loop {
-            if let Some(d) = self.consumer.receive(Duration::from_secs(3600)).await? {
-                break d;
-            }
-        };
-        // `ClientRequestor.request` leaves the reply unacknowledged; it
-        // goes with the reply queue.
-        let message = &reply.message;
-        let succeeded = matches!(
-            message.property(HDR_OPERATION_SUCCEEDED),
-            Some(PropertyValue::Bool(true))
-        );
-        // `getResults`: a JSON array, of which the result is the first.
-        let result = match message.text().context("management reply body")? {
-            Some(text) => match Json::parse(&text) {
-                Ok(Json::Array(mut items)) if !items.is_empty() => Some(items.swap_remove(0)),
-                Ok(_) => None,
-                Err(e) => anyhow::bail!("management reply: {e}"),
-            },
-            None => None,
-        };
-        Ok(Reply { succeeded, result })
+        Ok(self.0.attribute(resource, attribute, FOREVER).await?)
     }
 
     /// `ClientRequestor.close`: the reply queue is deleted.
     pub async fn close(self) {
-        self.consumer.close().await;
-        let _ = self.session.delete_queue(&self.reply_queue).await;
-        self.session.close().await;
+        self.0.close().await;
     }
 }
 

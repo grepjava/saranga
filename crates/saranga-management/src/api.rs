@@ -40,19 +40,22 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, FromRequestParts, Path, Request, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{any, delete, get, post, put};
 use saranga_security::audit;
 use saranga_server::Current;
 use saranga_server::management::json::Json;
 use saranga_server::management::view_fields;
+use tower::ServiceExt;
 
 use crate::console::{self, Auth, Console};
 use crate::jolokia::{Agent, Caller, Failure};
 use crate::live::{self, Live};
 use crate::mbean::{Bean, ObjectName};
+use crate::peers::{self, Credentials, Peers, Request as PeerRequest, Scope};
 use crate::rbac::Guard;
 use crate::{Peer, percent_decode};
 
@@ -134,10 +137,26 @@ pub(crate) struct ApiState {
     pub sessions: Console,
     /// The history and notifications every binding shares.
     pub live: Arc<Live>,
+    /// The links to the other nodes, which every binding shares.
+    pub peers: Arc<Peers>,
 }
 
 pub(crate) fn router(state: Arc<ApiState>) -> Router {
-    let api = Router::new()
+    // `/nodes/{node}/...` is the API again, for another node: the same
+    // routes, with the node the request is for.
+    let scoped = Router::new().nest(API, routes().with_state(state.clone()));
+    let api = routes()
+        .route("/nodes", get(nodes))
+        .route(
+            "/nodes/{node}/{*rest}",
+            any(move |p, s, r| for_node(scoped.clone(), p, s, r)),
+        )
+        .with_state(state);
+    Router::new().nest(API, api)
+}
+
+fn routes() -> Router<Arc<ApiState>> {
+    Router::new()
         .route("/openapi.json", get(openapi))
         .route("/session", post(login).delete(logout))
         .route("/me", get(me))
@@ -158,8 +177,77 @@ pub(crate) fn router(state: Arc<ApiState>) -> Router {
         .route("/history", get(live::history))
         .route("/notifications", get(live::notifications))
         .fallback(no_such_api)
-        .with_state(state);
-    Router::new().nest(API, api)
+}
+
+/// `/nodes/{node}/{rest}`: the request for `/{rest}`, for that node.
+async fn for_node(
+    scoped: Router,
+    Path((node, rest)): Path<(String, String)>,
+    State(state): State<Arc<ApiState>>,
+    request: Request,
+) -> Response {
+    let scope = Scope::parse(&node, state.broker.get().node_id());
+    let (parts, body) = request.into_parts();
+    let path = match parts.uri.query() {
+        Some(q) => format!("{API}/{rest}?{q}"),
+        None => format!("{API}/{rest}"),
+    };
+    let Ok(uri) = path.parse::<Uri>() else {
+        return no_such_api().await;
+    };
+    // A new request, so the routes inside see their own path parameters
+    // only: the client's address and the node go with it.
+    let mut inner = Request::new(body);
+    *inner.method_mut() = parts.method;
+    *inner.uri_mut() = uri;
+    *inner.version_mut() = parts.version;
+    *inner.headers_mut() = parts.headers;
+    if let Some(p) = parts.extensions.get::<Peer>() {
+        inner.extensions_mut().insert(*p);
+    }
+    inner.extensions_mut().insert(scope);
+    match scoped.oneshot(inner).await {
+        Ok(r) => r,
+        Err(e) => match e {},
+    }
+}
+
+/// The nodes of the cluster this broker knows of: itself, then the others
+/// its cluster connections' topology has.
+async fn nodes(
+    State(state): State<Arc<ApiState>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = user(&state, &headers, peer) {
+        return *r;
+    }
+    let broker = state.broker.get();
+    let endpoint = |tc: &Option<_>| match tc.as_ref().and_then(peers::endpoint) {
+        Some(e) => Json::from(e),
+        None => Json::Null,
+    };
+    let data = peers::members(&broker)
+        .iter()
+        .map(|m| {
+            Json::object()
+                .with("nodeID", m.node_id.as_str())
+                .with("local", m.local)
+                .with("primary", endpoint(&m.primary))
+                .with("backup", endpoint(&m.backup))
+                .with(
+                    "backupGroup",
+                    m.backup_group.as_deref().map_or(Json::Null, Json::from),
+                )
+                .with(
+                    "clusters",
+                    Json::Array(m.clusters.iter().map(|c| Json::from(c.as_str())).collect()),
+                )
+        })
+        .collect();
+    ok(&Json::object()
+        .with("local", broker.node_id())
+        .with("data", Json::Array(data)))
 }
 
 fn reply(status: StatusCode, body: &Json) -> Response {
@@ -199,6 +287,9 @@ fn failure(f: Failure) -> Response {
 pub(crate) struct Problem {
     pub status: StatusCode,
     pub message: String,
+    /// The node as a whole could not be asked (not there, not reachable,
+    /// or refusing the user), so no more is asked of it.
+    pub whole: bool,
 }
 
 impl Problem {
@@ -206,6 +297,15 @@ impl Problem {
         Self {
             status,
             message: message.into(),
+            whole: false,
+        }
+    }
+
+    /// A failure of the node as a whole.
+    pub fn of_node(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            whole: true,
+            ..Self::new(status, message)
         }
     }
 
@@ -241,6 +341,17 @@ async fn no_such_api() -> Response {
 pub(crate) struct User {
     pub name: String,
     pub caller: Caller,
+    /// What the other nodes are asked as.
+    pub password: Option<String>,
+}
+
+impl User {
+    pub fn credentials(&self) -> Credentials {
+        Credentials {
+            user: self.name.clone(),
+            password: self.password.clone(),
+        }
+    }
 }
 
 /// The user a request runs as: its session's, unless an `Authorization:
@@ -263,6 +374,7 @@ pub(crate) fn user(
                         subject: Some(s.subject),
                         remote,
                     },
+                    password: s.password,
                 });
             }
         }
@@ -282,6 +394,7 @@ pub(crate) fn user(
                 subject: Some(subject),
                 remote,
             },
+            password: Some(password),
         }),
         Auth::Throttled(wait) => Err(Box::new(throttled(wait))),
         Auth::NotAuthorized | Auth::NoCredentials => Err(Box::new(error(
@@ -324,57 +437,239 @@ pub(crate) fn marked(headers: &HeaderMap) -> Result<(), Box<Response>> {
     }
 }
 
-/// The broker's MBean.
-fn broker_bean(state: &ApiState) -> Result<ObjectName, Box<Response>> {
-    state
-        .agent
-        .bean_of("broker")
-        .map(|(n, _)| n)
-        .ok_or_else(|| {
-            Box::new(error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the broker is not running",
-            ))
-        })
+/// The node a request is for, which `/nodes/{node}/...` sets; this broker
+/// otherwise.
+pub(crate) struct Scoped(pub Scope);
+
+impl<S: Send + Sync> FromRequestParts<S> for Scoped {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<Scope>()
+                .cloned()
+                .unwrap_or(Scope::Local),
+        ))
+    }
 }
 
-/// An operation on the broker's MBean.
-async fn on_broker(
-    state: &ApiState,
-    user: &User,
-    operation: &str,
-    arguments: Vec<Json>,
-) -> Result<Json, Box<Response>> {
-    let name = broker_bean(state)?;
-    state
-        .agent
-        .call(&user.caller, name, operation, arguments)
-        .await
-        .map_err(|f| Box::new(failure(f)))
+/// Where a request goes: this broker's Jolokia agent, or another node by
+/// management messages.
+#[derive(Clone, Debug)]
+pub(crate) enum Target {
+    Local,
+    Peer(String),
 }
 
-/// An operation on the broker's MBean answering JSON text, parsed.
-pub(crate) async fn broker_json(
+impl Target {
+    /// One node's target; every node's only for the listings.
+    pub fn of(scope: &Scope) -> Result<Self, Problem> {
+        match scope {
+            Scope::Local => Ok(Self::Local),
+            Scope::Node(n) => Ok(Self::Peer(n.clone())),
+            Scope::All => Err(Problem::new(
+                StatusCode::BAD_REQUEST,
+                "only the listings span every node",
+            )),
+        }
+    }
+}
+
+/// An operation's name without its signature: a management message names
+/// the operation, and the node picks the one its arguments fit.
+fn bare(operation: &str) -> &str {
+    operation.split_once('(').map_or(operation, |(n, _)| n)
+}
+
+/// An operation on another node's resource, as the user.
+async fn peer_call(
     state: &ApiState,
-    user: &User,
+    u: &User,
+    node: &str,
+    resource: &str,
     operation: &str,
     arguments: Vec<Json>,
 ) -> Result<Json, Problem> {
-    let Some((name, _)) = state.agent.bean_of("broker") else {
-        return Err(Problem::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the broker is not running",
-        ));
-    };
-    match state
-        .agent
-        .call(&user.caller, name, operation, arguments)
-        .await?
-    {
+    state
+        .peers
+        .request(
+            &state.broker.get(),
+            node,
+            &u.credentials(),
+            PeerRequest::Invoke {
+                resource,
+                operation: bare(operation),
+                arguments,
+            },
+        )
+        .await
+}
+
+/// An attribute of another node's resource, as the user.
+pub(crate) async fn peer_attribute(
+    state: &ApiState,
+    u: &User,
+    node: &str,
+    resource: &str,
+    name: &str,
+) -> Result<Json, Problem> {
+    state
+        .peers
+        .request(
+            &state.broker.get(),
+            node,
+            &u.credentials(),
+            PeerRequest::Attribute { resource, name },
+        )
+        .await
+}
+
+/// An operation on a resource of the target.
+pub(crate) async fn call_on(
+    state: &ApiState,
+    u: &User,
+    t: &Target,
+    resource: &str,
+    operation: &str,
+    arguments: Vec<Json>,
+) -> Result<Json, Problem> {
+    match t {
+        Target::Local => {
+            let Some((name, _)) = state.agent.bean_of(resource) else {
+                return Err(if resource == "broker" {
+                    Problem::new(StatusCode::SERVICE_UNAVAILABLE, "the broker is not running")
+                } else {
+                    Problem::new(
+                        StatusCode::NOT_FOUND,
+                        format!("no such resource: {resource}"),
+                    )
+                });
+            };
+            Ok(state
+                .agent
+                .call(&u.caller, name, operation, arguments)
+                .await?)
+        }
+        Target::Peer(node) => peer_call(state, u, node, resource, operation, arguments).await,
+    }
+}
+
+/// An operation on the target's broker answering JSON text, parsed.
+pub(crate) async fn broker_json_on(
+    state: &ApiState,
+    u: &User,
+    t: &Target,
+    operation: &str,
+    arguments: Vec<Json>,
+) -> Result<Json, Problem> {
+    match call_on(state, u, t, "broker", operation, arguments).await? {
         Json::String(text) => {
             Json::parse(&text).map_err(|e| Problem::new(StatusCode::INTERNAL_SERVER_ERROR, e))
         }
         other => Ok(other),
+    }
+}
+
+/// Whether a failure says the node itself could not be asked, rather than
+/// that it refused or failed what it was asked.
+fn unreachable(p: &Problem) -> bool {
+    p.whole || p.status.is_server_error()
+}
+
+/// The resource of a management resource name (`ResourceNames`), for the
+/// shape of another node's: its attributes and operations are the same.
+fn bean_named(resource: &str) -> Option<Bean> {
+    if resource == "broker" {
+        return Some(Bean::Broker);
+    }
+    let (kind, name) = resource.split_once('.')?;
+    let name = name.to_owned();
+    Some(match kind {
+        "address" => Bean::Address(name),
+        "queue" => Bean::Queue(name),
+        "divert" => Bean::Divert(name),
+        "acceptor" => Bean::Acceptor(name, Vec::new()),
+        "broadcastgroup" => Bean::BroadcastGroup(name),
+        "bridge" => Bean::Bridge(name),
+        "brokerconnection" => Bean::BrokerConnection(name),
+        "clusterconnection" => Bean::ClusterConnection(name),
+        _ => return None,
+    })
+}
+
+/// Another node's resource, as `GET /resources` lists one: management
+/// messages do not give its object name.
+fn peer_resource_json(bean: &Bean) -> Json {
+    Json::object()
+        .with("resource", bean.resource())
+        .with("type", resource_type(bean))
+        .with("objectName", "")
+        .with("className", bean.class_name())
+}
+
+/// A resource of a kind, by its name.
+type NamedBean = fn(String) -> Bean;
+
+/// The resources of another node: its broker, and those the broker's
+/// attributes name.
+async fn peer_resources(state: &ApiState, u: &User, node: &str) -> Result<Vec<Json>, Problem> {
+    let mut out = vec![peer_resource_json(&Bean::Broker)];
+    let kinds: [(&str, NamedBean); 5] = [
+        ("AddressNames", Bean::Address),
+        ("QueueNames", Bean::Queue),
+        ("DivertNames", Bean::Divert),
+        ("BridgeNames", Bean::Bridge),
+        ("ClusterConnectionNames", Bean::ClusterConnection),
+    ];
+    for (attr, bean) in kinds {
+        let names = match peer_attribute(state, u, node, "broker", attr).await {
+            Ok(Json::Array(names)) => names,
+            Ok(_) => Vec::new(),
+            Err(p) if unreachable(&p) => return Err(p),
+            Err(_) => continue,
+        };
+        let mut names: Vec<String> = names
+            .iter()
+            .filter_map(|n| n.as_str().map(str::to_owned))
+            .collect();
+        names.sort();
+        out.extend(names.into_iter().map(|n| peer_resource_json(&bean(n))));
+    }
+    if let Ok(Json::Array(connections)) = broker_json_on(
+        state,
+        u,
+        &Target::Peer(node.to_owned()),
+        "listBrokerConnections",
+        Vec::new(),
+    )
+    .await
+    {
+        out.extend(
+            connections
+                .iter()
+                .filter_map(|c| c.get("name").and_then(Json::as_str))
+                .map(|n| peer_resource_json(&Bean::BrokerConnection(n.to_owned()))),
+        );
+    }
+    Ok(out)
+}
+
+/// One attribute's value on another node, or why it could not be read.
+pub(crate) async fn peer_attribute_value(
+    state: &ApiState,
+    u: &User,
+    node: &str,
+    resource: &str,
+    attr: &str,
+) -> Result<Json, Problem> {
+    match peer_attribute(state, u, node, resource, attr).await {
+        Ok(v) => Ok(Json::object().with("value", v)),
+        Err(p) if unreachable(&p) => Err(p),
+        Err(p) => Ok(Json::object()
+            .with("error", p.message)
+            .with("denied", p.status == StatusCode::FORBIDDEN)),
     }
 }
 
@@ -425,7 +720,9 @@ async fn login(
                 remote: Some(remote.clone()),
             };
             let body = me_json(&state, &user, &caller);
-            let id = state.sessions.start(user, roles, subject);
+            let id = state
+                .sessions
+                .start(user, roles, subject, Some(password.clone()));
             let mut r = ok(&body);
             state.sessions.set_cookie(&mut r, &id);
             r
@@ -448,6 +745,7 @@ async fn logout(State(state): State<Arc<ApiState>>, headers: HeaderMap) -> Respo
     if let Some((id, s)) = state.sessions.session(&headers) {
         tracing::info!("Saranga console: logging out user {}", s.user);
         state.sessions.invalidate(&id);
+        state.peers.forget(&s.user).await;
     }
     let mut r = crate::secure(StatusCode::NO_CONTENT.into_response());
     state.sessions.clear_cookie(&mut r);
@@ -483,14 +781,43 @@ fn me_json(state: &ApiState, user: &str, caller: &Caller) -> Json {
         .with("broker", actions)
 }
 
+/// On another node the guard is that node's: it answers each request, so
+/// what the user may do there is not known beforehand (`null`).
+fn me_peer_json(u: &User) -> Json {
+    let mut actions = Json::object();
+    for a in BROKER_ACTIONS {
+        actions.put(a, Json::Null);
+    }
+    Json::object()
+        .with("user", u.name.as_str())
+        .with(
+            "roles",
+            Json::Array(
+                u.caller
+                    .roles
+                    .iter()
+                    .map(|r| Json::from(r.as_str()))
+                    .collect(),
+            ),
+        )
+        .with("guard", "node")
+        .with("broker", actions)
+}
+
 async fn me(
     State(state): State<Arc<ApiState>>,
     Extension(Peer(peer)): Extension<Peer>,
+    Scoped(scope): Scoped,
     headers: HeaderMap,
 ) -> Response {
-    match user(&state, &headers, peer) {
-        Ok(u) => ok(&me_json(&state, &u.name, &u.caller)),
-        Err(r) => *r,
+    let u = match user(&state, &headers, peer) {
+        Ok(u) => u,
+        Err(r) => return *r,
+    };
+    match Target::of(&scope) {
+        Ok(Target::Local) => ok(&me_json(&state, &u.name, &u.caller)),
+        Ok(Target::Peer(_)) => ok(&me_peer_json(&u)),
+        Err(p) => p.response(),
     }
 }
 
@@ -499,9 +826,14 @@ async fn me(
 async fn can(
     State(state): State<Arc<ApiState>>,
     Extension(Peer(peer)): Extension<Peer>,
+    Scoped(scope): Scoped,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let local = match Target::of(&scope) {
+        Ok(t) => matches!(t, Target::Local),
+        Err(p) => return p.response(),
+    };
     let u = match user(&state, &headers, peer) {
         Ok(u) => u,
         Err(r) => return *r,
@@ -521,6 +853,9 @@ async fn can(
     let results: Vec<Json> = checks
         .iter()
         .map(|c| {
+            if !local {
+                return Json::Null;
+            }
             let s = |k: &str| c.get(k).and_then(Json::as_str);
             let allowed = match (s("resource"), s("method")) {
                 (Some(r), Some(m)) => state
@@ -573,13 +908,18 @@ async fn views(
 async fn broker(
     State(state): State<Arc<ApiState>>,
     Extension(Peer(peer)): Extension<Peer>,
+    Scoped(scope): Scoped,
     headers: HeaderMap,
 ) -> Response {
     let u = match user(&state, &headers, peer) {
         Ok(u) => u,
         Err(r) => return *r,
     };
-    match status(&state, &u).await {
+    let t = match Target::of(&scope) {
+        Ok(t) => t,
+        Err(p) => return p.response(),
+    };
+    match status_on(&state, &u, &t).await {
         Ok(s) => ok(&s),
         Err(p) => p.response(),
     }
@@ -602,6 +942,27 @@ pub(crate) async fn status(state: &ApiState, u: &User) -> Result<Json, Problem> 
             Ok(v) => attributes.put(a, v),
             Err(f) if f.status == 403 => denied.push(Json::from(*a)),
             // Not readable on this broker: left out.
+            Err(_) => {}
+        }
+    }
+    Ok(Json::object()
+        .with("attributes", attributes)
+        .with("denied", Json::Array(denied)))
+}
+
+/// The target's status attributes the user may read, and those they may
+/// not.
+pub(crate) async fn status_on(state: &ApiState, u: &User, t: &Target) -> Result<Json, Problem> {
+    let Target::Peer(node) = t else {
+        return status(state, u).await;
+    };
+    let mut attributes = Json::object();
+    let mut denied = Vec::new();
+    for a in STATUS {
+        match peer_attribute(state, u, node, "broker", a).await {
+            Ok(v) => attributes.put(a, v),
+            Err(p) if unreachable(&p) => return Err(p),
+            Err(p) if p.status == StatusCode::FORBIDDEN => denied.push(Json::from(*a)),
             Err(_) => {}
         }
     }
@@ -706,6 +1067,7 @@ pub(crate) fn list_operation(kind: &str) -> Option<&'static str> {
 async fn listing(
     State(state): State<Arc<ApiState>>,
     Extension(Peer(peer)): Extension<Peer>,
+    Scoped(scope): Scoped,
     Path(kind): Path<String>,
     uri: Uri,
     headers: HeaderMap,
@@ -721,16 +1083,24 @@ async fn listing(
         Ok(q) => q,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
     };
-    match list(&state, &u, operation, &q).await {
+    let page = match scope {
+        Scope::All => Ok(list_all(&state, &u, operation, &q).await),
+        scope => match Target::of(&scope) {
+            Ok(t) => list_on(&state, &u, &t, operation, &q).await,
+            Err(p) => Err(p),
+        },
+    };
+    match page {
         Ok(page) => ok(&page),
         Err(p) => p.response(),
     }
 }
 
-/// One page of a listing, by its operation.
-pub(crate) async fn list(
+/// One page of a listing on the target, by its operation.
+pub(crate) async fn list_on(
     state: &ApiState,
     u: &User,
+    t: &Target,
     operation: &str,
     q: &ListQuery,
 ) -> Result<Json, Problem> {
@@ -740,16 +1110,93 @@ pub(crate) async fn list(
         Json::Long(q.size),
     ];
     // The views answer JSON text.
-    let mut page = broker_json(state, u, operation, arguments).await?;
+    let mut page = broker_json_on(state, u, t, operation, arguments).await?;
     page.put("page", q.page);
     page.put("size", q.size);
     Ok(page)
+}
+
+/// One page of a listing across every node: each node's first rows, as far
+/// as this page reaches, merged, each row with its node, sorted again and
+/// paged. A node that cannot answer is named in `errors`.
+pub(crate) async fn list_all(state: &ApiState, u: &User, operation: &str, q: &ListQuery) -> Json {
+    let broker = state.broker.get();
+    let reach = q.page.saturating_mul(q.size).min(MAX_PAGE_SIZE);
+    let first = ListQuery {
+        page: 1,
+        size: reach,
+        ..q.clone()
+    };
+    let targets: Vec<(String, Target)> = peers::members(&broker)
+        .into_iter()
+        .filter(|m| m.local || m.primary.is_some())
+        .map(|m| {
+            let t = if m.local {
+                Target::Local
+            } else {
+                Target::Peer(m.node_id.clone())
+            };
+            (m.node_id, t)
+        })
+        .collect();
+    let mut rows = Vec::new();
+    let mut count = 0;
+    let mut errors = Vec::new();
+    for (node, t) in &targets {
+        match list_on(state, u, t, operation, &first).await {
+            Ok(page) => {
+                count += page.get("count").and_then(Json::as_i64).unwrap_or(0);
+                if let Some(Json::Array(data)) = page.get("data") {
+                    rows.extend(data.iter().cloned().map(|mut r| {
+                        r.put("node", node.as_str());
+                        r
+                    }));
+                }
+            }
+            Err(p) => errors.push(p.json().with("node", node.as_str())),
+        }
+    }
+    if let Some((field, descending)) = &q.sort {
+        rows.sort_by(|a, b| {
+            let o = compare(a.get(field), b.get(field));
+            if *descending { o.reverse() } else { o }
+        });
+    }
+    let start = ((q.page - 1).saturating_mul(q.size)).min(rows.len() as i64) as usize;
+    let data: Vec<Json> = rows.into_iter().skip(start).take(q.size as usize).collect();
+    Json::object()
+        .with("data", Json::Array(data))
+        .with("count", count)
+        .with("page", q.page)
+        .with("size", q.size)
+        .with("errors", Json::Array(errors))
+}
+
+/// Two rows' values of a field, as the views compare them: numbers as
+/// numbers, though the views write them as text, and the rest as text.
+fn compare(a: Option<&Json>, b: Option<&Json>) -> std::cmp::Ordering {
+    let number = |v: Option<&Json>| match v? {
+        Json::Long(n) => Some(*n as f64),
+        Json::Double(d) => Some(*d),
+        Json::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    };
+    if let (Some(x), Some(y)) = (number(a), number(b)) {
+        return x.total_cmp(&y);
+    }
+    let text = |v: Option<&Json>| match v {
+        Some(Json::String(s)) => s.clone(),
+        Some(Json::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    };
+    text(a).cmp(&text(b))
 }
 
 async fn close(
     state: &ApiState,
     headers: &HeaderMap,
     peer: SocketAddr,
+    scope: Scope,
     operation: &str,
     arguments: Vec<Json>,
 ) -> Response {
@@ -760,18 +1207,23 @@ async fn close(
         Ok(u) => u,
         Err(r) => return *r,
     };
-    match on_broker(state, &u, operation, arguments).await {
+    let t = match Target::of(&scope) {
+        Ok(t) => t,
+        Err(p) => return p.response(),
+    };
+    match call_on(state, &u, &t, "broker", operation, arguments).await {
         // `closeConnectionWithID` and the others answer whether it was
         // there to close.
         Ok(Json::Bool(false)) => error(StatusCode::NOT_FOUND, "nothing to close by that ID"),
         Ok(_) => crate::secure(StatusCode::NO_CONTENT.into_response()),
-        Err(r) => *r,
+        Err(p) => p.response(),
     }
 }
 
 async fn close_connection(
     State(state): State<Arc<ApiState>>,
     Extension(Peer(peer)): Extension<Peer>,
+    Scoped(scope): Scoped,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -779,6 +1231,7 @@ async fn close_connection(
         &state,
         &headers,
         peer,
+        scope,
         "closeConnectionWithID(java.lang.String)",
         vec![Json::from(id)],
     )
@@ -788,6 +1241,7 @@ async fn close_connection(
 async fn close_session(
     State(state): State<Arc<ApiState>>,
     Extension(Peer(peer)): Extension<Peer>,
+    Scoped(scope): Scoped,
     Path((connection, id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
@@ -795,6 +1249,7 @@ async fn close_session(
         &state,
         &headers,
         peer,
+        scope,
         "closeSessionWithID(java.lang.String,java.lang.String)",
         vec![Json::from(connection), Json::from(id)],
     )
@@ -804,6 +1259,7 @@ async fn close_session(
 async fn close_consumer(
     State(state): State<Arc<ApiState>>,
     Extension(Peer(peer)): Extension<Peer>,
+    Scoped(scope): Scoped,
     Path((session, id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
@@ -811,6 +1267,7 @@ async fn close_consumer(
         &state,
         &headers,
         peer,
+        scope,
         "closeConsumerWithID(java.lang.String,java.lang.String)",
         vec![Json::from(session), Json::from(id)],
     )
@@ -895,12 +1352,23 @@ pub(crate) async fn attribute_value(
 async fn resources(
     State(state): State<Arc<ApiState>>,
     Extension(Peer(peer)): Extension<Peer>,
+    Scoped(scope): Scoped,
     headers: HeaderMap,
 ) -> Response {
     let u = match user(&state, &headers, peer) {
         Ok(u) => u,
         Err(r) => return *r,
     };
+    match Target::of(&scope) {
+        Ok(Target::Local) => {}
+        Ok(Target::Peer(node)) => {
+            return match peer_resources(&state, &u, &node).await {
+                Ok(data) => ok(&Json::object().with("data", Json::Array(data))),
+                Err(p) => p.response(),
+            };
+        }
+        Err(p) => return p.response(),
+    }
     match state.agent.visible(&u.caller) {
         Ok(beans) => ok(&Json::object().with(
             "data",
@@ -915,6 +1383,7 @@ async fn resources(
 async fn resource(
     State(state): State<Arc<ApiState>>,
     Extension(Peer(peer)): Extension<Peer>,
+    Scoped(scope): Scoped,
     Path(resource): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -922,6 +1391,16 @@ async fn resource(
         Ok(u) => u,
         Err(r) => return *r,
     };
+    match Target::of(&scope) {
+        Ok(Target::Local) => {}
+        Ok(Target::Peer(node)) => {
+            return match peer_resource(&state, &u, &node, &resource).await {
+                Ok(j) => ok(&j),
+                Err(p) => p.response(),
+            };
+        }
+        Err(p) => return p.response(),
+    }
     let (name, bean) = match visible_resource(&state, &u, &resource) {
         Ok(b) => b,
         Err(r) => return *r,
@@ -978,10 +1457,85 @@ async fn resource(
         .with("operations", Json::Array(operations)))
 }
 
+/// Another node's resource: its attributes with their values, and its
+/// operations, which that node allows or refuses when called (`allowed` is
+/// `null`).
+async fn peer_resource(
+    state: &ApiState,
+    u: &User,
+    node: &str,
+    resource: &str,
+) -> Result<Json, Problem> {
+    let bean = bean_named(resource).ok_or_else(|| {
+        Problem::new(
+            StatusCode::NOT_FOUND,
+            format!("no such resource: {resource}"),
+        )
+    })?;
+    let control = bean.control();
+    let mut attributes = Vec::with_capacity(control.attrs.len());
+    for a in control.attrs {
+        let mut j = Json::object()
+            .with("name", a.name)
+            .with("type", a.type_name)
+            .with("description", a.desc)
+            .with("readable", a.readable)
+            .with("writable", a.writable);
+        if a.readable {
+            let v = peer_attribute_value(state, u, node, resource, a.name).await?;
+            // The broker answers what it does not have as failed: a
+            // resource that is not there has no attributes at all.
+            if let Some(Json::String(e)) = v.get("error")
+                && (e.contains("AMQ229071") || e.contains("not found"))
+                && attributes.is_empty()
+            {
+                return Err(Problem::new(
+                    StatusCode::NOT_FOUND,
+                    format!("no such resource: {resource}"),
+                ));
+            }
+            if let Json::Object(members) = v {
+                for (k, v) in members {
+                    j.put(&k, v);
+                }
+            }
+        }
+        attributes.push(j);
+    }
+    let operations = control
+        .ops
+        .iter()
+        .map(|o| {
+            let params = o
+                .params
+                .iter()
+                .map(|p| {
+                    Json::object()
+                        .with("name", p.name)
+                        .with("type", p.type_name)
+                        .with("description", p.desc)
+                })
+                .collect();
+            Json::object()
+                .with("name", o.name)
+                .with("signature", format!("{}{}", o.name, o.signature()))
+                .with("description", o.desc)
+                .with("returns", o.ret)
+                .with("impact", impact(o.impact))
+                .with("params", Json::Array(params))
+                .with("allowed", Json::Null)
+        })
+        .collect();
+    Ok(peer_resource_json(&bean)
+        .with("attributes", Json::Array(attributes))
+        .with("operations", Json::Array(operations)))
+}
+
 /// Some attributes' values: `name=A&name=B`.
 async fn attributes(
     State(state): State<Arc<ApiState>>,
     Extension(Peer(peer)): Extension<Peer>,
+    Scoped(scope): Scoped,
     Path(resource): Path<String>,
     uri: Uri,
     headers: HeaderMap,
@@ -990,9 +1544,9 @@ async fn attributes(
         Ok(u) => u,
         Err(r) => return *r,
     };
-    let (name, bean) = match visible_resource(&state, &u, &resource) {
-        Ok(b) => b,
-        Err(r) => return *r,
+    let t = match Target::of(&scope) {
+        Ok(t) => t,
+        Err(p) => return p.response(),
     };
     let mut wanted = Vec::new();
     for pair in uri
@@ -1013,8 +1567,24 @@ async fn attributes(
         );
     }
     let mut out = Json::object();
-    for a in &wanted {
-        out.put(a, attribute_value(&state, &u, &name, &bean, a).await);
+    match t {
+        Target::Local => {
+            let (name, bean) = match visible_resource(&state, &u, &resource) {
+                Ok(b) => b,
+                Err(r) => return *r,
+            };
+            for a in &wanted {
+                out.put(a, attribute_value(&state, &u, &name, &bean, a).await);
+            }
+        }
+        Target::Peer(node) => {
+            for a in &wanted {
+                match peer_attribute_value(&state, &u, &node, &resource, a).await {
+                    Ok(v) => out.put(a, v),
+                    Err(p) => return p.response(),
+                }
+            }
+        }
     }
     ok(&Json::object().with("attributes", out))
 }
@@ -1037,6 +1607,7 @@ fn change(
 async fn write(
     State(state): State<Arc<ApiState>>,
     Extension(Peer(peer)): Extension<Peer>,
+    Scoped(scope): Scoped,
     Path((resource, attr)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -1048,6 +1619,22 @@ async fn write(
     let Some(value) = body.get("value").cloned() else {
         return error(StatusCode::BAD_REQUEST, "the body needs a value");
     };
+    match Target::of(&scope) {
+        Ok(Target::Local) => {}
+        Ok(Target::Peer(node)) => {
+            // A management message cannot write an attribute: its setter
+            // is called, as an operation.
+            let previous = peer_attribute(&state, &u, &node, &resource, &attr)
+                .await
+                .unwrap_or(Json::Null);
+            let setter = format!("set{attr}");
+            return match peer_call(&state, &u, &node, &resource, &setter, vec![value]).await {
+                Ok(_) => ok(&Json::object().with("previous", previous)),
+                Err(p) => p.response(),
+            };
+        }
+        Err(p) => return p.response(),
+    }
     let (name, _) = match visible_resource(&state, &u, &resource) {
         Ok(b) => b,
         Err(r) => return *r,
@@ -1065,6 +1652,7 @@ async fn write(
 async fn invoke(
     State(state): State<Arc<ApiState>>,
     Extension(Peer(peer)): Extension<Peer>,
+    Scoped(scope): Scoped,
     Path(resource): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -1081,6 +1669,16 @@ async fn invoke(
         Some(Json::Array(a)) => a.clone(),
         Some(_) => return error(StatusCode::BAD_REQUEST, "arguments is an array"),
     };
+    match Target::of(&scope) {
+        Ok(Target::Local) => {}
+        Ok(Target::Peer(node)) => {
+            return match peer_call(&state, &u, &node, &resource, operation, arguments).await {
+                Ok(result) => ok(&Json::object().with("result", result)),
+                Err(p) => p.response(),
+            };
+        }
+        Err(p) => return p.response(),
+    }
     let (name, _) = match visible_resource(&state, &u, &resource) {
         Ok(b) => b,
         Err(r) => return *r,

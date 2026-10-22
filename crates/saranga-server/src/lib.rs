@@ -512,6 +512,12 @@ pub struct Broker {
     /// as if it had failed, and waits as a backup again.
     failing_back: std::sync::atomic::AtomicBool,
     failback: tokio::sync::Notify,
+    /// `forceFailover`: the broker stops as `stop(true, true)` stops it,
+    /// its backup told to take over.
+    forcing_failover: std::sync::atomic::AtomicBool,
+    /// The activation is a `SharedNothingPrimaryActivation`: replication
+    /// with quorum voting, a primary or a backup that took over.
+    shared_nothing_primary: bool,
     security: Option<Arc<saranga_security::SecurityStore>>,
     /// For the diverts a reload deploys.
     transformers: HashMap<String, postoffice::TransformerFactory>,
@@ -810,6 +816,12 @@ impl Broker {
                 .map(|c| cluster::ClusterConnection::new(c.clone(), &node_id))
                 .collect(),
             failing_back: std::sync::atomic::AtomicBool::new(false),
+            forcing_failover: std::sync::atomic::AtomicBool::new(false),
+            shared_nothing_primary: matches!(
+                &config.ha.policy,
+                saranga_config::HaPolicy::ReplicationPrimary(r)
+                    | saranga_config::HaPolicy::ReplicationBackup(r) if r.manager.is_none()
+            ),
             failback: tokio::sync::Notify::new(),
             security: config.security.clone(),
             transformers: config.transformers,
@@ -1195,6 +1207,9 @@ impl Broker {
             if self.failover_on_shutdown
                 || self.lock_lost.load(std::sync::atomic::Ordering::Acquire)
                 || self.failing_back.load(std::sync::atomic::Ordering::Acquire)
+                || self
+                    .forcing_failover
+                    .load(std::sync::atomic::Ordering::Acquire)
             {
                 n.crash_primary();
             } else if let Err(e) = n.pause_primary()

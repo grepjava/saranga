@@ -27,6 +27,7 @@ mod live;
 mod mbean;
 pub mod metrics;
 mod pages;
+mod peers;
 mod platform;
 mod rbac;
 pub mod rest;
@@ -198,6 +199,7 @@ pub async fn start(
     let live = options
         .saranga_console
         .then(|| live::Live::start(broker.clone()));
+    let peers = Arc::new(peers::Peers::default());
     for (index, b) in bindings.into_iter().enumerate() {
         // Java resolves a host name to its IPv4 address first.
         let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((b.host.as_str(), b.port))
@@ -353,6 +355,7 @@ pub async fn start(
                     options.session_timeout,
                 ),
                 live: live.clone(),
+                peers: peers.clone(),
             });
             router = router.merge(api::router(state));
         }

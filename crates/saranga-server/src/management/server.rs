@@ -1224,6 +1224,13 @@ pub(super) async fn invoke(
             });
         }
     }
+    if call.is("forceFailover", &[]).is_some() {
+        broker.force_failover();
+        return Some(Ok(Json::Null));
+    }
+    if call.is("freezeReplication", &[]).is_some() {
+        return Some(broker.freeze_replication().map(Json::from));
+    }
     if let Some(a) = call.is("destroyBridge", &[S]) {
         broker.destroy_bridge(&a.s_or_empty(0)).await;
         return Some(Ok(Json::Null));

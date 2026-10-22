@@ -35,10 +35,13 @@ export interface ListingInfo<K extends Listing> {
 
 const CLOSE = 'The broker ends them now. Clients that reconnect come back as new ones.';
 
-/** Every member of `T`, each once: a compile error otherwise. */
+/**
+ * Every member of `T`, each once: a compile error otherwise. A row's node
+ * is not one: only rows across every node have it, and their table adds it.
+ */
 function every<T>() {
-	return <const C extends readonly (keyof T & string)[]>(
-		columns: C & ([Exclude<keyof T, C[number]>] extends [never] ? unknown : never)
+	return <const C extends readonly (Exclude<keyof T, 'node'> & string)[]>(
+		columns: C & ([Exclude<keyof T, C[number] | 'node'>] extends [never] ? unknown : never)
 	) => columns;
 }
 

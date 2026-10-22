@@ -313,8 +313,12 @@ for kind in ["connections", "sessions", "consumers", "producers", "addresses", "
     data = page.get("data", []) if status == 200 else []
     wrong = []
     for r in data:
-        if set(r) != set(schema["properties"]):
-            wrong.append(("members", sorted(set(r) ^ set(schema["properties"]))))
+        # Every required member, and no member the document does not name
+        # (`node` is a row's only across every node).
+        missing = set(schema["required"]) - set(r)
+        unknown = set(r) - set(schema["properties"])
+        if missing or unknown:
+            wrong.append(("members", sorted(missing | unknown)))
         for k, p in schema["properties"].items():
             t = TYPES[p["type"]]
             if k in r and (not isinstance(r[k], t) or isinstance(r[k], bool)):

@@ -73,6 +73,10 @@ pub(crate) struct Session {
     pub user: String,
     pub roles: Vec<String>,
     pub subject: Arc<Subject>,
+    /// The password the user logged in with, kept in memory for as long as
+    /// the session lasts: the Saranga console reaches the other nodes of a
+    /// cluster with it. Artemis's console keeps none.
+    pub password: Option<String>,
     /// `LastAccess`: when the session was last used other than by Jolokia.
     last_access: Option<u64>,
     /// When Jetty last saw the session, by any request.
@@ -195,7 +199,13 @@ impl Console {
     }
 
     /// `AuthSessionHelpers.setup` on a new session: its id.
-    pub(crate) fn start(&self, user: String, roles: Vec<String>, subject: Arc<Subject>) -> String {
+    pub(crate) fn start(
+        &self,
+        user: String,
+        roles: Vec<String>,
+        subject: Arc<Subject>,
+        password: Option<String>,
+    ) -> String {
         let id = format!("node0{:032x}.node0", rand::random::<u128>());
         let mut sessions = self.sessions.lock().unwrap();
         sessions.retain(|_, s| !self.expired(s));
@@ -205,6 +215,7 @@ impl Console {
                 user,
                 roles,
                 subject,
+                password,
                 last_access: None,
                 accessed: Instant::now(),
             },
@@ -772,7 +783,7 @@ fn route(
                 subject,
             } => {
                 tracing::info!("Logging in user: {user}");
-                let id = console.start(user, roles, subject);
+                let id = console.start(user, roles, subject, None);
                 let mut r = index(console, path, headers);
                 console.set_cookie(&mut r, &id);
                 r
@@ -974,7 +985,7 @@ fn login(
                     &[&audit::caller(Some(&subject), Some(&remote)), "null"],
                 ));
             }
-            let id = console.start(user, roles, subject);
+            let id = console.start(user, roles, subject, None);
             let mut r = json(answer.to_string());
             console.set_cookie(&mut r, &id);
             r

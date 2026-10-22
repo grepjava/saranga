@@ -2,7 +2,8 @@
 	"openapi": "3.1.0",
 	"info": {
 		"title": "Saranga console API",
-		"version": "2.57.0"
+		"version": "2.57.0",
+		"description": "Every path but /session, /views, /nodes, /events, /history, /notifications and /openapi.json is served for another node too, at /saranga/api/v1/nodes/{node}/... (a node ID from GET /nodes; local is this broker): it is sent to that node as management messages, as the user, and that node allows or refuses it. At /saranga/api/v1/nodes/all/... the listings span every node."
 	},
 	"paths": {
 		"/saranga/api/v1/session": {
@@ -178,6 +179,35 @@
 						"application/json": {
 							"schema": {
 								"$ref": "#/components/schemas/Checks"
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/nodes": {
+			"get": {
+				"operationId": "nodes",
+				"summary": "This broker and the others its cluster topology has",
+				"parameters": [],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Nodes"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
 							}
 						}
 					}
@@ -1738,13 +1768,17 @@
 						"type": "string",
 						"enum": [
 							"management.xml",
-							"rbac"
+							"rbac",
+							"node"
 						]
 					},
 					"broker": {
 						"type": "object",
 						"additionalProperties": {
-							"type": "boolean"
+							"type": [
+								"boolean",
+								"null"
+							]
 						}
 					}
 				},
@@ -1787,12 +1821,95 @@
 					"results": {
 						"type": "array",
 						"items": {
-							"type": "boolean"
+							"type": [
+								"boolean",
+								"null"
+							]
 						}
 					}
 				},
 				"required": [
 					"results"
+				]
+			},
+			"NodeError": {
+				"type": "object",
+				"properties": {
+					"error": {
+						"type": "string"
+					},
+					"status": {
+						"type": "integer"
+					},
+					"node": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"error",
+					"status",
+					"node"
+				]
+			},
+			"Node": {
+				"type": "object",
+				"properties": {
+					"nodeID": {
+						"type": "string"
+					},
+					"local": {
+						"type": "boolean"
+					},
+					"primary": {
+						"type": [
+							"string",
+							"null"
+						]
+					},
+					"backup": {
+						"type": [
+							"string",
+							"null"
+						]
+					},
+					"backupGroup": {
+						"type": [
+							"string",
+							"null"
+						]
+					},
+					"clusters": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					}
+				},
+				"required": [
+					"nodeID",
+					"local",
+					"primary",
+					"backup",
+					"backupGroup",
+					"clusters"
+				]
+			},
+			"Nodes": {
+				"type": "object",
+				"properties": {
+					"local": {
+						"type": "string"
+					},
+					"data": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/Node"
+						}
+					}
+				},
+				"required": [
+					"local",
+					"data"
 				]
 			},
 			"Broker": {
@@ -1866,6 +1983,9 @@
 					},
 					"proxyProtocolVersion": {
 						"type": "string"
+					},
+					"node": {
+						"type": "string"
 					}
 				},
 				"required": [
@@ -1900,6 +2020,12 @@
 					},
 					"size": {
 						"type": "integer"
+					},
+					"errors": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/NodeError"
+						}
 					}
 				},
 				"required": [
@@ -1951,6 +2077,9 @@
 					},
 					"clientID": {
 						"type": "string"
+					},
+					"node": {
+						"type": "string"
 					}
 				},
 				"required": [
@@ -1982,6 +2111,12 @@
 					},
 					"size": {
 						"type": "integer"
+					},
+					"errors": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/NodeError"
+						}
 					}
 				},
 				"required": [
@@ -2089,6 +2224,9 @@
 					},
 					"status": {
 						"type": "string"
+					},
+					"node": {
+						"type": "string"
 					}
 				},
 				"required": [
@@ -2134,6 +2272,12 @@
 					},
 					"size": {
 						"type": "integer"
+					},
+					"errors": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/NodeError"
+						}
 					}
 				},
 				"required": [
@@ -2207,6 +2351,9 @@
 					},
 					"lastProducedMessageID": {
 						"type": "string"
+					},
+					"node": {
+						"type": "string"
 					}
 				},
 				"required": [
@@ -2244,6 +2391,12 @@
 					},
 					"size": {
 						"type": "integer"
+					},
+					"errors": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/NodeError"
+						}
 					}
 				},
 				"required": [
@@ -2348,6 +2501,9 @@
 					},
 					"paging": {
 						"type": "string"
+					},
+					"node": {
+						"type": "string"
 					}
 				},
 				"required": [
@@ -2393,6 +2549,12 @@
 					},
 					"size": {
 						"type": "integer"
+					},
+					"errors": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/NodeError"
+						}
 					}
 				},
 				"required": [
@@ -2550,6 +2712,9 @@
 					},
 					"internalQueue": {
 						"type": "string"
+					},
+					"node": {
+						"type": "string"
 					}
 				},
 				"required": [
@@ -2608,6 +2773,12 @@
 					},
 					"size": {
 						"type": "integer"
+					},
+					"errors": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/NodeError"
+						}
 					}
 				},
 				"required": [
@@ -2960,7 +3131,10 @@
 						}
 					},
 					"allowed": {
-						"type": "boolean"
+						"type": [
+							"boolean",
+							"null"
+						]
 					}
 				},
 				"required": [
@@ -3112,6 +3286,9 @@
 						]
 					},
 					"query": {
+						"type": "string"
+					},
+					"node": {
 						"type": "string"
 					}
 				},

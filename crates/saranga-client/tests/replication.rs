@@ -518,3 +518,86 @@ async fn with_a_lock_manager_the_latest_copy_activates() {
     primary.stop().unwrap();
     primary.coordination().unwrap().manager.stop().await;
 }
+
+/// A primary and its backup, in sync: the primary, its acceptor, the
+/// backup's task and their directories.
+async fn replicated_pair() -> (
+    Arc<Broker>,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+    tokio::task::JoinHandle<std::io::Result<String>>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let pdir = tempfile::tempdir().unwrap();
+    let bdir = tempfile::tempdir().unwrap();
+    let (pp, pb) = (free_port().await, free_port().await);
+    let primary = Broker::start(config(&xml("primary", pp, pb, "<primary/>"), pdir.path()))
+        .await
+        .unwrap();
+    let acceptor = serve(&primary, pp).await;
+    let bc = config(&xml("backup", pb, pp, "<backup/>"), bdir.path());
+    let backup = tokio::spawn(replicate(backup_config(&bc, false), "test"));
+    wait_for_sync(&primary).await;
+    assert!(primary.is_replica_sync());
+    (primary, acceptor, backup, pdir, bdir)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn force_failover_stops_the_primary_and_its_backup_takes_over() {
+    let (primary, acceptor, backup, _pdir, _bdir) = replicated_pair().await;
+    // `forceFailover` asks whoever runs the broker to stop it.
+    let asked = primary.shutdown_requested();
+    primary.force_failover();
+    tokio::time::timeout(WAIT, asked)
+        .await
+        .expect("the broker was not asked to stop");
+    stop(&primary, acceptor).await;
+    let node_id = tokio::time::timeout(WAIT, backup)
+        .await
+        .expect("the backup did not take over")
+        .unwrap()
+        .unwrap();
+    assert_eq!(node_id, primary.node_id());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn freeze_replication_cuts_the_backup_off() {
+    let (primary, acceptor, backup, _pdir, _bdir) = replicated_pair().await;
+    assert_eq!(primary.freeze_replication(), Ok(true));
+    for _ in 0..(WAIT.as_millis() / 20) {
+        if !primary.is_replica_sync() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!primary.is_replica_sync());
+    // With no backup attached it fails, as Artemis does on its missing
+    // ReplicationManager.
+    let mut detached = false;
+    for _ in 0..(WAIT.as_millis() / 20) {
+        if primary.freeze_replication().is_err() {
+            detached = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(detached, "the backup's connection is still attached");
+    backup.abort();
+    stop(&primary, acceptor).await;
+
+    // A broker that does not replicate answers false.
+    let dir = tempfile::tempdir().unwrap();
+    let alone = Broker::start(config(
+        &saranga_config::BrokerConfig::parse(
+            r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+                 <persistence-enabled>true</persistence-enabled>
+               </core></configuration>"#,
+        )
+        .unwrap(),
+        dir.path(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(alone.freeze_replication(), Ok(false));
+    alone.stop().unwrap();
+}

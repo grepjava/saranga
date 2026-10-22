@@ -294,7 +294,11 @@ impl Broker {
         let Some(r) = lock(&self.replicating).clone() else {
             return;
         };
-        if self.failing_back.load(std::sync::atomic::Ordering::Acquire) && !r.is_stopped() {
+        let failing_over = self.failing_back.load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .forcing_failover
+                .load(std::sync::atomic::Ordering::Acquire);
+        if failing_over && !r.is_stopped() {
             let (tx, rx) = std::sync::mpsc::channel();
             r.send(
                 ReplicationPrimaryIsStoppingMessage {
@@ -308,6 +312,47 @@ impl Broker {
         }
         self.replication_stopped(&r);
         conn_fail(&r);
+    }
+
+    /// `forceFailover`: the broker stops as `stop(true, true)` stops it.
+    /// The backup replicating it is told now (`STOP_CALLED`) and again as
+    /// the journals stop (`FAIL_OVER`); a shared store's lock is let go as
+    /// crashed, so its backup takes over.
+    pub fn force_failover(&self) {
+        self.forcing_failover
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(r) = lock(&self.replicating).clone()
+            && !r.is_stopped()
+        {
+            r.send(
+                ReplicationPrimaryIsStoppingMessage {
+                    primary_stopping: PrimaryStopping::StopCalled,
+                },
+                None,
+            );
+        }
+        self.request_shutdown();
+    }
+
+    /// `freezeReplication`: on a broker replicating with quorum voting
+    /// (`SharedNothingPrimaryActivation`), the backup's connection fails
+    /// (`ActiveMQDisconnectedException`), and true; on another, false.
+    /// Without a backup attached it fails as Artemis does, on the missing
+    /// `ReplicationManager`.
+    pub fn freeze_replication(&self) -> Result<bool, String> {
+        if !self.shared_nothing_primary {
+            return Ok(false);
+        }
+        match lock(&self.replicating).clone() {
+            Some(r) => {
+                r.conn.client.fail_with(crate::BrokerError::new(
+                    saranga_core_protocol::ErrorType::Disconnected,
+                    "",
+                ));
+                Ok(true)
+            }
+            None => Err("java.lang.NullPointerException: Cannot invoke \"org.apache.activemq.artemis.core.replication.ReplicationManager.getBackupTransportConnection()\" because \"this.replicationManager\" is null".to_owned()),
+        }
     }
 
     /// The connection of the backup this broker replicates to, which

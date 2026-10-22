@@ -22,6 +22,9 @@
 //!   "attributes", "resource", "names"}` (as `GET .../attributes`) or
 //!   `{"kind": "listing", "listing", "query"}` (a page of a listing). Each
 //!   is read as the user, through the guard and audit, as a request is.
+//!   A view with a `"node"` (a node ID, or `"all"` for a listing) is read
+//!   from that node, as `/nodes/{node}/...` reads it; the views are read
+//!   together, so a node slow to answer holds up none but its own.
 //! - `GET /history?resource=broker&resource=queue.orders`: the samples of
 //!   each resource's gauges the guard lets the user read.
 //! - `GET /notifications?since=N`: the last notifications, at most
@@ -34,7 +37,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
+use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
@@ -53,7 +59,8 @@ use saranga_server::{Broker, Current};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::api::{self, ApiState, ListQuery, Problem, User};
+use crate::api::{self, ApiState, ListQuery, Problem, Target, User};
+use crate::peers::Scope;
 use crate::{Peer, percent_decode};
 
 /// How often a stream sends its views, and the history samples the broker.
@@ -333,9 +340,16 @@ async fn sample(live: Weak<Live>) {
     }
 }
 
+/// What a stream watches, and on which node.
+#[derive(Clone)]
+struct View {
+    node: Scope,
+    what: What,
+}
+
 /// What a stream may watch.
 #[derive(Clone)]
-enum View {
+enum What {
     Broker,
     Topology,
     Attributes {
@@ -348,15 +362,28 @@ enum View {
     },
 }
 
-fn view(j: &Json) -> Result<View, String> {
+fn view(j: &Json, local_id: &str) -> Result<View, String> {
+    let node = match j.get("node") {
+        None | Some(Json::Null) => Scope::Local,
+        Some(Json::String(n)) => Scope::parse(n, local_id),
+        Some(_) => return Err("node is a string".into()),
+    };
+    let what = what(j)?;
+    if node == Scope::All && !matches!(what, What::Listing { .. }) {
+        return Err("only a listing spans every node".into());
+    }
+    Ok(View { node, what })
+}
+
+fn what(j: &Json) -> Result<What, String> {
     let text = |k: &str| {
         j.get(k)
             .and_then(Json::as_str)
             .ok_or_else(|| format!("a view of this kind needs a {k}"))
     };
     match j.get("kind").and_then(Json::as_str) {
-        Some("broker") => Ok(View::Broker),
-        Some("topology") => Ok(View::Topology),
+        Some("broker") => Ok(What::Broker),
+        Some("topology") => Ok(What::Topology),
         Some("attributes") => {
             let resource = text("resource")?.to_owned();
             let Some(Json::Array(names)) = j.get("names") else {
@@ -367,44 +394,103 @@ fn view(j: &Json) -> Result<View, String> {
                 .map(|n| n.as_str().map(str::to_owned))
                 .collect::<Option<Vec<_>>>()
                 .ok_or("names are strings")?;
-            Ok(View::Attributes { resource, names })
+            Ok(What::Attributes { resource, names })
         }
         Some("listing") => {
             let listing = text("listing")?;
             let operation = api::list_operation(listing)
                 .ok_or_else(|| format!("no such listing: {listing}"))?;
             let query = api::list_query(j.get("query").and_then(Json::as_str))?;
-            Ok(View::Listing { operation, query })
+            Ok(What::Listing { operation, query })
         }
         Some(k) => Err(format!("no such kind of view: {k}")),
         None => Err("a view needs a kind".into()),
     }
 }
 
+/// How long a view of another node waits for it.
+const PEER_READ: Duration = Duration::from_secs(10);
+
 /// A view's value now, as the user.
 async fn read(state: &ApiState, u: &User, v: &View) -> Json {
-    let value = match v {
-        View::Broker => api::status(state, u).await,
-        View::Topology => api::broker_json(state, u, "listNetworkTopology", Vec::new()).await,
-        View::Attributes { resource, names } => match state.agent.bean_of(resource) {
-            None => Err(Problem::new(
-                StatusCode::NOT_FOUND,
-                format!("no such resource: {resource}"),
-            )),
-            Some((name, bean)) => {
-                let mut out = Json::object();
-                for a in names {
-                    out.put(a, api::attribute_value(state, u, &name, &bean, a).await);
-                }
-                Ok(out)
-            }
+    let value = match (&v.node, &v.what) {
+        (Scope::All, What::Listing { operation, query }) => {
+            Ok(api::list_all(state, u, operation, query).await)
+        }
+        (scope, what) => match Target::of(scope) {
+            Err(p) => Err(p),
+            Ok(Target::Local) => read_on(state, u, &Target::Local, what).await,
+            Ok(t) => tokio::time::timeout(PEER_READ, read_on(state, u, &t, what))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Problem::new(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "the node did not answer in time",
+                    ))
+                }),
         },
-        View::Listing { operation, query } => api::list(state, u, operation, query).await,
     };
     match value {
         Ok(v) => Json::object().with("value", v),
         Err(p) => p.json(),
     }
+}
+
+async fn read_on(state: &ApiState, u: &User, t: &Target, what: &What) -> Result<Json, Problem> {
+    match what {
+        What::Broker => api::status_on(state, u, t).await,
+        What::Topology => api::broker_json_on(state, u, t, "listNetworkTopology", Vec::new()).await,
+        What::Attributes { resource, names } => match t {
+            Target::Local => match state.agent.bean_of(resource) {
+                None => Err(Problem::new(
+                    StatusCode::NOT_FOUND,
+                    format!("no such resource: {resource}"),
+                )),
+                Some((name, bean)) => {
+                    let mut out = Json::object();
+                    for a in names {
+                        out.put(a, api::attribute_value(state, u, &name, &bean, a).await);
+                    }
+                    Ok(out)
+                }
+            },
+            Target::Peer(node) => {
+                let mut out = Json::object();
+                for a in names {
+                    out.put(
+                        a,
+                        api::peer_attribute_value(state, u, node, resource, a).await?,
+                    );
+                }
+                Ok(out)
+            }
+        },
+        What::Listing { operation, query } => api::list_on(state, u, t, operation, query).await,
+    }
+}
+
+/// Every future's output, the futures run together.
+async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut futures: Vec<Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut out: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (f, o) in futures.iter_mut().zip(out.iter_mut()) {
+            if o.is_none() {
+                match f.as_mut().poll(cx) {
+                    Poll::Ready(v) => *o = Some(v),
+                    Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })
+    .await;
+    out.into_iter().flatten().collect()
 }
 
 /// Whether the user may consume from the notification address, as a
@@ -591,8 +677,8 @@ async fn run(
                 let views = watched.borrow_and_update().clone();
                 last.retain(|k, _| views.iter().any(|(key, _)| key == k));
                 let mut changed = Json::object();
-                for (key, v) in views.iter() {
-                    let value = read(state, u, v).await;
+                let values = join_all(views.iter().map(|(_, v)| read(state, u, v)).collect()).await;
+                for ((key, _), value) in views.iter().zip(values) {
                     let text = value.to_string();
                     if last.get(key) != Some(&text) {
                         last.insert(key.clone(), text);
@@ -657,8 +743,9 @@ pub(crate) async fn watch(
         );
     }
     let mut views = Vec::with_capacity(members.len());
+    let local_id = state.broker.get().node_id().to_owned();
     for (key, j) in members {
-        match view(j) {
+        match view(j, &local_id) {
             Ok(v) => views.push((key.clone(), v)),
             Err(e) => return api::error(StatusCode::BAD_REQUEST, format!("{key}: {e}")),
         }
@@ -825,18 +912,45 @@ mod tests {
     #[test]
     fn views_parse() {
         let j = |s: &str| Json::parse(s).unwrap();
-        assert!(matches!(view(&j(r#"{"kind":"broker"}"#)), Ok(View::Broker)));
+        let view = |s: &str| view(&j(s), "me");
         assert!(matches!(
-            view(&j(r#"{"kind":"listing","listing":"queues","query":"page=2&size=5"}"#)),
-            Ok(View::Listing { query, .. }) if query.page == 2 && query.size == 5
+            view(r#"{"kind":"broker"}"#),
+            Ok(View {
+                node: Scope::Local,
+                what: What::Broker
+            })
         ));
         assert!(matches!(
-            view(&j(r#"{"kind":"attributes","resource":"queue.q","names":["MessageCount"]}"#)),
-            Ok(View::Attributes { names, .. }) if names == ["MessageCount"]
+            view(r#"{"kind":"broker","node":"me"}"#),
+            Ok(View {
+                node: Scope::Local,
+                ..
+            })
         ));
-        assert!(view(&j(r#"{"kind":"listing","listing":"nope"}"#)).is_err());
-        assert!(view(&j(r#"{"kind":"attributes","resource":"q"}"#)).is_err());
-        assert!(view(&j(r#"{}"#)).is_err());
+        assert!(matches!(
+            view(r#"{"kind":"broker","node":"other"}"#),
+            Ok(View { node: Scope::Node(n), .. }) if n == "other"
+        ));
+        assert!(matches!(
+            view(r#"{"kind":"listing","listing":"queues","query":"page=2&size=5"}"#),
+            Ok(View { what: What::Listing { query, .. }, .. }) if query.page == 2 && query.size == 5
+        ));
+        assert!(matches!(
+            view(r#"{"kind":"listing","listing":"queues","node":"all"}"#),
+            Ok(View {
+                node: Scope::All,
+                ..
+            })
+        ));
+        assert!(matches!(
+            view(r#"{"kind":"attributes","resource":"queue.q","names":["MessageCount"]}"#),
+            Ok(View { what: What::Attributes { names, .. }, .. }) if names == ["MessageCount"]
+        ));
+        assert!(view(r#"{"kind":"broker","node":"all"}"#).is_err());
+        assert!(view(r#"{"kind":"broker","node":1}"#).is_err());
+        assert!(view(r#"{"kind":"listing","listing":"nope"}"#).is_err());
+        assert!(view(r#"{"kind":"attributes","resource":"q"}"#).is_err());
+        assert!(view(r#"{}"#).is_err());
     }
 
     #[test]

@@ -59,6 +59,16 @@ fn object_with_optional(props: &[(&str, Json)], optional: &[(&str, Json)]) -> Js
 }
 
 /// Any JSON value.
+/// A boolean, or `null` where another node decides when asked.
+fn maybe_boolean() -> Json {
+    obj().with("type", Json::Array(vec!["boolean".into(), "null".into()]))
+}
+
+/// A string, or `null`.
+fn maybe_string() -> Json {
+    obj().with("type", Json::Array(vec!["string".into(), "null".into()]))
+}
+
 fn any() -> Json {
     obj()
 }
@@ -329,7 +339,8 @@ fn row(kind: &str) -> Json {
             )
         })
         .collect();
-    object(&props).with("additionalProperties", false)
+    // Across every node, each row names its node.
+    object_with_optional(&props, &[("node", string())]).with("additionalProperties", false)
 }
 
 fn listing_name(kind: &str) -> String {
@@ -356,14 +367,8 @@ fn schemas() -> Json {
             object(&[
                 ("user", string()),
                 ("roles", array(string())),
-                (
-                    "guard",
-                    obj().with("type", "string").with(
-                        "enum",
-                        Json::Array(vec!["management.xml".into(), "rbac".into()]),
-                    ),
-                ),
-                ("broker", map_of(boolean())),
+                ("guard", enumeration(&["management.xml", "rbac", "node"])),
+                ("broker", map_of(maybe_boolean())),
             ]),
         )
         .with(
@@ -373,7 +378,33 @@ fn schemas() -> Json {
                 array(object(&[("resource", string()), ("method", string())])),
             )]),
         )
-        .with("CheckResults", object(&[("results", array(boolean()))]))
+        .with(
+            "CheckResults",
+            object(&[("results", array(maybe_boolean()))]),
+        )
+        .with(
+            "NodeError",
+            object(&[
+                ("error", string()),
+                ("status", integer()),
+                ("node", string()),
+            ]),
+        )
+        .with(
+            "Node",
+            object(&[
+                ("nodeID", string()),
+                ("local", boolean()),
+                ("primary", maybe_string()),
+                ("backup", maybe_string()),
+                ("backupGroup", maybe_string()),
+                ("clusters", array(string())),
+            ]),
+        )
+        .with(
+            "Nodes",
+            object(&[("local", string()), ("data", array(schema_ref("Node")))]),
+        )
         .with(
             "Broker",
             object(&[("attributes", map_of(obj())), ("denied", array(string()))]),
@@ -395,12 +426,16 @@ fn schemas() -> Json {
         s.put(&row_name, row(kind));
         s.put(
             &listing_name(kind),
-            object(&[
-                ("data", array(schema_ref(&row_name))),
-                ("count", integer()),
-                ("page", integer()),
-                ("size", integer()),
-            ]),
+            object_with_optional(
+                &[
+                    ("data", array(schema_ref(&row_name))),
+                    ("count", integer()),
+                    ("page", integer()),
+                    ("size", integer()),
+                ],
+                // Across every node: those that could not answer.
+                &[("errors", array(schema_ref("NodeError")))],
+            ),
         );
         views.push((
             kind,
@@ -462,7 +497,7 @@ fn schemas() -> Json {
                     ("description", string()),
                 ])),
             ),
-            ("allowed", boolean()),
+            ("allowed", maybe_boolean()),
         ]),
     );
     let mut resource = summary.to_vec();
@@ -492,6 +527,7 @@ fn schemas() -> Json {
                 ("names", array(string())),
                 ("listing", enumeration(&LISTINGS)),
                 ("query", string()),
+                ("node", string()),
             ],
         ),
     );
@@ -597,6 +633,18 @@ fn paths() -> Json {
                         responses(Some((200, schema_ref("CheckResults"))), &[400, 401]),
                     ),
                     schema_ref("Checks"),
+                ),
+            ),
+        )
+        .with(
+            &p("/nodes"),
+            obj().with(
+                "get",
+                operation(
+                    "nodes",
+                    "This broker and the others its cluster topology has",
+                    vec![],
+                    responses(Some((200, schema_ref("Nodes"))), &[401]),
                 ),
             ),
         )
@@ -859,7 +907,11 @@ pub fn document() -> Json {
             "info",
             obj()
                 .with("title", "Saranga console API")
-                .with("version", VERSION),
+                .with("version", VERSION)
+                .with(
+                    "description",
+                    "Every path but /session, /views, /nodes, /events, /history, /notifications and /openapi.json is served for another node too, at /saranga/api/v1/nodes/{node}/... (a node ID from GET /nodes; local is this broker): it is sent to that node as management messages, as the user, and that node allows or refuses it. At /saranga/api/v1/nodes/all/... the listings span every node.",
+                ),
         )
         .with("paths", paths())
         .with(
@@ -908,9 +960,9 @@ mod tests {
                 assert!(ids.insert(id.to_owned()), "{id} twice");
             }
         }
-        // Six of the session and the user, six listings, three closes, five
-        // of the resources, four of the live data.
-        assert_eq!(ids.len(), 24);
+        // Seven of the session, the user and the nodes, six listings, three
+        // closes, five of the resources, four of the live data.
+        assert_eq!(ids.len(), 25);
     }
 
     #[test]
