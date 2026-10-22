@@ -1,0 +1,60 @@
+# The Saranga image for FreeBSD (podman with ocijail), laid out as the Linux
+# image in docker/Dockerfile: the home in /opt/saranga, a broker instance
+# made on the first start in the /var/lib/artemis-instance volume, user 1001
+# and the same ports. The binary is built on a FreeBSD host and packaged
+# first, as .dockerignore leaves target/ out of the context:
+#
+#   cargo build --release --locked -p saranga-cli
+#   scripts/package.sh x86_64-unknown-freebsd target/release/saranga
+#   podman build -f docker/Dockerfile.freebsd -t saranga:freebsd .
+#   podman run -p 8161:8161 -p 61616:61616 saranga:freebsd
+
+FROM docker.io/freebsd/freebsd-runtime:15.1
+ARG VERSION=1.0.0
+LABEL org.opencontainers.image.title="Saranga" \
+      org.opencontainers.image.description="A message broker inspired by Apache ActiveMQ Artemis 2.57.0" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+ENV ARTEMIS_USER=artemis
+ENV ARTEMIS_PASSWORD=artemis
+ENV ANONYMOUS_LOGIN=false
+ENV EXTRA_ARGS="--http-host 0.0.0.0 --relax-jolokia"
+
+# docker-run.sh is a bash script, which the runtime image does not have,
+# nor libprocstat.so.1, which saranga links (FreeBSD-utilities has it).
+RUN env ASSUME_ALWAYS_YES=yes pkg bootstrap -f \
+    && pkg install -y bash FreeBSD-utilities && pkg clean -ay && rm -rf /var/db/pkg/repos \
+    && ln -s /usr/local/bin/bash /bin/bash
+
+# The user and group Artemis's image runs as.
+RUN pw groupadd artemis -g 1001 && pw useradd artemis -u 1001 -g artemis -d /nonexistent -s /usr/sbin/nologin
+
+# ADD unpacks the archive: saranga-<version>-x86_64-unknown-freebsd/ is the home.
+ADD dist/saranga-${VERSION}-x86_64-unknown-freebsd.tar.gz /opt/
+RUN mv /opt/saranga-${VERSION}-x86_64-unknown-freebsd /opt/saranga
+
+EXPOSE \
+# Port for HTTP
+    8161 \
+# Port for CORE,MQTT,AMQP,HORNETQ,STOMP,OPENWIRE
+    61616 \
+# Port for legacy HORNETQ,STOMP clients
+    5445 \
+# Port for AMQP
+    5672 \
+# Port for MQTT
+    1883 \
+# Port for STOMP
+    61613
+
+RUN mkdir -p /var/lib/artemis-instance && chown -R artemis:artemis /var/lib/artemis-instance
+
+COPY docker/docker-run.sh /
+
+USER artemis
+
+VOLUME ["/var/lib/artemis-instance"]
+WORKDIR /var/lib/artemis-instance
+
+ENTRYPOINT ["/docker-run.sh"]
+CMD ["run"]
