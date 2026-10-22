@@ -618,6 +618,53 @@ impl Agent {
         }
     }
 
+    /// The MBean of a management resource (`broker`, `queue.<name>`...), for
+    /// the console's API.
+    pub(crate) fn bean_of(&self, resource: &str) -> Option<(ObjectName, Bean)> {
+        self.beans()
+            .into_iter()
+            .find(|(_, b)| b.resource() == resource)
+    }
+
+    /// Whether the caller may call a method of an MBean, for the console's
+    /// API.
+    pub(crate) fn may(&self, caller: &Caller, name: &ObjectName, method: &str) -> bool {
+        self.can_invoke(caller, name, method)
+    }
+
+    /// An operation on an MBean, as Jolokia's `exec` calls it: the same
+    /// guard, parameter conversion and audit.
+    pub(crate) async fn call(
+        &self,
+        caller: &Caller,
+        name: ObjectName,
+        operation: &str,
+        arguments: Vec<Json>,
+    ) -> Result<Json, Failure> {
+        let req = Request {
+            kind: "exec",
+            mbean: Some(name),
+            attrs: Attrs::All,
+            path: None,
+            value: None,
+            operation: Some(operation.to_owned()),
+            arguments,
+            canonical: true,
+        };
+        self.exec(caller, &req).await
+    }
+
+    /// One attribute of an MBean, as Jolokia's `read` reads it.
+    pub(crate) async fn read_attribute(
+        &self,
+        caller: &Caller,
+        name: &ObjectName,
+        bean: &Bean,
+        attr: &str,
+    ) -> Result<Json, Failure> {
+        self.attribute(caller, name, bean, attr).await
+    }
+
     /// The one MBean a non-pattern name names; not found, it is named as
     /// the request gave it (`ObjectName.toString`).
     fn bean(&self, name: &ObjectName) -> Result<(ObjectName, Bean), Failure> {

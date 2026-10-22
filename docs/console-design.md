@@ -26,6 +26,7 @@ The pieces the console builds on are already there:
   - `addConnector` and `removeConnector`.
 
   A page that needs one of these gets it implemented as Artemis implements it, in the same stage. No button is ever shown for something the broker cannot do.
+- **Gaps found while building.** `closeSessionWithID` closes only Core sessions: for STOMP, AMQP, MQTT and OpenWire it answers false (COMPAT.md), while Artemis closes the server side of any session. Artemis's console can close any session, so Stage 3 implements it for every protocol.
 
 ## What Artemis's console does (parity checklist)
 
@@ -129,7 +130,7 @@ browser ──HTTPS── saranga (the node you logged into)
   - topology changes.
 
   The history ring buffer is sampled from the same counters `/metrics` reads.
-- **The API is typed.** Request and response types derive OpenAPI with `utoipa`. `openapi-typescript` generates the TypeScript client from it, so the Rust and TypeScript types cannot drift. The OpenAPI document is served too, so the API is documented.
+- **The API is typed.** `api_schema.rs` describes the API as OpenAPI 3.1, built from tables in the crate's own style. It uses no serde or utoipa: the crate has its own `Json` type and keeps its dependencies few. The listings' field enums come from the broker's views (`view_fields`), so they cannot drift. `openapi-typescript` generates the TypeScript client from the served `/openapi.json`. A row of a listing is typed loosely for now. Stage 2 gives each row exact types, with a test that checks live rows against them.
 - **Embedding.** `build.rs` embeds `console/build` with `rust-embed`, compressed.
   - A build without the built pages (a Rust-only build, with no Node) embeds a stub page that says how to build the console, and prints a warning. Release builds and CI require the real pages.
   - Running the console needs no Node.js.
@@ -198,6 +199,14 @@ Each stage is committed on its own, with its tests.
    - Playwright runs every page with every role (admin, read-only, none), on one node and on a cluster.
    - Then accessibility and phone-width checks.
    - The guide's management page, COMPAT.md and FUTURE.md are updated.
+
+## Progress
+
+- **Stage 1 (the API foundation) is done.**
+  - `crates/saranga-management/src/api.rs` serves `/saranga/api/v1`, and `api_schema.rs` serves its OpenAPI document. They cover sessions, `/me` and `/me/can`, the views, the broker's status, the six listings, and the three closes.
+  - Every call goes through the Jolokia agent's guard, parameter conversion and audit. The login is the Artemis console's (`console::login_user`), with its own cookie on `/saranga`.
+  - `-Dsaranga.console.enabled=false` turns it off.
+  - `tests/interop/console/api.sh` checks every endpoint as admin, viewer and a user without a console role: 56 checks, plus the off switch. It passes on Windows, and against the `saranga` podman jail on FreeBSD 15.1, checked from another host on the LAN.
 
 ## Decisions (confirmed 2026-10-22)
 

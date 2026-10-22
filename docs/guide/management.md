@@ -11,6 +11,7 @@ Saranga answers Artemis's management interface. Management messages sent to `act
 | Prometheus metrics | the metrics app's URL, `/metrics` | `<app url="metrics" war="metrics.war"/>` in `bootstrap.xml` |
 | Jolokia | `/console/jolokia` | the console's app, and a user with a console role |
 | Web console | `/console` | the console's app, and a `console.war` from Artemis |
+| Saranga console API (Saranga only) | `/saranga/api/v1` on every `<web>` binding | a user with a console role |
 | CLI | `saranga queue`, `address`, `user`, `check` | a Core connection to an acceptor |
 
 Every way in is audited the same way (see [operations.md](operations.md#the-audit-log)).
@@ -167,6 +168,38 @@ Where Saranga differs:
 - Sessions live in memory and end when the broker stops.
 
 See [COMPAT.md, Web server differences](../../COMPAT.md#web-server-differences) and Artemis's [management console](https://activemq.apache.org/components/artemis/documentation/latest/management-console.html) chapter.
+
+## The Saranga console API
+
+Saranga is getting a console of its own, served at `/saranga` (see [the design](../console-design.md)). Its pages are not built yet. Its API is served at `/saranga/api/v1` on every `<web>` binding, and it can be scripted.
+
+It calls the same MBeans as Jolokia and checks them the same way. The login is the console's: a user of the broker's JAAS domain who holds a console role (`HAWTIO_ROLES`). Then `management.xml`'s `<authorisation>`, or the RBAC guard, decides each call. Failed logins are throttled as on the Artemis console. Every call is audited.
+
+| Request | Does |
+|---|---|
+| `POST /session` with `{"user", "password"}` | logs in and sets the `SARANGA_SESSION_<binding>_<port>` cookie |
+| `DELETE /session` | logs out |
+| `GET /me` | the user, their roles, and which broker operations they may call |
+| `POST /me/can` with `{"checks": [{"resource", "method"}]}` | whether they may call each method, on resources named as for management messages (`queue.orders`) |
+| `GET /views` | the fields each listing filters and sorts by |
+| `GET /broker` | the broker's status attributes the user may read |
+| `GET /{connections\|sessions\|consumers\|producers\|addresses\|queues}` | one page of a listing; takes `filter=field:OPERATION:value` (repeatable), `sort`, `order` (`asc` or `desc`), `page` (from 1) and `size` (100 by default) |
+| `DELETE /connections/{id}`, `/sessions/{connection}/{id}`, `/consumers/{session}/{id}` | closes one |
+| `GET /openapi.json` | the API as OpenAPI 3.1, without a login |
+
+A filter's `OPERATION` is one of `EQUALS`, `NOT_EQUALS`, `CONTAINS`, `NOT_CONTAINS`, `GREATER_THAN` and `LESS_THAN`, as in the `list*` operations. A request may log in with HTTP Basic instead of the session. A request that changes something, including the login, must carry the header `X-Saranga-Console: 1`, which a cross-site form cannot send. A failure comes back as `{"error", "status"}`, with status 401 (no login, or a wrong one), 403 (not permitted, or no header), 404 (nothing there), 429 (too many failed logins) or 400.
+
+```bash
+# The queues that have consumers, busiest first
+curl -s -u admin:admin \
+  'http://localhost:8161/saranga/api/v1/queues?filter=consumerCount:GREATER_THAN:0&sort=messageCount&order=desc'
+
+# Close a connection
+curl -s -u admin:admin -X DELETE -H 'X-Saranga-Console: 1' \
+  http://localhost:8161/saranga/api/v1/connections/89ee1971
+```
+
+To turn the console off, give `-Dsaranga.console.enabled=false` in the profile's `JAVA_ARGS`. Jolokia and Artemis's console are not affected.
 
 ## The web server
 

@@ -12,8 +12,13 @@
 //!   the console roles (`HAWTIO_ROLES`), and every attribute and operation
 //!   is checked against `management.xml`'s `<authorisation>`. Without that
 //!   app neither is served.
+//! - Saranga's own console at `/saranga`, with its API at
+//!   `/saranga/api/v1` (see [`api`]), unless `saranga.console.enabled` is
+//!   `false`.
 
 mod access;
+pub mod api;
+mod api_schema;
 mod catalog;
 pub mod console;
 mod exceptions;
@@ -80,6 +85,9 @@ pub struct Options {
     /// The system properties `java.lang:type=Runtime` reports: those
     /// `artemis run` defines, then those given with `-D`.
     pub system_properties: Vec<(String, String)>,
+    /// Whether Saranga's own console is served (`saranga.console.enabled`,
+    /// true by default).
+    pub saranga_console: bool,
 }
 
 /// `jolokia-access.xml`'s `<cors>`: allowed origins, and whether a
@@ -293,6 +301,30 @@ pub async fn start(
                     "the web app {war} at /{url} is not served: Saranga runs no JVM and serves only the console and the metrics app"
                 );
             }
+        }
+        if options.saranga_console {
+            tracing::info!("Saranga console API available at {}{}", b.uri, api::API);
+            let state = Arc::new(api::ApiState {
+                agent: jolokia::Agent {
+                    broker: broker.clone(),
+                    domain: options.domain.clone(),
+                    broker_name: options.broker_name.clone(),
+                    access: options.access.clone(),
+                    agent_id: agent_id.clone(),
+                    acceptors: options.acceptors.clone(),
+                    process: process.clone(),
+                },
+                broker: broker.clone(),
+                console_roles: options.console_roles.clone(),
+                sessions: console::Console::new(
+                    api::BASE.to_owned(),
+                    None,
+                    format!("SARANGA_SESSION_{index}_{}", addr.port()),
+                    b.tls.is_some(),
+                    options.session_timeout,
+                ),
+            });
+            router = router.merge(api::router(state));
         }
         tokio::spawn(serve(listener, b.tls.clone(), router));
     }

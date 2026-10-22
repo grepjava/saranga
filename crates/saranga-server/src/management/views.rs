@@ -197,6 +197,23 @@ impl View {
     }
 }
 
+/// The fields of the listing `kind` names (`queues`, `addresses`,
+/// `connections`, `sessions`, `consumers` or `producers`) and its default
+/// sort field: each field as its enum constant and its name, which filters
+/// and sorts take.
+pub fn view_fields(kind: &str) -> Option<(&'static [(&'static str, &'static str)], &'static str)> {
+    let view = match kind {
+        "queues" => &QUEUE_VIEW,
+        "addresses" => &ADDRESS_VIEW,
+        "connections" => &CONNECTION_VIEW,
+        "sessions" => &SESSION_VIEW,
+        "consumers" => &CONSUMER_VIEW,
+        "producers" => &PRODUCER_VIEW,
+        _ => return None,
+    };
+    Some((view.fields, view.default_sort))
+}
+
 /// One element of a view: its fields for filtering and sorting, and its
 /// JSON (`toJson`).
 struct Item {

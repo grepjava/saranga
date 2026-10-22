@@ -207,6 +207,9 @@ pub async fn start(
             .unwrap_or(saranga_management::console::DEFAULT_SESSION_TIMEOUT),
         strict_transport_security: hawtio_setting(instance, "hawtio.http.strictTransportSecurity"),
         system_properties: instance.system_properties(),
+        saranga_console: instance
+            .lookup("saranga.console.enabled")
+            .is_none_or(|v| !v.trim().eq_ignore_ascii_case("false")),
     };
     saranga_management::start(current.clone(), bindings, options)
         .await

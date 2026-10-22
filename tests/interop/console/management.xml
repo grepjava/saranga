@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<!-- The console API suite's management.xml: amq may do anything; view may
+     only read (list, get, is, count, browse); other roles nothing. -->
+<management-context xmlns="http://activemq.apache.org/schema">
+   <connector connector-port="1099"/>
+   <authorisation>
+      <allowlist>
+         <entry domain="hawtio"/>
+      </allowlist>
+      <default-access>
+         <access method="list*" roles="amq,view"/>
+         <access method="get*" roles="amq,view"/>
+         <access method="is*" roles="amq,view"/>
+      </default-access>
+      <role-access>
+         <match domain="org.apache.activemq.artemis">
+            <access method="list*" roles="amq,view"/>
+            <access method="get*" roles="amq,view"/>
+            <access method="is*" roles="amq,view"/>
+            <access method="count*" roles="amq,view"/>
+            <access method="browse*" roles="amq,view"/>
+            <access method="*" roles="amq"/>
+         </match>
+      </role-access>
+   </authorisation>
+</management-context>

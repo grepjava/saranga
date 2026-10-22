@@ -188,7 +188,7 @@ impl Console {
     }
 
     /// `AuthSessionHelpers.setup` on a new session: its id.
-    fn start(&self, user: String, roles: Vec<String>, subject: Arc<Subject>) -> String {
+    pub(crate) fn start(&self, user: String, roles: Vec<String>, subject: Arc<Subject>) -> String {
         let id = format!("node0{:032x}.node0", rand::random::<u128>());
         let mut sessions = self.sessions.lock().unwrap();
         sessions.retain(|_, s| !self.expired(s));
@@ -206,7 +206,7 @@ impl Console {
     }
 
     /// The `Set-Cookie` of a new session, with Jetty's `Expires` beside it.
-    fn set_cookie(&self, r: &mut Response, id: &str) {
+    pub(crate) fn set_cookie(&self, r: &mut Response, id: &str) {
         let secure = if self.https { "; Secure" } else { "" };
         let value = format!(
             "{}={id}; Path={}; HttpOnly{secure}; SameSite=Strict",
@@ -219,6 +219,18 @@ impl Console {
             header::EXPIRES,
             HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"),
         );
+    }
+
+    /// The `Set-Cookie` that removes the session's cookie.
+    pub(crate) fn clear_cookie(&self, r: &mut Response) {
+        let secure = if self.https { "; Secure" } else { "" };
+        let value = format!(
+            "{}=; Path={}; Max-Age=0; HttpOnly{secure}; SameSite=Strict",
+            self.cookie, self.base
+        );
+        if let Ok(v) = HeaderValue::from_str(&value) {
+            r.headers_mut().append(header::SET_COOKIE, v);
+        }
     }
 
     /// `AuthenticationThrottler.attempt`: seconds to wait, when blocked.
@@ -283,17 +295,35 @@ pub(crate) fn authenticate(
     password: Option<&str>,
     peer: SocketAddr,
 ) -> Auth {
+    login_user(
+        &state.console,
+        &state.broker,
+        &state.console_roles,
+        user,
+        password,
+        peer,
+    )
+}
+
+/// [`authenticate`] for any console's sessions: Artemis's or Saranga's.
+pub(crate) fn login_user(
+    console: &Console,
+    current: &saranga_server::Current,
+    console_roles: &[String],
+    user: Option<&str>,
+    password: Option<&str>,
+    peer: SocketAddr,
+) -> Auth {
     let (Some(user), Some(password)) = (user, password) else {
         return Auth::NoCredentials;
     };
     if user.trim().is_empty() || password.trim().is_empty() || user == "public" {
         return Auth::NoCredentials;
     }
-    let console = &state.console;
     if let Some(wait) = console.blocked(user) {
         return Auth::Throttled(wait);
     }
-    let broker = state.broker.get();
+    let broker = current.get();
     let subject = broker.security().and_then(|store| {
         let connection = saranga_security::ConnectionInfo {
             remote_address: format!("/{peer}"),
@@ -311,8 +341,7 @@ pub(crate) fn authenticate(
     });
     let authorized = subject.and_then(|subject| {
         let roles: Vec<String> = subject.roles().map(str::to_owned).collect();
-        state
-            .console_roles
+        console_roles
             .iter()
             .any(|r| r == "*" || roles.iter().any(|u| u == r))
             .then_some((roles, subject))
