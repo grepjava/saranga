@@ -1353,6 +1353,7 @@ dependencies = [
 name = "saranga-buffer"
 version = "1.0.0"
 dependencies = [
+ "bytes",
  "thiserror",
 ]
 
@@ -1463,6 +1464,7 @@ dependencies = [
 name = "saranga-message"
 version = "1.0.0"
 dependencies = [
+ "bytes",
  "saranga-buffer",
 ]
 
@@ -1479,6 +1481,7 @@ dependencies = [
 name = "saranga-protocol-amqp"
 version = "1.0.0"
 dependencies = [
+ "bytes",
  "saranga-buffer",
  "saranga-config",
  "saranga-core-protocol",
@@ -1581,6 +1584,7 @@ dependencies = [
  "saranga-security",
  "saranga-storage",
  "saranga-transport",
+ "socket2",
  "thiserror",
  "tokio",
  "tracing",
