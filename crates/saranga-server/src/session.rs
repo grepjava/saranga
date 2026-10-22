@@ -589,6 +589,13 @@ enum Outgoing {
 }
 
 impl ServerSession {
+    /// The session is on management's own connection
+    /// (`ManagementRemotingConnection`): without a user name and password,
+    /// it is authorized as the subject it authenticated as.
+    pub(crate) fn on_management_connection(&mut self) {
+        self.auth.management = true;
+    }
+
     pub fn new(
         broker: Arc<Broker>,
         conn: Arc<ClientConnection>,

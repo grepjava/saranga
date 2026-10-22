@@ -296,6 +296,81 @@ check("admin may remove messages and count them", body.get("results") == [True, 
 status, body, _ = v.request("POST", "/me/can", checks)
 check("viewer may count messages but not remove them", body.get("results") == [False, True, False], body)
 
+# The resources: the explorer's view of the MBeans, and the operations the
+# pages call through it.
+status, body, _ = c.request("GET", "/resources")
+names = {r.get("resource"): r for r in (body or {}).get("data", [])}
+check("GET /resources lists the broker, the queues and the process",
+      status == 200 and "broker" in names and "queue.console.q2" in names and "java.lang.Runtime" in names,
+      (status, sorted(names)[:20]))
+check("a resource has its type and MBean name",
+      names.get("queue.console.q2", {}).get("type") == "queue"
+      and 'queue="console.q2"' in names.get("queue.console.q2", {}).get("objectName", ""),
+      names.get("queue.console.q2"))
+status, q2r, _ = c.request("GET", "/resources/queue.console.q2")
+attrs = {a["name"]: a for a in (q2r or {}).get("attributes", [])}
+ops = {o["signature"]: o for o in (q2r or {}).get("operations", [])}
+check("a resource has its attributes' values", status == 200 and attrs.get("MessageCount", {}).get("value") == 1,
+      (status, attrs.get("MessageCount")))
+check("and its operations, each allowed or not",
+      ops.get("browse(int,int,java.lang.String)", {}).get("allowed") is True
+      and ops.get("removeAllMessages()", {}).get("allowed") is True
+      and ops.get("removeAllMessages()", {}).get("impact") == "ACTION",
+      list(ops)[:5])
+status, body, _ = v.request("GET", "/resources/queue.console.q2")
+vops = {o["signature"]: o.get("allowed") for o in (body or {}).get("operations", [])}
+check("viewer may browse a queue but not purge it",
+      status == 200 and vops.get("browse(int,int,java.lang.String)") is True and vops.get("removeAllMessages()") is False,
+      (status, vops.get("browse(int,int,java.lang.String)"), vops.get("removeAllMessages()")))
+status, body, _ = c.request("GET", "/resources/queue.nosuchqueue")
+check("an unknown resource is 404", status == 404, (status, body))
+status, body, _ = c.request("GET", "/resources/queue.console.q2/attributes?name=MessageCount&name=Nope")
+values = (body or {}).get("attributes", {})
+check("some attributes are read, and one that is not there says so",
+      status == 200 and values.get("MessageCount", {}).get("value") == 1 and "error" in values.get("Nope", {}),
+      (status, body))
+
+def invoke(client, resource, operation, args=(), headers=MARK):
+    return client.request("POST", f"/resources/{resource}/operations",
+                          {"operation": operation, "arguments": list(args)}, headers)
+
+status, body, _ = invoke(c, "queue.console.q2", "browse(int,int,java.lang.String)", [1, 10, ""])
+browsed = (body or {}).get("result") or []
+check("admin browses the queue", status == 200 and len(browsed) == 1 and browsed[0].get("messageID"), (status, body))
+status, body, _ = invoke(v, "queue.console.q2", "countMessages()")
+check("viewer counts its messages", status == 200 and body.get("result") == 1, (status, body))
+status, body, _ = invoke(c, "queue.console.q2", "countMessages()", headers={})
+check("an operation without X-Saranga-Console is 403", status == 403, (status, body))
+status, body, _ = invoke(v, "queue.console.q2", "removeAllMessages()")
+check("viewer may not purge it", status == 403, (status, body))
+status, body, _ = invoke(c, "queue.console.q2", "moveMessages")
+check("an overloaded operation without its signature is 400", status == 400 and "overloaded" in body.get("error", ""),
+      (status, body))
+send = "sendMessage(java.util.Map,int,java.lang.String,boolean,java.lang.String,java.lang.String,boolean)"
+status, body, _ = invoke(c, "address.console.q2", send, [{"color": "red"}, 3, "from the console", True, None, None, True])
+check("admin sends a message as themself, with no user given", status == 200 and str(body.get("result", "")).isdigit(),
+      (status, body))
+status, body, _ = invoke(v, "address.console.q2", send, [{}, 3, "no", True, None, None, True])
+check("viewer may not send", status == 403, (status, body))
+status, body, _ = invoke(c, "queue.console.q2", "browse(int,int,java.lang.String)", [1, 10, "color = 'red'"])
+sent = (body or {}).get("result") or [{}]
+check("the message sent is there, as admin sent it",
+      len(sent) == 1 and sent[0].get("text") == "from the console" and sent[0].get("StringProperties", {}).get("color") == "red",
+      sent)
+status, body, _ = invoke(c, "queue.console.q2", "removeMessage(long)", [sent[0].get("messageID")])
+check("admin deletes it by its ID", status == 200 and body.get("result") is True, (status, body))
+
+status, body, _ = c.request("PUT", "/resources/broker/attributes/MessageCounterMaxDayCount", {"value": 9}, MARK)
+previous = (body or {}).get("previous")
+check("admin writes an attribute, which answers its previous value", status == 200 and isinstance(previous, int),
+      (status, body))
+status, body, _ = c.request("GET", "/resources/broker/attributes?name=MessageCounterMaxDayCount")
+check("the attribute has its new value", body.get("attributes", {}).get("MessageCounterMaxDayCount", {}).get("value") == 9,
+      body)
+c.request("PUT", "/resources/broker/attributes/MessageCounterMaxDayCount", {"value": previous}, MARK)
+status, body, _ = v.request("PUT", "/resources/broker/attributes/MessageCounterMaxDayCount", {"value": 9}, MARK)
+check("viewer may not write it", status == 403, (status, body))
+
 # Closing.
 session_id, consumer_id = consumer_row.get("session"), consumer_row.get("id")
 status, body, _ = v.request("DELETE", f"/consumers/{session_id}/{consumer_id}", headers=MARK)
@@ -317,6 +392,14 @@ status, body, _ = c.request("DELETE", f"/sessions/{core.get('connectionID')}/{co
 check("admin closes the session", status == 204, (status, body))
 status, page = until(c, "sessions", f"?filter=id:EQUALS:{core.get('id')}", lambda p: p.get("count") == 0)
 check("the session is gone", page.get("count") == 0, page)
+
+# A session of another protocol closes too, as in Artemis.
+status, page = until(c, "sessions", "?filter=protocol:EQUALS:STOMP", lambda p: p.get("count", 0) >= 1)
+stomp = (page.get("data") or [{}])[0]
+status, body, _ = c.request("DELETE", f"/sessions/{stomp.get('connectionID')}/{stomp.get('id')}", headers=MARK)
+check("admin closes a STOMP session", status == 204, (status, body))
+status, page = until(c, "sessions", f"?filter=id:EQUALS:{stomp.get('id')}", lambda p: p.get("count") == 0)
+check("the STOMP session is gone", page.get("count") == 0, page)
 
 status, page = rows(c, "connections", "?filter=protocol:EQUALS:STOMP")
 ids = [r.get("connectionID") for r in page.get("data", [])]

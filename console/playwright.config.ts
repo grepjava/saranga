@@ -7,6 +7,8 @@ export default defineConfig({
 	testDir: 'e2e',
 	testMatch: '**/*.e2e.ts',
 	fullyParallel: false,
+	// The tests share one broker.
+	workers: 1,
 	retries: 0,
 	reporter: [['list']],
 	use: {

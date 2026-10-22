@@ -26,3 +26,42 @@ export function listingHref(node: string, kind: Listing, params?: URLSearchParam
 export function preferencesHref(node: string): string {
 	return resolve('/n/[node]/preferences', { node });
 }
+
+export function queueHref(node: string, name: string): string {
+	return resolve('/n/[node]/queues/[name]', { node, name: encodeURIComponent(name) });
+}
+
+export function addressHref(node: string, name: string): string {
+	return resolve('/n/[node]/addresses/[name]', { node, name: encodeURIComponent(name) });
+}
+
+export function explorerHref(node: string, resource?: string): string {
+	const href = resolve('/n/[node]/explorer', { node });
+	return resource ? withQuery(href, new URLSearchParams({ r: resource })) : href;
+}
+
+export function diagramHref(node: string): string {
+	return resolve('/n/[node]/diagram', { node });
+}
+
+export function runtimeHref(node: string): string {
+	return resolve('/n/[node]/runtime', { node });
+}
+
+/**
+ * Where a linked value leads: a queue's or an address's name to its page, any
+ * other to the listing it names, filtered to it.
+ */
+export function linkHref(
+	node: string,
+	link: { kind: Listing; field: string },
+	value: string
+): string {
+	if (link.field === 'name' && link.kind === 'queues') return queueHref(node, value);
+	if (link.field === 'name' && link.kind === 'addresses') return addressHref(node, value);
+	return listingHref(
+		node,
+		link.kind,
+		new URLSearchParams({ filter: `${link.field}:EQUALS:${value}` })
+	);
+}

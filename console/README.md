@@ -49,7 +49,8 @@ there.
 - `src/routes/`: the pages. Routes are in the URL's fragment
   (`#/n/local/queues?filter=name:CONTAINS:orders`), and every page's URL
   names its node.
-- `src/lib/api/`: the typed client.
+- `src/lib/api/`: the typed client; `src/lib/broker.ts` names the broker operations the
+  pages call through its resources, by the signatures Artemis's console uses.
 - `src/lib/state/`: the session, the nodes and the preferences, as runes
   classes.
 - `src/lib/components/`: the shell and `DataTable`; `ui/` holds the

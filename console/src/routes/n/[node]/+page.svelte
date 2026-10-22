@@ -6,6 +6,7 @@
 	import { api } from '#lib/api/index.js';
 	import { formatBytes, formatDuration, formatNumber } from '#lib/format.js';
 	import { listingHref } from '#lib/nav.js';
+	import BrokerParts from '#lib/components/BrokerParts.svelte';
 	import type { PageProps } from './$types';
 
 	let { params }: PageProps = $props();
@@ -168,6 +169,8 @@
 			</Card.Content>
 		</Card.Root>
 	</div>
+
+	<BrokerParts node={params.node} />
 
 	{#if denied.length}
 		<p class="text-xs text-muted-foreground">

@@ -8,7 +8,9 @@
 	import DataTable, { type Column, type Row } from '#lib/components/DataTable.svelte';
 	import { api, type Listing } from '#lib/api/index.js';
 	import { LISTINGS, isListing, label, type ListingInfo } from '#lib/listings.js';
-	import { listingHref, hashQuery } from '#lib/nav.js';
+	import { listingHref, linkHref, hashQuery } from '#lib/nav.js';
+	import CreateAddress from '#lib/components/CreateAddress.svelte';
+	import CreateQueue from '#lib/components/CreateQueue.svelte';
 	import { MAX_PAGE_SIZE, parseQuery, queryParams, type ListQuery } from '#lib/query.js';
 	import { listingViews } from '#lib/views.js';
 	import { prefs } from '#lib/state/prefs.svelte.js';
@@ -76,13 +78,12 @@
 		}))
 	);
 
-	/** A linked value leads to the listing it names, filtered to it. */
+	/** A linked value leads to its page, or to the listing it names, filtered to it. */
 	function href(row: Row, column: Column): string | undefined {
 		const link = info?.links?.[column.key as never] as { kind: Listing; field: string } | undefined;
 		const value = row[column.key];
 		if (!link || value === '' || value === undefined || value === null) return undefined;
-		const filter = new URLSearchParams({ filter: `${link.field}:EQUALS:${value}` });
-		return listingHref(params.node, link.kind, filter);
+		return linkHref(params.node, link, String(value));
 	}
 	const allColumns = $derived(
 		(info?.columns ?? []).map((key) => ({ key, label: label(key as string) }))
@@ -104,19 +105,33 @@
 		}
 	}
 
-	const may = $derived(info?.close ? session.may(info.close.operation) : false);
+	const may = $derived(info?.bulk ? session.may(info.bulk.operation) : false);
 	let confirm = $state<Row[] | null>(null);
 
-	async function closeAll(which: Row[]) {
-		if (!info?.close) return;
-		const close = info.close;
+	const creates = $derived(
+		kind === 'addresses' ? 'createAddress' : kind === 'queues' ? 'createQueue' : undefined
+	);
+	const mayCreate = $derived(creates ? session.may(creates) : false);
+	let creating = $state(false);
+
+	/** `the queue`, `3 addresses`. */
+	function some(n: number): string {
+		const noun = info?.noun ?? '';
+		if (n === 1) return `the ${noun}`;
+		return `${n} ${noun === 'address' ? 'addresses' : `${noun}s`}`;
+	}
+
+	async function runAll(which: Row[]) {
+		if (!info?.bulk) return;
+		const bulk = info.bulk;
 		confirm = null;
-		const results = await Promise.allSettled(which.map((r) => close.run(r as never)));
+		const results = await Promise.allSettled(which.map((r) => bulk.run(r as never)));
 		const failed = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
 		const done = results.length - failed.length;
-		if (done) toast.success(`Closed ${done} ${info.noun}${done === 1 ? '' : 's'}`);
+		const past = bulk.verb === 'Close' ? 'Closed' : 'Deleted';
+		if (done) toast.success(`${past} ${some(done)}`);
 		if (failed.length)
-			toast.error(`${failed.length} could not be closed`, {
+			toast.error(`${failed.length} could not be ${past.toLowerCase()}`, {
 				description: (failed[0].reason as Error).message
 			});
 		selected.clear();
@@ -130,8 +145,11 @@
 
 {#if kind && info}
 	<div class="flex flex-col gap-4">
-		<div class="flex items-baseline gap-3">
+		<div class="flex items-center justify-between gap-3">
 			<h1 class="text-xl font-semibold">{info.title}</h1>
+			{#if mayCreate}
+				<Button size="sm" onclick={() => (creating = true)}>Create {info.noun}</Button>
+			{/if}
 		</div>
 		<DataTable
 			label={info.title}
@@ -155,7 +173,8 @@
 		>
 			{#snippet bulk({ rows: chosen })}
 				<Button size="xs" variant="destructive" onclick={() => (confirm = chosen)}>
-					Close {chosen.length === 1 ? `the ${info.noun}` : `${chosen.length} ${info.noun}s`}
+					{info.bulk?.verb}
+					{some(chosen.length)}
 				</Button>
 			{/snippet}
 		</DataTable>
@@ -164,20 +183,23 @@
 	<AlertDialog.Root open={confirm !== null} onOpenChange={(o) => !o && (confirm = null)}>
 		<AlertDialog.Content>
 			<AlertDialog.Header>
-				<AlertDialog.Title>
-					Close {confirm?.length === 1 ? `the ${info.noun}` : `${confirm?.length} ${info.noun}s`}?
-				</AlertDialog.Title>
-				<AlertDialog.Description>
-					The broker ends {confirm?.length === 1 ? 'it' : 'them'} now. Clients that reconnect come back
-					as new {info.noun}s.
-				</AlertDialog.Description>
+				<AlertDialog.Title>{info.bulk?.verb} {some(confirm?.length ?? 0)}?</AlertDialog.Title>
+				<AlertDialog.Description>{info.bulk?.warning}</AlertDialog.Description>
 			</AlertDialog.Header>
 			<AlertDialog.Footer>
 				<AlertDialog.Cancel>Cancel</AlertDialog.Cancel>
-				<AlertDialog.Action onclick={() => confirm && closeAll(confirm)}>Close</AlertDialog.Action>
+				<AlertDialog.Action onclick={() => confirm && runAll(confirm)}>
+					{info.bulk?.verb}
+				</AlertDialog.Action>
 			</AlertDialog.Footer>
 		</AlertDialog.Content>
 	</AlertDialog.Root>
+
+	{#if kind === 'addresses'}
+		<CreateAddress bind:open={creating} oncreated={() => tick++} />
+	{:else if kind === 'queues'}
+		<CreateQueue bind:open={creating} oncreated={() => tick++} />
+	{/if}
 {:else}
 	<h1 class="text-lg font-semibold">No such page</h1>
 	<p class="mt-1 text-sm text-muted-foreground">

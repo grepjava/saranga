@@ -34,6 +34,30 @@ pub(crate) use security::recovered as recovered_security_setting;
 pub use server::{VERSION, print_duration, queue_config_json, queue_spec_from_json};
 pub use views::view_fields;
 
+tokio::task_local! {
+    /// The subject a call runs as (`SecurityManagerShim.currentSubject()`):
+    /// the web console's or Jolokia's logged-in user. Management messages
+    /// run as none.
+    static SUBJECT: Arc<saranga_security::jaas::Subject>;
+}
+
+/// Runs `f` as `subject`, as the web console's authentication filter runs
+/// each request with `Subject.doAs`.
+pub async fn as_subject<F: std::future::Future>(
+    subject: Option<Arc<saranga_security::jaas::Subject>>,
+    f: F,
+) -> F::Output {
+    match subject {
+        Some(s) => SUBJECT.scope(s, f).await,
+        None => f.await,
+    }
+}
+
+/// The subject the current call runs as.
+fn current_subject() -> Option<Arc<saranga_security::jaas::Subject>> {
+    SUBJECT.try_with(Arc::clone).ok()
+}
+
 /// `ManagementHelper.HDR_RESOURCE_NAME`.
 pub const HDR_RESOURCE_NAME: &str = "_AMQ_ResourceName";
 /// `ManagementHelper.HDR_ATTRIBUTE`.

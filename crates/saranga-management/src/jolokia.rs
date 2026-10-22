@@ -665,6 +665,38 @@ impl Agent {
         self.attribute(caller, name, bean, attr).await
     }
 
+    /// Writes one attribute of an MBean, as Jolokia's `write` does; the
+    /// answer is its previous value.
+    pub(crate) async fn write_attribute(
+        &self,
+        caller: &Caller,
+        name: ObjectName,
+        attr: &str,
+        value: Json,
+    ) -> Result<Json, Failure> {
+        let req = Request {
+            kind: "write",
+            mbean: Some(name),
+            attrs: Attrs::One(attr.to_owned()),
+            path: None,
+            value: Some(value),
+            operation: None,
+            arguments: Vec::new(),
+            canonical: true,
+        };
+        self.write(caller, &req).await
+    }
+
+    /// The MBeans the caller may see, as Jolokia's `search` finds them.
+    pub(crate) fn visible(&self, caller: &Caller) -> Result<Vec<(ObjectName, Bean)>, Failure> {
+        self.query(caller)
+    }
+
+    /// `getMBeanInfo`, for the audit log.
+    pub(crate) fn audit_info(&self, caller: &Caller, bean: &Bean) {
+        caller.mbean_info(bean);
+    }
+
     /// The one MBean a non-pattern name names; not found, it is named as
     /// the request gave it (`ObjectName.toString`).
     fn bean(&self, name: &ObjectName) -> Result<(ObjectName, Bean), Failure> {
@@ -831,18 +863,19 @@ impl Agent {
                 .map_err(|f| platform_failure(f, attr))?;
             return Ok(old);
         }
-        self.broker
-            .get()
-            .management()
-            .invoke(
-                &self.broker.get(),
+        let broker = self.broker.get();
+        saranga_server::management::as_subject(
+            caller.subject.clone(),
+            broker.management().invoke(
+                &broker,
                 &bean.resource(),
                 &setter,
                 &[value],
                 caller.management(),
-            )
-            .await
-            .map_err(|e| Failure::new(error_type(&setter, &e), e, 500))?;
+            ),
+        )
+        .await
+        .map_err(|e| Failure::new(error_type(&setter, &e), e, 500))?;
         Ok(old)
     }
 
@@ -949,39 +982,44 @@ impl Agent {
         })?;
         let broker = self.broker.get();
         let management = broker.management();
-        let result = match (&bean, op.name) {
-            // Composite data, which management messages cannot carry.
-            (Bean::Queue(q), "browse") => {
-                let s = |j: &Json| match j {
-                    Json::String(s) => Some(s.clone()),
-                    _ => None,
-                };
-                let i = |j: &Json| match j {
-                    Json::Long(n) => *n as i32,
-                    _ => 0,
-                };
-                let (page, filter) = match params.as_slice() {
-                    [] => (None, None),
-                    [f] => (None, s(f)),
-                    [p, size] => (Some((i(p), i(size))), None),
-                    [p, size, f, ..] => (Some((i(p), i(size))), s(f)),
-                };
-                management
-                    .browse(&broker, q, page, filter, caller.management())
-                    .await
+        // As the web console's authentication filter runs each request:
+        // as the logged-in user's subject.
+        let result = saranga_server::management::as_subject(caller.subject.clone(), async {
+            match (&bean, op.name) {
+                // Composite data, which management messages cannot carry.
+                (Bean::Queue(q), "browse") => {
+                    let s = |j: &Json| match j {
+                        Json::String(s) => Some(s.clone()),
+                        _ => None,
+                    };
+                    let i = |j: &Json| match j {
+                        Json::Long(n) => *n as i32,
+                        _ => 0,
+                    };
+                    let (page, filter) = match params.as_slice() {
+                        [] => (None, None),
+                        [f] => (None, s(f)),
+                        [p, size] => (Some((i(p), i(size))), None),
+                        [p, size, f, ..] => (Some((i(p), i(size))), s(f)),
+                    };
+                    management
+                        .browse(&broker, q, page, filter, caller.management())
+                        .await
+                }
+                _ => {
+                    management
+                        .invoke(
+                            &broker,
+                            &bean.resource(),
+                            op.name,
+                            &params,
+                            caller.management(),
+                        )
+                        .await
+                }
             }
-            _ => {
-                management
-                    .invoke(
-                        &broker,
-                        &bean.resource(),
-                        op.name,
-                        &params,
-                        caller.management(),
-                    )
-                    .await
-            }
-        }
+        })
+        .await
         .map_err(|e| Failure::new(error_type(op.name, &e), e, 500))?;
         Ok(if op.ret == "void" { Json::Null } else { result })
     }

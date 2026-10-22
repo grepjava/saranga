@@ -361,6 +361,37 @@ impl SecurityStore {
         })
     }
 
+    /// `authenticate` for a management call made with no user and no
+    /// password on a management connection: the subject the call runs as
+    /// (`SecurityManagerShim.currentSubject()`, the web console's or
+    /// Jolokia's user) is taken as authenticated.
+    pub fn authenticate_as(
+        &self,
+        subject: Arc<Subject>,
+        connection: &ConnectionInfo,
+    ) -> Authenticated {
+        if !self.config.enabled {
+            return Authenticated::default();
+        }
+        let validated_user = self.manager.user_from_subject(&subject);
+        if audit::resource_enabled() {
+            audit::resource(audit::fill(
+                "AMQ601715: User {} successfully authenticated on connection {}",
+                &[
+                    &audit::caller(Some(&subject), Some(&connection.remote_address)),
+                    connection.connection_id.as_deref().unwrap_or("null"),
+                ],
+            ));
+        }
+        self.counters
+            .authentication_success
+            .fetch_add(1, Ordering::Relaxed);
+        Authenticated {
+            validated_user,
+            subject: Some(subject),
+        }
+    }
+
     /// `validateExpectedUserPrincipal`: a subject must name its user.
     fn has_user_principal(&self, subject: Option<&Subject>) -> bool {
         match subject {

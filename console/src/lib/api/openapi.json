@@ -1069,6 +1069,374 @@
 					}
 				}
 			}
+		},
+		"/saranga/api/v1/resources": {
+			"get": {
+				"operationId": "resources",
+				"summary": "The management resources (MBeans) the user may see",
+				"parameters": [],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Resources"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/resources/{resource}": {
+			"get": {
+				"operationId": "resource",
+				"summary": "A resource: its attributes' values and its operations",
+				"parameters": [
+					{
+						"name": "resource",
+						"in": "path",
+						"required": true,
+						"schema": {
+							"type": "string"
+						},
+						"description": ""
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Resource"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"404": {
+						"description": "Not found",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/resources/{resource}/attributes": {
+			"get": {
+				"operationId": "attributes",
+				"summary": "Some attributes' values",
+				"parameters": [
+					{
+						"name": "resource",
+						"in": "path",
+						"required": true,
+						"schema": {
+							"type": "string"
+						},
+						"description": ""
+					},
+					{
+						"name": "name",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "array",
+							"items": {
+								"type": "string"
+							}
+						},
+						"style": "form",
+						"explode": true,
+						"description": "An attribute's name"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Attributes"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"404": {
+						"description": "Not found",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/resources/{resource}/attributes/{name}": {
+			"put": {
+				"operationId": "writeAttribute",
+				"summary": "Write an attribute; the answer is its previous value",
+				"parameters": [
+					{
+						"name": "resource",
+						"in": "path",
+						"required": true,
+						"schema": {
+							"type": "string"
+						},
+						"description": ""
+					},
+					{
+						"name": "name",
+						"in": "path",
+						"required": true,
+						"schema": {
+							"type": "string"
+						},
+						"description": ""
+					},
+					{
+						"name": "X-Saranga-Console",
+						"in": "header",
+						"required": true,
+						"schema": {
+							"type": "string",
+							"const": "1"
+						},
+						"description": "Marks a request the console sent"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Written"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"404": {
+						"description": "Not found",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				},
+				"requestBody": {
+					"required": true,
+					"content": {
+						"application/json": {
+							"schema": {
+								"$ref": "#/components/schemas/Write"
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/resources/{resource}/operations": {
+			"post": {
+				"operationId": "invoke",
+				"summary": "Call an operation, by its signature when it is overloaded",
+				"parameters": [
+					{
+						"name": "resource",
+						"in": "path",
+						"required": true,
+						"schema": {
+							"type": "string"
+						},
+						"description": ""
+					},
+					{
+						"name": "X-Saranga-Console",
+						"in": "header",
+						"required": true,
+						"schema": {
+							"type": "string",
+							"const": "1"
+						},
+						"description": "Marks a request the console sent"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Result"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"404": {
+						"description": "Not found",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				},
+				"requestBody": {
+					"required": true,
+					"content": {
+						"application/json": {
+							"schema": {
+								"$ref": "#/components/schemas/Invoke"
+							}
+						}
+					}
+				}
+			}
 		}
 	},
 	"components": {
@@ -2195,6 +2563,269 @@
 					"producers",
 					"addresses",
 					"queues"
+				]
+			},
+			"ResourceSummary": {
+				"type": "object",
+				"properties": {
+					"resource": {
+						"type": "string"
+					},
+					"type": {
+						"type": "string",
+						"enum": [
+							"broker",
+							"address",
+							"queue",
+							"divert",
+							"acceptor",
+							"broadcastgroup",
+							"bridge",
+							"brokerconnection",
+							"clusterconnection",
+							"hawtio",
+							"platform"
+						]
+					},
+					"objectName": {
+						"type": "string"
+					},
+					"className": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"resource",
+					"type",
+					"objectName",
+					"className"
+				]
+			},
+			"Resources": {
+				"type": "object",
+				"properties": {
+					"data": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/ResourceSummary"
+						}
+					}
+				},
+				"required": [
+					"data"
+				]
+			},
+			"AttributeValue": {
+				"type": "object",
+				"properties": {
+					"value": {},
+					"error": {
+						"type": "string"
+					},
+					"denied": {
+						"type": "boolean"
+					}
+				},
+				"required": []
+			},
+			"Attribute": {
+				"type": "object",
+				"properties": {
+					"name": {
+						"type": "string"
+					},
+					"type": {
+						"type": "string"
+					},
+					"description": {
+						"type": "string"
+					},
+					"readable": {
+						"type": "boolean"
+					},
+					"writable": {
+						"type": "boolean"
+					},
+					"value": {},
+					"error": {
+						"type": "string"
+					},
+					"denied": {
+						"type": "boolean"
+					}
+				},
+				"required": [
+					"name",
+					"type",
+					"description",
+					"readable",
+					"writable"
+				]
+			},
+			"Operation": {
+				"type": "object",
+				"properties": {
+					"name": {
+						"type": "string"
+					},
+					"signature": {
+						"type": "string"
+					},
+					"description": {
+						"type": "string"
+					},
+					"returns": {
+						"type": "string"
+					},
+					"impact": {
+						"type": "string",
+						"enum": [
+							"INFO",
+							"ACTION",
+							"ACTION_INFO",
+							"UNKNOWN"
+						]
+					},
+					"params": {
+						"type": "array",
+						"items": {
+							"type": "object",
+							"properties": {
+								"name": {
+									"type": "string"
+								},
+								"type": {
+									"type": "string"
+								},
+								"description": {
+									"type": "string"
+								}
+							},
+							"required": [
+								"name",
+								"type",
+								"description"
+							]
+						}
+					},
+					"allowed": {
+						"type": "boolean"
+					}
+				},
+				"required": [
+					"name",
+					"signature",
+					"description",
+					"returns",
+					"impact",
+					"params",
+					"allowed"
+				]
+			},
+			"Resource": {
+				"type": "object",
+				"properties": {
+					"resource": {
+						"type": "string"
+					},
+					"type": {
+						"type": "string",
+						"enum": [
+							"broker",
+							"address",
+							"queue",
+							"divert",
+							"acceptor",
+							"broadcastgroup",
+							"bridge",
+							"brokerconnection",
+							"clusterconnection",
+							"hawtio",
+							"platform"
+						]
+					},
+					"objectName": {
+						"type": "string"
+					},
+					"className": {
+						"type": "string"
+					},
+					"attributes": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/Attribute"
+						}
+					},
+					"operations": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/Operation"
+						}
+					}
+				},
+				"required": [
+					"resource",
+					"type",
+					"objectName",
+					"className",
+					"attributes",
+					"operations"
+				]
+			},
+			"Attributes": {
+				"type": "object",
+				"properties": {
+					"attributes": {
+						"type": "object",
+						"additionalProperties": {
+							"$ref": "#/components/schemas/AttributeValue"
+						}
+					}
+				},
+				"required": [
+					"attributes"
+				]
+			},
+			"Write": {
+				"type": "object",
+				"properties": {
+					"value": {}
+				},
+				"required": [
+					"value"
+				]
+			},
+			"Written": {
+				"type": "object",
+				"properties": {
+					"previous": {}
+				},
+				"required": [
+					"previous"
+				]
+			},
+			"Invoke": {
+				"type": "object",
+				"properties": {
+					"operation": {
+						"type": "string"
+					},
+					"arguments": {
+						"type": "array",
+						"items": {}
+					}
+				},
+				"required": [
+					"operation"
+				]
+			},
+			"Result": {
+				"type": "object",
+				"properties": {
+					"result": {}
+				},
+				"required": [
+					"result"
 				]
 			}
 		},

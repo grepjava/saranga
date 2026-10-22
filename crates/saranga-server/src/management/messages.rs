@@ -342,11 +342,16 @@ pub(super) async fn send(
         security_domain: None,
         connection_id: None,
     });
-    let authenticated = match broker.security() {
-        Some(s) => s
+    // With no user and no password, the call's own subject
+    // (`SecurityStoreImpl.authenticate` on a `ManagementRemotingConnection`).
+    let authenticated = match (broker.security(), super::current_subject()) {
+        (Some(s), Some(subject)) if user.is_none() && password.is_none() => {
+            s.authenticate_as(subject, &info)
+        }
+        (Some(s), _) => s
             .authenticate(user.as_deref(), password.as_deref(), &info)
             .map_err(|e| e.0)?,
-        None => Default::default(),
+        (None, _) => Default::default(),
     };
     let conn = Arc::new(crate::session::ClientConnection::new(
         crate::session::Transport::management(),
@@ -368,6 +373,7 @@ pub(super) async fn send(
         },
         authenticated,
     );
+    session.on_management_connection();
     let id = broker.post_office().ids().next();
     let mut m = CoreMessage {
         message_id: id,

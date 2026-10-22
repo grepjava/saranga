@@ -171,13 +171,21 @@ See [COMPAT.md, Web server differences](../../COMPAT.md#web-server-differences) 
 
 ## The Saranga console
 
-Saranga has a console of its own at `/saranga/` on every `<web>` binding, built into the binary: it needs no `console.war` and no Node.js. It is being built in stages (see [the design](../console-design.md)). So far it has:
+Saranga has a console of its own at `/saranga/` on every `<web>` binding, built into the binary: it needs no `console.war` and no Node.js. It does what Artemis's console does, and it is gaining more in stages (see [the design](../console-design.md)). So far it has:
 
 - the login, with the same users, console roles and throttling as Artemis's console;
-- the broker's overview;
-- the connections, sessions, consumers, producers, addresses and queues, as tables the broker pages, sorts and filters, with a column chooser, CSV export and links between them; an admin may close connections, sessions and consumers from them;
+- the broker's overview: its status, memory and disk, its acceptors and cluster connections, its lock coordinators, and the topology's live and backup brokers;
+- the connections, sessions, consumers, producers, addresses and queues, as tables the broker pages, sorts and filters, with a column chooser, CSV export and links between them. An admin may close connections, sessions (of any protocol) and consumers, create and delete addresses and queues, from them;
+- a page for each queue: its counters, its consumers, its attributes, and its messages. The messages are browsed a page at a time, filtered by a selector, each with its headers, properties and body (bytes as hex, decimal or text). Messages can be moved, copied, expired, sent to the dead-letter address, deleted, and on a dead-letter or expiry queue retried, one at a time or a selection. A queue can be purged, paused, disabled, and its counters reset;
+- a page for each address: its counters, queues, producers and attributes, pausing, and creating a queue on it;
+- sending a message to an address or a queue, with string properties and a body editor that highlights and formats JSON and XML, as the logged-in user or as another; and resending one;
+- the explorer: every management resource with its attributes and operations, as Artemis's console shows the JMX tree. Writable attributes can be edited, numeric ones charted, and any operation called from a form typed by its parameters;
+- the diagram of the broker, its topology, its addresses and their queues;
+- the runtime: the process, its system properties and its threads;
 - a command palette (Ctrl+K) that goes to any page, queue or address;
-- light and dark themes, and preferences kept in the browser.
+- light and dark themes, and preferences kept in the browser: the page size, which queues hold dead letters and expired messages (`^DLQ$` and `^ExpiryQueue$` by default, as in Artemis's console), how bytes read, the diagram's size and whether internal addresses show.
+
+A message sent with no user given is sent as the logged-in user, as on Artemis: management takes the caller's own login (`SecurityStoreImpl`), so the user needs the `send` permission on the address.
 
 What a user sees and may do follows the guard, as below: a page or an action the guard refuses is not offered. Each page's URL holds its filters and sort (`/saranga/#/n/local/queues?filter=name:CONTAINS:orders`), so it can be bookmarked or shared. Where Artemis's `console.war` is not installed, `/` goes to `/saranga/`.
 
@@ -197,6 +205,11 @@ It calls the same MBeans as Jolokia and checks them the same way. The login is t
 | `GET /broker` | the broker's status attributes the user may read |
 | `GET /{connections\|sessions\|consumers\|producers\|addresses\|queues}` | one page of a listing; takes `filter=field:OPERATION:value` (repeatable), `sort`, `order` (`asc` or `desc`), `page` (from 1) and `size` (100 by default) |
 | `DELETE /connections/{id}`, `/sessions/{connection}/{id}`, `/consumers/{session}/{id}` | closes one |
+| `GET /resources` | the management resources (MBeans) the user may see, with their types and MBean names |
+| `GET /resources/{resource}` | one: its attributes with their values, and its operations, each with whether the user may call it |
+| `GET /resources/{resource}/attributes?name=A&name=B` | some of its attributes' values |
+| `PUT /resources/{resource}/attributes/{name}` with `{"value"}` | writes an attribute, and answers its previous value |
+| `POST /resources/{resource}/operations` with `{"operation", "arguments"}` | calls an operation, named by its signature (`browse(int,int,java.lang.String)`) when it is overloaded, and answers `{"result"}` |
 | `GET /openapi.json` | the API as OpenAPI 3.1, without a login |
 
 A filter's `OPERATION` is one of `EQUALS`, `NOT_EQUALS`, `CONTAINS`, `NOT_CONTAINS`, `GREATER_THAN` and `LESS_THAN`, as in the `list*` operations. A request may log in with HTTP Basic instead of the session. A request that changes something, including the login, must carry the header `X-Saranga-Console: 1`, which a cross-site form cannot send. A failure comes back as `{"error", "status"}`, with status 401 (no login, or a wrong one), 403 (not permitted, or no header), 404 (nothing there), 429 (too many failed logins) or 400.
@@ -209,7 +222,14 @@ curl -s -u admin:admin \
 # Close a connection
 curl -s -u admin:admin -X DELETE -H 'X-Saranga-Console: 1' \
   http://localhost:8161/saranga/api/v1/connections/89ee1971
+
+# The first ten messages on orders whose color is red
+curl -s -u admin:admin -X POST -H 'X-Saranga-Console: 1' -H 'Content-Type: application/json' \
+  -d '{"operation": "browse(int,int,java.lang.String)", "arguments": [1, 10, "color = '"'red'"'"]}' \
+  http://localhost:8161/saranga/api/v1/resources/queue.orders/operations
 ```
+
+A resource is named as for management messages: `broker`, `address.<name>`, `queue.<name>`, `divert.<name>`, `acceptor.<name>`, `bridge.<name>`, `clusterconnection.<name>` and so on, with the process's as `java.lang.Runtime`, `java.lang.Memory`, `java.lang.OperatingSystem`, `java.lang.Threading` and `java.lang.ClassLoading`. Arguments are converted to the parameters' types as Jolokia converts them, so a string serves for any of them.
 
 To turn the console off, give `-Dsaranga.console.enabled=false` in the profile's `JAVA_ARGS`. Jolokia and Artemis's console are not affected.
 

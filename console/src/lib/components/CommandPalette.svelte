@@ -10,7 +10,7 @@
 	import { setMode } from 'mode-watcher';
 	import { api } from '#lib/api/index.js';
 	import { NAVIGATION } from '#lib/navigation.js';
-	import { listingHref } from '#lib/nav.js';
+	import { addressHref, queueHref } from '#lib/nav.js';
 	import { session } from '#lib/state/session.svelte.js';
 
 	let { node, open = $bindable(false) }: { node: string; open?: boolean } = $props();
@@ -64,8 +64,7 @@
 	}
 
 	function show(kind: 'queues' | 'addresses', name: string) {
-		const params = new URLSearchParams({ filter: `name:EQUALS:${name}` });
-		run(() => goto(listingHref(node, kind, params)));
+		run(() => goto(kind === 'queues' ? queueHref(node, name) : addressHref(node, name)));
 	}
 </script>
 

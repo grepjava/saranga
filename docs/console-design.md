@@ -109,13 +109,11 @@ browser ──HTTPS── saranga (the node you logged into)
 
 ### Server side (Rust, `saranga-management`)
 
-- **A new module, `console_api`, mounted at `/saranga/api/v1`.** It has resource-shaped JSON endpoints:
-  - `GET /connections?filter=&sort=&page=&size=`
-  - `DELETE /connections/{id}`
-  - `POST /queues/{name}/messages:move`
-  - and the equivalents for every page.
+- **A new module, `api.rs`, mounted at `/saranga/api/v1`.** It has JSON endpoints of two kinds:
+  - typed ones where a page needs a shape of its own: the session, `/me`, the six listings (`GET /connections?filter=&sort=&page=&size=`), the closes (`DELETE /connections/{id}`) and the broker's status;
+  - and the resources, which serve everything else, as Jolokia serves Artemis's console: `GET /resources`, `GET /resources/{resource}` (attributes with values, operations with the guard's answer), `GET .../attributes?name=`, `PUT .../attributes/{name}` and `POST .../operations` (`{"operation", "arguments"}`). The pages call the operations Artemis's console calls, by the same signatures (`browse(int,int,java.lang.String)`, `moveMessage(long,java.lang.String)`, `createQueue(java.lang.String,boolean)`...), through typed wrappers in `console/src/lib/broker.ts`. Planned as one endpoint per action (`POST /queues/{name}/messages:move`), this way the explorer and the pages share one path, and an operation the broker gains needs no new endpoint.
 
-  Each handler converts its request into a call on `saranga_server::management`, and the guard check runs exactly as it does for REST and Jolokia. The existing `/api` stays as it is.
+  Each handler goes through the Jolokia agent (`Agent::call`, `read_attribute`, `write_attribute`, `visible`), so the guard, the parameter conversion and the audit are exactly Jolokia's. The existing `/api` stays as it is.
 - **Node scoping.** `/saranga/api/v1/nodes/{nodeId}/...` sends the same request to a peer, and `nodes/*` sends it to every node and merges the answers. The local node is the default.
 - **A peer client** (see decision 1). It connects to each peer's acceptor, taken from the topology, and sends management messages to the peer's `activemq.management`.
   - Management messages are Artemis's own protocol, so this works with Artemis nodes in a mixed cluster too.
@@ -219,6 +217,19 @@ Each stage is committed on its own, with its tests.
   - The broker embeds the pages (`build.rs`, `pages.rs`) and serves them at `/saranga/`. Where Artemis's `console.war` is missing, `/` goes there.
   - The tests: unit tests (Node), component tests (Chromium), and ten Playwright tests against a running broker, which `api.sh` runs after its checks. CI's `console` job runs them all, and the release builds the pages once and embeds them in every binary and image.
   - It passes on Windows (76 checks, 10 browser tests) and against the FreeBSD jail (75, with Artemis's `console.war` mounted, and 10).
+- **Stage 3 (parity) is done.** The console now does what Artemis's console 1.8 does.
+  - The API's resources (`GET /resources...`, `PUT` an attribute, `POST` an operation) serve the explorer and every action of the pages, through the agent's guard, conversion and audit.
+  - The overview adds the acceptors, the cluster connections, the lock coordinators and the topology's live and backup counts.
+  - The queue page: counters, consumers, attributes, and the messages, browsed a page at a time with a selector, each with its headers, properties and body (bytes in the format the preferences choose). They can be moved, copied, expired, sent to the dead-letter address, deleted, retried on a dead-letter or expiry queue, and resent; the queue purged, paused, disabled, its counter reset, deleted. The address page: counters, queues, producers, attributes, pausing, a queue created on it.
+  - Creating addresses and queues (with every setting Artemis's console offers), and deleting them from the tables.
+  - Sending a message with string properties and a CodeMirror 6 body editor (JSON and XML highlighted and formatted), as the logged-in user or another. Sending as the logged-in user needed the port of `SecurityStoreImpl`'s management branch: with no user and no password, a management send authenticates and is authorized as the caller's own subject, which the Jolokia agent now runs each call as (`management::as_subject`, Artemis's `Subject.doAs`).
+  - The explorer: every resource the guard shows, by kind, its attributes (writable ones edited, numeric ones charted with uPlot every two seconds) and its operations, each with a form typed by its parameters and the guard's answer.
+  - The diagram (Svelte Flow): the broker, its topology's members and backups, its addresses and their queues, internal ones optional. The runtime: the process, its system properties and its threads.
+  - Preferences add the dead-letter and expiry patterns, the bytes format, the diagram's size and the internal addresses.
+  - `closeSessionWithID` closes a session of every protocol (see above).
+  - Found on the way: shadcn-svelte's components style `data-checked`, `data-open`, `data-active` and `data-horizontal`, which bits-ui 2 does not set; `shadcn-svelte init` imports `shadcn-svelte/tailwind.css`, whose custom variants map them to `data-state` and `data-orientation`. Stage 2 skipped `init`, so checked, open and active states were unstyled; the import is now there, and Stage 2's patch of the sidebar is undone.
+  - The tests: unit tests of the body formats and the explorer's types, component tests of the operation form and the queue picker, and 18 Playwright tests, 8 of them new: sending, browsing, moving and deleting messages; purging; creating and deleting an address; the explorer; the diagram; the runtime; the preferences; and what a viewer may not do. `api.sh` adds checks of the resources as admin and viewer, of sending as oneself, and of closing a STOMP session.
+  - It passes on Windows (96 checks, 18 browser tests) and against the FreeBSD jail (95, and 18).
 
 ## Decisions (confirmed 2026-10-22)
 

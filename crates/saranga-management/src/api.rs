@@ -19,6 +19,13 @@
 //!   one page of the listing, `{"data", "count", "page", "size"}`.
 //! - `DELETE /connections/{id}`, `/sessions/{connection}/{id}`,
 //!   `/consumers/{session}/{id}`: closes one.
+//! - `GET    /resources`: the management resources (MBeans) the user may
+//!   see. `GET /resources/{resource}` describes one, with its attributes'
+//!   values and its operations, each with whether the guard allows it;
+//!   `GET /resources/{resource}/attributes?name=A&name=B` reads some.
+//! - `PUT    /resources/{resource}/attributes/{name}` `{"value"}` writes an
+//!   attribute; `POST /resources/{resource}/operations` `{"operation",
+//!   "arguments"}` calls an operation, by signature when it is overloaded.
 //! - `GET    /openapi.json`: this API, as OpenAPI 3.1.
 //!
 //! A request that changes something must carry `X-Saranga-Console: 1`, which
@@ -32,7 +39,7 @@ use axum::body::Bytes;
 use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use saranga_security::audit;
 use saranga_server::Current;
 use saranga_server::management::json::Json;
@@ -40,7 +47,7 @@ use saranga_server::management::view_fields;
 
 use crate::console::{self, Auth, Console};
 use crate::jolokia::{Agent, Caller, Failure};
-use crate::mbean::ObjectName;
+use crate::mbean::{Bean, ObjectName};
 use crate::rbac::Guard;
 use crate::{Peer, percent_decode};
 
@@ -77,6 +84,7 @@ const BROKER_ACTIONS: &[&str] = &[
     "deleteAddress",
     "createQueue",
     "destroyQueue",
+    "listNetworkTopology",
 ];
 
 /// The attributes `GET /broker` reads, those the broker's control has.
@@ -133,6 +141,11 @@ pub(crate) fn router(state: Arc<ApiState>) -> Router {
         .route("/connections/{id}", delete(close_connection))
         .route("/sessions/{connection}/{id}", delete(close_session))
         .route("/consumers/{session}/{id}", delete(close_consumer))
+        .route("/resources", get(resources))
+        .route("/resources/{resource}", get(resource))
+        .route("/resources/{resource}/attributes", get(attributes))
+        .route("/resources/{resource}/attributes/{name}", put(write))
+        .route("/resources/{resource}/operations", post(invoke))
         .fallback(no_such_api)
         .with_state(state);
     Router::new().nest(API, api)
@@ -714,6 +727,284 @@ async fn close_consumer(
         vec![Json::from(session), Json::from(id)],
     )
     .await
+}
+
+/// The kind of a resource, as its name begins.
+fn resource_type(bean: &Bean) -> &'static str {
+    match bean {
+        Bean::Broker => "broker",
+        Bean::Address(_) => "address",
+        Bean::Queue(_) => "queue",
+        Bean::Divert(_) => "divert",
+        Bean::Acceptor(..) => "acceptor",
+        Bean::BroadcastGroup(_) => "broadcastgroup",
+        Bean::Bridge(_) => "bridge",
+        Bean::BrokerConnection(_) => "brokerconnection",
+        Bean::ClusterConnection(_) => "clusterconnection",
+        Bean::HawtioSecurity => "hawtio",
+        Bean::Platform(_) => "platform",
+    }
+}
+
+fn resource_json(name: &ObjectName, bean: &Bean) -> Json {
+    Json::object()
+        .with("resource", bean.resource())
+        .with("type", resource_type(bean))
+        .with("objectName", name.canonical())
+        .with("className", bean.class_name())
+}
+
+/// `MBeanOperationInfo`'s impact.
+fn impact(i: u8) -> &'static str {
+    match i {
+        0 => "INFO",
+        1 => "ACTION",
+        2 => "ACTION_INFO",
+        _ => "UNKNOWN",
+    }
+}
+
+/// A resource the user may see.
+fn visible_resource(
+    state: &ApiState,
+    user: &User,
+    resource: &str,
+) -> Result<(ObjectName, Bean), Box<Response>> {
+    state
+        .agent
+        .visible(&user.caller)
+        .map_err(|f| Box::new(failure(f)))?
+        .into_iter()
+        .find(|(_, b)| b.resource() == resource)
+        .ok_or_else(|| {
+            Box::new(error(
+                StatusCode::NOT_FOUND,
+                format!("no such resource: {resource}"),
+            ))
+        })
+}
+
+/// One attribute's value, or why it could not be read.
+async fn attribute_value(
+    state: &ApiState,
+    user: &User,
+    name: &ObjectName,
+    bean: &Bean,
+    attr: &str,
+) -> Json {
+    match state
+        .agent
+        .read_attribute(&user.caller, name, bean, attr)
+        .await
+    {
+        Ok(v) => Json::object().with("value", v),
+        Err(f) => Json::object()
+            .with("error", f.message)
+            .with("denied", f.status == 403),
+    }
+}
+
+async fn resources(
+    State(state): State<Arc<ApiState>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    headers: HeaderMap,
+) -> Response {
+    let u = match user(&state, &headers, peer) {
+        Ok(u) => u,
+        Err(r) => return *r,
+    };
+    match state.agent.visible(&u.caller) {
+        Ok(beans) => ok(&Json::object().with(
+            "data",
+            Json::Array(beans.iter().map(|(n, b)| resource_json(n, b)).collect()),
+        )),
+        Err(f) => failure(f),
+    }
+}
+
+/// A resource: its attributes with their values, and its operations, each
+/// with whether the guard lets the user call it.
+async fn resource(
+    State(state): State<Arc<ApiState>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Path(resource): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let u = match user(&state, &headers, peer) {
+        Ok(u) => u,
+        Err(r) => return *r,
+    };
+    let (name, bean) = match visible_resource(&state, &u, &resource) {
+        Ok(b) => b,
+        Err(r) => return *r,
+    };
+    state.agent.audit_info(&u.caller, &bean);
+    let control = bean.control();
+    let mut attributes = Vec::with_capacity(control.attrs.len());
+    for a in control.attrs {
+        let mut j = Json::object()
+            .with("name", a.name)
+            .with("type", a.type_name)
+            .with("description", a.desc)
+            .with("readable", a.readable)
+            .with(
+                "writable",
+                a.writable && state.agent.may(&u.caller, &name, &format!("set{}", a.name)),
+            );
+        if a.readable {
+            let v = attribute_value(&state, &u, &name, &bean, a.name).await;
+            if let Json::Object(members) = v {
+                for (k, v) in members {
+                    j.put(&k, v);
+                }
+            }
+        }
+        attributes.push(j);
+    }
+    let operations = control
+        .ops
+        .iter()
+        .map(|o| {
+            let params = o
+                .params
+                .iter()
+                .map(|p| {
+                    Json::object()
+                        .with("name", p.name)
+                        .with("type", p.type_name)
+                        .with("description", p.desc)
+                })
+                .collect();
+            Json::object()
+                .with("name", o.name)
+                .with("signature", format!("{}{}", o.name, o.signature()))
+                .with("description", o.desc)
+                .with("returns", o.ret)
+                .with("impact", impact(o.impact))
+                .with("params", Json::Array(params))
+                .with("allowed", state.agent.may(&u.caller, &name, o.name))
+        })
+        .collect();
+    ok(&resource_json(&name, &bean)
+        .with("attributes", Json::Array(attributes))
+        .with("operations", Json::Array(operations)))
+}
+
+/// Some attributes' values: `name=A&name=B`.
+async fn attributes(
+    State(state): State<Arc<ApiState>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Path(resource): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let u = match user(&state, &headers, peer) {
+        Ok(u) => u,
+        Err(r) => return *r,
+    };
+    let (name, bean) = match visible_resource(&state, &u, &resource) {
+        Ok(b) => b,
+        Err(r) => return *r,
+    };
+    let mut wanted = Vec::new();
+    for pair in uri
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter(|p| !p.is_empty())
+    {
+        match pair.split_once('=') {
+            Some(("name", v)) => wanted.push(percent_decode(&v.replace('+', " "))),
+            _ => return error(StatusCode::BAD_REQUEST, format!("unknown parameter {pair}")),
+        }
+    }
+    if wanted.len() > MAX_CHECKS {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("at most {MAX_CHECKS} attributes at a time"),
+        );
+    }
+    let mut out = Json::object();
+    for a in &wanted {
+        out.put(a, attribute_value(&state, &u, &name, &bean, a).await);
+    }
+    ok(&Json::object().with("attributes", out))
+}
+
+/// The JSON body of a request that changes something, from a marked request
+/// of a logged-in user.
+fn change(
+    state: &ApiState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    body: &Bytes,
+) -> Result<(User, Json), Box<Response>> {
+    marked(headers)?;
+    let u = user(state, headers, peer)?;
+    let body = Json::parse(&String::from_utf8_lossy(body))
+        .map_err(|_| Box::new(error(StatusCode::BAD_REQUEST, "the body must be JSON")))?;
+    Ok((u, body))
+}
+
+async fn write(
+    State(state): State<Arc<ApiState>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Path((resource, attr)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (u, body) = match change(&state, &headers, peer, &body) {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let Some(value) = body.get("value").cloned() else {
+        return error(StatusCode::BAD_REQUEST, "the body needs a value");
+    };
+    let (name, _) = match visible_resource(&state, &u, &resource) {
+        Ok(b) => b,
+        Err(r) => return *r,
+    };
+    match state
+        .agent
+        .write_attribute(&u.caller, name, &attr, value)
+        .await
+    {
+        Ok(previous) => ok(&Json::object().with("previous", previous)),
+        Err(f) => failure(f),
+    }
+}
+
+async fn invoke(
+    State(state): State<Arc<ApiState>>,
+    Extension(Peer(peer)): Extension<Peer>,
+    Path(resource): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (u, body) = match change(&state, &headers, peer, &body) {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let Some(operation) = body.get("operation").and_then(Json::as_str) else {
+        return error(StatusCode::BAD_REQUEST, "the body needs an operation");
+    };
+    let arguments = match body.get("arguments") {
+        None => Vec::new(),
+        Some(Json::Array(a)) => a.clone(),
+        Some(_) => return error(StatusCode::BAD_REQUEST, "arguments is an array"),
+    };
+    let (name, _) = match visible_resource(&state, &u, &resource) {
+        Ok(b) => b,
+        Err(r) => return *r,
+    };
+    match state
+        .agent
+        .call(&u.caller, name, operation, arguments)
+        .await
+    {
+        Ok(result) => ok(&Json::object().with("result", result)),
+        Err(f) => failure(f),
+    }
 }
 
 async fn openapi() -> Response {

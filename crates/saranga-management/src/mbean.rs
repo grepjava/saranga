@@ -33,7 +33,6 @@ pub struct Op {
     pub name: &'static str,
     pub desc: &'static str,
     /// `MBeanOperationInfo`'s impact, which Jolokia does not list.
-    #[allow(dead_code)]
     pub impact: u8,
     pub ret: &'static str,
     pub params: &'static [Param],

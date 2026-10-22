@@ -1,29 +1,11 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test } from '@playwright/test';
+import { login, noErrors } from './common.js';
 
 // The shell against a running broker: logging in and out, the layout, the
 // tables, the command palette and the theme, with no error in the browser
 // (a Content-Security-Policy violation among them).
 
-const errors: string[] = [];
-
-test.beforeEach(({ page }) => {
-	errors.length = 0;
-	page.on('pageerror', (e) => errors.push(e.message));
-	page.on('console', (m) => m.type() === 'error' && errors.push(m.text()));
-});
-
-test.afterEach(() => {
-	// A failed login answers 401, which the browser logs; nothing else may fail.
-	expect(errors.filter((e) => !/status of 401/.test(e))).toEqual([]);
-});
-
-async function login(page: Page, user = 'admin', password = 'secret') {
-	await page.goto('/saranga/');
-	await page.getByLabel('User').fill(user);
-	await page.getByLabel('Password').fill(password);
-	await page.getByRole('button', { name: 'Log in' }).click();
-	await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
-}
+noErrors();
 
 test('a wrong password is refused', async ({ page }) => {
 	await page.goto('/saranga/');
@@ -48,6 +30,9 @@ test('the overview shows the broker', async ({ page }) => {
 	await expect(page.getByRole('region', { name: 'Counters' })).toContainText('Connections');
 	await expect(page.getByText('Address memory')).toBeVisible();
 	await expect(page.getByRole('button', { name: 'Node' })).toBeVisible();
+	// The acceptors and the cluster, as Artemis's status page shows them.
+	await expect(page.getByRole('link', { name: 'artemis', exact: true })).toBeVisible();
+	await expect(page.getByText('No cluster connection.')).toBeVisible();
 });
 
 test('the queues table pages, sorts and filters on the broker', async ({ page }) => {
@@ -76,13 +61,14 @@ test('the queues table pages, sorts and filters on the broker', async ({ page })
 	await page.reload();
 	await expect(page.getByRole('table', { name: 'Queues' }).getByRole('row')).toHaveCount(2);
 
-	// An address leads to the addresses, filtered to it.
+	// The address leads to its page.
 	await page
 		.getByRole('table', { name: 'Queues' })
 		.getByRole('link', { name: 'orders.eu' })
+		.nth(1)
 		.click();
-	await expect(page).toHaveURL(/#\/n\/local\/addresses\?filter=name/);
-	await expect(page.getByRole('table', { name: 'Addresses' }).getByRole('row')).toHaveCount(2);
+	await expect(page).toHaveURL(/#\/n\/local\/addresses\/orders\.eu$/);
+	await expect(page.getByRole('heading', { level: 1 })).toHaveText('orders.eu');
 });
 
 test('the columns can be chosen and are remembered', async ({ page }) => {
@@ -117,8 +103,8 @@ test('the command palette goes to pages and queues', async ({ page }) => {
 		.getByRole('dialog')
 		.getByRole('option', { name: /invoices.*Queue/ })
 		.click();
-	await expect(page).toHaveURL(/#\/n\/local\/queues\?filter=name/);
-	await expect(page.getByRole('table', { name: 'Queues' })).toContainText('invoices');
+	await expect(page).toHaveURL(/#\/n\/local\/queues\/invoices$/);
+	await expect(page.getByRole('heading', { level: 1 })).toHaveText('invoices');
 });
 
 test('the theme follows the choice', async ({ page }) => {
@@ -155,7 +141,7 @@ test('admin closes a connection, once confirmed', async ({ page }) => {
 
 	await page.getByRole('button', { name: 'Close the connection' }).click();
 	await page.getByRole('alertdialog').getByRole('button', { name: 'Close' }).click();
-	await expect(page.getByText('Closed 1 connection')).toBeVisible();
+	await expect(page.getByText('Closed the connection')).toBeVisible();
 	await expect(table).toContainText('Nothing matches the filters.');
 });
 

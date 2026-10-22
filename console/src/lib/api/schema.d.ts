@@ -243,6 +243,91 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/saranga/api/v1/resources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The management resources (MBeans) the user may see */
+        get: operations["resources"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/saranga/api/v1/resources/{resource}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A resource: its attributes' values and its operations */
+        get: operations["resource"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/saranga/api/v1/resources/{resource}/attributes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Some attributes' values */
+        get: operations["attributes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/saranga/api/v1/resources/{resource}/attributes/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Write an attribute; the answer is its previous value */
+        put: operations["writeAttribute"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/saranga/api/v1/resources/{resource}/operations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Call an operation, by its signature when it is overloaded */
+        post: operations["invoke"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -500,6 +585,72 @@ export interface components {
                 /** @constant */
                 defaultSort: "name";
             };
+        };
+        ResourceSummary: {
+            resource: string;
+            /** @enum {string} */
+            type: "broker" | "address" | "queue" | "divert" | "acceptor" | "broadcastgroup" | "bridge" | "brokerconnection" | "clusterconnection" | "hawtio" | "platform";
+            objectName: string;
+            className: string;
+        };
+        Resources: {
+            data: components["schemas"]["ResourceSummary"][];
+        };
+        AttributeValue: {
+            value?: unknown;
+            error?: string;
+            denied?: boolean;
+        };
+        Attribute: {
+            name: string;
+            type: string;
+            description: string;
+            readable: boolean;
+            writable: boolean;
+            value?: unknown;
+            error?: string;
+            denied?: boolean;
+        };
+        Operation: {
+            name: string;
+            signature: string;
+            description: string;
+            returns: string;
+            /** @enum {string} */
+            impact: "INFO" | "ACTION" | "ACTION_INFO" | "UNKNOWN";
+            params: {
+                name: string;
+                type: string;
+                description: string;
+            }[];
+            allowed: boolean;
+        };
+        Resource: {
+            resource: string;
+            /** @enum {string} */
+            type: "broker" | "address" | "queue" | "divert" | "acceptor" | "broadcastgroup" | "bridge" | "brokerconnection" | "clusterconnection" | "hawtio" | "platform";
+            objectName: string;
+            className: string;
+            attributes: components["schemas"]["Attribute"][];
+            operations: components["schemas"]["Operation"][];
+        };
+        Attributes: {
+            attributes: {
+                [key: string]: components["schemas"]["AttributeValue"];
+            };
+        };
+        Write: {
+            value: unknown;
+        };
+        Written: {
+            previous: unknown;
+        };
+        Invoke: {
+            operation: string;
+            arguments?: unknown[];
+        };
+        Result: {
+            result: unknown;
         };
     };
     responses: never;
@@ -1187,6 +1338,285 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Not logged in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not permitted, or the X-Saranga-Console header is missing */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    resources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resources"];
+                };
+            };
+            /** @description Not logged in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not permitted, or the X-Saranga-Console header is missing */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    resource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                resource: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource"];
+                };
+            };
+            /** @description Not logged in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not permitted, or the X-Saranga-Console header is missing */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    attributes: {
+        parameters: {
+            query?: {
+                /** @description An attribute's name */
+                name?: string[];
+            };
+            header?: never;
+            path: {
+                resource: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Attributes"];
+                };
+            };
+            /** @description Bad parameters, or the operation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not logged in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not permitted, or the X-Saranga-Console header is missing */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    writeAttribute: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Marks a request the console sent */
+                "X-Saranga-Console": "1";
+            };
+            path: {
+                resource: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Write"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Written"];
+                };
+            };
+            /** @description Bad parameters, or the operation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not logged in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not permitted, or the X-Saranga-Console header is missing */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    invoke: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Marks a request the console sent */
+                "X-Saranga-Console": "1";
+            };
+            path: {
+                resource: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Invoke"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Result"];
+                };
+            };
+            /** @description Bad parameters, or the operation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
             };
             /** @description Not logged in */
             401: {

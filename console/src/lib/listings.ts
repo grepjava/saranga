@@ -3,15 +3,20 @@
 // done to a row.
 
 import { api, type Listing, type Rows } from '#lib/api/index.js';
+import { broker } from '#lib/broker.js';
 
 export interface Link {
 	kind: Listing;
 	field: string;
 }
 
-export interface Close<K extends Listing> {
+/** What can be done to the rows selected: closing them, or deleting them. */
+export interface Bulk<K extends Listing> {
 	/** The broker operation the guard must allow. */
 	operation: string;
+	verb: 'Close' | 'Delete';
+	/** What the confirmation says happens. */
+	warning: string;
 	run: (row: Rows[K]) => Promise<unknown>;
 }
 
@@ -25,8 +30,10 @@ export interface ListingInfo<K extends Listing> {
 	shown: readonly (keyof Rows[K] & string)[];
 	key: (row: Rows[K]) => string;
 	links?: Partial<Record<keyof Rows[K] & string, Link>>;
-	close?: Close<K>;
+	bulk?: Bulk<K>;
 }
+
+const CLOSE = 'The broker ends them now. Clients that reconnect come back as new ones.';
 
 /** Every member of `T`, each once: a compile error otherwise. */
 function every<T>() {
@@ -62,8 +69,10 @@ const connections: ListingInfo<'connections'> = {
 		'creationTime'
 	],
 	key: (r) => r.connectionID,
-	close: {
+	bulk: {
 		operation: 'closeConnectionWithID',
+		verb: 'Close',
+		warning: CLOSE,
 		run: (r) => api.closeConnection(r.connectionID)
 	}
 };
@@ -92,8 +101,10 @@ const sessions: ListingInfo<'sessions'> = {
 	],
 	key: (r) => `${r.connectionID}/${r.id}`,
 	links: { connectionID: { kind: 'connections', field: 'connectionID' } },
-	close: {
+	bulk: {
 		operation: 'closeSessionWithID',
+		verb: 'Close',
+		warning: CLOSE,
 		run: (r) => api.closeSession(r.connectionID, r.id)
 	}
 };
@@ -144,8 +155,10 @@ const consumers: ListingInfo<'consumers'> = {
 		queue: { kind: 'queues', field: 'name' },
 		address: { kind: 'addresses', field: 'name' }
 	},
-	close: {
+	bulk: {
 		operation: 'closeConsumerWithID',
+		verb: 'Close',
+		warning: CLOSE,
 		run: (r) => api.closeConsumer(r.session, r.id)
 	}
 };
@@ -225,7 +238,14 @@ const addresses: ListingInfo<'addresses'> = {
 		'paused',
 		'paging'
 	],
-	key: (r) => r.name
+	key: (r) => r.name,
+	links: { name: { kind: 'addresses', field: 'name' } },
+	bulk: {
+		operation: 'deleteAddress',
+		verb: 'Delete',
+		warning: 'An address with queues bound to it is not deleted.',
+		run: (r) => broker.deleteAddress(r.name, false)
+	}
 };
 
 const queues: ListingInfo<'queues'> = {
@@ -282,7 +302,16 @@ const queues: ListingInfo<'queues'> = {
 		'paused'
 	],
 	key: (r) => r.name,
-	links: { address: { kind: 'addresses', field: 'name' } }
+	links: {
+		name: { kind: 'queues', field: 'name' },
+		address: { kind: 'addresses', field: 'name' }
+	},
+	bulk: {
+		operation: 'destroyQueue',
+		verb: 'Delete',
+		warning: 'Their messages are gone for good, and their consumers are closed.',
+		run: (r) => broker.destroyQueue(r.name, true, false)
+	}
 };
 
 export const LISTINGS: { [K in Listing]: ListingInfo<K> } = {

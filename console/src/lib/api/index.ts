@@ -124,3 +124,42 @@ export const api = {
 			})
 		)
 };
+
+export type ResourceSummary = Schemas['ResourceSummary'];
+export type Resource = Schemas['Resource'];
+export type Attribute = Schemas['Attribute'];
+export type Operation = Schemas['Operation'];
+export type AttributeValue = Schemas['AttributeValue'];
+export type ResourceType = ResourceSummary['type'];
+
+/** The management resources (MBeans) and their operations. */
+export const resources = {
+	list: () => call(client.GET('/saranga/api/v1/resources')).then((r) => r.data),
+
+	get: (resource: string) =>
+		call(client.GET('/saranga/api/v1/resources/{resource}', { params: { path: { resource } } })),
+
+	attributes: (resource: string, names: string[]) =>
+		call(
+			client.GET('/saranga/api/v1/resources/{resource}/attributes', {
+				params: { path: { resource }, query: { name: names } }
+			})
+		).then((r) => r.attributes),
+
+	write: (resource: string, name: string, value: unknown) =>
+		call(
+			client.PUT('/saranga/api/v1/resources/{resource}/attributes/{name}', {
+				params: { path: { resource, name }, header: mark },
+				body: { value }
+			})
+		).then((r) => r.previous),
+
+	/** An operation, by its signature when it is overloaded: `browse(int,int,java.lang.String)`. */
+	invoke: <T = unknown>(resource: string, operation: string, args: unknown[] = []): Promise<T> =>
+		call(
+			client.POST('/saranga/api/v1/resources/{resource}/operations', {
+				params: { path: { resource }, header: mark },
+				body: { operation, arguments: args }
+			})
+		).then((r) => r.result as T)
+};

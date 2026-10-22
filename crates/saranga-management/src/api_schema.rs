@@ -45,6 +45,31 @@ fn object(props: &[(&str, Json)]) -> Json {
         .with("required", Json::Array(required))
 }
 
+/// An object schema with some optional properties.
+fn object_with_optional(props: &[(&str, Json)], optional: &[(&str, Json)]) -> Json {
+    let mut o = object(props);
+    if let Some(Json::Object(p)) = o.get("properties").cloned() {
+        let mut p = Json::Object(p);
+        for (k, v) in optional {
+            p.put(k, v.clone());
+        }
+        o.put("properties", p);
+    }
+    o
+}
+
+/// Any JSON value.
+fn any() -> Json {
+    obj()
+}
+
+fn enumeration(values: &[&str]) -> Json {
+    obj().with("type", "string").with(
+        "enum",
+        Json::Array(values.iter().map(|v| Json::from(*v)).collect()),
+    )
+}
+
 fn map_of(values: Json) -> Json {
     obj()
         .with("type", "object")
@@ -392,8 +417,86 @@ fn schemas() -> Json {
         ));
     }
     s.put("Views", object(&views));
+    let summary = [
+        ("resource", string()),
+        ("type", enumeration(RESOURCE_TYPES)),
+        ("objectName", string()),
+        ("className", string()),
+    ];
+    let value = [("value", any()), ("error", string()), ("denied", boolean())];
+    s.put("ResourceSummary", object(&summary));
+    s.put(
+        "Resources",
+        object(&[("data", array(schema_ref("ResourceSummary")))]),
+    );
+    s.put("AttributeValue", object_with_optional(&[], &value));
+    s.put(
+        "Attribute",
+        object_with_optional(
+            &[
+                ("name", string()),
+                ("type", string()),
+                ("description", string()),
+                ("readable", boolean()),
+                ("writable", boolean()),
+            ],
+            &value,
+        ),
+    );
+    s.put(
+        "Operation",
+        object(&[
+            ("name", string()),
+            ("signature", string()),
+            ("description", string()),
+            ("returns", string()),
+            (
+                "impact",
+                enumeration(&["INFO", "ACTION", "ACTION_INFO", "UNKNOWN"]),
+            ),
+            (
+                "params",
+                array(object(&[
+                    ("name", string()),
+                    ("type", string()),
+                    ("description", string()),
+                ])),
+            ),
+            ("allowed", boolean()),
+        ]),
+    );
+    let mut resource = summary.to_vec();
+    resource.push(("attributes", array(schema_ref("Attribute"))));
+    resource.push(("operations", array(schema_ref("Operation"))));
+    s.put("Resource", object(&resource));
+    s.put(
+        "Attributes",
+        object(&[("attributes", map_of(schema_ref("AttributeValue")))]),
+    );
+    s.put("Write", object(&[("value", any())]));
+    s.put("Written", object(&[("previous", any())]));
+    s.put(
+        "Invoke",
+        object_with_optional(&[("operation", string())], &[("arguments", array(any()))]),
+    );
+    s.put("Result", object(&[("result", any())]));
     s
 }
+
+/// The kinds of resource, as `GET /resources` names them.
+const RESOURCE_TYPES: &[&str] = &[
+    "broker",
+    "address",
+    "queue",
+    "divert",
+    "acceptor",
+    "broadcastgroup",
+    "bridge",
+    "brokerconnection",
+    "clusterconnection",
+    "hawtio",
+    "platform",
+];
 
 fn paths() -> Json {
     let p = |path: &str| format!("{API}{path}");
@@ -531,6 +634,82 @@ fn paths() -> Json {
         &p("/consumers/{session}/{id}"),
         close("closeConsumer", "Close a consumer", &["session", "id"]),
     );
+    paths.put(
+        &p("/resources"),
+        obj().with(
+            "get",
+            operation(
+                "resources",
+                "The management resources (MBeans) the user may see",
+                vec![],
+                responses(Some((200, schema_ref("Resources"))), &[401, 403]),
+            ),
+        ),
+    );
+    paths.put(
+        &p("/resources/{resource}"),
+        obj().with(
+            "get",
+            operation(
+                "resource",
+                "A resource: its attributes' values and its operations",
+                vec![path_param("resource")],
+                responses(Some((200, schema_ref("Resource"))), &[401, 403, 404]),
+            ),
+        ),
+    );
+    paths.put(
+        &p("/resources/{resource}/attributes"),
+        obj().with(
+            "get",
+            operation(
+                "attributes",
+                "Some attributes' values",
+                vec![
+                    path_param("resource"),
+                    obj()
+                        .with("name", "name")
+                        .with("in", "query")
+                        .with("required", false)
+                        .with("schema", array(string()))
+                        .with("style", "form")
+                        .with("explode", true)
+                        .with("description", "An attribute's name"),
+                ],
+                responses(Some((200, schema_ref("Attributes"))), &[400, 401, 403, 404]),
+            ),
+        ),
+    );
+    paths.put(
+        &p("/resources/{resource}/attributes/{name}"),
+        obj().with(
+            "put",
+            with_body(
+                operation(
+                    "writeAttribute",
+                    "Write an attribute; the answer is its previous value",
+                    vec![path_param("resource"), path_param("name"), mark()],
+                    responses(Some((200, schema_ref("Written"))), &[400, 401, 403, 404]),
+                ),
+                schema_ref("Write"),
+            ),
+        ),
+    );
+    paths.put(
+        &p("/resources/{resource}/operations"),
+        obj().with(
+            "post",
+            with_body(
+                operation(
+                    "invoke",
+                    "Call an operation, by its signature when it is overloaded",
+                    vec![path_param("resource"), mark()],
+                    responses(Some((200, schema_ref("Result"))), &[400, 401, 403, 404]),
+                ),
+                schema_ref("Invoke"),
+            ),
+        ),
+    );
     paths
 }
 
@@ -591,8 +770,9 @@ mod tests {
                 assert!(ids.insert(id.to_owned()), "{id} twice");
             }
         }
-        // Six of the session and the user, six listings, three closes.
-        assert_eq!(ids.len(), 15);
+        // Six of the session and the user, six listings, three closes, five
+        // of the resources.
+        assert_eq!(ids.len(), 20);
     }
 
     #[test]

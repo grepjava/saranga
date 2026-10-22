@@ -11,7 +11,17 @@ import InboxIcon from '@lucide/svelte/icons/inbox';
 import Settings2Icon from '@lucide/svelte/icons/settings-2';
 import type { Listing } from '#lib/api/index.js';
 import { LISTINGS } from '#lib/listings.js';
-import { listingHref, overviewHref, preferencesHref } from '#lib/nav.js';
+import NetworkIcon from '@lucide/svelte/icons/network';
+import FolderTreeIcon from '@lucide/svelte/icons/folder-tree';
+import CpuIcon from '@lucide/svelte/icons/cpu';
+import {
+	diagramHref,
+	explorerHref,
+	listingHref,
+	overviewHref,
+	preferencesHref,
+	runtimeHref
+} from '#lib/nav.js';
 
 export interface NavItem {
 	title: string;
@@ -55,6 +65,13 @@ export const NAVIGATION: NavGroup[] = [
 				icon: LayoutDashboardIcon,
 				href: overviewHref,
 				keywords: ['status', 'home']
+			},
+			{
+				title: 'Diagram',
+				icon: NetworkIcon,
+				href: diagramHref,
+				needs: 'listAddresses',
+				keywords: ['topology', 'graph', 'cluster']
 			}
 		]
 	},
@@ -72,6 +89,23 @@ export const NAVIGATION: NavGroup[] = [
 		items: [
 			listing('addresses', WaypointsIcon, ['topics', 'destinations']),
 			listing('queues', InboxIcon, ['destinations', 'subscriptions'])
+		]
+	},
+	{
+		label: 'Tools',
+		items: [
+			{
+				title: 'Explorer',
+				icon: FolderTreeIcon,
+				href: (node) => explorerHref(node),
+				keywords: ['jmx', 'mbeans', 'attributes', 'operations', 'resources']
+			},
+			{
+				title: 'Runtime',
+				icon: CpuIcon,
+				href: runtimeHref,
+				keywords: ['system properties', 'threads', 'memory', 'process']
+			}
 		]
 	},
 	{
