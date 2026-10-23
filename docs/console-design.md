@@ -253,6 +253,13 @@ Each stage is committed on its own, with its tests.
   - The tests: unit tests of the export format, the repository's match listing, the permission checker and the DLQ groups; 57 more `api.sh` checks (148), 6 more `cluster.py` checks (55: a queue exported from node 2 and imported into the Artemis node), 8 Playwright tests of the pages and one of them on another node.
   - It passes on Windows (148 checks and 31 browser tests on one broker; 55 and 8 across two Saranga nodes and Artemis 2.57.0), and on FreeBSD 15.1 (147 and 31 in the `saranga` jail; 55 and 8 across three Saranga jails).
 
+- **Stage 7 (the exit check) is done.**
+  - `console/e2e/sweep.e2e.ts` opens every page and each of its tabs as admin, as a viewer (the `view` role, which may only read) and as a user without a console role: for admin and the viewer, axe checks it against WCAG 2.1 A and AA; the viewer is offered no enabled control that changes the broker (the preferences, which are the browser's, aside); at a phone's width (390 px) no page scrolls sideways; the user without a console role reaches no page, and the API answers it 401. `api.sh` runs it on one broker, and `cluster.sh` on node 1, on the Artemis node and across every node, with a viewer and a user without a console role on each node and `management-message-rbac` (`view` on `mops.#`, `edit` for `amq` alone) so each node holds the viewer to reading.
+  - What it found, fixed: the header was too wide for a phone (51 px), as were the tab lists and the explorer's operations; the Ctrl K hint lacked contrast; an event's row was opened by a click alone, with `aria-expanded` on the row, and has a button now; a region that scrolls without anything to focus in it can take the focus while it overflows (`#lib/scrollable.js`, on tables, the data table and long values); the layout's `main` was inside shadcn's inset, another `main`.
+  - On another node the viewer is offered the actions, as that node decides when asked, and the sweep checks the node's refusal is shown. The runtime page is offered for this broker only: a process is read from its platform MBeans, which management messages do not reach.
+  - The guide describes a read-only user on one broker and across a cluster, COMPAT.md lists the console among the web server's additions, and FUTURE.md marks the console done.
+  - It passes on Windows: 150 checks and 99 browser tests on one broker (68 of them the sweep), and 55 checks and 172 browser tests across two Saranga nodes and Artemis 2.57.0 (164 of them the sweep).
+
 ## Decisions (confirmed 2026-10-22)
 
 1. **How the console reaches other nodes.** Chosen: management messages over Core, sent with the logged-in user's own credentials, which the server holds in memory for the length of the session.

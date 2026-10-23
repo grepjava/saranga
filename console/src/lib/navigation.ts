@@ -48,6 +48,8 @@ export interface NavItem {
 	keywords?: string[];
 	/** It shows every node at once: offered across every node. */
 	everyNode?: boolean;
+	/** It shows the console's own process, which management messages cannot read: offered for this broker only. */
+	thisBroker?: boolean;
 }
 
 export interface NavGroup {
@@ -198,7 +200,8 @@ export const NAVIGATION: NavGroup[] = [
 				title: 'Runtime',
 				icon: CpuIcon,
 				href: runtimeHref,
-				keywords: ['system properties', 'threads', 'memory', 'process']
+				keywords: ['system properties', 'threads', 'memory', 'process'],
+				thisBroker: true
 			}
 		]
 	},

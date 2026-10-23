@@ -14,6 +14,7 @@
 	import { Badge } from '#lib/components/ui/badge/index.js';
 	import { resources, type Operation } from '#lib/api/index.js';
 	import { argument, display, inputFor, typeLabel } from '#lib/explorer.js';
+	import { scrollable } from '#lib/scrollable.js';
 
 	let { resource, operation }: { resource: string; operation: Operation } = $props();
 
@@ -121,6 +122,7 @@
 		</form>
 		{#if answer}
 			<pre
+				{@attach scrollable}
 				role={answer.ok ? 'status' : 'alert'}
 				class="max-h-96 overflow-auto rounded-md bg-muted p-3 font-mono text-xs break-all whitespace-pre-wrap {answer.ok
 					? ''

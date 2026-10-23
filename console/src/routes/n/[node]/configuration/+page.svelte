@@ -23,6 +23,7 @@
 	import { display } from '#lib/explorer.js';
 	import { saveText } from '#lib/files.js';
 	import { configurationHref, explorerHref, hashQuery } from '#lib/nav.js';
+	import { scrollable } from '#lib/scrollable.js';
 	import type { PageProps } from './$types';
 
 	let { params }: PageProps = $props();
@@ -545,6 +546,7 @@
 					{#if exported.text != null}
 						<p class="text-sm text-muted-foreground">Written to <code>{exported.file}</code>.</p>
 						<pre
+							{@attach scrollable}
 							class="max-h-[60vh] overflow-auto rounded-md border bg-muted/40 p-3 font-mono text-xs"
 							aria-label="Exported configuration">{exported.text}</pre>
 					{:else}

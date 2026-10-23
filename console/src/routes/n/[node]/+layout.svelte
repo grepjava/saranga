@@ -56,13 +56,13 @@
 			<Button
 				variant="outline"
 				size="sm"
-				class="w-full max-w-64 justify-start text-muted-foreground"
+				class="w-full max-w-64 min-w-0 shrink justify-start text-muted-foreground"
 				onclick={() => (palette = true)}
 			>
 				<SearchIcon />
 				<span class="truncate">Search…</span>
 				<kbd
-					class="pointer-events-none ml-auto hidden rounded border bg-muted px-1.5 font-mono text-[0.65rem] sm:inline"
+					class="pointer-events-none ml-auto hidden rounded border bg-muted px-1.5 font-mono text-[0.65rem] text-foreground sm:inline"
 					>Ctrl K</kbd
 				>
 			</Button>

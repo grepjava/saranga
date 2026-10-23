@@ -6,7 +6,8 @@
 	import * as Alert from '#lib/components/ui/alert/index.js';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import { Input } from '#lib/components/ui/input/index.js';
-	import { resources, type AttributeValue, type View } from '#lib/api/index.js';
+	import { resources, LOCAL, type AttributeValue, type View } from '#lib/api/index.js';
+	import { page } from '$app/state';
 	import { live } from '#lib/state/live.svelte.js';
 	import { display } from '#lib/explorer.js';
 	import { formatBytes, formatDuration, formatNumber } from '#lib/format.js';
@@ -47,12 +48,15 @@
 
 	let tick = $state(0);
 	let tab = $state('metrics');
+	/** The process is read from the platform MBeans, which only this broker's own have. */
+	const here = $derived(page.params.node === LOCAL);
 
 	// Each as the live stream reads it every tick.
 	const VIEWS = Object.entries(READ).map(
 		([resource, names]) => [resource, { kind: 'attributes', resource, names } as View] as const
 	);
 	$effect(() => {
+		if (!here) return;
 		const stop = VIEWS.map(([, v]) => live.watch(v));
 		return () => stop.forEach((f) => f());
 	});
@@ -147,7 +151,7 @@
 	let threadError = $state<string | null>(null);
 
 	$effect(() => {
-		if (tab !== 'threads') return;
+		if (tab !== 'threads' || !here) return;
 		void tick;
 		resources
 			.invoke<ThreadInfo[]>('java.lang.Threading', 'dumpAllThreads(boolean,boolean)', [
@@ -176,109 +180,116 @@
 			<RefreshCwIcon />
 		</Button>
 	</div>
-	{#if error}
-		<Alert.Root variant="destructive"><Alert.Description>{error}</Alert.Description></Alert.Root>
-	{/if}
-	<Tabs.Root bind:value={tab}>
-		<Tabs.List>
-			<Tabs.Trigger value="metrics">Process</Tabs.Trigger>
-			<Tabs.Trigger value="properties">System properties</Tabs.Trigger>
-			<Tabs.Trigger value="threads">Threads</Tabs.Trigger>
-		</Tabs.List>
-		<Tabs.Content value="metrics" class="mt-3 grid gap-4">
-			<section
-				class="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5"
-				aria-label="The process"
-			>
-				{#each cards as [label, value] (label)}
-					<Card.Root class="gap-1 py-3">
-						<Card.Header class="px-3"><Card.Description>{label}</Card.Description></Card.Header>
-						<Card.Content class="px-3 text-sm font-medium break-words">
-							{#if value === undefined || value === ''}
-								<span class="font-normal text-muted-foreground">Not reported</span>
-							{:else}
-								{typeof value === 'number' ? formatNumber(value) : value}
-							{/if}
+	{#if !here}
+		<p class="text-sm text-muted-foreground">
+			The runtime is that of the broker the console runs on. Another node's process cannot be read
+			over management messages; open that node's own console to see it.
+		</p>
+	{:else}
+		{#if error}
+			<Alert.Root variant="destructive"><Alert.Description>{error}</Alert.Description></Alert.Root>
+		{/if}
+		<Tabs.Root bind:value={tab}>
+			<Tabs.List>
+				<Tabs.Trigger value="metrics">Process</Tabs.Trigger>
+				<Tabs.Trigger value="properties">System properties</Tabs.Trigger>
+				<Tabs.Trigger value="threads">Threads</Tabs.Trigger>
+			</Tabs.List>
+			<Tabs.Content value="metrics" class="mt-3 grid gap-4">
+				<section
+					class="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5"
+					aria-label="The process"
+				>
+					{#each cards as [label, value] (label)}
+						<Card.Root class="gap-1 py-3">
+							<Card.Header class="px-3"><Card.Description>{label}</Card.Description></Card.Header>
+							<Card.Content class="px-3 text-sm font-medium break-words">
+								{#if value === undefined || value === ''}
+									<span class="font-normal text-muted-foreground">Not reported</span>
+								{:else}
+									{typeof value === 'number' ? formatNumber(value) : value}
+								{/if}
+							</Card.Content>
+						</Card.Root>
+					{/each}
+				</section>
+				{#if args.length}
+					<Card.Root>
+						<Card.Header><Card.Title class="text-sm">Arguments</Card.Title></Card.Header>
+						<Card.Content>
+							<pre class="font-mono text-xs break-all whitespace-pre-wrap">{args.join('\n')}</pre>
 						</Card.Content>
 					</Card.Root>
-				{/each}
-			</section>
-			{#if args.length}
-				<Card.Root>
-					<Card.Header><Card.Title class="text-sm">Arguments</Card.Title></Card.Header>
-					<Card.Content>
-						<pre class="font-mono text-xs break-all whitespace-pre-wrap">{args.join('\n')}</pre>
-					</Card.Content>
-				</Card.Root>
-			{/if}
-		</Tabs.Content>
-		<Tabs.Content value="properties" class="mt-3 grid gap-3">
-			<Input
-				aria-label="Find a property"
-				placeholder="Find a property"
-				bind:value={propertyFilter}
-			/>
-			<div class="overflow-x-auto rounded-lg border">
-				<Table.Root>
-					<Table.Header>
-						<Table.Row>
-							<Table.Head>Property</Table.Head>
-							<Table.Head>Value</Table.Head>
-						</Table.Row>
-					</Table.Header>
-					<Table.Body>
-						{#each properties as [k, val] (k)}
-							<Table.Row>
-								<Table.Cell class="align-top font-mono text-xs">{k}</Table.Cell>
-								<Table.Cell class="font-mono text-xs break-all whitespace-pre-wrap">
-									{display(val)}
-								</Table.Cell>
-							</Table.Row>
-						{:else}
-							<Table.Row>
-								<Table.Cell colspan={2} class="py-6 text-center text-muted-foreground">
-									{v('Runtime', 'SystemProperties') === undefined
-										? 'Not permitted.'
-										: 'No property matches.'}
-								</Table.Cell>
-							</Table.Row>
-						{/each}
-					</Table.Body>
-				</Table.Root>
-			</div>
-		</Tabs.Content>
-		<Tabs.Content value="threads" class="mt-3 grid gap-3">
-			{#if threadError}
-				<Alert.Root>
-					<Alert.Title>The threads cannot be listed</Alert.Title>
-					<Alert.Description>{threadError}</Alert.Description>
-				</Alert.Root>
-			{:else if threads}
+				{/if}
+			</Tabs.Content>
+			<Tabs.Content value="properties" class="mt-3 grid gap-3">
+				<Input
+					aria-label="Find a property"
+					placeholder="Find a property"
+					bind:value={propertyFilter}
+				/>
 				<div class="overflow-x-auto rounded-lg border">
 					<Table.Root>
 						<Table.Header>
 							<Table.Row>
-								<Table.Head class="text-right">ID</Table.Head>
-								<Table.Head>Name</Table.Head>
-								<Table.Head>State</Table.Head>
-								<Table.Head class="text-right">Blocked</Table.Head>
-								<Table.Head class="text-right">Waited</Table.Head>
+								<Table.Head>Property</Table.Head>
+								<Table.Head>Value</Table.Head>
 							</Table.Row>
 						</Table.Header>
 						<Table.Body>
-							{#each threads as t (t.threadId)}
+							{#each properties as [k, val] (k)}
 								<Table.Row>
-									<Table.Cell class="text-right font-mono tabular-nums">{t.threadId}</Table.Cell>
-									<Table.Cell class="font-mono text-xs">{t.threadName}</Table.Cell>
-									<Table.Cell>{t.threadState}</Table.Cell>
-									<Table.Cell class="text-right tabular-nums">{t.blockedCount ?? ''}</Table.Cell>
-									<Table.Cell class="text-right tabular-nums">{t.waitedCount ?? ''}</Table.Cell>
+									<Table.Cell class="align-top font-mono text-xs">{k}</Table.Cell>
+									<Table.Cell class="font-mono text-xs break-all whitespace-pre-wrap">
+										{display(val)}
+									</Table.Cell>
+								</Table.Row>
+							{:else}
+								<Table.Row>
+									<Table.Cell colspan={2} class="py-6 text-center text-muted-foreground">
+										{v('Runtime', 'SystemProperties') === undefined
+											? 'Not permitted.'
+											: 'No property matches.'}
+									</Table.Cell>
 								</Table.Row>
 							{/each}
 						</Table.Body>
 					</Table.Root>
 				</div>
-			{/if}
-		</Tabs.Content>
-	</Tabs.Root>
+			</Tabs.Content>
+			<Tabs.Content value="threads" class="mt-3 grid gap-3">
+				{#if threadError}
+					<Alert.Root>
+						<Alert.Title>The threads cannot be listed</Alert.Title>
+						<Alert.Description>{threadError}</Alert.Description>
+					</Alert.Root>
+				{:else if threads}
+					<div class="overflow-x-auto rounded-lg border">
+						<Table.Root>
+							<Table.Header>
+								<Table.Row>
+									<Table.Head class="text-right">ID</Table.Head>
+									<Table.Head>Name</Table.Head>
+									<Table.Head>State</Table.Head>
+									<Table.Head class="text-right">Blocked</Table.Head>
+									<Table.Head class="text-right">Waited</Table.Head>
+								</Table.Row>
+							</Table.Header>
+							<Table.Body>
+								{#each threads as t (t.threadId)}
+									<Table.Row>
+										<Table.Cell class="text-right font-mono tabular-nums">{t.threadId}</Table.Cell>
+										<Table.Cell class="font-mono text-xs">{t.threadName}</Table.Cell>
+										<Table.Cell>{t.threadState}</Table.Cell>
+										<Table.Cell class="text-right tabular-nums">{t.blockedCount ?? ''}</Table.Cell>
+										<Table.Cell class="text-right tabular-nums">{t.waitedCount ?? ''}</Table.Cell>
+									</Table.Row>
+								{/each}
+							</Table.Body>
+						</Table.Root>
+					</div>
+				{/if}
+			</Tabs.Content>
+		</Tabs.Root>
+	{/if}
 </div>

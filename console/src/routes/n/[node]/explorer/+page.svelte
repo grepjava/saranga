@@ -312,7 +312,7 @@
 								Operations ({detail.operations.length})
 							</Tabs.Trigger>
 						</Tabs.List>
-						<Tabs.Content value="attributes" class="mt-3 grid gap-3">
+						<Tabs.Content value="attributes" class="mt-3 grid grid-cols-1 gap-3">
 							<Input
 								aria-label="Find an attribute"
 								placeholder="Find an attribute"
@@ -327,7 +327,7 @@
 								onwritten={() => tick++}
 							/>
 						</Tabs.Content>
-						<Tabs.Content value="operations" class="mt-3 grid gap-2">
+						<Tabs.Content value="operations" class="mt-3 grid grid-cols-1 gap-2">
 							<Input
 								aria-label="Find an operation"
 								placeholder="Find an operation"

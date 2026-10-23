@@ -13,6 +13,7 @@
 	import * as Tooltip from '#lib/components/ui/tooltip/index.js';
 	import { resources, type Attribute } from '#lib/api/index.js';
 	import { argument, display, inputFor, numeric, typeLabel } from '#lib/explorer.js';
+	import { scrollable } from '#lib/scrollable.js';
 
 	let {
 		resource,
@@ -116,6 +117,7 @@
 							<span class="text-muted-foreground">Write only</span>
 						{:else}
 							<pre
+								{@attach scrollable}
 								class="max-h-40 overflow-auto font-mono text-xs break-all whitespace-pre-wrap">{display(
 									a.value,
 									typeof a.value === 'object' && a.value !== null

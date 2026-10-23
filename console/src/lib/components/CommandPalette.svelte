@@ -11,7 +11,7 @@
 	import { api } from '#lib/api/index.js';
 	import { NAVIGATION } from '#lib/navigation.js';
 	import { addressHref, queueHref } from '#lib/nav.js';
-	import { nodes, ALL } from '#lib/state/nodes.svelte.js';
+	import { nodes, ALL, LOCAL } from '#lib/state/nodes.svelte.js';
 	import { session } from '#lib/state/session.svelte.js';
 
 	let { node, open = $bindable(false) }: { node: string; open?: boolean } = $props();
@@ -106,7 +106,10 @@
 		{/if}
 		{#each NAVIGATION as group (group.label)}
 			{@const items = group.items.filter(
-				(i) => (!i.needs || session.may(i.needs)) && (node !== ALL || i.everyNode)
+				(i) =>
+					(!i.needs || session.may(i.needs)) &&
+					(node !== ALL || i.everyNode) &&
+					(node === LOCAL || !i.thisBroker)
 			)}
 			{#if items.length}
 				<Command.Group heading={group.label}>

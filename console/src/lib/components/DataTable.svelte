@@ -38,6 +38,7 @@
 	import { formatNumber, kindOf, type Kind } from '#lib/format.js';
 	import { download, toCsv } from '#lib/csv.js';
 	import { cn } from '#lib/utils.js';
+	import { scrollable } from '#lib/scrollable.js';
 
 	let {
 		columns,
@@ -250,6 +251,7 @@
 	{/if}
 
 	<div
+		{@attach scrollable}
 		class="relative max-h-[calc(100svh-16rem)] min-h-40 overflow-auto rounded-lg border"
 		onscroll={(e) => (scrollTop = e.currentTarget.scrollTop)}
 	>

@@ -5,7 +5,8 @@
 # node 2 is Saranga and node 3 Artemis 2.57.0 (Saranga where no Artemis
 # distribution is built). cluster.py checks the console's API on node 1 for
 # the other nodes: /nodes, /nodes/{node}/... and /nodes/all/...; then, with
-# the console's packages installed, Playwright drives its cluster pages.
+# the console's packages installed, Playwright drives its cluster pages and
+# sweeps every page as admin, a viewer and a user without a console role.
 #
 #   NODE3=saranga|artemis tests/interop/console/cluster.sh
 #
@@ -93,6 +94,19 @@ make_instance saranga "$N2" node2 1900 "$U1,$U3" noweb
 make_instance "$NODE3" "$N3" node3 2000 "$U1,$U2" noweb
 for i in "$N1" "$N2" "$N3"; do
   [[ -f "$i/etc/broker.xml" ]] || { echo "create failed for $i"; exit 1; }
+  # The view role may read every node and browse its queues: management
+  # messages checked by their content (management-message-rbac), view on
+  # mops.# and edit for amq alone, as node 1's management.xml has it.
+  sed -i -E \
+    -e '/<security-setting match="#">/,/<\/security-setting>/ s/(type="browse" roles=)"amq"/\1"amq,view"/' \
+    -e '/<security-setting match="activemq.management.#">/,/<\/security-setting>/ s/roles="amq"/roles="amq,view"/' \
+    -e 's#^( *)</security-settings>#\1   <security-setting match="mops.\#">\n\1      <permission type="view" roles="amq,view"/>\n\1      <permission type="edit" roles="amq"/>\n\1      <permission type="manage" roles="amq,view"/>\n\1   </security-setting>\n\1</security-settings>\n\1<management-message-rbac>true</management-message-rbac>#' \
+    "$i/etc/broker.xml"
+done
+cp "$ROOT/tests/interop/console/management.xml" "$N1/etc/management.xml"
+for p in "$N1/etc/artemis.profile" "$N1/etc/artemis.profile.cmd"; do
+  [[ -f "$p" ]] && sed -i -E -e "s/^HAWTIO_ROLES=.*/HAWTIO_ROLES='amq,view'/" \
+    -e "s/-Dhawtio.roles=amq /-Dhawtio.roles=amq,view /" "$p"
 done
 launch "$N1"; launch "$N2"; launch "$N3"
 for p in $CORE1 $CORE2 $CORE3 $WEB1; do
@@ -105,6 +119,14 @@ echo "the cluster formed (node 3 is $NODE3)"
 # A user only node 1 knows.
 "$SARANGA" user add --user-command-user visitor --user-command-password visitor --role amq \
   --url "$U1" --user admin --password admin --silent > /dev/null
+# Every node's viewer and user without a console role, for the pages' sweep.
+for u in "$U1" "$U2" "$U3"; do
+  for v in "viewer view" "outsider other"; do
+    set -- $v
+    "$SARANGA" user add --user-command-user "$1" --user-command-password "$1" --role "$2" \
+      --url "$u" --user admin --password admin --silent > /dev/null
+  done
+done
 
 "$PYTHON" -I "$(native "$ROOT/tests/interop/console/cluster.py")" \
   "http://localhost:$WEB1" "$(native "$SARANGA")" "$U1" "$U2" "$U3"
@@ -114,7 +136,8 @@ RESULT=$?
 # the console's packages are installed: SARANGA_E2E=0 skips them.
 CONSOLE="$ROOT/console"
 if [[ "${SARANGA_E2E:-1}" != 0 && -d "$CONSOLE/node_modules" ]]; then
-  (cd "$CONSOLE" && SARANGA_URL="http://localhost:$WEB1" SARANGA_CLUSTER=1     npx playwright test e2e/cluster.e2e.ts) || RESULT=1
+  (cd "$CONSOLE" && SARANGA_URL="http://localhost:$WEB1" SARANGA_CLUSTER=1 \
+    npx playwright test e2e/cluster.e2e.ts e2e/sweep.e2e.ts) || RESULT=1
 else
   echo "skip the console's cluster pages in a browser (no console/node_modules, or SARANGA_E2E=0)"
 fi

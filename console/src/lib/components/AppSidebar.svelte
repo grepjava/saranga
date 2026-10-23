@@ -4,7 +4,7 @@
 	import NodePicker from './NodePicker.svelte';
 	import { NAVIGATION } from '#lib/navigation.js';
 	import { session } from '#lib/state/session.svelte.js';
-	import { ALL } from '#lib/state/nodes.svelte.js';
+	import { ALL, LOCAL } from '#lib/state/nodes.svelte.js';
 	import { page } from '$app/state';
 
 	let { node }: { node: string } = $props();
@@ -24,7 +24,10 @@
 	<Sidebar.Content>
 		{#each NAVIGATION as group (group.label)}
 			{@const items = group.items.filter(
-				(i) => (!i.needs || session.may(i.needs)) && (node !== ALL || i.everyNode)
+				(i) =>
+					(!i.needs || session.may(i.needs)) &&
+					(node !== ALL || i.everyNode) &&
+					(node === LOCAL || !i.thisBroker)
 			)}
 			{#if items.length}
 				<Sidebar.Group>

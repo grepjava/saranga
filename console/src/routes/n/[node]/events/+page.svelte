@@ -158,15 +158,26 @@
 					{#each matching as n (n.seq)}
 						<Table.Row
 							class="cursor-pointer"
-							aria-expanded={open === n.seq}
 							onclick={() => (open = open === n.seq ? null : n.seq)}
 						>
 							<Table.Cell>
-								<ChevronRightIcon
-									class="size-4 text-muted-foreground transition-transform {open === n.seq
-										? 'rotate-90'
-										: ''}"
-								/>
+								<!-- The row opens on a click; the button is its keyboard's way. -->
+								<button
+									type="button"
+									class="flex rounded-sm focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+									aria-expanded={open === n.seq}
+									aria-label="Details"
+									onclick={(e) => {
+										e.stopPropagation();
+										open = open === n.seq ? null : n.seq;
+									}}
+								>
+									<ChevronRightIcon
+										class="size-4 text-muted-foreground transition-transform {open === n.seq
+											? 'rotate-90'
+											: ''}"
+									/>
+								</button>
 							</Table.Cell>
 							<Table.Cell class="font-mono text-xs tabular-nums">
 								{time.format(n.timestamp)}

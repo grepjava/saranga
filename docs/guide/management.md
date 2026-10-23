@@ -171,7 +171,7 @@ See [COMPAT.md, Web server differences](../../COMPAT.md#web-server-differences) 
 
 ## The Saranga console
 
-Saranga has a console of its own at `/saranga/` on every `<web>` binding, built into the binary: it needs no `console.war` and no Node.js. It does what Artemis's console does, and it is gaining more in stages (see [the design](../console-design.md)). So far it has:
+Saranga has a console of its own at `/saranga/` on every `<web>` binding, built into the binary: it needs no `console.war` and no Node.js. It does what Artemis's console does, and manages the cluster and the broker's configuration besides (see [the design](../console-design.md)). It has:
 
 - the login, with the same users, console roles and throttling as Artemis's console;
 - the broker's overview: its status, memory and disk, charts of its connections, consumers, messages, message rates and address memory, its acceptors and cluster connections, its lock coordinators, and the topology's live and backup brokers;
@@ -199,6 +199,52 @@ A message sent with no user given is sent as the logged-in user, as on Artemis: 
 
 What a user sees and may do follows the guard, as below: a page or an action the guard refuses is not offered. Each page's URL holds its filters and sort (`/saranga/#/n/local/queues?filter=name:CONTAINS:orders`), so it can be bookmarked or shared. Where Artemis's `console.war` is not installed, `/` goes to `/saranga/`.
 
+Every page works at a phone's width and from the keyboard, and is checked against WCAG 2.1 AA (with axe) for an admin and a read-only user, on one broker and across a cluster.
+
+### A read-only user
+
+A user whose role may only read sees every page and is offered no change. For the broker the console runs on, give the role a console role and only the reading methods in `management.xml` (the `view` role here):
+
+```xml
+<!-- etc/management.xml -->
+<role-access>
+   <match domain="org.apache.activemq.artemis">
+      <access method="list*" roles="amq,view"/>
+      <access method="get*" roles="amq,view"/>
+      <access method="is*" roles="amq,view"/>
+      <access method="count*" roles="amq,view"/>
+      <access method="browse*" roles="amq,view"/>
+      <access method="*" roles="amq"/>
+   </match>
+</role-access>
+```
+
+with `HAWTIO_ROLES='amq,view'` in `etc/artemis.profile` (`-Dhawtio.roles=amq,view` in `artemis.profile.cmd`). The other nodes of a cluster check the user themselves, by their own security settings: with `management-message-rbac`, give the role `view` on `mops.#` and `edit` to the admins only, and `manage` and the reply queue's permissions on the management address:
+
+```xml
+<!-- etc/broker.xml, on every node -->
+<management-message-rbac>true</management-message-rbac>
+<security-settings>
+   <security-setting match="mops.#">
+      <permission type="view" roles="amq,view"/>
+      <permission type="edit" roles="amq"/>
+      <permission type="manage" roles="amq,view"/>
+   </security-setting>
+   <security-setting match="activemq.management.#">
+      <permission type="manage" roles="amq,view"/>
+      <permission type="createNonDurableQueue" roles="amq,view"/>
+      <permission type="deleteNonDurableQueue" roles="amq,view"/>
+      <permission type="createAddress" roles="amq,view"/>
+      <permission type="deleteAddress" roles="amq,view"/>
+      <permission type="consume" roles="amq,view"/>
+      <permission type="send" roles="amq,view"/>
+   </security-setting>
+   <!-- and browse on the queues whose messages the role may read -->
+</security-settings>
+```
+
+On another node the console offers the actions, since that node decides only when asked, and shows its refusal.
+
 ### The other nodes
 
 The console reaches the other nodes of the cluster as the cluster topology gives them, through the connector each one announces. It sends them management messages over Core (the `activemq.management` address), as `artemis queue stat --clustered` does, so an Artemis node answers them as a Saranga one does. It logs in to each node as the user logged in to the console, with the same password, which the console's session keeps in memory for as long as it lasts. Each node then checks that user itself: the user must exist there and be allowed to manage (`manage` on the management address, or the RBAC permissions of `management-message-rbac`). A node that does not know the user, or cannot be reached, says so on the page, and the other nodes go on.
@@ -207,7 +253,7 @@ A queue's messages on another node are browsed as a client browses them, with a 
 
 So what another node lets the user do is known only when it is asked: the console offers its actions, and shows that node's error when it refuses one. The live data of another node comes every two seconds as this broker's does, but its charts start from the moment a page opens: the hour of history is this broker's only. The notifications on the events page are this broker's.
 
-Management messages do not give a resource's MBean name, and they cannot list a node's acceptors or broadcast groups, so the explorer of another node has neither, nor does its configuration page.
+Management messages do not give a resource's MBean name, and they cannot list a node's acceptors or broadcast groups, so the explorer of another node has neither, nor does its configuration page. The runtime page is offered for this broker only: a process is read from its platform MBeans (`java.lang`), which management messages do not reach, so another node's is seen in its own console.
 
 No management operation lists a broker's address-settings or security-settings matches, so the console lists them for the broker you are logged in to; for another node, the configuration page shows an address's settings (`getAddressSettingsAsJSON`) and the security page checks an address's roles (`getRolesAsJSON`), which every node answers. A message export or import with another node goes over the user's connection to it: the export browses, so the user needs `browse` on the queue there, and the import sends, so they need `send` on its address.
 
