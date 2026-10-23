@@ -305,7 +305,7 @@ saranga version
 ```
 
 ```
-Saranga 1.0.0 (Apache Artemis 2.57.0)
+Saranga 1.1.0 (Apache Artemis 2.57.0)
 Saranga home: /opt/saranga
 Saranga instance: /var/lib/mybroker
 ```

@@ -36,7 +36,10 @@ Saranga has a web console of its own at `http://localhost:8161/saranga/`, built 
 - **Live data.** The pages follow the broker over one server-sent-events stream instead of polling, the charts open on the last hour of the broker's own history, and the events page shows the management notifications as they come.
 - **A typed API** at `/saranga/api/v1`, described as OpenAPI 3.1 at `/saranga/api/v1/openapi.json`.
 
-It is being built in stages, set out in [docs/console-design.md](docs/console-design.md). Stages 1 to 4 are done. Cluster and HA views, the configuration editors and the dead-letter workbench come next. It is not in Saranga 1.0.0. To include it in a build from source, run `npm ci && npm run build` in `console/` (Node.js is needed only for this step) before `cargo build`; without that, `/saranga/` serves a page that says how. [Management](docs/guide/management.md#the-saranga-console) in the guide describes it in full. Artemis's own console can still be served alongside it.
+- **The cluster and the broker's administration.** Every node of the cluster, Artemis or Saranga, with high availability and bridges; address settings, diverts, acceptors, users and security settings, XA transactions and a dead-letter workbench.
+- **Accessible, and at a phone's width.** Every page is checked against WCAG 2.1 AA.
+
+It is in Saranga 1.1.0 and later; [docs/console-design.md](docs/console-design.md) records how it was built. To include it in a build from source, run `npm ci && npm run build` in `console/` (Node.js is needed only for this step) before `cargo build`; without that, `/saranga/` serves a page that says how. [Management](docs/guide/management.md#the-saranga-console) in the guide describes it in full. Artemis's own console can still be served alongside it.
 
 ## Performance against Artemis
 
