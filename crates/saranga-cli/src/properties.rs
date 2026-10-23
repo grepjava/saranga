@@ -56,9 +56,15 @@ pub fn run(
 /// the configuration it runs on (as it read it at start, broker
 /// properties applied, with what each reload replaced), written as
 /// `broker_config_as_properties.txt` in `java.io.tmpdir`, which `artemis
-/// run` sets to the instance's `tmp`.
-pub fn export_running(instance: &crate::instance::Instance) -> anyhow::Result<PathBuf> {
-    let config = instance.running_configuration()?;
+/// run` sets to the instance's `tmp`. The configured queues are as the
+/// broker's last deployment of them left them (`deployed`), as Artemis's
+/// deployment leaves their `QueueConfiguration`s.
+pub fn export_running(
+    instance: &crate::instance::Instance,
+    deployed: &[saranga_server::reload::DeployedQueue],
+) -> anyhow::Result<PathBuf> {
+    let mut config = instance.running_configuration()?;
+    saranga_server::reload::DeployedQueue::write_all(deployed, &mut config);
     let ctx = ExportContext {
         max_memory: saranga_server::jvm::max_memory(),
         broker_instance: java_file(&instance.dir),

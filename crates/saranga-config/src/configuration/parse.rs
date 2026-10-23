@@ -1921,6 +1921,7 @@ fn parse_addresses(e: Node<'_, '_>, config: &mut Configuration) -> Result<()> {
                 consumers_before_dispatch: q.consumers_before_dispatch,
                 delay_before_dispatch: q.delay_before_dispatch,
                 ring_size: Some(q.ring_size),
+                ..QueueConfiguration::default()
             })
             .collect();
         config

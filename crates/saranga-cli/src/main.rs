@@ -1740,8 +1740,13 @@ fn announce(instance: Option<&Arc<instance::Instance>>, started: &Started) {
             read_reload(&loader, reload_period, with_acceptors).map_err(|e| format!("{e:#}"))
         }));
         let exported = instance.clone();
+        let deployer = Arc::downgrade(broker);
         broker.set_config_exporter(Arc::new(move || {
-            properties::export_running(&exported).map_err(|e| format!("{e:#}"))
+            let deployed = deployer
+                .upgrade()
+                .map(|b| b.post_office().deployed_queues())
+                .unwrap_or_default();
+            properties::export_running(&exported, &deployed).map_err(|e| format!("{e:#}"))
         }));
     }
 }

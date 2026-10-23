@@ -875,8 +875,12 @@ fn address_bean(a: &CoreAddressConfiguration) -> Bean {
 fn queue_bean(q: &QueueConfiguration) -> Bean {
     Bean::new()
         .v("address", q.address.as_deref().unwrap_or(&q.name))
+        .o("autoCreateAddress", q.auto_create_address)
         .v("autoCreated", false)
-        .v("configurationManaged", false)
+        .o("autoDelete", q.auto_delete)
+        .o("autoDeleteDelay", q.auto_delete_delay)
+        .o("autoDeleteMessageCount", q.auto_delete_message_count)
+        .v("configurationManaged", q.configuration_managed)
         .o("consumersBeforeDispatch", q.consumers_before_dispatch)
         .o("delayBeforeDispatch", q.delay_before_dispatch)
         .v("durable", q.durable.unwrap_or(true))
@@ -890,6 +894,7 @@ fn queue_bean(q: &QueueConfiguration) -> Bean {
             "groupRebalancePauseDispatch",
             q.group_rebalance_pause_dispatch,
         )
+        .o("id", q.id)
         .v("internal", false)
         .o("lastValue", q.last_value)
         .o("lastValueKey", q.last_value_key.as_deref())

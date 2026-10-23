@@ -579,12 +579,10 @@ fn address_property(
                     address.queues.last_mut().expect("pushed")
                 }
             };
-            queue_field(q, field, value)?;
-            if *field == "routingType" && !address.routing_types.contains(&q.routing_type) {
-                let rt = q.routing_type;
-                address.routing_types.push(rt);
-            }
-            Ok(())
+            // The address keeps the routing types it is given, as
+            // Artemis's CoreAddressConfiguration does: a queue's routing
+            // type is not added to them.
+            queue_field(q, field, value)
         }
         _ => Err(format!("{} is not an address property", rest.join("."))),
     }
@@ -1001,7 +999,9 @@ brokerPlugins.p.className=x"#,
         let roles = &c.security_settings[0].1.roles;
         assert!(roles[0].allows(CheckType::Send) && !roles[0].allows(CheckType::Consume));
         let a = &c.addresses[0];
-        assert_eq!(a.routing_types, vec![RoutingType::Anycast]);
+        // As Artemis has it: the queue's routing type is not the address's.
+        assert!(a.routing_types.is_empty());
+        assert_eq!(a.queues[0].routing_type, RoutingType::Anycast);
         assert!(!a.queues[0].durable);
         let acc = &c.acceptors[0];
         assert_eq!(

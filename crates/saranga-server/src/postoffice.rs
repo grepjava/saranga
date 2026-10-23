@@ -254,6 +254,29 @@ impl QueueSpec {
             .get_or_insert(s.auto_delete_queues_message_count);
     }
 
+    /// `QueueConfigurationUtils.applyStaticDefaults`: what is still unset
+    /// takes Artemis's default.
+    pub fn apply_static_defaults(&mut self) {
+        self.max_consumers.get_or_insert(-1);
+        self.routing_type.get_or_insert(RoutingType::Multicast);
+        self.exclusive.get_or_insert(false);
+        self.non_destructive.get_or_insert(false);
+        self.purge_on_no_consumers.get_or_insert(false);
+        self.enabled.get_or_insert(true);
+        self.consumers_before_dispatch.get_or_insert(0);
+        self.delay_before_dispatch.get_or_insert(-1);
+        self.group_rebalance.get_or_insert(false);
+        self.group_rebalance_pause_dispatch.get_or_insert(false);
+        self.group_buckets.get_or_insert(-1);
+        // An auto-created queue is deleted when unused by default, a
+        // created one is not.
+        self.auto_delete.get_or_insert(self.auto_created);
+        self.auto_delete_delay.get_or_insert(0);
+        self.auto_delete_message_count.get_or_insert(0);
+        self.ring_size.get_or_insert(-1);
+        self.last_value.get_or_insert(false);
+    }
+
     /// Dynamic then static defaults (`applyStaticDefaults`), giving the
     /// queue's final configuration.
     fn resolve(mut self, s: &AddressSettings) -> QueueConfig {
@@ -467,6 +490,9 @@ pub struct PostOffice {
     grouping: std::sync::OnceLock<Arc<crate::grouping::GroupingHandler>>,
     /// The mirror sources installed.
     mirrors: crate::mirror::Mirrors,
+    /// What the last deployment of the configured addresses wrote into
+    /// their queues' configurations.
+    deployed: Mutex<Vec<crate::reload::DeployedQueue>>,
 }
 
 #[derive(Default)]
@@ -501,7 +527,22 @@ impl PostOffice {
             balanced: AtomicBool::new(false),
             grouping: std::sync::OnceLock::new(),
             mirrors: crate::mirror::Mirrors::default(),
+            deployed: Mutex::default(),
         })
+    }
+
+    /// What the last deployment of the configured addresses wrote into
+    /// their queues' configurations, as Artemis's deployment writes into
+    /// the `QueueConfiguration`s of the configuration it runs on.
+    pub fn deployed_queues(&self) -> Vec<crate::reload::DeployedQueue> {
+        self.deployed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn set_deployed_queues(&self, deployed: Vec<crate::reload::DeployedQueue>) {
+        *self.deployed.lock().unwrap_or_else(|e| e.into_inner()) = deployed;
     }
 
     /// `setGroupingHandler`.

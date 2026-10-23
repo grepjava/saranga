@@ -477,6 +477,11 @@ check("admin exports the configuration as broker properties",
       and (os.name != "nt" or exported_file.startswith(tmpdir.replace("\\", "/").lower()))
       and (os.name == "nt" or exported_file.endswith("/tmp/broker_config_as_properties.txt"))
       and re.search(r"^name=", text, re.M) and "addressSettings." in text, (status, body and body.get("file")))
+check("and the configured queues as the broker deployed them",
+      "addressConfigurations.DLQ.queueConfigs.DLQ.configurationManaged=true" in text.splitlines()
+      and any(re.fullmatch(r"addressConfigurations\.DLQ\.queueConfigs\.DLQ\.id=\d+", l)
+              for l in text.splitlines()),
+      [l for l in text.splitlines() if l.startswith("addressConfigurations.DLQ.")])
 check("with the broker properties the broker started with",
       'addressSettings."console.properties.#".maxDeliveryAttempts=7' in text.splitlines(),
       [l for l in text.splitlines() if "console.properties" in l][:3])

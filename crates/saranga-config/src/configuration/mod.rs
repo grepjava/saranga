@@ -195,6 +195,14 @@ pub struct QueueConfiguration {
     pub consumers_before_dispatch: Option<i32>,
     pub delay_before_dispatch: Option<i64>,
     pub ring_size: Option<i64>,
+    // What the broker's deployment of the queue sets, never broker.xml.
+    pub auto_create_address: Option<bool>,
+    pub auto_delete: Option<bool>,
+    pub auto_delete_delay: Option<i64>,
+    pub auto_delete_message_count: Option<i64>,
+    pub configuration_managed: bool,
+    /// The journal ID `createQueue` gave it.
+    pub id: Option<i64>,
 }
 
 /// `CoreAddressConfiguration`.
