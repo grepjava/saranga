@@ -4,7 +4,7 @@ This page takes you from a release or the source tree to a running broker: insta
 
 ## Installing a release
 
-Each release on GitHub has an archive for Linux (x86_64 and aarch64), Windows (x86_64) and macOS (x86_64 and aarch64), with `SHA256SUMS` to check them. An archive is a Saranga home, laid out as an Artemis home is:
+Each release on GitHub has an archive for Linux (x86_64 and aarch64), Windows (x86_64) and macOS (x86_64 and aarch64), and from 1.1.0 for FreeBSD 15 (x86_64), with `SHA256SUMS` to check them. An archive is a Saranga home, laid out as an Artemis home is:
 
 ```
 saranga-1.1.0-x86_64-unknown-linux-gnu/
