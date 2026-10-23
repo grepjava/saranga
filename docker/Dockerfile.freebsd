@@ -10,7 +10,7 @@
 #   podman run -p 8161:8161 -p 61616:61616 saranga:freebsd
 
 FROM docker.io/freebsd/freebsd-runtime:15.1
-ARG VERSION=1.0.0
+ARG VERSION=1.1.0
 LABEL org.opencontainers.image.title="Saranga" \
       org.opencontainers.image.description="A message broker inspired by Apache ActiveMQ Artemis 2.57.0" \
       org.opencontainers.image.licenses="Apache-2.0"
