@@ -110,6 +110,8 @@ Saranga applies the top-level settings it supports and these collections: `addre
 
 and records the key in the broker's status under `configuration.properties.<source>`, as Artemis does. See [COMPAT.md](../../COMPAT.md#configuration-differences).
 
+A top-level setting takes the name Artemis gives it as a bean property, such as `journalFileSize`, `IDCacheSize`, `JMXDomain` or `journalBufferTimeout_NIO`; the camel-case form of its `broker.xml` element, such as `idCacheSize`, is also taken. `exportConfigAsProperties` (management, and the console's Configuration page) exports the configuration the broker runs on, the broker properties it applied included, as Artemis exports it.
+
 Artemis's documentation on broker properties is in its [configuration index](https://activemq.apache.org/components/artemis/documentation/latest/configuration-index.html).
 
 ## Configuration reload

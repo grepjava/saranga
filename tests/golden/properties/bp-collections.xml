@@ -1,0 +1,48 @@
+<?xml version='1.0'?>
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+   <core xmlns="urn:activemq:core">
+      <journal-type>NIO</journal-type>
+      <connectors>
+         <connector name="netty">tcp://localhost:61616</connector>
+      </connectors>
+      <acceptors>
+         <acceptor name="artemis">tcp://0.0.0.0:61616?protocols=CORE,AMQP</acceptor>
+         <acceptor name="old">tcp://0.0.0.0:61618</acceptor>
+      </acceptors>
+      <security-settings>
+         <security-setting match="orders.#">
+            <permission type="send" roles="clerks"/>
+            <permission type="consume" roles="clerks,auditors"/>
+         </security-setting>
+         <security-setting match="old.#">
+            <permission type="send" roles="any"/>
+         </security-setting>
+      </security-settings>
+      <address-settings>
+         <address-setting match="orders.#">
+            <dead-letter-address>DLA</dead-letter-address>
+            <max-delivery-attempts>5</max-delivery-attempts>
+         </address-setting>
+         <address-setting match="old.#">
+            <max-size-bytes>1M</max-size-bytes>
+         </address-setting>
+      </address-settings>
+      <addresses>
+         <address name="orders">
+            <anycast>
+               <queue name="orders"/>
+            </anycast>
+         </address>
+         <address name="old">
+            <multicast/>
+         </address>
+      </addresses>
+      <diverts>
+         <divert name="audit">
+            <routing-name>audit</routing-name>
+            <address>orders</address>
+            <forwarding-address>audit</forwarding-address>
+         </divert>
+      </diverts>
+   </core>
+</configuration>

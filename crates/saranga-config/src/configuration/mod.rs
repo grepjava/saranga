@@ -9,9 +9,12 @@
 //! `HashMap` or `HashSet` is kept in insertion order and walked in Java's
 //! order where it is written out.
 
+mod apply;
 mod export;
 mod parse;
 
+pub use apply::apply_property;
+pub(crate) use apply::scalar_element;
 pub use export::{ExportContext, ExportError, export_as_properties};
 pub use parse::parse_main_config;
 
@@ -84,6 +87,18 @@ impl<V> JavaMap<V> {
         self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
 
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut V> {
+        self.entries
+            .iter_mut()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+
+    pub fn remove(&mut self, key: &str) -> Option<V> {
+        let i = self.entries.iter().position(|(k, _)| k == key)?;
+        Some(self.entries.remove(i).1)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -112,6 +127,11 @@ pub struct TransportConfiguration {
     pub params: JavaMap<JavaValue>,
     /// `null` when the schema gave none.
     pub extra_props: Option<JavaMap<JavaValue>>,
+    /// The [`hash_code`](Self::hash_code) it had when it went into the
+    /// acceptors' `HashSet`, which places it by that hash however it
+    /// changes after: set once broker properties change it, `None` while
+    /// it is the hash it has.
+    pub set_hash: Option<i32>,
 }
 
 impl TransportConfiguration {
@@ -146,6 +166,7 @@ impl TransportConfiguration {
             lock_coordinator: None,
             params: map(t.params),
             extra_props: Some(map(t.extra)),
+            set_hash: None,
         }
     }
 }
@@ -205,6 +226,25 @@ pub struct Role {
 }
 
 impl Role {
+    /// `new Role()` named `name`: no permission.
+    pub fn named(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            send: false,
+            consume: false,
+            create_durable_queue: false,
+            delete_durable_queue: false,
+            create_non_durable_queue: false,
+            delete_non_durable_queue: false,
+            manage: false,
+            browse: false,
+            create_address: false,
+            delete_address: false,
+            view: false,
+            edit: false,
+        }
+    }
+
     /// `Objects.hash(name, send, consume, createDurableQueue,
     /// deleteDurableQueue, createNonDurableQueue, deleteNonDurableQueue,
     /// manage, browse, createAddress, deleteAddress, view, edit)`.
@@ -304,6 +344,60 @@ pub struct BridgeConfiguration {
     pub parent_name: Option<String>,
     pub configuration_managed: bool,
     pub client_id: Option<String>,
+}
+
+impl BridgeConfiguration {
+    /// A `new BridgeConfiguration()` given its name, which `setName` makes
+    /// its parent's too: Artemis's defaults.
+    pub fn new(name: String) -> Self {
+        Self {
+            parent_name: Some(name.clone()),
+            name,
+            queue_name: String::new(),
+            forwarding_address: None,
+            filter_string: None,
+            static_connectors: None,
+            discovery_group_name: None,
+            ha: false,
+            transformer_configuration: None,
+            retry_interval: 2000,
+            retry_interval_multiplier: 1.0,
+            initial_connect_attempts: -1,
+            reconnect_attempts: -1,
+            reconnect_attempts_on_same_node: 10,
+            use_duplicate_detection: true,
+            confirmation_window_size: 1024 * 1024 * 10,
+            producer_window_size: 1024 * 1024,
+            client_failure_check_period: 30000,
+            user: Some("ACTIVEMQ.CLUSTER.ADMIN.USER".to_owned()),
+            password: Some("CHANGE ME!!".to_owned()),
+            connection_ttl: 60000,
+            max_retry_interval: 2000,
+            min_large_message_size: 100 * 1024,
+            call_timeout: 30000,
+            routing_type: "PASS".to_owned(),
+            concurrency: 1,
+            pending_ack_timeout: 60000,
+            configuration_managed: true,
+            client_id: None,
+        }
+    }
+}
+
+/// `JaasAppConfiguration`: a JAAS realm broker properties configure.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JaasAppConfiguration {
+    pub name: String,
+    pub modules: Vec<JaasAppConfigurationEntry>,
+}
+
+/// `JaasAppConfigurationEntry`: one login module of a realm.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JaasAppConfigurationEntry {
+    pub name: String,
+    pub login_module_class: Option<String>,
+    pub control_flag: Option<String>,
+    pub params: JavaMap<String>,
 }
 
 /// `ClusterConnectionConfiguration`.
@@ -873,6 +967,9 @@ pub struct Configuration {
     pub resource_limit_settings: JavaMap<ResourceLimitSettings>,
     /// Each match's roles, a `HashSet<Role>` kept in insertion order.
     pub security_settings: JavaMap<Vec<Role>>,
+    /// The JAAS realms broker properties configure: a `ConcurrentHashMap`,
+    /// walked as a `HashMap` of the same keys is.
+    pub jaas_configs: JavaMap<JaasAppConfiguration>,
     pub security_setting_plugins: Vec<SecuritySettingPlugin>,
     pub metrics_configuration: Option<MetricsConfiguration>,
     pub broker_plugins: Vec<BrokerPlugin>,
@@ -930,6 +1027,26 @@ pub struct Configuration {
     pub purge_page_folders: bool,
     /// `artemisInstance`: the instance directory as `new File` holds it.
     pub broker_instance: Option<String>,
+}
+
+impl Configuration {
+    /// `ActiveMQServerImpl.updateReloadableConfigurationFrom`: what a
+    /// reload replaces in the configuration the broker runs on, from the
+    /// configuration it read again. The rest stays as the broker started.
+    pub fn update_reloadable_from(&mut self, other: Configuration) {
+        self.security_settings = other.security_settings;
+        self.address_settings = other.address_settings;
+        self.divert_configurations = other.divert_configurations;
+        self.address_configurations = other.address_configurations;
+        self.bridge_configurations = other.bridge_configurations;
+        self.connector_configs = other.connector_configs;
+        self.acceptor_configs = other.acceptor_configs;
+        self.amqp_broker_connect_configurations = other.amqp_broker_connect_configurations;
+        self.amqp_transport_configurations = other.amqp_transport_configurations;
+        self.purge_page_folders = other.purge_page_folders;
+        self.connection_routers = other.connection_routers;
+        self.jaas_configs = other.jaas_configs;
+    }
 }
 
 /// `NetworkHealthCheck.IPV4_DEFAULT_COMMAND` and `IPV6_DEFAULT_COMMAND`, for
@@ -1040,6 +1157,7 @@ impl Default for Configuration {
             address_settings: JavaMap::default(),
             resource_limit_settings: JavaMap::default(),
             security_settings: JavaMap::default(),
+            jaas_configs: JavaMap::default(),
             security_setting_plugins: Vec::new(),
             metrics_configuration: None,
             broker_plugins: Vec::new(),

@@ -1036,7 +1036,7 @@ fn read_reload(
     reload_period: std::time::Duration,
     with_acceptors: bool,
 ) -> anyhow::Result<saranga_server::reload::Reload> {
-    let file = instance.broker_config_validated(saranga_config::Validation::Reload)?;
+    let file = instance.broker_config_running(saranga_config::Validation::Reload)?;
     let mut reload = saranga_server::reload::Reload::from_file_config(&file)?;
     if with_acceptors {
         reload.acceptors = Some(acceptor_plan(Arc::new(file), reload_period));
@@ -1336,7 +1336,8 @@ async fn boot(
     let mut file_config = None;
     let (mut broker_config, mut binds, reload_period) = match instance {
         Some(instance) => {
-            let file = instance.broker_config()?;
+            let file =
+                instance.broker_config_running(saranga_config::Validation::Deploy { jms: true })?;
             tracing::info!(
                 "AMQ221000: {} message broker is starting with configuration Broker Configuration (clustered={},journalDirectory={},bindingsDirectory={},largeMessagesDirectory={},pagingDirectory={})",
                 if file.ha_policy.is_backup() || as_backup {

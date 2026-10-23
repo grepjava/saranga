@@ -1,4 +1,4 @@
-//! `ConfigurationImpl.exportAsProperties`: the configuration as broker
+//! `Con        .v("factoryClassName", &t.factory_class_name)igurationImpl.exportAsProperties`: the configuration as broker
 //! properties, one `key=value` line each, as `artemis properties` writes
 //! them.
 //!
@@ -569,6 +569,10 @@ fn configuration(c: &Configuration, ctx: &ExportContext) -> Node {
             strings(&c.incoming_interceptor_class_names),
         )
         .v("internalNamingPrefix", &c.internal_naming_prefix)
+        .n(
+            "jaasConfigs",
+            java_map(&c.jaas_configs, |j| jaas_bean(j).node()),
+        )
         .v("JMXDomain", &c.jmx_domain)
         .v("JMXManagementEnabled", c.jmx_management_enabled)
         .v("JMXNotificationEnabled", c.jmx_notification_enabled)
@@ -800,7 +804,7 @@ fn element_name(name: Option<&str>) -> String {
 /// The `HashSet` of acceptors, walked by `TransportConfiguration.hashCode`.
 fn acceptors(acceptors: &[TransportConfiguration]) -> Option<Node> {
     entries(
-        hash_set_order(acceptors, TransportConfiguration::hash_code)
+        hash_set_order(acceptors, |t| t.set_hash.unwrap_or_else(|| t.hash_code()))
             .into_iter()
             .map(|t| (element_name(t.name.as_deref()), transport_bean(t).node()))
             .collect(),
@@ -812,10 +816,36 @@ fn transport_bean(t: &TransportConfiguration) -> Bean {
     let params = |m: &JavaMap<JavaValue>| java_map(m, |v| Node::Text(v.export_text()));
     Bean::new()
         .n("extraParams", t.extra_props.as_ref().and_then(params))
-        .v("factoryClassName", &t.factory_class_name)
+        // Unset (`null`) only on an acceptor broker properties made.
+        .o(
+            "factoryClassName",
+            Some(t.factory_class_name.as_str()).filter(|f| !f.is_empty()),
+        )
         .o("lockCoordinator", t.lock_coordinator.as_deref())
         .o("name", t.name.as_deref())
         .n("params", params(&t.params))
+}
+
+/// `JaasAppConfiguration`: its modules keyed by name.
+fn jaas_bean(j: &JaasAppConfiguration) -> Bean {
+    Bean::new()
+        .n(
+            "modules",
+            entries(
+                j.modules
+                    .iter()
+                    .map(|m| {
+                        let bean = Bean::new()
+                            .o("controlFlag", m.control_flag.as_deref())
+                            .o("loginModuleClass", m.login_module_class.as_deref())
+                            .v("name", &m.name)
+                            .n("params", java_map(&m.params, |v| Node::Text(v.clone())));
+                        (m.name.clone(), bean.node())
+                    })
+                    .collect(),
+            ),
+        )
+        .v("name", &j.name)
 }
 
 /// `CoreAddressConfiguration`.

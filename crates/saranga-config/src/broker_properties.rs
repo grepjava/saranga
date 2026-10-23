@@ -9,9 +9,12 @@
 //! otherwise). A collection entry whose value is the remove value (`-`
 //! unless `remove.value` says otherwise) is removed.
 //!
-//! Top-level settings take the camel-case form of their `broker.xml`
-//! element (`journalFileSize` for `<journal-file-size>`) and go through the
-//! same parsing; so do address settings. Saranga supports the collections
+//! Top-level settings take their bean property's name (`journalFileSize`,
+//! `IDCacheSize`) or the camel-case form of their `broker.xml` element
+//! (`idCacheSize` for `<id-cache-size>`) and go through that element's
+//! parsing; so do address settings. Each entry the broker takes is applied
+//! to the configuration it exports as well (see
+//! [`crate::configuration::apply_property`]). Saranga supports the collections
 //! `addressSettings`, `securityRoles`, `addressConfigurations`,
 //! `acceptorConfigurations`, `divertConfigurations`, `bridgeConfigurations`,
 //! `clusterConfigurations`
@@ -24,6 +27,7 @@ use crate::broker::{
     AddressConfig, BrokerConfig, DivertConfig, DivertRoutingType, JaasModuleConfig, QueueConfig,
     Warning,
 };
+use crate::configuration::Configuration;
 use crate::security::{CheckType, Role, SecuritySetting};
 use crate::{ConfigError, Result, RoutingType, mask};
 use saranga_buffer::json::Json;
@@ -41,6 +45,7 @@ pub const DEFAULT_SYSTEM_PROPERTY_PREFIX: &str = "brokerconfig.";
 /// query) are applied in name order. YAML files are reported and skipped. A file that cannot be read is an error, as it is in Artemis.
 pub fn apply_sources(
     config: &mut BrokerConfig,
+    mut export: Option<&mut Configuration>,
     sources: &str,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Vec<Warning>> {
@@ -68,10 +73,15 @@ pub fn apply_sources(
             names.sort();
             for name in names {
                 let file = Path::new(path).join(&name);
-                warnings.extend(apply_file(config, &file, lookup)?);
+                warnings.extend(apply_file(config, export.as_deref_mut(), &file, lookup)?);
             }
         } else {
-            warnings.extend(apply_file(config, Path::new(path), lookup)?);
+            warnings.extend(apply_file(
+                config,
+                export.as_deref_mut(),
+                Path::new(path),
+                lookup,
+            )?);
         }
     }
     Ok(warnings)
@@ -81,6 +91,7 @@ pub fn apply_sources(
 /// file name.
 pub fn apply_file(
     config: &mut BrokerConfig,
+    export: Option<&mut Configuration>,
     file: &Path,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Vec<Warning>> {
@@ -104,6 +115,7 @@ pub fn apply_file(
     match entries {
         Ok(entries) => Ok(apply_counted(
             config,
+            export,
             &name,
             &entries,
             Adler32::of(&bytes),
@@ -175,6 +187,7 @@ fn json_object(
 /// without it.
 pub fn apply_system(
     config: &mut BrokerConfig,
+    export: Option<&mut Configuration>,
     system: &[(String, String)],
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<Warning> {
@@ -183,18 +196,25 @@ pub fn apply_system(
         .iter()
         .filter_map(|(k, v)| Some((k.strip_prefix(&prefix)?.to_owned(), v.clone())))
         .collect();
-    apply(config, &format!("system-{prefix}"), &entries, lookup)
+    apply(
+        config,
+        export,
+        &format!("system-{prefix}"),
+        &entries,
+        lookup,
+    )
 }
 
 /// Applies `entries` (in file order) to `config`. `source` names them in
 /// warnings; `lookup` resolves `${...}` in keys and values.
 pub fn apply(
     config: &mut BrokerConfig,
+    export: Option<&mut Configuration>,
     source: &str,
     entries: &[(String, String)],
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<Warning> {
-    apply_counted(config, source, entries, 0, lookup)
+    apply_counted(config, export, source, entries, 0, lookup)
 }
 
 /// [`apply`], recording in the configuration's status the checksum of the
@@ -203,6 +223,7 @@ pub fn apply(
 /// (`updateApplyStatus`).
 fn apply_counted(
     config: &mut BrokerConfig,
+    export: Option<&mut Configuration>,
     source: &str,
     entries: &[(String, String)],
     file_adler32: u32,
@@ -221,7 +242,7 @@ fn apply_counted(
         return Vec::new();
     }
     let mut errors = Vec::new();
-    let warnings = apply_entries(config, source, entries, lookup, &mut errors);
+    let warnings = apply_entries(config, export, source, entries, lookup, &mut errors);
     apply_status(config, source, &errors);
     warnings
 }
@@ -247,6 +268,7 @@ fn apply_status(config: &mut BrokerConfig, source: &str, errors: &[(String, Stri
 
 fn apply_entries(
     config: &mut BrokerConfig,
+    mut export: Option<&mut Configuration>,
     source: &str,
     entries: &[(String, String)],
     lookup: &dyn Fn(&str) -> Option<String>,
@@ -276,9 +298,20 @@ fn apply_entries(
         }
         let path = split_key(&key, &surround);
         let p: Vec<&str> = path.iter().map(String::as_str).collect();
-        if let Err(reason) = apply_one(config, &p, &value, value == remove) {
-            errors.push((format!("{key}={value}"), reason.clone()));
-            warnings.push(problem(source, &key, reason));
+        match apply_one(config, &p, &value, value == remove) {
+            // What the broker took, the configuration it exports holds.
+            Ok(()) => {
+                if let Some(export) = export.as_deref_mut()
+                    && let Err(reason) =
+                        crate::configuration::apply_property(export, &p, &value, value == remove)
+                {
+                    tracing::debug!("{source}: {key} is not exported: {reason}");
+                }
+            }
+            Err(reason) => {
+                errors.push((format!("{key}={value}"), reason.clone()));
+                warnings.push(problem(source, &key, reason));
+            }
         }
     }
     warnings
@@ -360,12 +393,22 @@ fn apply_one(
 ) -> std::result::Result<(), String> {
     match path {
         [] => Err("empty key".into()),
-        [scalar] => match crate::parser::apply_scalar(config, &kebab(scalar), value) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(format!(
-                "{scalar} is not a configuration property Saranga knows"
-            )),
-            Err(e) => Err(err_text(e)),
+        // A top-level property by its bean name (`IDCacheSize`), which a
+        // property no element sets the same way is, or by its element's
+        // name in camel case (`idCacheSize`).
+        [scalar] => match crate::configuration::scalar_element(scalar) {
+            Some(None) => Ok(()),
+            element => match crate::parser::apply_scalar(
+                config,
+                &element.flatten().unwrap_or_else(|| kebab(scalar)),
+                value,
+            ) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(format!(
+                    "{scalar} is not a configuration property Saranga knows"
+                )),
+                Err(e) => Err(err_text(e)),
+            },
         },
         ["addressSettings", m] if remove => {
             config.address_settings.retain(|(k, _)| k != m);
@@ -793,7 +836,7 @@ mod tests {
     }
 
     fn apply_str(config: &mut BrokerConfig, s: &str) -> Vec<Warning> {
-        apply(config, "broker.properties", &props(s), &|n| {
+        apply(config, None, "broker.properties", &props(s), &|n| {
             (n == "PORT").then(|| "61699".to_owned())
         })
     }
@@ -814,9 +857,11 @@ mod tests {
         .unwrap();
         let d = dir.display().to_string().replace('\\', "/");
         let mut c = BrokerConfig::default();
-        apply_sources(&mut c, &format!("{d}/"), &|_| None).unwrap();
-        apply_system(&mut c, &[], &|_| None);
-        apply(&mut c, "x.properties", &props("nonsense=1"), &|_| None);
+        apply_sources(&mut c, None, &format!("{d}/"), &|_| None).unwrap();
+        apply_system(&mut c, None, &[], &|_| None);
+        apply(&mut c, None, "x.properties", &props("nonsense=1"), &|_| {
+            None
+        });
         // As Artemis 2.57.0 reports them for these files.
         let expected = concat!(
             r#"{"properties":{"#,
@@ -871,20 +916,24 @@ mod tests {
         write("d/x.txt", "name=txt\n");
         let d = dir.display().to_string().replace('\\', "/");
         let mut c = BrokerConfig::default();
-        let w = apply_sources(&mut c, &format!("{d}/a.properties,{d}/d/"), &|_| None).unwrap();
+        let w =
+            apply_sources(&mut c, None, &format!("{d}/a.properties,{d}/d/"), &|_| None).unwrap();
         assert!(w.is_empty(), "{w:?}");
         assert_eq!((c.name.as_str(), c.id_cache_size), ("two", 7));
         assert_eq!(c.global_max_size, Some(1024 * 1024));
-        let w = apply_sources(&mut c, &format!("{d}/d/?filter=.*\\.txt"), &|_| None).unwrap();
+        let w = apply_sources(&mut c, None, &format!("{d}/d/?filter=.*\\.txt"), &|_| None).unwrap();
         assert!(w.is_empty() && c.name == "txt");
-        assert!(apply_sources(&mut c, &format!("{d}/missing.properties"), &|_| None).is_err());
+        assert!(
+            apply_sources(&mut c, None, &format!("{d}/missing.properties"), &|_| None).is_err()
+        );
 
         write(
             "b.json",
             r#"{"name": "json", "idCacheSize": 9, "addressSettings": {"orders.#": {"maxDeliveryAttempts": 3}}}"#,
         );
         write("bad.json", "{\"name\": ");
-        let w = apply_sources(&mut c, &format!("{d}/b.json,{d}/bad.json"), &|_| None).unwrap();
+        let w =
+            apply_sources(&mut c, None, &format!("{d}/b.json,{d}/bad.json"), &|_| None).unwrap();
         assert_eq!(w.len(), 1, "{w:?}");
         assert_eq!((c.name.as_str(), c.id_cache_size), ("json", 9));
         assert!(c.address_settings.iter().any(|(m, _)| m == "orders.#"));
@@ -893,7 +942,7 @@ mod tests {
             ("brokerconfig.name".to_owned(), "sys".to_owned()),
             ("other".to_owned(), "x".to_owned()),
         ];
-        assert!(apply_system(&mut c, &system, &|_| None).is_empty());
+        assert!(apply_system(&mut c, None, &system, &|_| None).is_empty());
         assert_eq!(c.name, "sys");
         std::fs::remove_dir_all(dir).ok();
     }

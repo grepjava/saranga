@@ -186,7 +186,7 @@ fn number<T: std::str::FromStr + Default>(v: Option<&str>) -> T {
 
 /// BeanUtils' `BooleanConverter` with its default: anything it does not
 /// know is false.
-fn boolean(v: Option<&str>) -> bool {
+pub(crate) fn boolean(v: Option<&str>) -> bool {
     let v = v.unwrap_or_default().trim().to_ascii_lowercase();
     matches!(v.as_str(), "true" | "yes" | "y" | "on" | "1")
 }

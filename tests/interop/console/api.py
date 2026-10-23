@@ -466,9 +466,20 @@ status, body, _ = v.request("POST", "/configuration/export", headers=MARK)
 check("viewer may not export the configuration", status == 403, (status, body))
 status, body, _ = c.request("POST", "/configuration/export", headers=MARK)
 text = (body or {}).get("text") or ""
+# In java.io.tmpdir: the instance's tmp as bin/artemis sets it, Java's own
+# on Windows, where artemis.cmd does not.
+# Windows' GetTempPath, which Java takes: TMP, else TEMP (not TMPDIR, which
+# Python's tempfile looks at first).
+tmpdir = (os.environ.get("TMP") or os.environ.get("TEMP") or "") if os.name == "nt" else "/tmp"
+exported_file = (body or {}).get("file", "").replace("\\", "/").lower()
 check("admin exports the configuration as broker properties",
-      status == 200 and body.get("file", "").replace("\\", "/").endswith("/tmp/broker_config_as_properties.txt")
+      status == 200 and exported_file.endswith("/broker_config_as_properties.txt")
+      and (os.name != "nt" or exported_file.startswith(tmpdir.replace("\\", "/").lower()))
+      and (os.name == "nt" or exported_file.endswith("/tmp/broker_config_as_properties.txt"))
       and re.search(r"^name=", text, re.M) and "addressSettings." in text, (status, body and body.get("file")))
+check("with the broker properties the broker started with",
+      'addressSettings."console.properties.#".maxDeliveryAttempts=7' in text.splitlines(),
+      [l for l in text.splitlines() if "console.properties" in l][:3])
 check("its passwords are redacted", "secret" not in text, [l for l in text.splitlines() if "secret" in l])
 
 create = "createQueue(java.lang.String,boolean)"

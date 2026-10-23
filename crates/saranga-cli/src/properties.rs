@@ -53,11 +53,12 @@ pub fn run(
 }
 
 /// `ActiveMQServerControl.exportConfigAsProperties` of a running broker:
-/// its configuration read again from its file, written as
+/// the configuration it runs on (as it read it at start, broker
+/// properties applied, with what each reload replaced), written as
 /// `broker_config_as_properties.txt` in `java.io.tmpdir`, which `artemis
 /// run` sets to the instance's `tmp`.
 pub fn export_running(instance: &crate::instance::Instance) -> anyhow::Result<PathBuf> {
-    let config = read_instance(instance, None)?;
+    let config = instance.running_configuration()?;
     let ctx = ExportContext {
         max_memory: saranga_server::jvm::max_memory(),
         broker_instance: java_file(&instance.dir),
@@ -112,16 +113,7 @@ fn read_instance(
     let url = match broker {
         Some(b) if b.starts_with("file:") => b,
         Some(b) => format!("file:{b}"),
-        None => instance
-            .bootstrap
-            .as_ref()
-            .and_then(|b| b.server_configuration.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "file:{}",
-                    instance.broker_xml.display().to_string().replace('\\', "/")
-                )
-            }),
+        None => instance.configuration_url(),
     };
     let path = saranga_config::file_uri_path(&url)
         .unwrap_or_else(|| PathBuf::from(url.trim_start_matches("file:")));

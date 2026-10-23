@@ -232,3 +232,68 @@ fn a_connection_expiry_plugin_as_the_manual_configures_it() {
         }
     }
 }
+
+/// `<case>.xml` read, `<case>.broker.properties` applied as the broker
+/// applies them at start (to its own configuration, and what it takes to
+/// the configuration it exports), then exported: `<case>.properties` is
+/// what Artemis 2.57's `exportAsProperties` wrote for the same files
+/// (`ExportWithProperties.java`).
+fn export_with_properties(case: &str) -> (String, String) {
+    let dir = golden_dir();
+    let xml = std::fs::read_to_string(dir.join(format!("{case}.xml"))).unwrap();
+    let expected = std::fs::read_to_string(dir.join(format!("{case}.properties")))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let expected = platform_ping_defaults(expected);
+    let url = line_value(&expected, "configurationUrl");
+    let mut config = read_configuration(
+        &xml,
+        |_| None,
+        Validation::Deploy { jms: true },
+        url.as_deref(),
+    )
+    .unwrap();
+    let mut broker = saranga_config::BrokerConfig::parse_with(&xml, |_| None).unwrap();
+    let sources = dir.join(format!("{case}.broker.properties"));
+    let warnings = saranga_config::broker_properties::apply_sources(
+        &mut broker,
+        Some(&mut config),
+        &sources.display().to_string().replace('\\', "/"),
+        &|_| None,
+    )
+    .unwrap();
+    assert!(warnings.is_empty(), "{case}: {warnings:?}");
+    let ctx = ExportContext {
+        max_memory: 1 << 30,
+        broker_instance: line_value(&expected, "brokerInstance").unwrap_or_default(),
+        uuid: || "not-used".to_owned(),
+        identity: |class| format!("{class}@0"),
+    };
+    let (text, failed) = export_as_properties(&config, &ctx);
+    assert_eq!(failed, None, "{case}");
+    if let Ok(dir) = std::env::var("SARANGA_EXPORT_OUT") {
+        std::fs::write(Path::new(&dir).join(format!("{case}.properties")), &text).unwrap();
+    }
+    (expected, text.replace("\r\n", "\n"))
+}
+
+#[test]
+fn broker_properties_over_top_level_settings() {
+    let (expected, actual) = export_with_properties("bp-scalars");
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn broker_properties_over_collections() {
+    let (expected, actual) = export_with_properties("bp-collections");
+    assert_eq!(actual, expected);
+}
+
+/// Acceptors broker properties make go into the set by the hash they have
+/// when BeanUtils adds them: named, and their factory set when that is the
+/// first of their properties, but before a parameter is.
+#[test]
+fn acceptors_broker_properties_make_are_walked_as_java_adds_them() {
+    let (expected, actual) = export_with_properties("bp-acceptors");
+    assert_eq!(actual, expected);
+}

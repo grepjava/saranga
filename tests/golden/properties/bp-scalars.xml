@@ -1,0 +1,9 @@
+<?xml version='1.0'?>
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+   <core xmlns="urn:activemq:core">
+      <name>from-xml</name>
+      <journal-type>NIO</journal-type>
+      <id-cache-size>100</id-cache-size>
+      <global-max-size>100M</global-max-size>
+   </core>
+</configuration>

@@ -623,9 +623,15 @@ impl Parser {
         if let Some(v) = s.i64("critical-analyzer-timeout", Check::GeZero)? {
             config.critical_analyzer_timeout = v;
         }
-        if let Some(v) = s.i64("critical-analyzer-check-period", Check::GeZero)? {
-            config.critical_analyzer_check_period = v;
-        }
+        // The default is what `getCriticalAnalyzerCheckPeriod` gives now:
+        // half the timeout, kept however the timeout changes after.
+        config.critical_analyzer_check_period = s
+            .i64("critical-analyzer-check-period", Check::GeZero)?
+            .unwrap_or(if config.critical_analyzer_check_period <= 0 {
+                config.critical_analyzer_timeout / 2
+            } else {
+                config.critical_analyzer_check_period
+            });
         let policy = non_empty(
             &s,
             "critical-analyzer-policy",

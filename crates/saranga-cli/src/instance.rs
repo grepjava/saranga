@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
+use saranga_config::configuration::Configuration;
 use saranga_config::{
     BootstrapConfig, BootstrapSecurity, BrokerConfig, ConfigError, DecodeError, Validation,
     broker_properties,
@@ -102,6 +103,10 @@ pub struct Instance {
     /// Whether `etc/broker.properties` existed when first looked for: `run`
     /// decides it once, as it starts.
     etc_properties: std::sync::OnceLock<bool>,
+    /// The configuration `exportConfigAsProperties` exports: as the broker
+    /// read it at start, broker properties applied, with what each reload
+    /// replaced; or why it could not be read.
+    running: std::sync::Mutex<Option<Result<Configuration, String>>>,
 }
 
 impl Instance {
@@ -184,7 +189,14 @@ impl Instance {
         properties.insert("artemis.instance.etc", slash(&etc));
         properties.insert("artemis.URI.instance", uri_path(&dir));
         properties.insert("data.dir", slash(&dir.join("data")));
-        properties.insert("java.io.tmpdir", slash(&dir.join("tmp")));
+        // bin/artemis sets it to the instance's tmp; artemis.cmd leaves
+        // Java's, the user's temporary directory.
+        let tmp = if cfg!(windows) {
+            std::env::temp_dir()
+        } else {
+            dir.join("tmp")
+        };
+        properties.insert("java.io.tmpdir", slash(&tmp));
         properties.insert(
             "java.security.auth.login.config",
             slash(&etc.join("login.config")),
@@ -198,6 +210,7 @@ impl Instance {
             system: options.system,
             broker_properties: options.broker_properties,
             etc_properties: std::sync::OnceLock::new(),
+            running: std::sync::Mutex::new(None),
         }
     }
 
@@ -339,6 +352,80 @@ impl Instance {
     /// says: deployed by the broker or a tool (`FileDeploymentManager`), or
     /// read again by a reload, which only logs what is not valid.
     pub fn broker_config_validated(&self, validation: Validation) -> anyhow::Result<BrokerConfig> {
+        self.read_broker_config(validation, None)
+    }
+
+    /// [`broker_config_validated`](Self::broker_config_validated) for the
+    /// broker that runs on it, as it starts or reloads: the configuration
+    /// it exports is read too, the same broker properties applied, and
+    /// kept for [`running_configuration`](Self::running_configuration),
+    /// a reload replacing what Artemis's replaces.
+    pub fn broker_config_running(&self, validation: Validation) -> anyhow::Result<BrokerConfig> {
+        let xml = self.broker_xml_text()?;
+        // Silent: the broker's own read logs what the file holds.
+        let read =
+            tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::new(), || {
+                saranga_config::configuration::read_configuration(
+                    &xml,
+                    |n| self.lookup(n),
+                    validation,
+                    Some(&self.configuration_url()),
+                )
+            });
+        let (config, exported) = match read {
+            Ok(mut exported) => {
+                let config = self.read_broker_config(validation, Some(&mut exported))?;
+                (config, Ok(exported))
+            }
+            Err(e) => (
+                self.read_broker_config(validation, None)?,
+                Err(e.to_string()),
+            ),
+        };
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        match (running.as_mut(), exported) {
+            (Some(Ok(kept)), Ok(read)) if validation == Validation::Reload => {
+                kept.update_reloadable_from(read)
+            }
+            (_, exported) => *running = Some(exported),
+        }
+        Ok(config)
+    }
+
+    /// The configuration the running broker exports: as it was read at
+    /// start, with what each reload replaced.
+    pub fn running_configuration(&self) -> anyhow::Result<Configuration> {
+        match self
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            Some(Ok(c)) => Ok(c),
+            Some(Err(e)) => Err(anyhow::anyhow!(e)),
+            None => bail!("the broker's configuration was not read"),
+        }
+    }
+
+    /// The URL the broker's configuration is read from: bootstrap.xml's
+    /// `<server configuration>`, else `broker.xml`'s as a `file:` URL.
+    pub fn configuration_url(&self) -> String {
+        self.bootstrap
+            .as_ref()
+            .and_then(|b| b.server_configuration.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "file:{}",
+                    self.broker_xml.display().to_string().replace('\\', "/")
+                )
+            })
+    }
+
+    fn read_broker_config(
+        &self,
+        validation: Validation,
+        mut export: Option<&mut Configuration>,
+    ) -> anyhow::Result<BrokerConfig> {
         let path = &self.broker_xml;
         let xml = self.broker_xml_text()?;
         let mut config = BrokerConfig::parse_validated(&xml, |n| self.lookup(n), validation)
@@ -350,12 +437,18 @@ impl Instance {
         let mut warnings = Vec::new();
         if let Some(sources) = self.broker_properties_sources() {
             warnings.extend(
-                broker_properties::apply_sources(&mut config, &sources, &lookup)
-                    .with_context(|| format!("reading broker properties {sources}"))?,
+                broker_properties::apply_sources(
+                    &mut config,
+                    export.as_deref_mut(),
+                    &sources,
+                    &lookup,
+                )
+                .with_context(|| format!("reading broker properties {sources}"))?,
             );
         }
         warnings.extend(broker_properties::apply_system(
             &mut config,
+            export,
             &self.system,
             &lookup,
         ));
@@ -602,4 +695,74 @@ fn uri_path(p: &Path) -> String {
         format!("/{s}")
     };
     s.replace(' ', "%20")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn broker_xml(name: &str, max_delivery_attempts: u32) -> String {
+        format!(
+            r#"<?xml version='1.0'?>
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
+   <core xmlns="urn:activemq:core">
+      <name>{name}</name>
+      <journal-type>NIO</journal-type>
+      <address-settings>
+         <address-setting match="orders.#">
+            <max-delivery-attempts>{max_delivery_attempts}</max-delivery-attempts>
+         </address-setting>
+      </address-settings>
+   </core>
+</configuration>
+"#
+        )
+    }
+
+    /// The configuration exported is the broker's at start, broker
+    /// properties applied; a reload replaces what Artemis's replaces (the
+    /// address settings) and leaves the rest (the name) as it started.
+    #[test]
+    fn the_running_configuration_is_kept_from_start_and_reloads() {
+        let dir = std::env::temp_dir().join(format!("saranga-running-{}", std::process::id()));
+        let etc = dir.join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(etc.join("broker.xml"), broker_xml("started", 5)).unwrap();
+        std::fs::write(
+            etc.join("broker.properties"),
+            "IDCacheSize=7\naddressSettings.\"new.#\".maxDeliveryAttempts=2\n",
+        )
+        .unwrap();
+        let instance = Instance::from_etc(&etc, Options::default()).unwrap();
+        assert!(instance.running_configuration().is_err());
+
+        let config = instance
+            .broker_config_running(Validation::Deploy { jms: true })
+            .unwrap();
+        assert_eq!(config.id_cache_size, 7);
+        let running = instance.running_configuration().unwrap();
+        assert_eq!(
+            (running.name.as_str(), running.id_cache_size),
+            ("started", 7)
+        );
+        assert!(running.address_settings.contains_key("new.#"));
+        assert!(
+            running
+                .configuration_url
+                .unwrap()
+                .ends_with("/etc/broker.xml")
+        );
+
+        // Changed, not yet reloaded: exported as the broker read it.
+        std::fs::write(etc.join("broker.xml"), broker_xml("reloaded", 9)).unwrap();
+        assert_eq!(instance.running_configuration().unwrap().name, "started");
+
+        instance.broker_config_running(Validation::Reload).unwrap();
+        let running = instance.running_configuration().unwrap();
+        assert_eq!(running.name, "started");
+        let orders = running.address_settings.get("orders.#").unwrap();
+        assert_eq!(orders.max_delivery_attempts, Some(9));
+        assert!(running.address_settings.contains_key("new.#"));
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

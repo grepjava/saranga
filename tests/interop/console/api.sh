@@ -45,6 +45,8 @@ start() {
 "$SARANGA" create "$(native "$I")" --silent --no-autotune --user admin --password secret \
   --require-login --port-offset $OFFSET > /dev/null 2>&1 || { echo "create failed"; exit 1; }
 cp "$ROOT/tests/interop/console/management.xml" "$I/etc/management.xml"
+# Broker properties, which the configuration exported holds.
+echo 'addressSettings."console.properties.#".maxDeliveryAttempts=7' > "$I/etc/broker.properties"
 for p in "$I/etc/artemis.profile" "$I/etc/artemis.profile.cmd"; do
   [[ -f "$p" ]] && sed -i -E -e "s/^HAWTIO_ROLES=.*/HAWTIO_ROLES='amq,view'/" \
     -e "s/-Dhawtio.roles=amq /-Dhawtio.roles=amq,view /" "$p"
