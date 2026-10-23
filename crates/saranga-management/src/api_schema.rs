@@ -568,6 +568,113 @@ fn schemas() -> Json {
             ("last", integer()),
         ]),
     );
+    s.put(
+        "AddressSettingsMatch",
+        object(&[
+            ("match", string()),
+            ("settings", map_of(any())),
+            ("added", boolean()),
+        ]),
+    );
+    s.put(
+        "AddressSettingName",
+        object_with_optional(
+            &[
+                ("name", string()),
+                (
+                    "type",
+                    enumeration(&["string", "integer", "number", "boolean"]),
+                ),
+            ],
+            &[("choices", array(string()))],
+        ),
+    );
+    s.put(
+        "AddressSettings",
+        object_with_optional(
+            &[
+                ("matches", array(schema_ref("AddressSettingsMatch"))),
+                ("names", array(schema_ref("AddressSettingName"))),
+            ],
+            &[
+                ("address", string()),
+                ("applying", array(string())),
+                ("effective", map_of(any())),
+                ("from", map_of(string())),
+            ],
+        ),
+    );
+    s.put(
+        "Role",
+        object(&[
+            ("name", string()),
+            ("send", boolean()),
+            ("consume", boolean()),
+            ("createDurableQueue", boolean()),
+            ("deleteDurableQueue", boolean()),
+            ("createNonDurableQueue", boolean()),
+            ("deleteNonDurableQueue", boolean()),
+            ("manage", boolean()),
+            ("browse", boolean()),
+            ("createAddress", boolean()),
+            ("deleteAddress", boolean()),
+            ("view", boolean()),
+            ("edit", boolean()),
+        ]),
+    );
+    s.put(
+        "SecuritySettingsMatch",
+        object(&[("match", string()), ("roles", array(schema_ref("Role")))]),
+    );
+    s.put(
+        "SecuritySettings",
+        object_with_optional(
+            &[
+                ("enabled", boolean()),
+                ("matches", array(schema_ref("SecuritySettingsMatch"))),
+            ],
+            &[("address", string()), ("applying", maybe_string())],
+        ),
+    );
+    s.put(
+        "MessageProperty",
+        object(&[
+            ("name", string()),
+            (
+                "type",
+                enumeration(&[
+                    "null", "boolean", "byte", "short", "int", "long", "float", "double", "char",
+                    "bytes", "string",
+                ]),
+            ),
+            ("value", any()),
+        ]),
+    );
+    s.put(
+        "ExportedMessage",
+        object_with_optional(
+            &[
+                ("messageID", string()),
+                ("address", maybe_string()),
+                ("type", integer()),
+                ("durable", boolean()),
+                ("priority", integer()),
+                ("timestamp", integer()),
+                ("expiration", integer()),
+                ("userID", maybe_string()),
+                ("properties", array(schema_ref("MessageProperty"))),
+            ],
+            &[("text", string()), ("body", string())],
+        ),
+    );
+    s.put(
+        "Imported",
+        object_with_optional(&[("sent", integer())], &[("error", string())]),
+    );
+    s.put(
+        "ExportedConfiguration",
+        object_with_optional(&[("text", maybe_string())], &[("file", string())]),
+    );
     s
 }
 
@@ -884,6 +991,101 @@ fn paths() -> Json {
             ),
         ),
     );
+    let address = param(
+        "address",
+        "query",
+        string(),
+        false,
+        "An address, whose settings are given with the match each comes from",
+    );
+    paths.put(
+        &p("/address-settings"),
+        obj().with(
+            "get",
+            operation(
+                "addressSettings",
+                "This broker's address-settings matches, and those that apply to an address",
+                vec![address.clone()],
+                responses(Some((200, schema_ref("AddressSettings"))), &[400, 401, 403]),
+            ),
+        ),
+    );
+    paths.put(
+        &p("/security-settings"),
+        obj().with(
+            "get",
+            operation(
+                "securitySettings",
+                "This broker's security-settings matches, and the one that applies to an address",
+                vec![address],
+                responses(
+                    Some((200, schema_ref("SecuritySettings"))),
+                    &[400, 401, 403],
+                ),
+            ),
+        ),
+    );
+    paths.put(
+        &p("/configuration/export"),
+        obj().with(
+            "post",
+            operation(
+                "exportConfiguration",
+                "exportConfigAsProperties, then the file it wrote (another node's stays there)",
+                vec![mark()],
+                responses(
+                    Some((200, schema_ref("ExportedConfiguration"))),
+                    &[400, 401, 403],
+                ),
+            ),
+        ),
+    );
+    paths.put(
+        &p("/queues/{name}/export"),
+        obj().with(
+            "get",
+            operation(
+                "exportMessages",
+                "A queue's messages, whole, with every property's type",
+                vec![
+                    path_param("name"),
+                    param(
+                        "filter",
+                        "query",
+                        string(),
+                        false,
+                        "A filter selecting the messages",
+                    ),
+                    param(
+                        "max",
+                        "query",
+                        integer(),
+                        false,
+                        "How many at most, 10,000 at most",
+                    ),
+                ],
+                responses(
+                    Some((200, array(schema_ref("ExportedMessage")))),
+                    &[400, 401, 403, 404],
+                ),
+            ),
+        ),
+    );
+    paths.put(
+        &p("/queues/{name}/import"),
+        obj().with(
+            "post",
+            with_body(
+                operation(
+                    "importMessages",
+                    "Messages, as the export writes them, sent to a queue in order as the user",
+                    vec![path_param("name"), mark()],
+                    responses(Some((200, schema_ref("Imported"))), &[400, 401, 403, 404]),
+                ),
+                array(schema_ref("ExportedMessage")),
+            ),
+        ),
+    );
     paths.put(
         &p("/notifications"),
         obj().with(
@@ -910,7 +1112,7 @@ pub fn document() -> Json {
                 .with("version", VERSION)
                 .with(
                     "description",
-                    "Every path but /session, /views, /nodes, /events, /history, /notifications and /openapi.json is served for another node too, at /saranga/api/v1/nodes/{node}/... (a node ID from GET /nodes; local is this broker): it is sent to that node as management messages, as the user, and that node allows or refuses it. At /saranga/api/v1/nodes/all/... the listings span every node.",
+                    "Every path but /session, /views, /nodes, /events, /history, /notifications, /address-settings, /security-settings and /openapi.json is served for another node too, at /saranga/api/v1/nodes/{node}/... (a node ID from GET /nodes; local is this broker): it is sent to that node as management messages, as the user, and that node allows or refuses it. At /saranga/api/v1/nodes/all/... the listings span every node.",
                 ),
         )
         .with("paths", paths())
@@ -962,7 +1164,7 @@ mod tests {
         }
         // Seven of the session, the user and the nodes, six listings, three
         // closes, five of the resources, four of the live data.
-        assert_eq!(ids.len(), 25);
+        assert_eq!(ids.len(), 30);
     }
 
     #[test]

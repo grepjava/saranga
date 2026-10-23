@@ -109,3 +109,21 @@ test("another node's events are this broker's, and the page says so", async ({ p
 	await page.getByRole('link', { name: 'Events' }).click();
 	await expect(page.getByText(/These are the notifications of node1/)).toBeVisible();
 });
+
+test("another node's configuration and security, asked of it", async ({ page }) => {
+	await login(page, 'admin', 'admin');
+	await pick(page, 'node3');
+	await page.getByRole('link', { name: 'Configuration' }).click();
+	await expect(
+		page.getByText('The matches are listed for the broker you are logged in to.')
+	).toBeVisible();
+	await page.getByRole('textbox', { name: 'Address', exact: true }).fill('only.node3');
+	await page.getByRole('button', { name: 'Show' }).click();
+	await expect(page.getByRole('row', { name: /^maxSizeBytes / })).toBeVisible();
+
+	await page.getByRole('link', { name: 'Security' }).click();
+	await page.getByRole('tab', { name: 'Check permissions' }).click();
+	await page.getByRole('textbox', { name: 'Address', exact: true }).fill('only.node3');
+	await page.getByRole('button', { name: 'Check' }).click();
+	await expect(page.getByRole('row', { name: /^Send / })).toBeVisible();
+});

@@ -217,6 +217,29 @@ impl SecurityStore {
         self.invalidate_authorization_cache();
     }
 
+    /// Every security setting's match with its roles.
+    pub fn entries(&self) -> Vec<(String, Vec<Role>)> {
+        self.repository
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries()
+            .into_iter()
+            .map(|(m, s)| (m, s.roles.clone()))
+            .collect()
+    }
+
+    /// The match whose roles apply to `address` ([`Self::roles`]), if one
+    /// does.
+    pub fn matching(&self, address: &str) -> Option<String> {
+        self.repository
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .named_matches(address)
+            .into_iter()
+            .next()
+            .map(|(m, _)| m)
+    }
+
     /// `getMatch`: the roles of the most specific setting for `address`.
     pub fn roles(&self, address: &str) -> Vec<Role> {
         self.repository

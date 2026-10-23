@@ -275,3 +275,54 @@ export const live = {
 	notifications: (since = 0) =>
 		call(client.GET('/saranga/api/v1/notifications', { params: { query: { since } } }))
 };
+
+export type AddressSettings = Schemas['AddressSettings'];
+export type SecuritySettings = Schemas['SecuritySettings'];
+export type Role = Schemas['Role'];
+
+/**
+ * What the administration pages read that no operation gives: this broker's
+ * address-settings and security-settings matches, and the configuration
+ * exported as broker properties.
+ */
+export const admin = {
+	addressSettings: (address?: string) =>
+		call(
+			client.GET('/saranga/api/v1/address-settings', {
+				params: { query: { address: address || undefined } }
+			})
+		),
+
+	securitySettings: (address?: string) =>
+		call(
+			client.GET('/saranga/api/v1/security-settings', {
+				params: { query: { address: address || undefined } }
+			})
+		),
+
+	/** exportConfigAsProperties, and the file it wrote: none from another node. */
+	exportConfiguration: () =>
+		call(client.POST('/saranga/api/v1/configuration/export', { params: { header: mark } })),
+
+	/**
+	 * A queue's messages, whole, as JSON text: kept as text, since a long
+	 * property is a number JavaScript cannot hold.
+	 */
+	exportMessages: (queue: string, filter?: string, max?: number) =>
+		call(
+			client.GET('/saranga/api/v1/queues/{name}/export', {
+				params: { path: { name: queue }, query: { filter: filter || undefined, max } },
+				parseAs: 'text'
+			})
+		) as Promise<string>,
+
+	/** Messages as the export writes them, sent to a queue in order: the text as it is. */
+	importMessages: (queue: string, text: string) =>
+		call(
+			client.POST('/saranga/api/v1/queues/{name}/import', {
+				params: { path: { name: queue }, header: mark },
+				body: text as unknown as Schemas['ExportedMessage'][],
+				bodySerializer: (b) => b as unknown as string
+			})
+		)
+};

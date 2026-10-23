@@ -1738,6 +1738,10 @@ fn announce(instance: Option<&Arc<instance::Instance>>, started: &Started) {
         broker.set_config_loader(Arc::new(move || {
             read_reload(&loader, reload_period, with_acceptors).map_err(|e| format!("{e:#}"))
         }));
+        let exported = instance.clone();
+        broker.set_config_exporter(Arc::new(move || {
+            properties::export_running(&exported).map_err(|e| format!("{e:#}"))
+        }));
     }
 }
 

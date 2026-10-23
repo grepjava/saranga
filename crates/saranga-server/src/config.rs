@@ -95,6 +95,29 @@ impl SettingsRepository for ConfiguredSettings {
         state.cache.clear();
         true
     }
+
+    fn entries(&self) -> Vec<(String, cfg::AddressSettings, bool)> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .repository
+            .entries()
+            .into_iter()
+            .map(|(m, s)| {
+                let added = state.added.iter().any(|(k, _)| *k == m);
+                (m, s.clone(), added)
+            })
+            .collect()
+    }
+
+    fn matching(&self, address: &str) -> Vec<(String, cfg::AddressSettings)> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .repository
+            .named_matches(address)
+            .into_iter()
+            .map(|(m, s)| (m, s.clone()))
+            .collect()
+    }
 }
 
 fn routing_type(t: cfg::RoutingType) -> RoutingType {

@@ -184,6 +184,7 @@ impl Instance {
         properties.insert("artemis.instance.etc", slash(&etc));
         properties.insert("artemis.URI.instance", uri_path(&dir));
         properties.insert("data.dir", slash(&dir.join("data")));
+        properties.insert("java.io.tmpdir", slash(&dir.join("tmp")));
         properties.insert(
             "java.security.auth.login.config",
             slash(&etc.join("login.config")),

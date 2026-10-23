@@ -427,3 +427,29 @@ fn specificity_comparator() {
     assert_eq!(cmp("a.*.c", "*.b.c"), Less);
     assert_eq!(cmp("a.b", "a.b"), Equal);
 }
+
+#[test]
+fn entries_and_named_matches_name_each_match_as_added() {
+    let mut r: HierarchicalRepository<Plain> = repo().with_literal_markers('(', ')');
+    r.add_match("#", Plain("root")).unwrap();
+    r.add_match("a.*", Plain("a-star")).unwrap();
+    r.add_match("a.b", Plain("ab")).unwrap();
+    r.add_match("(a.#)", Plain("literal")).unwrap();
+    let names: Vec<String> = r.entries().into_iter().map(|(m, _)| m).collect();
+    assert_eq!(names, ["#", "a.*", "a.b", "(a.#)"]);
+    let ab: Vec<(String, &str)> = r
+        .named_matches("a.b")
+        .into_iter()
+        .map(|(m, v)| (m, v.0))
+        .collect();
+    assert_eq!(
+        ab,
+        [
+            ("a.b".to_owned(), "ab"),
+            ("a.*".to_owned(), "a-star"),
+            ("#".to_owned(), "root")
+        ]
+    );
+    let literal: Vec<String> = r.named_matches("a.#").into_iter().map(|(m, _)| m).collect();
+    assert_eq!(literal, ["(a.#)", "a.*", "#"]);
+}

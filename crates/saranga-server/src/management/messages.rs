@@ -358,6 +358,44 @@ pub(super) async fn send(
     password: Option<String>,
     create_message_id: bool,
 ) -> Result<String, String> {
+    let mut m = CoreMessage {
+        message_type: kind as u8,
+        durable,
+        timestamp: crate::message::now_millis(),
+        priority: 4,
+        ..Default::default()
+    };
+    for (k, v) in headers {
+        m.properties.insert(
+            SimpleString::from(k.as_str()),
+            PropertyValue::String(SimpleString::from(v.as_str())),
+        );
+    }
+    if let Some(body) = body {
+        if kind as u8 == message_type::TEXT {
+            let mut w = Writer::new();
+            w.nullable_simple_string(Some(&SimpleString::from(body.as_str())));
+            m.body = w.into_vec().into();
+        } else {
+            m.body = base64_decode(&body).ok_or("Invalid base64 body")?.into();
+        }
+    }
+    if create_message_id {
+        m.user_id = Some(*uuid::Uuid::new_v4().as_bytes());
+    }
+    send_as(broker, address, m, user, password).await
+}
+
+/// A message sent to `address` in a session of `user`, or of the call's
+/// own subject when no user and no password are given, with a new ID,
+/// which is returned.
+async fn send_as(
+    broker: &Arc<Broker>,
+    address: &str,
+    mut m: CoreMessage,
+    user: Option<String>,
+    password: Option<String>,
+) -> Result<String, String> {
     let info = Arc::new(saranga_security::ConnectionInfo {
         remote_address: "management".to_owned(),
         certificates: None,
@@ -397,33 +435,8 @@ pub(super) async fn send(
     );
     session.on_management_connection();
     let id = broker.post_office().ids().next();
-    let mut m = CoreMessage {
-        message_id: id,
-        address: Some(SimpleString::from(address)),
-        message_type: kind as u8,
-        durable,
-        timestamp: crate::message::now_millis(),
-        priority: 4,
-        ..Default::default()
-    };
-    for (k, v) in headers {
-        m.properties.insert(
-            SimpleString::from(k.as_str()),
-            PropertyValue::String(SimpleString::from(v.as_str())),
-        );
-    }
-    if let Some(body) = body {
-        if kind as u8 == message_type::TEXT {
-            let mut w = Writer::new();
-            w.nullable_simple_string(Some(&SimpleString::from(body.as_str())));
-            m.body = w.into_vec().into();
-        } else {
-            m.body = base64_decode(&body).ok_or("Invalid base64 body")?.into();
-        }
-    }
-    if create_message_id {
-        m.user_id = Some(*uuid::Uuid::new_v4().as_bytes());
-    }
+    m.message_id = id;
+    m.address = Some(SimpleString::from(address));
     let sent = session.send_with_id(m).await;
     session.close(false).await;
     // The routed message reaches its queues once journaled.
@@ -431,6 +444,55 @@ pub(super) async fn send(
     sent.map_err(|e| e.message)?;
     written.map_err(|e| e.to_string())?;
     Ok(id.to_string())
+}
+
+/// The console's import: each message (as [`super::export`] writes them)
+/// sent to `address` as the call's own subject, in order. Returns how many
+/// were sent, and why the next one was not.
+pub async fn import(
+    broker: &Arc<Broker>,
+    address: &str,
+    messages: Vec<CoreMessage>,
+) -> (usize, Option<String>) {
+    let mut sent = 0;
+    for m in messages {
+        if let Err(e) = send_as(broker, address, m, None, None).await {
+            return (sent, Some(e));
+        }
+        sent += 1;
+    }
+    (sent, None)
+}
+
+/// The console's export of a queue: up to `max` of its messages that
+/// `filter` selects, whole, as [`super::export`] writes them, a large
+/// message's body read from its file.
+pub async fn export(
+    broker: &Broker,
+    queue: &str,
+    filter: Option<String>,
+    max: usize,
+) -> Result<Vec<Json>, String> {
+    let q = broker
+        .post_office()
+        .queue(queue)
+        .ok_or_else(|| format!("AMQ229017: Queue {queue} does not exist"))?;
+    let f = super::queue::filter(broker, filter)?;
+    let mut out = Vec::new();
+    for r in q.browse().await.iter() {
+        if out.len() >= max {
+            break;
+        }
+        if f.as_ref().is_some_and(|f| !f.matches(&*r.message)) {
+            continue;
+        }
+        let mut core = full_core(&r.message).into_owned();
+        if let Some(large) = r.message.large() {
+            core.body = large.read_all().map_err(|e| e.to_string())?.into();
+        }
+        out.push(super::export::message_json(&core));
+    }
+    Ok(out)
 }
 
 /// `Base64.decode` (standard alphabet, padding optional, whitespace

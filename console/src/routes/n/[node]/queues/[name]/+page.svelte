@@ -13,6 +13,7 @@
 	import { Input } from '#lib/components/ui/input/index.js';
 	import { Skeleton } from '#lib/components/ui/skeleton/index.js';
 	import MessageBrowser from '#lib/components/MessageBrowser.svelte';
+	import PendingMessages from '#lib/components/PendingMessages.svelte';
 	import MiniListing from '#lib/components/MiniListing.svelte';
 	import AttributeTable from '#lib/components/AttributeTable.svelte';
 	import SendMessage from '#lib/components/SendMessage.svelte';
@@ -304,11 +305,19 @@
 	<Tabs.Root bind:value={tab}>
 		<Tabs.List>
 			<Tabs.Trigger value="messages">Messages</Tabs.Trigger>
+			<Tabs.Trigger value="scheduled">Scheduled</Tabs.Trigger>
+			<Tabs.Trigger value="delivering">Delivering</Tabs.Trigger>
 			<Tabs.Trigger value="consumers">Consumers</Tabs.Trigger>
 			<Tabs.Trigger value="attributes">Attributes</Tabs.Trigger>
 		</Tabs.List>
 		<Tabs.Content value="messages" class="mt-3">
 			<MessageBrowser queue={name} refresh={tick} onchange={() => tick++} />
+		</Tabs.Content>
+		<Tabs.Content value="scheduled" class="mt-3">
+			<PendingMessages queue={name} kind="scheduled" {tick} onchange={() => tick++} />
+		</Tabs.Content>
+		<Tabs.Content value="delivering" class="mt-3">
+			<PendingMessages queue={name} kind="delivering" {tick} />
 		</Tabs.Content>
 		<Tabs.Content value="consumers" class="mt-3 grid gap-2">
 			<MiniListing

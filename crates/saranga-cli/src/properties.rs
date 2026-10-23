@@ -52,6 +52,35 @@ pub fn run(
     }
 }
 
+/// `ActiveMQServerControl.exportConfigAsProperties` of a running broker:
+/// its configuration read again from its file, written as
+/// `broker_config_as_properties.txt` in `java.io.tmpdir`, which `artemis
+/// run` sets to the instance's `tmp`.
+pub fn export_running(instance: &crate::instance::Instance) -> anyhow::Result<PathBuf> {
+    let config = read_instance(instance, None)?;
+    let ctx = ExportContext {
+        max_memory: saranga_server::jvm::max_memory(),
+        broker_instance: java_file(&instance.dir),
+        uuid: time_uuid,
+        identity: identity_string,
+    };
+    let tmp = instance
+        .lookup("java.io.tmpdir")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("java.io.tmpdir system property must be set"))?;
+    let output = tmp.join(CONFIG_AS_PROPERTIES_FILE);
+    let (text, failed) = export_as_properties(&config, &ctx);
+    std::fs::write(&output, text)
+        .map_err(|e| anyhow::anyhow!(crate::data::dirs::file_not_found(&output, &e)))?;
+    match failed {
+        None => Ok(output),
+        Some(ExportError::Runtime(m) | ExportError::NullPointer(m)) => Err(anyhow::anyhow!(m)),
+    }
+}
+
+/// `ActiveMQServerControlImpl.CONFIG_AS_PROPERTIES_FILE`.
+pub const CONFIG_AS_PROPERTIES_FILE: &str = "broker_config_as_properties.txt";
+
 /// `UUIDGenerator.generateStringUUID`: a time-based UUID.
 fn time_uuid() -> String {
     saranga_client::uuid::to_string(&saranga_client::uuid::time_based())
@@ -72,6 +101,14 @@ fn read(broker: Option<String>, configuration: Option<String>) -> anyhow::Result
         }
         None => crate::instance::Instance::from_etc(&etc, options)?,
     };
+    read_instance(&instance, broker)
+}
+
+/// [`read`] of an instance: `broker`, else its configuration's URL.
+fn read_instance(
+    instance: &crate::instance::Instance,
+    broker: Option<String>,
+) -> anyhow::Result<Configuration> {
     let url = match broker {
         Some(b) if b.starts_with("file:") => b,
         Some(b) => format!("file:{b}"),

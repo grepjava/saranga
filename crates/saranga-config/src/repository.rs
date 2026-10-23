@@ -189,17 +189,56 @@ impl<T> HierarchicalRepository<T> {
         self.literal_matches.clear();
     }
 
+    /// Every match with its value, as it was added: the wildcard matches in
+    /// the order they were added, then the exact and the literal ones by
+    /// name, a literal one in its markers.
+    pub fn entries(&self) -> Vec<(String, &T)> {
+        let mut exact: Vec<(String, &T)> = self
+            .exact_matches
+            .iter()
+            .map(|(k, (_, v))| (k.clone(), v))
+            .collect();
+        exact.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut literal: Vec<(String, &T)> = self
+            .literal_matches
+            .iter()
+            .map(|(k, (_, v))| match self.literal_markers {
+                Some((start, end)) => (format!("{start}{k}{end}"), v),
+                None => (k.clone(), v),
+            })
+            .collect();
+        literal.sort_by(|a, b| a.0.cmp(&b.0));
+        self.wildcard_matches
+            .iter()
+            .map(|(m, v)| (m.as_str().to_owned(), v))
+            .chain(exact)
+            .chain(literal)
+            .collect()
+    }
+
     /// Every value that applies to `address`, most specific first: the exact
     /// match, then the literal match, then the wildcard matches ordered by
     /// [`Match::compare_specificity`].
     pub fn matches(&self, address: &str) -> Vec<&T> {
+        self.named_matches(address)
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect()
+    }
+
+    /// [`Self::matches`] with each value's match, as [`Self::entries`]
+    /// names it.
+    pub fn named_matches(&self, address: &str) -> Vec<(String, &T)> {
         let address = self.modify(address);
-        let mut out: Vec<&T> = Vec::new();
+        let mut out: Vec<(String, &T)> = Vec::new();
         if let Some((_, v)) = self.exact_matches.get(&address) {
-            out.push(v);
+            out.push((address.clone(), v));
         }
         if let Some((_, v)) = self.literal_matches.get(&address) {
-            out.push(v);
+            out.push(match self.literal_markers {
+                Some((start, end)) => (format!("{start}{address}{end}"), v),
+                None => (address.clone(), v),
+            });
         }
         let mut wild: Vec<&(Match, T)> = self
             .wildcard_matches
@@ -221,7 +260,7 @@ impl<T> HierarchicalRepository<T> {
                 j -= 1;
             }
         }
-        out.extend(wild.into_iter().map(|(_, v)| v));
+        out.extend(wild.into_iter().map(|(m, v)| (m.as_str().to_owned(), v)));
         out
     }
 }

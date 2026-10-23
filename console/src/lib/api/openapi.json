@@ -3,7 +3,7 @@
 	"info": {
 		"title": "Saranga console API",
 		"version": "2.57.0",
-		"description": "Every path but /session, /views, /nodes, /events, /history, /notifications and /openapi.json is served for another node too, at /saranga/api/v1/nodes/{node}/... (a node ID from GET /nodes; local is this broker): it is sent to that node as management messages, as the user, and that node allows or refuses it. At /saranga/api/v1/nodes/all/... the listings span every node."
+		"description": "Every path but /session, /views, /nodes, /events, /history, /notifications, /address-settings, /security-settings and /openapi.json is served for another node too, at /saranga/api/v1/nodes/{node}/... (a node ID from GET /nodes; local is this broker): it is sent to that node as management messages, as the user, and that node allows or refuses it. At /saranga/api/v1/nodes/all/... the listings span every node."
 	},
 	"paths": {
 		"/saranga/api/v1/session": {
@@ -1653,6 +1653,366 @@
 							"application/json": {
 								"schema": {
 									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/address-settings": {
+			"get": {
+				"operationId": "addressSettings",
+				"summary": "This broker's address-settings matches, and those that apply to an address",
+				"parameters": [
+					{
+						"name": "address",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "string"
+						},
+						"description": "An address, whose settings are given with the match each comes from"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/AddressSettings"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/security-settings": {
+			"get": {
+				"operationId": "securitySettings",
+				"summary": "This broker's security-settings matches, and the one that applies to an address",
+				"parameters": [
+					{
+						"name": "address",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "string"
+						},
+						"description": "An address, whose settings are given with the match each comes from"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/SecuritySettings"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/configuration/export": {
+			"post": {
+				"operationId": "exportConfiguration",
+				"summary": "exportConfigAsProperties, then the file it wrote (another node's stays there)",
+				"parameters": [
+					{
+						"name": "X-Saranga-Console",
+						"in": "header",
+						"required": true,
+						"schema": {
+							"type": "string",
+							"const": "1"
+						},
+						"description": "Marks a request the console sent"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/ExportedConfiguration"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/queues/{name}/export": {
+			"get": {
+				"operationId": "exportMessages",
+				"summary": "A queue's messages, whole, with every property's type",
+				"parameters": [
+					{
+						"name": "name",
+						"in": "path",
+						"required": true,
+						"schema": {
+							"type": "string"
+						},
+						"description": ""
+					},
+					{
+						"name": "filter",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "string"
+						},
+						"description": "A filter selecting the messages"
+					},
+					{
+						"name": "max",
+						"in": "query",
+						"required": false,
+						"schema": {
+							"type": "integer"
+						},
+						"description": "How many at most, 10,000 at most"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"type": "array",
+									"items": {
+										"$ref": "#/components/schemas/ExportedMessage"
+									}
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"404": {
+						"description": "Not found",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"/saranga/api/v1/queues/{name}/import": {
+			"post": {
+				"operationId": "importMessages",
+				"summary": "Messages, as the export writes them, sent to a queue in order as the user",
+				"parameters": [
+					{
+						"name": "name",
+						"in": "path",
+						"required": true,
+						"schema": {
+							"type": "string"
+						},
+						"description": ""
+					},
+					{
+						"name": "X-Saranga-Console",
+						"in": "header",
+						"required": true,
+						"schema": {
+							"type": "string",
+							"const": "1"
+						},
+						"description": "Marks a request the console sent"
+					}
+				],
+				"responses": {
+					"200": {
+						"description": "OK",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Imported"
+								}
+							}
+						}
+					},
+					"400": {
+						"description": "Bad parameters, or the operation failed",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"401": {
+						"description": "Not logged in",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"403": {
+						"description": "Not permitted, or the X-Saranga-Console header is missing",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					},
+					"404": {
+						"description": "Not found",
+						"content": {
+							"application/json": {
+								"schema": {
+									"$ref": "#/components/schemas/Error"
+								}
+							}
+						}
+					}
+				},
+				"requestBody": {
+					"required": true,
+					"content": {
+						"application/json": {
+							"schema": {
+								"type": "array",
+								"items": {
+									"$ref": "#/components/schemas/ExportedMessage"
 								}
 							}
 						}
@@ -3414,6 +3774,316 @@
 				"required": [
 					"data",
 					"last"
+				]
+			},
+			"AddressSettingsMatch": {
+				"type": "object",
+				"properties": {
+					"match": {
+						"type": "string"
+					},
+					"settings": {
+						"type": "object",
+						"additionalProperties": {}
+					},
+					"added": {
+						"type": "boolean"
+					}
+				},
+				"required": [
+					"match",
+					"settings",
+					"added"
+				]
+			},
+			"AddressSettingName": {
+				"type": "object",
+				"properties": {
+					"name": {
+						"type": "string"
+					},
+					"type": {
+						"type": "string",
+						"enum": [
+							"string",
+							"integer",
+							"number",
+							"boolean"
+						]
+					},
+					"choices": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					}
+				},
+				"required": [
+					"name",
+					"type"
+				]
+			},
+			"AddressSettings": {
+				"type": "object",
+				"properties": {
+					"matches": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/AddressSettingsMatch"
+						}
+					},
+					"names": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/AddressSettingName"
+						}
+					},
+					"address": {
+						"type": "string"
+					},
+					"applying": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"effective": {
+						"type": "object",
+						"additionalProperties": {}
+					},
+					"from": {
+						"type": "object",
+						"additionalProperties": {
+							"type": "string"
+						}
+					}
+				},
+				"required": [
+					"matches",
+					"names"
+				]
+			},
+			"Role": {
+				"type": "object",
+				"properties": {
+					"name": {
+						"type": "string"
+					},
+					"send": {
+						"type": "boolean"
+					},
+					"consume": {
+						"type": "boolean"
+					},
+					"createDurableQueue": {
+						"type": "boolean"
+					},
+					"deleteDurableQueue": {
+						"type": "boolean"
+					},
+					"createNonDurableQueue": {
+						"type": "boolean"
+					},
+					"deleteNonDurableQueue": {
+						"type": "boolean"
+					},
+					"manage": {
+						"type": "boolean"
+					},
+					"browse": {
+						"type": "boolean"
+					},
+					"createAddress": {
+						"type": "boolean"
+					},
+					"deleteAddress": {
+						"type": "boolean"
+					},
+					"view": {
+						"type": "boolean"
+					},
+					"edit": {
+						"type": "boolean"
+					}
+				},
+				"required": [
+					"name",
+					"send",
+					"consume",
+					"createDurableQueue",
+					"deleteDurableQueue",
+					"createNonDurableQueue",
+					"deleteNonDurableQueue",
+					"manage",
+					"browse",
+					"createAddress",
+					"deleteAddress",
+					"view",
+					"edit"
+				]
+			},
+			"SecuritySettingsMatch": {
+				"type": "object",
+				"properties": {
+					"match": {
+						"type": "string"
+					},
+					"roles": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/Role"
+						}
+					}
+				},
+				"required": [
+					"match",
+					"roles"
+				]
+			},
+			"SecuritySettings": {
+				"type": "object",
+				"properties": {
+					"enabled": {
+						"type": "boolean"
+					},
+					"matches": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/SecuritySettingsMatch"
+						}
+					},
+					"address": {
+						"type": "string"
+					},
+					"applying": {
+						"type": [
+							"string",
+							"null"
+						]
+					}
+				},
+				"required": [
+					"enabled",
+					"matches"
+				]
+			},
+			"MessageProperty": {
+				"type": "object",
+				"properties": {
+					"name": {
+						"type": "string"
+					},
+					"type": {
+						"type": "string",
+						"enum": [
+							"null",
+							"boolean",
+							"byte",
+							"short",
+							"int",
+							"long",
+							"float",
+							"double",
+							"char",
+							"bytes",
+							"string"
+						]
+					},
+					"value": {}
+				},
+				"required": [
+					"name",
+					"type",
+					"value"
+				]
+			},
+			"ExportedMessage": {
+				"type": "object",
+				"properties": {
+					"messageID": {
+						"type": "string"
+					},
+					"address": {
+						"type": [
+							"string",
+							"null"
+						]
+					},
+					"type": {
+						"type": "integer"
+					},
+					"durable": {
+						"type": "boolean"
+					},
+					"priority": {
+						"type": "integer"
+					},
+					"timestamp": {
+						"type": "integer"
+					},
+					"expiration": {
+						"type": "integer"
+					},
+					"userID": {
+						"type": [
+							"string",
+							"null"
+						]
+					},
+					"properties": {
+						"type": "array",
+						"items": {
+							"$ref": "#/components/schemas/MessageProperty"
+						}
+					},
+					"text": {
+						"type": "string"
+					},
+					"body": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"messageID",
+					"address",
+					"type",
+					"durable",
+					"priority",
+					"timestamp",
+					"expiration",
+					"userID",
+					"properties"
+				]
+			},
+			"Imported": {
+				"type": "object",
+				"properties": {
+					"sent": {
+						"type": "integer"
+					},
+					"error": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"sent"
+				]
+			},
+			"ExportedConfiguration": {
+				"type": "object",
+				"properties": {
+					"text": {
+						"type": [
+							"string",
+							"null"
+						]
+					},
+					"file": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"text"
 				]
 			}
 		},

@@ -128,7 +128,7 @@ pub(crate) fn internal_prefix(broker: &Broker) -> String {
     )
 }
 
-fn filter(
+pub(super) fn filter(
     broker: &Broker,
     text: Option<String>,
 ) -> Result<Option<crate::queue::FilterRef>, String> {

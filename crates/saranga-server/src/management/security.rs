@@ -159,7 +159,7 @@ pub(crate) fn recovered(p: &PersistedSecuritySetting) -> SecuritySetting {
 }
 
 /// `Role.toJson`.
-fn role_json(r: &Role) -> Json {
+pub fn role_json(r: &Role) -> Json {
     let mut o = Json::object().with("name", r.name.clone());
     for c in PERMISSIONS {
         o.put(c.permission_name(), r.allows(c));

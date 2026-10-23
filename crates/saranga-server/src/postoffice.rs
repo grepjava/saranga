@@ -717,6 +717,21 @@ impl PostOffice {
         self.settings.configured(address)
     }
 
+    /// Every address-settings match with its settings as configured, and
+    /// whether management added it.
+    pub fn settings_entries(&self) -> Vec<(String, saranga_config::AddressSettings, bool)> {
+        self.settings.entries()
+    }
+
+    /// The address-settings matches that apply to an address, most specific
+    /// first, with their settings as configured.
+    pub fn settings_matching(
+        &self,
+        address: &str,
+    ) -> Vec<(String, saranga_config::AddressSettings)> {
+        self.settings.matching(address)
+    }
+
     /// Gives every page store its settings again.
     fn settings_changed(&self) {
         for store in self.paging.stores() {

@@ -2,7 +2,8 @@
 	A queue's messages, as Artemis's console browses them (`browse(page, size,
 	filter)` and `countMessages(filter)`): a page at a time, filtered by a
 	selector, with the actions the guard allows on a selection or on one
-	message.
+	message, and on every message the filter selects (`moveMessages(filter,
+	queue)`...). Those can be exported whole, and messages exported imported.
 -->
 <script lang="ts">
 	import { SvelteSet } from 'svelte/reactivity';
@@ -10,6 +11,12 @@
 	import ChevronLeftIcon from '@lucide/svelte/icons/chevron-left';
 	import ChevronRightIcon from '@lucide/svelte/icons/chevron-right';
 	import RefreshCwIcon from '@lucide/svelte/icons/refresh-cw';
+	import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
+	import * as Dialog from '#lib/components/ui/dialog/index.js';
+	import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js';
+	import { Label } from '#lib/components/ui/label/index.js';
+	import { admin } from '#lib/api/index.js';
+	import { messageCount, messagesFile, saveText } from '#lib/files.js';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import { Checkbox } from '#lib/components/ui/checkbox/index.js';
 	import { Input } from '#lib/components/ui/input/index.js';
@@ -23,6 +30,7 @@
 	import {
 		MESSAGE_TYPES,
 		addressResource,
+		matching,
 		originalQueue,
 		queue as ops,
 		queueResource,
@@ -55,7 +63,15 @@
 		'copyMessage',
 		'retryMessage',
 		'expireMessage',
-		'sendMessageToDeadLetterAddress'
+		'sendMessageToDeadLetterAddress',
+		'changeMessagePriority',
+		'moveMessages',
+		'removeMessages',
+		'retryMessages',
+		'expireMessages',
+		'sendMessagesToDeadLetterAddress',
+		'changeMessagesPriority',
+		'sendMessage'
 	] as const;
 
 	let may = $state<Allowed>({});
@@ -115,7 +131,7 @@
 		onchange?.();
 	}
 
-	type Action = 'remove' | 'move' | 'copy' | 'retry' | 'expire' | 'toDeadLetter';
+	type Action = 'remove' | 'move' | 'copy' | 'retry' | 'expire' | 'toDeadLetter' | 'priority';
 
 	const DONE: Record<Action, string> = {
 		remove: 'Deleted',
@@ -123,12 +139,17 @@
 		copy: 'Copied',
 		retry: 'Retried',
 		expire: 'Expired',
-		toDeadLetter: 'Sent to the dead-letter address'
+		toDeadLetter: 'Sent to the dead-letter address',
+		priority: 'Changed the priority of'
 	};
 
-	async function run(action: Action, ids: string[], to?: string) {
+	async function run(action: Action, ids: string[], to?: string, priority?: number) {
 		const call = (id: string) =>
-			action === 'move' || action === 'copy' ? ops[action](queue, id, to!) : ops[action](queue, id);
+			action === 'move' || action === 'copy'
+				? ops[action](queue, id, to!)
+				: action === 'priority'
+					? ops.changePriority(queue, id, priority!)
+					: ops[action](queue, id);
 		const results = await Promise.allSettled(ids.map(call));
 		// The operations answer false for a message no longer there.
 		const done = results.filter((r) => r.status === 'fulfilled' && r.value !== false).length;
@@ -146,7 +167,64 @@
 		refresh();
 	}
 
-	let picking = $state<{ action: 'move' | 'copy'; ids: string[] } | null>(null);
+	/** What every message the filter selects is having done, by the queue's `*Messages` operations. */
+	type Bulk = 'move' | 'remove' | 'retry' | 'expire' | 'toDeadLetter' | 'priority';
+
+	async function runMatching(action: Bulk, to?: string, priority?: number) {
+		try {
+			const n =
+				action === 'move'
+					? await matching.move(queue, filter, to!)
+					: action === 'priority'
+						? await matching.changePriority(queue, filter, priority!)
+						: await matching[action](queue, filter);
+			toast.success(
+				`${DONE[action]} ${n} message${n === 1 ? '' : 's'}`,
+				to ? { description: `To ${to}` } : {}
+			);
+		} catch (e) {
+			toast.error(`They could not be ${DONE[action].toLowerCase()}`, {
+				description: (e as Error).message
+			});
+		}
+		selected.clear();
+		refresh();
+	}
+
+	let exporting = $state(false);
+	async function exportMatching() {
+		exporting = true;
+		try {
+			const text = await admin.exportMessages(queue, filter);
+			saveText(messagesFile(queue), text);
+			const n = messageCount(text);
+			toast.success(`Exported ${n} message${n === 1 ? '' : 's'}`);
+		} catch (e) {
+			toast.error('They could not be exported', { description: (e as Error).message });
+		} finally {
+			exporting = false;
+		}
+	}
+
+	let importer = $state<HTMLInputElement | null>(null);
+	async function importFile(file: File | undefined) {
+		if (!file) return;
+		try {
+			const r = await admin.importMessages(queue, await file.text());
+			const n = (k: number) => `${k} message${k === 1 ? '' : 's'}`;
+			if (r.error) toast.warning(`Imported ${n(r.sent)}, then stopped`, { description: r.error });
+			else toast.success(`Imported ${n(r.sent)}`, { description: `From ${file.name}` });
+		} catch (e) {
+			toast.error(`${file.name} could not be imported`, { description: (e as Error).message });
+		}
+		if (importer) importer.value = '';
+		refresh();
+	}
+
+	let picking = $state<{ action: 'move' | 'copy'; ids: string[] | null } | null>(null);
+	/** A new priority, for the selection or, with no IDs, for every message the filter selects. */
+	let prioritizing = $state<{ ids: string[] | null; value: number } | null>(null);
+	let confirmingAll = $state<'remove' | 'expire' | 'toDeadLetter' | 'retry' | null>(null);
 	let confirming = $state<{ action: 'remove' | 'expire'; ids: string[] } | null>(null);
 	let resend = $state<{ address: string; draft: Draft } | null>(null);
 	let sending = $state(false);
@@ -197,6 +275,11 @@
 			>To dead letters</Button
 		>
 	{/if}
+	{#if may.changeMessagePriority}
+		<Button {size} variant="outline" onclick={() => (prioritizing = { ids, value: 4 })}
+			>Priority</Button
+		>
+	{/if}
 	{#if may.removeMessage}
 		<Button {size} variant="destructive" onclick={() => (confirming = { action: 'remove', ids })}>
 			Delete
@@ -225,6 +308,69 @@
 		<Button variant="ghost" size="icon-sm" aria-label="Refresh" onclick={refresh}>
 			<RefreshCwIcon class={cn(loading && 'animate-spin')} />
 		</Button>
+		<DropdownMenu.Root>
+			<DropdownMenu.Trigger>
+				{#snippet child({ props })}
+					<Button {...props} size="sm" variant="outline" disabled={!count}>
+						{filter ? 'Every match' : 'Every message'}
+						<ChevronDownIcon />
+					</Button>
+				{/snippet}
+			</DropdownMenu.Trigger>
+			<DropdownMenu.Content align="end">
+				<DropdownMenu.Label class="text-xs font-normal text-muted-foreground">
+					{formatNumber(count)} message{count === 1 ? '' : 's'}{filter ? ' matching' : ''}
+				</DropdownMenu.Label>
+				<DropdownMenu.Item
+					disabled={!may.moveMessages}
+					onSelect={() => (picking = { action: 'move', ids: null })}>Move…</DropdownMenu.Item
+				>
+				{#if retryable}
+					<DropdownMenu.Item
+						disabled={!may.retryMessages}
+						onSelect={() => (confirmingAll = 'retry')}>Retry</DropdownMenu.Item
+					>
+				{:else}
+					<DropdownMenu.Item
+						disabled={!may.sendMessagesToDeadLetterAddress}
+						onSelect={() => (confirmingAll = 'toDeadLetter')}
+						>Send to the dead-letter address</DropdownMenu.Item
+					>
+				{/if}
+				<DropdownMenu.Item
+					disabled={!may.changeMessagesPriority}
+					onSelect={() => (prioritizing = { ids: null, value: 4 })}
+					>Change the priority…</DropdownMenu.Item
+				>
+				<DropdownMenu.Item
+					disabled={!may.expireMessages}
+					onSelect={() => (confirmingAll = 'expire')}>Expire</DropdownMenu.Item
+				>
+				<DropdownMenu.Item disabled={exporting || !may.browse} onSelect={exportMatching}
+					>Export as JSON</DropdownMenu.Item
+				>
+				<DropdownMenu.Separator />
+				<DropdownMenu.Item
+					variant="destructive"
+					disabled={!may.removeMessages}
+					onSelect={() => (confirmingAll = 'remove')}>Delete</DropdownMenu.Item
+				>
+			</DropdownMenu.Content>
+		</DropdownMenu.Root>
+		<Button
+			size="sm"
+			variant="outline"
+			disabled={may.sendMessage === false}
+			onclick={() => importer?.click()}>Import</Button
+		>
+		<input
+			bind:this={importer}
+			type="file"
+			accept="application/json,.json"
+			class="hidden"
+			aria-label="Messages to import"
+			onchange={(e) => importFile(e.currentTarget.files?.[0])}
+		/>
 	</div>
 
 	{#if selected.size}
@@ -373,10 +519,13 @@
 
 <QueuePicker
 	title={picking?.action === 'copy' ? 'Copy to a queue' : 'Move to a queue'}
-	description={`${picking?.ids.length ?? 0} message${picking?.ids.length === 1 ? '' : 's'} from ${queue}.`}
+	description={picking?.ids
+		? `${picking.ids.length} message${picking.ids.length === 1 ? '' : 's'} from ${queue}.`
+		: `Every message${filter ? ` that ${filter} selects` : ''} on ${queue}.`}
 	action={picking?.action === 'copy' ? 'Copy' : 'Move'}
 	exclude={queue}
-	onpick={(to) => picking && run(picking.action, picking.ids, to)}
+	onpick={(to) =>
+		picking && (picking.ids ? run(picking.action, picking.ids, to) : runMatching('move', to))}
 	bind:open={() => picking !== null, (o) => !o && (picking = null)}
 />
 
@@ -407,6 +556,88 @@
 		</AlertDialog.Footer>
 	</AlertDialog.Content>
 </AlertDialog.Root>
+
+<AlertDialog.Root open={confirmingAll !== null} onOpenChange={(o) => !o && (confirmingAll = null)}>
+	<AlertDialog.Content>
+		{#if confirmingAll}
+			<AlertDialog.Header>
+				<AlertDialog.Title>
+					{confirmingAll === 'remove'
+						? 'Delete'
+						: confirmingAll === 'expire'
+							? 'Expire'
+							: confirmingAll === 'retry'
+								? 'Retry'
+								: 'Send to the dead-letter address'}
+					{filter ? `every message that ${filter} selects` : 'every message'}?
+				</AlertDialog.Title>
+				<AlertDialog.Description>
+					{formatNumber(count)} message{count === 1 ? '' : 's'} on {queue} now; any that arrive meanwhile
+					and match too.
+				</AlertDialog.Description>
+			</AlertDialog.Header>
+			<AlertDialog.Footer>
+				<AlertDialog.Cancel>Cancel</AlertDialog.Cancel>
+				<AlertDialog.Action
+					onclick={() => {
+						const a = confirmingAll;
+						confirmingAll = null;
+						if (a) runMatching(a);
+					}}
+				>
+					{confirmingAll === 'remove'
+						? 'Delete'
+						: confirmingAll === 'expire'
+							? 'Expire'
+							: confirmingAll === 'retry'
+								? 'Retry'
+								: 'Send'}
+				</AlertDialog.Action>
+			</AlertDialog.Footer>
+		{/if}
+	</AlertDialog.Content>
+</AlertDialog.Root>
+
+<Dialog.Root open={prioritizing !== null} onOpenChange={(o) => !o && (prioritizing = null)}>
+	<Dialog.Content class="sm:max-w-sm">
+		{#if prioritizing}
+			<Dialog.Header>
+				<Dialog.Title>Change the priority</Dialog.Title>
+				<Dialog.Description>
+					{prioritizing.ids
+						? `${prioritizing.ids.length} message${prioritizing.ids.length === 1 ? '' : 's'}.`
+						: `Every message${filter ? ` that ${filter} selects` : ''} on ${queue}.`}
+				</Dialog.Description>
+			</Dialog.Header>
+			<form
+				id="priority"
+				class="grid gap-1.5"
+				onsubmit={(e) => {
+					e.preventDefault();
+					const p = prioritizing;
+					prioritizing = null;
+					if (!p) return;
+					if (p.ids) run('priority', p.ids, undefined, p.value);
+					else runMatching('priority', undefined, p.value);
+				}}
+			>
+				<Label for="priority-value">Priority, 0 to 9</Label>
+				<Input
+					id="priority-value"
+					type="number"
+					min="0"
+					max="9"
+					required
+					bind:value={prioritizing.value}
+				/>
+			</form>
+			<Dialog.Footer>
+				<Button variant="outline" onclick={() => (prioritizing = null)}>Cancel</Button>
+				<Button type="submit" form="priority">Change</Button>
+			</Dialog.Footer>
+		{/if}
+	</Dialog.Content>
+</Dialog.Root>
 
 {#if resend}
 	<SendMessage

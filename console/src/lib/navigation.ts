@@ -18,8 +18,14 @@ import BellIcon from '@lucide/svelte/icons/bell';
 import ServerCogIcon from '@lucide/svelte/icons/server-cog';
 import ShieldCheckIcon from '@lucide/svelte/icons/shield-check';
 import CableIcon from '@lucide/svelte/icons/cable';
+import SlidersHorizontalIcon from '@lucide/svelte/icons/sliders-horizontal';
+import KeyRoundIcon from '@lucide/svelte/icons/key-round';
+import ArrowLeftRightIcon from '@lucide/svelte/icons/arrow-left-right';
+import MailWarningIcon from '@lucide/svelte/icons/mail-warning';
 import {
 	clusterHref,
+	configurationHref,
+	deadLettersHref,
 	diagramHref,
 	federationHref,
 	haHref,
@@ -28,7 +34,9 @@ import {
 	listingHref,
 	overviewHref,
 	preferencesHref,
-	runtimeHref
+	runtimeHref,
+	securityHref,
+	transactionsHref
 } from '#lib/nav.js';
 
 export interface NavItem {
@@ -135,6 +143,46 @@ export const NAVIGATION: NavGroup[] = [
 		items: [
 			listing('addresses', WaypointsIcon, ['topics', 'destinations']),
 			listing('queues', InboxIcon, ['destinations', 'subscriptions'])
+		]
+	},
+	{
+		label: 'Administration',
+		items: [
+			{
+				title: 'Dead letters',
+				icon: MailWarningIcon,
+				href: (node) => deadLettersHref(node),
+				needs: 'listQueues',
+				keywords: ['dlq', 'dead letter queue', 'expiry', 'retry', 'failed']
+			},
+			{
+				title: 'Configuration',
+				icon: SlidersHorizontalIcon,
+				href: (node) => configurationHref(node),
+				needs: 'getAddressSettingsAsJSON',
+				keywords: [
+					'address settings',
+					'diverts',
+					'acceptors',
+					'reload',
+					'export',
+					'broker properties'
+				]
+			},
+			{
+				title: 'Security',
+				icon: KeyRoundIcon,
+				href: (node) => securityHref(node),
+				needs: 'getRolesAsJSON',
+				keywords: ['users', 'roles', 'permissions', 'security settings', 'rbac']
+			},
+			{
+				title: 'Transactions',
+				icon: ArrowLeftRightIcon,
+				href: transactionsHref,
+				needs: 'listPreparedTransactionDetailsAsJSON',
+				keywords: ['xa', 'prepared', 'heuristic', 'commit', 'rollback']
+			}
 		]
 	},
 	{

@@ -396,6 +396,91 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/saranga/api/v1/address-settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** This broker's address-settings matches, and those that apply to an address */
+        get: operations["addressSettings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/saranga/api/v1/security-settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** This broker's security-settings matches, and the one that applies to an address */
+        get: operations["securitySettings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/saranga/api/v1/configuration/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** exportConfigAsProperties, then the file it wrote (another node's stays there) */
+        post: operations["exportConfiguration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/saranga/api/v1/queues/{name}/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A queue's messages, whole, with every property's type */
+        get: operations["exportMessages"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/saranga/api/v1/queues/{name}/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Messages, as the export writes them, sent to a queue in order as the user */
+        post: operations["importMessages"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/saranga/api/v1/notifications": {
         parameters: {
             query?: never;
@@ -810,6 +895,83 @@ export interface components {
         Notifications: {
             data: components["schemas"]["Notification"][];
             last: number;
+        };
+        AddressSettingsMatch: {
+            match: string;
+            settings: {
+                [key: string]: unknown;
+            };
+            added: boolean;
+        };
+        AddressSettingName: {
+            name: string;
+            /** @enum {string} */
+            type: "string" | "integer" | "number" | "boolean";
+            choices?: string[];
+        };
+        AddressSettings: {
+            matches: components["schemas"]["AddressSettingsMatch"][];
+            names: components["schemas"]["AddressSettingName"][];
+            address?: string;
+            applying?: string[];
+            effective?: {
+                [key: string]: unknown;
+            };
+            from?: {
+                [key: string]: string;
+            };
+        };
+        Role: {
+            name: string;
+            send: boolean;
+            consume: boolean;
+            createDurableQueue: boolean;
+            deleteDurableQueue: boolean;
+            createNonDurableQueue: boolean;
+            deleteNonDurableQueue: boolean;
+            manage: boolean;
+            browse: boolean;
+            createAddress: boolean;
+            deleteAddress: boolean;
+            view: boolean;
+            edit: boolean;
+        };
+        SecuritySettingsMatch: {
+            match: string;
+            roles: components["schemas"]["Role"][];
+        };
+        SecuritySettings: {
+            enabled: boolean;
+            matches: components["schemas"]["SecuritySettingsMatch"][];
+            address?: string;
+            applying?: string | null;
+        };
+        MessageProperty: {
+            name: string;
+            /** @enum {string} */
+            type: "null" | "boolean" | "byte" | "short" | "int" | "long" | "float" | "double" | "char" | "bytes" | "string";
+            value: unknown;
+        };
+        ExportedMessage: {
+            messageID: string;
+            address: string | null;
+            type: number;
+            durable: boolean;
+            priority: number;
+            timestamp: number;
+            expiration: number;
+            userID: string | null;
+            properties: components["schemas"]["MessageProperty"][];
+            text?: string;
+            body?: string;
+        };
+        Imported: {
+            sent: number;
+            error?: string;
+        };
+        ExportedConfiguration: {
+            text: string | null;
+            file?: string;
         };
     };
     responses: never;
@@ -1973,6 +2135,284 @@ export interface operations {
             };
             /** @description Not logged in */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    addressSettings: {
+        parameters: {
+            query?: {
+                /** @description An address, whose settings are given with the match each comes from */
+                address?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AddressSettings"];
+                };
+            };
+            /** @description Bad parameters, or the operation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not logged in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not permitted, or the X-Saranga-Console header is missing */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    securitySettings: {
+        parameters: {
+            query?: {
+                /** @description An address, whose settings are given with the match each comes from */
+                address?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SecuritySettings"];
+                };
+            };
+            /** @description Bad parameters, or the operation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not logged in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not permitted, or the X-Saranga-Console header is missing */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    exportConfiguration: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Marks a request the console sent */
+                "X-Saranga-Console": "1";
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExportedConfiguration"];
+                };
+            };
+            /** @description Bad parameters, or the operation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not logged in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not permitted, or the X-Saranga-Console header is missing */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    exportMessages: {
+        parameters: {
+            query?: {
+                /** @description A filter selecting the messages */
+                filter?: string;
+                /** @description How many at most, 10,000 at most */
+                max?: number;
+            };
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExportedMessage"][];
+                };
+            };
+            /** @description Bad parameters, or the operation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not logged in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not permitted, or the X-Saranga-Console header is missing */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    importMessages: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Marks a request the console sent */
+                "X-Saranga-Console": "1";
+            };
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExportedMessage"][];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Imported"];
+                };
+            };
+            /** @description Bad parameters, or the operation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not logged in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not permitted, or the X-Saranga-Console header is missing */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

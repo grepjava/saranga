@@ -259,6 +259,18 @@ pub trait SettingsRepository: Send + Sync {
     fn remove_match(&self, _match: &str) -> bool {
         false
     }
+
+    /// Every match with its settings as configured, and whether management
+    /// added it.
+    fn entries(&self) -> Vec<(String, saranga_config::AddressSettings, bool)> {
+        Vec::new()
+    }
+
+    /// The matches that apply to an address with their settings, most
+    /// specific first: what [`Self::configured`] merges.
+    fn matching(&self, _address: &str) -> Vec<(String, saranga_config::AddressSettings)> {
+        Vec::new()
+    }
 }
 
 /// One set of settings for every address.

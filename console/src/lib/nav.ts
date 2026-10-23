@@ -81,3 +81,19 @@ export function federationHref(node: string): string {
 export function eventsHref(node: string, params?: URLSearchParams): string {
 	return withQuery(resolve('/n/[node]/events', { node }), params);
 }
+
+export function configurationHref(node: string, params?: URLSearchParams): string {
+	return withQuery(resolve('/n/[node]/configuration', { node }), params);
+}
+
+export function securityHref(node: string, params?: URLSearchParams): string {
+	return withQuery(resolve('/n/[node]/security', { node }), params);
+}
+
+export function transactionsHref(node: string): string {
+	return resolve('/n/[node]/transactions', { node });
+}
+
+export function deadLettersHref(node: string, params?: URLSearchParams): string {
+	return withQuery(resolve('/n/[node]/dead-letters', { node }), params);
+}

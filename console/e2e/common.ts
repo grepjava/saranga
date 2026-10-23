@@ -29,3 +29,13 @@ export async function login(page: Page, user = 'admin', password = 'secret') {
 export function unique(prefix: string): string {
 	return `${prefix}.${Date.now().toString(36)}${Math.floor(Math.random() * 1e4)}`;
 }
+
+/** An operation, as the logged-in user: its result. */
+export async function op(page: Page, resource: string, operation: string, args: unknown[] = []) {
+	const r = await page.request.post(
+		`/saranga/api/v1/resources/${encodeURIComponent(resource)}/operations`,
+		{ headers: { 'X-Saranga-Console': '1' }, data: { operation, arguments: args } }
+	);
+	expect(r.status(), await r.text()).toBe(200);
+	return (await r.json()).result;
+}

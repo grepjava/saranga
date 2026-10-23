@@ -1927,6 +1927,7 @@ dependencies = [
  "saranga-client",
  "saranga-config",
  "saranga-core-protocol",
+ "saranga-message",
  "saranga-security",
  "saranga-server",
  "saranga-transport",

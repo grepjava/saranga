@@ -1269,6 +1269,14 @@ pub(super) async fn invoke(
         );
     }
     // Configuration.
+    if call.is("exportConfigAsProperties", &[]).is_some() {
+        return Some(
+            broker
+                .export_config_as_properties()
+                .await
+                .map(|()| Json::Null),
+        );
+    }
     if call.is("reloadConfigurationFile", &[]).is_some() {
         return Some(
             broker
@@ -1564,7 +1572,7 @@ fn update_divert(broker: &Broker, d: DivertDeployment) -> Outcome {
 }
 
 /// `AddressSettings.toJSON`: the settings that are set.
-pub(super) fn settings_json(s: Option<saranga_config::AddressSettings>) -> Json {
+pub fn settings_json(s: Option<saranga_config::AddressSettings>) -> Json {
     use saranga_config::SettingValue as V;
     let mut o = Json::object();
     for (name, v) in s.unwrap_or_default().named_values() {

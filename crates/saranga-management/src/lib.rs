@@ -17,6 +17,7 @@
 //!   `saranga.console.enabled` is `false`.
 
 mod access;
+mod admin;
 pub mod api;
 mod api_schema;
 mod catalog;

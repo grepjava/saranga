@@ -19,6 +19,7 @@ import socket
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 WEB = sys.argv[1].rstrip("/")
@@ -421,6 +422,81 @@ check("the attribute has its new value", body.get("attributes", {}).get("Message
 c.request("PUT", "/resources/broker/attributes/MessageCounterMaxDayCount", {"value": previous}, MARK)
 status, body, _ = v.request("PUT", "/resources/broker/attributes/MessageCounterMaxDayCount", {"value": 9}, MARK)
 check("viewer may not write it", status == 403, (status, body))
+
+# Administration: the address and security settings' matches, the
+# configuration exported, and a queue's messages exported and imported.
+status, body, _ = c.request("GET", "/address-settings")
+names = {n.get("name"): n for n in (body or {}).get("names", [])}
+check("GET /address-settings lists the matches", status == 200
+      and any(m.get("match") == "#" for m in body.get("matches", [])), (status, body))
+check("and every setting's name and type", names.get("maxSizeBytes", {}).get("type") == "integer"
+      and "PAGE" in names.get("addressFullMessagePolicy", {}).get("choices", []), names.get("addressFullMessagePolicy"))
+settings = '{"maxSizeBytes":20971520,"addressFullMessagePolicy":"BLOCK"}'
+add_settings = "addAddressSettings(java.lang.String,java.lang.String)"
+status, body, _ = invoke(v, "broker", add_settings, ["console.settings.#", settings])
+check("viewer may not add address settings", status == 403, (status, body))
+status, body, _ = invoke(c, "broker", add_settings, ["console.settings.#", settings])
+check("admin adds address settings", status == 200, (status, body))
+status, body, _ = v.request("GET", "/address-settings?address=console.settings.a")
+added = [m for m in (body or {}).get("matches", []) if m.get("match") == "console.settings.#"]
+check("they are listed, as management's", status == 200 and added and added[0].get("added") is True
+      and added[0].get("settings", {}).get("maxSizeBytes") == 20971520, (status, added))
+check("an address's settings name the match each comes from",
+      (body or {}).get("applying", [None])[0] == "console.settings.#"
+      and body.get("effective", {}).get("addressFullMessagePolicy") == "BLOCK"
+      and body.get("from", {}).get("maxSizeBytes") == "console.settings.#"
+      and body.get("from", {}).get("deadLetterAddress") == "#", body)
+status, body, _ = invoke(c, "broker", "removeAddressSettings", ["console.settings.#"])
+status, body, _ = c.request("GET", "/address-settings")
+check("admin removes them", status == 200
+      and not any(m.get("match") == "console.settings.#" for m in body.get("matches", [])), body)
+status, body, _ = Client().request("GET", "/address-settings", basic="outsider:outsider")
+check("a user without a console role may not read them", status == 401, (status, body))
+
+status, body, _ = v.request("GET", "/security-settings?address=console.q2")
+amq = [r for m in (body or {}).get("matches", []) if m.get("match") == "#" for r in m.get("roles", [])
+       if r.get("name") == "amq"]
+check("GET /security-settings lists each match's roles", status == 200 and body.get("enabled") is True
+      and amq and amq[0].get("send") is True, (status, body))
+check("and the match that applies to an address", body.get("applying") == "#", body)
+
+status, body, _ = c.request("POST", "/configuration/export")
+check("exporting the configuration without X-Saranga-Console is 403", status == 403, (status, body))
+status, body, _ = v.request("POST", "/configuration/export", headers=MARK)
+check("viewer may not export the configuration", status == 403, (status, body))
+status, body, _ = c.request("POST", "/configuration/export", headers=MARK)
+text = (body or {}).get("text") or ""
+check("admin exports the configuration as broker properties",
+      status == 200 and body.get("file", "").replace("\\", "/").endswith("/tmp/broker_config_as_properties.txt")
+      and re.search(r"^name=", text, re.M) and "addressSettings." in text, (status, body and body.get("file")))
+check("its passwords are redacted", "secret" not in text, [l for l in text.splitlines() if "secret" in l])
+
+create = "createQueue(java.lang.String,boolean)"
+for q in ("console.export", "console.import"):
+    invoke(c, "broker", create, [json.dumps({"name": q, "address": q, "routing-type": "ANYCAST", "durable": True}), False])
+for t in ("one", "two"):
+    invoke(c, "queue.console.export", send, [{"color": "red"}, 3, t, True, None, None, True])
+status, exported, _ = v.request("GET", "/queues/console.export/export")
+check("viewer exports a queue's messages, whole", status == 200 and [m.get("text") for m in exported or []] == ["one", "two"]
+      and {"name": "color", "type": "string", "value": "red"} in exported[0].get("properties", []), (status, exported))
+status, body, _ = c.request("GET", "/queues/console.export/export?filter=" + urllib.parse.quote("color = 'blue'"))
+check("a filter selects what is exported", status == 200 and body == [], (status, body))
+status, body, _ = c.request("GET", "/queues/console.nosuchqueue/export")
+check("exporting a queue that is not there is 404", status == 404, (status, body))
+status, body, _ = v.request("POST", "/queues/console.import/import", exported, MARK)
+check("viewer may not import", status == 403, (status, body))
+status, body, _ = c.request("POST", "/queues/console.import/import", [{"properties": [{"name": "x", "type": "byte", "value": 999}]}], MARK)
+check("a message that cannot be read is 400, saying why", status == 400 and "message 1" in (body or {}).get("error", ""),
+      (status, body))
+status, body, _ = c.request("POST", "/queues/console.import/import", exported, MARK)
+check("admin imports them into another queue", status == 200 and body == {"sent": 2}, (status, body))
+status, body, _ = c.request("GET", "/queues/console.import/export")
+check("they are there as they were exported", status == 200
+      and [(m.get("text"), m.get("priority"), m.get("properties")) for m in body or []]
+      == [(m.get("text"), m.get("priority"), m.get("properties")) for m in exported], body)
+
+status, body, _ = invoke(v, "broker", "listPreparedTransactionDetailsAsJSON")
+check("viewer lists the prepared transactions: none", status == 200 and body.get("result") == "", (status, body))
 
 # The live data: the stream, the history and the notifications.
 e = Events(c)

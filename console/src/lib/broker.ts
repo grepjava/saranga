@@ -213,3 +213,161 @@ export const address = {
 	pause: (a: string) => onAddress(a, 'pause()'),
 	resume: (a: string) => onAddress(a, 'resume()')
 };
+
+/** `DivertConfiguration.toJSON`'s names. */
+export interface Divert {
+	name: string;
+	address: string;
+	forwardingAddress: string;
+	routingName?: string;
+	exclusive: boolean;
+	filter?: string;
+	routingType: 'STRIP' | 'PASS' | 'ANYCAST' | 'MULTICAST';
+	transformerClassName?: string;
+	transformerProperties?: Record<string, string>;
+}
+
+export function divertConfiguration(d: Divert): string {
+	const c: Record<string, unknown> = {
+		name: d.name,
+		address: d.address,
+		'forwarding-address': d.forwardingAddress,
+		'routing-name': d.routingName || undefined,
+		exclusive: d.exclusive,
+		'filter-string': d.filter || undefined,
+		'routing-type': d.routingType,
+		'transformer-configuration': d.transformerClassName
+			? { 'class-name': d.transformerClassName, properties: d.transformerProperties ?? {} }
+			: undefined
+	};
+	for (const k of Object.keys(c)) if (c[k] === undefined) delete c[k];
+	return JSON.stringify(c);
+}
+
+/** A user of the basic security manager, as `listUser` gives them. */
+export interface User {
+	username: string;
+	roles: string[];
+}
+
+/** A prepared transaction, as `listPreparedTransactionDetailsAsJSON` gives it. */
+export interface PreparedTransaction {
+	creation_time: string;
+	xid_as_base64: string;
+	xid_format_id: number;
+	xid_global_txid: string;
+	xid_branch_qual: string;
+	tx_related_messages: {
+		message_operation_type: string;
+		message_type: string;
+		message_properties: Record<string, unknown>;
+	}[];
+}
+
+/** The permissions of a role, as `getRolesAsJSON` names them. */
+export const PERMISSIONS = [
+	'send',
+	'consume',
+	'createDurableQueue',
+	'deleteDurableQueue',
+	'createNonDurableQueue',
+	'deleteNonDurableQueue',
+	'manage',
+	'browse',
+	'createAddress',
+	'deleteAddress',
+	'view',
+	'edit'
+] as const;
+export type Permission = (typeof PERMISSIONS)[number];
+
+/** `addSecuritySettings(match, json)`'s body: each permission's roles. */
+export function securitySettingsJson(grants: Record<Permission, string[]>): string {
+	return JSON.stringify(Object.fromEntries(PERMISSIONS.map((p) => [p, grants[p] ?? []])));
+}
+
+const parsed = <T>(text: Promise<string>) => text.then((t) => JSON.parse(t) as T);
+
+export const config = {
+	addressSettings: (address: string, node?: string) =>
+		parsed<Record<string, unknown>>(
+			resources.invoke<string>('broker', 'getAddressSettingsAsJSON', [address], node)
+		),
+	addAddressSettings: (match: string, settings: Record<string, unknown>) =>
+		onBroker<string>('addAddressSettings(java.lang.String,java.lang.String)', [
+			match,
+			JSON.stringify(settings)
+		]),
+	removeAddressSettings: (match: string) => onBroker('removeAddressSettings', [match]),
+	createDivert: (d: Divert) => onBroker('createDivert(java.lang.String)', [divertConfiguration(d)]),
+	updateDivert: (d: Divert) => onBroker('updateDivert(java.lang.String)', [divertConfiguration(d)]),
+	destroyDivert: (name: string) => onBroker('destroyDivert', [name]),
+	exportProperties: () => onBroker('exportConfigAsProperties'),
+	reload: () => onBroker('reloadConfigurationFile')
+};
+
+export const security = {
+	users: () => parsed<User[]>(onBroker<string>('listUser', [''])),
+	addUser: (user: string, password: string, roles: string[], plaintext: boolean) =>
+		onBroker('addUser', [user, password, roles.join(','), plaintext]),
+	resetUser: (user: string, password: string | null, roles: string[], plaintext: boolean) =>
+		onBroker('resetUser(java.lang.String,java.lang.String,java.lang.String,boolean)', [
+			user,
+			password,
+			roles.join(','),
+			plaintext
+		]),
+	removeUser: (user: string) => onBroker('removeUser', [user]),
+	roles: (address: string, node?: string) =>
+		parsed<Record<string, unknown>[]>(
+			resources.invoke<string>('broker', 'getRolesAsJSON', [address], node)
+		),
+	addSecuritySettings: (match: string, grants: Record<Permission, string[]>) =>
+		onBroker('addSecuritySettings(java.lang.String,java.lang.String)', [
+			match,
+			securitySettingsJson(grants)
+		]),
+	removeSecuritySettings: (match: string) => onBroker('removeSecuritySettings', [match]),
+	clearAuthenticationCache: () => onBroker('clearAuthenticationCache'),
+	clearAuthorizationCache: () => onBroker('clearAuthorizationCache')
+};
+
+export const transactions = {
+	/** None is an empty text, as Artemis answers. */
+	prepared: () =>
+		onBroker<string>('listPreparedTransactionDetailsAsJSON').then((t) =>
+			t ? (JSON.parse(t) as PreparedTransaction[]) : []
+		),
+	heuristicCommitted: () => onBroker<string[]>('listHeuristicCommittedTransactions'),
+	heuristicRolledBack: () => onBroker<string[]>('listHeuristicRolledBackTransactions'),
+	commit: (xid: string) => onBroker<boolean>('commitPreparedTransaction', [xid]),
+	rollback: (xid: string) => onBroker<boolean>('rollbackPreparedTransaction', [xid])
+};
+
+/** A queue's operations on the messages a filter selects; each answers how many it touched. */
+export const matching = {
+	move: (q: string, filter: string, to: string) => queue.moveMatching(q, filter, to),
+	remove: (q: string, filter: string) => queue.removeMatching(q, filter),
+	retry: (q: string, filter: string) =>
+		onQueue<number>(q, 'retryMessages(java.lang.String)', [filter]),
+	expire: (q: string, filter: string) =>
+		onQueue<number>(q, 'expireMessages(java.lang.String)', [filter]),
+	toDeadLetter: (q: string, filter: string) =>
+		onQueue<number>(q, 'sendMessagesToDeadLetterAddress(java.lang.String)', [filter]),
+	changePriority: (q: string, filter: string, priority: number) =>
+		onQueue<number>(q, 'changeMessagesPriority(java.lang.String,int)', [filter, priority])
+};
+
+/** A queue's scheduled and delivering messages. */
+export const pending = {
+	scheduled: (q: string) =>
+		parsed<Record<string, unknown>[]>(onQueue<string>(q, 'listScheduledMessagesAsJSON')),
+	/** By consumer: each one's messages, keyed by its description. */
+	delivering: (q: string) =>
+		parsed<Record<string, Record<string, unknown>[]>>(
+			onQueue<string>(q, 'listDeliveringMessagesAsJSON')
+		),
+	deliverScheduled: (q: string, id: string) => onQueue(q, 'deliverScheduledMessage', [id]),
+	deliverAllScheduled: (q: string, filter: string) =>
+		onQueue(q, 'deliverScheduledMessages', [filter])
+};

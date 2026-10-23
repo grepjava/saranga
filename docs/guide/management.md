@@ -178,7 +178,7 @@ Saranga has a console of its own at `/saranga/` on every `<web>` binding, built 
 - live data: the pages follow the broker as it changes, without being reloaded. The broker reads what each page shows every two seconds, as the logged-in user, and sends what changed over one stream. The charts start from the broker's own history, the last hour of the counters `/metrics` reads, so they have data the moment they open;
 - the events page: the management notifications (`activemq.notifications`) as they come, by type and searchable, with each one's properties, for a user who may consume from that address. The header says when new ones came;
 - the connections, sessions, consumers, producers, addresses and queues, as tables the broker pages, sorts and filters, with a column chooser, CSV export and links between them. An admin may close connections, sessions (of any protocol) and consumers, create and delete addresses and queues, from them;
-- a page for each queue: its counters and their charts, its consumers, its attributes, and its messages. The messages are browsed a page at a time, filtered by a selector, each with its headers, properties and body (bytes as hex, decimal or text). Messages can be moved, copied, expired, sent to the dead-letter address, deleted, and on a dead-letter or expiry queue retried, one at a time or a selection. A queue can be purged, paused, disabled, and its counters reset;
+- a page for each queue: its counters and their charts, its consumers, its attributes, and its messages. The messages are browsed a page at a time, filtered by a selector, each with its headers, properties and body (bytes as hex, decimal or text). Messages can be moved, copied, expired, sent to the dead-letter address, given another priority, deleted, and on a dead-letter or expiry queue retried, one at a time or a selection; or every message the filter selects at once, by the queue's `moveMessages`, `retryMessages`, `expireMessages`, `sendMessagesToDeadLetterAddress`, `changeMessagesPriority` and `removeMessages`. Those can be exported as JSON, whole, and a file of them imported into a queue (see the API below). The scheduled messages can be delivered now, and the messages out with consumers are listed by consumer. A queue can be purged, paused, disabled, and its counters reset;
 - a page for each address: its counters and their charts, queues, producers and attributes, pausing, and creating a queue on it;
 - sending a message to an address or a queue, with string properties and a body editor that highlights and formats JSON and XML, as the logged-in user or as another; and resending one;
 - the explorer: every management resource with its attributes and operations, as Artemis's console shows the JMX tree. Writable attributes can be edited, numeric ones charted, and any operation called from a form typed by its parameters;
@@ -188,6 +188,10 @@ Saranga has a console of its own at `/saranga/` on every `<web>` binding, built 
 - the nodes' page: each node's status, read live, this broker's cluster connections, and each queue's messages and consumers on each node, where load balancing and redistribution show;
 - high availability: each node's HA policy, its backup and whether the backup is in sync, the lock coordinators, and forcing a node to fail over or freezing its replication (`forceFailover`, `freezeReplication`, as Artemis implements them);
 - bridges and connections: a node's broker connections (AMQP, with their bridges, federation and mirrors), core bridges and cluster connections, with their counters, each started or stopped;
+- dead letters: a dead-letter or expiry queue's messages grouped by the queue or the address they came from (`_AMQ_ORIG_QUEUE`, `_AMQ_ORIG_ADDRESS`), or by whether they expired, each group retried, moved, exported or deleted at once by the filter that selects it;
+- configuration: every address-settings match with its settings, and for an address each setting it takes with the match it comes from; adding, changing and removing a match's settings (`addAddressSettings`, `removeAddressSettings`); creating, changing and destroying diverts; starting, stopping and reloading acceptors; the configuration exported as broker properties (`exportConfigAsProperties`) and shown; and reloading the configuration file (`reloadConfigurationFile`);
+- security: the users (`listUser`, `addUser`, `resetUser`, `removeUser`), each security match's roles and permissions, edited as a grid (`addSecuritySettings`, `removeSecuritySettings`), a checker of what each role, or a given user, may do on an address, and clearing the login and permission caches;
+- transactions: the prepared XA transactions, each with the messages it sends and acknowledges, committed or rolled back by hand, and those completed heuristically;
 - a command palette (Ctrl+K) that goes to any page, queue or address;
 - light and dark themes, and preferences kept in the browser: the page size, which queues hold dead letters and expired messages (`^DLQ$` and `^ExpiryQueue$` by default, as in Artemis's console), how bytes read, the diagram's size and whether internal addresses show.
 
@@ -203,7 +207,9 @@ A queue's messages on another node are browsed as a client browses them, with a 
 
 So what another node lets the user do is known only when it is asked: the console offers its actions, and shows that node's error when it refuses one. The live data of another node comes every two seconds as this broker's does, but its charts start from the moment a page opens: the hour of history is this broker's only. The notifications on the events page are this broker's.
 
-Management messages do not give a resource's MBean name, and they cannot list a node's acceptors or broadcast groups, so the explorer of another node has neither.
+Management messages do not give a resource's MBean name, and they cannot list a node's acceptors or broadcast groups, so the explorer of another node has neither, nor does its configuration page.
+
+No management operation lists a broker's address-settings or security-settings matches, so the console lists them for the broker you are logged in to; for another node, the configuration page shows an address's settings (`getAddressSettingsAsJSON`) and the security page checks an address's roles (`getRolesAsJSON`), which every node answers. A message export or import with another node goes over the user's connection to it: the export browses, so the user needs `browse` on the queue there, and the import sends, so they need `send` on its address.
 
 ### Its API
 
@@ -231,9 +237,14 @@ It calls the same MBeans as Jolokia and checks them the same way. The login is t
 | `GET /history?resource=broker&resource=queue.orders` | the last hour of the resources' counters: the broker's every two seconds, an address's or a queue's every 30 seconds |
 | `GET /notifications?since=N` | the last 1,000 management notifications, or those after the `N`th |
 | `GET /nodes` | this broker and the other nodes its cluster connections' topology has, with their node IDs, connectors, backups and cluster connections |
+| `GET /address-settings?address=A` | this broker's address-settings matches, each with its settings as configured and whether management added it, and every setting's name and type; with `address`, the matches that apply to it, most specific first, its settings (as `getAddressSettingsAsJSON`) and the match each comes from. Allowed to whoever may call `getAddressSettingsAsJSON` |
+| `GET /security-settings?address=A` | this broker's security matches, each with its roles as `getRolesAsJSON` writes them, and whether security is enabled; with `address`, the match that applies to it. Allowed to whoever may call `getRolesAsJSON` |
+| `POST /configuration/export` | calls `exportConfigAsProperties`, then answers `{"file", "text"}`: the file it wrote and its text (another node's is written there, and `text` is `null`) |
+| `GET /queues/{name}/export?filter=F&max=N` | up to `N` (10,000 at most) of the queue's messages `F` selects, whole: every property with its type and the body whole, which `browse` cuts (see below). Allowed to whoever may call the queue's `browse` |
+| `POST /queues/{name}/import` with an array of messages | sends them to the queue, in order, as they were exported but for their IDs, as the user (so the address's `send` permission applies; the guard must allow the queue's `sendMessage` too), and answers `{"sent"}`, with `error` if one could not be sent |
 | `GET /openapi.json` | the API as OpenAPI 3.1, without a login |
 
-Every request above but `/session`, `/views`, `/nodes`, `/events`, `/history`, `/notifications` and `/openapi.json` is served for another node too, at `/saranga/api/v1/nodes/{node}/...`, where `{node}` is a node ID from `GET /nodes` (`local` is this broker). It is sent to that node as management messages, as the user, and that node allows or refuses it: there, `/me` and `/me/can` answer `null` for what it decides when asked, and an operation's `allowed` is `null`. A node that is not in the topology is 404, one that cannot be reached 502 (504 when it does not answer), and one that refuses the user 403. At `/saranga/api/v1/nodes/all/{listing}` a listing spans every node: each row has its `node`, the rows are sorted and paged across the nodes, and `errors` names those that could not answer. A view of the live stream may name a `node` too, or `all` for a listing.
+Every request above but `/session`, `/views`, `/nodes`, `/events`, `/history`, `/notifications`, `/address-settings`, `/security-settings` and `/openapi.json` is served for another node too, at `/saranga/api/v1/nodes/{node}/...`, where `{node}` is a node ID from `GET /nodes` (`local` is this broker). It is sent to that node as management messages, as the user, and that node allows or refuses it: there, `/me` and `/me/can` answer `null` for what it decides when asked, and an operation's `allowed` is `null`. A node that is not in the topology is 404, one that cannot be reached 502 (504 when it does not answer), and one that refuses the user 403. At `/saranga/api/v1/nodes/all/{listing}` a listing spans every node: each row has its `node`, the rows are sorted and paged across the nodes, and `errors` names those that could not answer. A view of the live stream may name a `node` too, or `all` for a listing.
 
 A filter's `OPERATION` is one of `EQUALS`, `NOT_EQUALS`, `CONTAINS`, `NOT_CONTAINS`, `GREATER_THAN` and `LESS_THAN`, as in the `list*` operations. A request may log in with HTTP Basic instead of the session. A request that changes something, including the login, must carry the header `X-Saranga-Console: 1`, which a cross-site form cannot send. A failure comes back as `{"error", "status"}`, with status 401 (no login, or a wrong one), 403 (not permitted, or no header), 404 (nothing there), 429 (too many failed logins) or 400.
 
@@ -265,6 +276,16 @@ curl -s -u admin:admin -X PUT -H 'X-Saranga-Console: 1' -H 'Content-Type: applic
 ```
 
 The history samples the broker's addresses and queues whose address settings enable metrics, as `/metrics` does, the first 1,000 of each by name. A stream's views are read through the guard and audited as any call is; the stream does not keep its session from idling out.
+
+An exported message is `{"messageID", "address", "type", "durable", "priority", "timestamp", "expiration", "userID", "properties": [{"name", "type", "value"}], "text"}`, with `body` (base64) instead of `text` for a message that is not text. A property's `type` is `null`, `boolean`, `byte`, `short`, `int`, `long`, `float`, `double`, `char`, `bytes` (base64) or `string`; a `long` is written as a string, since JavaScript cannot hold every long as a number. A large message's body is read whole.
+
+```bash
+# Export the red messages of orders, then import them into orders.replay
+curl -s -u admin:admin -o red.json \
+  "http://localhost:8161/saranga/api/v1/queues/orders/export?filter=color%20%3D%20'red'"
+curl -s -u admin:admin -X POST -H 'X-Saranga-Console: 1' -H 'Content-Type: application/json' \
+  --data-binary @red.json http://localhost:8161/saranga/api/v1/queues/orders.replay/import
+```
 
 A resource is named as for management messages: `broker`, `address.<name>`, `queue.<name>`, `divert.<name>`, `acceptor.<name>`, `bridge.<name>`, `clusterconnection.<name>` and so on, with the process's as `java.lang.Runtime`, `java.lang.Memory`, `java.lang.OperatingSystem`, `java.lang.Threading` and `java.lang.ClassLoading`. Arguments are converted to the parameters' types as Jolokia converts them, so a string serves for any of them.
 

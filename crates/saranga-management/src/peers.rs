@@ -24,6 +24,7 @@ use saranga_client::{Connection, ConnectionOptions, Connector, SessionOptions};
 use saranga_core_protocol::ErrorType;
 use saranga_core_protocol::transport::TransportConfiguration;
 use saranga_server::Broker;
+use saranga_server::management::export::message_json;
 use saranga_server::management::json::Json;
 use saranga_server::management::requestor::{RequestError, Requestor};
 use saranga_server::management::{Composed, composite};
@@ -183,6 +184,18 @@ pub(crate) enum Request<'a> {
         skip: usize,
         take: usize,
     },
+    /// At most `max` of a queue's messages, whole, as the console's export
+    /// writes them.
+    Export {
+        queue: &'a str,
+        filter: Option<&'a str>,
+        max: usize,
+    },
+    /// Messages sent to an address, in order: the console's import.
+    Import {
+        address: &'a str,
+        messages: Vec<saranga_message::CoreMessage>,
+    },
 }
 
 /// How long a browser waits for a message more before it takes the queue
@@ -202,6 +215,12 @@ impl Peers {
     ) -> Result<Json, Problem> {
         let link = self.link(broker, node, who).await?;
         *link.used.lock().unwrap() = Instant::now();
+        let request_queue = match &request {
+            Request::Browse { queue, .. } | Request::Export { queue, .. } => {
+                Some((*queue).to_owned())
+            }
+            _ => None,
+        };
         let guard = link.requestor.lock().await;
         let Some(r) = guard.as_ref() else {
             return Err(unreachable(node, "the link was closed"));
@@ -213,21 +232,37 @@ impl Peers {
                 arguments,
             } => r.invoke(resource, operation, arguments, TIMEOUT).await,
             Request::Attribute { resource, name } => r.attribute(resource, name, TIMEOUT).await,
-            Request::Browse {
-                queue,
-                filter,
-                skip,
-                take,
-            } => {
-                let browsed = browse(r.session(), queue, filter, skip, take).await;
+            Request::Browse { .. } | Request::Export { .. } | Request::Import { .. } => {
+                let done = match request {
+                    Request::Browse {
+                        queue,
+                        filter,
+                        skip,
+                        take,
+                    } => browse(r.session(), queue, filter, skip, take, shown).await,
+                    Request::Export { queue, filter, max } => {
+                        browse(r.session(), queue, filter, 0, max, whole).await
+                    }
+                    Request::Import { address, messages } => {
+                        import(r.session(), address, messages).await
+                    }
+                    _ => unreachable!(),
+                };
+                let queue = match &request_queue {
+                    Some(q) => q.as_str(),
+                    None => "",
+                };
                 drop(guard);
                 *link.used.lock().unwrap() = Instant::now();
-                return browsed.map_err(|e| match e.kind() {
+                return done.map_err(|e| match e.kind() {
                     Some(ErrorType::SecurityException) => client_problem(node, &e, false),
                     Some(ErrorType::QueueDoesNotExist) => Problem::new(
                         StatusCode::NOT_FOUND,
                         format!("no such resource: queue.{queue}"),
                     ),
+                    Some(ErrorType::AddressDoesNotExist) => {
+                        Problem::new(StatusCode::NOT_FOUND, e.to_string())
+                    }
                     Some(_) => Problem::new(StatusCode::BAD_REQUEST, e.to_string()),
                     None => unreachable(node, e),
                 });
@@ -379,14 +414,62 @@ impl Peers {
     }
 }
 
-/// A page of a queue's messages, as a client browses them, each written as
-/// the queue's `browse` writes a message.
+/// A browsed message as the queue's `browse` writes it.
+fn shown(d: &saranga_client::Delivery) -> Json {
+    composite(
+        &d.message,
+        &Composed {
+            protocol: None,
+            redelivered: d.delivery_count > 1,
+            large: d.is_large(),
+            persistent_size: i64::from(d.encode_size()),
+        },
+        MESSAGE_ATTRIBUTE_LIMIT,
+    )
+}
+
+/// A browsed message whole, as the console's export writes it: a large
+/// message's body is read with it.
+fn whole(d: &saranga_client::Delivery) -> Json {
+    message_json(&d.message)
+}
+
+/// Messages sent to an address in order, as many as can be: how many were.
+async fn import(
+    session: &saranga_client::Session,
+    address: &str,
+    messages: Vec<saranga_message::CoreMessage>,
+) -> saranga_client::Result<Json> {
+    let producer = session.create_producer(Some(address)).await?;
+    let mut sent = 0i64;
+    let mut failed = None;
+    for m in messages {
+        if let Err(e) = producer.send(m).await {
+            failed = Some(e);
+            break;
+        }
+        sent += 1;
+    }
+    producer.close();
+    match failed {
+        // None sent: the node's refusal is the answer.
+        Some(e) if sent == 0 => Err(e),
+        Some(e) => Ok(Json::object()
+            .with("sent", sent)
+            .with("error", e.to_string())),
+        None => Ok(Json::object().with("sent", sent)),
+    }
+}
+
+/// A page of a queue's messages, as a client browses them, each written by
+/// `write`.
 async fn browse(
     session: &saranga_client::Session,
     queue: &str,
     filter: Option<&str>,
     skip: usize,
     take: usize,
+    write: fn(&saranga_client::Delivery) -> Json,
 ) -> saranga_client::Result<Json> {
     let browser = session.create_consumer(queue, filter, true).await?;
     let mut out = Vec::new();
@@ -400,16 +483,7 @@ async fn browse(
             if seen <= skip {
                 continue;
             }
-            out.push(composite(
-                &d.message,
-                &Composed {
-                    protocol: None,
-                    redelivered: d.delivery_count > 1,
-                    large: d.is_large(),
-                    persistent_size: i64::from(d.encode_size()),
-                },
-                MESSAGE_ATTRIBUTE_LIMIT,
-            ));
+            out.push(write(&d));
         }
         saranga_client::Result::Ok(())
     }

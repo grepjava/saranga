@@ -50,6 +50,9 @@ macro_rules! string_enum {
         }
 
         impl AsSettingValue for $name {
+            const KIND: &'static str = "string";
+            const CHOICES: &'static [&'static str] = &[$($text),+];
+
             fn setting_value(&self) -> SettingValue {
                 SettingValue::Text(self.as_str().to_owned())
             }
@@ -68,34 +71,45 @@ pub enum SettingValue {
 
 /// Turns a field into the value `toJSON` writes.
 pub trait AsSettingValue {
+    /// The JSON type `toJSON` writes the field as: `string`, `integer`,
+    /// `number` or `boolean`.
+    const KIND: &'static str;
+    /// An enum's values; none for anything else.
+    const CHOICES: &'static [&'static str] = &[];
+
     fn setting_value(&self) -> SettingValue;
 }
 
 impl AsSettingValue for String {
+    const KIND: &'static str = "string";
     fn setting_value(&self) -> SettingValue {
         SettingValue::Text(self.clone())
     }
 }
 
 impl AsSettingValue for i64 {
+    const KIND: &'static str = "integer";
     fn setting_value(&self) -> SettingValue {
         SettingValue::Long(*self)
     }
 }
 
 impl AsSettingValue for i32 {
+    const KIND: &'static str = "integer";
     fn setting_value(&self) -> SettingValue {
         SettingValue::Long(i64::from(*self))
     }
 }
 
 impl AsSettingValue for f64 {
+    const KIND: &'static str = "number";
     fn setting_value(&self) -> SettingValue {
         SettingValue::Double(*self)
     }
 }
 
 impl AsSettingValue for bool {
+    const KIND: &'static str = "boolean";
     fn setting_value(&self) -> SettingValue {
         SettingValue::Bool(*self)
     }
@@ -226,6 +240,16 @@ macro_rules! address_settings {
         impl AddressSettings {
             /// The Rust names of the fields, in `metaBean` order.
             pub const FIELDS: &'static [&'static str] = &[$(stringify!($field)),+];
+
+            /// Every field by its `metaBean` name, with the JSON type
+            /// `toJSON` writes it as and an enum's values.
+            pub fn kinds() -> Vec<(String, &'static str, &'static [&'static str])> {
+                vec![$((
+                    java_name(stringify!($field)),
+                    <$ty as AsSettingValue>::KIND,
+                    <$ty as AsSettingValue>::CHOICES,
+                )),+]
+            }
 
             /// The fields that are set, by their `metaBean` names, in
             /// registration order (`toJSON` ignoring null attributes).
@@ -547,6 +571,9 @@ impl AddressSettings {
 }
 
 impl AsSettingValue for RoutingType {
+    const KIND: &'static str = "string";
+    const CHOICES: &'static [&'static str] = &["MULTICAST", "ANYCAST"];
+
     fn setting_value(&self) -> SettingValue {
         SettingValue::Text(
             match self {

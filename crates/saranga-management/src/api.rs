@@ -51,6 +51,7 @@ use saranga_server::management::json::Json;
 use saranga_server::management::view_fields;
 use tower::ServiceExt;
 
+use crate::admin;
 use crate::console::{self, Auth, Console};
 use crate::jolokia::{Agent, Caller, Failure};
 use crate::live::{self, Live};
@@ -93,6 +94,10 @@ const BROKER_ACTIONS: &[&str] = &[
     "createQueue",
     "destroyQueue",
     "listNetworkTopology",
+    "getAddressSettingsAsJSON",
+    "getRolesAsJSON",
+    "listUser",
+    "listPreparedTransactionDetailsAsJSON",
 ];
 
 /// The attributes `GET /broker` reads, those the broker's control has.
@@ -176,6 +181,11 @@ fn routes() -> Router<Arc<ApiState>> {
         .route("/events/{stream}", put(live::watch))
         .route("/history", get(live::history))
         .route("/notifications", get(live::notifications))
+        .route("/address-settings", get(admin::address_settings))
+        .route("/security-settings", get(admin::security_settings))
+        .route("/configuration/export", post(admin::export))
+        .route("/queues/{name}/export", get(admin::export_messages))
+        .route("/queues/{name}/import", post(admin::import_messages))
         .fallback(no_such_api)
 }
 

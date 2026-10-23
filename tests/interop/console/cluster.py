@@ -179,6 +179,27 @@ check("an operation on a resource node 3 does not have fails with node 3's error
 status, r = request("GET", f"/nodes/{N2}/resources/nonsense")
 check("a resource name that is no resource", status == 404, r)
 
+# A queue's messages exported whole from one node and imported into another,
+# each on the user's link.
+status, exported = request("GET", f"/nodes/{N2}/queues/only.node2/export")
+check("node 2's queue exported whole",
+      status == 200 and isinstance(exported, list) and len(exported) == 3
+      and all(isinstance(m.get("properties"), list) and ("text" in m or "body" in m) for m in exported),
+      (status, exported))
+status, r = request("POST", f"/nodes/{N3}/queues/only.node3/import", exported, MARK)
+check("imported into node 3's queue", status == 200 and r == {"sent": 3}, (status, r))
+status, back = request("GET", f"/nodes/{N3}/queues/only.node3/export")
+same = lambda ms: [(m.get("text"), m.get("body"), m.get("priority"), m.get("properties")) for m in ms or []]
+check("which has them as they were exported", status == 200 and same(back) == same(exported), (status, back))
+status, r = request("GET", f"/nodes/{N3}/queues/only.node3/export?filter=" + urllib.parse.quote("AMQPriority > 9"))
+check("an export selects with a filter there too", status == 200 and r == [], (status, r))
+invoke(N3, "queue.only.node3", "removeAllMessages()")
+status, r = request("GET", f"/nodes/{N2}/address-settings")
+check("the address settings' matches are this broker's alone", status == 400, (status, r))
+status, r = invoke(N2, "broker", "getAddressSettingsAsJSON", ["only.node2"])
+check("node 2 gives an address's settings", status == 200 and "maxSizeBytes" in json.loads(r.get("result", "{}")),
+      (status, r))
+
 # The nodes check the user themselves.
 status, r = request("GET", f"/nodes/{N2}/broker", user="visitor:visitor")
 check("a user node 2 does not know is refused there", status == 403, (status, r))

@@ -531,6 +531,11 @@ pub struct Broker {
     management: management::Management,
     /// Reads the configuration again, for `reloadConfigurationFile`.
     config_loader: Mutex<Option<ConfigLoader>>,
+    /// Writes the configuration as broker properties, for
+    /// `exportConfigAsProperties`.
+    config_exporter: Mutex<Option<ConfigExporter>>,
+    /// The file the last `exportConfigAsProperties` wrote.
+    config_exported: Mutex<Option<std::path::PathBuf>>,
     /// The connections, sessions, consumers and producers.
     registry: Arc<registry::Registry>,
     /// The basic security manager's users.
@@ -551,6 +556,12 @@ pub struct Broker {
 
 /// Reads the configuration files again (`ReloadManager`).
 pub type ConfigLoader = Arc<dyn Fn() -> std::result::Result<reload::Reload, String> + Send + Sync>;
+
+/// `Configuration.exportAsProperties` into the file
+/// `exportConfigAsProperties` writes: `broker_config_as_properties.txt` in
+/// `java.io.tmpdir`.
+pub type ConfigExporter =
+    Arc<dyn Fn() -> std::result::Result<std::path::PathBuf, String> + Send + Sync>;
 
 impl Broker {
     /// Starts the broker: with persistence, takes the journal directory's
@@ -837,6 +848,8 @@ impl Broker {
             extra_records: Mutex::new(extra_records),
             management: management::Management::new(config.management),
             config_loader: Mutex::new(None),
+            config_exporter: Mutex::new(None),
+            config_exported: Mutex::new(None),
             registry,
             users: config.users.clone(),
             security_records: Mutex::default(),
@@ -1263,6 +1276,41 @@ impl Broker {
     /// How `reloadConfigurationFile` reads the configuration again.
     pub fn set_config_loader(&self, loader: ConfigLoader) {
         *self.config_loader.lock().unwrap_or_else(|e| e.into_inner()) = Some(loader);
+    }
+
+    /// How `exportConfigAsProperties` writes the configuration.
+    pub fn set_config_exporter(&self, exporter: ConfigExporter) {
+        *self
+            .config_exporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(exporter);
+    }
+
+    /// `exportConfigAsProperties`. A broker without an instance has no
+    /// configuration file to export.
+    pub async fn export_config_as_properties(&self) -> std::result::Result<(), String> {
+        let exporter = self
+            .config_exporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| "this broker has no configuration file to export".to_owned())?;
+        let file = tokio::task::spawn_blocking(move || exporter())
+            .await
+            .map_err(|e| e.to_string())??;
+        *self
+            .config_exported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(file);
+        Ok(())
+    }
+
+    /// The file the last `exportConfigAsProperties` wrote, if one did.
+    pub fn exported_config(&self) -> Option<std::path::PathBuf> {
+        self.config_exported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// `reloadConfigurationFile`: the configuration is read again and
