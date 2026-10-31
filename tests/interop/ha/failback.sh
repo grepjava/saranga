@@ -36,11 +36,15 @@ cargo build -q --release -p saranga-cli --manifest-path "$(native "$ROOT/Cargo.t
 mkdir -p "$ROOT/target/ha"
 WORK="$(mktemp -d -p "$ROOT/target/ha")"
 P="$WORK/primary" B="$WORK/backup" SHARED="$WORK/shared" MARK="$WORK/marker"
-PORTP=62616 PORTB=62716
-CLIENT_PID= CLI_PID=
+# PORT_SHIFT moves both brokers' ports (for a machine that reserves 62616
+# or 62716); the output shows them as 62616 and 62716 all the same.
+SHIFT="${PORT_SHIFT:-0}"
+PORTP=$((62616 + SHIFT)) PORTB=$((62716 + SHIFT))
+CLIENT_PID= CLI_PID= AMQP_PID=
 cleanup() {
   [[ -n "$CLIENT_PID" ]] && kill "$CLIENT_PID" 2>/dev/null
   [[ -n "$CLI_PID" ]] && kill "$CLI_PID" 2>/dev/null
+  [[ -n "$AMQP_PID" ]] && kill "$AMQP_PID" 2>/dev/null
   for i in "$P" "$B"; do
     [[ -d "$i" ]] && instance "$i" stop > /dev/null 2>&1
   done
@@ -70,6 +74,11 @@ make_instance() {
   sed -i -E \
     -e "s#<(paging|bindings|journal|large-messages)-directory>[^<]*<#<\1-directory>$shared/\1<#" \
     "$dir/etc/broker.xml"
+  # MAX_DISK_USAGE: for a machine whose disk is past create's 90%, where
+  # both brokers would block every producer.
+  if [[ -n "${MAX_DISK_USAGE:-}" ]]; then
+    sed -i -E "s#<max-disk-usage>[0-9]+</max-disk-usage>#<max-disk-usage>$MAX_DISK_USAGE</max-disk-usage>#" "$dir/etc/broker.xml"
+  fi
 }
 
 # As the runbook suite runs bin/artemis.
@@ -149,8 +158,8 @@ client() {
 }
 
 suite() {
-  make_instance "$PRIMARY" "$P" 1000 "$PORTB" --failover-on-shutdown
-  make_instance "$BACKUP" "$B" 1100 "$PORTP" --backup
+  make_instance "$PRIMARY" "$P" $((1000 + SHIFT)) "$PORTB" --failover-on-shutdown
+  make_instance "$BACKUP" "$B" $((1100 + SHIFT)) "$PORTP" --backup
 
   # 1. The backup announces itself to the primary.
   step "artemis run (primary)"
@@ -179,6 +188,11 @@ suite() {
     --url "tcp://localhost:$PORTP?ha=true;reconnectAttempts=-1;retryInterval=500" \
     --destination queue://cli --message-count 20 --receive-timeout -1 > "$cli" &
   CLI_PID=$!
+  step "Failover.java amqp-failover failover:(amqp://localhost:$PORTP) (in the background)"
+  local amqp="$WORK/amqp.out"
+  client amqp-failover "amqp://localhost:$PORTP" "$(native "$MARK")" "$PORTB" > "$amqp" &
+  AMQP_PID=$!
+  wait_for "$amqp" "amqp: sent 5" && echo "amqp client: sent 5"
   # Its first ten received and acknowledged.
   sleep 5
   step "artemis kill (primary)"
@@ -188,6 +202,9 @@ suite() {
   said backup "$B"
   touch "$MARK.1"
   wait_for "$out" "received" && grep -E "^(failover event|received)" "$out" | sed 's/^/client: /'
+  wait_for "$amqp" "amqp: done" && grep "^amqp: " "$amqp" | grep -v -E "sent 5|done"
+  wait "$AMQP_PID"
+  AMQP_PID=
   step "artemis producer (backup)"
   instance "$B" producer --user admin --password admin --url "tcp://localhost:$PORTB" \
     --destination queue://cli --message-count 10 | grep -o "Produced: .*"
@@ -221,6 +238,8 @@ suite() {
 
 OUT="$(mktemp)"
 suite > "$OUT" 2>&1
+# The ports as they would be without PORT_SHIFT.
+[[ "$SHIFT" != 0 ]] && sed -i -e "s/\b$PORTP\b/62616/g" -e "s/\b$PORTB\b/62716/g" "$OUT"
 if [[ -n "${UPDATE:-}" ]]; then
   cp "$OUT" "$HERE/failback.expected.txt"
   echo "== updated $HERE/failback.expected.txt"

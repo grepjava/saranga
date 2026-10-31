@@ -21,6 +21,11 @@
 //       It prints "committed <n>" every hundred, then what was lost: a
 //       message whose transaction committed and that was never received, or
 //       one received by two commits that succeeded.
+//   java -cp '<artemis>/lib/*' Failover.java amqp-failover <amqp-url> <marker> <backup-port>
+//       Qpid JMS given only the primary, failover:(<amqp-url>), sends 5
+//       messages to queue amqp-failover, waits for <marker>.1 (the primary
+//       killed), then receives them: it can only reach the backup through
+//       the failover-server-list the primary's Open gave it.
 // tests/interop/ha/failback.sh and replication.sh run it; it prints what it
 // saw.
 
@@ -41,9 +46,44 @@ public class Failover {
             case "failover" -> failover(args[1], args[2], Integer.parseInt(args[3]), 2);
             case "failover-once" -> failover(args[1], args[2], Integer.parseInt(args[3]), 1);
             case "load" -> load(args[1], args[2]);
+            case "amqp-failover" -> amqpFailover(args[1], args[2], Integer.parseInt(args[3]));
             default -> throw new IllegalArgumentException(args[0]);
         }
         System.exit(0);
+    }
+
+    static void amqpFailover(String url, String marker, int backupPort) throws Exception {
+        // Without the server's list, reconnecting to the primary alone gives
+        // up after these attempts.
+        String failover = "failover:(" + url + ")?failover.maxReconnectAttempts=40&failover.reconnectDelay=500"
+            + "&failover.useReconnectBackOff=false";
+        ConnectionFactory cf = new org.apache.qpid.jms.JmsConnectionFactory("admin", "admin", failover);
+        try (Connection connection = cf.createConnection()) {
+            connection.start();
+            Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            javax.jms.Queue queue = session.createQueue("amqp-failover");
+            MessageProducer producer = session.createProducer(queue);
+            for (int i = 0; i < 5; i++) {
+                producer.send(session.createTextMessage("amqp message " + i));
+            }
+            System.out.println("amqp: sent 5");
+            await(Paths.get(marker + ".1"));
+            MessageConsumer consumer = session.createConsumer(queue);
+            int received = 0;
+            while (received < 5) {
+                TextMessage m = (TextMessage) consumer.receive(30000);
+                if (m == null) {
+                    break;
+                }
+                received++;
+            }
+            System.out.println("amqp: received " + received);
+            java.net.URI at = ((org.apache.qpid.jms.JmsConnection) connection).getConnectedURI();
+            System.out.println("amqp: connected to " + (at != null && at.getPort() == backupPort ? "the backup" : at));
+        } catch (JMSException e) {
+            System.out.println("amqp: " + e);
+        }
+        System.out.println("amqp: done");
     }
 
     static String hostPort(TransportConfiguration tc) {

@@ -18,6 +18,8 @@ client: sent 10
 === artemis producer (primary)
 Produced: 10 messages
 === artemis consumer --url tcp://localhost:62616?ha=true;reconnectAttempts=-1 (in the background)
+=== Failover.java amqp-failover failover:(amqp://localhost:62616) (in the background)
+amqp client: sent 5
 === artemis kill (primary)
 primary: down
 backup: listening
@@ -25,6 +27,8 @@ backup: AMQ221010: Backup Server is now active
 client: failover event: FAILURE_DETECTED
 client: failover event: FAILOVER_COMPLETED
 client: received 10
+amqp: received 5
+amqp: connected to the backup
 === artemis producer (backup)
 Produced: 10 messages
 consumer: Consumed: 20 messages

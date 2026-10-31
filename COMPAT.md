@@ -136,7 +136,6 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
   - **SASL mechanisms:** SCRAM-SHA-256/512, GSSAPI, OAUTHBEARER and XOAUTH2. An acceptor's `saslMechanisms` that lists them gets outcome `sys` for them.
   - **Core-message tunnelling** (`AMQ_CORE_MESSAGE_TUNNELING`): Core messages always go out converted to AMQP.
   - **Connection routers and interceptors.**
-  - The `failover-server-list` connection property.
 - **Large messages:**
   - An AMQP large message is held whole in memory while the broker holds it. It is also written to its large-message file, with Artemis's record, so either broker reads the other's.
   - A copy to a dead-letter or expiry address copies the file as it is. Artemis rewrites the copy's header and properties without the expiry.

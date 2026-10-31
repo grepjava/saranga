@@ -282,6 +282,41 @@ pub struct Member {
     pub unique_event_id: i64,
 }
 
+impl Member {
+    /// `toBackupURI`'s parts: the backup's host (`localhost` without one),
+    /// port (0 without one) and whether it has `sslEnabled`; `None` without
+    /// a backup.
+    pub fn backup_address(&self) -> Option<(String, i32, bool)> {
+        self.backup.as_ref().map(connector_address)
+    }
+}
+
+/// A connector's `host`, `port` and `sslEnabled` as `ConfigurationHelper`
+/// reads them: any value as a string; a number as an int; a string that
+/// does not parse, or another type, as the default (`localhost`, 0, false).
+fn connector_address(tc: &TransportConfiguration) -> (String, i32, bool) {
+    let param = |name: &str| tc.params.iter().find(|(k, _)| k.to_string_lossy() == name);
+    let host = match param("host") {
+        Some((_, ParamValue::String(s))) => s.to_string_lossy(),
+        Some((_, ParamValue::Int(i))) => i.to_string(),
+        Some((_, ParamValue::Long(l))) => l.to_string(),
+        Some((_, ParamValue::Bool(b))) => b.to_string(),
+        None => "localhost".to_owned(),
+    };
+    let port = match param("port") {
+        Some((_, ParamValue::Int(i))) => *i,
+        Some((_, ParamValue::Long(l))) => *l as i32,
+        Some((_, ParamValue::String(s))) => s.to_string_lossy().parse().unwrap_or(0),
+        _ => 0,
+    };
+    let ssl = match param("sslEnabled") {
+        Some((_, ParamValue::Bool(b))) => *b,
+        Some((_, ParamValue::String(s))) => s.to_string_lossy().eq_ignore_ascii_case("true"),
+        _ => false,
+    };
+    (host, port, ssl)
+}
+
 /// `ClusterTopologyListener`.
 pub trait TopologyListener: Send + Sync {
     fn node_up(&self, member: &Member, last: bool);

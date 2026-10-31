@@ -30,6 +30,7 @@ use crate::federation::constants as fed;
 use crate::federation::manager::ConsumerKind;
 use crate::federation::{FedLink, Federation};
 use crate::frame::{self, AMQP_HEADER, FrameBody, SASL_HEADER};
+use crate::javamap::{self, JavaMap};
 use crate::link::{self, LinkError, ReceiverTarget, SenderSource, capability};
 use crate::message::AmqpMessage;
 use crate::messaging::{
@@ -1461,9 +1462,43 @@ impl Conn {
     }
 
     fn local_open(&self) -> Open {
+        // AMQPConnectionContext's connectionProperties, a HashMap.
+        let mut props = JavaMap::new(javamap::Kind::Hash(None));
+        props.insert(Symbol::from("product"), Value::string("saranga"));
+        props.insert(
+            Symbol::from("version"),
+            Value::string(env!("CARGO_PKG_VERSION")),
+        );
+        // getConnectionPropertiesForResponse: where this node's member of the
+        // first cluster connection has a backup, the backup, for a failover
+        // client to reconnect to.
+        let backup = self
+            .broker
+            .cluster()
+            .and_then(|c| c.member(self.broker.node_id()))
+            .and_then(|m| m.backup_address());
+        if let Some((host, port, ssl)) = backup {
+            let mut details = JavaMap::new(javamap::Kind::Hash(None));
+            details.insert(Symbol::from("network-host"), Value::string(host.clone()));
+            details.insert(
+                Symbol::from("scheme"),
+                Value::string(if ssl { "amqps" } else { "amqp" }),
+            );
+            details.insert(Symbol::from("hostname"), Value::string(host));
+            details.insert(Symbol::from("port"), Value::Int(port));
+            let details = details
+                .iter()
+                .map(|(k, v)| (Value::Symbol(k.clone()), v.clone()))
+                .collect();
+            props.insert(
+                Symbol::from("failover-server-list"),
+                Value::List(vec![Value::Map(details)]),
+            );
+        }
         let mut properties = Fields::default();
-        properties.insert("product", Value::string("saranga"));
-        properties.insert("version", Value::string(env!("CARGO_PKG_VERSION")));
+        for (k, v) in props.iter() {
+            properties.insert(k.clone(), v.clone());
+        }
         Open {
             container_id: self.broker.node_id().to_owned(),
             hostname: None,
