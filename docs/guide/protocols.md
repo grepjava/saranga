@@ -84,12 +84,13 @@ Clients connect as they do to Artemis, for example `ws://broker:61616` for Paho,
 
 - `webSocketMaxFramePayloadLength` (65536 by default). A larger frame from a client closes the connection with status 1009. The deprecated `stompMaxFramePayloadLength` is still read, with Artemis's `AMQ221038` message.
 - `webSocketEncoderType`: `binary` (the default) or `text`.
+- `webSocketCompressionSupported` (false by default): offers `permessage-deflate` and `deflate-frame`, as Netty's compression handler does in Artemis. What clients compress is inflated; the broker's own messages go out uncompressed, as Artemis's do.
 
 Where Saranga differs:
 
 - One broker write is one WebSocket message, which can hold several protocol frames. Clients read the payloads as a stream, so this does not affect them.
 - A request that is not a GET, or an HTTP request without an upgrade, gets `403 Forbidden`.
-- Compression (`webSocketCompressionSupported`) and the old draft-00 handshake are not supported.
+- The old draft-00 handshake is not supported.
 
 See [COMPAT.md](../../COMPAT.md#websocket-differences).
 

@@ -104,7 +104,11 @@ public class WebSocket {
     }
 
     /** A WebSocket frame. */
-    record Frame(boolean fin, int opcode, byte[] payload) {
+    record Frame(boolean fin, int rsv, int opcode, byte[] payload) {
+        Frame(boolean fin, int opcode, byte[] payload) {
+            this(fin, 0, opcode, payload);
+        }
+
         String text() {
             return new String(payload, StandardCharsets.UTF_8);
         }
@@ -135,11 +139,21 @@ public class WebSocket {
         }
 
         static RawWs upgrade(String protocols, String version) throws IOException {
+            return upgradeWith(protocols, version, "");
+        }
+
+        static RawWs upgradeWith(String protocols, String version, String extraHeaders) throws IOException {
             String key = Base64.getEncoder().encodeToString(new byte[16]);
             String h = "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\n"
                 + (version == null ? "" : "Sec-WebSocket-Version: " + version + "\r\n")
-                + (protocols == null ? "" : "Sec-WebSocket-Protocol: " + protocols + "\r\n");
+                + (protocols == null ? "" : "Sec-WebSocket-Protocol: " + protocols + "\r\n")
+                + extraHeaders;
             return new RawWs("GET", h);
+        }
+
+        /** An upgrade offering these Sec-WebSocket-Extensions. */
+        static RawWs offering(String extensions) throws IOException {
+            return upgradeWith("v12.stomp", "13", "Sec-WebSocket-Extensions: " + extensions + "\r\n");
         }
 
         static RawWs upgrade(String protocols) throws IOException {
@@ -157,8 +171,12 @@ public class WebSocket {
         }
 
         void send(int opcode, boolean fin, byte[] payload) throws IOException {
+            send(opcode, fin, 0, payload);
+        }
+
+        void send(int opcode, boolean fin, int rsv, byte[] payload) throws IOException {
             ByteArrayOutputStream f = new ByteArrayOutputStream();
-            f.write((fin ? 0x80 : 0) | opcode);
+            f.write((fin ? 0x80 : 0) | (rsv << 4) | opcode);
             if (payload.length < 126) {
                 f.write(0x80 | payload.length);
             } else if (payload.length <= 0xFFFF) {
@@ -193,7 +211,7 @@ public class WebSocket {
             else if (len == 127) len = in.readLong();
             byte[] p = new byte[(int) len];
             in.readFully(p);
-            return new Frame((b0 & 0x80) != 0, b0 & 0x0F, p);
+            return new Frame((b0 & 0x80) != 0, (b0 >> 4) & 7, b0 & 0x0F, p);
         }
 
         /** The frames of the next message, from its first data frame to its last. */
@@ -514,6 +532,143 @@ public class WebSocket {
             javax.jms.Message m = consumer.receive(5000);
             check(m != null, "no message");
             eq("amqp over ws", ((TextMessage) m).getText(), "body");
+        }
+    }
+
+    // ------------------------------------------------- compression
+    // webSocketCompressionSupported=true on the acceptor (broker.xml):
+    // Netty's WebSocketServerCompressionHandler agrees on permessage-deflate
+    // (RFC 7692) or deflate-frame.
+
+    /** The client's side of a deflate extension: raw deflate, the window kept. */
+    static final class Deflate {
+        final java.util.zip.Deflater deflater = new java.util.zip.Deflater(java.util.zip.Deflater.DEFAULT_COMPRESSION, true);
+
+        /** A sync flush of `in`, its 00 00 ff ff tail left off. */
+        byte[] compress(byte[] in) {
+            return compress(in, true);
+        }
+
+        /** A sync flush of `in`; its tail left off when it ends the message. */
+        byte[] compress(byte[] in, boolean last) {
+            deflater.setInput(in);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            do {
+                n = deflater.deflate(buf, 0, buf.length, java.util.zip.Deflater.SYNC_FLUSH);
+                out.write(buf, 0, n);
+            } while (n == buf.length);
+            byte[] z = out.toByteArray();
+            return last ? Arrays.copyOf(z, z.length - 4) : z;
+        }
+    }
+
+    static void t_deflateAgreed() throws Exception {
+        try (RawWs ws = RawWs.offering("permessage-deflate; client_max_window_bits")) {
+            eq("HTTP/1.1 101 Switching Protocols", ws.status, "status");
+            eq("permessage-deflate", ws.headers.get("sec-websocket-extensions"), "extension");
+        }
+    }
+
+    static void t_deflateClientWindowEchoed() throws Exception {
+        try (RawWs ws = RawWs.offering("permessage-deflate; client_max_window_bits=10")) {
+            eq("permessage-deflate;client_max_window_bits=10", ws.headers.get("sec-websocket-extensions"), "extension");
+        }
+    }
+
+    // The server keeps its context and its window: an offer asking
+    // otherwise is declined, and the next acceptable one taken.
+    static void t_deflateOffersTheServerCannotHonourDeclined() throws Exception {
+        for (String offer : List.of("permessage-deflate; server_no_context_takeover",
+                                    "permessage-deflate; server_max_window_bits=10",
+                                    "permessage-deflate; client_max_window_bits=7",
+                                    "permessage-deflate; foo")) {
+            try (RawWs ws = RawWs.offering(offer)) {
+                eq("HTTP/1.1 101 Switching Protocols", ws.status, offer + ": status");
+                check(!ws.headers.containsKey("sec-websocket-extensions"), offer + ": agreed " + ws.headers.get("sec-websocket-extensions"));
+                eq("CONNECTED", stompConnect(ws).split("\n")[0], offer + ": STOMP uncompressed");
+            }
+        }
+        try (RawWs ws = RawWs.offering("permessage-deflate; server_no_context_takeover, permessage-deflate; client_no_context_takeover")) {
+            eq("permessage-deflate", ws.headers.get("sec-websocket-extensions"), "the second offer");
+        }
+    }
+
+    static void t_deflateFrameAgreed() throws Exception {
+        for (String name : List.of("x-webkit-deflate-frame", "deflate-frame")) {
+            try (RawWs ws = RawWs.offering(name)) {
+                eq(name, ws.headers.get("sec-websocket-extensions"), "extension");
+            }
+        }
+        try (RawWs ws = RawWs.offering("deflate-frame; max_window_bits=10")) {
+            check(!ws.headers.containsKey("sec-websocket-extensions"), "agreed with a parameter");
+        }
+    }
+
+    // The client's messages compressed, the context kept from one to the
+    // next, one of them larger than a frame (its continuations without
+    // RSV1); an uncompressed message is still taken. The broker's own
+    // messages go out uncompressed: Artemis's websocket-frame-encoder sits
+    // nearer the head than the extension's encoder, which so never sees
+    // them as frames (RFC 7692 lets an endpoint send any message
+    // uncompressed).
+    static void t_deflateStomp() throws Exception {
+        String q = unique("wsdeflate");
+        String body = "deflated ".repeat(600);
+        try (RawWs ws = RawWs.offering("permessage-deflate; client_max_window_bits")) {
+            Deflate z = new Deflate();
+            ws.send(1, true, 4, z.compress("CONNECT\naccept-version:1.2\nhost:localhost\n\n\0".getBytes()));
+            List<Frame> frames = ws.message();
+            eq(0, frames.get(0).rsv(), "CONNECTED uncompressed");
+            String connected = new String(RawWs.join(frames), StandardCharsets.UTF_8);
+            check(connected.startsWith("CONNECTED\n"), "connected: " + connected);
+            ws.send(1, true, 4, z.compress(("SUBSCRIBE\nid:1\ndestination:" + q + "\nsubscription-type:ANYCAST\n\n\0").getBytes()));
+            // Each frame a sync flush of its own: a first frame that
+            // inflates to nothing fails Netty's DeflateDecoder ("cannot read
+            // uncompressed buffer").
+            byte[] send = ("SEND\ndestination:" + q + "\ndestination-type:ANYCAST\n\n" + body + "\0").getBytes();
+            int half = send.length / 2;
+            ws.send(1, false, 4, z.compress(Arrays.copyOfRange(send, 0, half), false));
+            ws.send(0, true, 0, z.compress(Arrays.copyOfRange(send, half, send.length), true));
+            frames = ws.message();
+            for (Frame f : frames) eq(0, f.rsv(), "MESSAGE uncompressed");
+            String m = new String(RawWs.join(frames), StandardCharsets.UTF_8);
+            check(m.startsWith("MESSAGE\n") && m.contains(body), "message: " + m.substring(0, Math.min(80, m.length())));
+            ws.sendText("DISCONNECT\nreceipt:bye\n\n\0");
+            eq("RECEIPT", ws.stompUntil("RECEIPT").split("\n")[0], "an uncompressed message taken");
+        }
+    }
+
+    // deflate-frame: every frame the client compressed on its own, RSV1 on
+    // each.
+    static void t_deflateFrameStomp() throws Exception {
+        try (RawWs ws = RawWs.offering("x-webkit-deflate-frame")) {
+            Deflate z = new Deflate();
+            byte[] connect = "CONNECT\naccept-version:1.2\nhost:localhost\n\n\0".getBytes();
+            ws.send(1, false, 4, z.compress(Arrays.copyOfRange(connect, 0, 10)));
+            ws.send(0, true, 4, z.compress(Arrays.copyOfRange(connect, 10, connect.length)));
+            List<Frame> frames = ws.message();
+            for (Frame f : frames) eq(0, f.rsv(), "CONNECTED uncompressed");
+            check(new String(RawWs.join(frames), StandardCharsets.UTF_8).startsWith("CONNECTED\n"), "connected");
+        }
+    }
+
+    // A compressed message that does not inflate closes the connection.
+    static void t_deflateGarbageCloses() throws Exception {
+        try (RawWs ws = RawWs.offering("permessage-deflate")) {
+            ws.send(1, true, 4, new byte[] {(byte) 0xff, (byte) 0xff, (byte) 0xff, 1, 2, 3});
+            check(ws.closedByServer(), "connection left open");
+        }
+    }
+
+    // With compression supported, a frame's RSV bits are let through even
+    // without an extension (allowExtensions): its payload is taken as it is.
+    static void t_rsvWithoutExtensionTaken() throws Exception {
+        try (RawWs ws = RawWs.upgrade("v12.stomp")) {
+            check(!ws.headers.containsKey("sec-websocket-extensions"), "no extension offered, none agreed");
+            ws.send(1, true, 4, "CONNECT\naccept-version:1.2\nhost:localhost\n\n\0".getBytes());
+            eq("CONNECTED", ws.stompUntil("CONNECTED").split("\n")[0], "connected");
         }
     }
 

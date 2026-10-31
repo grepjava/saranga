@@ -118,10 +118,119 @@ pub async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<(R
 /// The outcome of a request to an acceptor.
 #[derive(Debug)]
 pub enum Upgrade {
-    /// The handshake went out: the stream now carries WebSocket frames.
-    WebSocket,
+    /// The handshake went out: the stream now carries WebSocket frames,
+    /// compressed as the extension agreed on says.
+    WebSocket(Option<Extension>),
     /// The request was answered (or refused) and the connection closes.
     Closed,
+}
+
+/// A compression extension agreed on in the handshake, as Netty's
+/// `WebSocketServerCompressionHandler` offers them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Extension {
+    /// `permessage-deflate` (RFC 7692): a message's frames are one deflate
+    /// stream, its first frame marked RSV1.
+    PerMessageDeflate,
+    /// `deflate-frame` or `x-webkit-deflate-frame`, by the name the client
+    /// gave: each frame compressed on its own, all marked RSV1.
+    DeflateFrame(String),
+}
+
+/// An extension's parameters, in the order given; a bare one's value is
+/// `None`.
+type Parameters = Vec<(String, Option<String>)>;
+
+/// `WebSocketExtensionUtil.extractExtensions`: each extension's name and
+/// parameters.
+fn extract_extensions(header: &str) -> Vec<(String, Parameters)> {
+    // Java's split drops trailing empty strings.
+    fn split(s: &str, sep: char) -> Vec<&str> {
+        let mut parts: Vec<&str> = s.split(sep).collect();
+        while parts.len() > 1 && parts.last().is_some_and(|p| p.is_empty()) {
+            parts.pop();
+        }
+        parts
+    }
+    split(header, ',')
+        .into_iter()
+        .map(|raw| {
+            let parts = split(raw, ';');
+            let name = parts[0].trim().to_owned();
+            let mut params: Parameters = Vec::new();
+            for p in &parts[1..] {
+                // ^([^=]+)(=["]?([^"]+)["]?)?$, into a HashMap: a key given
+                // twice keeps the last value.
+                let p = p.trim();
+                let (key, value) = match p.split_once('=') {
+                    None => (p, None),
+                    Some((k, v)) => {
+                        let v = v.strip_prefix('"').unwrap_or(v);
+                        let v = v.strip_suffix('"').unwrap_or(v);
+                        if v.is_empty() || v.contains('"') {
+                            continue;
+                        }
+                        (k, Some(v.to_owned()))
+                    }
+                };
+                if key.is_empty() {
+                    continue;
+                }
+                params.retain(|(k, _)| k != key);
+                params.push((key.to_owned(), value));
+            }
+            (name, params)
+        })
+        .collect()
+}
+
+/// `WebSocketServerExtensionHandler` with the handshakers of
+/// `WebSocketServerCompressionHandler`: the first extension the client
+/// offers that `PerMessageDeflateServerExtensionHandshaker` (compression
+/// level 6, no server window size or no-context, without JZlib) or
+/// `DeflateFrameServerExtensionHandshaker` accepts, and the
+/// `Sec-WebSocket-Extensions` value answering it. An error for a window
+/// size that is not a number, which Netty fails on.
+fn negotiate(header: &str) -> io::Result<Option<(Extension, String)>> {
+    for (name, params) in extract_extensions(header) {
+        if name == "permessage-deflate" {
+            let mut accepted = true;
+            let mut client_window = 15;
+            for (key, value) in &params {
+                if key.eq_ignore_ascii_case("client_max_window_bits") {
+                    if let Some(v) = value {
+                        client_window = v.parse::<i32>().map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("For input string: \"{v}\""),
+                            )
+                        })?;
+                        if !(8..=15).contains(&client_window) {
+                            accepted = false;
+                        }
+                    }
+                } else if key.eq_ignore_ascii_case("client_no_context_takeover") {
+                    // Accepted, though the server does not ask it of the
+                    // client.
+                } else {
+                    // server_max_window_bits, server_no_context_takeover or
+                    // anything else.
+                    accepted = false;
+                }
+            }
+            if accepted {
+                let mut response = name.clone();
+                if client_window != 15 {
+                    response.push_str(&format!(";client_max_window_bits={client_window}"));
+                }
+                return Ok(Some((Extension::PerMessageDeflate, response)));
+            }
+        }
+        if (name == "x-webkit-deflate-frame" || name == "deflate-frame") && params.is_empty() {
+            return Ok(Some((Extension::DeflateFrame(name.clone()), name)));
+        }
+    }
+    Ok(None)
 }
 
 /// `sendHttpResponse` of a refusal: the status is also its body.
@@ -179,11 +288,14 @@ fn base64(b: &[u8]) -> String {
 
 /// `ProtocolDecoder.channelRead` and `WebSocketServerHandler.handleHttpRequest`:
 /// answers an HTTP request with the WebSocket handshake, offering
-/// `subprotocols`, or refuses it.
+/// `subprotocols`, or refuses it. With `compression`
+/// (`webSocketCompressionSupported`), a compression extension the client
+/// offers is agreed on, as `WebSocketServerCompressionHandler` does.
 pub async fn handshake<S: AsyncWrite + Unpin>(
     stream: &mut S,
     request: &Request,
     subprotocols: &[&str],
+    compression: bool,
 ) -> io::Result<Upgrade> {
     let upgrade = request.header("upgrade");
     if upgrade.is_some_and(|u| u.eq_ignore_ascii_case("activemq-remoting")) {
@@ -240,11 +352,20 @@ pub async fn handshake<S: AsyncWrite + Unpin>(
             None => tracing::debug!("Requested subprotocol(s) not supported: {requested}"),
         }
     }
+    // The extension handler adds its header to the handshaker's response.
+    let mut extension = None;
+    if compression
+        && let Some(offered) = request.header("sec-websocket-extensions")
+        && let Some((agreed, value)) = negotiate(offered)?
+    {
+        response.push_str(&format!("sec-websocket-extensions: {value}\r\n"));
+        extension = Some(agreed);
+    }
     response.push_str("\r\n");
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
     let _ = request.keep_alive();
-    Ok(Upgrade::WebSocket)
+    Ok(Upgrade::WebSocket(extension))
 }
 
 /// How data frames go out (`webSocketEncoderType`).
@@ -265,12 +386,86 @@ impl EncoderType {
     }
 }
 
+/// `PerMessageDeflateDecoder.FRAME_TAIL`: what a sync flush ends with, left
+/// off the wire.
+const FRAME_TAIL: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
+
+/// The `DeflateDecoder` of the extension agreed on: raw deflate, its window
+/// kept from one message to the next. (Its encoder never sees the broker's
+/// data: see `poll_write`.)
+struct Deflate {
+    per_message: bool,
+    /// Made by the first compressed frame, which must start a message.
+    decompress: Option<flate2::Decompress>,
+    /// `PerMessageDeflateDecoder.compressing`: the message being read is
+    /// compressed.
+    inflating: bool,
+}
+
+impl Deflate {
+    fn new(extension: &Extension) -> Self {
+        Self {
+            per_message: *extension == Extension::PerMessageDeflate,
+            decompress: None,
+            inflating: false,
+        }
+    }
+
+    /// `decompressContent`: a frame's payload inflated, the tail added
+    /// first when `tail`. `continuation`: whether it continues a message.
+    fn inflate(&mut self, payload: &[u8], tail: bool, continuation: bool) -> io::Result<Vec<u8>> {
+        let err = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_owned());
+        let d = match &mut self.decompress {
+            Some(d) => d,
+            None if continuation => {
+                return Err(err(
+                    "unexpected initial frame type: ContinuationWebSocketFrame",
+                ));
+            }
+            None => self.decompress.insert(flate2::Decompress::new(false)),
+        };
+        let mut input = payload.to_vec();
+        if tail {
+            input.extend_from_slice(&FRAME_TAIL);
+        }
+        let mut out = Vec::with_capacity(input.len() * 3 + 64);
+        let start = d.total_in();
+        loop {
+            let done = (d.total_in() - start) as usize;
+            if out.capacity() - out.len() < 64 {
+                out.reserve(out.capacity().max(64));
+            }
+            let before = (d.total_in(), d.total_out());
+            let status = d
+                .decompress_vec(&input[done..], &mut out, flate2::FlushDecompress::Sync)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let all_in = (d.total_in() - start) as usize == input.len();
+            if status == flate2::Status::StreamEnd
+                || (all_in && out.len() < out.capacity())
+                || (d.total_in(), d.total_out()) == before
+            {
+                break;
+            }
+        }
+        // A frame that held data but gave none (and is not the empty
+        // deflate block) cannot start a message.
+        if out.is_empty() && !payload.is_empty() && payload != [0x00] && !continuation {
+            return Err(err("cannot read uncompressed buffer"));
+        }
+        Ok(out)
+    }
+}
+
 /// The byte stream inside a WebSocket: data frames' payloads in, frames
 /// out. Control frames are answered here.
 pub struct WebSocketStream<S> {
     inner: S,
     max_payload: usize,
     encoder: EncoderType,
+    /// `allowExtensions` (`webSocketCompressionSupported`): frames with RSV
+    /// bits are taken, as they are unless an extension inflates them.
+    allow_extensions: bool,
+    deflate: Option<Deflate>,
     /// Received and not yet framed.
     raw: Vec<u8>,
     /// Payload not yet read by the protocol.
@@ -291,6 +486,8 @@ impl<S> WebSocketStream<S> {
             inner,
             max_payload: max_payload.max(1),
             encoder,
+            allow_extensions: false,
+            deflate: None,
             raw: leftover,
             data: Vec::new(),
             data_at: 0,
@@ -300,7 +497,18 @@ impl<S> WebSocketStream<S> {
             eof: false,
         }
     }
+
+    /// With `webSocketCompressionSupported`: frames may carry RSV bits, and
+    /// the extension the handshake agreed on inflates what comes in.
+    pub fn with_compression(mut self, extension: Option<&Extension>) -> Self {
+        self.allow_extensions = true;
+        self.deflate = extension.map(Deflate::new);
+        self
+    }
 }
+
+/// RSV1: a compressed frame.
+const RSV1: u8 = 0x40;
 
 fn frame_header(out: &mut Vec<u8>, fin: bool, opcode: u8, len: usize) {
     out.push(if fin { 0x80 } else { 0 } | opcode);
@@ -335,6 +543,36 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
         self.out.clear();
         self.out_at = 0;
         Poll::Ready(Ok(()))
+    }
+
+    /// A data frame's payload, inflated when the extension says it is
+    /// compressed: `PerMessageDeflateDecoder` takes a text or binary frame
+    /// with RSV1 and the continuations of its message, adding the tail to
+    /// the last; `PerFrameDeflateDecoder` takes every data frame with RSV1.
+    fn inflated(&mut self, fin_opcode: u8, payload: Vec<u8>) -> io::Result<Vec<u8>> {
+        let Some(d) = &mut self.deflate else {
+            return Ok(payload);
+        };
+        let fin = fin_opcode & 0x80 != 0;
+        let continuation = fin_opcode & 0x0F == 0;
+        let rsv1 = fin_opcode & RSV1 != 0;
+        if d.per_message {
+            if !continuation {
+                d.inflating = rsv1;
+            }
+            if !d.inflating {
+                return Ok(payload);
+            }
+            let out = d.inflate(&payload, fin, continuation);
+            if fin {
+                d.inflating = false;
+            }
+            out
+        } else if rsv1 {
+            d.inflate(&payload, true, continuation)
+        } else {
+            Ok(payload)
+        }
     }
 
     /// Decodes the frames in `raw`. An error means the connection must
@@ -374,7 +612,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
                     reason.to_owned(),
                 ))
             };
-            if fin_opcode & 0x70 != 0 {
+            if fin_opcode & 0x70 != 0 && !self.allow_extensions {
                 return violation(self, "RSV != 0 and no extension negotiated");
             }
             if !masked {
@@ -402,6 +640,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
             self.raw.drain(..at + len);
             match opcode {
                 0x0..=0x2 => {
+                    let payload = match self.inflated(fin_opcode, payload) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            // The decoder's exception closes the channel.
+                            self.closed = true;
+                            return Err(e);
+                        }
+                    };
                     if self.data_at == self.data.len() {
                         self.data.clear();
                         self.data_at = 0;
@@ -500,6 +746,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
             EncoderType::Binary => 0x2,
             EncoderType::Text => 0x1,
         };
+        // Never compressed, even with an extension agreed on: Artemis adds
+        // its websocket-frame-encoder after the handshaker's wsencoder,
+        // nearer the head than the extension's encoder, so the broker's
+        // data reaches that encoder as bytes, not frames, and passes it by.
+        // RFC 7692 lets an endpoint send any message uncompressed.
         let mut chunks = buf.chunks(me.max_payload).peekable();
         let mut opcode = first;
         while let Some(c) = chunks.next() {
@@ -557,6 +808,130 @@ mod tests {
         let mask = [1, 2, 3, 4];
         f.extend_from_slice(&mask);
         f.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        f
+    }
+
+    #[test]
+    fn compression_offers_are_answered_as_netty_answers_them() {
+        let agreed = |h: &str| negotiate(h).unwrap().map(|(_, v)| v);
+        assert_eq!(
+            agreed("permessage-deflate; client_max_window_bits").as_deref(),
+            Some("permessage-deflate")
+        );
+        assert_eq!(
+            agreed("permessage-deflate; client_max_window_bits=10").as_deref(),
+            Some("permessage-deflate;client_max_window_bits=10")
+        );
+        assert_eq!(
+            agreed("permessage-deflate; client_no_context_takeover").as_deref(),
+            Some("permessage-deflate")
+        );
+        for declined in [
+            "permessage-deflate; server_no_context_takeover",
+            "permessage-deflate; server_max_window_bits=10",
+            "permessage-deflate; client_max_window_bits=16",
+            "permessage-deflate; foo",
+            "deflate-frame; x=1",
+            "PERMESSAGE-DEFLATE",
+            "",
+        ] {
+            assert_eq!(agreed(declined), None, "{declined}");
+        }
+        assert_eq!(
+            agreed("permessage-deflate; server_no_context_takeover, x-webkit-deflate-frame")
+                .as_deref(),
+            Some("x-webkit-deflate-frame")
+        );
+        assert!(negotiate("permessage-deflate; client_max_window_bits=x").is_err());
+    }
+
+    /// A client's raw deflate: sync flushes, the tail left off the last.
+    fn client_deflate(c: &mut flate2::Compress, data: &[u8], last: bool) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len() + 64);
+        c.compress_vec(data, &mut out, flate2::FlushCompress::Sync)
+            .unwrap();
+        if last {
+            out.truncate(out.len() - 4);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn compressed_messages_are_inflated_with_their_context() {
+        let (_client, server) = tokio::io::duplex(1 << 20);
+        let mut c = flate2::Compress::new(flate2::Compression::default(), false);
+        // Two messages on one context, the second in two frames; then an
+        // uncompressed one.
+        let mut input = masked_rsv(0x1, true, RSV1, &client_deflate(&mut c, b"hello ", true));
+        input.extend(masked_rsv(
+            0x2,
+            false,
+            RSV1,
+            &client_deflate(&mut c, b"hello ", false),
+        ));
+        input.extend(masked_rsv(
+            0x0,
+            true,
+            0,
+            &client_deflate(&mut c, b"world ", true),
+        ));
+        input.extend(masked(0x1, true, b"plain"));
+        let mut ws = WebSocketStream::new(server, input, 1024, EncoderType::Binary)
+            .with_compression(Some(&Extension::PerMessageDeflate));
+        let mut got = vec![0u8; 23];
+        ws.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hello hello world plain");
+    }
+
+    #[tokio::test]
+    async fn deflate_frame_inflates_each_frame() {
+        let (_client, server) = tokio::io::duplex(1 << 20);
+        let mut c = flate2::Compress::new(flate2::Compression::default(), false);
+        let mut input = masked_rsv(0x2, false, RSV1, &client_deflate(&mut c, b"one ", true));
+        input.extend(masked_rsv(
+            0x0,
+            true,
+            RSV1,
+            &client_deflate(&mut c, b"two", true),
+        ));
+        let mut ws = WebSocketStream::new(server, input, 1024, EncoderType::Binary)
+            .with_compression(Some(&Extension::DeflateFrame("deflate-frame".to_owned())));
+        let mut got = vec![0u8; 7];
+        ws.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"one two");
+    }
+
+    #[tokio::test]
+    async fn rsv_bits_are_refused_without_compression_and_taken_with_it() {
+        let input = masked_rsv(0x1, true, RSV1, b"raw");
+        let (_c1, server) = tokio::io::duplex(1 << 16);
+        let mut ws = WebSocketStream::new(server, input.clone(), 1024, EncoderType::Binary);
+        let mut got = Vec::new();
+        ws.read_to_end(&mut got).await.unwrap();
+        assert!(got.is_empty());
+        // Compression supported, no extension agreed: the payload as it is.
+        let (_c2, server) = tokio::io::duplex(1 << 16);
+        let mut ws =
+            WebSocketStream::new(server, input, 1024, EncoderType::Binary).with_compression(None);
+        let mut got = [0u8; 3];
+        ws.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"raw");
+    }
+
+    #[tokio::test]
+    async fn a_message_that_does_not_inflate_closes() {
+        let (_client, server) = tokio::io::duplex(1 << 16);
+        let input = masked_rsv(0x1, true, RSV1, &[0xff, 0xff, 0xff, 1, 2, 3]);
+        let mut ws = WebSocketStream::new(server, input, 1024, EncoderType::Binary)
+            .with_compression(Some(&Extension::PerMessageDeflate));
+        let mut got = Vec::new();
+        ws.read_to_end(&mut got).await.unwrap();
+        assert!(got.is_empty());
+    }
+
+    fn masked_rsv(opcode: u8, fin: bool, rsv: u8, payload: &[u8]) -> Vec<u8> {
+        let mut f = masked(opcode, fin, payload);
+        f[0] |= rsv;
         f
     }
 

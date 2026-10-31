@@ -629,13 +629,18 @@ async fn upgrade(
         .iter()
         .flat_map(|m| m.websocket_subprotocols().iter().copied())
         .collect();
-    match websocket::handshake(&mut stream, &request, &subprotocols).await {
-        Ok(Upgrade::WebSocket) => Some(Box::new(websocket::WebSocketStream::new(
-            stream,
-            leftover,
-            max_payload,
-            encoder,
-        ))),
+    // ConfigurationHelper.getBooleanProperty: Boolean.parseBoolean.
+    let compression =
+        p("webSocketCompressionSupported").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    match websocket::handshake(&mut stream, &request, &subprotocols, compression).await {
+        Ok(Upgrade::WebSocket(extension)) => {
+            let ws = websocket::WebSocketStream::new(stream, leftover, max_payload, encoder);
+            Some(Box::new(if compression {
+                ws.with_compression(extension.as_ref())
+            } else {
+                ws
+            }))
+        }
         Ok(Upgrade::Closed) => None,
         Err(e) => {
             tracing::debug!("WebSocket handshake: {e}");

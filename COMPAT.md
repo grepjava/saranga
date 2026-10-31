@@ -159,7 +159,6 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **A refused upgrade.** An upgrade request that is not a GET gets `403 Forbidden`. Artemis does not answer it.
 - **A frame over the maximum payload** gets a close frame with status 1009 before the connection closes. Artemis closes the connection, and its close frame may not arrive.
 - **Not supported:**
-  - `webSocketCompressionSupported` (permessage-deflate).
   - The draft-00 handshake of clients that send no `Sec-WebSocket-Version`: they get `426 Upgrade Required`.
   - Core over HTTP (`httpEnabled`, `HttpAcceptorHandler`): an HTTP request without a WebSocket upgrade gets `403 Forbidden`.
 

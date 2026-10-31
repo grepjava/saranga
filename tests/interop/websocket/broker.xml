@@ -1,7 +1,8 @@
 <?xml version="1.0"?>
 <!-- Every protocol on one acceptor, over TCP and over WebSockets
      (WebSocket.java). Frames of at most 2048 bytes each way, so that
-     larger messages go out as continuation frames. -->
+     larger messages go out as continuation frames, and compression offered
+     (permessage-deflate and deflate-frame). -->
 <configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
    <core xmlns="urn:activemq:core">
@@ -9,7 +10,7 @@
       <persistence-enabled>true</persistence-enabled>
       <security-enabled>false</security-enabled>
       <acceptors>
-         <acceptor name="artemis">tcp://0.0.0.0:61616?protocols=CORE,AMQP,STOMP,MQTT,OPENWIRE;webSocketMaxFramePayloadLength=2048</acceptor>
+         <acceptor name="artemis">tcp://0.0.0.0:61616?protocols=CORE,AMQP,STOMP,MQTT,OPENWIRE;webSocketMaxFramePayloadLength=2048;webSocketCompressionSupported=true</acceptor>
       </acceptors>
       <address-settings>
          <address-setting match="#">

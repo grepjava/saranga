@@ -545,11 +545,14 @@ impl AsyncWrite for Wire<'_> {
 }
 
 /// WebSocket: even, an HTTP request and its handshake; odd, the frames a
-/// client sends once upgraded (at most 64 KiB a frame).
+/// client sends once upgraded (at most 64 KiB a frame). Selector bit 2
+/// turns compression on: the handshake may agree on an extension, and the
+/// frames are read as permessage-deflate (bit 3 clear) or deflate-frame.
 pub fn websocket(data: &[u8]) {
     let Some((selector, rest)) = split(data) else {
         return;
     };
+    let compression = selector & 4 != 0;
     if selector % 2 == 0 {
         let _ = websocket::is_http(rest);
         let mut wire = Wire { input: rest };
@@ -560,6 +563,7 @@ pub fn websocket(data: &[u8]) {
             &mut wire,
             &request,
             &["v12.stomp", "mqtt", "amqp", "artemis"],
+            compression,
         ));
     } else {
         let encoder = if selector & 2 == 0 {
@@ -568,9 +572,21 @@ pub fn websocket(data: &[u8]) {
             EncoderType::Text
         };
         let mut stream = WebSocketStream::new(Wire { input: rest }, Vec::new(), 65536, encoder);
+        if compression {
+            let extension = if selector & 8 == 0 {
+                websocket::Extension::PerMessageDeflate
+            } else {
+                websocket::Extension::DeflateFrame("deflate-frame".to_owned())
+            };
+            stream = stream.with_compression(Some(&extension));
+        }
         let mut out = Vec::new();
         let _ = block_on(stream.read_to_end(&mut out));
-        assert!(out.len() <= rest.len(), "more payload than was sent");
+        // Inflated frames may hold more than was sent.
+        assert!(
+            compression || out.len() <= rest.len(),
+            "more payload than was sent"
+        );
     }
 }
 
