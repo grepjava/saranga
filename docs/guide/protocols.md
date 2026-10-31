@@ -122,13 +122,13 @@ Some Artemis errors are not copied: for example, a failed link attach refuses on
 
 ## OpenWire
 
-ActiveMQ 5 clients connect as they do to Artemis: every wire-format version, tight and loose encoding, the prefetch model and `MessagePull`, every acknowledgement type, local and XA transactions, durable subscriptions, browsers, virtual topics and advisories. The acceptor parameters are Artemis's, for example `supportAdvisory`, `suppressInternalManagementObjects` and `virtualTopicConsumerWildcards`. A full address holds producers back as on Artemis: under `BLOCK` a send that waits for an answer, or one with a producer window, is answered once there is room, and the connection stops being read after an asynchronous send; under `FAIL` the send gets `ResourceAllocationException`. See [Artemis's OpenWire documentation](https://activemq.apache.org/components/artemis/documentation/latest/openwire.html).
+ActiveMQ 5 clients connect as they do to Artemis: every wire-format version, tight and loose encoding, the prefetch model and `MessagePull`, every acknowledgement type, local and XA transactions, durable subscriptions, browsers, virtual topics and advisories. The acceptor parameters are Artemis's, for example `supportAdvisory`, `suppressInternalManagementObjects` and `virtualTopicConsumerWildcards`. With `updateClusterClients` a manageable client (as ActiveMQ 5 clients are by default) is told the cluster's brokers at login and whenever one joins or leaves, and told to rebalance with `rebalanceClusterClients`, as ActiveMQ 5's `ConnectionControl` does. A full address holds producers back as on Artemis: under `BLOCK` a send that waits for an answer, or one with a producer window, is answered once there is room, and the connection stops being read after an asynchronous send; under `FAIL` the send gets `ResourceAllocationException`. See [Artemis's OpenWire documentation](https://activemq.apache.org/components/artemis/documentation/latest/openwire.html).
 
 The main differences:
 
 - `brokerName` defaults to the host name from `HOSTNAME`, `COMPUTERNAME` or `/etc/hostname`, lowercased, then to the node ID. Artemis asks the JVM for the local host name.
 - A queue browser gets a snapshot of the queue when it is created.
-- Cluster client updates and the `openwireMaxPacketChunkSize` back-pressure are not there.
+- The `openwireMaxPacketChunkSize` back-pressure is not there.
 
 See [COMPAT.md](../../COMPAT.md#openwire-differences).
 

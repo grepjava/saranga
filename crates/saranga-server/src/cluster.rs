@@ -289,6 +289,13 @@ impl Member {
     pub fn backup_address(&self) -> Option<(String, i32, bool)> {
         self.backup.as_ref().map(connector_address)
     }
+
+    /// `toURI`: `tcp://host:port` of the primary's connector (`localhost`
+    /// and 0 without them); `None` without a primary.
+    pub fn primary_uri(&self) -> Option<String> {
+        let (host, port, _) = connector_address(self.primary.as_ref()?);
+        Some(format!("tcp://{host}:{port}"))
+    }
 }
 
 /// A connector's `host`, `port` and `sslEnabled` as `ConfigurationHelper`

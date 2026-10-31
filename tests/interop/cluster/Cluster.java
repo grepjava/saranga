@@ -23,6 +23,11 @@
 //       every cluster connection's control, and the network topology.
 //   java -cp '<artemis>/lib/*' Cluster.java drain <url> <queue>
 //       how many messages the queue has, taking them.
+//   java -cp '<artemis>/lib/*' Cluster.java openwire-controls <url> <marker>
+//       an OpenWire client (ActiveMQ 5) logged in to the node until <marker>
+//       exists, then each ConnectionControl it was sent (updateClusterClients):
+//       the brokers, sorted as they come in hash order, and whether to
+//       rebalance.
 // tests/interop/cluster/cluster.sh runs it; it prints what it saw.
 
 import java.util.*;
@@ -49,6 +54,7 @@ public class Cluster {
             case "control-restart" -> controlRestart(args[1]);
             case "controls" -> controls(args[1]);
             case "drain" -> drain(args[1], args[2]);
+            case "openwire-controls" -> openWireControls(args[1], args[2]);
             default -> throw new IllegalArgumentException(args[0]);
         }
     }
@@ -152,6 +158,36 @@ public class Cluster {
         }
         String topology = String.valueOf(manage(url, "broker", "listNetworkTopology", true));
         System.out.println("listNetworkTopology entries = " + (topology.split("\"nodeID\"", -1).length - 1));
+    }
+
+    static void openWireControls(String url, String marker) throws Exception {
+        List<String> controls = Collections.synchronizedList(new ArrayList<>());
+        org.apache.activemq.ActiveMQConnectionFactory cf = new org.apache.activemq.ActiveMQConnectionFactory(USER, PASSWORD, url);
+        org.apache.activemq.ActiveMQConnection c = (org.apache.activemq.ActiveMQConnection) cf.createConnection();
+        c.addTransportListener(new org.apache.activemq.transport.TransportListener() {
+            public void onCommand(Object command) {
+                if (command instanceof org.apache.activemq.command.ConnectionControl cc) {
+                    String[] brokers = cc.getConnectedBrokers() == null ? new String[0] : cc.getConnectedBrokers().split(",");
+                    Arrays.sort(brokers);
+                    controls.add("brokers=" + String.join(",", brokers) + " rebalance=" + cc.isRebalanceConnection()
+                        + " faultTolerant=" + cc.isFaultTolerant());
+                }
+            }
+            public void onException(java.io.IOException e) {}
+            public void transportInterupted() {}
+            public void transportResumed() {}
+        });
+        c.start();
+        System.out.println("openwire: connected");
+        java.nio.file.Path done = java.nio.file.Paths.get(marker);
+        for (int i = 0; i < 1200 && !java.nio.file.Files.exists(done); i++) {
+            Thread.sleep(100);
+        }
+        c.close();
+        for (String control : controls) {
+            System.out.println("openwire: control " + control);
+        }
+        System.out.println("openwire: done");
     }
 
     static void drain(String url, String queue) throws Exception {

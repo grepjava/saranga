@@ -36,7 +36,11 @@ impl OpenWireProtocol {
     fn manager(&self, broker: &Broker, acceptor: &Acceptor) -> Arc<Manager> {
         lock(&self.managers)
             .entry((acceptor.host.clone(), acceptor.port))
-            .or_insert_with(|| Arc::new(Manager::new(broker, acceptor)))
+            .or_insert_with(|| {
+                let m = Arc::new(Manager::new(broker, acceptor));
+                m.listen(broker);
+                m
+            })
             .clone()
     }
 }
@@ -75,6 +79,11 @@ pub(crate) struct Settings {
     pub suppress_internal_management_objects: bool,
     pub destination_cache_size: usize,
     pub use_duplicate_detection_on_failover: bool,
+    /// `updateClusterClients`: clients are told the cluster's brokers, at
+    /// login and when the topology changes (`ConnectionControl`).
+    pub update_cluster_clients: bool,
+    /// `rebalanceClusterClients`: and asked to reconnect to spread out.
+    pub rebalance_cluster_clients: bool,
 }
 
 /// A `virtualTopicConsumerWildcards` entry: consumers on queues the filter
@@ -115,10 +124,61 @@ pub(crate) struct Manager {
     /// Client ID to (connection, its remote address) (`clientIdSet`).
     client_ids: Mutex<HashMap<String, (u64, String)>>,
     /// The connections in the order they logged in, with their temporary
-    /// destinations (`connections`, `getTemporaryDestinations`).
-    connections: Mutex<Vec<(u64, TempList)>>,
+    /// destinations and where to tell their clients of the cluster
+    /// (`connections`, `getTemporaryDestinations`).
+    connections: Mutex<Vec<(u64, TempList, Arc<connection::Outbound>)>>,
     next_connection: AtomicU64,
     virtual_topics: Vec<VirtualTopic>,
+    cluster: Mutex<ClusterClients>,
+}
+
+/// The cluster as `OpenWireProtocolManager` keeps it for its clients.
+#[derive(Default)]
+struct ClusterClients {
+    /// `topologyMap`, a `ConcurrentHashMap`: each node's `toURI`, in
+    /// insertion order, iterated as Java does.
+    nodes: Vec<(String, String)>,
+    /// `members`: the URIs as last copied from `nodes`, turned by each
+    /// control when rebalancing.
+    members: std::collections::VecDeque<String>,
+}
+
+impl ClusterClients {
+    /// `topologyMap.values()` in `ConcurrentHashMap` order, which is a
+    /// `HashMap`'s for a map that never grew past 16 buckets with more
+    /// than one node in a bucket.
+    fn values(&self) -> Vec<String> {
+        let hashes: Vec<i32> = self
+            .nodes
+            .iter()
+            .map(|(id, _)| {
+                let units: Vec<u16> = id.encode_utf16().collect();
+                saranga_storage::java::string_hash(&units)
+            })
+            .collect();
+        saranga_buffer::java_hash::hash_map_order(&hashes, None)
+            .into_iter()
+            .map(|i| self.nodes[i].1.clone())
+            .collect()
+    }
+}
+
+/// `OpenWireProtocolManager` as the first cluster connection's
+/// `ClusterTopologyListener`.
+struct TopologyListener(std::sync::Weak<Manager>);
+
+impl saranga_server::cluster::TopologyListener for TopologyListener {
+    fn node_up(&self, member: &saranga_server::cluster::Member, _last: bool) {
+        if let Some(m) = self.0.upgrade() {
+            m.node_up(member);
+        }
+    }
+
+    fn node_down(&self, _unique_event_id: i64, node_id: &str) {
+        if let Some(m) = self.0.upgrade() {
+            m.node_down(node_id);
+        }
+    }
 }
 
 pub(crate) type TempList = Arc<Mutex<Vec<DestinationInfo>>>;
@@ -184,6 +244,8 @@ impl Manager {
                 "openwireUseDuplicateDetectionOnFailover",
                 true,
             ),
+            update_cluster_clients: flag("updateClusterClients", false),
+            rebalance_cluster_clients: flag("rebalanceClusterClients", false),
         };
         let mut virtual_topics = Vec::new();
         if let Some(v) = p("virtualTopicConsumerWildcards") {
@@ -225,7 +287,95 @@ impl Manager {
             connections: Mutex::default(),
             next_connection: AtomicU64::new(1),
             virtual_topics,
+            cluster: Mutex::default(),
         }
+    }
+
+    /// The constructor's `addClusterTopologyListener` on the first cluster
+    /// connection, which tells it the nodes already known.
+    fn listen(self: &Arc<Self>, broker: &Broker) {
+        if let Some(cluster) = broker.cluster() {
+            cluster.add_listener(Arc::new(TopologyListener(Arc::downgrade(self))));
+        }
+    }
+
+    /// `nodeUP`: a node with a primary that is new to the map updates the
+    /// clients.
+    fn node_up(&self, member: &saranga_server::cluster::Member) {
+        let Some(uri) = member.primary_uri() else {
+            return;
+        };
+        let added = {
+            let mut c = lock(&self.cluster);
+            match c.nodes.iter_mut().find(|(id, _)| *id == member.node_id) {
+                Some(entry) => {
+                    entry.1 = uri;
+                    false
+                }
+                None => {
+                    c.nodes.push((member.node_id.clone(), uri));
+                    true
+                }
+            }
+        };
+        if added {
+            self.update_client_cluster_info();
+        }
+    }
+
+    /// `nodeDown`.
+    fn node_down(&self, node_id: &str) {
+        let removed = {
+            let mut c = lock(&self.cluster);
+            let before = c.nodes.len();
+            c.nodes.retain(|(id, _)| id != node_id);
+            c.nodes.len() != before
+        };
+        if removed {
+            self.update_client_cluster_info();
+        }
+    }
+
+    /// `updateClientClusterInfo`: the members copied from the map, then a
+    /// control for each connection, sent with `updateClusterClients`.
+    fn update_client_cluster_info(&self) {
+        {
+            let mut c = lock(&self.cluster);
+            c.members = c.values().into();
+        }
+        let outs: Vec<Arc<connection::Outbound>> = lock(&self.connections)
+            .iter()
+            .map(|(_, _, out)| out.clone())
+            .collect();
+        for out in outs {
+            let control = self.new_connection_control();
+            if self.settings.update_cluster_clients {
+                out.send_command(&control);
+            }
+        }
+    }
+
+    /// `newConnectionControl`: the members' URIs, and whether to
+    /// rebalance.
+    pub fn new_connection_control(&self) -> commands::DataStructure {
+        let rebalance = self.settings.rebalance_cluster_clients;
+        commands::DataStructure::ConnectionControl(commands::ConnectionControl {
+            connected_brokers: Some(self.generate_members_uri(rebalance)),
+            rebalance_connection: rebalance,
+            ..Default::default()
+        })
+    }
+
+    /// `generateMembersURI`: the URIs joined by commas; with `flip`, the
+    /// first goes last for the next control, spreading the clients out.
+    fn generate_members_uri(&self, flip: bool) -> String {
+        let mut c = lock(&self.cluster);
+        let uri = c.members.iter().cloned().collect::<Vec<_>>().join(",");
+        if flip && c.members.len() > 1 {
+            let first = c.members.pop_front().expect("more than one");
+            c.members.push_back(first);
+        }
+        uri
     }
 
     pub fn next_connection(&self) -> u64 {
@@ -255,8 +405,8 @@ impl Manager {
         Ok(())
     }
 
-    pub fn add_connection(&self, connection: u64, temp: TempList) {
-        lock(&self.connections).push((connection, temp));
+    pub fn add_connection(&self, connection: u64, temp: TempList, out: Arc<connection::Outbound>) {
+        lock(&self.connections).push((connection, temp, out));
     }
 
     /// `removeConnection`: the client ID only if it is still this
@@ -268,14 +418,14 @@ impl Manager {
                 ids.remove(id);
             }
         }
-        lock(&self.connections).retain(|(c, _)| *c != connection);
+        lock(&self.connections).retain(|(c, _, _)| *c != connection);
     }
 
     /// Every connection's temporary destinations, in connection order.
     pub fn temporary_destinations(&self) -> Vec<DestinationInfo> {
         let lists: Vec<TempList> = lock(&self.connections)
             .iter()
-            .map(|(_, l)| l.clone())
+            .map(|(_, l, _)| l.clone())
             .collect();
         lists.iter().flat_map(|l| lock(l).clone()).collect()
     }

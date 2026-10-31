@@ -21,6 +21,8 @@ Time variance in the cluster is <n> milliseconds
    verification on primary tcp://localhost:64916
    ok!
 exit 0
+=== Cluster.java openwire-controls (node 1, in the background)
+openwire: connected
 === Cluster.java on-demand orders 10
 node 2 received [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]
 no more
@@ -73,6 +75,9 @@ Time variance in the cluster is <n> milliseconds
    verification on primary tcp://localhost:64916
    ok!
 exit 0
+openwire: control brokers=tcp://localhost:64816,tcp://localhost:64916 rebalance=true faultTolerant=false
+openwire: control brokers=tcp://localhost:64816 rebalance=true faultTolerant=false
+openwire: control brokers=tcp://localhost:64816,tcp://localhost:64916 rebalance=true faultTolerant=false
 === Cluster.java control (node 1)
 clusterConnectionNames = [my-cluster]
 name = my-cluster

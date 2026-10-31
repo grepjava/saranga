@@ -1315,7 +1315,7 @@ impl Connection {
         self.internal = Some(self.new_session(uuid::Uuid::new_v4().to_string(), &info));
         self.info = Some(info.clone());
         self.manager
-            .add_connection(self.key, self.temp_destinations.clone());
+            .add_connection(self.key, self.temp_destinations.clone(), self.out.clone());
         // The connection advisory.
         let mut copy = info.clone();
         copy.password = Some(String::new());
@@ -1332,6 +1332,19 @@ impl Connection {
             value: -1,
         };
         self.add_session(own).await;
+        // A client that may be managed is told the cluster's brokers, before
+        // its login is answered; one reconnecting after a failover is not
+        // asked to rebalance.
+        if info.manageable && self.manager.settings.update_cluster_clients {
+            let mut control = self.manager.new_connection_control();
+            if let DataStructure::ConnectionControl(c) = &mut control {
+                c.fault_tolerant = false;
+                if info.failover_reconnect {
+                    c.rebalance_connection = false;
+                }
+            }
+            self.out.send_command(&control);
+        }
         Ok(())
     }
 

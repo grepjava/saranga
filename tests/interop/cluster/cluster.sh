@@ -57,6 +57,14 @@ make_instance() {
     artemis) java -cp "$(native "$DIST/lib")/*" -Dartemis.home="$(native "$DIST")" \
       org.apache.activemq.artemis.boot.Artemis create "$(native "$dir")" "${opts[@]}" > /dev/null 2>&1 ;;
   esac
+  # OpenWire clients are told the cluster's brokers, and to rebalance.
+  sed -i -E 's#(<acceptor name="artemis">[^<]*)</acceptor>#\1;updateClusterClients=true;rebalanceClusterClients=true</acceptor>#' \
+    "$dir/etc/broker.xml"
+  # MAX_DISK_USAGE: for a machine whose disk is past create's 90%, where
+  # both brokers would block every producer.
+  if [[ -n "${MAX_DISK_USAGE:-}" ]]; then
+    sed -i -E "s#<max-disk-usage>[0-9]+</max-disk-usage>#<max-disk-usage>$MAX_DISK_USAGE</max-disk-usage>#" "$dir/etc/broker.xml"
+  fi
 }
 
 instance() {
@@ -131,6 +139,10 @@ suite() {
   client topology "$U1"
   step "artemis check cluster (node 1)"
   check_cluster "$N1"
+  step "Cluster.java openwire-controls (node 1, in the background)"
+  local controls="$WORK/openwire.out"
+  client openwire-controls "$U1" "$(native "$WORK/openwire.done")" > "$controls" &
+  wait_for "$controls" "openwire: connected" && echo "openwire: connected"
 
   # 2. Load balancing.
   step "Cluster.java on-demand orders 10"
@@ -162,6 +174,10 @@ suite() {
   client topology "$U1"
   step "artemis check cluster (node 2)"
   check_cluster "$N2"
+  # The OpenWire client was told of both nodes at login, of node 1 alone
+  # when node 2 went, and of both again.
+  touch "$WORK/openwire.done"
+  wait_for "$controls" "openwire: done" && grep "openwire: control" "$controls"
 
   # 4. Management: the cluster connection's control on each node, then a
   #    stop and start through it.
