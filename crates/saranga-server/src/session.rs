@@ -112,7 +112,7 @@ pub struct ClientConnection {
     /// Temporary queues, deleted when the connection goes away.
     temp_queues: Mutex<Vec<Name>>,
     /// What the security store knows of this connection.
-    security_info: Arc<ConnectionInfo>,
+    security_info: std::sync::RwLock<Arc<ConnectionInfo>>,
     /// The subject its sessions authenticated as (`getSubject`), for the
     /// audit log.
     subject: Mutex<Option<Arc<saranga_security::jaas::Subject>>>,
@@ -154,7 +154,7 @@ impl ClientConnection {
             created: crate::message::now_millis(),
             client_id: Mutex::default(),
             temp_queues: Mutex::default(),
-            security_info,
+            security_info: std::sync::RwLock::new(security_info),
             subject: Mutex::default(),
             prefixes,
             acceptor: None,
@@ -317,7 +317,24 @@ impl ClientConnection {
     }
 
     pub fn security_info(&self) -> Arc<ConnectionInfo> {
-        self.security_info.clone()
+        self.security_info
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The principals of the identity an AMQP SASL mechanism established,
+    /// which the login modules of later logins on this connection see
+    /// (`ActiveMQProtonRemotingConnection.getSubject`).
+    pub fn set_sasl_principals(&self, principals: Vec<saranga_security::Principal>) {
+        let mut info = self
+            .security_info
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *info = Arc::new(ConnectionInfo {
+            sasl_principals: Some(principals.into()),
+            ..(**info).clone()
+        });
     }
 
     /// `setSubject`: the subject a session of this connection logged in as.
@@ -686,6 +703,7 @@ impl ServerSession {
             certificates: None,
             security_domain: None,
             connection_id: None,
+            sasl_principals: None,
         });
         let conn = Arc::new(ClientConnection::new(
             Transport::internal(name),

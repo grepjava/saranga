@@ -436,6 +436,7 @@ impl BrokerConfig {
             // (`login.config`, `bootstrap.xml`): whoever starts the broker
             // sets it.
             security: None,
+            login_config: None,
             populate_validated_user: config.populate_validated_user,
             reject_empty_validated_user: config.reject_empty_validated_user,
             mirror_ack_manager: crate::mirror::AckManagerSettings {

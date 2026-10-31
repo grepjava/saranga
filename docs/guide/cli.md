@@ -323,7 +323,10 @@ saranga mask secret                                   # the default codec
 saranga mask --key mykey secret                       # the default codec with your own key
 saranga mask --password-codec --config etc/broker.xml secret   # broker.xml's <password-codec>
 saranga mask --hash secret                            # a one-way hash, for artemis-users.properties
+saranga mask --scram alice secret                     # alice's SCRAM lines, for SCRAMPropertiesLoginModule
 ```
+
+`--scram <user>` prints what `SCRAMPropertiesLoginModule`'s `main` prints in Artemis: the user's SCRAM-SHA-512 and SCRAM-SHA-256 data as `user|SHA512` and `user|SHA256` lines to add to the users file. `--iterations` sets the iteration count (4096, the default, at least).
 
 The default codec's key can also come from `ARTEMIS_DEFAULT_SENSITIVE_STRING_CODEC_KEY`. See [Security](security.md) and [Artemis's masking passwords](https://activemq.apache.org/components/artemis/documentation/latest/masking-passwords.html).
 

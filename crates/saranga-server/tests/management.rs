@@ -181,6 +181,7 @@ fn xa_session(broker: &Arc<Broker>) -> ServerSession {
             certificates: None,
             security_domain: None,
             connection_id: None,
+            sasl_principals: None,
         }),
         Vec::new(),
     ));
@@ -395,6 +396,7 @@ async fn security_violations_are_notified() {
         certificates: None,
         security_domain: None,
         connection_id: None,
+        sasl_principals: None,
     };
     assert!(store.authenticate(Some("bob"), Some("x"), &info).is_err());
     let auth = saranga_security::SecurityAuth {

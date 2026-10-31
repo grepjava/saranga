@@ -348,6 +348,7 @@ pub(crate) fn login_user(
             certificates: None,
             security_domain: None,
             connection_id: None,
+            sasl_principals: None,
         };
         match store
             .manager()

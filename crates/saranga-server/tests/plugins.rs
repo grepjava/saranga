@@ -204,6 +204,7 @@ fn connection() -> Arc<ClientConnection> {
             certificates: None,
             security_domain: None,
             connection_id: None,
+            sasl_principals: None,
         }),
         Vec::new(),
     ))

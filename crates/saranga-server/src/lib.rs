@@ -248,6 +248,11 @@ pub struct BrokerConfig {
     pub global_max_messages: i64,
     /// Authentication and authorization; `None` lets everyone do anything.
     pub security: Option<Arc<saranga_security::SecurityStore>>,
+    /// The JAAS configuration of the JVM in Artemis (`login.config`, and
+    /// broker properties' `jaasConfigs`), for the logins made outside the
+    /// security manager: those of AMQP's SASL mechanisms. The JAAS security
+    /// manager when it is the one in use.
+    pub login_config: Option<Arc<saranga_security::JaasSecurityManager>>,
     /// `populate-validated-user`: sent messages carry the user that sent
     /// them (`_AMQ_VALIDATED_USER`).
     pub populate_validated_user: bool,
@@ -325,6 +330,7 @@ impl BrokerConfig {
             global_max_size: -1,
             global_max_messages: -1,
             security: None,
+            login_config: None,
             populate_validated_user: false,
             reject_empty_validated_user: false,
             mirror_ack_manager: mirror::AckManagerSettings::default(),
@@ -530,6 +536,7 @@ pub struct Broker {
     /// with quorum voting, a primary or a backup that took over.
     shared_nothing_primary: bool,
     security: Option<Arc<saranga_security::SecurityStore>>,
+    login_config: Option<Arc<saranga_security::JaasSecurityManager>>,
     /// For the diverts a reload deploys.
     transformers: HashMap<String, postoffice::TransformerFactory>,
     interceptors: interceptor::Interceptors,
@@ -862,6 +869,7 @@ impl Broker {
             ),
             failback: tokio::sync::Notify::new(),
             security: config.security.clone(),
+            login_config: config.login_config.clone(),
             transformers: config.transformers,
             interceptors,
             populate_validated_user: config.populate_validated_user,
@@ -1366,6 +1374,11 @@ impl Broker {
         queue.disconnect_consumers().await;
     }
 
+    /// The JAAS configuration (`BrokerConfig::login_config`).
+    pub fn login_config(&self) -> Option<&Arc<saranga_security::JaasSecurityManager>> {
+        self.login_config.as_ref()
+    }
+
     /// The security store, whether or not security is enabled.
     pub fn security_store(&self) -> Option<&Arc<saranga_security::SecurityStore>> {
         self.security.as_ref()
@@ -1600,6 +1613,7 @@ impl Broker {
                 certificates: None,
                 security_domain: acceptor.security_domain.clone(),
                 connection_id: None,
+                sasl_principals: None,
             };
             let broker = self.clone();
             let acceptor = acceptor.clone();

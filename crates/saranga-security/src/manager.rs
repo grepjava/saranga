@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use saranga_config::{CheckType, Role};
 
-use crate::jaas::{self, Callbacks, LoginConfig, ModuleFactory, PeerCertificate, Subject};
+use crate::jaas::{self, Callbacks, LoginConfig, LoginError, ModuleFactory, PeerCertificate};
+use crate::jaas::{Principal, Subject};
 
 /// What the security store knows about a client connection.
 #[derive(Debug, Clone, Default)]
@@ -20,10 +21,27 @@ pub struct ConnectionInfo {
     pub security_domain: Option<String>,
     /// The connection's ID, for the audit log; `None` for a web login.
     pub connection_id: Option<String>,
+    /// The principals of the identity an AMQP SASL mechanism established
+    /// (`ActiveMQProtonRemotingConnection.getSubject`): SCRAM's subject's,
+    /// or GSSAPI's Kerberos principal.
+    pub sasl_principals: Option<Arc<[Principal]>>,
 }
 
 impl ConnectionInfo {
     /// `CertificateUtil.getCertSubjectDN`.
+    /// What `JaasCallbackHandler` gives a `PrincipalsCallback`: the
+    /// principals of the SASL identity, else the TLS peer's principal.
+    pub fn peer_principals(&self) -> Option<Vec<Principal>> {
+        if let Some(p) = self.sasl_principals.as_deref().filter(|p| !p.is_empty()) {
+            return Some(p.to_vec());
+        }
+        let cert = self.certificates.as_deref()?.first()?;
+        Some(vec![Principal::Other {
+            class: "javax.security.auth.x500.X500Principal".to_owned(),
+            name: cert.subject_dn.clone(),
+        }])
+    }
+
     pub fn cert_subject_dn(&self) -> &str {
         self.certificates
             .as_deref()
@@ -222,6 +240,16 @@ impl JaasSecurityManager {
     pub fn certificate_domain(&self) -> Option<&str> {
         self.certificate_domain.as_deref()
     }
+
+    /// `new LoginContext(realm, handler).login()`, for the logins made
+    /// outside the security domain: AMQP's SASL mechanisms, through
+    /// `saslLoginConfigScope`.
+    pub fn login(&self, realm: &str, callbacks: &Callbacks<'_>) -> Result<Subject, LoginError> {
+        let Some(entries) = self.entry(realm) else {
+            return Err(LoginError::new(format!("No LoginModules configured for {realm}")));
+        };
+        jaas::login(&entries, &self.modules, callbacks)
+    }
 }
 
 impl SecurityManager for JaasSecurityManager {
@@ -248,11 +276,14 @@ impl SecurityManager for JaasSecurityManager {
             tracing::debug!("No LoginModules configured for {domain}");
             return Ok(None);
         };
+        let peer = connection.peer_principals();
         let callbacks = Callbacks {
             user,
             password,
             certificates: connection.certificates.as_deref(),
             remote_address: Some(&connection.remote_address),
+            peer_principals: peer.as_deref(),
+            scram: None,
         };
         match jaas::login(&entries, &self.modules, &callbacks) {
             Ok(subject) => Ok(Some(subject)),

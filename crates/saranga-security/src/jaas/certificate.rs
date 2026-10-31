@@ -73,6 +73,7 @@ impl TextFileCertificateLoginModule {
 
 impl LoginModule for TextFileCertificateLoginModule {
     fn login(&mut self, callbacks: &Callbacks<'_>) -> Result<bool, LoginError> {
+        callbacks.jaas("CertificateCallback")?;
         let Some(certs) = callbacks.certificates else {
             return Err(LoginError::new(
                 "Client certificates not found. Cannot authenticate.",
@@ -126,6 +127,7 @@ impl ExternalCertificateLoginModule {
 
 impl LoginModule for ExternalCertificateLoginModule {
     fn login(&mut self, callbacks: &Callbacks<'_>) -> Result<bool, LoginError> {
+        callbacks.jaas("CertificateCallback")?;
         let first = callbacks.certificates.and_then(|c| c.first());
         self.user = first.map(|c| c.subject_dn_legacy.clone());
         if let (Some(cert), Some(prefix)) = (first, &self.san_uri_role_prefix) {

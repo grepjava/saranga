@@ -6,6 +6,8 @@
 //!   and decide whether its roles pass a check.
 //! - [`store`]: the security store the broker asks, with its caches.
 //! - [`properties`]: the Java properties format of users and roles files.
+//! - [`scram`]: SCRAM-SHA-256 and SCRAM-SHA-512, as AMQP's SASL and the SCRAM
+//!   login modules use them.
 //!
 //! Ported from `org.apache.activemq.artemis.core.security` and
 //! `org.apache.activemq.artemis.spi.core.security`.
@@ -18,6 +20,7 @@ pub mod jaas;
 pub mod keystore;
 pub mod manager;
 pub use saranga_config::properties;
+pub mod scram;
 pub mod store;
 
 pub use basic::{BasicSecurityManager, UserDirectory};

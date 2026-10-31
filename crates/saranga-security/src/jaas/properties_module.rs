@@ -40,6 +40,7 @@ impl PropertiesLoginModule {
 
 impl LoginModule for PropertiesLoginModule {
     fn login(&mut self, callbacks: &Callbacks<'_>) -> Result<bool, LoginError> {
+        callbacks.jaas("PasswordCallback")?;
         let Some(user) = callbacks.user else {
             return Err(LoginError::new("User is null"));
         };

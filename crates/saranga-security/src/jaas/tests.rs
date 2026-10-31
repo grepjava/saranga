@@ -233,3 +233,104 @@ fn external_certificate() {
     // No certificate: the module is ignored, so nothing logs in.
     assert!(login(&entries, &factory, &Callbacks::default()).is_err());
 }
+
+const SCRAM_PROPS: &str =
+    "org.apache.activemq.artemis.spi.core.security.jaas.SCRAMPropertiesLoginModule";
+const SCRAM: &str = "org.apache.activemq.artemis.spi.core.security.jaas.SCRAMLoginModule";
+
+/// SCRAMPropertiesLoginModule: a user's encoded data for the mechanism, a
+/// password in clear made into data, data made up for a user that does
+/// not exist, and roles; only SCRAM's handler serves it.
+#[test]
+fn scram_properties() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = crate::scram::new_password(crate::scram::Scram::Sha256, "pw", b"0123456789", 4096)
+        .unwrap()
+        .user_data();
+    let encoded = format!(
+        r"ENC({}\:{}\:{}\:{})",
+        data.salt, data.iterations, data.server_key, data.stored_key
+    )
+    .replace('=', r"\=");
+    std::fs::write(
+        dir.path().join("users.properties"),
+        format!("alice|SHA256 = {encoded}\nbob = clear\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("roles.properties"), "admins = alice\nops = alice,bob\n").unwrap();
+    let entries = config(&format!(
+        "activemq {{ {SCRAM_PROPS} required org.apache.activemq.jaas.properties.user=\"users.properties\" org.apache.activemq.jaas.properties.role=\"roles.properties\"; }};"
+    ));
+    let factory = ModuleFactory::new(Some(dir.path().to_path_buf()));
+    let scram = |user, mechanism| Callbacks {
+        user: Some(user),
+        scram: Some(mechanism),
+        ..Callbacks::default()
+    };
+    use crate::scram::Scram;
+    let subject = login(&entries, &factory, &scram("alice", Scram::Sha256)).unwrap();
+    assert_eq!(subject.scram_user_data(), Some(&data));
+    assert_eq!(subject.user(), Some("alice"));
+    assert_eq!(subject.roles().collect::<Vec<_>>(), vec!["admins", "ops"]);
+    // SHA512 has no entry of its own: `alice` is looked up, and there is
+    // none, so the data is made up.
+    let other = login(&entries, &factory, &scram("alice", Scram::Sha512)).unwrap();
+    assert_ne!(other.scram_user_data(), Some(&data));
+    let bob = login(&entries, &factory, &scram("bob", Scram::Sha256)).unwrap();
+    let d = bob.scram_user_data().unwrap();
+    let salt = crate::scram::base64_decode(&d.salt).unwrap();
+    let expected = crate::scram::new_password(Scram::Sha256, "clear", &salt, 4096).unwrap();
+    assert_eq!(d, &expected.user_data());
+    assert!(login(&entries, &factory, &scram("nobody", Scram::Sha256)).is_ok());
+    // The usual handler has no SCRAMMechanismCallback.
+    assert!(login(&entries, &factory, &creds(Some("alice"), Some("pw"))).is_err());
+}
+
+/// SCRAMLoginModule: the principals of the peer's identity and a user
+/// principal named like the first; PropertiesLoginModule after it maps
+/// that user to roles. SCRAM's handler has no PrincipalsCallback, nor a
+/// password for PropertiesLoginModule.
+#[test]
+fn scram_login_module_takes_the_peer_principals() {
+    let dir = tempfile::tempdir().unwrap();
+    etc(dir.path());
+    let entries = config(&format!("activemq {{ {SCRAM} required; {} }};", props("optional")));
+    let factory = ModuleFactory::new(Some(dir.path().to_path_buf()));
+    let peer = [Principal::User("plain".into()), Principal::Role("scrammers".into())];
+    let subject = login(
+        &entries,
+        &factory,
+        &Callbacks {
+            user: Some("plain"),
+            peer_principals: Some(&peer),
+            ..Callbacks::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(subject.user(), Some("plain"));
+    assert_eq!(subject.roles().collect::<Vec<_>>(), vec!["scrammers", "ops"]);
+    // No identity: the module is ignored, and the password is wrong.
+    assert!(login(&entries, &factory, &creds(Some("plain"), None)).is_err());
+    let e = login(
+        &config(&format!("activemq {{ {SCRAM} required; }};")),
+        &factory,
+        &Callbacks {
+            peer_principals: Some(&peer),
+            scram: Some(crate::scram::Scram::Sha256),
+            ..Callbacks::default()
+        },
+    )
+    .unwrap_err();
+    assert!(e.message.contains("PrincipalsCallback"), "{e}");
+    let e = login(
+        &config(&format!("activemq {{ {} }};", props("required"))),
+        &factory,
+        &Callbacks {
+            user: Some("plain"),
+            scram: Some(crate::scram::Scram::Sha256),
+            ..Callbacks::default()
+        },
+    )
+    .unwrap_err();
+    assert!(e.message.contains("PasswordCallback"), "{e}");
+}

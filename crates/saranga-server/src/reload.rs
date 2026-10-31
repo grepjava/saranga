@@ -73,8 +73,16 @@ impl Broker {
     /// start fails the reload, before `AMQ221087`.
     pub async fn reload(self: &std::sync::Arc<Self>, reload: Reload) -> Result<(), String> {
         // parseProperties and setJaasConfigs, before anything deploys.
-        if let Some(jaas) = self.security.as_ref().and_then(|s| s.manager().as_jaas()) {
-            jaas.reload_jaas_configs(reload.jaas_configs);
+        let manager = self.security.as_ref().and_then(|s| s.manager().as_jaas());
+        if let Some(jaas) = manager {
+            jaas.reload_jaas_configs(reload.jaas_configs.clone());
+        }
+        // The configuration AMQP's SASL logins use, where it is not the
+        // security manager's.
+        if let Some(login) = &self.login_config
+            && !manager.is_some_and(|m| std::ptr::eq(m, &**login))
+        {
+            login.reload_jaas_configs(reload.jaas_configs);
         }
         saranga_buffer::status::update(
             saranga_buffer::status::CONFIGURATION_COMPONENT,

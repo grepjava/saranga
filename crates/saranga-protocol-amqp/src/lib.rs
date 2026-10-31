@@ -27,6 +27,8 @@ pub mod messaging;
 pub mod mirror;
 pub mod native;
 pub mod sasl;
+mod scram;
+mod server_sasl;
 pub mod transaction;
 pub mod transport;
 pub mod types;
@@ -71,6 +73,9 @@ pub struct Settings {
     pub idle_timeout: Option<i64>,
     /// `saslMechanisms`; empty for the defaults.
     pub sasl_mechanisms: Vec<String>,
+    /// `saslLoginConfigScope`: the JAAS realm the SCRAM and GSSAPI
+    /// mechanisms log in through.
+    pub sasl_login_config_scope: String,
     /// `directDeliver`.
     pub direct_deliver: bool,
     /// `maxTransfersPerDelivery`: the most transfer frames a delivery
@@ -119,6 +124,10 @@ impl Settings {
                         .collect()
                 })
                 .unwrap_or_default(),
+            sasl_login_config_scope: params
+                .get("saslLoginConfigScope")
+                .cloned()
+                .unwrap_or_else(|| "amqp-sasl-gssapi".to_owned()),
             direct_deliver: flag("directDeliver", true),
             max_transfers_per_delivery: int("maxTransfersPerDelivery", 65535) as i32,
         }

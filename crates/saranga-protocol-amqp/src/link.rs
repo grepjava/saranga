@@ -165,15 +165,8 @@ pub fn resolve_target(
                     ));
                 }
                 Ok(_) => {}
-                Err(e) if is_security(&e) => {
-                    return Err(LinkError::new(
-                        condition::UNAUTHORIZED_ACCESS,
-                        format!(
-                            "AMQ119017: not authorized to create producer, {}",
-                            e.message
-                        ),
-                    ));
-                }
+                // A user who may not create the address included: only
+                // the SEND check below is a security error.
                 Err(e) => return Err(LinkError::internal(&e)),
             }
             let bare = session.remove_prefix(&address).to_owned();

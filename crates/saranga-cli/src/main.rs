@@ -27,6 +27,7 @@ mod logging;
 mod network;
 mod perf;
 mod properties;
+mod scram;
 mod shell;
 mod upgrade;
 mod web;
@@ -233,6 +234,14 @@ enum Command {
         /// place of the instance's.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Write the lines of a users file served by
+        /// SCRAMPropertiesLoginModule for this user, as its main method
+        /// does: the password's SCRAM-SHA-512 and SCRAM-SHA-256 data.
+        #[arg(long, value_name = "user")]
+        scram: Option<String>,
+        /// With --scram: the iterations (4096 at least, the default).
+        #[arg(long, requires = "scram")]
+        iterations: Option<String>,
         /// Print additional information.
         #[arg(long)]
         verbose: bool,
@@ -791,6 +800,17 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             ..
         } => properties::run(broker, configuration, output),
         Command::Activation(cmd) => activation::run(cmd).await,
+        Command::Mask {
+            password,
+            scram: Some(user),
+            iterations,
+            ..
+        } => {
+            let date = client::check::java_date_now();
+            let out = scram::lines(&user, &password, iterations.as_deref(), &date)?;
+            std::io::Write::write_all(&mut std::io::stdout(), &out)?;
+            Ok(())
+        }
         Command::Mask {
             password,
             hash,
@@ -1371,6 +1391,7 @@ async fn boot(
             let mut config = BrokerConfig::from_file_config(&file, filters, &instance.dir)?;
             let security = instance.security(&file)?;
             config.security = security.store;
+            config.login_config = security.login_config;
             config.users = security.users;
             config.bootstrap_users = security.bootstrap_users;
             config.management.file_path = Some(instance.broker_xml.clone());

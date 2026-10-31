@@ -387,6 +387,7 @@ pub async fn serve_connection(broker: Arc<Broker>, stream: TcpStream) {
         certificates: None,
         security_domain: None,
         connection_id: None,
+        sasl_principals: None,
     };
     serve_stream(broker, stream, peer, local, info, Arc::default()).await;
 }

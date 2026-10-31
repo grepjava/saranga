@@ -11,7 +11,9 @@ mod certificate;
 pub mod config;
 mod guest;
 mod ldap;
+mod principal;
 mod properties_module;
+mod scram_properties;
 
 use saranga_buffer::json::Json;
 use saranga_buffer::status::{self, Adler32};
@@ -19,6 +21,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+
+use crate::scram::{Scram, UserData};
 
 pub use config::{ControlFlag, LoginConfig, ModuleEntry, ParseError};
 
@@ -34,14 +38,44 @@ pub enum Principal {
     Other { class: String, name: String },
 }
 
+impl Principal {
+    /// `getName`.
+    pub fn name(&self) -> &str {
+        match self {
+            Principal::User(n) | Principal::Role(n) => n,
+            Principal::Other { name, .. } => name,
+        }
+    }
+}
+
 /// `javax.security.auth.Subject`: a set of principals, kept in the order
-/// they were added (the JDK's `SecureSet` is a list too).
+/// they were added (the JDK's `SecureSet` is a list too), and the public
+/// credentials modules add.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Subject {
     principals: Vec<Principal>,
+    credentials: Vec<Credential>,
+}
+
+/// A public credential of a subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Credential {
+    /// The SCRAM data of the user `SCRAMPropertiesLoginModule` logged in.
+    Scram(UserData),
 }
 
 impl Subject {
+    pub fn add_credential(&mut self, credential: Credential) {
+        if !self.credentials.contains(&credential) {
+            self.credentials.push(credential);
+        }
+    }
+
+    /// `getPublicCredentials(UserData.class)`: the first.
+    pub fn scram_user_data(&self) -> Option<&UserData> {
+        self.credentials.iter().map(|Credential::Scram(d)| d).next()
+    }
+
     pub fn add(&mut self, principal: Principal) {
         if !self.principals.contains(&principal) {
             self.principals.push(principal);
@@ -94,6 +128,28 @@ pub struct Callbacks<'a> {
     /// The client's certificate chain, client certificate first.
     pub certificates: Option<&'a [PeerCertificate]>,
     pub remote_address: Option<&'a str>,
+    /// `PrincipalsCallback`: the peer's principals, those of the identity
+    /// an AMQP SASL mechanism established, or else its TLS certificate's.
+    pub peer_principals: Option<&'a [Principal]>,
+    /// The handler is SCRAM's (`JAASSCRAMServerSASL`) rather than
+    /// `JaasCallbackHandler`: it gives the user name, this mechanism and
+    /// its digest and HMAC, and no other callback.
+    pub scram: Option<Scram>,
+}
+
+impl Callbacks<'_> {
+    /// A callback only `JaasCallbackHandler` gives (the password, the
+    /// certificates, the peer's principals): SCRAM's handler fails it with
+    /// `UnsupportedCallbackException`, which modules turn into a
+    /// `LoginException`.
+    pub(crate) fn jaas(&self, callback: &str) -> Result<(), LoginError> {
+        match self.scram {
+            None => Ok(()),
+            Some(_) => Err(LoginError::new(format!(
+                "Unrecognized Callback {callback} not available to obtain information from user"
+            ))),
+        }
+    }
 }
 
 /// `LoginException`. `no_cache` is Artemis's `NoCacheLoginException`: the
@@ -181,6 +237,10 @@ impl ModuleFactory {
                 certificate::ExternalCertificateLoginModule::new(entry),
             )),
             Some("LDAPLoginModule") => Ok(Box::new(ldap::LdapLoginModule::new(entry))),
+            Some("SCRAMPropertiesLoginModule") => Ok(Box::new(
+                scram_properties::ScramPropertiesLoginModule::new(self, entry),
+            )),
+            Some("SCRAMLoginModule") => Ok(Box::new(principal::PrincipalLoginModule::default())),
             _ => Err(LoginError::new(format!(
                 "unable to instantiate LoginModule {class}: not supported by Saranga"
             ))),
@@ -199,6 +259,8 @@ impl ModuleFactory {
                     | "TextFileCertificateLoginModule"
                     | "ExternalCertificateLoginModule"
                     | "LDAPLoginModule"
+                    | "SCRAMPropertiesLoginModule"
+                    | "SCRAMLoginModule"
             )
         )
     }

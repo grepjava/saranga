@@ -78,6 +78,8 @@ pub struct Security {
     /// The basic security manager's users, for the broker to load.
     pub users: Option<Arc<Users>>,
     pub bootstrap_users: Vec<(String, String, Vec<String>)>,
+    /// The JAAS configuration AMQP's SASL logins use (`BrokerConfig::login_config`).
+    pub login_config: Option<Arc<JaasSecurityManager>>,
 }
 
 /// What `saranga run` adds to the instance's files.
@@ -573,8 +575,10 @@ impl Instance {
         }
         let manager = JaasSecurityManager::new(login, Some(&self.etc), domain, certificate_domain);
         manager.set_jaas_configs(realms);
+        let manager = Arc::new(manager);
         Ok(Security {
-            store: Some(self.store(config, Arc::new(manager))?),
+            store: Some(self.store(config, manager.clone())?),
+            login_config: Some(manager),
             ..Security::default()
         })
     }
@@ -648,7 +652,37 @@ impl Instance {
             store: Some(self.store(config, Arc::new(manager))?),
             users: Some(users),
             bootstrap_users,
+            login_config: Some(self.jvm_login_config(config)),
         })
+    }
+}
+
+impl Instance {
+    /// The JVM's JAAS configuration with the basic security manager:
+    /// `login.config`, which `artemis run` names in
+    /// `java.security.auth.login.config` whatever the manager, and the
+    /// broker properties' `jaasConfigs`. A file that does not parse serves
+    /// no realm, as each login through it would fail.
+    fn jvm_login_config(&self, config: &BrokerConfig) -> Arc<JaasSecurityManager> {
+        let path = self.etc.join("login.config");
+        let login = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| match LoginConfig::parse(&text, |n| self.lookup(n)) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    tracing::debug!("{}: {e}", path.display());
+                    None
+                }
+            })
+            .unwrap_or_default();
+        let manager = JaasSecurityManager::new(
+            login,
+            Some(&self.etc),
+            JaasSecurityManager::DEFAULT_DOMAIN,
+            None,
+        );
+        manager.set_jaas_configs(saranga_security::manager::realms(&config.jaas_configs));
+        Arc::new(manager)
     }
 }
 

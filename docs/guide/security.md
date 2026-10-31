@@ -51,8 +51,10 @@ These login modules are supported, with Artemis's class names and options:
 | `TextFileCertificateLoginModule` | Maps the subject DN of a TLS client certificate to a user through a users file (exact DN or `/regex/`), and users to roles through a roles file. `normalise` is not supported and is ignored with a warning. |
 | `ExternalCertificateLoginModule` | Takes the certificate's subject DN as the user name; roles can come from subject alternative name URIs (`sanUriRolePrefix`). |
 | `LDAPLoginModule` | Checks the password by binding to the directory and collects roles from the user's entry and from role searches, with nested groups (`expandRoles`). GSSAPI binds are not supported. |
+| `SCRAMPropertiesLoginModule` | For AMQP's SCRAM-SHA-256 and SCRAM-SHA-512, in the realm the acceptor's `saslLoginConfigScope` names: a user's SCRAM data from a users file (`user\|SHA256` or `user\|SHA512` as `ENC(salt:iterations:serverKey:storedKey)`, or `user` with a password in clear), and roles from a roles file. `saranga mask --scram` writes the lines. |
+| `SCRAMLoginModule` | In the broker's realm: makes the identity a SCRAM exchange established (the user and roles `SCRAMPropertiesLoginModule` found) the client's user. |
 
-`Krb5LoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not supported. An entry that names one gets a warning at startup, and logins that reach that module fail. Saranga also warns at startup when the domain `bootstrap.xml` names has no entry in `login.config`.
+`Krb5LoginModule`, `OIDCLoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not supported. An entry that names one gets a warning at startup, and logins that reach that module fail. Saranga also warns at startup when the domain `bootstrap.xml` names has no entry in `login.config`.
 
 `jaasConfigs` broker properties replace the realm of the same name in `login.config`, as in Artemis. A configuration reload applies the `jaasConfigs` it reads, as Artemis's does. Artemis puts each reload's realms in front of the ones before them, so a realm that a later reload no longer names is still used, and Saranga does the same. Restart the broker to drop a realm. `login.config` itself is not reloaded while the broker runs, in either broker.
 
@@ -62,7 +64,30 @@ Authentication and authorisation results are cached as in Artemis: `authenticati
 
 ### Protocol notes
 
-Every protocol logs in through the same security manager. AMQP clients use SASL: Saranga offers `PLAIN` and `ANONYMOUS` by default, as Artemis does, and `EXTERNAL`, for a client with a certificate, when the acceptor's `saslMechanisms` lists it; SCRAM-SHA-256/512, GSSAPI, OAUTHBEARER and XOAUTH2 are not supported. See [protocols.md](protocols.md) and [COMPAT.md's AMQP section](../../COMPAT.md#amqp-differences).
+Every protocol logs in through the same security manager. AMQP clients use SASL: Saranga offers `PLAIN` and `ANONYMOUS` by default, as Artemis does, and `EXTERNAL`, for a client with a certificate, and `SCRAM-SHA-256` and `SCRAM-SHA-512` when the acceptor's `saslMechanisms` lists them; GSSAPI, OAUTHBEARER and XOAUTH2 are not supported.
+
+SCRAM works as in Artemis. The acceptor names the realm SCRAM logs in through, and the broker's realm takes the identity it established with `SCRAMLoginModule`:
+
+```xml
+<acceptor name="amqp">tcp://0.0.0.0:5672?protocols=AMQP;saslMechanisms=SCRAM-SHA-256,SCRAM-SHA-512;saslLoginConfigScope=amqp-sasl-scram</acceptor>
+```
+
+```
+activemq {
+   org.apache.activemq.artemis.spi.core.security.jaas.SCRAMLoginModule sufficient;
+   org.apache.activemq.artemis.spi.core.security.jaas.PropertiesLoginModule sufficient
+       org.apache.activemq.jaas.properties.user="artemis-users.properties"
+       org.apache.activemq.jaas.properties.role="artemis-roles.properties";
+};
+
+amqp-sasl-scram {
+   org.apache.activemq.artemis.spi.core.security.jaas.SCRAMPropertiesLoginModule required
+       org.apache.activemq.jaas.properties.user="scram-users.properties"
+       org.apache.activemq.jaas.properties.role="scram-roles.properties";
+};
+```
+
+`saranga mask --scram alice secret` prints the lines for `scram-users.properties`: alice's data for both mechanisms, never the password. The SCRAM login reads `login.config` whichever security manager is in use, as Artemis's JVM does. See [protocols.md](protocols.md) and [COMPAT.md's AMQP section](../../COMPAT.md#amqp-differences).
 
 ## Managing users
 

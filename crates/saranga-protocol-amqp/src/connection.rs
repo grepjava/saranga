@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use saranga_core_protocol::ErrorType;
 use saranga_security::Authenticated;
+use saranga_security::scram::Scram;
 use saranga_server::interceptor::Log;
 use saranga_server::message::{ServerMessage, now_millis};
 use saranga_server::protocol::{Connection as Accepted, DirectOut, Written};
@@ -40,6 +41,8 @@ use crate::messaging::{
 };
 use crate::native::AmqpNative;
 use crate::sasl::{self, SaslFrame, SaslInit, SaslMechanisms, SaslOutcome};
+use crate::scram::{ClientState as ScramClientState, ScramClient};
+use crate::server_sasl::{self, ServerSasl};
 use crate::transaction::{
     Coordinator, Declare, Declared, Discharge, TransactionalState, capability as txn_cap,
 };
@@ -937,6 +940,7 @@ where
         certificates: None,
         security_domain: None,
         connection_id: None,
+        sasl_principals: None,
     };
     let client = Arc::new(ClientConnection::new(
         Transport::socket("AMQP", "ActiveMQProtonRemotingConnection", peer, local),
@@ -1103,26 +1107,75 @@ impl Conn {
             }),
         );
         self.out.now(out);
-        let init = match r
-            .frame(self.settings.initial_remote_max_frame_size.max(512))
-            .await
-        {
-            Ok(bytes) => match frame::decode(&bytes) {
-                Ok(frame::Frame {
-                    body: FrameBody::Sasl(SaslFrame::Init(init)),
-                    ..
-                }) => init,
-                _ => return false,
-            },
-            Err(_) => return false,
+        let max = self.settings.initial_remote_max_frame_size.max(512);
+        let init = match r.frame(max).await.map(|b| frame::decode(&b)) {
+            Ok(Ok(frame::Frame {
+                body: FrameBody::Sasl(SaslFrame::Init(init)),
+                ..
+            })) => init,
+            _ => return false,
         };
-        let code = self.sasl_init(&init, &offered).await;
+        // getServerSASL: a mechanism offered, with a factory that makes it.
+        let mechanism = init.mechanism.as_str();
+        let chosen = offered
+            .iter()
+            .any(|m| m == mechanism)
+            .then(|| ServerSasl::create(mechanism, &self.client.security_info()))
+            .flatten();
+        let (code, additional_data) = match chosen {
+            None => (sasl::code::SYS, None),
+            Some(mut chosen) => {
+                let env = server_sasl::Env {
+                    broker: self.broker.clone(),
+                    info: self.client.security_info(),
+                    login_config_scope: self.settings.sasl_login_config_scope.clone(),
+                };
+                let mut data = init.initial_response;
+                // processPending, for the init and each response.
+                let result = loop {
+                    let response = chosen.process(&env, data).await;
+                    if let Some(result) = chosen.result() {
+                        break Some((result, response));
+                    }
+                    if let Some(challenge) = response {
+                        let mut out = Vec::new();
+                        frame::encode_sasl(
+                            &mut out,
+                            &SaslFrame::Challenge(sasl::SaslChallenge { challenge }),
+                        );
+                        self.out.now(out);
+                    }
+                    match r.frame(max).await.map(|b| frame::decode(&b)) {
+                        Ok(Ok(frame::Frame {
+                            body: FrameBody::Sasl(SaslFrame::Response(resp)),
+                            ..
+                        })) => data = Some(resp.response),
+                        _ => break None,
+                    }
+                };
+                let Some((result, response)) = result else {
+                    return false;
+                };
+                if result.success {
+                    self.user = result.user;
+                    self.password = result.password;
+                    if let Some(principals) = result.principals {
+                        self.client.set_sasl_principals(principals);
+                    }
+                    // What the mechanism sent last goes with a successful
+                    // outcome (SCRAM's server signature).
+                    (sasl::code::OK, response)
+                } else {
+                    (sasl::code::AUTH, None)
+                }
+            }
+        };
         let mut out = Vec::new();
         frame::encode_sasl(
             &mut out,
             &SaslFrame::Outcome(SaslOutcome {
                 code,
-                additional_data: None,
+                additional_data,
             }),
         );
         self.out.now(out);
@@ -1174,6 +1227,50 @@ impl Conn {
                 format!("no SASL mechanism to use among {}", offered.join(", ")),
             );
         };
+        // SCRAMClientSASL: the client's first message is the initial
+        // response, its proof the answer to the challenge, and the server's
+        // signature, in the outcome, is checked.
+        let mut scram = match Scram::from_name(mechanism) {
+            None => None,
+            Some(s) => {
+                let o = self.outgoing.as_ref().expect("a broker connection");
+                let (user, password) = (
+                    o.user.clone().unwrap_or_default(),
+                    o.password.clone().unwrap_or_default(),
+                );
+                let mut client = ScramClient::new(s, saranga_security::scram::random_uuid());
+                match client.prepare_first_message(&user) {
+                    Ok(first) => Some((client, password, first)),
+                    Err(e) => return refused(self, format!("prepareFirstMessage failed: {e}")),
+                }
+            }
+        };
+        let response = match &mut scram {
+            Some((_, _, first)) => std::mem::take(first).into_bytes(),
+            None => response,
+        };
+        let answer = |scram: &mut Option<(ScramClient, String, String)>,
+                          challenge: &[u8]|
+         -> Result<Vec<u8>, String> {
+            let Some((client, password, _)) = scram else {
+                return Ok(Vec::new());
+            };
+            let message = crate::scram::ascii_text(challenge);
+            match client.state() {
+                ScramClientState::FirstPrepared => {
+                    match client.prepare_final_message(password, &message) {
+                        Ok(Some(last)) => Ok(last.into_bytes()),
+                        Ok(None) => Err("the server's first message is not one to answer".into()),
+                        Err(e) => Err(format!("prepareFinalMessage failed: {e}")),
+                    }
+                }
+                ScramClientState::FinalPrepared => client
+                    .check_server_final_message(&message)
+                    .map(|()| Vec::new())
+                    .map_err(|e| format!("checkServerFinalMessage failed: {e}")),
+                _ => Ok(Vec::new()),
+            }
+        };
         let mut out = Vec::new();
         frame::encode_sasl(
             &mut out,
@@ -1190,17 +1287,19 @@ impl Conn {
                     body: FrameBody::Sasl(SaslFrame::Outcome(o)),
                     ..
                 })) => break o,
-                // The mechanisms chosen answer a challenge with nothing.
+                // Other mechanisms answer a challenge with nothing.
                 Ok(Ok(frame::Frame {
-                    body: FrameBody::Sasl(SaslFrame::Challenge(_)),
+                    body: FrameBody::Sasl(SaslFrame::Challenge(c)),
                     ..
                 })) => {
+                    let response = match answer(&mut scram, &c.challenge) {
+                        Ok(r) => r,
+                        Err(why) => return refused(self, why),
+                    };
                     let mut out = Vec::new();
                     frame::encode_sasl(
                         &mut out,
-                        &SaslFrame::Response(sasl::SaslResponse {
-                            response: Vec::new(),
-                        }),
+                        &SaslFrame::Response(sasl::SaslResponse { response }),
                     );
                     self.out.now(out);
                 }
@@ -1213,6 +1312,12 @@ impl Conn {
                 format!("SASL {mechanism} failed with code {}", outcome.code),
             );
         }
+        // onSaslOutcome: additional data goes to the mechanism.
+        if let Some(data) = outcome.additional_data.filter(|d| !d.is_empty())
+            && let Err(why) = answer(&mut scram, &data)
+        {
+            return refused(self, why);
+        }
         self.out.now(AMQP_HEADER.to_vec());
         match r.header().await {
             Ok(h) if h == AMQP_HEADER => true,
@@ -1220,11 +1325,11 @@ impl Conn {
         }
     }
 
-    /// `ClientSASLFactoryImpl.chooseMechanism`: among those offered (and
-    /// allowed by the URI's `saslMechanisms`), EXTERNAL when the TLS
-    /// handshake sent this end's certificate, then PLAIN with a user and
-    /// password, then XOAUTH2, then ANONYMOUS. SCRAM is not supported, so
-    /// it is not chosen.
+    /// `AMQPBrokerConnection.SaslFactory.chooseMechanism`: among those
+    /// offered (and allowed by the URI's `saslMechanisms`), EXTERNAL when the
+    /// TLS handshake sent this end's certificate, then, with a user and
+    /// password, SCRAM-SHA-512, SCRAM-SHA-256, PLAIN and XOAUTH2, then
+    /// ANONYMOUS. SCRAM's initial response is made by the caller.
     fn choose_mechanism(&self, offered: &[String]) -> Option<(&'static str, Vec<u8>)> {
         let o = self.outgoing.as_ref()?;
         let allowed = |m: &str| {
@@ -1242,6 +1347,9 @@ impl Conn {
             _ => None,
         };
         if let Some((u, p)) = creds {
+            if let Some(s) = Scram::ALL.into_iter().find(|s| allowed(s.name())) {
+                return Some((s.name(), Vec::new()));
+            }
             if allowed("PLAIN") {
                 let mut r = vec![0u8];
                 r.extend_from_slice(u.as_bytes());
@@ -1292,60 +1400,6 @@ impl Conn {
             }),
         );
         channel
-    }
-
-    /// One `sasl-init`: the outcome code.
-    async fn sasl_init(&mut self, init: &SaslInit, offered: &[String]) -> u8 {
-        let mechanism = init.mechanism.as_str();
-        if !offered.iter().any(|m| m == mechanism) {
-            return sasl::code::SYS;
-        }
-        match mechanism {
-            "ANONYMOUS" => sasl::code::OK,
-            "PLAIN" => {
-                let Some(data) = &init.initial_response else {
-                    return sasl::code::AUTH;
-                };
-                // String.split("\0"): trailing empty parts go.
-                let text = String::from_utf8_lossy(data).into_owned();
-                let mut parts: Vec<&str> = text.split('\0').collect();
-                while parts.last() == Some(&"") {
-                    parts.pop();
-                }
-                let (user, pass) = match parts.as_slice() {
-                    [u, p] => (Some((*u).to_owned()), Some((*p).to_owned())),
-                    [_, u, p] => (Some((*u).to_owned()), Some((*p).to_owned())),
-                    _ => (None, None),
-                };
-                self.user = user.clone();
-                self.password = pass.clone();
-                match self.broker.security().cloned() {
-                    None => sasl::code::OK,
-                    Some(store) if !store.is_enabled() => sasl::code::OK,
-                    Some(store) => {
-                        let info = self.client.security_info();
-                        let ok = tokio::task::spawn_blocking(move || {
-                            store
-                                .authenticate(user.as_deref(), pass.as_deref(), &info)
-                                .is_ok()
-                        })
-                        .await
-                        .unwrap_or(false);
-                        if ok { sasl::code::OK } else { sasl::code::AUTH }
-                    }
-                }
-            }
-            "EXTERNAL" => {
-                let has_cert = self.client.security_info().certificates.is_some();
-                let empty = init.initial_response.as_ref().is_none_or(|r| r.is_empty());
-                match (has_cert, empty) {
-                    (false, _) => sasl::code::SYS,
-                    (true, true) => sasl::code::OK,
-                    (true, false) => sasl::code::AUTH,
-                }
-            }
-            _ => sasl::code::SYS,
-        }
     }
 
     // -------------------------------------------------------- the loop

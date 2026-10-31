@@ -365,7 +365,11 @@ pub fn saranga() -> &'static Spec {
                     own(&["--bind"], "<bind>", false),
                     own(&["-D"], "<NAME=VALUE>", true),
                 ]),
-                "mask" => c.options.push(own(&["--config"], "<config>", false)),
+                "mask" => c.options.extend([
+                    own(&["--config"], "<config>", false),
+                    own(&["--scram"], "<user>", false),
+                    own(&["--iterations"], "<iterations>", false),
+                ]),
                 _ => {}
             }
         }

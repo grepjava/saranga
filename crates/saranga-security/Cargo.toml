@@ -16,6 +16,8 @@ regex = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 saranga-config = { path = "../saranga-config" }
 sha2 = "0.10"
+ring = "0.17"
+unicode-normalization = "0.1"
 thiserror = "2"
 tracing = "0.1"
 

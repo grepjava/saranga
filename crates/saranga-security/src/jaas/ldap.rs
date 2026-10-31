@@ -205,6 +205,7 @@ impl LoginModule for LdapLoginModule {
         if !self.authenticate_user {
             return Ok(false);
         }
+        callbacks.jaas("PasswordCallback")?;
         let Some(user) = callbacks.user else {
             return Ok(false);
         };
