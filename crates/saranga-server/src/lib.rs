@@ -21,6 +21,7 @@ pub mod duplicate;
 pub mod error;
 pub mod federation;
 pub mod grouping;
+pub mod interceptor;
 pub mod jvm;
 pub mod large;
 pub mod localtime;
@@ -217,6 +218,13 @@ pub struct BrokerConfig {
     pub diverts: Vec<postoffice::DivertDeployment>,
     /// Divert transformers by the class name `broker.xml` refers to them by.
     pub transformers: HashMap<String, postoffice::TransformerFactory>,
+    /// Interceptors by the class name `broker.xml` refers to them by.
+    pub interceptors: HashMap<String, interceptor::InterceptorFactory>,
+    /// `<remoting-incoming-interceptors>` (and `<remoting-interceptors>`),
+    /// class names [`interceptors`](Self::interceptors) must have.
+    pub incoming_interceptors: Vec<String>,
+    /// `<remoting-outgoing-interceptors>`.
+    pub outgoing_interceptors: Vec<String>,
     /// The journals; `None` keeps everything in memory
     /// (`persistence-enabled` false).
     pub storage: Option<storage::StorageConfig>,
@@ -304,6 +312,9 @@ impl BrokerConfig {
             legacy_queues: Vec::new(),
             diverts: Vec::new(),
             transformers: HashMap::new(),
+            interceptors: HashMap::new(),
+            incoming_interceptors: Vec::new(),
+            outgoing_interceptors: Vec::new(),
             storage: None,
             message_expiry_scan_period: 30000,
             transaction_timeout: 300000,
@@ -521,6 +532,7 @@ pub struct Broker {
     security: Option<Arc<saranga_security::SecurityStore>>,
     /// For the diverts a reload deploys.
     transformers: HashMap<String, postoffice::TransformerFactory>,
+    interceptors: interceptor::Interceptors,
     populate_validated_user: bool,
     reject_empty_validated_user: bool,
     /// Every protocol the broker serves, Core first.
@@ -592,6 +604,21 @@ impl Broker {
         }
         let internal =
             |what: &str, e: &dyn std::fmt::Display| BrokerError::internal(format!("{what}: {e}"));
+        // `RemotingServiceImpl.setInterceptors`: before anything starts.
+        let interceptors = interceptor::Interceptors::new(
+            interceptor::resolve(
+                &config.incoming_interceptors,
+                &config.interceptors,
+                "remoting-incoming-interceptors",
+            )
+            .map_err(BrokerError::illegal_state)?,
+            interceptor::resolve(
+                &config.outgoing_interceptors,
+                &config.interceptors,
+                "remoting-outgoing-interceptors",
+            )
+            .map_err(BrokerError::illegal_state)?,
+        );
         // `SharedNothingPrimaryActivation`: each broker of a replicating
         // pair has its own data, and takes no primary lock on it.
         let replicating = config.ha.policy.replication().is_some();
@@ -836,6 +863,7 @@ impl Broker {
             failback: tokio::sync::Notify::new(),
             security: config.security.clone(),
             transformers: config.transformers,
+            interceptors,
             populate_validated_user: config.populate_validated_user,
             reject_empty_validated_user: config.reject_empty_validated_user,
             protocols: [
@@ -1266,6 +1294,11 @@ impl Broker {
 
     pub fn federation(&self) -> &federation::FederationManager {
         &self.federation
+    }
+
+    /// The interceptors every protocol's connections use.
+    pub fn interceptors(&self) -> &interceptor::Interceptors {
+        &self.interceptors
     }
 
     /// Divert transformers by class name.

@@ -16,6 +16,10 @@
 //!   time), with its API at `/saranga/api/v1` (see [`api`]), unless
 //!   `saranga.console.enabled` is `false`.
 
+// Whether the live view's streams are Send is worked out through the
+// broker's whole type, deeper than the default limit.
+#![recursion_limit = "256"]
+
 mod access;
 mod admin;
 pub mod api;

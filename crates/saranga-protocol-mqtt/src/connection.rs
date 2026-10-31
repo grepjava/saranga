@@ -8,7 +8,7 @@
 //! client's subscriptions add to it too.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,6 +16,7 @@ use saranga_buffer::{PropertyValue, Reader};
 use saranga_core_protocol::ErrorType;
 use saranga_message::{CoreMessage, message_type};
 use saranga_security::Authenticated;
+use saranga_server::interceptor::Log;
 use saranga_server::message::{ServerMessage, now_millis};
 use saranga_server::postoffice::{QueueSpec, RoutingTypes};
 use saranga_server::protocol::{Connection as Accepted, DirectOut, Written};
@@ -55,10 +56,82 @@ enum Out {
 pub struct Outbound {
     tx: mpsc::UnboundedSender<Out>,
     direct: DirectOut,
+    /// For the outgoing interceptors.
+    broker: Arc<Broker>,
+    client: Arc<ClientConnection>,
+    /// The version the client connected with (`Version::level`), 0 until
+    /// a CONNECT names one.
+    level: AtomicU8,
 }
 
 impl Outbound {
+    fn new(
+        tx: mpsc::UnboundedSender<Out>,
+        direct: DirectOut,
+        broker: Arc<Broker>,
+        client: Arc<ClientConnection>,
+    ) -> Self {
+        Self {
+            tx,
+            direct,
+            broker,
+            client,
+            level: AtomicU8::new(0),
+        }
+    }
+
+    fn set_version(&self, version: Version) {
+        self.level.store(version.level(), Ordering::Relaxed);
+    }
+
+    fn version(&self) -> Version {
+        match self.level.load(Ordering::Relaxed) {
+            3 => Version::V3_1,
+            5 => Version::V5,
+            _ => Version::V3_1_1,
+        }
+    }
+
+    /// `sendToClient`'s outgoing interceptors: the packets decoded for
+    /// them and written again only where one was changed; `None` once one
+    /// is refused, which is then not sent.
+    fn intercept(&self, bytes: Vec<u8>) -> Option<Vec<u8>> {
+        let interceptors = self.broker.interceptors();
+        if !interceptors.intercepts_outgoing::<Packet>() {
+            return Some(bytes);
+        }
+        let version = self.version();
+        let mut decoder = codec::Decoder::for_version(version);
+        let mut rest = bytes.clone();
+        let mut out = Vec::with_capacity(bytes.len());
+        while !rest.is_empty() {
+            let before = rest.len();
+            let Some(Ok(packet)) = decoder.decode(&mut rest) else {
+                // Not a packet this side decodes: as it is.
+                out.extend_from_slice(&bytes[bytes.len() - before..]);
+                break;
+            };
+            let mut intercepted = packet.clone();
+            if let Some(by) =
+                interceptors.invoke_outgoing(&mut intercepted, &self.client, Log::Server)
+            {
+                tracing::debug!(
+                    "Interceptor {by} rejected MQTT control packet: {}",
+                    packet.name()
+                );
+                return None;
+            }
+            if intercepted == packet {
+                out.extend_from_slice(&bytes[bytes.len() - before..bytes.len() - rest.len()]);
+            } else {
+                out.extend(intercepted.encode(version)?);
+            }
+        }
+        Some(out)
+    }
+
     fn send(&self, wait: Completion, bytes: Option<Vec<u8>>) {
+        let bytes = bytes.and_then(|b| self.intercept(b));
         let tx = &self.tx;
         match bytes {
             // Ready now: to the socket while the writer has nothing left
@@ -1513,6 +1586,12 @@ pub async fn serve(
         -1 | 0 => -1,
         k => i64::from(k) * util::KEEP_ALIVE_ADJUSTMENT,
     };
+    let out = Arc::new(Outbound::new(
+        out_tx,
+        direct,
+        broker.clone(),
+        client.clone(),
+    ));
     let mut conn = Conn {
         broker,
         manager,
@@ -1520,7 +1599,7 @@ pub async fn serve(
         id: NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed),
         client,
         remote,
-        out: Arc::new(Outbound { tx: out_tx, direct }),
+        out,
         events: events_tx,
         control: control_tx,
         decoder: codec::Decoder::new(),
@@ -1662,8 +1741,27 @@ impl Conn {
                     }
                     self.disconnect(true).await;
                 }
-                Ok(Packet::PingReq) => self.send(codec::pingresp()),
-                Ok(packet) => self.act(packet).await,
+                Ok(mut packet) => {
+                    if let Some(v) = self.decoder.version {
+                        self.out.set_version(v);
+                    }
+                    if let Some(by) = self.broker.interceptors().invoke_incoming(
+                        &mut packet,
+                        &self.client,
+                        Log::Server,
+                    ) {
+                        tracing::debug!(
+                            "Interceptor {by} rejected MQTT control packet: {}",
+                            packet.name()
+                        );
+                        self.disconnect(true).await;
+                        continue;
+                    }
+                    match packet {
+                        Packet::PingReq => self.send(codec::pingresp()),
+                        packet => self.act(packet).await,
+                    }
+                }
             }
         }
     }
@@ -1687,9 +1785,9 @@ impl Conn {
             }
             // Enhanced authentication is not implemented.
             Packet::Auth { .. } => Ok(()),
-            Packet::ConnAck
-            | Packet::SubAck
-            | Packet::UnsubAck
+            Packet::ConnAck { .. }
+            | Packet::SubAck { .. }
+            | Packet::UnsubAck { .. }
             | Packet::PingResp
             | Packet::PingReq => {
                 self.disconnect(true).await;

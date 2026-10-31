@@ -1775,6 +1775,7 @@ dependencies = [
  "saranga-buffer",
  "saranga-client",
  "saranga-config",
+ "saranga-core-protocol",
  "saranga-filter",
  "saranga-ha",
  "saranga-journal",

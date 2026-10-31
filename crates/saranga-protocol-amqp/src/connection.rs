@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use saranga_core_protocol::ErrorType;
 use saranga_security::Authenticated;
+use saranga_server::interceptor::Log;
 use saranga_server::message::{ServerMessage, now_millis};
 use saranga_server::protocol::{Connection as Accepted, DirectOut, Written};
 use saranga_server::queue::{DeliverySink, FORCED_DELIVERY_MESSAGE, Queue};
@@ -3921,7 +3922,7 @@ impl Conn {
                 let _ = t
                     .receive(&mut s.server, incoming.format, payload, now, large_at)
                     .await;
-                Ok(())
+                Ok(true)
             }
             _ => {
                 s.server.set_sender(Some(rl.name.clone()));
@@ -3981,7 +3982,14 @@ impl Conn {
             return Ok(());
         };
         let state = match result {
-            Ok(()) => match txn_id {
+            // rejectMessage
+            Ok(false) => DeliveryState::Rejected(Rejected {
+                error: Some(Error::new(
+                    "failed",
+                    Some("Interceptor rejected message".to_owned()),
+                )),
+            }),
+            Ok(true) => match txn_id {
                 Some(txn_id) => DeliveryState::Transactional(TransactionalState {
                     txn_id,
                     outcome: Some(Box::new(DeliveryState::Accepted)),
@@ -4619,19 +4627,42 @@ impl Conn {
             .mirror
             .as_deref()
             .and_then(|snf| crate::mirror::delivery_annotations(&message, snf));
-        let (format, payload) = match message
+        let native = message
             .native()
-            .and_then(|n| n.as_any().downcast_ref::<AmqpNative>())
-        {
-            Some(n) => (
-                n.message.message_format as u32,
-                n.message.send_buffer_with(delivery_count, da.as_ref()),
-            ),
-            None => (
-                0,
-                crate::convert::from_core(message.delivery_core(), now_millis())
-                    .send_buffer_with(delivery_count, da.as_ref()),
-            ),
+            .and_then(|n| n.as_any().downcast_ref::<AmqpNative>());
+        let interceptors = self.broker.interceptors();
+        let (format, payload) = if interceptors.intercepts_outgoing::<AmqpMessage>() {
+            // AMQPMessageWriter.writeBytes: the outgoing interceptors see
+            // the message (a copy for this delivery), and one refused is
+            // not delivered, staying with the consumer until it closes.
+            let now = now_millis();
+            let mut m = match native {
+                Some(n) => n.message.clone(),
+                None => crate::convert::from_core(message.delivery_core(), now),
+            };
+            if interceptors
+                .invoke_outgoing(&mut m, &self.client, Log::Server)
+                .is_some()
+            {
+                lock(&sl.credit).pending -= 1;
+                return Ok(());
+            }
+            (
+                m.message_format as u32,
+                m.send_buffer_with(delivery_count, da.as_ref()),
+            )
+        } else {
+            match native {
+                Some(n) => (
+                    n.message.message_format as u32,
+                    n.message.send_buffer_with(delivery_count, da.as_ref()),
+                ),
+                None => (
+                    0,
+                    crate::convert::from_core(message.delivery_core(), now_millis())
+                        .send_buffer_with(delivery_count, da.as_ref()),
+                ),
+            }
         };
         sl.link_credit = sl.link_credit.saturating_sub(1);
         sl.delivery_count = sl.delivery_count.wrapping_add(1);
@@ -4892,7 +4923,8 @@ impl Conn {
 }
 
 /// `AMQPSessionCallback.serverSend`: the address and routing type, then
-/// the send.
+/// the send (`inSessionSend`), unless an incoming interceptor refuses the
+/// message: false then.
 #[allow(clippy::too_many_arguments)] // AMQPSessionCallback.serverSend's
 async fn server_send(
     server: &mut ServerSession,
@@ -4905,7 +4937,7 @@ async fn server_send(
     large_at: usize,
     settled: bool,
     anonymous: &mut Anonymous<'_>,
-) -> Result<(), BrokerError> {
+) -> Result<bool, BrokerError> {
     // At amqpMinLargeMessageSize the message goes to a file of its own.
     let large = large_at > 0 && payload.len() >= large_at;
     let file = large.then(|| payload.clone());
@@ -4976,25 +5008,13 @@ async fn server_send(
         if let Some(tx) = &tx {
             saranga_server::transaction::lock(tx).mark_rollback_only(&e);
         }
-        return Ok(());
+        return Ok(true);
     }
     msg.set_connection_id(container);
-    let body = match file {
-        Some(bytes) => {
-            let id = server.broker().post_office().ids().next();
-            msg.set_message_id(id);
-            msg.make_large();
-            let io = |e: std::io::Error| BrokerError::new(ErrorType::IoError, e.to_string());
-            let mut w = server
-                .broker()
-                .large_messages()
-                .create(id, msg.is_durable())
-                .map_err(io)?;
-            w.append(&bytes).map_err(io)?;
-            Some(w.finish().map_err(io)?)
-        }
-        None => None,
-    };
+    if file.is_some() {
+        msg.set_message_id(server.broker().post_office().ids().next());
+        msg.make_large();
+    }
     // The ID and the address the session would give it (setMessageID,
     // setAddress), given here so that the session takes the message as it
     // is rather than copying it to change them.
@@ -5009,10 +5029,36 @@ async fn server_send(
             .clone(),
     };
     msg.route_to(to);
+    // inSessionSend: the incoming interceptors see the message as it is
+    // sent, a refused one going no further. What they change is changed
+    // in the message, its encoding kept as it is, as AMQPMessage's setters
+    // leave it.
+    if server
+        .broker()
+        .interceptors()
+        .invoke_incoming(&mut msg, server.connection(), Log::Server)
+        .is_some()
+    {
+        return Ok(false);
+    }
+    let body = match file {
+        Some(bytes) => {
+            let io = |e: std::io::Error| BrokerError::new(ErrorType::IoError, e.to_string());
+            let mut w = server
+                .broker()
+                .large_messages()
+                .create(msg.message_id(), msg.is_durable())
+                .map_err(io)?;
+            w.append(&bytes).map_err(io)?;
+            Some(w.finish().map_err(io)?)
+        }
+        None => None,
+    };
     let native = AmqpNative::arc(msg);
     server
         .send_native_large_to(native, body, tx, Some(&address), routing)
-        .await
+        .await?;
+    Ok(true)
 }
 
 /// What `serverSend` asks of an anonymous relay's last address.

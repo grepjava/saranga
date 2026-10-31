@@ -1001,6 +1001,11 @@ pub struct BrokerConfig {
     pub security_setting_plugins: Vec<SecuritySettingPluginConfig>,
     /// `<broker-plugins>`, in document order.
     pub broker_plugins: Vec<BrokerPluginConfig>,
+    /// `<remoting-interceptors>` and `<remoting-incoming-interceptors>`:
+    /// class names, trimmed.
+    pub incoming_interceptors: Vec<String>,
+    /// `<remoting-outgoing-interceptors>`: class names, as written.
+    pub outgoing_interceptors: Vec<String>,
     /// `jaasConfigs` from broker properties: login configurations by realm,
     /// which take the place of the same realm in `login.config`.
     pub jaas_configs: Vec<(String, Vec<JaasModuleConfig>)>,
@@ -1214,6 +1219,8 @@ impl Default for BrokerConfig {
             security_settings: Vec::new(),
             security_setting_plugins: Vec::new(),
             broker_plugins: Vec::new(),
+            incoming_interceptors: Vec::new(),
+            outgoing_interceptors: Vec::new(),
             jaas_configs: Vec::new(),
             system_property_prefix: crate::broker_properties::DEFAULT_SYSTEM_PROPERTY_PREFIX
                 .to_owned(),

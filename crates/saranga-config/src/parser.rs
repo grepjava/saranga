@@ -501,6 +501,7 @@ fn parse_core(
     parse_grouping_handler(core, config)?;
     parse_security_settings(core, config, warnings)?;
     parse_broker_plugins(core, config)?;
+    parse_interceptors(core, config);
     parse_address_settings(core, config, warnings)?;
     parse_addresses(core, config, warnings)?;
     parse_bridges(core, config)?;
@@ -522,18 +523,6 @@ const NOT_ACTED_ON: &[(&str, &str)] = &[
     (
         "metrics-plugin",
         "its settings are not applied; the web server's metrics app exports the broker, address and queue metrics",
-    ),
-    (
-        "remoting-interceptors",
-        "interceptors are Java classes, which Saranga cannot load",
-    ),
-    (
-        "remoting-incoming-interceptors",
-        "interceptors are Java classes, which Saranga cannot load",
-    ),
-    (
-        "remoting-outgoing-interceptors",
-        "interceptors are Java classes, which Saranga cannot load",
     ),
     (
         "connector-services",
@@ -1709,6 +1698,37 @@ pub(crate) fn required_attribute(n: Node<'_, '_>, attribute: &str) -> Result<Str
             element: n.tag_name().name().to_owned(),
             attribute: attribute.to_owned(),
         })
+}
+
+/// The interceptors' class names, as `parseMainConfig` reads them: the
+/// incoming ones of `remoting-interceptors` then
+/// `remoting-incoming-interceptors`, trimmed, the outgoing ones as written.
+fn parse_interceptors(core: Node<'_, '_>, config: &mut BrokerConfig) {
+    let names = |list: &str, trim: bool| {
+        first(core, list)
+            .into_iter()
+            .flat_map(elements)
+            .filter(|c| c.tag_name().name().eq_ignore_ascii_case("class-name"))
+            .map(move |c| {
+                if trim {
+                    trimmed_text(c)
+                } else {
+                    text_content(c)
+                }
+            })
+    };
+    let incoming: Vec<String> = names("remoting-interceptors", true)
+        .chain(names("remoting-incoming-interceptors", true))
+        .collect();
+    let outgoing: Vec<String> = names("remoting-outgoing-interceptors", false).collect();
+    if first(core, "remoting-interceptors").is_some()
+        || first(core, "remoting-incoming-interceptors").is_some()
+    {
+        config.incoming_interceptors = incoming;
+    }
+    if first(core, "remoting-outgoing-interceptors").is_some() {
+        config.outgoing_interceptors = outgoing;
+    }
 }
 
 /// `parseSecurity`: role mappings first, then each `<security-setting>`

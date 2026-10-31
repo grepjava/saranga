@@ -140,6 +140,15 @@ pub fn message_properties(msg: &Message) -> R<PrimitiveMap> {
     }
 }
 
+/// `Message.setProperties` with `beforeMarshall`: the properties written
+/// back marshalled, as an interceptor that changes them needs.
+pub fn set_message_properties(msg: &mut Message, properties: &PrimitiveMap) -> R<()> {
+    let mut b = Vec::new();
+    p::write_map(&mut b, Some(properties))?;
+    msg.marshalled_properties = Some(b);
+    Ok(())
+}
+
 /// `CoreMessage.putObjectProperty` of a value read from a primitive map;
 /// what a property cannot hold goes in as its `toString()`.
 fn put_primitive(core: &mut CoreMessage, key: &str, v: &Primitive) {

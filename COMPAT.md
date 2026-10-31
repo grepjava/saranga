@@ -107,7 +107,6 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **The `server` header** of CONNECTED is `Saranga/<version>`. Artemis sends `ActiveMQ-Artemis/2.57.0 ActiveMQ Artemis Messaging Engine`. `disableStompServerHeader` leaves it out on both.
 - **`AMQ339011 Error sending message`** names the message by its ID, durability and address. Artemis prints the whole `CoreMessage.toString()`.
 - **Byte-array properties** appear in MESSAGE headers as `[B@` followed by a hash of their contents. Artemis prints the array's identity hash. Neither means anything to a client.
-- **Frame interceptors** (Java classes) are not supported.
 - **The connection TTL** closes a silent connection when it runs out. Artemis notices at its next `connection-ttl-check-interval`, up to that much later.
 - **A `\r` that is the last byte read** waits for its `\n`. Artemis reports `There is a CR not followed by an LF` when the two arrive in different packets.
 
@@ -118,7 +117,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **A second CONNECT** on a connection closes it, after a DISCONNECT 0x8E (session taken over) for MQTT 5. That is what Artemis's link stealing ends up doing when the client ID is the same. Artemis would instead start a second session if the client ID differed.
 - **The connection TTL** closes a silent connection when it runs out. Artemis notices at its next `connection-ttl-check-interval`, up to that much later.
 - **`mqtt-session-state-persistence-timeout`** is accepted and reported as deprecated (`AMQ221038`), as in Artemis, but as a warning rather than at INFO level.
-- **Interceptors** (Java classes) and connection routers (redirects) are not supported.
+- **Connection routers** (redirects) are not supported.
 - **A large message** (over the journal's record size) published as a retained message stays a regular message in the retained-message queue. Artemis converts it to a large message there.
 
 ## AMQP differences
@@ -135,7 +134,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **Not supported:**
   - **SASL mechanisms:** SCRAM-SHA-256/512, GSSAPI, OAUTHBEARER and XOAUTH2. An acceptor's `saslMechanisms` that lists them gets outcome `sys` for them.
   - **Core-message tunnelling** (`AMQ_CORE_MESSAGE_TUNNELING`): Core messages always go out converted to AMQP.
-  - **Connection routers and interceptors.**
+  - **Connection routers.**
 - **Large messages:**
   - An AMQP large message is held whole in memory while the broker holds it. It is also written to its large-message file, with Artemis's record, so either broker reads the other's.
   - A copy to a dead-letter or expiry address copies the file as it is. Artemis rewrites the copy's header and properties without the expiry.
@@ -148,7 +147,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **Removal advisories** on connection close are sent for the temporary destinations the connection made. Artemis also sends them for the temporary subscription queues of its topic consumers, under `ActiveMQ.Advisory.TempQueue`.
 - **Dispatched properties** of messages that came from Core or the journal are marshalled in the order they were put, not in the order of a freshly decoded Java `HashMap`. Clients read them into a map.
 - **`openwireMaxPacketChunkSize` and `actorThresholdBytes`** are accepted and change nothing. In Artemis the first makes a frame larger than it be read into a heap buffer rather than Netty's pooled ones, and written in pieces of that size without a flush between them, so the client gets the same bytes at the same time; Saranga reads every frame into its own buffer and writes it whole. The second is how many bytes of commands Artemis lets queue for the connection's executor before it stops reading; Saranga handles a connection's commands as it reads them and reads nothing more while it does, so nothing queues.
-- **Not supported:** connection routers and interceptors.
+- **Not supported:** connection routers.
 
 ## WebSocket differences
 - **A broker write is one WebSocket message**, which can hold several protocol frames: the connection's writer batches what is ready. Artemis sends each protocol frame as its own message. Clients read the payloads as a stream.
@@ -268,6 +267,12 @@ A plugin is Rust code implementing `saranga_server::plugin::BrokerPlugin`, the e
 - **Arguments.** A message's acknowledgement is reported without its transaction (the logging plugin prints `with transaction: null`) and without its consumer; a destroyed queue is reported without the session that destroyed it (`session: null`).
 - **Notifications.** The notification plugin's `MESSAGE_EXPIRED` has no `_AMQ_ConsumerName`, as expiry by a consumer is reported as by the reaper.
 - **Objects in messages** print as in the audit log (Saranga's values, identity hashes not Java's), and a message's properties are in insertion order, not a Java `HashMap`'s.
+
+## Interceptor differences
+An interceptor is Rust code: a `saranga_server::interceptor::Interceptor`, named, that implements `Intercept<P>` for the packets of the protocols it takes, Artemis's `Interceptor`, `StompFrameInterceptor`, `MQTTInterceptor`, `OpenWireInterceptor` and `AmqpInterceptor`: Core's `saranga_core_protocol::Packet`, STOMP's `Frame`, MQTT's `codec::Packet`, OpenWire's `DataStructure` and AMQP's `AmqpMessage`. An embedding application registers it in `BrokerConfig::interceptors` under the class name `<remoting-incoming-interceptors>` (or `<remoting-interceptors>`) and `<remoting-outgoing-interceptors>` give, and can add and remove interceptors on a running broker through `Broker::interceptors`, as `RemotingService` allows. A class name with no interceptor registered stops the broker from starting, as a class Artemis cannot load does. They are called where Artemis calls them, and a refusal does what it does there: a Core packet is dropped, a STOMP frame is dropped (the frames read with it wait for more bytes), an MQTT or OpenWire connection is closed (an OpenWire command refused before the connection is made is only dropped), an AMQP message is rejected with `failed` "Interceptor rejected message", and an outgoing packet is not sent. One that fails is logged (`AMQ212038` for Core, `AMQ224082` for the others) and the next is called. A STOMP MESSAGE is encoded before the outgoing interceptors see it, and an AMQP message's application properties are changed without its encoding, so what an interceptor changes of them does not reach the client, in either broker. [tests/interop/interceptors](https://github.com/grepjava/saranga/blob/main/tests/interop/interceptors/interceptors.sh) runs the same interceptors in both brokers, in Java and in Rust (the CLI's `interop-interceptors` feature). The differences:
+- **Interceptors are given the connection** as `ClientConnection`, which every protocol's connections share, not as the protocol's own connection class.
+- **The outgoing interceptors of Core and AMQP** are given a copy of the delivered message, for that delivery. Artemis gives them the message the queue holds, so what one changes stays with the message for its later deliveries.
+- **A refused Core large message** takes no consumer credit. Artemis asks the packet it did not encode for its size, which fails the delivery.
 
 ## Security differences
 - **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule` and `LDAPLoginModule` are supported. `Krb5LoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.

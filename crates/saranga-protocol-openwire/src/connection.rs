@@ -16,6 +16,7 @@ use saranga_core_protocol::ErrorType;
 use saranga_core_protocol::packets::xa::Xid;
 use saranga_message::CoreMessage;
 use saranga_security::{Authenticated, SecurityError};
+use saranga_server::interceptor::Log;
 use saranga_server::postoffice::{AutoCreate, AutoCreateOptions, QueueSpec, split_fqqn};
 use saranga_server::protocol::{Connection as Accepted, DirectOut, Written};
 use saranga_server::queue::AckResult;
@@ -188,11 +189,30 @@ pub(crate) struct Outbound {
     destroyed: AtomicBool,
     /// When anything was last written (`lastSent`).
     last_sent: AtomicI64,
+    /// For the outgoing interceptors.
+    broker: Arc<Broker>,
+    client: Arc<ClientConnection>,
 }
 
 impl Outbound {
-    /// `physicalSend`.
+    /// `physicalSend`: the outgoing interceptors first, a refusal keeping
+    /// the command back.
     pub fn send(&self, command: &DataStructure) -> bool {
+        let interceptors = self.broker.interceptors();
+        let intercepted;
+        let command = if interceptors.intercepts_outgoing::<DataStructure>() {
+            let mut c = command.clone();
+            if interceptors
+                .invoke_outgoing(&mut c, &self.client, Log::Server)
+                .is_some()
+            {
+                return false;
+            }
+            intercepted = c;
+            &intercepted
+        } else {
+            command
+        };
         let bytes = match lock(&self.wf).marshal(Some(command)) {
             Ok(b) => b,
             Err(e) => {
@@ -677,6 +697,8 @@ pub async fn serve(broker: Arc<Broker>, manager: Arc<Manager>, c: Accepted) {
         wf: Mutex::new(WireFormat::new(crate::codec::DEFAULT_WIRE_VERSION)),
         destroyed: AtomicBool::new(false),
         last_sent: AtomicI64::new(-1),
+        broker: broker.clone(),
+        client: client.clone(),
     });
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let (replies_tx, replies_rx) = mpsc::unbounded_channel();
@@ -934,6 +956,25 @@ impl Connection {
             );
             return true;
         };
+        let mut command = command;
+        if self
+            .broker
+            .interceptors()
+            .invoke_incoming(&mut command, &self.client, Log::Server)
+            .is_some()
+        {
+            tracing::debug!(
+                "Interceptor rejected OpenWire command: {}",
+                command.class_name()
+            );
+            // `disconnect(true)`, which does nothing before the connection
+            // is made.
+            if self.info.is_none() {
+                return true;
+            }
+            self.disconnect().await;
+            return false;
+        }
         // The pre-authentication gate.
         if self.info.is_none()
             && !matches!(

@@ -41,6 +41,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::interceptor::Log;
 use crate::message::ServerMessage;
 use crate::protocol::{DirectOut, Written};
 use crate::queue::DeliverySink;
@@ -73,6 +74,8 @@ pub(crate) struct ConnShared {
     pub(crate) client: Arc<ClientConnection>,
     /// Served as HORNETQ: messages and filters are converted.
     hornetq: bool,
+    /// For the interceptors.
+    broker: Arc<Broker>,
 }
 
 impl ConnShared {
@@ -89,8 +92,28 @@ impl ConnShared {
             .write(frame, |f| self.out.send(Outgoing::Frame(f)).is_ok());
     }
 
+    /// `ChannelImpl.send`: the outgoing interceptors first, a refusal
+    /// keeping the packet back.
     pub(crate) fn send(&self, channel_id: i64, packet: impl Into<Packet>) {
-        self.send_raw(packet.into().encode_frame(channel_id, &self.context()));
+        let mut packet = packet.into();
+        if self.intercepting() && !self.intercept(&mut packet) {
+            return;
+        }
+        self.send_raw(packet.encode_frame(channel_id, &self.context()));
+    }
+
+    /// Whether outgoing interceptors take Core packets, for the packets
+    /// written straight to bytes to be made only then.
+    fn intercepting(&self) -> bool {
+        self.broker.interceptors().intercepts_outgoing::<Packet>()
+    }
+
+    /// The outgoing interceptors: false when one refused the packet.
+    fn intercept(&self, packet: &mut Packet) -> bool {
+        self.broker
+            .interceptors()
+            .invoke_outgoing(packet, &self.client, Log::Core)
+            .is_none()
     }
 
     /// Closes the connection once what is queued is written.
@@ -179,11 +202,66 @@ impl CoreDeliverySink {
         hornetq::rename(&mut core.properties, false);
         Some(core)
     }
+
+    /// The message as `toCore` gives it the outgoing interceptors: with
+    /// the legacy prefix, and before HORNETQ's conversion, which comes after
+    /// them.
+    fn core_for_client(&self, message: &ServerMessage) -> saranga_message::CoreMessage {
+        self.legacy(message)
+            .unwrap_or_else(|| message.delivery_core().clone())
+    }
+
+    /// HORNETQ's outgoing `HQPropertiesConversionInterceptor`, the last of
+    /// the outgoing interceptors.
+    fn hornetq_outgoing(&self, packet: &mut Packet) {
+        if !self.conn.hornetq {
+            return;
+        }
+        let message = match packet {
+            Packet::SessionReceiveMessage(p) => &mut p.message,
+            Packet::SessionReceiveMessage1X(p) => &mut p.message,
+            Packet::SessionReceiveLargeMessage(p) => &mut p.message,
+            _ => return,
+        };
+        hornetq::rename(&mut message.properties, false);
+    }
 }
 
 impl DeliverySink for CoreDeliverySink {
     fn deliver(&self, consumer_id: i64, message: &Arc<ServerMessage>, delivery_count: i32) -> i64 {
         let ctx = self.conn.context();
+        if self.conn.intercepting() {
+            let message = self.core_for_client(message);
+            let mut packet = if ctx.is_version_before_address_change() {
+                Packet::from(SessionReceiveMessage1X {
+                    // Worked out once the message is final.
+                    end_of_message_position: 0,
+                    message,
+                    consumer_id,
+                    delivery_count,
+                })
+            } else {
+                Packet::from(
+                    saranga_core_protocol::packets::message::SessionReceiveMessage {
+                        message,
+                        consumer_id,
+                        delivery_count,
+                    },
+                )
+            };
+            // `sendBatched` refused: no credit taken.
+            if !self.conn.intercept(&mut packet) {
+                return 0;
+            }
+            self.hornetq_outgoing(&mut packet);
+            if let Packet::SessionReceiveMessage1X(p) = &mut packet {
+                p.end_of_message_position = legacy_end_of_message_position(&p.message);
+            }
+            let frame = packet.encode_frame(self.channel_id, &ctx);
+            let size = frame.len() as i64;
+            self.conn.send_raw(frame);
+            return size;
+        }
         let frame = if ctx.is_version_before_address_change() {
             let core = self
                 .for_client(message)
@@ -222,6 +300,26 @@ impl DeliverySink for CoreDeliverySink {
         body_size: i64,
         delivery_count: i32,
     ) -> i64 {
+        if self.conn.intercepting() {
+            let mut packet = Packet::from(
+                saranga_core_protocol::packets::large::SessionReceiveLargeMessage {
+                    consumer_id,
+                    delivery_count,
+                    large_message_size: body_size,
+                    message: self.core_for_client(message),
+                },
+            );
+            // Artemis asks a packet it never encoded for its size, and
+            // fails; no credit is taken here.
+            if !self.conn.intercept(&mut packet) {
+                return 0;
+            }
+            self.hornetq_outgoing(&mut packet);
+            let frame = packet.encode_frame(self.channel_id, &self.conn.context());
+            let size = frame.len() as i64;
+            self.conn.send_raw(frame);
+            return size;
+        }
         // SessionReceiveLargeMessage: the headers and properties are the
         // message's encoded form.
         let legacy = self.for_client(message).map(|core| {
@@ -247,7 +345,13 @@ impl DeliverySink for CoreDeliverySink {
             continues,
             consumer_id,
         };
-        let frame = Packet::from(packet).encode_frame(self.channel_id, &self.conn.context());
+        let mut packet = Packet::from(packet);
+        // A refused continuation counts nothing
+        // (`SessionReceiveContinuationMessage.getPacketSize` unencoded).
+        if self.conn.intercepting() && !self.conn.intercept(&mut packet) {
+            return 0;
+        }
+        let frame = packet.encode_frame(self.channel_id, &self.conn.context());
         let size = frame.len() as i64;
         self.conn.send_raw(frame);
         size
@@ -346,6 +450,7 @@ async fn serve<S>(
             .with_acceptor(&acceptor.name),
         ),
         hornetq,
+        broker: broker.clone(),
     });
     let _registered = broker.registry().add(&shared.client);
     // `CoreFrameWithSizeLimitDecoder`: with connection security, frames are
@@ -518,6 +623,19 @@ impl Connection {
             while let Some((frame, used)) = read_frame(&buf[start..])? {
                 let ctx = Context::new(Direction::ToServer, self.shared.version());
                 let mut packet = Packet::decode(&frame, &ctx)?;
+                // doBufferReceived: a packet an incoming interceptor refuses
+                // is dropped; HORNETQ's conversions come after the
+                // configured interceptors.
+                if self
+                    .broker
+                    .interceptors()
+                    .invoke_incoming(&mut packet, &self.shared.client, Log::Core)
+                    .is_some()
+                {
+                    start += used;
+                    self.check_frame_size(&buf[start..])?;
+                    continue;
+                }
                 if hornetq {
                     hornetq::incoming(&mut packet);
                 }

@@ -410,6 +410,9 @@ impl BrokerConfig {
             legacy_queues: legacy_queues(config),
             diverts: config.diverts.iter().map(divert).collect(),
             transformers: HashMap::new(),
+            interceptors: HashMap::new(),
+            incoming_interceptors: config.incoming_interceptors.clone(),
+            outgoing_interceptors: config.outgoing_interceptors.clone(),
             storage: config
                 .persistence_enabled
                 .then(|| storage_config(config, instance)),

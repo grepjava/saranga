@@ -49,14 +49,22 @@ fn features_not_acted_on_are_reported() {
         })
         .collect();
     // The critical analyzer only watches the broker; nothing to report.
-    assert_eq!(
-        names,
-        [
-            "connection-routers",
-            "remoting-incoming-interceptors",
-            "connector-services"
-        ]
+    assert_eq!(names, ["connection-routers", "connector-services"]);
+    assert_eq!(c.incoming_interceptors, ["org.example.Check"]);
+}
+
+#[test]
+fn interceptor_class_names() {
+    let c = parse(
+        r##"<configuration><core>
+              <remoting-interceptors><class-name> a.Old </class-name></remoting-interceptors>
+              <remoting-incoming-interceptors><class-name> a.In </class-name><class-name>a.In2</class-name></remoting-incoming-interceptors>
+              <remoting-outgoing-interceptors><class-name> a.Out </class-name></remoting-outgoing-interceptors>
+           </core></configuration>"##,
     );
+    assert_eq!(c.incoming_interceptors, ["a.Old", "a.In", "a.In2"]);
+    // `parseMainConfig` does not trim the outgoing ones.
+    assert_eq!(c.outgoing_interceptors, [" a.Out "]);
 }
 
 #[test]

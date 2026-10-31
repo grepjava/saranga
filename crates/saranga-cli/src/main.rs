@@ -21,6 +21,8 @@ mod create;
 mod data;
 mod help;
 mod instance;
+#[cfg(feature = "interop-interceptors")]
+mod interop_interceptors;
 mod logging;
 mod network;
 mod perf;
@@ -1382,6 +1384,8 @@ async fn boot(
             std::time::Duration::from_secs(5),
         ),
     };
+    #[cfg(feature = "interop-interceptors")]
+    interop_interceptors::register(&mut broker_config);
     if let Some(bind) = bind {
         // The first Core acceptor's settings (TLS, security domain), at
         // this address instead.

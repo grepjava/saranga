@@ -330,11 +330,16 @@ pub struct Subscription {
     pub option: SubscriptionOption,
 }
 
-/// A packet a client sent.
+/// A packet: one a client sent, or one going to a client as outgoing
+/// interceptors see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Packet {
     Connect(Box<Connect>),
-    ConnAck,
+    ConnAck {
+        session_present: bool,
+        reason: u8,
+        properties: Properties,
+    },
     Publish(Publish),
     PubAck {
         packet_id: i32,
@@ -357,13 +362,21 @@ pub enum Packet {
         properties: Properties,
         subscriptions: Vec<Subscription>,
     },
-    SubAck,
+    SubAck {
+        packet_id: i32,
+        properties: Properties,
+        codes: Vec<u8>,
+    },
     Unsubscribe {
         packet_id: i32,
         properties: Properties,
         topics: Vec<String>,
     },
-    UnsubAck,
+    UnsubAck {
+        packet_id: i32,
+        properties: Properties,
+        codes: Vec<u8>,
+    },
     PingReq,
     PingResp,
     Disconnect {
@@ -381,21 +394,149 @@ impl Packet {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Connect(_) => "CONNECT",
-            Self::ConnAck => "CONNACK",
+            Self::ConnAck { .. } => "CONNACK",
             Self::Publish(_) => "PUBLISH",
             Self::PubAck { .. } => "PUBACK",
             Self::PubRec { .. } => "PUBREC",
             Self::PubRel { .. } => "PUBREL",
             Self::PubComp { .. } => "PUBCOMP",
             Self::Subscribe { .. } => "SUBSCRIBE",
-            Self::SubAck => "SUBACK",
+            Self::SubAck { .. } => "SUBACK",
             Self::Unsubscribe { .. } => "UNSUBSCRIBE",
-            Self::UnsubAck => "UNSUBACK",
+            Self::UnsubAck { .. } => "UNSUBACK",
             Self::PingReq => "PINGREQ",
             Self::PingResp => "PINGRESP",
             Self::Disconnect { .. } => "DISCONNECT",
             Self::Auth { .. } => "AUTH",
         }
+    }
+
+    /// `MqttEncoder.doEncode`, for a packet an outgoing interceptor
+    /// changed; `None` where Netty refuses to write it.
+    pub fn encode(&self, version: Version) -> Option<Vec<u8>> {
+        let v5 = version == Version::V5;
+        // A reason code and properties, written when either is there
+        // (`encodeReasonCodePlusPropertiesMessage`).
+        let reason_and_properties = |body: &mut Vec<u8>, reason: u8, properties: &Properties| {
+            if v5 && (reason != 0 || !properties.is_empty()) {
+                body.push(reason);
+                properties.encode(body);
+            }
+        };
+        Some(match self {
+            Self::Connect(c) => {
+                let mut body = Vec::new();
+                write_string(&mut body, c.version.protocol_name());
+                body.push(c.version.level());
+                let mut flags = 0u8;
+                if c.username.is_some() {
+                    flags |= 0x80;
+                }
+                if c.password.is_some() {
+                    flags |= 0x40;
+                }
+                if let Some(w) = &c.will {
+                    flags |= 0x04 | (w.qos & 0x03) << 3 | u8::from(w.retain) << 5;
+                }
+                if c.clean_start {
+                    flags |= 0x02;
+                }
+                body.push(flags);
+                body.extend_from_slice(&c.keep_alive.to_be_bytes());
+                properties_if_needed(c.version, &c.properties, &mut body);
+                write_string(&mut body, &c.client_id);
+                if let Some(w) = &c.will {
+                    properties_if_needed(c.version, &w.properties, &mut body);
+                    write_string(&mut body, w.topic.as_deref().unwrap_or_default());
+                    write_bytes(&mut body, &w.message);
+                }
+                if let Some(u) = &c.username {
+                    write_string(&mut body, u);
+                }
+                if let Some(p) = &c.password {
+                    write_bytes(&mut body, p);
+                }
+                frame(0x10, body)
+            }
+            Self::ConnAck {
+                session_present,
+                reason,
+                properties,
+            } => connack(version, *session_present, *reason, properties),
+            Self::Publish(p) => publish(
+                version,
+                p.dup,
+                p.qos,
+                p.retain,
+                &p.topic,
+                p.packet_id,
+                &p.properties,
+                &p.payload,
+            )?,
+            Self::PubAck { packet_id, reason } => pub_reply(version, 4, *packet_id, *reason),
+            Self::PubRec { packet_id, reason } => pub_reply(version, 5, *packet_id, *reason),
+            Self::PubRel { packet_id, reason } => pub_reply(version, 6, *packet_id, *reason),
+            Self::PubComp { packet_id, reason } => pub_reply(version, 7, *packet_id, *reason),
+            Self::Subscribe {
+                packet_id,
+                properties,
+                subscriptions,
+            } => {
+                let mut body = (*packet_id as u16).to_be_bytes().to_vec();
+                properties_if_needed(version, properties, &mut body);
+                for s in subscriptions {
+                    write_string(&mut body, &s.filter);
+                    let o = &s.option;
+                    let mut option = o.qos & 0x03;
+                    if v5 {
+                        option |= u8::from(o.no_local) << 2
+                            | u8::from(o.retain_as_published) << 3
+                            | (o.retain_handling & 0x03) << 4;
+                    }
+                    body.push(option);
+                }
+                frame(0x82, body)
+            }
+            Self::SubAck {
+                packet_id,
+                properties,
+                codes,
+            } => {
+                let mut body = (*packet_id as u16).to_be_bytes().to_vec();
+                properties_if_needed(version, properties, &mut body);
+                body.extend_from_slice(codes);
+                frame(0x90, body)
+            }
+            Self::Unsubscribe {
+                packet_id,
+                properties,
+                topics,
+            } => {
+                let mut body = (*packet_id as u16).to_be_bytes().to_vec();
+                properties_if_needed(version, properties, &mut body);
+                for t in topics {
+                    write_string(&mut body, t);
+                }
+                frame(0xA2, body)
+            }
+            Self::UnsubAck {
+                packet_id,
+                properties,
+                codes,
+            } => unsuback(version, *packet_id, properties, codes),
+            Self::PingReq => vec![0xC0, 0x00],
+            Self::PingResp => pingresp(),
+            Self::Disconnect { reason, properties } => {
+                let mut body = Vec::new();
+                reason_and_properties(&mut body, *reason, properties);
+                frame(0xE0, body)
+            }
+            Self::Auth { reason, properties } => {
+                let mut body = Vec::new();
+                reason_and_properties(&mut body, *reason, properties);
+                frame(0xF0, body)
+            }
+        })
     }
 }
 
@@ -605,6 +746,14 @@ impl Decoder {
         }
     }
 
+    /// A decoder of the packets of a connection whose version is known.
+    pub fn for_version(version: Version) -> Self {
+        Self {
+            version: Some(version),
+            bad: false,
+        }
+    }
+
     fn current(&self) -> Version {
         self.version.unwrap_or(Version::V3_1_1)
     }
@@ -801,14 +950,22 @@ impl Decoder {
                 })))
             }
             2 => {
-                c.u8()?;
-                c.u8()?;
+                let session_present = c.u8()? & 0x01 != 0;
+                let reason = c.u8()?;
                 remaining -= 2;
-                if v5(self) {
-                    remaining -= c.properties()?.1;
-                }
+                let properties = if v5(self) {
+                    let (p, n) = c.properties()?;
+                    remaining -= n;
+                    p
+                } else {
+                    Properties::default()
+                };
                 no_bytes_remain(remaining, 0)?;
-                Ok(Packet::ConnAck)
+                Ok(Packet::ConnAck {
+                    session_present,
+                    reason,
+                    properties,
+                })
             }
             3 => {
                 let (topic, mut n) = c.string()?;
@@ -931,15 +1088,24 @@ impl Decoder {
                         })
                     }
                     _ => {
+                        let mut codes = Vec::new();
                         while consumed < remaining {
-                            c.u8()?;
+                            codes.push(c.u8()?);
                             consumed += 1;
                         }
                         no_bytes_remain(remaining, consumed)?;
                         Ok(if kind == 9 {
-                            Packet::SubAck
+                            Packet::SubAck {
+                                packet_id,
+                                properties,
+                                codes,
+                            }
                         } else {
-                            Packet::UnsubAck
+                            Packet::UnsubAck {
+                                packet_id,
+                                properties,
+                                codes,
+                            }
                         })
                     }
                 }
@@ -994,6 +1160,11 @@ pub fn write_var_int(out: &mut Vec<u8>, mut num: u32) {
 fn write_string(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u16).to_be_bytes());
     out.extend_from_slice(s.as_bytes());
+}
+
+fn write_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u16).to_be_bytes());
+    out.extend_from_slice(b);
 }
 
 fn frame(byte1: u8, body: Vec<u8>) -> Vec<u8> {
@@ -1112,6 +1283,43 @@ mod tests {
             out.push(p);
         }
         (d, out)
+    }
+
+    #[test]
+    fn what_the_broker_writes_decodes_and_encodes_again() {
+        let mut props = Properties::default();
+        props.add_int(prop::TOPIC_ALIAS, 3);
+        props.add_user("k".into(), "v".into());
+        for version in [Version::V3_1, Version::V3_1_1, Version::V5] {
+            let written = [
+                connack(version, true, 0, &props),
+                connack(version, false, 0x87, &Properties::default()),
+                publish(version, false, 0, false, "a/b", -1, &props, b"x").unwrap(),
+                publish(version, true, 2, true, "a", 7, &props, b"").unwrap(),
+                pub_reply(version, 4, 1, 0),
+                pub_reply(version, 5, 2, 0x10),
+                pub_reply(version, 6, 3, 0),
+                pub_reply(version, 7, 4, 0x92),
+                suback(version, 5, &[0, 1, 0x80]),
+                unsuback(version, 6, &props, &[0, 0x11]),
+                pingresp(),
+                disconnect(version, 0),
+                disconnect(version, 0x8E),
+            ];
+            for bytes in written {
+                let mut buf = bytes.clone();
+                let packet = Decoder::for_version(version)
+                    .decode(&mut buf)
+                    .unwrap()
+                    .unwrap();
+                assert!(buf.is_empty());
+                assert_eq!(
+                    packet.encode(version).unwrap(),
+                    bytes,
+                    "{version:?} {packet:?}"
+                );
+            }
+        }
     }
 
     fn connect_v311(client_id: &str) -> Vec<u8> {

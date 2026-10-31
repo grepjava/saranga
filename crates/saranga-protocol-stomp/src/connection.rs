@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use saranga_message::CoreMessage;
 use saranga_security::{Authenticated, SecurityError};
+use saranga_server::interceptor::Log;
 use saranga_server::postoffice::{AutoCreate, QueueSpec, split_fqqn};
 use saranga_server::protocol::{Connection as Accepted, DirectOut, Written};
 use saranga_server::queue::{AckResult, DeliverySink, Queue};
@@ -138,11 +139,36 @@ struct Outbound {
     direct: DirectOut,
     destroyed: AtomicBool,
     remote: String,
+    /// For the outgoing interceptors.
+    broker: Arc<Broker>,
+    client: Arc<ClientConnection>,
 }
 
 impl Outbound {
-    /// `StompProtocolManager.send` with `physicalSend`.
+    /// Whether outgoing interceptors take STOMP frames.
+    fn intercepting(&self) -> bool {
+        self.broker.interceptors().intercepts_outgoing::<Frame>()
+    }
+
+    /// `StompProtocolManager.send` with `physicalSend`: the outgoing
+    /// interceptors first, a refusal keeping the frame back.
     fn send(&self, frame: &Frame) -> bool {
+        let intercepted;
+        let frame = if self.intercepting() {
+            let mut f = frame.clone();
+            if self
+                .broker
+                .interceptors()
+                .invoke_outgoing(&mut f, &self.client, Log::Server)
+                .is_some()
+            {
+                return false;
+            }
+            intercepted = f;
+            &intercepted
+        } else {
+            frame
+        };
         if !self.send_bytes(frame.encode()) {
             return false;
         }
@@ -156,6 +182,21 @@ impl Outbound {
             );
         }
         true
+    }
+
+    /// `StompSession.sendMessage`'s send of a MESSAGE, which
+    /// `getEncodedSize` encoded before the outgoing interceptors see it:
+    /// they can refuse it, but what they change of it is not sent.
+    fn send_encoded(&self, mut frame: Frame, bytes: Vec<u8>) -> bool {
+        if self
+            .broker
+            .interceptors()
+            .invoke_outgoing(&mut frame, &self.client, Log::Server)
+            .is_some()
+        {
+            return false;
+        }
+        self.send_bytes(bytes)
     }
 
     /// [`send`](Self::send) of a frame already encoded, not an ERROR.
@@ -417,14 +458,32 @@ impl DeliverySink for StompSink {
         }
         // A message of another protocol as Core (`toCore`).
         let core = message.delivery_core();
-        let bytes = match convert::message_bytes(
+        let ack_header = self.kind == Kind::V12 && sub.ack != AckMode::Auto;
+        let built = convert::message_bytes(
             self.kind,
             &sub.id,
-            self.kind == Kind::V12 && sub.ack != AckMode::Auto,
+            ack_header,
             consumer_id,
             core,
             delivery_count,
-        ) {
+        )
+        .and_then(|bytes| {
+            // The frame itself only for outgoing interceptors to be given.
+            let frame = if self.out.intercepting() {
+                Some(convert::message_frame(
+                    self.kind,
+                    &sub.id,
+                    ack_header,
+                    consumer_id,
+                    core,
+                    delivery_count,
+                )?)
+            } else {
+                None
+            };
+            Ok((bytes, frame))
+        });
+        let (bytes, frame) = match built {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
@@ -435,8 +494,12 @@ impl DeliverySink for StompSink {
             }
         };
         let length = bytes.len() as i64;
+        let send = |bytes, frame| match frame {
+            None => self.out.send_bytes(bytes),
+            Some(frame) => self.out.send_encoded(frame, bytes),
+        };
         if sub.ack == AckMode::Auto {
-            if self.out.send_bytes(bytes) {
+            if send(bytes, frame) {
                 let _ = self.events.send(Event::AutoAck {
                     consumer: consumer_id,
                     message: core.message_id,
@@ -445,7 +508,7 @@ impl DeliverySink for StompSink {
         } else {
             // Recorded before it goes out, or the client could ack first.
             lock(&self.to_ack).insert((consumer_id, core.message_id), length);
-            self.out.send_bytes(bytes);
+            send(bytes, frame);
         }
         length
     }
@@ -566,6 +629,8 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
         direct,
         destroyed: AtomicBool::new(false),
         remote,
+        broker: broker.clone(),
+        client: client.clone(),
     });
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let (replies_tx, replies_rx) = mpsc::unbounded_channel();
@@ -676,8 +741,18 @@ impl Connection {
             match decoder::decode(self.handler.rules(), rest) {
                 Ok(Some((decoded, used))) => {
                     *at += used;
-                    let frame =
+                    let mut frame =
                         Frame::decoded(decoded.command, Kind::V11, decoded.headers, decoded.body);
+                    // `handleBuffer`: a frame an interceptor refuses is
+                    // dropped, and the frames after it wait for more bytes.
+                    if let Some(by) = self.broker.interceptors().invoke_incoming(
+                        &mut frame,
+                        &self.client,
+                        Log::Server,
+                    ) {
+                        tracing::debug!("Interceptor {by} rejected STOMP frame {}", frame.command);
+                        return true;
+                    }
                     self.handle_frame(frame).await;
                 }
                 Ok(None) => {

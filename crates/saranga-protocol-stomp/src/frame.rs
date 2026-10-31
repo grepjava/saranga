@@ -148,6 +148,11 @@ impl Frame {
         &self.headers
     }
 
+    /// The headers to change (`getHeadersMap`), for interceptors.
+    pub fn headers_mut(&mut self) -> &mut Vec<(String, String)> {
+        &mut self.headers
+    }
+
     /// `addHeader`. 1.0 frames (a `LinkedHashMap`) replace the value in
     /// place; 1.1 and 1.2 frames write a repeated header again, except
     /// `content-length`, and keep the first value for lookups.

@@ -16,6 +16,7 @@ flate2 = "1"
 clap = { version = "4", features = ["derive"] }
 saranga-config = { path = "../saranga-config" }
 saranga-buffer = { path = "../saranga-buffer" }
+saranga-core-protocol = { path = "../saranga-core-protocol", optional = true }
 saranga-journal = { path = "../saranga-journal" }
 saranga-message = { path = "../saranga-message" }
 saranga-paging = { path = "../saranga-paging" }
@@ -48,3 +49,6 @@ tempfile = "3"
 
 [features]
 default = ["mimalloc"]
+# The interceptors suite's interceptors (tests/interop/interceptors), for its
+# runs only.
+interop-interceptors = ["dep:saranga-core-protocol"]
