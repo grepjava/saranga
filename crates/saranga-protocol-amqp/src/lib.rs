@@ -73,6 +73,9 @@ pub struct Settings {
     pub sasl_mechanisms: Vec<String>,
     /// `directDeliver`.
     pub direct_deliver: bool,
+    /// `maxTransfersPerDelivery`: the most transfer frames a delivery
+    /// from the client may take; 0 or less for no limit.
+    pub max_transfers_per_delivery: i32,
 }
 
 impl Settings {
@@ -117,6 +120,7 @@ impl Settings {
                 })
                 .unwrap_or_default(),
             direct_deliver: flag("directDeliver", true),
+            max_transfers_per_delivery: int("maxTransfersPerDelivery", 65535) as i32,
         }
     }
 }

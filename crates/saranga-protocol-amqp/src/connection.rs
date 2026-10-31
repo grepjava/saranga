@@ -588,6 +588,8 @@ struct Incoming {
     settled: bool,
     state: Option<DeliveryState>,
     payload: Vec<u8>,
+    /// The transfers it has taken, for `maxTransfersPerDelivery`.
+    transfers: u32,
 }
 
 /// A link the client sends on (`ProtonServerReceiverContext`).
@@ -3734,6 +3736,7 @@ impl Conn {
             ));
         };
         s.next_incoming_id = s.next_incoming_id.wrapping_add(1);
+        let limit = self.settings.max_transfers_per_delivery;
         let complete = match s.links.get_mut(&t.handle) {
             Some(Link::Receiver(rl)) => accumulate(
                 &mut rl.incoming,
@@ -3741,14 +3744,16 @@ impl Conn {
                 payload,
                 &mut rl.credit,
                 &mut rl.delivery_count,
-            ),
+                limit,
+            )?,
             Some(Link::Coordinator(cl)) => accumulate(
                 &mut cl.incoming,
                 &t,
                 payload,
                 &mut cl.credit,
                 &mut cl.delivery_count,
-            ),
+                limit,
+            )?,
             Some(Link::Sender(_)) => {
                 return Err(Fatal::new(
                     condition::ILLEGAL_STATE,
@@ -5090,16 +5095,27 @@ impl Gate {
 }
 
 /// Adds a transfer to the delivery it continues, or starts one; the
-/// delivery when it is complete.
+/// delivery when it is complete. A delivery taking more than `limit`
+/// transfers, when it is above 0, ends the connection, as proton-j's
+/// `TransportSession.checkTransfersPerDeliveryLimit` does: every transfer
+/// counts, empty or aborting.
 fn accumulate(
     incoming: &mut Option<Incoming>,
     t: &Transfer,
     payload: Vec<u8>,
     credit: &mut u32,
     delivery_count: &mut u32,
-) -> Option<Incoming> {
+    limit: i32,
+) -> Result<Option<Incoming>, Fatal> {
     match incoming {
         Some(inc) => {
+            inc.transfers += 1;
+            if limit > 0 && inc.transfers > limit as u32 {
+                return Err(Fatal::new(
+                    condition::TRANSFER_LIMIT_EXCEEDED,
+                    "Max transfers per delivery limit exceeded",
+                ));
+            }
             inc.payload.extend_from_slice(&payload);
             if let Some(st) = &t.state {
                 inc.state = Some(st.clone());
@@ -5117,17 +5133,18 @@ fn accumulate(
                 settled: t.settled.unwrap_or(false),
                 state: t.state.clone(),
                 payload,
+                transfers: 1,
             });
         }
     }
     if t.aborted {
         *incoming = None;
-        return None;
+        return Ok(None);
     }
     if t.more {
-        return None;
+        return Ok(None);
     }
-    incoming.take()
+    Ok(incoming.take())
 }
 
 /// `topUpCreditIfNeeded`: back to `credits` once at or below `low`.

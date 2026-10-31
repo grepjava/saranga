@@ -1,6 +1,7 @@
 <?xml version="1.0"?>
 <!-- AMQP and Core on one acceptor (Amqp.java): two delivery attempts before
-     the dead-letter address for amqp.dlq.#, and a quick expiry scan. -->
+     the dead-letter address for amqp.dlq.#, a quick expiry scan, and at most
+     20 transfers per delivery from a client (the 1 MiB message takes 8). -->
 <configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xsi:schemaLocation="urn:activemq /schema/artemis-configuration.xsd">
    <core xmlns="urn:activemq:core">
@@ -9,7 +10,7 @@
       <security-enabled>false</security-enabled>
       <message-expiry-scan-period>100</message-expiry-scan-period>
       <acceptors>
-         <acceptor name="artemis">tcp://0.0.0.0:61616?protocols=CORE,AMQP</acceptor>
+         <acceptor name="artemis">tcp://0.0.0.0:61616?protocols=CORE,AMQP;maxTransfersPerDelivery=20</acceptor>
       </acceptors>
       <address-settings>
          <address-setting match="#">

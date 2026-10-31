@@ -800,6 +800,86 @@ public class Amqp {
         }
     }
 
+    /** A described list: descriptor code, then list8 of the encoded fields. */
+    static byte[] described(int code, byte[]... fields) throws IOException {
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        for (byte[] f : fields) body.write(f);
+        ByteArrayOutputStream b = new ByteArrayOutputStream();
+        b.write(new byte[] {0, 0x53, (byte) code, (byte) 0xc0, (byte) (body.size() + 1), (byte) fields.length});
+        body.writeTo(b);
+        return b.toByteArray();
+    }
+
+    static byte[] uint(int v) {
+        return new byte[] {0x70, (byte) (v >>> 24), (byte) (v >>> 16), (byte) (v >>> 8), (byte) v};
+    }
+
+    static byte[] str8(int code, String s) {
+        byte[] t = s.getBytes(StandardCharsets.UTF_8);
+        byte[] b = new byte[t.length + 2];
+        b[0] = (byte) code;
+        b[1] = (byte) t.length;
+        System.arraycopy(t, 0, b, 2, t.length);
+        return b;
+    }
+
+    static final byte[] NULL = {0x40}, TRUE = {0x41}, FALSE = {0x42};
+
+    /** An AMQP frame on channel 0: the performative, then the payload. */
+    static void send(OutputStream out, byte[] performative, byte[] payload) throws IOException {
+        int size = 8 + performative.length + payload.length;
+        java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(size);
+        b.putInt(size).put((byte) 2).put((byte) 0).putShort((short) 0).put(performative).put(payload);
+        out.write(b.array());
+    }
+
+    /** The performative code of a frame read with frame(): 00 53 <code>. */
+    static int performative(byte[] f) {
+        return f.length > 6 && f[4] == 0 && f[5] == 0x53 ? f[6] & 0xff : -1;
+    }
+
+    // maxTransfersPerDelivery=20 on the acceptor (broker.xml): a delivery
+    // taking a 21st transfer, empty or not, closes the connection with
+    // amqp:link:transfer-limit-exceeded, as proton-j's
+    // TransportSession.checkTransfersPerDeliveryLimit does.
+    static void t_rawTransferLimit() throws Exception {
+        String q = unique("amqp.transfer.limit");
+        try (Socket sock = new Socket(host, port)) {
+            sock.setSoTimeout(5000);
+            OutputStream out = sock.getOutputStream();
+            DataInputStream in = new DataInputStream(sock.getInputStream());
+            out.write(new byte[] {'A', 'M', 'Q', 'P', 0, 1, 0, 0});
+            in.readFully(new byte[8]);
+            send(out, described(0x10, str8(0xa1, "raw")), new byte[0]);
+            eq(0x10, performative(frame(in)), "open");
+            send(out, described(0x11, NULL, uint(0), uint(2048), uint(2048)), new byte[0]);
+            eq(0x11, performative(frame(in)), "begin");
+            // address, durable, expiry-policy, timeout, dynamic,
+            // dynamic-node-properties, capabilities: an anycast queue.
+            byte[] target = described(0x29, str8(0xa1, q), NULL, NULL, NULL, NULL, NULL, str8(0xa3, "queue"));
+            byte[] source = described(0x28);
+            send(out, described(0x12, str8(0xa1, "sender"), uint(0), FALSE, NULL, NULL, source, target), new byte[0]);
+            eq(0x12, performative(frame(in)), "attach");
+            eq(0x13, performative(frame(in)), "flow");
+            byte[] data = {0, 0x53, 0x75, (byte) 0xa0, 1, 'x'};
+            send(out, described(0x14, uint(0), uint(0), new byte[] {(byte) 0xa0, 1, 0}, uint(0), FALSE, TRUE), data);
+            for (int i = 2; i <= 20; i++) {
+                // The 10th is empty: it counts all the same.
+                send(out, described(0x14, uint(0), NULL, NULL, NULL, NULL, TRUE), i == 10 ? new byte[0] : data);
+            }
+            send(out, described(0x14, uint(0), NULL, NULL, NULL, NULL, FALSE), data);
+            byte[] f = frame(in);
+            while (performative(f) != 0x18) {
+                f = frame(in);
+            }
+            check(text(f).contains("amqp:link:transfer-limit-exceeded"), "close with transfer-limit-exceeded: " + text(f));
+        }
+        try (Connection c = amqp(); Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE)) {
+            c.start();
+            none(s.createConsumer(s.createQueue(q)));
+        }
+    }
+
     static void t_rawNoSaslAnonymous() throws Exception {
         // Security is disabled: a client may skip SASL.
         try (Socket sock = new Socket(host, port)) {
