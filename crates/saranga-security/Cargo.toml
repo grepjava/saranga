@@ -18,6 +18,8 @@ saranga-config = { path = "../saranga-config" }
 sha2 = "0.10"
 ring = "0.17"
 unicode-normalization = "0.1"
+p521 = { version = "0.14", default-features = false, features = ["ecdsa", "sha512"] }
+rustls-native-certs = "0.8"
 thiserror = "2"
 tracing = "0.1"
 

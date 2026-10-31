@@ -275,7 +275,13 @@ An interceptor is Rust code: a `saranga_server::interceptor::Interceptor`, named
 - **A refused Core large message** takes no consumer credit. Artemis asks the packet it did not encode for its size, which fails the delivery.
 
 ## Security differences
-- **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule` and `LDAPLoginModule` are supported. `Krb5LoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.
+- **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule`, `LDAPLoginModule`, `SCRAMPropertiesLoginModule`, `SCRAMLoginModule` and `OIDCLoginModule` are supported. `Krb5LoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.
+- **`OIDCLoginModule`** checks tokens as Artemis's Nimbus JOSE + JWT does: the same algorithms, key choice, claim checks, plain and encrypted JWTs refused, and the provider's metadata and keys fetched and cached as Artemis caches them. Where it differs:
+  - A `provider` URL ending in `/` is taken without it. Artemis 2.57 keeps only the slash while stripping it and loops for ever, so its login never ends.
+  - RSA keys of fewer than 2048 bits do not verify. Java's do.
+  - ES256K verifies in neither: Java has had no secp256k1 since JDK 16.
+  - `userPrincipalClass` and `rolePrincipalClass` other than Artemis's `UserPrincipal` and `RolePrincipal` make principals of that class name, which no other module or check counts. Artemis loads the class, and fails to initialize without it.
+  - Over HTTPS without `caCertificate`, the provider's certificate is trusted through the platform's trusted certificates, where Java uses its own `cacerts`.
 - **Security managers.** The JAAS security manager (`<jaas-security>`) and `ActiveMQBasicSecurityManager` are supported. The basic manager keeps its users in the bindings journal, so its users move with the data directory in both directions. Any other `<security-manager>` class stops the broker from starting. As in Artemis, the basic manager has no users without persistence. Users are added through the bootstrap credentials or through management (`addUser`).
 - **A role named `*`** in a security setting grants nothing in Artemis 2.57, despite looking like a wildcard. Saranga matches this.
 - **Security setting plugins** (`<security-setting-plugin>`) are not supported and produce a warning.
