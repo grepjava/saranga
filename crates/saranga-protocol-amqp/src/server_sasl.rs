@@ -252,7 +252,6 @@ fn java_split(s: &str, c: char) -> Vec<&str> {
     parts
 }
 
-
 /// `JAASSCRAMServerSASL`: SCRAM-SHA-256 or SCRAM-SHA-512, the user's
 /// SCRAM data from a login through `saslLoginConfigScope`, whose subject's
 /// principals become the connection's.

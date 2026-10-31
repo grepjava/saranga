@@ -1250,7 +1250,7 @@ impl Conn {
             None => response,
         };
         let answer = |scram: &mut Option<(ScramClient, String, String)>,
-                          challenge: &[u8]|
+                      challenge: &[u8]|
          -> Result<Vec<u8>, String> {
             let Some((client, password, _)) = scram else {
                 return Ok(Vec::new());

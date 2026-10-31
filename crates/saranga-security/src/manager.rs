@@ -246,7 +246,9 @@ impl JaasSecurityManager {
     /// `saslLoginConfigScope`.
     pub fn login(&self, realm: &str, callbacks: &Callbacks<'_>) -> Result<Subject, LoginError> {
         let Some(entries) = self.entry(realm) else {
-            return Err(LoginError::new(format!("No LoginModules configured for {realm}")));
+            return Err(LoginError::new(format!(
+                "No LoginModules configured for {realm}"
+            )));
         };
         jaas::login(&entries, &self.modules, callbacks)
     }

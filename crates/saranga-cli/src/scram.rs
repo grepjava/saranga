@@ -11,7 +11,12 @@ const MIN_ITERATIONS: i32 = 4096;
 /// The lines, in `Properties.store`'s form: a comment, the date, and one
 /// `user|SHA512` and one `user|SHA256` entry of
 /// `ENC(salt:iterations:serverKey:storedKey)`.
-pub fn lines(user: &str, password: &str, iterations: Option<&str>, date: &str) -> anyhow::Result<Vec<u8>> {
+pub fn lines(
+    user: &str,
+    password: &str,
+    iterations: Option<&str>,
+    date: &str,
+) -> anyhow::Result<Vec<u8>> {
     let iterations = match iterations {
         None => MIN_ITERATIONS,
         Some(i) => {
@@ -132,12 +137,17 @@ mod tests {
         for (key, value) in entries {
             let (user, mechanism) = key.split_once('|').unwrap();
             assert_eq!(user, "al ice");
-            let s = Scram::ALL.into_iter().find(|s| s.constant() == mechanism).unwrap();
+            let s = Scram::ALL
+                .into_iter()
+                .find(|s| s.constant() == mechanism)
+                .unwrap();
             let bare = saranga_config::mask::unwrap(&value);
             let p: Vec<&str> = bare.split(':').collect();
             assert_eq!(p[1], "4096");
             let salt = scram::base64_decode(p[0]).unwrap();
-            let d = scram::new_password(s, "pw", &salt, 4096).unwrap().user_data();
+            let d = scram::new_password(s, "pw", &salt, 4096)
+                .unwrap()
+                .user_data();
             assert_eq!((p[2], p[3]), (d.server_key.as_str(), d.stored_key.as_str()));
         }
         assert!(lines("u", "pw", Some("100"), "d").is_err());

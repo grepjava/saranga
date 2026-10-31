@@ -248,7 +248,12 @@ mod tests {
         let without_proof = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
         let auth = format!("{client_first_bare},{server_first},{without_proof}");
         let signature = Scram::Sha256.hmac(&p.stored_key, auth.as_bytes()).unwrap();
-        let proof: Vec<u8> = p.client_key.iter().zip(&signature).map(|(a, b)| a ^ b).collect();
+        let proof: Vec<u8> = p
+            .client_key
+            .iter()
+            .zip(&signature)
+            .map(|(a, b)| a ^ b)
+            .collect();
         assert_eq!(
             base64_encode(&proof),
             "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="

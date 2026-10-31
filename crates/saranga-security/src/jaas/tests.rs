@@ -257,7 +257,11 @@ fn scram_properties() {
         format!("alice|SHA256 = {encoded}\nbob = clear\n"),
     )
     .unwrap();
-    std::fs::write(dir.path().join("roles.properties"), "admins = alice\nops = alice,bob\n").unwrap();
+    std::fs::write(
+        dir.path().join("roles.properties"),
+        "admins = alice\nops = alice,bob\n",
+    )
+    .unwrap();
     let entries = config(&format!(
         "activemq {{ {SCRAM_PROPS} required org.apache.activemq.jaas.properties.user=\"users.properties\" org.apache.activemq.jaas.properties.role=\"roles.properties\"; }};"
     ));
@@ -294,9 +298,15 @@ fn scram_properties() {
 fn scram_login_module_takes_the_peer_principals() {
     let dir = tempfile::tempdir().unwrap();
     etc(dir.path());
-    let entries = config(&format!("activemq {{ {SCRAM} required; {} }};", props("optional")));
+    let entries = config(&format!(
+        "activemq {{ {SCRAM} required; {} }};",
+        props("optional")
+    ));
     let factory = ModuleFactory::new(Some(dir.path().to_path_buf()));
-    let peer = [Principal::User("plain".into()), Principal::Role("scrammers".into())];
+    let peer = [
+        Principal::User("plain".into()),
+        Principal::Role("scrammers".into()),
+    ];
     let subject = login(
         &entries,
         &factory,
@@ -308,7 +318,10 @@ fn scram_login_module_takes_the_peer_principals() {
     )
     .unwrap();
     assert_eq!(subject.user(), Some("plain"));
-    assert_eq!(subject.roles().collect::<Vec<_>>(), vec!["scrammers", "ops"]);
+    assert_eq!(
+        subject.roles().collect::<Vec<_>>(),
+        vec!["scrammers", "ops"]
+    );
     // No identity: the module is ignored, and the password is wrong.
     assert!(login(&entries, &factory, &creds(Some("plain"), None)).is_err());
     let e = login(

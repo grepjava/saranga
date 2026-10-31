@@ -20,12 +20,10 @@ static CLIENT_FIRST_MESSAGE: LazyLock<Regex> = LazyLock::new(|| {
     ))
     .expect("pattern")
 });
-static CLIENT_FINAL_MESSAGE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(r"^(c=([^,]*),r=([^,]*)),p=({ANY}*)$")).expect("pattern")
-});
-static SERVER_FIRST_MESSAGE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(r"^r=([^,]*),s=([^,]*),i=({ANY}*)$")).expect("pattern")
-});
+static CLIENT_FINAL_MESSAGE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^(c=([^,]*),r=([^,]*)),p=({ANY}*)$")).expect("pattern"));
+static SERVER_FIRST_MESSAGE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"^r=([^,]*),s=([^,]*),i=({ANY}*)$")).expect("pattern"));
 static SERVER_FINAL_MESSAGE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^v=([^,]*)$").expect("pattern"));
 
@@ -85,7 +83,10 @@ impl ScramServer {
     }
 
     /// `handleClientFirstMessage`: the user name.
-    pub(crate) fn handle_client_first_message(&mut self, message: &str) -> Result<String, ScramError> {
+    pub(crate) fn handle_client_first_message(
+        &mut self,
+        message: &str,
+    ) -> Result<String, ScramError> {
         let Some(m) = CLIENT_FIRST_MESSAGE.captures(message) else {
             self.state = ServerState::Ended;
             return Err(ScramError::new("Invalid message received"));
@@ -110,7 +111,10 @@ impl ScramServer {
 
     /// `prepareFinalMessage`: the server's signature, when the client's
     /// proof is right.
-    pub(crate) fn prepare_final_message(&mut self, client_final: &str) -> Result<String, ScramError> {
+    pub(crate) fn prepare_final_message(
+        &mut self,
+        client_final: &str,
+    ) -> Result<String, ScramError> {
         let message = self.prepare_final_message_unchecked(client_final)?;
         if !self.successful {
             return Err(ScramError::new("client credentials missmatch"));
@@ -118,7 +122,10 @@ impl ScramServer {
         Ok(message)
     }
 
-    fn prepare_final_message_unchecked(&mut self, client_final: &str) -> Result<String, ScramError> {
+    fn prepare_final_message_unchecked(
+        &mut self,
+        client_final: &str,
+    ) -> Result<String, ScramError> {
         self.state = ServerState::Ended;
         let Some(m) = CLIENT_FINAL_MESSAGE.captures(client_final) else {
             return Err(ScramError::new("Invalid message received"));
@@ -131,7 +138,10 @@ impl ScramServer {
             "{},{},{without_proof}",
             self.client_first_message_bare, self.server_first_message
         );
-        let data = self.user_data.as_ref().ok_or_else(|| ScramError::new("no user data"))?;
+        let data = self
+            .user_data
+            .as_ref()
+            .ok_or_else(|| ScramError::new("no user data"))?;
         // Base64 that does not decode is an IllegalArgumentException.
         let decode = |s: &str| {
             scram::base64_decode(s).ok_or_else(|| ScramError::new("Illegal base64 character"))
@@ -231,8 +241,8 @@ impl ScramClient {
             self.state = ClientState::Ended;
             return Ok(None);
         }
-        let salt =
-            scram::base64_decode(&m[2]).ok_or_else(|| ScramError::new("Illegal base64 character"))?;
+        let salt = scram::base64_decode(&m[2])
+            .ok_or_else(|| ScramError::new("Illegal base64 character"))?;
         self.salted_password = scram::salted_password(self.scram, password, &salt, iterations)?;
         let without_proof = format!(
             "c={},r={nonce}",
@@ -245,7 +255,11 @@ impl ScramClient {
         let client_key = self.scram.hmac(&self.salted_password, b"Client Key")?;
         let stored_key = self.scram.digest(&client_key);
         let signature = self.scram.hmac(&stored_key, self.auth_message.as_bytes())?;
-        let proof: Vec<u8> = client_key.iter().zip(&signature).map(|(k, s)| k ^ s).collect();
+        let proof: Vec<u8> = client_key
+            .iter()
+            .zip(&signature)
+            .map(|(k, s)| k ^ s)
+            .collect();
         self.state = ClientState::FinalPrepared;
         Ok(Some(format!(
             "{without_proof},p={}",
@@ -254,13 +268,16 @@ impl ScramClient {
     }
 
     /// `checkServerFinalMessage`.
-    pub(crate) fn check_server_final_message(&mut self, server_final: &str) -> Result<(), ScramError> {
+    pub(crate) fn check_server_final_message(
+        &mut self,
+        server_final: &str,
+    ) -> Result<(), ScramError> {
         let Some(m) = SERVER_FINAL_MESSAGE.captures(server_final) else {
             self.state = ClientState::Ended;
             return Err(ScramError::new("invalid message format"));
         };
-        let signature =
-            scram::base64_decode(&m[1]).ok_or_else(|| ScramError::new("Illegal base64 character"))?;
+        let signature = scram::base64_decode(&m[1])
+            .ok_or_else(|| ScramError::new("Illegal base64 character"))?;
         self.state = ClientState::Ended;
         let server_key = self.scram.hmac(&self.salted_password, b"Server Key")?;
         let expected = self.scram.hmac(&server_key, self.auth_message.as_bytes())?;

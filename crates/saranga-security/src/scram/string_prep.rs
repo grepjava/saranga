@@ -88,12 +88,15 @@ mod tests {
         );
         // RFC 4013's examples of bidi: RandALCat with LCat, and RandALCat
         // not at both ends.
+        assert_eq!(prep_as_query_string("\u{627}1"), Err(StringPrepError::Rtl));
         assert_eq!(
-            prep_as_query_string("\u{627}1"),
+            prep_as_query_string("\u{627}1\u{628}").unwrap(),
+            "\u{627}1\u{628}"
+        );
+        assert_eq!(
+            prep_as_query_string("\u{627}a\u{628}"),
             Err(StringPrepError::Rtl)
         );
-        assert_eq!(prep_as_query_string("\u{627}1\u{628}").unwrap(), "\u{627}1\u{628}");
-        assert_eq!(prep_as_query_string("\u{627}a\u{628}"), Err(StringPrepError::Rtl));
         // Unassigned code points are allowed in a query string.
         assert_eq!(prep_as_query_string("\u{0221}").unwrap(), "\u{0221}");
     }
