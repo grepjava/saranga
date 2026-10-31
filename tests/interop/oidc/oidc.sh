@@ -11,7 +11,16 @@
 #               realm_access.roles with broker-user mapped to amq
 #   oidc-plain  plain JWTs allowed, only sub required, roles from roles
 #   oidc-tls    the provider over HTTPS, trusted through caCertificate
+#   k8s         KubernetesLoginModule, reviewing tokens with Suite.java's
+#               API server (KUBERNETES_* in the broker's environment), users
+#               mapped to roles by k8s-roles.properties
+#   k8s-ignore  the same, with ignoreTokenReviewRoles
+#   oidc-convert  users made com.sun.security.auth.UserPrincipal, which
+#               PrincipalConversionLoginModule turns into Artemis's, for
+#               PropertiesLoginModule (optional, so its failed login does
+#               not count) to give roles to
 #
+# OFFSET: the port offset, 3100 unless given (Windows may reserve its ports).
 # MAX_DISK_USAGE: for a machine whose disk is past create's 90%, where the
 # broker would block every producer.
 set -uo pipefail
@@ -21,13 +30,17 @@ HERE="$ROOT/tests/interop/oidc"
 VERSION="${ARTEMIS_VERSION:-2.57.0}"
 DIST="${ARTEMIS_DIST:-$ROOT/reference/activemq-artemis/artemis-distribution/target/apache-artemis-$VERSION-bin/apache-artemis-$VERSION}"
 KIND="${1:-saranga}"; shift || true
-OFFSET=3100
+OFFSET="${OFFSET:-3100}"
 PORT=$((61616 + OFFSET))
 OIDC_PORT=$((PORT + 1))
 PLAIN_PORT=$((PORT + 2))
 TLS_PORT=$((PORT + 3))
+K8S_PORT=$((PORT + 4))
+K8S_IGNORE_PORT=$((PORT + 5))
+CONVERT_PORT=$((PORT + 6))
 HTTP_PORT=$((PORT + 10))
 HTTPS_PORT=$((PORT + 11))
+API_PORT=$((PORT + 12))
 export MSYS_NO_PATHCONV=1
 native() { command -v cygpath >/dev/null && cygpath -m "$1" || echo "$1"; }
 windows() { [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; }
@@ -74,6 +87,8 @@ keytool -exportcert -rfc -alias oidc -keystore "$(native "$WORK/provider.p12")" 
   > "$ETC/oidc-ca.pem" 2> /dev/null || exit 1
 
 MODULE=org.apache.activemq.artemis.spi.core.security.jaas.OIDCLoginModule
+K8S=org.apache.activemq.artemis.spi.core.security.jaas.KubernetesLoginModule
+CONVERT=org.apache.activemq.artemis.spi.core.security.jaas.PrincipalConversionLoginModule
 cat > "$ETC/login.config" <<CONF
 activemq {
    org.apache.activemq.artemis.spi.core.security.jaas.PropertiesLoginModule required
@@ -106,7 +121,33 @@ oidc-tls {
        requiredClaims="sub"
        rolesPaths="roles";
 };
+
+k8s {
+   $K8S required
+       org.apache.activemq.jaas.kubernetes.role="k8s-roles.properties";
+};
+
+k8s-ignore {
+   $K8S required
+       ignoreTokenReviewRoles=true;
+};
+
+oidc-convert {
+   $MODULE required
+       provider="http://localhost:$HTTP_PORT"
+       requiredClaims="sub"
+       userPrincipalClass="com.sun.security.auth.UserPrincipal";
+   $CONVERT required
+       principalClassList="javax.security.auth.x500.X500Principal, com.sun.security.auth.UserPrincipal";
+   org.apache.activemq.artemis.spi.core.security.jaas.PropertiesLoginModule optional
+       org.apache.activemq.jaas.properties.user="artemis-users.properties"
+       org.apache.activemq.jaas.properties.role="convert-roles.properties";
+};
 CONF
+printf 'amq = converted\n' > "$ETC/convert-roles.properties"
+printf 'amq = mapped-user\n' > "$ETC/k8s-roles.properties"
+# The broker's service account token, with a comment and a line break in it.
+printf '# the service account token\n\nsa-\ntoken\n' > "$WORK/sa-token"
 # Artemis loops for ever on a provider URL ending in a slash (see COMPAT.md):
 # its oidc-plain realm names the URL without one.
 if [[ "$KIND" == artemis ]]; then
@@ -116,12 +157,15 @@ acceptor() {
   echo "<acceptor name=\"$1\">tcp://localhost:$2?protocols=AMQP;saslMechanisms=PLAIN;securityDomain=$1</acceptor>"
 }
 ACCEPTORS="$(acceptor oidc "$OIDC_PORT")$(acceptor oidc-plain "$PLAIN_PORT")$(acceptor oidc-tls "$TLS_PORT")"
+ACCEPTORS="$ACCEPTORS$(acceptor k8s "$K8S_PORT")$(acceptor k8s-ignore "$K8S_IGNORE_PORT")$(acceptor oidc-convert "$CONVERT_PORT")"
 sed -i "s|</acceptors>|$ACCEPTORS</acceptors>|" "$ETC/broker.xml"
 if [[ -n "${MAX_DISK_USAGE:-}" ]]; then
   sed -i -E "s#<max-disk-usage>[0-9]+</max-disk-usage>#<max-disk-usage>$MAX_DISK_USAGE</max-disk-usage>#" "$ETC/broker.xml"
 fi
 
 mkdir -p "$I/log"
+export KUBERNETES_SERVICE_HOST=localhost KUBERNETES_SERVICE_PORT="$API_PORT"
+export KUBERNETES_TOKEN_PATH="$(native "$WORK/sa-token")" KUBERNETES_CA_PATH="$(native "$ETC/oidc-ca.pem")"
 if windows; then
   (cd "$I/bin" && cmd /c "$(cygpath -w "$I/bin/artemis.cmd")" run > "$WORK/run.out" 2>&1 &)
 else
@@ -132,4 +176,5 @@ up || { echo "the broker did not start"; cat "$WORK/run.out"; exit 1; }
 
 java -cp "$(native "$DIST/lib")/*" "$(native "$HERE/Suite.java")" \
   "127.0.0.1" "$OIDC_PORT" "$PLAIN_PORT" "$TLS_PORT" "$HTTP_PORT" "$HTTPS_PORT" \
+  "$K8S_PORT" "$K8S_IGNORE_PORT" "$API_PORT" "$CONVERT_PORT" \
   "$(native "$WORK/provider.p12")" "$@"

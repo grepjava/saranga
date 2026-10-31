@@ -275,7 +275,7 @@ An interceptor is Rust code: a `saranga_server::interceptor::Interceptor`, named
 - **A refused Core large message** takes no consumer credit. Artemis asks the packet it did not encode for its size, which fails the delivery.
 
 ## Security differences
-- **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule`, `LDAPLoginModule`, `SCRAMPropertiesLoginModule`, `SCRAMLoginModule` and `OIDCLoginModule` are supported. `Krb5LoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.
+- **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule`, `LDAPLoginModule`, `SCRAMPropertiesLoginModule`, `SCRAMLoginModule`, `OIDCLoginModule`, `KubernetesLoginModule` and `PrincipalConversionLoginModule` are supported. `Krb5LoginModule` and custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.
 - **`OIDCLoginModule`** checks tokens as Artemis's Nimbus JOSE + JWT does: the same algorithms, key choice, claim checks, plain and encrypted JWTs refused, and the provider's metadata and keys fetched and cached as Artemis caches them. Where it differs:
   - A `provider` URL ending in `/` is taken without it. Artemis 2.57 keeps only the slash while stripping it and loops for ever, so its login never ends.
   - RSA keys of fewer than 2048 bits do not verify. Java's do.

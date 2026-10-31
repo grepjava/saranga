@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -32,26 +32,16 @@ use crate::tls::{TlsError, select_suites, select_versions};
 /// How long `NettyConnector.createConnection` waits for the handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The JVM's system properties, as the broker or the command line was
-/// given them (`-D` in `JAVA_ARGS` or on `run`).
-static SYSTEM_PROPERTIES: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
-
 /// Sets the system properties the connectors read (`System.getProperty`).
 /// The last of a name wins.
 pub fn set_system_properties(properties: Vec<(String, String)>) {
-    *SYSTEM_PROPERTIES.write().unwrap_or_else(|e| e.into_inner()) = properties;
+    saranga_config::system::set_properties(properties);
 }
 
 /// `System.getProperty`: a system property given to the broker or the
 /// command line.
 pub fn system_property(name: &str) -> Option<String> {
-    SYSTEM_PROPERTIES
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .rev()
-        .find(|(k, _)| k == name)
-        .map(|(_, v)| v.clone())
+    saranga_config::system::property(name)
 }
 
 /// The parameters naming Java classes or checks that cannot run here.

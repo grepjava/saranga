@@ -1,19 +1,21 @@
-//! The HTTP client `OIDCLoginModule` reaches its provider with
-//! (`SharedHttpClientAccess`): HTTP/1.1 GETs, redirects not followed (Java's
-//! `HttpClient` default), with a connect timeout and a timeout for the whole
-//! exchange. `https` trusts the `caCertificate` file (PEM, every
-//! certificate in it) over `tlsVersion`, or else the platform's trusted
-//! certificates over TLS 1.2, as Java's default `SSLContext.getInstance("TLSv1.2")`
-//! does.
+//! The HTTP client of the login modules that call a server: HTTP/1.1
+//! requests, redirects not followed (Java's `HttpClient` default).
+//! `OIDCLoginModule` reaches its provider with it (`SharedHttpClientAccess`),
+//! with a connect timeout and a timeout for the whole exchange; `https`
+//! trusts the `caCertificate` file (PEM, every certificate in it) over
+//! `tlsVersion`, or else the platform's trusted certificates over TLS 1.2,
+//! as Java's default `SSLContext.getInstance("TLSv1.2")` does.
+//! `KubernetesLoginModule` posts its token reviews with it, with no timeout,
+//! as `KubernetesClientImpl`'s client has none.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// A client for one provider: how it connects.
+/// A client: how it connects.
 pub(crate) struct HttpClient {
-    timeout: Duration,
+    timeout: Option<Duration>,
     tls: Result<Arc<rustls::ClientConfig>, String>,
 }
 
@@ -30,13 +32,41 @@ impl HttpClient {
         ca_certificate: Option<&str>,
     ) -> Self {
         Self {
-            timeout: Duration::from_millis(timeout_ms.max(1) as u64),
+            timeout: Some(Duration::from_millis(timeout_ms.max(1) as u64)),
             tls: tls_config(tls_version, ca_certificate).map(Arc::new),
+        }
+    }
+
+    /// A client with no timeout, over this TLS configuration.
+    pub(crate) fn untimed(tls: Arc<rustls::ClientConfig>) -> Self {
+        Self {
+            timeout: None,
+            tls: Ok(tls),
         }
     }
 
     /// One GET of an `http` or `https` URL.
     pub(crate) fn get(&self, url: &str) -> Result<Response, String> {
+        self.send("GET", url, &[("Accept", "*/*")], None)
+    }
+
+    /// One POST of `body`.
+    pub(crate) fn post(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<Response, String> {
+        self.send("POST", url, headers, Some(body))
+    }
+
+    fn send(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<Response, String> {
         let (secure, rest) = if let Some(r) = url.strip_prefix("https://") {
             (true, r)
         } else if let Some(r) = url.strip_prefix("http://") {
@@ -49,15 +79,23 @@ impl HttpClient {
             None => (rest, "/"),
         };
         let (host, port) = split_authority(authority, if secure { 443 } else { 80 })?;
-        let deadline = Instant::now() + self.timeout;
-        // Each address the name has, in turn (`localhost` may be ::1 first).
+        let deadline = self.timeout.map(|t| Instant::now() + t);
+        // Each address the name has, in turn, IPv4 first, as Java orders
+        // them unless `java.net.preferIPv6Addresses` (`localhost` may be
+        // ::1 first, where a refusal takes seconds on Windows).
         let mut last = format!("{host}: no address");
         let mut connected = None;
-        for addr in (host.as_str(), port)
+        let mut addrs: Vec<_> = (host.as_str(), port)
             .to_socket_addrs()
             .map_err(|e| e.to_string())?
-        {
-            match TcpStream::connect_timeout(&addr, self.timeout) {
+            .collect();
+        addrs.sort_by_key(|a| a.is_ipv6());
+        for addr in addrs {
+            let attempt = match self.timeout {
+                Some(t) => TcpStream::connect_timeout(&addr, t),
+                None => TcpStream::connect(addr),
+            };
+            match attempt {
                 Ok(s) => {
                     connected = Some(s);
                     break;
@@ -66,11 +104,19 @@ impl HttpClient {
             }
         }
         let tcp = connected.ok_or(last)?;
-        tcp.set_read_timeout(Some(self.timeout)).ok();
-        tcp.set_write_timeout(Some(self.timeout)).ok();
-        let request = format!(
-            "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: saranga\r\nAccept: */*\r\nConnection: close\r\n\r\n"
-        );
+        tcp.set_read_timeout(self.timeout).ok();
+        tcp.set_write_timeout(self.timeout).ok();
+        let mut request =
+            format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: saranga\r\n");
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        if let Some(body) = body {
+            request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        }
+        request.push_str("Connection: close\r\n\r\n");
+        let mut request = request.into_bytes();
+        request.extend_from_slice(body.unwrap_or_default());
         if secure {
             let config = self.tls.clone()?;
             let name =
@@ -106,17 +152,15 @@ fn split_authority(authority: &str, default_port: u16) -> Result<(String, u16), 
 
 fn exchange(
     stream: &mut (impl Read + Write),
-    request: &str,
-    deadline: Instant,
+    request: &[u8],
+    deadline: Option<Instant>,
 ) -> Result<Response, String> {
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| e.to_string())?;
+    stream.write_all(request).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
     let mut data = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
-        if Instant::now() > deadline {
+        if deadline.is_some_and(|d| Instant::now() > d) {
             return Err("request timed out".into());
         }
         match stream.read(&mut buf) {
@@ -202,7 +246,7 @@ fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-fn tls_config(
+pub(crate) fn tls_config(
     tls_version: Option<&str>,
     ca_certificate: Option<&str>,
 ) -> Result<rustls::ClientConfig, String> {

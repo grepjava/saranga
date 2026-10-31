@@ -30,6 +30,7 @@ mod repository;
 mod schema;
 mod security;
 mod substitute;
+pub mod system;
 mod wildcard;
 pub mod xerces;
 mod xinclude;

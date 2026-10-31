@@ -11,7 +11,6 @@
 //! in a way that may pass is fetched again after `metadataRetrySeconds`,
 //! keys after `cacheKeysSeconds`.
 
-mod http;
 pub(crate) mod jose;
 
 use std::collections::{BTreeSet, HashMap};
@@ -196,7 +195,7 @@ impl Metadata {
 #[derive(Default)]
 struct Shared {
     metadata: HashMap<String, Metadata>,
-    clients: HashMap<String, Arc<http::HttpClient>>,
+    clients: HashMap<String, Arc<super::http::HttpClient>>,
 }
 
 fn shared() -> &'static Mutex<Shared> {
@@ -231,7 +230,7 @@ impl Provider {
                         self.url
                     );
                 }
-                Arc::new(http::HttpClient::new(
+                Arc::new(super::http::HttpClient::new(
                     self.http_timeout,
                     self.tls_version.as_deref(),
                     self.ca_certificate.as_deref(),
@@ -257,7 +256,7 @@ impl Provider {
     }
 
     /// `fetchOIDCMetadata`.
-    fn fetch_metadata(&self, client: &http::HttpClient) -> Metadata {
+    fn fetch_metadata(&self, client: &super::http::HttpClient) -> Metadata {
         let uri = format!("{}/.well-known/openid-configuration", self.url);
         if self.debug {
             tracing::debug!("Fetching OIDC Metadata from {uri}");
@@ -286,7 +285,7 @@ impl Provider {
     }
 
     /// `fetchJwkSet`: the body, or `{}` (no keys) with a warning.
-    fn fetch_jwk_set(&self, client: &http::HttpClient, uri: &str) -> String {
+    fn fetch_jwk_set(&self, client: &super::http::HttpClient, uri: &str) -> String {
         if self.debug {
             tracing::debug!("Fetching JWK set from {uri}");
         }

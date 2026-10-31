@@ -10,9 +10,12 @@
 mod certificate;
 pub mod config;
 mod guest;
+mod http;
+mod kubernetes;
 mod ldap;
 mod oidc;
 mod principal;
+mod principal_conversion;
 mod properties_module;
 mod scram_properties;
 
@@ -45,6 +48,19 @@ impl Principal {
         match self {
             Principal::User(n) | Principal::Role(n) => n,
             Principal::Other { name, .. } => name,
+        }
+    }
+
+    /// `getClass().getName()`.
+    pub fn class_name(&self) -> &str {
+        match self {
+            Principal::User(_) => {
+                "org.apache.activemq.artemis.spi.core.security.jaas.UserPrincipal"
+            }
+            Principal::Role(_) => {
+                "org.apache.activemq.artemis.spi.core.security.jaas.RolePrincipal"
+            }
+            Principal::Other { class, .. } => class,
         }
     }
 }
@@ -242,7 +258,13 @@ impl ModuleFactory {
                 scram_properties::ScramPropertiesLoginModule::new(self, entry),
             )),
             Some("SCRAMLoginModule") => Ok(Box::new(principal::PrincipalLoginModule::default())),
+            Some("PrincipalConversionLoginModule") => Ok(Box::new(
+                principal_conversion::PrincipalConversionLoginModule::new(entry),
+            )),
             Some("OIDCLoginModule") => Ok(Box::new(oidc::OidcLoginModule::new(entry)?)),
+            Some("KubernetesLoginModule") => Ok(Box::new(kubernetes::KubernetesLoginModule::new(
+                self, entry,
+            ))),
             _ => Err(LoginError::new(format!(
                 "unable to instantiate LoginModule {class}: not supported by Saranga"
             ))),
@@ -264,6 +286,8 @@ impl ModuleFactory {
                     | "SCRAMPropertiesLoginModule"
                     | "SCRAMLoginModule"
                     | "OIDCLoginModule"
+                    | "KubernetesLoginModule"
+                    | "PrincipalConversionLoginModule"
             )
         )
     }

@@ -2,9 +2,11 @@
 // /.well-known/openid-configuration and its JWK set over HTTP and HTTPS;
 // tokens are signed here with its keys (RSA, and EC on P-256, P-384 and
 // P-521), or with one it does not publish, and handed to Qpid JMS as the
-// PLAIN password.
+// PLAIN password. A Kubernetes API server answers the broker's TokenReviews
+// over HTTPS, for the KubernetesLoginModule realms.
 //
-//   java -cp '<artemis>/lib/*' Suite.java host oidc-port plain-port tls-port http-port https-port provider.p12 [test-name...]
+//   java -cp '<artemis>/lib/*' Suite.java host oidc-port plain-port tls-port http-port https-port \
+//       k8s-port k8s-ignore-port api-port convert-port provider.p12 [test-name...]
 //
 // Run by tests/interop/oidc/oidc.sh [saranga|artemis].
 
@@ -23,7 +25,7 @@ import javax.net.ssl.*;
 
 public class Suite {
    static String host;
-   static int oidcPort, plainPort, tlsPort, httpPort, httpsPort;
+   static int oidcPort, plainPort, tlsPort, httpPort, httpsPort, k8sPort, k8sIgnorePort;
 
    interface Test { void run() throws Exception; }
 
@@ -42,7 +44,12 @@ public class Suite {
       tlsPort = Integer.parseInt(args[3]);
       httpPort = Integer.parseInt(args[4]);
       httpsPort = Integer.parseInt(args[5]);
-      Set<String> only = new HashSet<>(Arrays.asList(args).subList(7, args.length));
+      k8sPort = Integer.parseInt(args[6]);
+      k8sIgnorePort = Integer.parseInt(args[7]);
+      int apiPort = Integer.parseInt(args[8]);
+      int convertPort = Integer.parseInt(args[9]);
+      String p12 = args[10];
+      Set<String> only = new HashSet<>(Arrays.asList(args).subList(11, args.length));
 
       KeyPairGenerator r = KeyPairGenerator.getInstance("RSA");
       r.initialize(2048);
@@ -53,8 +60,12 @@ public class Suite {
       ec521 = ec("secp521r1");
       serve(HttpServer.create(new InetSocketAddress("localhost", httpPort), 0), "http://localhost:" + httpPort);
       HttpsServer https = HttpsServer.create(new InetSocketAddress("localhost", httpsPort), 0);
-      https.setHttpsConfigurator(new HttpsConfigurator(tls(args[6])));
+      https.setHttpsConfigurator(new HttpsConfigurator(tls(p12)));
       serve(https, "https://localhost:" + httpsPort);
+      HttpsServer api = HttpsServer.create(new InetSocketAddress("localhost", apiPort), 0);
+      api.setHttpsConfigurator(new HttpsConfigurator(tls(p12)));
+      api.createContext("/apis/authentication.k8s.io/v1/tokenreviews", Suite::review);
+      api.start();
 
       Map<String, Test> tests = new LinkedHashMap<>();
       tests.put("rs256", () -> works(oidcPort, sign("RS256", "rsa", rsa, claims())));
@@ -97,23 +108,28 @@ public class Suite {
       tests.put("plainAllowed", () -> works(plainPort, plain(new Claims().with("sub", "x").withRaw("roles", "[\"amq\"]"))));
       tests.put("encrypted", () -> refused(oidcPort, b64("{\"alg\":\"RSA-OAEP\",\"enc\":\"A128GCM\"}".getBytes()) + ".a.b.c.d"));
       tests.put("notAJwt", () -> refused(oidcPort, "a-password"));
-      tests.put("noRole", () -> {
-         String t = sign("RS256", "rsa", rsa, claims().withRaw("realm_access", "{\"roles\":[\"nothing\"]}"));
-         try (Connection c = factory(oidcPort).createConnection("x", t)) {
-            c.start();
-            Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
-            try {
-               s.createProducer(s.createQueue("oidc.none")).send(s.createTextMessage("x"));
-               throw new AssertionError("sent without a role");
-            } catch (JMSException expected) {
-               check(String.valueOf(expected.getMessage()).contains("does not have permission"), String.valueOf(expected.getMessage()));
-            }
-         }
-      });
+      tests.put("noRole", () -> noRole(oidcPort,
+            sign("RS256", "rsa", rsa, claims().withRaw("realm_access", "{\"roles\":[\"nothing\"]}"))));
       tests.put("missingIdentity", () -> refused(oidcPort, sign("RS256", "rsa", rsa, claims().without("preferred_username"))));
       tests.put("thumbprintWithoutTls", () -> refused(plainPort, sign("RS256", "rsa", rsa,
             new Claims().with("sub", "x").withRaw("roles", "[\"amq\"]").withRaw("cnf", "{\"x5t#256\":\"abc\"}"))));
       tests.put("https", () -> works(tlsPort, sign("RS256", "rsa", rsa, new Claims().with("sub", "x").withRaw("roles", "[\"amq\"]"))));
+      tests.put("k8sGroups", () -> works(k8sPort, "k8s-good"));
+      tests.put("k8sRoleFile", () -> works(k8sPort, "k8s-mapped"));
+      tests.put("k8sUnauthenticated", () -> refused(k8sPort, "k8s-bad"));
+      tests.put("k8sServerError", () -> refused(k8sPort, "k8s-500"));
+      tests.put("k8sNoUser", () -> refused(k8sPort, "k8s-nouser"));
+      tests.put("k8sEmptyToken", () -> refused(k8sPort, ""));
+      tests.put("k8sIgnoreRoles", () -> noRole(k8sIgnorePort, "k8s-good-ignored"));
+      tests.put("k8sIgnoreRolesFileless", () -> noRole(k8sIgnorePort, "k8s-mapped-ignored"));
+      tests.put("principalConversion", () -> works(convertPort, sign("RS256", "rsa", rsa, new Claims().with("sub", "converted"))));
+      tests.put("principalConversionUnmapped", () -> noRole(convertPort, sign("RS256", "rsa", rsa, new Claims().with("sub", "other"))));
+      tests.put("k8sRequests", () -> {
+         int before = reviews;
+         works(k8sPort, "k8s-good-counted");
+         check(reviews == before + 1, "reviews " + (reviews - before));
+         check(badRequests == 0, "requests refused: " + badRequests);
+      });
 
       int failed = 0;
       for (Map.Entry<String, Test> t : tests.entrySet()) {
@@ -161,10 +177,53 @@ public class Suite {
       server.start();
    }
 
+   // ------------------------------------------------------- the Kubernetes API server
+
+   static volatile int reviews, badRequests;
+
+   /**
+    * A TokenReview: refused (401) unless the broker calls with its service
+    * account token and posts the review as KubernetesClientImpl writes it;
+    * otherwise the token decides the status.
+    */
+   static void review(HttpExchange ex) throws IOException {
+      reviews++;
+      String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+      java.util.regex.Matcher m = java.util.regex.Pattern
+            .compile("\\{\"apiVersion\":\"authentication.k8s.io/v1\",\"kind\":\"TokenReview\",\"spec\":\\{\"token\":\"([^\"]*)\"}}")
+            .matcher(body);
+      if (!ex.getRequestMethod().equals("POST")
+            || !"Bearer sa-token".equals(ex.getRequestHeaders().getFirst("Authorization"))
+            || !"application/json; charset=utf-8".equals(ex.getRequestHeaders().getFirst("Accept"))
+            || !m.matches()) {
+         badRequests++;
+         reply(ex, 401, "{\"kind\":\"Status\",\"code\":401}");
+         return;
+      }
+      String status = switch (m.group(1)) {
+         case "k8s-good", "k8s-good-ignored", "k8s-good-counted" -> "{\"authenticated\":true,\"user\":{\"username\":\"system:serviceaccount:ns:app\","
+               + "\"uid\":\"u1\",\"groups\":[\"amq\",\"system:authenticated\"],"
+               + "\"extra\":{\"authentication.kubernetes.io/pod-name\":[\"app-0\"]}},\"audiences\":[\"https://kubernetes.default.svc\"]}";
+         case "k8s-mapped", "k8s-mapped-ignored" -> "{\"authenticated\":true,\"user\":{\"username\":\"mapped-user\"}}";
+         case "k8s-nouser" -> "{\"authenticated\":true}";
+         case "k8s-500" -> null;
+         default -> "{\"authenticated\":false,\"error\":\"invalid bearer token\"}";
+      };
+      if (status == null) {
+         reply(ex, 500, "{\"kind\":\"Status\",\"code\":500}");
+      } else {
+         reply(ex, 201, "{\"kind\":\"TokenReview\",\"apiVersion\":\"authentication.k8s.io/v1\",\"status\":" + status + "}");
+      }
+   }
+
    static void reply(HttpExchange ex, String body) throws IOException {
+      reply(ex, 200, body);
+   }
+
+   static void reply(HttpExchange ex, int code, String body) throws IOException {
       byte[] b = body.getBytes(StandardCharsets.UTF_8);
       ex.getResponseHeaders().add("Content-Type", "application/json");
-      ex.sendResponseHeaders(200, b.length);
+      ex.sendResponseHeaders(code, b.length);
       try (OutputStream o = ex.getResponseBody()) {
          o.write(b);
       }
@@ -301,6 +360,23 @@ public class Suite {
          s.createProducer(q).send(s.createTextMessage("hi"));
          TextMessage got = (TextMessage) consumer.receive(5000);
          check(got != null && got.getText().equals("hi"), "received " + got);
+      }
+   }
+
+   static int noRoles;
+
+   // Each to its own address: a send the authorization cache allowed another
+   // login with the same user name would pass.
+   static void noRole(int port, String token) throws Exception {
+      try (Connection c = factory(port).createConnection("x", token)) {
+         c.start();
+         Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+         try {
+            s.createProducer(s.createQueue("oidc.none." + (++noRoles))).send(s.createTextMessage("x"));
+            throw new AssertionError("sent without a role");
+         } catch (JMSException expected) {
+            check(String.valueOf(expected.getMessage()).contains("does not have permission"), String.valueOf(expected.getMessage()));
+         }
       }
    }
 
