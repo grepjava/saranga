@@ -131,7 +131,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
     - An `amqp-value` body of a type other than null, string, binary, list or map becomes a BytesMessage holding the encoded section. Artemis copies the wrong bytes there (ARTEMIS-6316).
     - An application property or stream item that Core has no type for is left out. Artemis fails the whole conversion.
 - **Not supported:**
-  - **SASL mechanisms:** GSSAPI, OAUTHBEARER and XOAUTH2. An acceptor's `saslMechanisms` that lists them gets outcome `sys` for them.
+  - **SASL mechanisms:** GSSAPI. An acceptor's `saslMechanisms` that lists it gets outcome `sys` for it.
   - **Core-message tunnelling** (`AMQ_CORE_MESSAGE_TUNNELING`): Core messages always go out converted to AMQP.
   - **Connection routers.**
 - **Large messages:**

@@ -3,8 +3,10 @@
 # an AMQP acceptor offering SCRAM-SHA-256, SCRAM-SHA-512 and PLAIN through
 # the login.config realm amqp-sasl-scram (SCRAMPropertiesLoginModule), and
 # SCRAMLoginModule in the broker's realm before PropertiesLoginModule.
-# Suite.java logs in with Qpid JMS; two broker connections to the same
-# acceptor log in with SCRAM, one with a wrong password.
+# A second AMQP acceptor offers XOAUTH2, OAUTHBEARER and PLAIN, whose bearer
+# tokens PropertiesLoginModule checks as passwords. Suite.java logs in with
+# Qpid JMS (and OAUTHBEARER over a raw socket); two broker connections to
+# the SCRAM acceptor log in with SCRAM, one with a wrong password.
 #
 #   tests/interop/sasl/sasl.sh [saranga|artemis] [test-name...]
 #
@@ -24,6 +26,7 @@ KIND="${1:-saranga}"; shift || true
 OFFSET=3000
 PORT=$((61616 + OFFSET))
 SASL_PORT=$((PORT + 1))
+TOKEN_PORT=$((PORT + 2))
 export MSYS_NO_PATHCONV=1
 native() { command -v cygpath >/dev/null && cygpath -m "$1" || echo "$1"; }
 windows() { [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; }
@@ -90,6 +93,10 @@ ETC="$I/etc"
   "$SARANGA" mask --scram dave davepw | grep -v '^#'
 } > "$ETC/scram-users.properties"
 printf 'amq = alice,bob,carol\n' > "$ETC/scram-roles.properties"
+# tok logs in with a bearer token, which PropertiesLoginModule checks as
+# its password. create's users file ends without a line end.
+printf '\ntok = secret-token\n' >> "$ETC/artemis-users.properties"
+sed -i -E 's/^amq ?= ?(.*)$/amq = \1,tok/' "$ETC/artemis-roles.properties"
 cat > "$ETC/login.config" <<CONF
 activemq {
    org.apache.activemq.artemis.spi.core.security.jaas.SCRAMLoginModule sufficient;
@@ -106,6 +113,7 @@ amqp-sasl-scram {
 };
 CONF
 ACCEPTOR="<acceptor name=\"scram\">tcp://localhost:$SASL_PORT?protocols=AMQP;saslMechanisms=SCRAM-SHA-512,SCRAM-SHA-256,PLAIN;saslLoginConfigScope=amqp-sasl-scram</acceptor>"
+ACCEPTOR+="<acceptor name=\"token\">tcp://localhost:$TOKEN_PORT?protocols=AMQP;saslMechanisms=XOAUTH2,OAUTHBEARER,PLAIN</acceptor>"
 CONNECT="<broker-connections>"
 CONNECT+="<amqp-connection uri=\"tcp://localhost:$SASL_PORT\" name=\"scram-good\" user=\"bob\" password=\"bobpw\" retry-interval=\"500\" reconnect-attempts=\"2\"><sender address-match=\"bc.unused.#\"/></amqp-connection>"
 CONNECT+="<amqp-connection uri=\"tcp://localhost:$SASL_PORT\" name=\"scram-bad\" user=\"bob\" password=\"wrong\" retry-interval=\"500\" reconnect-attempts=\"2\"><sender address-match=\"bc.unused.#\"/></amqp-connection>"
@@ -124,7 +132,7 @@ fi
 for _ in $(seq 1 600); do up && break; sleep 0.2; done
 up || { echo "the broker did not start"; cat "$WORK/run.out"; exit 1; }
 
-java -cp "$(client_cp)" "$(native "$HERE/Suite.java")" "127.0.0.1:$SASL_PORT" "$@"
+java -cp "$(client_cp)" "$(native "$HERE/Suite.java")" "127.0.0.1:$SASL_PORT" "127.0.0.1:$TOKEN_PORT" "$@"
 status=$?
 
 # The broker connections: bob's SCRAM login, and a wrong password. Both

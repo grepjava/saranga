@@ -64,7 +64,7 @@ Authentication and authorisation results are cached as in Artemis: `authenticati
 
 ### Protocol notes
 
-Every protocol logs in through the same security manager. AMQP clients use SASL: Saranga offers `PLAIN` and `ANONYMOUS` by default, as Artemis does, and `EXTERNAL`, for a client with a certificate, and `SCRAM-SHA-256` and `SCRAM-SHA-512` when the acceptor's `saslMechanisms` lists them; GSSAPI, OAUTHBEARER and XOAUTH2 are not supported.
+Every protocol logs in through the same security manager. AMQP clients use SASL: Saranga offers `PLAIN` and `ANONYMOUS` by default, as Artemis does, and `EXTERNAL`, for a client with a certificate, and `SCRAM-SHA-256`, `SCRAM-SHA-512`, `OAUTHBEARER` and `XOAUTH2` when the acceptor's `saslMechanisms` lists them; GSSAPI is not supported. OAUTHBEARER and XOAUTH2 carry a bearer token, which the broker's realm gets as the password, as in Artemis: a login module checks it (`PropertiesLoginModule` as a password, for one).
 
 SCRAM works as in Artemis. The acceptor names the realm SCRAM logs in through, and the broker's realm takes the identity it established with `SCRAMLoginModule`:
 

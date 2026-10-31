@@ -47,6 +47,15 @@ pub(crate) enum ServerSasl {
         result: Option<SaslResult>,
     },
     Scram(Box<JaasScram>),
+    /// OAUTHBEARER (RFC 7628) or XOAUTH2: a bearer token, validated as the
+    /// password of the user it names (`ServerSASLToken`).
+    Token(TokenKind, Option<SaslResult>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenKind {
+    OAuthBearer,
+    XOAuth2,
 }
 
 impl ServerSasl {
@@ -67,6 +76,8 @@ impl ServerSasl {
                     result: None,
                 })
             }
+            "OAUTHBEARER" => Some(Self::Token(TokenKind::OAuthBearer, None)),
+            "XOAUTH2" => Some(Self::Token(TokenKind::XOAuth2, None)),
             m => Scram::from_name(m).map(|s| Self::Scram(Box::new(JaasScram::new(s)))),
         }
     }
@@ -96,6 +107,29 @@ impl ServerSasl {
                 Some(Vec::new())
             }
             Self::Scram(s) => s.process(env, bytes).await,
+            Self::Token(kind, result) => {
+                let parsed = match kind {
+                    TokenKind::OAuthBearer => oauth_bearer(bytes.as_deref()),
+                    TokenKind::XOAuth2 => xoauth2(bytes.as_deref()),
+                };
+                let r = match parsed {
+                    Some((user, token)) => {
+                        let success = authenticate(env, user.clone(), Some(token.clone())).await;
+                        SaslResult {
+                            success,
+                            user,
+                            password: Some(token),
+                            principals: None,
+                        }
+                    }
+                    None => SaslResult::failed(),
+                };
+                *result = Some(r);
+                // Artemis answers a failure with an error (RFC 7628's JSON
+                // status), but a failed outcome carries no additional data,
+                // so it never reaches the client.
+                None
+            }
         }
     }
 
@@ -108,6 +142,7 @@ impl ServerSasl {
             }),
             Self::Plain(r) | Self::External { result: r, .. } => r.clone(),
             Self::Scram(s) => s.result(),
+            Self::Token(_, r) => r.clone(),
         }
     }
 }
@@ -129,18 +164,7 @@ async fn plain(env: &Env, data: Option<&[u8]>) -> SaslResult {
         [u, p] | [_, u, p] => (Some((*u).to_owned()), Some((*p).to_owned())),
         _ => (None, None),
     };
-    let success = match env.broker.security().cloned() {
-        None => true,
-        Some(store) => {
-            let info = env.info.clone();
-            let (u, p) = (user.clone(), password.clone());
-            tokio::task::spawn_blocking(move || {
-                store.authenticate(u.as_deref(), p.as_deref(), &info).is_ok()
-            })
-            .await
-            .unwrap_or(false)
-        }
-    };
+    let success = authenticate(env, user.clone(), password.clone()).await;
     SaslResult {
         success,
         user,
@@ -148,6 +172,86 @@ async fn plain(env: &Env, data: Option<&[u8]>) -> SaslResult {
         principals: None,
     }
 }
+
+/// `securityStore.authenticate`, when security is enabled: a mechanism's
+/// user and password (or bearer token, which `JwtCallback` gets as the
+/// password).
+async fn authenticate(env: &Env, user: Option<String>, password: Option<String>) -> bool {
+    match env.broker.security().cloned() {
+        None => true,
+        Some(store) => {
+            let info = env.info.clone();
+            tokio::task::spawn_blocking(move || {
+                store
+                    .authenticate(user.as_deref(), password.as_deref(), &info)
+                    .is_ok()
+            })
+            .await
+            .unwrap_or(false)
+        }
+    }
+}
+
+/// `OAuthBearerSASL`: `n,a=<user>,\x01host=<host>\x01port=<port>\x01auth=Bearer
+/// <token>\x01\x01` (RFC 7628 3.1), the user from the GS2 header's `a=`,
+/// which may be missing. `None` where it is not one.
+fn oauth_bearer(bytes: Option<&[u8]>) -> Option<(Option<String>, String)> {
+    let bytes = bytes.filter(|b| b.len() >= 2 && b.ends_with(&[1, 1]))?;
+    let data = String::from_utf8_lossy(bytes);
+    let segments = java_split(&data, '\u{1}');
+    if segments.len() < 2 {
+        return None;
+    }
+    let user = segments[0]
+        .split(',')
+        .filter_map(|s| s.strip_prefix("a="))
+        .next_back()
+        .map(str::to_owned);
+    let token = segments[1..]
+        .iter()
+        .filter_map(|s| s.strip_prefix("auth=Bearer "))
+        .next_back()?;
+    Some((user, token.to_owned()))
+}
+
+/// `XOAuth2SASL`: `user=<user>\x01auth=Bearer <token>\x01\x01`, scanned as
+/// Artemis scans it.
+fn xoauth2(bytes: Option<&[u8]>) -> Option<(Option<String>, String)> {
+    let bytes = bytes.filter(|b| !b.is_empty())?;
+    let text = |from: usize, to: usize| String::from_utf8_lossy(&bytes[from..to]).into_owned();
+    let (mut from, mut to) = (0, 0);
+    while to < bytes.len() && bytes[to] != 1 {
+        to += 1;
+    }
+    let mut user_part = None;
+    if to - from >= 5 {
+        user_part = Some(text(from, to));
+        to += 1;
+        from = to;
+    }
+    while to < bytes.len() && bytes[to] != 1 {
+        to += 1;
+    }
+    let token_part = (to - from >= 12).then(|| text(from, to));
+    let (user, token) = (user_part?, token_part?);
+    // Two 0x01 after the token, and nothing else.
+    if to != bytes.len() - 2 {
+        return None;
+    }
+    let user = user.strip_prefix("user=")?;
+    let token = token.strip_prefix("auth=Bearer ")?;
+    Some((Some(user.to_owned()), token.to_owned()))
+}
+
+/// `String.split` on one character: trailing empty parts dropped.
+fn java_split(s: &str, c: char) -> Vec<&str> {
+    let mut parts: Vec<&str> = s.split(c).collect();
+    while parts.last() == Some(&"") {
+        parts.pop();
+    }
+    parts
+}
+
 
 /// `JAASSCRAMServerSASL`: SCRAM-SHA-256 or SCRAM-SHA-512, the user's
 /// SCRAM data from a login through `saslLoginConfigScope`, whose subject's
@@ -258,5 +362,36 @@ impl JaasScram {
             password: None,
             principals: Some(principals.clone()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bearer_tokens_are_read_as_artemis_reads_them() {
+        let ob = |s: &str| oauth_bearer(Some(s.as_bytes()));
+        assert_eq!(
+            ob("n,a=tok,\u{1}host=h\u{1}port=5672\u{1}auth=Bearer abc\u{1}\u{1}"),
+            Some((Some("tok".into()), "abc".into()))
+        );
+        assert_eq!(
+            ob("n,,\u{1}auth=Bearer abc\u{1}\u{1}"),
+            Some((None, "abc".into()))
+        );
+        assert_eq!(ob("n,a=tok,\u{1}auth=Bearer abc\u{1}"), None);
+        assert_eq!(ob("n,a=tok,\u{1}host=h\u{1}\u{1}"), None);
+        assert_eq!(oauth_bearer(None), None);
+
+        let x = |s: &str| xoauth2(Some(s.as_bytes()));
+        assert_eq!(
+            x("user=tok\u{1}auth=Bearer abc\u{1}\u{1}"),
+            Some((Some("tok".into()), "abc".into()))
+        );
+        assert_eq!(x("user=tok\u{1}auth=Bearer abc\u{1}"), None);
+        assert_eq!(x("user=tok\u{1}auth=Bearer abc\u{1}\u{1}x"), None);
+        assert_eq!(x("usr=tok\u{1}auth=Bearer abc\u{1}\u{1}"), None);
+        assert_eq!(x("u\u{1}auth=Bearer abc\u{1}\u{1}"), None);
     }
 }
