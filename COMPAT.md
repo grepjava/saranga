@@ -147,9 +147,8 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **A poison acknowledgement** inside a transaction moves the message to the dead-letter address at once. Artemis moves it when the transaction commits.
 - **Removal advisories** on connection close are sent for the temporary destinations the connection made. Artemis also sends them for the temporary subscription queues of its topic consumers, under `ActiveMQ.Advisory.TempQueue`.
 - **Dispatched properties** of messages that came from Core or the journal are marshalled in the order they were put, not in the order of a freshly decoded Java `HashMap`. Clients read them into a map.
-- **Not supported:**
-  - Connection routers and interceptors.
-  - The `openwireMaxPacketChunkSize` and `actorThresholdBytes` back-pressure: frames are read and written whole.
+- **`openwireMaxPacketChunkSize` and `actorThresholdBytes`** are accepted and change nothing. In Artemis the first makes a frame larger than it be read into a heap buffer rather than Netty's pooled ones, and written in pieces of that size without a flush between them, so the client gets the same bytes at the same time; Saranga reads every frame into its own buffer and writes it whole. The second is how many bytes of commands Artemis lets queue for the connection's executor before it stops reading; Saranga handles a connection's commands as it reads them and reads nothing more while it does, so nothing queues.
+- **Not supported:** connection routers and interceptors.
 
 ## WebSocket differences
 - **A broker write is one WebSocket message**, which can hold several protocol frames: the connection's writer batches what is ready. Artemis sends each protocol frame as its own message. Clients read the payloads as a stream.

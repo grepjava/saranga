@@ -128,7 +128,7 @@ The main differences:
 
 - `brokerName` defaults to the host name from `HOSTNAME`, `COMPUTERNAME` or `/etc/hostname`, lowercased, then to the node ID. Artemis asks the JVM for the local host name.
 - A queue browser gets a snapshot of the queue when it is created.
-- The `openwireMaxPacketChunkSize` back-pressure is not there.
+- `openwireMaxPacketChunkSize` and `actorThresholdBytes` are accepted and change nothing: frames are read into their own buffers and written whole, and a connection's commands are handled as they are read, so none queue up.
 
 See [COMPAT.md](../../COMPAT.md#openwire-differences).
 
