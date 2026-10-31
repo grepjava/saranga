@@ -1253,6 +1253,10 @@ impl crate::queue::DeliverySink for AuditedSink {
         self.inner.disconnect(consumer_id, reason)
     }
 
+    fn slow_consumer(&self, consumer_id: i64) {
+        self.inner.slow_consumer(consumer_id)
+    }
+
     fn accepts(&self, message: &ServerMessage) -> bool {
         if self.plugins.is_empty() {
             return true;

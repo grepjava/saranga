@@ -91,7 +91,13 @@ pub(crate) struct AmqConsumer {
     /// The session's unnegotiated wire format, for conversion.
     wf: Mutex<WireFormat>,
     client: Arc<saranga_server::session::ClientConnection>,
+    /// The connection's `SlowConsumerDetection`: told when the reaper
+    /// finds this consumer slow.
+    on_slow: SlowConsumerListener,
 }
+
+/// `SlowConsumerDetectionListener`: the consumer's ID and destination.
+pub(crate) type SlowConsumerListener = Arc<dyn Fn(&ConsumerId, &Destination) + Send + Sync>;
 
 pub(crate) struct NewConsumer {
     pub id: ConsumerId,
@@ -105,6 +111,7 @@ pub(crate) struct NewConsumer {
     pub no_local: Arc<AtomicBool>,
     pub node_id: String,
     pub client: Arc<saranga_server::session::ClientConnection>,
+    pub on_slow: SlowConsumerListener,
 }
 
 impl AmqConsumer {
@@ -138,6 +145,7 @@ impl AmqConsumer {
             node_id: n.node_id,
             wf: Mutex::new(WireFormat::new(crate::codec::DEFAULT_WIRE_VERSION)),
             client: n.client,
+            on_slow: n.on_slow,
         })
     }
 
@@ -468,6 +476,10 @@ impl DeliverySink for Sink {
 
     fn supports_large(&self) -> bool {
         false
+    }
+
+    fn slow_consumer(&self, _consumer_id: i64) {
+        (self.0.on_slow)(&self.0.id, &self.0.destination);
     }
 
     /// `AMQConsumer.hasCredits`.

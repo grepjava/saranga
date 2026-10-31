@@ -90,6 +90,11 @@ pub trait DeliverySink: Send + Sync {
     /// queue, and the client is told its consumer is gone.
     fn disconnect(&self, _consumer_id: i64, _reason: &str) {}
 
+    /// `fireSlowConsumer`: the slow-consumer reaper found this consumer
+    /// slow (`SlowConsumerDetectionListener.onSlowConsumer`, which only
+    /// OpenWire listens to).
+    fn slow_consumer(&self, _consumer_id: i64) {}
+
     /// Whether the broker's plugins let this consumer have the message
     /// (`callBrokerMessagePluginsCanAccept`).
     fn accepts(&self, _message: &ServerMessage) -> bool {

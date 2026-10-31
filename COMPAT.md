@@ -149,7 +149,6 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **Removal advisories** on connection close are sent for the temporary destinations the connection made. Artemis also sends them for the temporary subscription queues of its topic consumers, under `ActiveMQ.Advisory.TempQueue`.
 - **Dispatched properties** of messages that came from Core or the journal are marshalled in the order they were put, not in the order of a freshly decoded Java `HashMap`. Clients read them into a map.
 - **Not supported:**
-  - The slow-consumer advisory.
   - `ConnectionControl` for cluster clients (`updateClusterClients`, `rebalanceClusterClients`), connection routers and interceptors.
   - The `openwireMaxPacketChunkSize` and `actorThresholdBytes` back-pressure: frames are read and written whole.
 
@@ -175,7 +174,6 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **`listUser`** lists users and each user's roles in the order Java's `HashMap` and `HashSet` iterate them, as Artemis does. For a basic security manager the users are first put in name order; Artemis puts them in the order of its own map of the journal's users, so a long list can come out in a different order.
 - **Notifications.** A divert's `BINDING_ADDED` carries a new ID in `_AMQ_Binding_ID`, as Saranga's diverts have none of their own.
 - **`management-message-rbac`** checks the permission before it looks for the operation. For an operation that does not exist, a caller without the permission gets the permission error; Artemis looks for the operation's method first and answers `AMQ229069: no operation`.
-- **The slow-consumer advisory** (`ActiveMQ.Advisory.SlowConsumer.*`) is not sent to OpenWire clients; the `CONSUMER_SLOW` notification and the `KILL` policy work for consumers of every protocol.
 - **Slow consumers** are checked by one task for all queues, within 200 ms of each queue's check period. Artemis schedules a task for each queue.
 - **JSON numbers beyond a double's range** (such as `1e400`), in management arguments or JSON configuration, are an error. Artemis's Johnzon reads them as a `BigDecimal`.
 - **Records.** Paused queues and addresses, address settings and diverts are journaled as Artemis journals them (`QUEUE_STATUS_RECORD`, `ADDRESS_STATUS_RECORD`, `ADDRESS_SETTING_RECORD_JSON`, `DIVERT_RECORD`), so they move with the data directory in both directions. Like Artemis, Saranga journals every deployed divert, configured ones included.

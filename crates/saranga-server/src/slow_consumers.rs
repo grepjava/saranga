@@ -214,6 +214,9 @@ fn reap(
         if !(rate < threshold || (rate == 0.0 && threshold == 0.0)) {
             continue;
         }
+        // fireSlowConsumer comes first: whatever the policy, and before the
+        // connection is looked for.
+        c.sink.slow_consumer(c.id);
         let Some(connection) = broker
             .registry()
             .session(&c.session)

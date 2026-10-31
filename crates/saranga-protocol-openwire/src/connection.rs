@@ -325,6 +325,11 @@ enum Event {
     RestoreAutoRead,
     /// Management closed a session (`closeSessionWithID`).
     CloseSession { name: String },
+    /// The reaper found a consumer slow (`SlowConsumerDetection`).
+    SlowConsumer {
+        id: ConsumerId,
+        destination: Destination,
+    },
 }
 
 /// A message a full address held back, sent once it has room.
@@ -731,6 +736,9 @@ pub async fn serve(broker: Arc<Broker>, manager: Arc<Manager>, c: Accepted) {
                 Some(Event::Released) => conn.send_released().await,
                 Some(Event::RestoreAutoRead) => conn.restore_auto_read(),
                 Some(Event::CloseSession { name }) => conn.close_server_session(&name).await,
+                Some(Event::SlowConsumer { id, destination }) => {
+                    conn.slow_consumer(id, &destination).await
+                }
             },
             _ = tick.tick() => {
                 if !conn.check_ttl() {
@@ -1502,11 +1510,51 @@ impl Connection {
 
     /// `fireAdvisory`: routed only to an address that exists, with no
     /// security check.
+    /// `SlowConsumerDetection.onSlowConsumer`: an `ActiveMQMessage` naming
+    /// the consumer, on `ActiveMQ.Advisory.SlowConsumer.<type>.<name>`, for
+    /// that consumer (`targetConsumerId`).
+    async fn slow_consumer(&mut self, id: ConsumerId, destination: &Destination) {
+        let topic = Destination::topic(format!(
+            "ActiveMQ.Advisory.SlowConsumer.{}.{}",
+            type_string(destination),
+            destination.physical_name()
+        ));
+        let mut props = PrimitiveMap::new();
+        props.insert(
+            "consumerId".into(),
+            Primitive::String(consumer_id_string(&id)),
+        );
+        let mut marshalled = Vec::new();
+        if primitive::write_map(&mut marshalled, Some(&props)).is_err() {
+            return;
+        }
+        let data = DataStructure::Message(Message {
+            data_type: 23,
+            marshalled_properties: Some(marshalled),
+            ..Default::default()
+        });
+        self.fire_advisory_to(&topic, data, None, Some(id)).await;
+        // What was routed joins its queues once journaled.
+        self.reply(None, None);
+    }
+
     async fn fire_advisory(
         &mut self,
         topic: &Destination,
         data: DataStructure,
         original_connection_id: Option<String>,
+    ) {
+        self.fire_advisory_to(topic, data, original_connection_id, None)
+            .await
+    }
+
+    /// `fireAdvisory`, with the consumer the advisory is for.
+    async fn fire_advisory_to(
+        &mut self,
+        topic: &Destination,
+        data: DataStructure,
+        original_connection_id: Option<String>,
+        target_consumer_id: Option<ConsumerId>,
     ) {
         if !self.manager.settings.support_advisory {
             return;
@@ -1551,6 +1599,7 @@ impl Connection {
             timestamp: now,
             marshalled_properties: Some(marshalled),
             data_structure: Some(Box::new(data)),
+            target_consumer_id,
             ..Default::default()
         };
         let mut wf = WireFormat::new(crate::codec::DEFAULT_WIRE_VERSION);
@@ -2436,6 +2485,15 @@ impl Connection {
             no_local: self.no_local.clone(),
             node_id: self.broker.node_id().to_owned(),
             client: self.client.clone(),
+            on_slow: {
+                let events = self.events.clone();
+                Arc::new(move |id: &ConsumerId, destination: &Destination| {
+                    let _ = events.send(Event::SlowConsumer {
+                        id: id.clone(),
+                        destination: destination.clone(),
+                    });
+                })
+            },
         });
         if info.browser {
             // A browser reads a snapshot of the queue.

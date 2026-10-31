@@ -1279,6 +1279,35 @@ public class OpenWire {
         }
     }
 
+    // slow-consumer-threshold 1 and a check every second on ow.slow.#
+    // (broker.xml): a consumer that never acknowledges is slow, and the
+    // reaper's fireSlowConsumer sends an advisory naming it on
+    // ActiveMQ.Advisory.SlowConsumer.Queue.<queue> (OpenWireConnection's
+    // SlowConsumerDetection).
+    static void t_slowConsumerAdvisory() throws Exception {
+        try (Connection c = cf().createConnection()) {
+            c.start();
+            Session s = c.createSession(false, Session.CLIENT_ACKNOWLEDGE);
+            Queue q = s.createQueue(unique("ow.slow.q"));
+            MessageConsumer advisories = s.createConsumer(AdvisorySupport.getSlowConsumerAdvisoryTopic(
+                (org.apache.activemq.command.ActiveMQDestination) q));
+            MessageConsumer slow = s.createConsumer(q);
+            String id = ((org.apache.activemq.ActiveMQMessageConsumer) slow).getConsumerId().toString();
+            sendTexts(s, q, "m", 10);
+            check(slow.receive(5000) != null, "a delivery, never acknowledged");
+            Message m = advisories.receive(15000);
+            check(m != null, "no slow consumer advisory");
+            ActiveMQMessage advisory = (ActiveMQMessage) m;
+            eq("ActiveMQ.Advisory.SlowConsumer.Queue." + q.getQueueName(),
+               ((Topic) advisory.getJMSDestination()).getTopicName(), "advisory topic");
+            // Fired for the slow consumer (targetConsumerId), which the
+            // conversion through Core leaves out.
+            eq(null, advisory.getTargetConsumerId(), "targetConsumerId");
+            check(advisory.getDataStructure() instanceof ActiveMQMessage, "data: " + advisory.getDataStructure());
+            eq(id, ((ActiveMQMessage) advisory.getDataStructure()).getStringProperty("consumerId"), "consumerId");
+        }
+    }
+
     static void t_tempQueueAdvisory() throws Exception {
         try (Connection c = cf().createConnection()) {
             c.start();
