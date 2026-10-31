@@ -13,6 +13,8 @@
 # it both use the login files the image makes for anonymous login
 # (tests/interop/etc).
 # PORT and NAME (the Artemis container) let two runs share a machine.
+# ARTEMIS_LOCAL=1 runs Artemis from ARTEMIS_DIST on this machine instead of
+# in the container.
 #
 # Runs tests/interop/jms/Phase2.java and the golden scenarios that the current
 # phase supports, with the Artemis client jars from the reference build.
@@ -28,11 +30,27 @@ CONFIG="${CONFIG:-$ROOT/tests/golden/etc/broker.xml}"
 export MSYS_NO_PATHCONV=1
 native() { command -v cygpath >/dev/null && cygpath -m "$1" || echo "$1"; }
 
+windows() { [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; }
+# An Artemis instance's bin/artemis (artemis.cmd on Windows).
+artemis_cmd() {
+  local dir="$1"; shift
+  if windows; then
+    (cd "$dir/bin" && cmd /c "$(cygpath -w "$dir/bin/artemis.cmd")" "$@")
+  else
+    (cd "$dir/bin" && ./artemis "$@")
+  fi
+}
+
 BROKER_PID=""
+LOCAL_ARTEMIS=""
 cleanup() {
   [[ -n "$BROKER_PID" ]] && kill "$BROKER_PID" 2>/dev/null || true
+  if [[ -n "$LOCAL_ARTEMIS" ]]; then
+    artemis_cmd "$LOCAL_ARTEMIS" stop >/dev/null 2>&1 || true
+    for _ in $(seq 1 100); do (echo > "/dev/tcp/127.0.0.1/$PORT") 2>/dev/null || break; sleep 0.1; done
+  fi
   [[ -n "${INSTANCE:-}" ]] && rm -rf "$INSTANCE"
-  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  [[ -z "${ARTEMIS_LOCAL:-}" ]] && docker rm -f "$NAME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -49,16 +67,34 @@ case "$TARGET" in
     for _ in $(seq 1 50); do (echo > "/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break; sleep 0.1; done
     ;;
   artemis)
-    docker rm -f "$NAME" >/dev/null 2>&1 || true
-    docker create --name "$NAME" -e ANONYMOUS_LOGIN=true \
-      -p "127.0.0.1:$PORT:61616" "saranga/artemis-ref:$VERSION" >/dev/null
-    # The image creates its instance with etc-override/broker.xml.
-    INSTANCE="$(mktemp -d)"
-    mkdir -p "$INSTANCE/etc-override" && cp "$CONFIG" "$INSTANCE/etc-override/broker.xml"
-    [[ -n "${ETC:-}" ]] && cp "$ETC"/* "$INSTANCE/etc-override/"
-    docker cp "$(native "$INSTANCE/etc-override")" "$NAME":/var/lib/artemis-instance/etc-override >/dev/null
-    docker start "$NAME" >/dev/null
-    for _ in $(seq 1 60); do docker logs "$NAME" 2>&1 | grep -q AMQ221007 && break; sleep 1; done
+    if [[ -n "${ARTEMIS_LOCAL:-}" ]]; then
+      # Without Docker: an instance of the ARTEMIS_DIST distribution, made
+      # as the image makes it (anonymous login) and run by its bin/artemis.
+      # The configuration's acceptors move to PORT, as the image's port
+      # mapping moves them.
+      INSTANCE="$(mktemp -d)"
+      LOCAL_ARTEMIS="$INSTANCE/i"
+      java -cp "$(native "$DIST/lib")/*" -Dartemis.home="$(native "$DIST")" \
+        org.apache.activemq.artemis.boot.Artemis create "$(native "$LOCAL_ARTEMIS")" --silent --no-autotune \
+        --user artemis --password artemis --allow-anonymous --no-web --host localhost > /dev/null 2>&1 \
+        || { echo "artemis create failed"; exit 1; }
+      sed "s/:61616\b/:$PORT/g" "$CONFIG" > "$LOCAL_ARTEMIS/etc/broker.xml"
+      [[ -n "${ETC:-}" ]] && cp "$ETC"/* "$LOCAL_ARTEMIS/etc/"
+      artemis_cmd "$LOCAL_ARTEMIS" run > "$INSTANCE/run.out" 2>&1 &
+      for _ in $(seq 1 600); do grep -q AMQ221007 "$LOCAL_ARTEMIS/log/artemis.log" 2>/dev/null && break; sleep 0.1; done
+      grep -q AMQ221007 "$LOCAL_ARTEMIS/log/artemis.log" 2>/dev/null || { echo "artemis did not start"; cat "$INSTANCE/run.out"; exit 1; }
+    else
+      docker rm -f "$NAME" >/dev/null 2>&1 || true
+      docker create --name "$NAME" -e ANONYMOUS_LOGIN=true \
+        -p "127.0.0.1:$PORT:61616" "saranga/artemis-ref:$VERSION" >/dev/null
+      # The image creates its instance with etc-override/broker.xml.
+      INSTANCE="$(mktemp -d)"
+      mkdir -p "$INSTANCE/etc-override" && cp "$CONFIG" "$INSTANCE/etc-override/broker.xml"
+      [[ -n "${ETC:-}" ]] && cp "$ETC"/* "$INSTANCE/etc-override/"
+      docker cp "$(native "$INSTANCE/etc-override")" "$NAME":/var/lib/artemis-instance/etc-override >/dev/null
+      docker start "$NAME" >/dev/null
+      for _ in $(seq 1 60); do docker logs "$NAME" 2>&1 | grep -q AMQ221007 && break; sleep 1; done
+    fi
     ;;
   *) echo "usage: interop.sh [saranga|artemis] [test-name...]"; exit 2 ;;
 esac
