@@ -149,7 +149,6 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **Removal advisories** on connection close are sent for the temporary destinations the connection made. Artemis also sends them for the temporary subscription queues of its topic consumers, under `ActiveMQ.Advisory.TempQueue`.
 - **Dispatched properties** of messages that came from Core or the journal are marshalled in the order they were put, not in the order of a freshly decoded Java `HashMap`. Clients read them into a map.
 - **Not supported:**
-  - The `ConsumerControl` that tells a client about `queue-prefetch` 0.
   - The slow-consumer advisory.
   - `ConnectionControl` for cluster clients (`updateClusterClients`, `rebalanceClusterClients`), connection routers and interceptors.
   - The `openwireMaxPacketChunkSize` and `actorThresholdBytes` back-pressure: frames are read and written whole.

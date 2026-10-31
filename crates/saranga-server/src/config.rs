@@ -152,6 +152,7 @@ fn resolve(s: &cfg::AddressSettings) -> AddressSettings {
         default_consumers_before_dispatch: s.default_consumers_before_dispatch(),
         default_delay_before_dispatch: s.default_delay_before_dispatch(),
         default_consumer_window_size: s.default_consumer_window_size(),
+        queue_prefetch: s.queue_prefetch(),
         default_group_rebalance: s.default_group_rebalance(),
         default_group_rebalance_pause_dispatch: s.default_group_rebalance_pause_dispatch(),
         default_group_buckets: s.default_group_buckets(),

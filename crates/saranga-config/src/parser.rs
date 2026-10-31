@@ -1283,6 +1283,14 @@ pub(crate) fn address_setting_fragment(
     element: &str,
     value: &str,
 ) -> Result<Option<AddressSettings>> {
+    // A bean property with no broker.xml element (ActiveMQ 5's
+    // PolicyEntry): broker properties and fromJSON set it all the same.
+    if element == "queue-prefetch" {
+        return Ok(Some(AddressSettings {
+            queue_prefetch: Some(parse_num(element, java_trim(value))?),
+            ..Default::default()
+        }));
+    }
     let text = format!(
         "<address-setting><{element}>{}</{element}></address-setting>",
         xml_escape(value)

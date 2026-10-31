@@ -37,6 +37,9 @@ pub struct AddressSettings {
     pub default_consumers_before_dispatch: i32,
     pub default_delay_before_dispatch: i64,
     pub default_consumer_window_size: i32,
+    /// `queuePrefetch`, from ActiveMQ 5's policy entries: 0 tells an
+    /// OpenWire consumer of a queue to pull (a `ConsumerControl`).
+    pub queue_prefetch: i32,
     pub default_group_rebalance: bool,
     pub default_group_rebalance_pause_dispatch: bool,
     pub default_group_buckets: i32,
@@ -176,6 +179,7 @@ impl Default for AddressSettings {
             default_consumers_before_dispatch: 0,
             default_delay_before_dispatch: -1,
             default_consumer_window_size: 1024 * 1024,
+            queue_prefetch: 1000,
             default_group_rebalance: false,
             default_group_rebalance_pause_dispatch: false,
             default_group_buckets: -1,

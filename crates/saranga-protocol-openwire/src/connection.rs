@@ -2387,6 +2387,24 @@ impl Connection {
             });
         }
         let destination_name = self.convert_wildcard(&member);
+        // AMQConsumer.init (see ActiveMQ 5's PolicyEntry): a queue whose
+        // queuePrefetch is 0 tells a consumer asking for a prefetch to pull,
+        // once its consumer is made.
+        let pull = (!member.is_topic()
+            && info.prefetch_size != 0
+            && self
+                .broker
+                .post_office()
+                .settings(&destination_name)
+                .queue_prefetch
+                == 0)
+            .then(|| {
+                DataStructure::ConsumerControl(ConsumerControl {
+                    consumer_id: Some(cid.clone()),
+                    prefetch: 0,
+                    ..Default::default()
+                })
+            });
         let (queue_name, filter) = if member.is_topic() {
             let q = self
                 .create_topic_subscription(
@@ -2432,6 +2450,9 @@ impl Connection {
                 CheckType::Browse,
             )?;
             consumer.set_queue(queue);
+            if let Some(cc) = &pull {
+                self.out.send_command(cc);
+            }
             return Ok((consumer, filter));
         }
         let sink = consumer.sink();
@@ -2449,6 +2470,9 @@ impl Connection {
             .await;
         session.session.set_pre_acknowledge(false);
         result?;
+        if let Some(cc) = &pull {
+            self.out.send_command(cc);
+        }
         // credits = -1: only the prefetch window paces it.
         session.session.consumer_credits(core_id, -1);
         if let Some(q) = session.session.consumer_queue(core_id) {

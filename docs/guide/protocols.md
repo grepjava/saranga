@@ -128,7 +128,7 @@ The main differences:
 
 - `brokerName` defaults to the host name from `HOSTNAME`, `COMPUTERNAME` or `/etc/hostname`, lowercased, then to the node ID. Artemis asks the JVM for the local host name.
 - A queue browser gets a snapshot of the queue when it is created.
-- The slow-consumer advisory, `ConsumerControl` for prefetch 0, cluster client updates, and the `openwireMaxPacketChunkSize` back-pressure are not there.
+- The slow-consumer advisory, cluster client updates, and the `openwireMaxPacketChunkSize` back-pressure are not there.
 
 See [COMPAT.md](../../COMPAT.md#openwire-differences).
 

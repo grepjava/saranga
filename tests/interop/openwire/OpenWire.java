@@ -5,7 +5,7 @@
 // Core (Artemis JMS) checks what crosses between the protocols.
 //   java -cp '<artemis>/lib/*' OpenWire.java tcp://host:port [test-name...]
 // The broker runs tests/interop/openwire/broker.xml:
-//   CONFIG=tests/interop/openwire/broker.xml SUITE_FILE=tests/interop/openwire/OpenWire.java scripts/interop.sh [saranga|artemis]
+//   CONFIG=tests/interop/openwire/broker.xml ETC=tests/interop/openwire/etc SUITE_FILE=tests/interop/openwire/OpenWire.java scripts/interop.sh [saranga|artemis]
 // Run it against the reference Java broker too: a test that fails there is a wrong test.
 
 import java.net.URI;
@@ -714,6 +714,32 @@ public class OpenWire {
             MessageConsumer other = s.createConsumer(q);
             eq("m2", text(other.receive(5000)), "other pulls");
             check(consumer.receiveNoWait() == null, "nothing left");
+        }
+    }
+
+    /** The prefetch the client now uses for a consumer (ConsumerInfo.currentPrefetchSize). */
+    static int currentPrefetch(MessageConsumer consumer) throws Exception {
+        java.lang.reflect.Field f = org.apache.activemq.ActiveMQMessageConsumer.class.getDeclaredField("info");
+        f.setAccessible(true);
+        return ((org.apache.activemq.command.ConsumerInfo) f.get(consumer)).getCurrentPrefetchSize();
+    }
+
+    // queuePrefetch=0 on ow.pull.# (etc/broker.properties): a consumer of
+    // such a queue asking for a prefetch is sent a ConsumerControl with
+    // prefetch 0 (AMQConsumer.init, as ActiveMQ 5's PolicyEntry); other
+    // queues and topics are left as they are (Artemis's
+    // ZeroPrefetchConsumerTest.testBrokerZeroPrefetchConfigWithConsumerControl).
+    static void t_queuePrefetchZeroSendsConsumerControl() throws Exception {
+        try (Connection c = cf().createConnection()) {
+            c.start();
+            Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            MessageConsumer pulled = s.createConsumer(s.createQueue(unique("ow.pull.q")));
+            waitFor(() -> currentPrefetch(pulled) == 0, 5000, "prefetch 0 from the broker");
+            MessageConsumer other = s.createConsumer(s.createQueue(unique("ow.other.q")));
+            MessageConsumer topic = s.createConsumer(s.createTopic(unique("ow.pull.t")));
+            Thread.sleep(500);
+            eq(1000, currentPrefetch(other), "another queue keeps its prefetch");
+            eq(32767, currentPrefetch(topic), "a topic keeps its prefetch");
         }
     }
 

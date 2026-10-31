@@ -1018,6 +1018,20 @@ brokerPlugins.p.className=x"#,
         assert!(c.address_settings.is_empty() && c.acceptors.is_empty());
     }
 
+    /// `queuePrefetch` has no broker.xml element, but is a bean property of
+    /// AddressSettings, so broker properties set it.
+    #[test]
+    fn queue_prefetch_has_no_element_but_is_set() {
+        let mut c = BrokerConfig::default();
+        let w = apply_str(
+            &mut c,
+            "addressSettings.\"pull.#\".queuePrefetch=0\naddressSettings.\"bad.#\".queuePrefetch=x",
+        );
+        assert_eq!(w.len(), 1, "{w:?}");
+        let (m, s) = &c.address_settings[0];
+        assert_eq!((m.as_str(), s.queue_prefetch()), ("pull.#", 0));
+    }
+
     /// As Artemis 2.57.0 applies them (the values checked with its
     /// `ConfigurationImpl.parsePrefixedProperties`).
     #[test]
