@@ -964,17 +964,6 @@ impl ServerSession {
         self.auto_commit_acks
     }
 
-    /// Whether this request or an earlier completion from this session
-    /// still has journal writes or deferred queue updates pending.
-    fn has_pending_writes(&self) -> bool {
-        !self.ops.is_empty()
-            || !self.actions.is_empty()
-            || self
-                .pending_writes
-                .load(std::sync::atomic::Ordering::Acquire)
-                > 0
-    }
-
     /// The journal writes and queue updates the requests so far lined up;
     /// the protocol answers its client once they are done.
     pub fn take_completion(&mut self) -> Completion {
@@ -985,12 +974,18 @@ impl ServerSession {
         } else {
             vec![std::mem::take(&mut self.replicated)]
         };
-        let pending = if waits.is_empty() && actions.is_empty() {
-            Vec::new()
-        } else {
+        let pending = if (!waits.is_empty()
+            || self
+                .pending_writes
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0)
+            && (!waits.is_empty() || !actions.is_empty())
+        {
             self.pending_writes
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             vec![PendingWrite(self.pending_writes.clone())]
+        } else {
+            Vec::new()
         };
         Completion {
             waits,
@@ -1094,7 +1089,7 @@ impl ServerSession {
         if let Some(p) = outcome.write(storage.as_deref())? {
             self.ops.push(p);
         }
-        if defer && self.has_pending_writes() {
+        if defer && self.broker.storage().is_some() {
             let replicated = self.replicated.clone();
             self.actions.push(Box::new(move || {
                 let waits = outcome.apply();
@@ -1772,7 +1767,7 @@ impl ServerSession {
                         self.ops.push(s.commit(jtx).map_err(io_error)?);
                     }
                 }
-                if self.has_pending_writes() {
+                if storage.is_some() {
                     // The references count against their addresses now,
                     // and join their queues once journaled.
                     for (r, queues) in &routed {

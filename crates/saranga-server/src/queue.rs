@@ -2378,16 +2378,9 @@ impl Actor {
             }
             _ => None,
         };
-        let last_in_queue =
-            self.messages.is_empty() && self.shared.adds_pending.load(Ordering::Relaxed) == 0;
         let c = &mut self.consumers[index];
         r.delivery_count += 1;
-        let msg = flagged.as_ref().unwrap_or(&r.message);
-        if last_in_queue {
-            crate::protocol::with_direct_write(|| c.send(msg, r.delivery_count));
-        } else {
-            c.send(msg, r.delivery_count);
-        }
+        c.send(flagged.as_ref().unwrap_or(&r.message), r.delivery_count);
         if c.large.is_some() && c.continue_large() {
             self.shared.tx.send(Cmd::ResumeLarge).ok();
         }

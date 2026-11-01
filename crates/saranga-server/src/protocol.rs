@@ -90,9 +90,8 @@ impl WritePart {
 /// What a connection's tasks hand its writer task. What the connection's
 /// own task (or a caller inside [`with_direct_write`]) sends while the
 /// writer has nothing left to write goes straight to the socket instead:
-/// the writer, on another thread, is not woken for each response,
-/// confirmation, or single-message delivery when the queue is drained.
-/// Multi-message bursts from a queue go to the writer still, which gathers
+/// the writer, on another thread, is not woken for each response or
+/// confirmation. Deliveries from a queue go to the writer, which gathers
 /// what arrives meanwhile into one write: written one at a time, each would
 /// cost the queue's task a system call, and under load it fell behind its
 /// producers.
@@ -120,8 +119,8 @@ std::thread_local! {
 
 /// Runs `f` with direct socket writes enabled on the current thread, even
 /// when called from a task other than the connection's owner task (for
-/// example, a session task sending a response or confirmation, or a queue
-/// task delivering its last queued message).
+/// example, a session task sending a response, confirmation, or producer
+/// credits).
 pub fn with_direct_write<R>(f: impl FnOnce() -> R) -> R {
     struct Guard(bool);
     impl Drop for Guard {
