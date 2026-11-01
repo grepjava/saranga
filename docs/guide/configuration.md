@@ -133,7 +133,7 @@ A reload does what Artemis's does:
 
 An acceptor that cannot be started (its port is in use, say) logs `AMQ224104: Error starting the Acceptor <name> <parameters>`, and the reload then fails with `AMQ224069` and the bind exception, before `AMQ221087`, as in Artemis. What it changed before that stays changed.
 
-Saranga has no connection routers. `login.config` is not reloaded, as in Artemis. Other settings take a restart. See [Artemis's configuration reload](https://activemq.apache.org/components/artemis/documentation/latest/config-reload.html) and [COMPAT.md](../../COMPAT.md#configuration-differences).
+Connection routers are reloaded as Artemis reloads them: a router added or changed is deployed again, and one no longer configured is stopped. `login.config` is not reloaded, as in Artemis. Other settings take a restart. See [Artemis's configuration reload](https://activemq.apache.org/components/artemis/documentation/latest/config-reload.html) and [COMPAT.md](../../COMPAT.md#configuration-differences).
 
 When a reload changes a queue's filter, the record Saranga writes holds the new filter, where Artemis writes the old one. Either broker reads the other's record. See [COMPAT.md](../../COMPAT.md#persistence-differences).
 
@@ -208,12 +208,11 @@ Saranga reads the whole `broker.xml` schema. Elements are matched by their local
 These are read and ignored, each with a warning in the log:
 
 - an element the schema does not define at that position, in a file a reload reads (when the broker starts, it is an error);
-- `<connection-routers>`;
 - `<lock-coordinators>`;
 - `<metrics>` and `<metrics-plugin>` (the broker, address and queue metrics are still served where `bootstrap.xml` declares the metrics app; see [Management](management.md));
 - `<resource-limit-settings>`, which are not enforced;
 - `<connector-services>`, which name Java classes;
-- an acceptor's `proxyProtocolEnabled`, `httpEnabled` and `router`;
+- an acceptor's `proxyProtocolEnabled` and `httpEnabled`;
 - `scale-down` in an HA policy;
 - `<security-setting-plugin>` (see [Security](security.md));
 - in `bootstrap.xml`, `<component>`s and every `<web>` after the first: Artemis starts each as a Java component, and Saranga runs one web server and no Java code;

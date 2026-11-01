@@ -7174,6 +7174,57 @@ pub static CLUSTER_CONNECTION: Control = Control {
     ],
 };
 
+/// `ConnectionRouterControl`.
+pub static CONNECTION_ROUTER: Control = Control {
+    interface: "ConnectionRouterControl",
+    ctors: &[&[
+        "org.apache.activemq.artemis.core.server.routing.ConnectionRouter",
+        "org.apache.activemq.artemis.core.persistence.StorageManager",
+    ]],
+    attrs: &[
+        Attr {
+            name: "LocalTargetFilter",
+            type_name: "java.lang.String",
+            desc: "N/A",
+            readable: true,
+            writable: true,
+            is: false,
+        },
+        Attr {
+            name: "TargetKeyFilter",
+            type_name: "java.lang.String",
+            desc: "N/A",
+            readable: true,
+            writable: true,
+            is: false,
+        },
+    ],
+    ops: &[
+        Op {
+            name: "getTarget",
+            desc: "Get the target associated with key",
+            impact: 0,
+            ret: "javax.management.openmbean.CompositeData",
+            params: &[Param {
+                name: "key",
+                type_name: "java.lang.String",
+                desc: "a key",
+            }],
+        },
+        Op {
+            name: "getTargetAsJSON",
+            desc: "Get the target associated with key as JSON",
+            impact: 0,
+            ret: "java.lang.String",
+            params: &[Param {
+                name: "key",
+                type_name: "java.lang.String",
+                desc: "a key",
+            }],
+        },
+    ],
+};
+
 /// The public constructors of `HawtioSecurityControlImpl`.
 pub static HAWTIO_SECURITY_CTORS: &[&[&str]] = &[&[
     "org.apache.activemq.artemis.core.server.management.GuardInvocationHandler",

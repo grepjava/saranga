@@ -21,7 +21,7 @@ These stop the broker from starting:
 
 These are read but not acted on, each with a warning:
 
-- `scale-down`, `<connection-routers>`, `<metrics>` and `<resource-limit-settings>` in `broker.xml`;
+- `scale-down`, `<metrics>` and `<resource-limit-settings>` in `broker.xml`;
 - `<security-setting-plugin>`, so security settings that such a plugin would load are missing;
 - a `login.config` entry naming a login module Saranga does not have: logins that reach that module fail (see [security.md](security.md));
 - a divert whose transformer is not registered: the divert is not deployed.
@@ -202,7 +202,6 @@ Saranga has no JVM, so it cannot load Java classes. Anything you added to Artemi
 - **Transformers.** Divert and core federation transformers are Rust code, registered by an embedding application under the class name `broker.xml` gives. A divert whose transformer is not registered is not deployed, with a warning. Transformers of AMQP federation and AMQP bridge policies are not applied. ([Queue semantics differences](../../COMPAT.md#queue-semantics-differences), [Configuration differences](../../COMPAT.md#configuration-differences))
 - **Login modules and security managers.** Only the modules and managers listed in [The files in etc](#the-files-in-etc) are there; a custom module gets a warning and its logins fail, and a custom security manager stops the broker. ([Security differences](../../COMPAT.md#security-differences))
 - **Interceptors** are Rust code, registered by an embedding application under the class names `broker.xml` gives; a name with none registered stops the broker. ([Interceptor differences](../../COMPAT.md#interceptor-differences))
-- **Connection routers** are not supported. ([MQTT](../../COMPAT.md#mqtt-differences), [AMQP](../../COMPAT.md#amqp-differences) and [OpenWire differences](../../COMPAT.md#openwire-differences))
 - **Password codecs.** Only `DefaultSensitiveStringCodec` is available.
 - **Web apps.** Other `.war` apps in `bootstrap.xml` are not served.
 

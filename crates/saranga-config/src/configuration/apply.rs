@@ -76,6 +76,13 @@ pub fn apply_property(
             Ok(())
         }
         ["clusterConfigurations", name, field] => cluster(config, name, field, value),
+        ["connectionRouters", name] if remove => {
+            config.connection_routers.retain(|r| r.name != *name);
+            Ok(())
+        }
+        ["connectionRouters", name, rest @ ..] => {
+            connection_router(&mut config.connection_routers, name, rest, value)
+        }
         ["jaasConfigs", realm] if remove => {
             config.jaas_configs.remove(realm);
             Ok(())
@@ -581,6 +588,110 @@ fn bridge(
         "pendingAckTimeout" => b.pending_ack_timeout = long(v)?,
         "clientId" => b.client_id = Some(v.to_owned()),
         other => return Err(format!("{other} is not a bridge property")),
+    }
+    Ok(())
+}
+
+/// `connectionRouters.<name>.<property>`: a router's bean properties, its
+/// cache and pool made when first set, its policy by its name (the
+/// `NamedPropertyConfiguration` converter) and then its properties.
+pub(crate) fn connection_router(
+    routers: &mut Vec<ConnectionRouterConfiguration>,
+    name: &str,
+    rest: &[&str],
+    v: &str,
+) -> std::result::Result<(), String> {
+    let i = match routers.iter().position(|r| r.name == name) {
+        Some(i) => i,
+        None => {
+            routers.push(ConnectionRouterConfiguration {
+                name: name.to_owned(),
+                key_type: "SOURCE_IP".to_owned(),
+                key_filter: None,
+                local_target_filter: None,
+                cache_configuration: None,
+                pool_configuration: None,
+                policy_configuration: None,
+            });
+            routers.len() - 1
+        }
+    };
+    let r = &mut routers[i];
+    match rest {
+        ["name"] => r.name = v.to_owned(),
+        ["keyType"] => {
+            const TYPES: [&str; 5] = [
+                "CLIENT_ID",
+                "SNI_HOST",
+                "SOURCE_IP",
+                "USER_NAME",
+                "ROLE_NAME",
+            ];
+            if !TYPES.contains(&v) {
+                return Err(format!(
+                    "No enum constant org.apache.activemq.artemis.core.server.routing.KeyType.{v}"
+                ));
+            }
+            r.key_type = v.to_owned();
+        }
+        ["keyFilter"] => r.key_filter = Some(v.to_owned()),
+        ["localTargetFilter"] => r.local_target_filter = Some(v.to_owned()),
+        ["policyConfiguration"] => {
+            r.policy_configuration = Some(NamedPropertyConfiguration {
+                name: v.to_owned(),
+                properties: JavaMap::default(),
+            })
+        }
+        ["policyConfiguration", "name"] => {
+            r.policy_configuration
+                .get_or_insert_with(|| NamedPropertyConfiguration {
+                    name: String::new(),
+                    properties: JavaMap::default(),
+                })
+                .name = v.to_owned()
+        }
+        ["policyConfiguration", "properties", key] => {
+            r.policy_configuration
+                .get_or_insert_with(|| NamedPropertyConfiguration {
+                    name: String::new(),
+                    properties: JavaMap::default(),
+                })
+                .properties
+                .put((*key).to_owned(), v.to_owned());
+        }
+        ["cacheConfiguration", field] => {
+            let c = r
+                .cache_configuration
+                .get_or_insert_with(CacheConfiguration::default);
+            match *field {
+                "persisted" => c.persisted = boolean(v),
+                "timeout" => c.timeout = int(v),
+                other => return Err(format!("{other} is not a cache property")),
+            }
+        }
+        ["poolConfiguration", field] => {
+            let p = r
+                .pool_configuration
+                .get_or_insert_with(PoolConfiguration::default);
+            match *field {
+                "username" => p.username = Some(v.to_owned()),
+                "password" => p.password = Some(v.to_owned()),
+                "localTargetEnabled" => p.local_target_enabled = boolean(v),
+                "clusterConnection" => p.cluster_connection = Some(v.to_owned()),
+                "staticConnectors" => p.static_connectors = Some(list(v)),
+                "discoveryGroupName" => p.discovery_group_name = Some(v.to_owned()),
+                "checkPeriod" => p.check_period = int(v),
+                "quorumSize" => p.quorum_size = int(v),
+                "quorumTimeout" => p.quorum_timeout = int(v),
+                other => return Err(format!("{other} is not a pool property")),
+            }
+        }
+        _ => {
+            return Err(format!(
+                "{} is not a connection router property",
+                rest.join(".")
+            ));
+        }
     }
     Ok(())
 }

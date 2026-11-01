@@ -495,6 +495,16 @@ fn apply_one(
             Ok(())
         }
         ["clusterConfigurations", name, field] => cluster_property(config, name, field, value),
+        ["connectionRouters", name] if remove => {
+            config.connection_routers.retain(|r| r.name != *name);
+            Ok(())
+        }
+        ["connectionRouters", name, rest @ ..] => crate::configuration::connection_router(
+            &mut config.connection_routers,
+            name,
+            rest,
+            value,
+        ),
         ["jaasConfigs", realm] if remove => {
             config.jaas_configs.retain(|(r, _)| r != realm);
             Ok(())

@@ -788,7 +788,7 @@ export interface components {
         ResourceSummary: {
             resource: string;
             /** @enum {string} */
-            type: "broker" | "address" | "queue" | "divert" | "acceptor" | "broadcastgroup" | "bridge" | "brokerconnection" | "clusterconnection" | "hawtio" | "platform";
+            type: "broker" | "address" | "queue" | "divert" | "acceptor" | "broadcastgroup" | "bridge" | "brokerconnection" | "clusterconnection" | "connectionrouter" | "hawtio" | "platform";
             objectName: string;
             className: string;
         };
@@ -827,7 +827,7 @@ export interface components {
         Resource: {
             resource: string;
             /** @enum {string} */
-            type: "broker" | "address" | "queue" | "divert" | "acceptor" | "broadcastgroup" | "bridge" | "brokerconnection" | "clusterconnection" | "hawtio" | "platform";
+            type: "broker" | "address" | "queue" | "divert" | "acceptor" | "broadcastgroup" | "bridge" | "brokerconnection" | "clusterconnection" | "connectionrouter" | "hawtio" | "platform";
             objectName: string;
             className: string;
             attributes: components["schemas"]["Attribute"][];

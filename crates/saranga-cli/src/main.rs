@@ -948,11 +948,6 @@ fn acceptor(
                 tracing::warn!("acceptor {name}: {param} was ignored: {why}");
             }
         }
-        if let Some(router) = a.param("router") {
-            tracing::warn!(
-                "acceptor {name}: router {router} was ignored: connection routers are not supported"
-            );
-        }
         let host = a.host.as_deref().unwrap_or("localhost");
         let port = a.port.unwrap_or(61616);
         // `ConfigurationHelper.getPasswordProperty`: `mask-password` and

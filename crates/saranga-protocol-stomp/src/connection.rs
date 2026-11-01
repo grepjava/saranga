@@ -616,7 +616,7 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
             Arc::new(c.info),
             c.acceptor.prefixes.clone(),
         )
-        .with_acceptor(&c.acceptor.name),
+        .with_acceptor(&c.acceptor),
     );
     let _registered = broker.registry().add(&client);
     let failed = client.clone();

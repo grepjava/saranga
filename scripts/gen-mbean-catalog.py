@@ -40,6 +40,7 @@ CONTROLS = [
     ("BRIDGE", "BridgeControl"),
     ("BROKER_CONNECTION", "BrokerConnectionControl"),
     ("CLUSTER_CONNECTION", "ClusterConnectionControl"),
+    ("CONNECTION_ROUTER", "ConnectionRouterControl"),
 ]
 
 # The classes implementing them, in artemis-server, and hawtio's

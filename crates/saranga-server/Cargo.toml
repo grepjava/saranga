@@ -20,6 +20,7 @@ saranga-paging = { path = "../saranga-paging" }
 saranga-security = { path = "../saranga-security" }
 saranga-transport = { path = "../saranga-transport" }
 regex = "1"
+fancy-regex = "0.16"
 socket2 = "0.6"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 thiserror = "2"

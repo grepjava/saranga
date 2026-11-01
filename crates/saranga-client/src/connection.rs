@@ -492,11 +492,14 @@ impl ConnInner {
             .drain()
             .map(|(_, c)| c)
             .collect();
+        // The factory hears first, as `callFailureListeners` comes before
+        // `cleanupBeforeFailover` unblocks the calls: a call unblocked by a
+        // failover finds it in progress.
+        if let Some(factory) = self.factory.upgrade() {
+            factory.connection_failed(self, err.clone());
+        }
         for channel in &channels {
             channel.return_blocking(&err);
-        }
-        if let Some(factory) = self.factory.upgrade() {
-            factory.connection_failed(self, err);
         }
     }
 
@@ -537,7 +540,15 @@ impl ConnInner {
         match packet {
             Packet::DisconnectMessage(p) => self.node_disconnected(node_id(p.node_id)),
             Packet::DisconnectMessageV2(p) => self.node_disconnected(node_id(p.node_id)),
-            Packet::DisconnectMessageV3(p) => self.node_disconnected(node_id(p.node_id)),
+            Packet::DisconnectMessageV3(p) => {
+                // `DisconnectReason.REDIRECT` and `REDIRECT_ON_CRITICAL_ERROR`:
+                // a connection router sends the client to its target.
+                if matches!(p.reason, 0 | 1) {
+                    self.redirected(node_id(p.node_id), p.target_connector.0.as_ref());
+                } else {
+                    self.node_disconnected(node_id(p.node_id));
+                }
+            }
             Packet::ClusterTopologyChangeMessage(p) => self.topology_changed(
                 &p.node_id.to_string_lossy(),
                 p.update.as_ref(),
@@ -584,6 +595,21 @@ impl ConnInner {
             factory.notify_node_down(&id, now_millis(), true);
         }
         self.fail(Error::disconnected());
+    }
+
+    /// `nodeDisconnected` with a redirect: the factory's current connector
+    /// becomes the target, then the connection fails, for a reconnection to
+    /// go there.
+    fn redirected(&self, node_id: Option<String>, target: Option<&TransportConfiguration>) {
+        if let Some(factory) = self.factory.upgrade() {
+            if let Some(id) = &node_id {
+                factory.notify_node_down(id, now_millis(), true);
+            }
+            if let Some(c) = target.and_then(Connector::from_transport) {
+                factory.state().current = Some(c);
+            }
+        }
+        self.fail(Error::redirected());
     }
 
     /// `notifyTopologyChange`, with the event's ID and group names.
@@ -1503,8 +1529,19 @@ impl Connection {
         config: crate::discovery::DiscoveryConfig,
         options: ConnectionOptions,
     ) -> Result<Self> {
+        Self::connect_discovery_as(config, options, "").await
+    }
+
+    /// [`Connection::connect_discovery`] for a locator with a node ID
+    /// (`ServerLocator.setNodeID`), as a cluster connection's is: the
+    /// group ignores that node's own broadcasts.
+    pub async fn connect_discovery_as(
+        config: crate::discovery::DiscoveryConfig,
+        options: ConnectionOptions,
+        node_id: &str,
+    ) -> Result<Self> {
         crate::discovery::ensure_discovery_enabled()?;
-        let group = crate::discovery::DiscoveryGroup::start(&config, "")?;
+        let group = crate::discovery::DiscoveryGroup::start(&config, node_id)?;
         let factory =
             Factory::with_discovery(options, Vec::new(), Some((group, config)), Arc::default());
         if let Err(e) = factory.connect_initial().await {
@@ -1581,23 +1618,34 @@ impl Connection {
     /// failover in progress.
     pub async fn create_session(&self, options: SessionOptions) -> Result<Session> {
         let factory = &self.factory;
-        factory.wait_failover().await;
-        let conn = factory.current().unwrap_or_else(|| factory.latest());
-        if let Some(e) = conn.failure() {
-            return Err(e);
-        }
         let name = uuid::to_string(&uuid::time_based());
-        let channel_id = factory.next_channel_id.fetch_add(1, Ordering::SeqCst);
-        let channel = Arc::new(Channel::new(channel_id));
-        conn.add_channel(channel.clone());
-        let server_version = match factory
-            .send_create_session(&conn, &name, channel_id, &options)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                conn.remove_channel(channel_id);
+        // `createSessionContext`: a request a failover unblocked, or a
+        // connection router redirected, is made again once the failover
+        // is done.
+        let (conn, channel, server_version) = loop {
+            factory.wait_failover().await;
+            let conn = factory.current().unwrap_or_else(|| factory.latest());
+            if let Some(e) = conn.failure() {
                 return Err(e);
+            }
+            let channel_id = factory.next_channel_id.fetch_add(1, Ordering::SeqCst);
+            let channel = Arc::new(Channel::new(channel_id));
+            conn.add_channel(channel.clone());
+            match factory
+                .send_create_session(&conn, &name, channel_id, &options)
+                .await
+            {
+                Ok(v) => break (conn, channel, v),
+                Err(e) => {
+                    conn.remove_channel(channel_id);
+                    let retry = matches!(
+                        e.kind(),
+                        Some(ErrorType::Unblocked | ErrorType::RoutingException)
+                    );
+                    if !retry || factory.is_closed() {
+                        return Err(e);
+                    }
+                }
             }
         };
         let session = SessionInner::new(

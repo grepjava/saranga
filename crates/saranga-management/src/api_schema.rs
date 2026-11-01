@@ -689,6 +689,7 @@ const RESOURCE_TYPES: &[&str] = &[
     "bridge",
     "brokerconnection",
     "clusterconnection",
+    "connectionrouter",
     "hawtio",
     "platform",
 ];

@@ -120,6 +120,9 @@ pub struct ClientConnection {
     prefixes: Vec<(String, RoutingType)>,
     /// The name of the acceptor the connection came in on.
     acceptor: Option<String>,
+    /// The acceptor's `router` parameter (`Connection.getRouter`): the
+    /// connection router that routes the connection.
+    router: Option<String>,
     sessions: Mutex<Vec<Arc<SessionEntry>>>,
     /// Management closed the connection (`fail`).
     failed: AtomicBool,
@@ -158,6 +161,7 @@ impl ClientConnection {
             subject: Mutex::default(),
             prefixes,
             acceptor: None,
+            router: None,
             sessions: Mutex::default(),
             failed: AtomicBool::new(false),
             cause: Mutex::default(),
@@ -167,10 +171,19 @@ impl ClientConnection {
         }
     }
 
-    /// Names the acceptor the connection came in on.
-    pub fn with_acceptor(mut self, name: &str) -> Self {
+    /// Names the acceptor the connection came in on, and the connection
+    /// router its `router` parameter names.
+    pub fn with_acceptor(mut self, acceptor: &crate::Acceptor) -> Self {
+        let name = &acceptor.name;
         self.acceptor = (!name.is_empty()).then(|| name.to_owned());
+        self.router = acceptor.params.get("router").cloned();
         self
+    }
+
+    /// The connection router of the acceptor the connection came in on
+    /// (`Connection.getRouter`).
+    pub fn router(&self) -> Option<&str> {
+        self.router.as_deref()
     }
 
     pub fn id(&self) -> &str {
@@ -704,6 +717,7 @@ impl ServerSession {
             security_domain: None,
             connection_id: None,
             sasl_principals: None,
+            sni_host: None,
         });
         let conn = Arc::new(ClientConnection::new(
             Transport::internal(name),

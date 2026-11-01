@@ -169,6 +169,7 @@ enum Resource {
     Bridge(Arc<crate::bridge::Bridge>),
     BrokerConnection(Arc<dyn crate::broker_connection::BrokerConnection>),
     ClusterConnection(Arc<crate::cluster::ClusterConnection>),
+    ConnectionRouter(Arc<crate::routing::ConnectionRouter>),
 }
 
 impl Resource {
@@ -185,6 +186,7 @@ impl Resource {
             Resource::Bridge(b) => (Control::Bridge, b.name().to_owned()),
             Resource::BrokerConnection(c) => (Control::BrokerConnection, c.name().to_owned()),
             Resource::ClusterConnection(c) => (Control::ClusterConnection, c.config().name.clone()),
+            Resource::ConnectionRouter(r) => (Control::ConnectionRouter, r.name().to_owned()),
         }
     }
 }
@@ -293,6 +295,9 @@ impl Management {
                 .cloned()
                 .map(Resource::ClusterConnection);
         }
+        if let Some(r) = name.strip_prefix("connectionrouter.") {
+            return broker.routers().get(r).map(Resource::ConnectionRouter);
+        }
         None
     }
 
@@ -324,6 +329,7 @@ impl Management {
             Resource::Bridge(b) => bridge_attribute(b, &upper),
             Resource::BrokerConnection(c) => Ok(broker_connection_attribute(c.as_ref(), &upper)),
             Resource::ClusterConnection(c) => Ok(cluster_connection_attribute(broker, c, &upper)),
+            Resource::ConnectionRouter(r) => Ok(router_attribute(r, &upper)),
         };
         match found {
             // A boolean attribute is read through its `is` method.
@@ -433,6 +439,7 @@ impl Management {
             Resource::Bridge(b) => invoke_bridge(b, &call).await,
             Resource::BrokerConnection(c) => invoke_broker_connection(c.as_ref(), &call),
             Resource::ClusterConnection(c) => invoke_cluster_connection(c, &call).await,
+            Resource::ConnectionRouter(r) => invoke_router(r, &call).await,
         };
         if let Some(outcome) = found {
             return outcome;
@@ -457,6 +464,7 @@ impl Management {
                         Resource::ClusterConnection(c) => {
                             Ok(cluster_connection_attribute(broker, c, attr))
                         }
+                        Resource::ConnectionRouter(r) => Ok(router_attribute(r, attr)),
                     };
                     match value {
                         Ok(Some(v)) => return Ok(v),
@@ -863,4 +871,54 @@ fn divert_attribute(d: &crate::postoffice::Divert, name: &str) -> Option<Json> {
         ),
         _ => return None,
     })
+}
+
+/// `ConnectionRouterControl`'s attributes.
+fn router_attribute(r: &crate::routing::ConnectionRouter, attr: &str) -> Option<Json> {
+    Some(match attr {
+        "LocalTargetFilter" => Json::from(r.local_target_filter()),
+        "TargetKeyFilter" => Json::from(r.resolver().key_filter()),
+        _ => return None,
+    })
+}
+
+/// `ConnectionRouterControl`'s operations. `getTarget`'s `CompositeData`
+/// only the Jolokia layer carries, as `browse`'s.
+async fn invoke_router(
+    r: &crate::routing::ConnectionRouter,
+    call: &args::Call<'_>,
+) -> Option<Outcome> {
+    use args::Ty::S;
+    if let Some(a) = call.is("getTargetAsJSON", &[S]) {
+        return Some(match a.s(0) {
+            Some(key) => Ok(r.target_json(&key).await),
+            None => Err("java.lang.NullPointerException".to_owned()),
+        });
+    }
+    if let Some(a) = call.is("setLocalTargetFilter", &[S]) {
+        return Some(
+            r.set_local_target_filter(a.s(0).as_deref())
+                .map(|()| Json::Null),
+        );
+    }
+    if let Some(a) = call.is("setTargetKeyFilter", &[S]) {
+        return Some(
+            r.resolver()
+                .set_key_filter(a.s(0).as_deref())
+                .map(|()| Json::Null),
+        );
+    }
+    None
+}
+
+/// `ConnectionRouterControl.getTarget`, for the Jolokia layer: the target
+/// as its `CompositeData` reads, or null.
+pub async fn router_target(broker: &Broker, router: &str, key: Option<&str>) -> Outcome {
+    let r = broker.routers().get(router).ok_or_else(|| {
+        format!("AMQ229067: Cannot find resource with name connectionrouter.{router}")
+    })?;
+    match key {
+        Some(key) => Ok(r.target_composite(key).await),
+        None => Err("java.lang.NullPointerException".to_owned()),
+    }
 }

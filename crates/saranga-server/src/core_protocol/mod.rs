@@ -388,6 +388,7 @@ pub async fn serve_connection(broker: Arc<Broker>, stream: TcpStream) {
         security_domain: None,
         connection_id: None,
         sasl_principals: None,
+        sni_host: None,
     };
     serve_stream(broker, stream, peer, local, info, Arc::default()).await;
 }
@@ -448,7 +449,7 @@ async fn serve<S>(
                 Arc::new(info),
                 acceptor.prefixes.clone(),
             )
-            .with_acceptor(&acceptor.name),
+            .with_acceptor(&acceptor),
         ),
         hornetq,
         broker: broker.clone(),
@@ -1188,6 +1189,19 @@ impl Connection {
                 }
             }
         };
+        // A connection router routes the connection, once authenticated.
+        if let Some(router) = self.shared.client.router().map(str::to_owned)
+            && let Err(e) = self.route(&router, &request, &authenticated).await
+        {
+            self.shared.send(
+                CHANNEL_SESSION,
+                ActiveMQExceptionMessage {
+                    code: e.kind.code(),
+                    message: (!e.message.is_empty()).then(|| e.message.as_str().into()),
+                },
+            );
+            return;
+        }
         let channel_id = request.channel_id;
         let (tx, rx) = mpsc::unbounded_channel();
         let session = CoreSession::new(
@@ -1223,6 +1237,79 @@ impl Connection {
                 server_version: version::CURRENT,
             },
         );
+    }
+
+    /// `ActiveMQRoutingHandler.route`: a client older than 2.18 cannot be
+    /// routed; a refused connection gets the router's exception; a
+    /// redirected one a `DISCONNECT_V3` naming the target, then the
+    /// exception.
+    async fn route(
+        &self,
+        router: &str,
+        request: &session::CreateSession,
+        authenticated: &Authenticated,
+    ) -> Result<(), BrokerError> {
+        if self.shared.version() < version::ARTEMIS_2_18_0 {
+            return Err(BrokerError::incompatible_client_server());
+        }
+        let client_id = self.shared.client.client_id();
+        let username = authenticated
+            .validated_user
+            .clone()
+            .or_else(|| request.username.clone());
+        let r = crate::routing::Request {
+            connection: &self.shared.client,
+            client_id: client_id.as_deref(),
+            username: username.as_deref(),
+            subject: authenticated.subject.as_deref(),
+        };
+        let failed = |e: BrokerError| {
+            tracing::error!("AMQ224018: Failed to create session: {e}");
+            e
+        };
+        match crate::routing::route(&self.broker, router, &r).await {
+            crate::routing::Routed::Local => Ok(()),
+            // `refuse` of a missing result: a NullPointerException, which
+            // the session fails with as an internal error.
+            crate::routing::Routed::NotFound(_) => Err(failed(BrokerError::new(
+                saranga_core_protocol::ErrorType::InternalError,
+                String::new(),
+            ))),
+            crate::routing::Routed::Refused { router, result } => match result {
+                crate::routing::TargetResult::RefusedUseAnother => Err(failed(BrokerError::new(
+                    saranga_core_protocol::ErrorType::RemoteDisconnect,
+                    format!("AMQ229240: Connection router {router} rejected the connection"),
+                ))),
+                _ => Err(BrokerError::new(
+                    saranga_core_protocol::ErrorType::RoutingException,
+                    format!("AMQ229238: Connection router {router} not ready"),
+                )),
+            },
+            crate::routing::Routed::Redirect { router, target } => {
+                // `disconnect(REDIRECT, nodeID, connector)`.
+                self.shared.send(
+                    CHANNEL_PING,
+                    DisconnectMessageV3 {
+                        node_id: Some(saranga_buffer::SimpleString::from(self.broker.node_id())),
+                        reason: DISCONNECT_REASON_REDIRECT,
+                        target_node_id: target
+                            .node_id()
+                            .map(|n| saranga_buffer::SimpleString::from(n.as_str())),
+                        target_connector: Flagged(target.connector().cloned()),
+                    },
+                );
+                let connector = target.connector().map_or_else(
+                    || "null".to_owned(),
+                    crate::replication::quorum::transport_to_string,
+                );
+                Err(BrokerError::new(
+                    saranga_core_protocol::ErrorType::RoutingException,
+                    format!(
+                        "AMQ229237: Connection router {router} redirected the connection to {connector}"
+                    ),
+                ))
+            }
+        }
     }
 
     /// `validateUser`. Login modules may block (LDAP), so they run off the
@@ -1324,6 +1411,10 @@ impl Connection {
 /// `DisconnectReason.SCALE_DOWN`: what `freeze` gives as the reason, with
 /// no target, whenever the broker stops.
 const DISCONNECT_REASON_SCALE_DOWN: i8 = 2;
+
+/// `DisconnectReason.REDIRECT`: a connection router sends the client to
+/// another broker.
+const DISCONNECT_REASON_REDIRECT: i8 = 0;
 
 /// `INITIAL_ACTIVEMQ_INCREMENTING_VERSION`: older clients are HornetQ's.
 const INITIAL_ACTIVEMQ_VERSION: i32 = 126;

@@ -37,6 +37,8 @@ pub struct Reload {
     pub acceptors: Option<crate::acceptors::AcceptorPlan>,
     /// `<broker-connections>`, for the protocols' services.
     pub broker_connections: Vec<cfg::AmqpBrokerConnectConfig>,
+    /// `<connection-routers>`.
+    pub connection_routers: Vec<cfg::configuration::ConnectionRouterConfiguration>,
 }
 
 impl Reload {
@@ -59,6 +61,7 @@ impl Reload {
             jaas_configs: saranga_security::manager::realms(&config.jaas_configs),
             acceptors: None,
             broker_connections: config.broker_connections.clone(),
+            connection_routers: config.connection_routers.clone(),
         })
     }
 }
@@ -107,8 +110,8 @@ impl Broker {
         self.bridges.set_targets(reload.bridge_targets);
         self.reload_bridges(&reload.bridges).await;
 
-        // Saranga has no connection routers to update.
         reloading("connection routers");
+        self.routers.update(self, &reload.connection_routers)?;
 
         reloading("protocol services");
         if let Some(plan) = reload.acceptors {

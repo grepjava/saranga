@@ -683,7 +683,7 @@ pub async fn serve(broker: Arc<Broker>, manager: Arc<Manager>, c: Accepted) {
             Arc::new(c.info),
             c.acceptor.prefixes.clone(),
         )
-        .with_acceptor(&c.acceptor.name),
+        .with_acceptor(&c.acceptor),
     );
     let _registered = broker.registry().add(&client);
     let failed = client.clone();
@@ -1295,12 +1295,15 @@ impl Connection {
     /// `processAddConnection`.
     async fn process_add_connection(&mut self, info: ConnectionInfo) -> Handled {
         match self.add_connection(info).await {
-            Ok(()) => Handled::Reply(None),
+            Ok(true) => Handled::Reply(None),
+            // Routed elsewhere: closed, with no reply.
+            Ok(false) => Handled::Close,
             Err(e) => Handled::Returned(e),
         }
     }
 
-    async fn add_connection(&mut self, mut info: ConnectionInfo) -> OwResult<()> {
+    /// False when a connection router sent the client elsewhere.
+    async fn add_connection(&mut self, mut info: ConnectionInfo) -> OwResult<bool> {
         // validateUser
         let authenticated = match self.broker.security().cloned() {
             None => Authenticated::default(),
@@ -1326,6 +1329,11 @@ impl Connection {
                 }
             }
         };
+        if let Some(router) = self.client.router().map(str::to_owned)
+            && !self.route(&router, &info, &authenticated).await?
+        {
+            return Ok(false);
+        }
         self.destroyed = false;
         self.out.destroyed.store(false, Ordering::SeqCst);
         let Some(client_id) = info.client_id.clone() else {
@@ -1386,7 +1394,55 @@ impl Connection {
             }
             self.out.send_command(&control);
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// `OpenWireRoutingHandler.route`: only a fault-tolerant (failover)
+    /// client may be routed. False when the connection is to close: refused
+    /// (with nothing sent) or redirected (with a `ConnectionControl` that
+    /// rebalances the client to the target).
+    async fn route(
+        &mut self,
+        router: &str,
+        info: &ConnectionInfo,
+        authenticated: &Authenticated,
+    ) -> OwResult<bool> {
+        use saranga_server::routing::{Request, Routed};
+        if !info.fault_tolerant {
+            return Err(OwError::new(
+                "java.lang.IllegalStateException",
+                "Client not fault tolerant",
+            ));
+        }
+        let username = authenticated
+            .validated_user
+            .clone()
+            .or_else(|| info.user_name.clone());
+        let routed = saranga_server::routing::route(
+            &self.broker,
+            router,
+            &Request {
+                connection: &self.client,
+                client_id: info.client_id.as_deref(),
+                username: username.as_deref(),
+                subject: authenticated.subject.as_deref(),
+            },
+        )
+        .await;
+        match routed {
+            Routed::Local => Ok(true),
+            Routed::NotFound(_) | Routed::Refused { .. } => Ok(false),
+            Routed::Redirect { target, .. } => {
+                let (host, port) = target.host_port();
+                let mut control = self.manager.new_connection_control();
+                if let DataStructure::ConnectionControl(c) = &mut control {
+                    c.connected_brokers = Some(format!("tcp://{host}:{port}"));
+                    c.rebalance_connection = true;
+                }
+                self.out.send_command(&control);
+                Ok(false)
+            }
+        }
     }
 
     fn new_session(&self, name: String, info: &ConnectionInfo) -> ServerSession {

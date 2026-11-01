@@ -122,7 +122,7 @@ fn static_connectors(n: Node<'_, '_>) -> Vec<String> {
 }
 
 /// `PasswordMaskingUtil.resolveMask(maskPassword, text, codec)`.
-fn resolve(config: &Configuration, name: &str, text: &str) -> Result<String> {
+fn resolve(config: &impl MaskSettings, name: &str, text: &str) -> Result<String> {
     mask::resolve_mask(config.mask_password(), text, Some(config.password_codec()))
         .map_err(|e| mask_error(name, text, e))
 }
@@ -1727,9 +1727,9 @@ fn parse_divert(e: Node<'_, '_>) -> Result<DivertConfiguration> {
 }
 
 /// `parseConnectionRouterConfiguration`.
-fn parse_connection_router(
+pub(crate) fn parse_connection_router(
     e: Node<'_, '_>,
-    config: &Configuration,
+    config: &impl MaskSettings,
 ) -> Result<ConnectionRouterConfiguration> {
     let s = Settings { core: e };
     let name = attribute_or_empty(e, "name");
@@ -1779,7 +1779,7 @@ fn parse_connection_router(
                 ];
                 if !POLICIES.contains(&name.as_str()) && name != "CONSISTENT_HASH_MODULO" {
                     return Err(ConfigError::Checked(format!(
-                        "java.lang.ClassNotFoundException: No ConnectionRouterPolicyFactory found for {name}"
+                        "java.lang.ClassNotFoundException: No PolicyFactory found for the policy {name}"
                     )));
                 }
                 router.policy_configuration = Some(NamedPropertyConfiguration {
@@ -1795,7 +1795,7 @@ fn parse_connection_router(
 }
 
 /// `parsePoolConfiguration`.
-fn parse_pool(e: Node<'_, '_>, config: &Configuration) -> Result<PoolConfiguration> {
+fn parse_pool(e: Node<'_, '_>, config: &impl MaskSettings) -> Result<PoolConfiguration> {
     let s = Settings { core: e };
     let mut p = PoolConfiguration {
         username: s.string("username"),

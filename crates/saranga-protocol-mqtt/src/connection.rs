@@ -1571,7 +1571,7 @@ pub async fn serve(
             Arc::new(c.info),
             c.acceptor.prefixes.clone(),
         )
-        .with_acceptor(&c.acceptor.name),
+        .with_acceptor(&c.acceptor),
     );
     let _registered = broker.registry().add(&client);
     let failed = client.clone();
@@ -2025,9 +2025,79 @@ impl Conn {
                 control: self.control.clone(),
             },
         );
+        // Routed after the login, which a role key needs.
+        if let Some(router) = self.client.router().map(str::to_owned) {
+            let user = authenticated
+                .validated_user
+                .clone()
+                .or_else(|| username.clone());
+            if !self
+                .route(&router, &client_id, user.as_deref(), &authenticated)
+                .await
+            {
+                return;
+            }
+        }
         self.calculate_keep_alive(&connect);
         self.connect(connect, client_id, username, password, authenticated)
             .await;
+    }
+
+    /// `MQTTRoutingHandler.route`: false when the connection was refused
+    /// (`USE_ANOTHER_SERVER` or `SERVER_UNAVAILABLE`) or redirected
+    /// (`USE_ANOTHER_SERVER` with the target as the server reference),
+    /// and closed.
+    async fn route(
+        &mut self,
+        router: &str,
+        client_id: &str,
+        username: Option<&str>,
+        authenticated: &Authenticated,
+    ) -> bool {
+        use saranga_server::routing::{Request, Routed, TargetResult};
+        let routed = saranga_server::routing::route(
+            &self.broker,
+            router,
+            &Request {
+                connection: &self.client,
+                client_id: Some(client_id),
+                username,
+                subject: authenticated.subject.as_deref(),
+            },
+        )
+        .await;
+        let (code, properties) = match routed {
+            Routed::Local => return true,
+            // `refuse` of a missing result: the packet's failure.
+            Routed::NotFound(_) => {
+                tracing::error!(
+                    "AMQ834002: Error processing MQTT packet; client ID: {client_id}; packet: CONNECT; Cannot invoke \"org.apache.activemq.artemis.core.server.routing.targets.TargetResult.getStatus()\" because the return value of \"org.apache.activemq.artemis.core.protocol.mqtt.MQTTRoutingContext.getResult()\" is null"
+                );
+                if self.v5() {
+                    self.send_disconnect(reason::IMPLEMENTATION_SPECIFIC_ERROR);
+                }
+                self.disconnect(true).await;
+                return false;
+            }
+            Routed::Refused { result, .. } => match result {
+                TargetResult::RefusedUseAnother => {
+                    (reason::USE_ANOTHER_SERVER, Properties::default())
+                }
+                _ => (reason::SERVER_UNAVAILABLE, Properties::default()),
+            },
+            Routed::Redirect { target, .. } => {
+                let (host, port) = target.host_port();
+                let mut properties = Properties::default();
+                properties.add(
+                    codec::prop::SERVER_REFERENCE,
+                    codec::Value::Str(format!("{host}:{port}")),
+                );
+                (reason::USE_ANOTHER_SERVER, properties)
+            }
+        };
+        self.send_connack(code, false, &properties);
+        self.disconnect(true).await;
+        false
     }
 
     async fn invalid_client_id(&mut self) {

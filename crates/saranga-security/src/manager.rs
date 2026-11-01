@@ -25,6 +25,9 @@ pub struct ConnectionInfo {
     /// (`ActiveMQProtonRemotingConnection.getSubject`): SCRAM's subject's,
     /// or GSSAPI's Kerberos principal.
     pub sasl_principals: Option<Arc<[Principal]>>,
+    /// The host name the client asked for in its TLS handshake's SNI
+    /// extension (`getSNIHostName`), if any.
+    pub sni_host: Option<String>,
 }
 
 impl ConnectionInfo {

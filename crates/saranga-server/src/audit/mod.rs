@@ -34,6 +34,8 @@ pub(crate) enum Control {
     Bridge,
     BrokerConnection,
     ClusterConnection,
+    /// `ConnectionRouterControlImpl`, which audits nothing.
+    ConnectionRouter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +343,11 @@ fn source(broker: &Broker, control: Control, name: &str) -> String {
             .bridges()
             .get(name)
             .map_or_else(|| "null".to_owned(), |b| b.describe()),
+        // ConnectionRouter has no toString either.
+        Control::ConnectionRouter => format!(
+            "org.apache.activemq.artemis.core.server.routing.ConnectionRouter@{:x}",
+            identity(("connection-router", name))
+        ),
         // AMQPBrokerConnection has no toString either.
         Control::BrokerConnection => format!(
             "org.apache.activemq.artemis.protocol.amqp.connect.AMQPBrokerConnection@{:x}",
@@ -834,11 +841,20 @@ pub(crate) fn session_created(
 /// `RemotingConnectionImpl.toString`, the transport connection named as
 /// Netty's (`NettyServerConnection@hash`), its hash taken from the ID.
 pub(crate) fn connection_string(c: &crate::session::ClientConnection, node_id: &str) -> String {
-    let hash = u32::from_str_radix(c.id(), 16).unwrap_or(0) & 0x7fff_ffff;
     format!(
-        "RemotingConnectionImpl [ID={}, clientID={}, nodeID={node_id}, transportConnection=org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@{hash:x}[ID={}, local= {}, remote={}]]",
+        "RemotingConnectionImpl [ID={}, clientID={}, nodeID={node_id}, transportConnection={}]",
         c.id(),
         c.client_id().as_deref().unwrap_or("null"),
+        transport_string(c)
+    )
+}
+
+/// `NettyConnection.toString`: the transport connection, its hash taken
+/// from the ID.
+pub(crate) fn transport_string(c: &crate::session::ClientConnection) -> String {
+    let hash = u32::from_str_radix(c.id(), 16).unwrap_or(0) & 0x7fff_ffff;
+    format!(
+        "org.apache.activemq.artemis.core.remoting.impl.netty.NettyServerConnection@{hash:x}[ID={}, local= {}, remote={}]",
         c.id(),
         c.local_address(),
         c.remote_address()

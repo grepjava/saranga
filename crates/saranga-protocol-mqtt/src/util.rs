@@ -64,6 +64,7 @@ pub mod reason {
     pub const BAD_USER_NAME_OR_PASSWORD: u8 = 0x86;
     pub const NOT_AUTHORIZED: u8 = 0x87;
     pub const SERVER_UNAVAILABLE: u8 = 0x88;
+    pub const USE_ANOTHER_SERVER: u8 = 0x9C;
     pub const BAD_AUTHENTICATION_METHOD: u8 = 0x8C;
     pub const SESSION_TAKEN_OVER: u8 = 0x8E;
     pub const PACKET_IDENTIFIER_NOT_FOUND: u8 = 0x92;

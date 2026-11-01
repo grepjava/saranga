@@ -34,7 +34,7 @@ fn features_not_acted_on_are_reported() {
     let c = parse(
         r##"<configuration><core>
               <security-settings><security-setting match="#"><permission type="send" roles="amq"/></security-setting></security-settings>
-              <connection-routers/>
+              <lock-coordinators/>
               <critical-analyzer>true</critical-analyzer>
               <remoting-incoming-interceptors><class-name>org.example.Check</class-name></remoting-incoming-interceptors>
               <connector-services><connector-service><factory-class>org.example.F</factory-class></connector-service></connector-services>
@@ -49,7 +49,7 @@ fn features_not_acted_on_are_reported() {
         })
         .collect();
     // The critical analyzer only watches the broker; nothing to report.
-    assert_eq!(names, ["connection-routers", "connector-services"]);
+    assert_eq!(names, ["lock-coordinators", "connector-services"]);
     assert_eq!(c.incoming_interceptors, ["org.example.Check"]);
 }
 

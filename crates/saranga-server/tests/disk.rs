@@ -97,6 +97,7 @@ async fn session_send(broker: &Arc<Broker>, address: &str) -> Result<(), String>
             security_domain: None,
             connection_id: None,
             sasl_principals: None,
+            sni_host: None,
         }),
         Vec::new(),
     ));

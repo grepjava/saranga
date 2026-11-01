@@ -906,7 +906,7 @@ pub async fn serve(
             Arc::new(c.info),
             c.acceptor.prefixes.clone(),
         )
-        .with_acceptor(&c.acceptor.name),
+        .with_acceptor(&c.acceptor),
     );
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     drive(
@@ -941,6 +941,7 @@ where
         security_domain: None,
         connection_id: None,
         sasl_principals: None,
+        sni_host: None,
     };
     let client = Arc::new(ClientConnection::new(
         Transport::socket("AMQP", "ActiveMQProtonRemotingConnection", peer, local),
@@ -1712,6 +1713,9 @@ impl Conn {
                 }
             }
         }
+        if let Some(router) = self.client.router().map(str::to_owned) {
+            self.route(&router, &open.container_id).await?;
+        }
         let sole = link::has(
             open.desired_capabilities.as_ref(),
             capability::SOLE_CONNECTION,
@@ -1736,6 +1740,67 @@ impl Conn {
         let o = self.local_open();
         self.send(0, Performative::Open(o));
         Ok(())
+    }
+
+    /// `AMQPRoutingHandler.route`: a refused connection is forced closed,
+    /// a redirected one closed with `amqp:connection:redirect` and the
+    /// target's host and port, each after an Open that says it failed.
+    async fn route(&mut self, router: &str, container_id: &str) -> Handled {
+        use saranga_server::routing::{Request, Routed, TargetResult};
+        let username = self
+            .auth
+            .validated_user
+            .clone()
+            .or_else(|| self.user.clone());
+        let subject = self.auth.subject.clone();
+        let routed = saranga_server::routing::route(
+            &self.broker,
+            router,
+            &Request {
+                connection: &self.client,
+                client_id: Some(container_id),
+                username: username.as_deref(),
+                subject: subject.as_deref(),
+            },
+        )
+        .await;
+        let error = match routed {
+            Routed::Local => return Ok(()),
+            // `refuse` of a missing result: the handler's failure.
+            Routed::NotFound(_) => {
+                let e = "Cannot invoke \"org.apache.activemq.artemis.core.server.routing.targets.TargetResult.getStatus()\" because the return value of \"org.apache.activemq.artemis.protocol.amqp.proton.AMQPRoutingContext.getResult()\" is null";
+                tracing::warn!("{e}");
+                return Err(Fatal::new(
+                    condition::INTERNAL_ERROR,
+                    format!("Unrecoverable error: {e}"),
+                ));
+            }
+            Routed::Refused { router, result } => Error::new(
+                condition::CONNECTION_FORCED,
+                Some(match result {
+                    TargetResult::RefusedUseAnother => {
+                        format!("Connection router {router} rejected this connection")
+                    }
+                    _ => format!("Connection router {router} is not ready"),
+                }),
+            ),
+            Routed::Redirect { router, target } => {
+                let (host, port) = target.host_port();
+                let mut info = Fields::default();
+                info.insert("network-host", Value::string(host.as_str()));
+                info.insert("port", Value::Int(port));
+                Error {
+                    condition: Symbol::from(condition::REDIRECT),
+                    description: Some(format!(
+                        "Connection router {router} redirected this connection to {host}:{port}"
+                    )),
+                    info: Some(info),
+                }
+            }
+        };
+        let mut props = Fields::default();
+        props.insert(CONNECTION_OPEN_FAILED, Value::Boolean(true));
+        Err(self.refuse(error, props))
     }
 
     /// An Open that refuses the connection, then the Close carrying why.

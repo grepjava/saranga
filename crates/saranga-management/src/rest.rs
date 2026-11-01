@@ -112,6 +112,7 @@ fn login(
         security_domain: None,
         connection_id: None,
         sasl_principals: None,
+        sni_host: None,
     });
     let authenticated = store
         .authenticate(Some(&user), Some(&password), &connection)

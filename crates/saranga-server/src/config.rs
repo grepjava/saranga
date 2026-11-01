@@ -459,6 +459,7 @@ impl BrokerConfig {
             federations: config.federations.clone(),
             federation_downstream_authorization: config.federation_downstream_authorization.clone(),
             bridge_targets: crate::bridge::Targets::from_file(config),
+            connection_routers: config.connection_routers.clone(),
             plugins: plugins(config)?,
             disk_monitor: crate::disk::MonitorConfig::new(
                 config.journal.max_disk_usage.unwrap_or(90),

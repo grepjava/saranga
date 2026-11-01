@@ -152,6 +152,7 @@ pub fn load_bindings(
     storage: &Storage,
     post_office: &PostOffice,
     users: Option<&crate::users::Users>,
+    key_values: &crate::routing::store::KeyValuePairs,
 ) -> Result<RecoveredBindings> {
     let records = storage
         .load_bindings()
@@ -220,6 +221,9 @@ pub fn load_bindings(
                         .map_err(|e| corrupt("user record", e))?;
                 }
             }
+            ids::KEY_VALUE_PAIR_RECORD => key_values
+                .load(r.id, &r.data)
+                .map_err(|e| corrupt("key-value pair", e))?,
             ids::SECURITY_SETTING_RECORD => {
                 let s = saranga_storage::codec::PersistedSecuritySetting::decode(&r.data)
                     .map_err(|e| corrupt("security setting", e))?;

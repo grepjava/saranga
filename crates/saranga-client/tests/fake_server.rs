@@ -630,7 +630,8 @@ async fn server_disconnect_unblocks_and_fails() {
         0,
         DisconnectMessageV3 {
             node_id: Some("node".into()),
-            reason: 0,
+            // SCALE_DOWN, as a stopping broker sends it.
+            reason: 2,
             ..Default::default()
         },
     );
@@ -647,6 +648,35 @@ async fn server_disconnect_unblocks_and_fails() {
     );
     let err = session.start().await.unwrap_err();
     assert_eq!(err.kind(), Some(ErrorType::Disconnected));
+}
+
+#[tokio::test]
+async fn redirect_fails_the_connection_as_redirected() {
+    let reply: Replier = Box::new(|ch, p| match p {
+        Packet::SessionQueueQueryMessage(_) => vec![],
+        _ => broker_reply(ch, p),
+    });
+    let (conn, mut fake) = setup_with(reply, ConnectionOptions::default()).await;
+    let session = open_session(&conn, &mut fake, SessionOptions::default()).await;
+    let s2 = session.clone();
+    let call = tokio::spawn(async move { s2.queue_query("q").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // A connection router's REDIRECT, naming its target: with no
+    // reconnection allowed, the connection fails as redirected.
+    fake.send(
+        0,
+        DisconnectMessageV3 {
+            node_id: Some("node".into()),
+            reason: 0,
+            target_node_id: Some("other".into()),
+            ..Default::default()
+        },
+    );
+    let err = call.await.unwrap().unwrap_err();
+    assert_eq!(err.kind(), Some(ErrorType::Unblocked), "{err}");
+    let failure = conn.failure().unwrap();
+    assert_eq!(failure.kind(), Some(ErrorType::RoutingException));
+    assert!(failure.to_string().contains("AMQ219066"), "{failure}");
 }
 
 #[tokio::test]

@@ -509,6 +509,7 @@ fn may_see_notifications(state: &ApiState, u: &User) -> bool {
             security_domain: None,
             connection_id: None,
             sasl_principals: None,
+            sni_host: None,
         }),
         subject: u.caller.subject.clone(),
         management: true,

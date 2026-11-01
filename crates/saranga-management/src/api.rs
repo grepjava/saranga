@@ -665,6 +665,7 @@ fn bean_named(resource: &str) -> Option<Bean> {
         "bridge" => Bean::Bridge(name),
         "brokerconnection" => Bean::BrokerConnection(name),
         "clusterconnection" => Bean::ClusterConnection(name),
+        "connectionrouter" => Bean::ConnectionRouter(name),
         _ => return None,
     })
 }
@@ -1356,6 +1357,7 @@ fn resource_type(bean: &Bean) -> &'static str {
         Bean::Bridge(_) => "bridge",
         Bean::BrokerConnection(_) => "brokerconnection",
         Bean::ClusterConnection(_) => "clusterconnection",
+        Bean::ConnectionRouter(_) => "connectionrouter",
         Bean::HawtioSecurity => "hawtio",
         Bean::Platform(_) => "platform",
     }

@@ -23,7 +23,8 @@ How Saranga treats an acceptor:
 - **Socket options.** `tcpNoDelay`, `tcpSendBufferSize` and `tcpReceiveBufferSize` are honoured. Netty's own options, such as `useEpoll`, are accepted and have no effect.
 - **Address prefixes.** `anycastPrefix` and `multicastPrefix` work on every protocol, as in Artemis.
 - **Handshake timeout.** `handshake-timeout` (10 seconds by default) closes a connection that does not send enough bytes to be recognised.
-- **Not supported.** The PROXY protocol, and Core over HTTP (`httpEnabled`). Connection routers are not supported either. Interceptors are Rust code that an embedding application registers (see [Operations](operations.md)).
+- **Connection routers.** `router` names the connection router that routes the acceptor's connections. See [Connection routers](clustering.md#connection-routers).
+- **Not supported.** The PROXY protocol, and Core over HTTP (`httpEnabled`). Interceptors are Rust code that an embedding application registers (see [Operations](operations.md)).
 
 The startup log names each acceptor and the protocols it serves, with Artemis's message:
 
@@ -152,7 +153,6 @@ The main differences:
 - Two Artemis bugs are not copied: retained messages reach MQTT 5 wildcard subscriptions, and a clean start deletes the client's packet-ID records.
 - A second CONNECT on a connection closes it.
 - The connection TTL closes a silent connection as soon as it runs out.
-- Connection routers are not supported.
 
 See [COMPAT.md](../../COMPAT.md#mqtt-differences).
 

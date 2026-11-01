@@ -41,6 +41,7 @@ pub mod reload;
 pub mod remote_binding;
 pub mod replay;
 pub mod replication;
+pub mod routing;
 pub mod session;
 pub mod settings;
 mod slow_consumers;
@@ -297,6 +298,8 @@ pub struct BrokerConfig {
     /// are held back while the stores' disks are full. Only with
     /// persistence.
     pub disk_monitor: Option<disk::MonitorConfig>,
+    /// `<connection-routers>`.
+    pub connection_routers: Vec<saranga_config::configuration::ConnectionRouterConfiguration>,
 }
 
 impl BrokerConfig {
@@ -349,6 +352,7 @@ impl BrokerConfig {
             bridge_targets: bridge::Targets::default(),
             plugins: Vec::new(),
             disk_monitor: None,
+            connection_routers: Vec::new(),
         }
     }
 }
@@ -559,6 +563,10 @@ pub struct Broker {
     registry: Arc<registry::Registry>,
     /// The basic security manager's users.
     users: Option<Arc<users::Users>>,
+    /// The connection routers.
+    routers: routing::RouterManager,
+    /// The bindings journal's key-value pairs, for the routers' caches.
+    key_values: Arc<routing::store::KeyValuePairs>,
     /// The records of the security settings management added, by match
     /// (`mapPersistedSecuritySettings`).
     security_records: Mutex<HashMap<String, i64>>,
@@ -738,8 +746,11 @@ impl Broker {
         if let Some(g) = &config.grouping_handler {
             post_office.set_grouping(grouping::GroupingHandler::new(g.clone(), &post_office));
         }
+        let key_values = Arc::new(routing::store::KeyValuePairs::default());
         let recovered = match &storage {
-            Some(s) => recovery::load_bindings(s, &post_office, config.users.as_deref())?,
+            Some(s) => {
+                recovery::load_bindings(s, &post_office, config.users.as_deref(), &key_values)?
+            }
             None => Default::default(),
         };
         reload::deploy_addresses(&post_office, &config.addresses);
@@ -786,6 +797,9 @@ impl Broker {
             paging.set_loaded();
         }
         reload::undeploy_not_configured(&post_office, &config.addresses);
+        if let Some(s) = &storage {
+            key_values.attach(s.clone());
+        }
         // ActiveMQBasicSecurityManager.completeInit.
         if let (Some(users), Some(s)) = (&config.users, &storage) {
             users.attach(s.clone());
@@ -891,6 +905,8 @@ impl Broker {
             config_exported: Mutex::new(None),
             registry,
             users: config.users.clone(),
+            routers: routing::RouterManager::default(),
+            key_values,
             security_records: Mutex::default(),
             stopped: Default::default(),
             services_stopped: Default::default(),
@@ -972,6 +988,11 @@ impl Broker {
                 }
             }));
         }
+        // `ConnectionRouterManager.deploy`.
+        broker
+            .routers
+            .deploy(&broker, &config.connection_routers)
+            .map_err(BrokerError::illegal_state)?;
         // loadProtocolServices: each protocol sets itself up once the
         // journals are loaded.
         for p in broker.protocols.clone() {
@@ -1028,6 +1049,8 @@ impl Broker {
             &config.federations,
             &config.federation_downstream_authorization,
         );
+        // `ConnectionRouterManager.start`, before the protocols' services.
+        broker.routers.start().map_err(BrokerError::illegal_state)?;
         // startProtocolServices: AMQP's broker connections.
         for p in broker.protocols.clone() {
             p.start_services(&broker);
@@ -1204,6 +1227,7 @@ impl Broker {
         {
             return;
         }
+        self.routers.stop();
         if let Some(g) = self.post_office.grouping() {
             g.stop();
         }
@@ -1385,6 +1409,16 @@ impl Broker {
     /// The security store, whether or not security is enabled.
     pub fn security_store(&self) -> Option<&Arc<saranga_security::SecurityStore>> {
         self.security.as_ref()
+    }
+
+    /// The connection routers (`getConnectionRouterManager`).
+    pub fn routers(&self) -> &routing::RouterManager {
+        &self.routers
+    }
+
+    /// The bindings journal's key-value pairs.
+    pub fn key_values(&self) -> &Arc<routing::store::KeyValuePairs> {
+        &self.key_values
     }
 
     /// The basic security manager's users, when it is the one in use.
@@ -1617,6 +1651,7 @@ impl Broker {
                 security_domain: acceptor.security_domain.clone(),
                 connection_id: None,
                 sasl_principals: None,
+                sni_host: None,
             };
             let broker = self.clone();
             let acceptor = acceptor.clone();
@@ -1640,6 +1675,7 @@ impl Broker {
                                 stream.get_ref().1.peer_certificates(),
                             )
                             .map(Arc::from);
+                            info.sni_host = stream.get_ref().1.server_name().map(str::to_owned);
                             Box::new(stream)
                         }
                     };

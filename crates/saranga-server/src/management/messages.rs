@@ -402,6 +402,7 @@ async fn send_as(
         security_domain: None,
         connection_id: None,
         sasl_principals: None,
+        sni_host: None,
     });
     // With no user and no password, the call's own subject
     // (`SecurityStoreImpl.authenticate` on a `ManagementRemotingConnection`).

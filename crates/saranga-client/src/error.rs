@@ -89,6 +89,14 @@ impl Error {
         )
     }
 
+    /// `ActiveMQClientMessageBundle.redirected`.
+    pub(crate) fn redirected() -> Self {
+        Self::amq(
+            ErrorType::RoutingException,
+            "AMQ219066: The connection was redirected",
+        )
+    }
+
     pub(crate) fn disconnected() -> Self {
         Self::amq(
             ErrorType::Disconnected,

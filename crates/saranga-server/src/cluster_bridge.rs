@@ -813,7 +813,15 @@ impl ClusterConnection {
                 return;
             }
             let attempt = match &self.config().discovery {
-                Some(d) => Connection::connect_discovery(d.clone(), self.locator_options()).await,
+                // `setNodeID`: this node's own broadcasts are not heard.
+                Some(d) => {
+                    Connection::connect_discovery_as(
+                        d.clone(),
+                        self.locator_options(),
+                        self.node_id(),
+                    )
+                    .await
+                }
                 None => {
                     let targets: Vec<Connector> = self
                         .config()

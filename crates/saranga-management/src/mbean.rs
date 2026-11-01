@@ -332,6 +332,7 @@ pub enum Bean {
     Bridge(String),
     BrokerConnection(String),
     ClusterConnection(String),
+    ConnectionRouter(String),
     /// hawtio's permission checks (`HawtioSecurityControl`), which
     /// `artemis run` registers for the console.
     HawtioSecurity,
@@ -354,6 +355,7 @@ impl Bean {
             Self::Bridge(_) => &crate::catalog::BRIDGE,
             Self::BrokerConnection(_) => &crate::catalog::BROKER_CONNECTION,
             Self::ClusterConnection(_) => &crate::catalog::CLUSTER_CONNECTION,
+            Self::ConnectionRouter(_) => &crate::catalog::CONNECTION_ROUTER,
             Self::HawtioSecurity => &HAWTIO_SECURITY_CONTROL,
             Self::Platform(p) => p.control(),
         }
@@ -371,6 +373,7 @@ impl Bean {
             Self::Bridge(b) => format!("bridge.{b}"),
             Self::BrokerConnection(c) => format!("brokerconnection.{c}"),
             Self::ClusterConnection(c) => format!("clusterconnection.{c}"),
+            Self::ConnectionRouter(r) => format!("connectionrouter.{r}"),
             Self::HawtioSecurity => "hawtio.security".to_owned(),
             Self::Platform(p) => format!("java.lang.{}", p.type_name()),
         }
@@ -399,6 +402,9 @@ impl Bean {
             }
             Self::ClusterConnection(_) => {
                 "org.apache.activemq.artemis.core.management.impl.ClusterConnectionControlImpl"
+            }
+            Self::ConnectionRouter(_) => {
+                "org.apache.activemq.artemis.core.management.impl.ConnectionRouterControlImpl"
             }
             Self::HawtioSecurity => {
                 "org.apache.activemq.artemis.core.server.management.impl.HawtioSecurityControlImpl"
@@ -449,6 +455,14 @@ pub fn registered(
     for b in broker.bridges().names() {
         if let Some(n) = name(format!("{base},component=bridges,name={}", quote(&b))) {
             out.push((n, Bean::Bridge(b)));
+        }
+    }
+    for r in broker.routers().names() {
+        if let Some(n) = name(format!(
+            "{base},component=connection-routers,name={}",
+            quote(&r)
+        )) {
+            out.push((n, Bean::ConnectionRouter(r)));
         }
     }
     for c in broker.broker_connections() {

@@ -242,6 +242,41 @@ Differences, in short:
 
 The full lists of AMQP federation, bridge and mirror differences are under [Configuration differences](../../COMPAT.md#configuration-differences).
 
+## Connection routers
+
+A connection router decides, for each client that connects to an acceptor naming it, whether the client stays on this broker, goes to another one, or is refused. The decision is made once the client has logged in, by a key: its client ID, user name, role, source address or TLS SNI host (`key-type`). Routers work as Artemis's do, with the same configuration and management, so its [connection router documentation](https://activemq.apache.org/components/artemis/documentation/latest/connection-routers.html) applies.
+
+```xml
+<acceptors>
+   <acceptor name="routed">tcp://0.0.0.0:61617?router=by-client</acceptor>
+</acceptors>
+
+<connection-routers>
+   <connection-router name="by-client">
+      <key-type>CLIENT_ID</key-type>
+      <key-filter>^.{3}</key-filter>
+      <local-target-filter>NULL|eu-.*</local-target-filter>
+      <cache><persisted>true</persisted><timeout>600000</timeout></cache>
+      <policy name="CONSISTENT_HASH"/>
+      <pool>
+         <username>router</username>
+         <password>secret</password>
+         <static-connectors><connector-ref>node2</connector-ref><connector-ref>node3</connector-ref></static-connectors>
+      </pool>
+   </connection-router>
+</connection-routers>
+```
+
+- **Keys.** `key-filter` keeps the first match of a regular expression in the key, and a key it does not match, or a missing one, is `NULL`. A key that `local-target-filter` matches whole stays on this broker. Expressions are read as Java's are, lookarounds and backreferences included.
+- **Pools.** The targets are the `static-connectors`, the brokers a `discovery-group-ref` hears of, or the other members of a `cluster-connection`; `local-target-enabled` adds this broker. Each target is checked every `check-period`: the router logs in to it with the pool's `username` and `password` and asks its management whether it is active. While fewer than `quorum-size` targets are ready, the router waits up to `quorum-timeout` and then refuses.
+- **Policies.** `FIRST_ELEMENT`, `ROUND_ROBIN`, `CONSISTENT_HASH`, `LEAST_CONNECTIONS` (by each target's connection count, below `CONNECTION_COUNT_THRESHOLD` counted as none) and `CONSISTENT_HASH_MODULO`, which turns the key into its bucket out of `MODULO` and picks no target, for sharding with `local-target-filter`.
+- **Cache.** The target a key went to is kept, for `timeout` milliseconds after its last use (for ever with 0). With `persisted`, the bindings journal keeps it across restarts, in the records Artemis writes.
+- **Redirection.** Core clients get a disconnect naming the target and reconnect to it, which needs `reconnectAttempts`. AMQP clients get `amqp:connection:redirect` with the target's host and port, which Qpid JMS follows with `failover:`. MQTT 5 clients get a CONNACK with `Use another server` and the target as the server reference. OpenWire clients connected through `failover:` are rebalanced to it; others are refused. STOMP connections are not routed. A refused client gets the protocol's refusal: an error naming the router, `amqp:connection:forced`, a CONNACK with `Use another server` or `Server unavailable`.
+- **Management.** Each router has a `ConnectionRouterControl` (`component=connection-routers`, resource `connectionrouter.<name>`): `getTargetAsJSON` and `getTarget` answer where a key would go, and the `LocalTargetFilter` and `TargetKeyFilter` attributes can be changed. Clients of protocols that cannot be redirected ask it before they connect.
+- **Reload.** A router added or changed in `broker.xml` is deployed again on a configuration reload, and one removed is stopped. The `connectionRouters.<name>.*` broker properties set them as well.
+
+`saranga-client`, the CLI's client, follows a Core redirect as the Java client does. See [Connection router differences](../../COMPAT.md#connection-router-differences).
+
 ## Mixed Java and Saranga clusters
 
 Java and Saranga nodes can be in one cluster. The interop suites run a three-node cluster with every mix of Artemis 2.57.0 and Saranga nodes: the Artemis JMS client sees every node in the topology, messages are shared out and redistributed, groups keep their node, transacted producers and consumers move every message once, and a node that stops and returns is bridged to again. Each two-node suite (discovery, core bridges, cluster connections, grouping, core federation, AMQP broker connections, AMQP federation, AMQP bridges and mirroring) passes in all four Artemis/Saranga pairings.

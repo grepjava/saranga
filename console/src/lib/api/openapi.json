@@ -3365,6 +3365,7 @@
 							"bridge",
 							"brokerconnection",
 							"clusterconnection",
+							"connectionrouter",
 							"hawtio",
 							"platform"
 						]
@@ -3525,6 +3526,7 @@
 							"bridge",
 							"brokerconnection",
 							"clusterconnection",
+							"connectionrouter",
 							"hawtio",
 							"platform"
 						]

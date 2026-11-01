@@ -41,6 +41,7 @@ impl Caller {
             Bean::Bridge(n) => ("BridgeControlImpl", n.as_str()),
             Bean::BrokerConnection(n) => ("BrokerConnectionControlImpl", n.as_str()),
             Bean::ClusterConnection(n) => ("ClusterConnectionControlImpl", n.as_str()),
+            Bean::ConnectionRouter(n) => ("ConnectionRouterControlImpl", n.as_str()),
             // Its getMBeanInfo is audited from another package; not yet.
             Bean::HawtioSecurity | Bean::Platform(_) => return,
         };
@@ -1006,6 +1007,13 @@ impl Agent {
                     management
                         .browse(&broker, q, page, filter, caller.management())
                         .await
+                }
+                (Bean::ConnectionRouter(r), "getTarget") => {
+                    let key = match params.first() {
+                        Some(Json::String(k)) => Some(k.as_str()),
+                        _ => None,
+                    };
+                    saranga_server::management::router_target(&broker, r, key).await
                 }
                 _ => {
                     management

@@ -844,6 +844,8 @@ pub struct BrokerConfig {
     /// `<discovery-groups>`, in document order; a name used again is
     /// skipped (`AMQ222019`).
     pub discovery_groups: Vec<DiscoveryGroupConfig>,
+    /// `<connection-routers>`, in document order.
+    pub connection_routers: Vec<crate::configuration::ConnectionRouterConfiguration>,
     /// Match string and settings, in document order.
     pub address_settings: Vec<(String, AddressSettings)>,
     pub addresses: Vec<AddressConfig>,
@@ -1151,6 +1153,7 @@ impl Default for BrokerConfig {
             cluster_connections: Vec::new(),
             broadcast_groups: Vec::new(),
             discovery_groups: Vec::new(),
+            connection_routers: Vec::new(),
             address_settings: Vec::new(),
             addresses: Vec::new(),
             queues: Vec::new(),

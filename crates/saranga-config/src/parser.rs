@@ -508,13 +508,16 @@ fn parse_core(
     parse_federations(core, config)?;
     parse_broker_connections(core, config)?;
     parse_diverts(core, config, warnings)?;
+    for node in all(core, "connection-router") {
+        let router = crate::configuration::parse_connection_router(node, config)?;
+        config.connection_routers.push(router);
+    }
     parse_wildcards(core, config, warnings)?;
     Ok(())
 }
 
 /// `<core>` children Saranga reads but does not act on, and why.
 const NOT_ACTED_ON: &[(&str, &str)] = &[
-    ("connection-routers", "connection routers are not supported"),
     ("lock-coordinators", "lock coordinators are not supported"),
     (
         "metrics",
