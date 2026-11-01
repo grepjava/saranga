@@ -1,7 +1,9 @@
 // The GSSAPI suite's KDC: Apache Kerby's SimpleKdcServer for the realm
 // EXAMPLE.COM over TCP, with the broker's service principals in one keytab,
-// the clients' in another, and a user with a password. Writes krb5.conf and
-// then "ready" into its directory, and serves until killed.
+// the clients' in another, a user with a password, and the directory's
+// ldap/localhost with the password Directory.java derives its keys from.
+// Writes krb5.conf and then "ready" into its directory, and serves until
+// killed.
 //
 //   java -cp '<artemis>/lib/*:<kerby jars>' Kdc.java dir port
 //
@@ -17,7 +19,7 @@ public class Kdc {
       int port = Integer.parseInt(args[1]);
       dir.mkdirs();
       File conf = new File(dir, "krb5.conf");
-      Files.writeString(conf.toPath(), """
+      String text = """
             [libdefaults]
                 default_realm = EXAMPLE.COM
                 udp_preference_limit = 1
@@ -34,7 +36,7 @@ public class Kdc {
             [domain_realm]
                 localhost = EXAMPLE.COM
                 otherhost = EXAMPLE.COM
-            """.formatted(port));
+            """.formatted(port);
 
       SimpleKdcServer kdc = new SimpleKdcServer();
       kdc.setWorkDir(dir);
@@ -44,9 +46,13 @@ public class Kdc {
       kdc.setAllowUdp(false);
       kdc.init();
       kdc.start();
+      // After init, which writes a krb5.conf of its own there.
+      Files.writeString(conf.toPath(), text);
       kdc.createAndExportPrincipals(new File(dir, "service.keytab"), "amqp/localhost", "amqp/otherhost");
-      kdc.createAndExportPrincipals(new File(dir, "client.keytab"), "client", "norole");
+      kdc.createAndExportPrincipals(new File(dir, "client.keytab"), "client", "norole", "ldapclient", "ldapother", "ldapsclient");
       kdc.createPrincipal("pwuser", "pw-secret");
+      // The directory derives its keys from the same password.
+      kdc.createPrincipal("ldap/localhost", "ldap-service-secret");
       Files.writeString(new File(dir, "ready").toPath(), "ready\n");
       Thread.currentThread().join();
    }

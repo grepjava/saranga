@@ -832,6 +832,9 @@ impl Broker {
             .iter()
             .map(|g| discovery::BroadcastGroup::new(g.clone(), &node_id, &post_office))
             .collect();
+        if let Some(login) = &config.login_config {
+            saranga_security::jaas::install_jvm_configuration(login);
+        }
         let broker = Arc::new(Self {
             broadcast_groups,
             bridges: bridge::Bridges::new(config.bridge_targets.clone()),

@@ -10,7 +10,8 @@
 //!
 //! LDAP calls block, so each login runs its directory work on a thread of
 //! its own (the module may be called from inside the broker's runtime).
-//! GSSAPI binds are not supported.
+//! `authentication=GSSAPI` binds as the broker's Kerberos identity (see
+//! `ldap_sasl`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,13 +51,13 @@ const CONFIG_KEYS: &[&str] = &[
 
 /// A failure, named after the Java exception that would be its root cause,
 /// which `noCacheExceptions` lists.
-struct DirError {
+pub(crate) struct DirError {
     java_class: &'static str,
     message: String,
 }
 
 impl DirError {
-    fn from_ldap(e: LdapError) -> Self {
+    pub(crate) fn from_ldap(e: LdapError) -> Self {
         let java_class = match &e {
             LdapError::Io { source } => match source.kind() {
                 std::io::ErrorKind::ConnectionRefused => "java.net.ConnectException",
@@ -76,11 +77,47 @@ impl DirError {
         }
     }
 
-    fn naming(message: impl Into<String>) -> Self {
+    pub(crate) fn naming(message: impl Into<String>) -> Self {
         Self {
             java_class: "javax.naming.NamingException",
             message: message.into(),
         }
+    }
+
+    pub(crate) fn authentication(message: impl Into<String>) -> Self {
+        Self {
+            java_class: "javax.naming.AuthenticationException",
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn communication(message: impl Into<String>) -> Self {
+        Self {
+            java_class: "javax.naming.CommunicationException",
+            message: message.into(),
+        }
+    }
+
+    /// A result code other than success, as JNDI maps it.
+    pub(crate) fn ldap_result(code: u32, message: &str) -> Self {
+        Self {
+            java_class: if code == 49 {
+                "javax.naming.AuthenticationException"
+            } else {
+                "javax.naming.NamingException"
+            },
+            message: format!("[LDAP: error code {code} - {message}]"),
+        }
+    }
+
+    fn is_communication(&self) -> bool {
+        matches!(
+            self.java_class,
+            "javax.naming.CommunicationException"
+                | "java.net.ConnectException"
+                | "java.net.SocketTimeoutException"
+                | "java.net.UnknownHostException"
+        )
     }
 }
 
@@ -98,12 +135,12 @@ impl From<DirError> for Failure {
 }
 
 #[derive(Clone)]
-struct Options {
+pub(crate) struct Options {
     options: Vec<(String, String)>,
 }
 
 impl Options {
-    fn get(&self, key: &str) -> Option<&str> {
+    pub(crate) fn get(&self, key: &str) -> Option<&str> {
         self.options
             .iter()
             .find(|(k, _)| k == key)
@@ -111,7 +148,7 @@ impl Options {
     }
 
     /// `isLoginPropertySet`: present and not empty.
-    fn set(&self, key: &str) -> Option<&str> {
+    pub(crate) fn set(&self, key: &str) -> Option<&str> {
         self.get(key).filter(|v| !v.is_empty())
     }
 
@@ -120,7 +157,7 @@ impl Options {
             .is_some_and(|v| v.eq_ignore_ascii_case("true"))
     }
 
-    fn millis(&self, key: &str) -> Option<Duration> {
+    pub(crate) fn millis(&self, key: &str) -> Option<Duration> {
         self.set(key)
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&ms| ms > 0)
@@ -269,11 +306,15 @@ impl LoginModule for LdapLoginModule {
 /// `openContext`: connects and binds as the configured connection user.
 fn open(o: &Options) -> Result<LdapConn, Failure> {
     let opening = |e: DirError| Failure::Dir("Error opening LDAP connection".into(), e);
-    if o.get("authentication")
-        .is_some_and(|a| a.eq_ignore_ascii_case("GSSAPI"))
-    {
-        return Err(opening(DirError::naming("GSSAPI is not supported")));
-    }
+    let gssapi = o
+        .get("authentication")
+        .is_some_and(|a| a.eq_ignore_ascii_case("GSSAPI"));
+    // Logged in again for each connection, as `openContext` does.
+    let identity = if gssapi {
+        Some(super::ldap_sasl::identity(o).map_err(|e| Failure::Login(e.message))?)
+    } else {
+        None
+    };
     let url = o
         .set("connectionURL")
         .ok_or_else(|| opening(DirError::naming("connectionURL is not set")))?;
@@ -289,6 +330,14 @@ fn open(o: &Options) -> Result<LdapConn, Failure> {
         } else {
             url.to_owned()
         };
+        if let Some(identity) = &identity {
+            match super::ldap_sasl::connect(&url, o, identity.as_ref(), || tls_config(o)) {
+                Ok(conn) => return Ok(conn),
+                Err(e) if e.is_communication() => last = Some(e),
+                Err(e) => return Err(opening(e)),
+            }
+            continue;
+        }
         let mut settings = LdapConnSettings::new();
         if let Some(t) = o.millis("connectionTimeout") {
             settings = settings.set_conn_timeout(t);
@@ -332,6 +381,94 @@ fn bind_service(conn: &mut LdapConn, o: &Options) -> Result<(), DirError> {
         .and_then(|r| r.success())
         .map(|_| ())
         .map_err(DirError::from_ldap)
+}
+
+/// The TLS configuration of a connection made here (GSSAPI's): the
+/// module's truststore, every certificate with `trustAll`, else the
+/// platform's trusted certificates, as ldap3 trusts them by default.
+fn tls_config(o: &Options) -> Result<Arc<rustls::ClientConfig>, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?;
+    if o.flag("trustAll") {
+        return Ok(Arc::new(
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(TrustAll(provider)))
+                .with_no_client_auth(),
+        ));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    match o.set("truststorePath") {
+        Some(path) => {
+            let store = crate::keystore::KeyStore::load(
+                o.get("truststoreType").unwrap_or("JKS"),
+                Some(path),
+                o.get("truststorePassword"),
+                None,
+            )
+            .map_err(|e| format!("truststore: {e}"))?;
+            for c in store.trusted_certificates() {
+                roots.add(c).map_err(|e| format!("truststore: {e}"))?;
+            }
+        }
+        None => {
+            roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+        }
+    }
+    Ok(Arc::new(
+        builder.with_root_certificates(roots).with_no_client_auth(),
+    ))
+}
+
+/// `trustAll`: any certificate, signatures still checked.
+#[derive(Debug)]
+struct TrustAll(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for TrustAll {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 /// `LDAPLoginSSLSocketFactory`: the module's truststore, or the system's.

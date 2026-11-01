@@ -14,6 +14,7 @@ mod http;
 mod krb5;
 mod kubernetes;
 mod ldap;
+mod ldap_sasl;
 mod oidc;
 mod principal;
 mod principal_conversion;
@@ -339,6 +340,32 @@ impl ModuleFactory {
                     | "PrincipalConversionLoginModule"
             )
         )
+    }
+}
+
+/// The JVM's JAAS configuration (`Configuration.getConfiguration()`), for
+/// the logins a module makes itself through `new LoginContext(scope)`.
+static JVM_CONFIGURATION: std::sync::RwLock<Option<std::sync::Weak<crate::JaasSecurityManager>>> =
+    std::sync::RwLock::new(None);
+
+/// Makes `config` the JVM's JAAS configuration (the broker's
+/// `BrokerConfig::login_config`).
+pub fn install_jvm_configuration(config: &Arc<crate::JaasSecurityManager>) {
+    *JVM_CONFIGURATION.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(config));
+}
+
+/// `new LoginContext(realm).login()` through the JVM's configuration.
+pub(crate) fn jvm_login(realm: &str, callbacks: &Callbacks<'_>) -> Result<Subject, LoginError> {
+    let config = JVM_CONFIGURATION
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade);
+    match config {
+        Some(c) => c.login(realm, callbacks),
+        None => Err(LoginError::new(format!(
+            "No LoginModules configured for {realm}"
+        ))),
     }
 }
 
