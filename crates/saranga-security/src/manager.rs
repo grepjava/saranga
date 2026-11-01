@@ -286,6 +286,7 @@ impl SecurityManager for JaasSecurityManager {
             remote_address: Some(&connection.remote_address),
             peer_principals: peer.as_deref(),
             scram: None,
+            no_handler: false,
         };
         match jaas::login(&entries, &self.modules, &callbacks) {
             Ok(subject) => Ok(Some(subject)),

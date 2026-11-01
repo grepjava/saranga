@@ -131,7 +131,6 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
     - An `amqp-value` body of a type other than null, string, binary, list or map becomes a BytesMessage holding the encoded section. Artemis copies the wrong bytes there (ARTEMIS-6316).
     - An application property or stream item that Core has no type for is left out. Artemis fails the whole conversion.
 - **Not supported:**
-  - **SASL mechanisms:** GSSAPI. An acceptor's `saslMechanisms` that lists it gets outcome `sys` for it.
   - **Core-message tunnelling** (`AMQ_CORE_MESSAGE_TUNNELING`): Core messages always go out converted to AMQP.
   - **Connection routers.**
 - **Large messages:**
@@ -275,13 +274,20 @@ An interceptor is Rust code: a `saranga_server::interceptor::Interceptor`, named
 - **A refused Core large message** takes no consumer credit. Artemis asks the packet it did not encode for its size, which fails the delivery.
 
 ## Security differences
-- **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule`, `LDAPLoginModule`, `SCRAMPropertiesLoginModule`, `SCRAMLoginModule`, `OIDCLoginModule`, `KubernetesLoginModule` and `PrincipalConversionLoginModule` are supported. `Krb5LoginModule` and custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.
+- **Login modules.** `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule`, `LDAPLoginModule`, `SCRAMPropertiesLoginModule`, `SCRAMLoginModule`, `OIDCLoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule`, `Krb5LoginModule` and the JDK's `com.sun.security.auth.module.Krb5LoginModule` are supported. Custom Java modules are not. A `login.config` entry that names one gets a warning at startup, and logins that reach that module fail.
 - **`OIDCLoginModule`** checks tokens as Artemis's Nimbus JOSE + JWT does: the same algorithms, key choice, claim checks, plain and encrypted JWTs refused, and the provider's metadata and keys fetched and cached as Artemis caches them. Where it differs:
   - A `provider` URL ending in `/` is taken without it. Artemis 2.57 keeps only the slash while stripping it and loops for ever, so its login never ends.
   - RSA keys of fewer than 2048 bits do not verify. Java's do.
   - ES256K verifies in neither: Java has had no secp256k1 since JDK 16.
   - `userPrincipalClass` and `rolePrincipalClass` other than Artemis's `UserPrincipal` and `RolePrincipal` make principals of that class name, which no other module or check counts. Artemis loads the class, and fails to initialize without it.
   - Over HTTPS without `caCertificate`, the provider's certificate is trusted through the platform's trusted certificates, where Java uses its own `cacerts`.
+- **Kerberos** (AMQP's GSSAPI, the JDK's `Krb5LoginModule`) uses the system's Kerberos library, loaded when first used, where Artemis uses Java's own Kerberos: MIT Kerberos 1.11 or later (macOS's Heimdal is not used), or on Windows MIT Kerberos for Windows, else SSPI. Without one, those logins fail. Where it differs:
+  - `krb5.conf` is the one `java.security.krb5.conf` names, else the library's default (`KRB5_CONFIG`, else `/etc/krb5.conf`), not Java's (`<java.home>/conf/security/krb5.conf`, `C:\Windows\krb5.ini`). `java.security.krb5.realm` and `java.security.krb5.kdc` are not read: a warning says so.
+  - Without `keyTab`, the keytab is the library's default (`KRB5_KTNAME`, `default_keytab_name`, else `/etc/krb5.keytab`), where Java takes `~/krb5.keytab` when `krb5.conf` names none. The default ticket cache is the library's too.
+  - Keys made from a password (`storeKey` with no keytab, as an acceptor) cannot accept GSSAPI contexts. In Artemis they can, though no GSSAPI login can give a password, its realm being logged into without a callback handler.
+  - JAAS's shared state is not kept between modules, so `useFirstPass` fails and `tryFirstPass` asks the handler, as when no module before stored a name and password. `storePass` and `clearPass` do nothing.
+  - `refreshKrb5Config` is always in effect: the library reads `krb5.conf` each time.
+  - Through SSPI (Windows without MIT Kerberos for Windows), the broker accepts as the account it runs as, for that account's service principal names, whatever keytab is named; `useKeyTab` for a TGT fails; the ticket cache is the logon session's; a password is tried against the KDC only when a context is first made with it, so a login with a wrong one succeeds; and principals without a realm take the session's domain. It needs the machine in a Kerberos (Active Directory) realm.
 - **Security managers.** The JAAS security manager (`<jaas-security>`) and `ActiveMQBasicSecurityManager` are supported. The basic manager keeps its users in the bindings journal, so its users move with the data directory in both directions. Any other `<security-manager>` class stops the broker from starting. As in Artemis, the basic manager has no users without persistence. Users are added through the bootstrap credentials or through management (`addUser`).
 - **A role named `*`** in a security setting grants nothing in Artemis 2.57, despite looking like a wildcard. Saranga matches this.
 - **Security setting plugins** (`<security-setting-plugin>`) are not supported and produce a warning.

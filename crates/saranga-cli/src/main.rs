@@ -475,6 +475,7 @@ async fn execute(command: Command) -> bool {
         let system = java_args_system_properties();
         apply_discovery_switch(&system);
         saranga_transport::connector::set_system_properties(system);
+        saranga_security::kerberos::apply_system_properties();
     }
     if let Command::Help { args } = &command {
         print!(
@@ -744,6 +745,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             system.extend(system_properties);
             apply_discovery_switch(&system);
             saranga_transport::connector::set_system_properties(system.clone());
+            saranga_security::kerberos::apply_system_properties();
             let options = instance::Options {
                 system,
                 broker_properties: properties,

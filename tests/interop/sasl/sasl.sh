@@ -14,6 +14,7 @@
 # --scram", bob's lines made by SCRAMPropertiesLoginModule's main, and carol
 # with a password in clear, for both brokers.
 #
+# OFFSET: the port offset, 3000 unless given (Windows may reserve its ports).
 # MAX_DISK_USAGE: for a machine whose disk is past create's 90%, where the
 # broker would block every producer.
 set -uo pipefail
@@ -23,7 +24,7 @@ HERE="$ROOT/tests/interop/sasl"
 VERSION="${ARTEMIS_VERSION:-2.57.0}"
 DIST="${ARTEMIS_DIST:-$ROOT/reference/activemq-artemis/artemis-distribution/target/apache-artemis-$VERSION-bin/apache-artemis-$VERSION}"
 KIND="${1:-saranga}"; shift || true
-OFFSET=3000
+OFFSET="${OFFSET:-3000}"
 PORT=$((61616 + OFFSET))
 SASL_PORT=$((PORT + 1))
 TOKEN_PORT=$((PORT + 2))

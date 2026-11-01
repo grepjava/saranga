@@ -136,7 +136,7 @@ To move a cluster, take one node at a time: stop it, `saranga upgrade` it, start
 | `artemis.profile`, `artemis.profile.cmd` | `bin/artemis` reads them as Artemis's does and passes `JAVA_ARGS` and `JAVA_ARGS_APPEND` on. Saranga takes only the `-D` options from them, as system properties. Everything else is for a JVM and is ignored: `-Xmx`, `-Xms`, garbage collector and `--add-opens` options have no effect. |
 | `artemis-utility.profile` | Used by the CLI's commands other than `run`, as in Artemis. |
 | `bootstrap.xml` | Read as Artemis reads it: the `broker.xml` URI, `<jaas-security>` or `<security-manager>`, and `<web>` with its bindings and apps. Saranga serves the console app, Jolokia under it, the metrics app, and its own REST API at `/api` on every binding; it runs no other web apps. See [Web server differences](../../COMPAT.md#web-server-differences) and [management.md](management.md). |
-| `login.config` | `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule`, `LDAPLoginModule`, `SCRAMPropertiesLoginModule`, `SCRAMLoginModule`, `OIDCLoginModule`, `KubernetesLoginModule` and `PrincipalConversionLoginModule` are supported. `Krb5LoginModule` and custom Java modules are not. See [Security differences](../../COMPAT.md#security-differences) and [security.md](security.md). |
+| `login.config` | `PropertiesLoginModule`, `GuestLoginModule`, `TextFileCertificateLoginModule`, `ExternalCertificateLoginModule`, `LDAPLoginModule`, `SCRAMPropertiesLoginModule`, `SCRAMLoginModule`, `OIDCLoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule`, `Krb5LoginModule` and the JDK's `com.sun.security.auth.module.Krb5LoginModule` are supported. Custom Java modules are not. See [Security differences](../../COMPAT.md#security-differences) and [security.md](security.md). |
 | `artemis-users.properties`, `artemis-roles.properties` | Read as Artemis reads them, masked passwords (`ENC(...)`) included. |
 | `management.xml` | Its `<authorisation>` decides who may call what through Jolokia and the console, as Artemis's guard applies it. Saranga has no JMX, so no JMX connector is opened. |
 | `jolokia-access.xml` | Its CORS rules are applied. |
@@ -156,7 +156,7 @@ Clients need no change. They connect to the same acceptors on the same ports and
 
 A 1.x Artemis JMS client, which names queues `jms.queue.<name>` and topics `jms.topic.<name>`, works against an acceptor with those prefixes, as on Artemis (Phase 6 in [PHASES.md](https://github.com/grepjava/saranga/blob/main/PHASES.md#phase-6-config-and-security)).
 
-Messages sent with one protocol are received with another as on Artemis. The protocol features Saranga does not have are listed per protocol in COMPAT.md; the ones most likely to matter are the AMQP SASL mechanism GSSAPI ([AMQP differences](../../COMPAT.md#amqp-differences)), and Core over HTTP ([WebSocket differences](../../COMPAT.md#websocket-differences)). See [protocols.md](protocols.md).
+Messages sent with one protocol are received with another as on Artemis. The protocol features Saranga does not have are listed per protocol in COMPAT.md; the one most likely to matter is Core over HTTP ([WebSocket differences](../../COMPAT.md#websocket-differences)). See [protocols.md](protocols.md).
 
 A client that checks the broker's name sees Saranga's: the STOMP `server` header is `Saranga/<version>`, and the AMQP Open's `product` is `saranga`. Management's `getVersion` reports 2.57.0, so tools that check the version keep working.
 

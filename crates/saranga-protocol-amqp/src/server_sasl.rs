@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use saranga_security::jaas::Callbacks;
+use saranga_security::kerberos;
 use saranga_security::scram::{self, Scram};
 use saranga_security::{ConnectionInfo, Principal};
 use saranga_server::Broker;
@@ -50,6 +51,7 @@ pub(crate) enum ServerSasl {
     /// OAUTHBEARER (RFC 7628) or XOAUTH2: a bearer token, validated as the
     /// password of the user it names (`ServerSASLToken`).
     Token(TokenKind, Option<SaslResult>),
+    Gssapi(Box<Gssapi>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +80,7 @@ impl ServerSasl {
             }
             "OAUTHBEARER" => Some(Self::Token(TokenKind::OAuthBearer, None)),
             "XOAUTH2" => Some(Self::Token(TokenKind::XOAuth2, None)),
+            "GSSAPI" => Some(Self::Gssapi(Box::default())),
             m => Scram::from_name(m).map(|s| Self::Scram(Box::new(JaasScram::new(s)))),
         }
     }
@@ -130,6 +133,7 @@ impl ServerSasl {
                 // so it never reaches the client.
                 None
             }
+            Self::Gssapi(g) => g.process(env, bytes).await,
         }
     }
 
@@ -143,6 +147,163 @@ impl ServerSasl {
             Self::Plain(r) | Self::External { result: r, .. } => r.clone(),
             Self::Scram(s) => s.result(),
             Self::Token(_, r) => r.clone(),
+            Self::Gssapi(g) => g.result.clone(),
+        }
+    }
+}
+
+/// `GSSAPIServerSASL`: the acceptor's keys from a login through
+/// `saslLoginConfigScope` (made with no callback handler), and a GSS-API
+/// context accepted with them, then RFC 4752's security layer exchange as
+/// the JDK's `GssKrb5Server` has it, made as Artemis makes it (no service
+/// name, QOP `auth` only): the client is authorized only as itself, and
+/// becomes a `KerberosPrincipal`.
+#[derive(Default)]
+pub(crate) struct Gssapi {
+    state: Option<GssState>,
+    result: Option<SaslResult>,
+}
+
+#[derive(Default)]
+struct GssState {
+    ctx: Option<Box<dyn kerberos::SecurityContext>>,
+    stage: u8,
+    peer: String,
+}
+
+/// What a step of the exchange gives.
+enum GssStep {
+    Challenge(Option<Vec<u8>>),
+    Complete(String),
+}
+
+/// `AbstractSaslImpl`'s receive buffer size.
+const RECV_MAX_BUF_SIZE: u32 = 65536;
+
+impl GssState {
+    /// `processSASL` and `evaluateResponse`.
+    fn evaluate(
+        &mut self,
+        jaas: Option<&saranga_security::JaasSecurityManager>,
+        scope: &str,
+        bytes: Option<Vec<u8>>,
+    ) -> Result<GssStep, String> {
+        if self.ctx.is_none() {
+            let jaas = jaas.ok_or_else(|| format!("No LoginModules configured for {scope}"))?;
+            let callbacks = Callbacks {
+                no_handler: true,
+                ..Callbacks::default()
+            };
+            let subject = jaas.login(scope, &callbacks).map_err(|e| e.message)?;
+            let acceptor = subject.kerberos_acceptor().ok_or(
+                "GSS initiate failed: No valid credentials provided (Mechanism level: Failed to find any Kerberos credentials)",
+            )?;
+            self.ctx = Some(kerberos::accept(acceptor).map_err(|e| e.0)?);
+        }
+        // Artemis fails here with a NullPointerException.
+        let bytes = bytes.ok_or("no response")?;
+        let ctx = self.ctx.as_mut().expect("context");
+        match self.stage {
+            0 => {
+                let out = ctx
+                    .step(&bytes)
+                    .map_err(|e| format!("GSS initiate failed: {e}"))?;
+                if ctx.is_established() {
+                    self.stage = 1;
+                    self.peer = ctx.source_name().map_err(|e| e.0)?;
+                    tracing::debug!("KRB5SRV05:Peer name is : {}", self.peer);
+                    if out.is_none() {
+                        return self.handshake1(&[]);
+                    }
+                }
+                Ok(GssStep::Challenge(out))
+            }
+            1 => self.handshake1(&bytes),
+            _ => self.handshake2(&bytes),
+        }
+    }
+
+    /// `doHandshake1`: the layers offered (none) and the receive buffer
+    /// size, wrapped.
+    fn handshake1(&mut self, bytes: &[u8]) -> Result<GssStep, String> {
+        if !bytes.is_empty() {
+            return Err("Handshake expecting no response data from server".into());
+        }
+        let size = RECV_MAX_BUF_SIZE.to_be_bytes();
+        let token = [kerberos::layer::NO_PROTECTION, size[1], size[2], size[3]];
+        self.stage = 2;
+        let ctx = self.ctx.as_mut().expect("context");
+        let wrapped = ctx
+            .wrap(&token)
+            .map_err(|e| format!("Problem wrapping handshake1: {e}"))?;
+        Ok(GssStep::Challenge(Some(wrapped)))
+    }
+
+    /// `doHandshake2`: the client's layer and authorization ID.
+    fn handshake2(&mut self, bytes: &[u8]) -> Result<GssStep, String> {
+        let ctx = self.ctx.as_mut().expect("context");
+        let out = ctx
+            .unwrap(bytes)
+            .map_err(|e| format!("Final handshake step failed: {e}"))?;
+        let selected = *out.first().ok_or("Index 0 out of bounds for length 0")?;
+        if selected & kerberos::layer::NO_PROTECTION == 0 {
+            return Err(format!(
+                "Client selected unsupported protection: {}",
+                selected as i8
+            ));
+        }
+        let authzid = if out.len() > 4 {
+            String::from_utf8_lossy(&out[4..]).into_owned()
+        } else {
+            self.peer.clone()
+        };
+        // Only as itself.
+        if authzid != self.peer {
+            return Err(format!(
+                "{} is not authorized to connect as {authzid}",
+                self.peer
+            ));
+        }
+        Ok(GssStep::Complete(authzid))
+    }
+}
+
+impl Gssapi {
+    async fn process(&mut self, env: &Env, bytes: Option<Vec<u8>>) -> Option<Vec<u8>> {
+        let jaas = env.broker.login_config().cloned();
+        let scope = env.login_config_scope.clone();
+        let mut state = self.state.take().unwrap_or_default();
+        let run = tokio::task::spawn_blocking(move || {
+            let r = state.evaluate(jaas.as_deref(), &scope, bytes);
+            (state, r)
+        })
+        .await;
+        let (state, step) = match run {
+            Ok(r) => r,
+            Err(e) => (GssState::default(), Err(e.to_string())),
+        };
+        match step {
+            Ok(GssStep::Challenge(c)) => {
+                self.state = Some(state);
+                c
+            }
+            Ok(GssStep::Complete(authzid)) => {
+                self.result = Some(SaslResult {
+                    success: true,
+                    user: Some(authzid.clone()),
+                    password: None,
+                    principals: Some(vec![Principal::Other {
+                        class: "javax.security.auth.kerberos.KerberosPrincipal".to_owned(),
+                        name: authzid,
+                    }]),
+                });
+                None
+            }
+            Err(e) => {
+                tracing::info!("Error on sasl input: {e}");
+                self.result = Some(SaslResult::failed());
+                None
+            }
         }
     }
 }

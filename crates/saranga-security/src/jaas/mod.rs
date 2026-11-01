@@ -11,6 +11,7 @@ mod certificate;
 pub mod config;
 mod guest;
 mod http;
+mod krb5;
 mod kubernetes;
 mod ldap;
 mod oidc;
@@ -74,11 +75,17 @@ pub struct Subject {
     credentials: Vec<Credential>,
 }
 
-/// A public credential of a subject.
+/// A credential of a subject.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Credential {
     /// The SCRAM data of the user `SCRAMPropertiesLoginModule` logged in.
     Scram(UserData),
+    /// What the JDK's `Krb5LoginModule` obtained: a TGT (`KerberosTicket`)
+    /// and the keys to accept with (`KeyTab`, `KerberosKey`).
+    Kerberos {
+        initiator: Option<crate::kerberos::Initiator>,
+        acceptor: Option<crate::kerberos::Acceptor>,
+    },
 }
 
 impl Subject {
@@ -90,7 +97,30 @@ impl Subject {
 
     /// `getPublicCredentials(UserData.class)`: the first.
     pub fn scram_user_data(&self) -> Option<&UserData> {
-        self.credentials.iter().map(|Credential::Scram(d)| d).next()
+        self.credentials.iter().find_map(|c| match c {
+            Credential::Scram(d) => Some(d),
+            _ => None,
+        })
+    }
+
+    /// The first keys to accept Kerberos contexts with.
+    pub fn kerberos_acceptor(&self) -> Option<&crate::kerberos::Acceptor> {
+        self.credentials.iter().find_map(|c| match c {
+            Credential::Kerberos {
+                acceptor: Some(a), ..
+            } => Some(a),
+            _ => None,
+        })
+    }
+
+    /// The first TGT, to initiate Kerberos contexts with.
+    pub fn kerberos_initiator(&self) -> Option<&crate::kerberos::Initiator> {
+        self.credentials.iter().find_map(|c| match c {
+            Credential::Kerberos {
+                initiator: Some(i), ..
+            } => Some(i),
+            _ => None,
+        })
     }
 
     pub fn add(&mut self, principal: Principal) {
@@ -152,7 +182,14 @@ pub struct Callbacks<'a> {
     /// `JaasCallbackHandler`: it gives the user name, this mechanism and
     /// its digest and HMAC, and no other callback.
     pub scram: Option<Scram>,
+    /// There is no handler: the login is a `LoginContext` made with none
+    /// (GSSAPI's acceptor, LDAP's GSSAPI identity).
+    pub no_handler: bool,
 }
+
+/// `Krb5LoginModule`'s message when it has no handler to ask.
+pub(crate) const NO_HANDLER: &str =
+    "No CallbackHandler available to garner authentication information from the user";
 
 impl Callbacks<'_> {
     /// A callback only `JaasCallbackHandler` gives (the password, the
@@ -160,6 +197,9 @@ impl Callbacks<'_> {
     /// `UnsupportedCallbackException`, which modules turn into a
     /// `LoginException`.
     pub(crate) fn jaas(&self, callback: &str) -> Result<(), LoginError> {
+        if self.no_handler {
+            return Err(LoginError::new(NO_HANDLER));
+        }
         match self.scram {
             None => Ok(()),
             Some(_) => Err(LoginError::new(format!(
@@ -239,6 +279,9 @@ impl ModuleFactory {
 
     pub fn create(&self, entry: &ModuleEntry) -> Result<Box<dyn LoginModule>, LoginError> {
         let class = entry.class_name.as_str();
+        if class == krb5::KRB5_LOGIN_MODULE {
+            return Ok(Box::new(krb5::Krb5LoginModule::new(entry)));
+        }
         let simple = class
             .strip_prefix(ARTEMIS_JAAS)
             .and_then(|s| s.strip_prefix('.'));
@@ -257,7 +300,9 @@ impl ModuleFactory {
             Some("SCRAMPropertiesLoginModule") => Ok(Box::new(
                 scram_properties::ScramPropertiesLoginModule::new(self, entry),
             )),
-            Some("SCRAMLoginModule") => Ok(Box::new(principal::PrincipalLoginModule::default())),
+            Some("SCRAMLoginModule" | "Krb5LoginModule") => {
+                Ok(Box::new(principal::PrincipalLoginModule::default()))
+            }
             Some("PrincipalConversionLoginModule") => Ok(Box::new(
                 principal_conversion::PrincipalConversionLoginModule::new(entry),
             )),
@@ -273,6 +318,9 @@ impl ModuleFactory {
 
     /// Is this a module class [`create`](Self::create) knows?
     pub fn supports(class: &str) -> bool {
+        if class == krb5::KRB5_LOGIN_MODULE {
+            return true;
+        }
         matches!(
             class
                 .strip_prefix(ARTEMIS_JAAS)
@@ -287,6 +335,7 @@ impl ModuleFactory {
                     | "SCRAMLoginModule"
                     | "OIDCLoginModule"
                     | "KubernetesLoginModule"
+                    | "Krb5LoginModule"
                     | "PrincipalConversionLoginModule"
             )
         )

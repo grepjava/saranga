@@ -1,4 +1,4 @@
-//! `AbstractPrincipalLoginModule`, as `SCRAMLoginModule`: the principals
+//! `AbstractPrincipalLoginModule`, as `SCRAMLoginModule` and Artemis's `Krb5LoginModule`: the principals
 //! of the identity the peer authenticated as (`PrincipalsCallback`), with a
 //! user principal named like the first.
 

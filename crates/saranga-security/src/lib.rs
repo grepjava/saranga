@@ -17,6 +17,7 @@ pub mod basic;
 mod der;
 pub mod dn;
 pub mod jaas;
+pub mod kerberos;
 pub mod keystore;
 pub mod manager;
 pub use saranga_config::properties;

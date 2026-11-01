@@ -55,9 +55,11 @@ These login modules are supported, with Artemis's class names and options:
 | `SCRAMLoginModule` | In the broker's realm: makes the identity a SCRAM exchange established (the user and roles `SCRAMPropertiesLoginModule` found) the client's user. |
 | `OIDCLoginModule` | Takes the password as a JWT (an OAuth 2 access token, as OAUTHBEARER, XOAUTH2 or PLAIN carry it), checks its signature with the keys the OpenID Connect `provider` publishes and its claims (`audience`, `requiredClaims`, `maxClockSkew`, `allowPlainJWT`, `requireOAuth2MTLS`), and takes users and roles from claim paths (`identityPaths`, `rolesPaths`, `roleMapping`). `caCertificate`, `tlsVersion`, `httpTimeout`, `cacheKeysSeconds` and `metadataRetrySeconds` apply as in Artemis. |
 | `KubernetesLoginModule` | Takes the password as a Kubernetes bearer token and asks the API server to review it (a `TokenReview`), calling it with the broker's own service account token over TLS trusting the cluster's CA. `KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT`, `KUBERNETES_TOKEN_PATH` and `KUBERNETES_CA_PATH` come from system properties or the environment, as in Artemis. The user is the one the review names, with its groups as roles unless `ignoreTokenReviewRoles=true`, and roles from the file `org.apache.activemq.jaas.kubernetes.role` names. A token the server does not authenticate leaves the module ignored. |
-| `PrincipalConversionLoginModule` | When no module before it gave the subject a user, makes the first principal of each class `principalClassList` names a user, for the modules after it (`com.sun.security.auth.UserPrincipal` from `OIDCLoginModule`'s `userPrincipalClass`, say). |
+| `PrincipalConversionLoginModule` | When no module before it gave the subject a user, makes the first principal of each class `principalClassList` names a user, for the modules after it (`com.sun.security.auth.UserPrincipal` from `OIDCLoginModule`'s `userPrincipalClass`, or the `javax.security.auth.kerberos.KerberosPrincipal` of the JDK's `Krb5LoginModule`, say). |
+| `Krb5LoginModule` | Artemis's, in the broker's realm: makes the Kerberos identity AMQP's GSSAPI established the client's user (`client@EXAMPLE.COM`). |
+| `com.sun.security.auth.module.Krb5LoginModule` | The JDK's, with its options (`useKeyTab`, `keyTab`, `principal`, `storeKey`, `isInitiator`, `useTicketCache`, `ticketCache`, `renewTGT`, `doNotPrompt`): in the realm an acceptor's `saslLoginConfigScope` names, it gives GSSAPI the keys the broker accepts with; in the broker's realm, it checks a client's password with the KDC and gives the subject a `KerberosPrincipal`. See [Kerberos](#kerberos). |
 
-`Krb5LoginModule` and custom Java modules are not supported. An entry that names one gets a warning at startup, and logins that reach that module fail. Saranga also warns at startup when the domain `bootstrap.xml` names has no entry in `login.config`.
+Custom Java modules are not supported. An entry that names one gets a warning at startup, and logins that reach that module fail. Saranga also warns at startup when the domain `bootstrap.xml` names has no entry in `login.config`.
 
 `jaasConfigs` broker properties replace the realm of the same name in `login.config`, as in Artemis. A configuration reload applies the `jaasConfigs` it reads, as Artemis's does. Artemis puts each reload's realms in front of the ones before them, so a realm that a later reload no longer names is still used, and Saranga does the same. Restart the broker to drop a realm. `login.config` itself is not reloaded while the broker runs, in either broker.
 
@@ -67,7 +69,7 @@ Authentication and authorisation results are cached as in Artemis: `authenticati
 
 ### Protocol notes
 
-Every protocol logs in through the same security manager. AMQP clients use SASL: Saranga offers `PLAIN` and `ANONYMOUS` by default, as Artemis does, and `EXTERNAL`, for a client with a certificate, and `SCRAM-SHA-256`, `SCRAM-SHA-512`, `OAUTHBEARER` and `XOAUTH2` when the acceptor's `saslMechanisms` lists them; GSSAPI is not supported. OAUTHBEARER and XOAUTH2 carry a bearer token, which the broker's realm gets as the password, as in Artemis: a login module checks it (`PropertiesLoginModule` as a password, for one).
+Every protocol logs in through the same security manager. AMQP clients use SASL: Saranga offers `PLAIN` and `ANONYMOUS` by default, as Artemis does, and `EXTERNAL`, for a client with a certificate, and `SCRAM-SHA-256`, `SCRAM-SHA-512`, `GSSAPI`, `OAUTHBEARER` and `XOAUTH2` when the acceptor's `saslMechanisms` lists them. OAUTHBEARER and XOAUTH2 carry a bearer token, which the broker's realm gets as the password, as in Artemis: a login module checks it (`PropertiesLoginModule` as a password, for one).
 
 SCRAM works as in Artemis. The acceptor names the realm SCRAM logs in through, and the broker's realm takes the identity it established with `SCRAMLoginModule`:
 
@@ -91,6 +93,36 @@ amqp-sasl-scram {
 ```
 
 `saranga mask --scram alice secret` prints the lines for `scram-users.properties`: alice's data for both mechanisms, never the password. The SCRAM login reads `login.config` whichever security manager is in use, as Artemis's JVM does. See [protocols.md](protocols.md) and [COMPAT.md's AMQP section](../../COMPAT.md#amqp-differences).
+
+### Kerberos
+
+GSSAPI works as in Artemis. The acceptor's `saslLoginConfigScope` names the realm that gives the broker its keys, through the JDK's `Krb5LoginModule` and a keytab, and the broker's realm takes the client's Kerberos identity with Artemis's `Krb5LoginModule`:
+
+```xml
+<acceptor name="amqp">tcp://0.0.0.0:5672?protocols=AMQP;saslMechanisms=GSSAPI;saslLoginConfigScope=amqp-sasl-gssapi</acceptor>
+```
+
+```
+activemq {
+   org.apache.activemq.artemis.spi.core.security.jaas.Krb5LoginModule required;
+   org.apache.activemq.artemis.spi.core.security.jaas.PropertiesLoginModule optional
+       org.apache.activemq.jaas.properties.user="artemis-users.properties"
+       org.apache.activemq.jaas.properties.role="kerberos-roles.properties";
+};
+
+amqp-sasl-gssapi {
+   com.sun.security.auth.module.Krb5LoginModule required
+       isInitiator=false
+       storeKey=true
+       useKeyTab=true
+       keyTab="/etc/saranga/amqp.keytab"
+       principal="amqp/broker.example.com";
+};
+```
+
+The client logs in as itself (`client@EXAMPLE.COM`), which a roles file maps to roles (`amq = client@EXAMPLE.COM`). `principal="*"` accepts tickets for any principal the keytab has keys for.
+
+Saranga uses the system's Kerberos library, loaded when Kerberos is first used, where Artemis uses Java's: MIT Kerberos 1.11 or later. On Linux and FreeBSD it is `libgssapi_krb5.so.2` and `libkrb5.so.3` (the `libgssapi-krb5-2` or `krb5-libs` package, or FreeBSD's base system). On macOS, install MIT Kerberos with Homebrew (`brew install krb5`) or MacPorts, as macOS's own Kerberos is Heimdal. On Windows, Saranga uses MIT Kerberos for Windows when it is installed, and else Windows's SSPI, which has the limits [COMPAT.md](../../COMPAT.md#security-differences) lists. `-Djava.security.krb5.conf` in `JAVA_ARGS` names the `krb5.conf` to read, as for Java; without it the library reads its own default (`KRB5_CONFIG`, else `/etc/krb5.conf`).
 
 ## Managing users
 
