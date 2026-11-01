@@ -4094,10 +4094,10 @@ impl Conn {
             self.top_up(channel, handle);
         }
         self.check_stopped(channel, handle);
-        if incoming.settled {
-            return Ok(());
-        }
-        let Some(id) = incoming.delivery_id else {
+        let Some(id) = incoming.delivery_id.filter(|_| !incoming.settled) else {
+            if !wait.is_empty() {
+                self.out.send(wait, Vec::new());
+            }
             return Ok(());
         };
         let state = match result {
@@ -4768,18 +4768,20 @@ impl Conn {
             }
             (
                 m.message_format as u32,
-                m.send_buffer_with(delivery_count, da.as_ref()),
+                std::borrow::Cow::Owned(m.send_buffer_with(delivery_count, da.as_ref())),
             )
         } else {
             match native {
                 Some(n) => (
                     n.message.message_format as u32,
-                    n.message.send_buffer_with(delivery_count, da.as_ref()),
+                    n.message.send_buffer_cow(delivery_count, da.as_ref()),
                 ),
                 None => (
                     0,
-                    crate::convert::from_core(message.delivery_core(), now_millis())
-                        .send_buffer_with(delivery_count, da.as_ref()),
+                    std::borrow::Cow::Owned(
+                        crate::convert::from_core(message.delivery_core(), now_millis())
+                            .send_buffer_with(delivery_count, da.as_ref()),
+                    ),
                 ),
             }
         };
@@ -5386,8 +5388,13 @@ fn transfer_frames(
     payload: &[u8],
     max_frame: usize,
 ) -> Vec<Vec<u8>> {
-    let mut frames = Vec::new();
     let mut out = Vec::with_capacity(payload.len().min(max_frame) + 64);
+    let tag_len = first.delivery_tag.as_ref().map_or(0, Vec::len);
+    if payload.len().saturating_add(64).saturating_add(tag_len) <= max_frame {
+        frame::encode_amqp(&mut out, channel, &Performative::Transfer(first), payload);
+        return vec![out];
+    }
+    let mut frames = Vec::new();
     let header_len = |t: &Transfer| {
         let mut v = Vec::new();
         Composite::encode(t, &mut v);
@@ -5428,7 +5435,15 @@ fn transfer_frames(
 
 /// Writes transfer frames while the client's incoming window allows,
 /// keeping the rest for its next flow.
-fn send_transfers(s: &mut Session, frames: Vec<Vec<u8>>, out: &Outbound) {
+fn send_transfers(s: &mut Session, mut frames: Vec<Vec<u8>>, out: &Outbound) {
+    if s.blocked.is_empty() && frames.len() == 1 && s.remote_incoming_window > 0 {
+        if let Some(f) = frames.pop() {
+            s.next_outgoing_id = s.next_outgoing_id.wrapping_add(1);
+            s.remote_incoming_window -= 1;
+            out.now(f);
+        }
+        return;
+    }
     s.blocked.extend(frames);
     let mut bytes = Vec::new();
     while s.remote_incoming_window > 0 {

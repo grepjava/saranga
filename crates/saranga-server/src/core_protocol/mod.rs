@@ -145,19 +145,25 @@ pub(crate) fn producer_credits(
     let grant: crate::paging::Grant = {
         let conn = conn.clone();
         let (credits, address) = (p.credits, p.address.clone());
-        Box::new(move || conn.send(channel, SessionProducerCreditsMessage { credits, address }))
+        Box::new(move || {
+            crate::protocol::with_direct_write(|| {
+                conn.send(channel, SessionProducerCreditsMessage { credits, address });
+            });
+        })
     };
     match broker.page_store(addr) {
         None => grant(),
         Some(store) => {
             if !store.check_memory(true, grant, None, Some(blocked)) {
-                conn.send(
-                    channel,
-                    SessionProducerCreditsFailMessage {
-                        credits: p.credits,
-                        address: p.address,
-                    },
-                );
+                crate::protocol::with_direct_write(|| {
+                    conn.send(
+                        channel,
+                        SessionProducerCreditsFailMessage {
+                            credits: p.credits,
+                            address: p.address,
+                        },
+                    );
+                });
             }
         }
     }
@@ -645,7 +651,11 @@ impl Connection {
                 start += used;
                 self.check_frame_size(&buf[start..])?;
             }
-            buf.drain(..start);
+            if start == buf.len() {
+                buf.clear();
+            } else if start > 0 {
+                buf.drain(..start);
+            }
             start = 0;
             if self.read_more(rd, &mut buf).await? == 0 {
                 return Ok(());

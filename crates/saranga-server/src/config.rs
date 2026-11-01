@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use saranga_journal::JournalConfig;
 
@@ -21,7 +21,7 @@ use crate::{AddressDeployment, BrokerConfig, RoutingType};
 /// Address settings resolved through `<address-settings>` match rules,
 /// cached per address until the rules are swapped.
 pub struct ConfiguredSettings {
-    state: Mutex<Rules>,
+    state: RwLock<Rules>,
 }
 
 struct Rules {
@@ -34,7 +34,7 @@ struct Rules {
 impl ConfiguredSettings {
     pub fn new(repository: cfg::HierarchicalRepository<cfg::AddressSettings>) -> Self {
         Self {
-            state: Mutex::new(Rules {
+            state: RwLock::new(Rules {
                 repository,
                 cache: HashMap::new(),
                 added: Vec::new(),
@@ -45,7 +45,13 @@ impl ConfiguredSettings {
 
 impl SettingsRepository for ConfiguredSettings {
     fn get_match(&self, address: &str) -> Arc<AddressSettings> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = state.cache.get(address) {
+                return s.clone();
+            }
+        }
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         if let Some(s) = state.cache.get(address) {
             return s.clone();
         }
@@ -61,7 +67,7 @@ impl SettingsRepository for ConfiguredSettings {
     }
 
     fn swap(&self, rules: cfg::HierarchicalRepository<cfg::AddressSettings>) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         // Matches added through management outlive a reload.
         let mut rules = rules;
         for (m, s) in &state.added {
@@ -73,12 +79,12 @@ impl SettingsRepository for ConfiguredSettings {
     }
 
     fn configured(&self, address: &str) -> Option<cfg::AddressSettings> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         state.repository.get_match(address)
     }
 
     fn add_match(&self, m: &str, settings: cfg::AddressSettings) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         if state.repository.add_match(m, settings.clone()).is_err() {
             return false;
         }
@@ -89,7 +95,7 @@ impl SettingsRepository for ConfiguredSettings {
     }
 
     fn remove_match(&self, m: &str) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         state.repository.remove_match(m);
         state.added.retain(|(k, _)| k != m);
         state.cache.clear();
@@ -97,7 +103,7 @@ impl SettingsRepository for ConfiguredSettings {
     }
 
     fn entries(&self) -> Vec<(String, cfg::AddressSettings, bool)> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         state
             .repository
             .entries()
@@ -110,7 +116,7 @@ impl SettingsRepository for ConfiguredSettings {
     }
 
     fn matching(&self, address: &str) -> Vec<(String, cfg::AddressSettings)> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         state
             .repository
             .named_matches(address)

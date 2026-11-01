@@ -486,6 +486,10 @@ pub struct PostOffice {
     positions: Mutex<HashMap<(Name, Name), usize>>,
     /// Some position in `positions` is not 0.
     balanced: AtomicBool,
+    /// Whether `has_wild` reflects the current `state.addresses`.
+    wild_checked: AtomicBool,
+    /// Whether any address in `state.addresses` is a wildcard pattern.
+    has_wild: AtomicBool,
     /// The broker's grouping handler, when it has one.
     grouping: std::sync::OnceLock<Arc<crate::grouping::GroupingHandler>>,
     /// The mirror sources installed.
@@ -525,6 +529,8 @@ impl PostOffice {
             plugins: Arc::default(),
             positions: Mutex::default(),
             balanced: AtomicBool::new(false),
+            wild_checked: AtomicBool::new(true),
+            has_wild: AtomicBool::new(false),
             grouping: std::sync::OnceLock::new(),
             mirrors: crate::mirror::Mirrors::default(),
             deployed: Mutex::default(),
@@ -898,6 +904,28 @@ impl PostOffice {
             crate::mirror::Mirroring::Disabled => Vec::new(),
             _ => self.mirrors.all(),
         };
+        if mirrors.is_empty()
+            && let [(r, queues)] = routed.as_slice()
+            && let Some(first) = queues.first()
+        {
+            let address = first.config().address.clone();
+            if queues[1..].iter().all(|q| q.config().address == address) {
+                return match self.paging_store(&address).page(&r.message, tx, queues)? {
+                    crate::paging::Paged::No => Ok(PageRouted {
+                        routed,
+                        ..PageRouted::default()
+                    }),
+                    crate::paging::Paged::Yes(p) => {
+                        queues.iter().for_each(Queue::paged_added);
+                        Ok(PageRouted {
+                            pending: p.into_iter().collect(),
+                            ..PageRouted::default()
+                        })
+                    }
+                    crate::paging::Paged::Dropped => Ok(PageRouted::default()),
+                };
+            }
+        }
         let mut out = PageRouted {
             routed: Vec::with_capacity(routed.len()),
             ..PageRouted::default()
@@ -1061,7 +1089,9 @@ impl PostOffice {
     }
 
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, State> {
-        self.state.write().unwrap_or_else(|e| e.into_inner())
+        let guard = self.state.write().unwrap_or_else(|e| e.into_inner());
+        self.wild_checked.store(false, Ordering::Release);
+        guard
     }
 
     fn io(e: saranga_journal::JournalError) -> BrokerError {
@@ -2188,9 +2218,20 @@ impl PostOffice {
             mirror,
         } = hop;
         let (real, _) = split_fqqn(address);
+        // Fast check under a single read lock when the address already exists
+        // and has at least one local binding.
+        let (has_addr, has_local) = if auto_create {
+            let state = self.read();
+            match state.addresses.get(real) {
+                Some(e) => (true, !e.queues.is_empty() || !e.diverts.is_empty()),
+                None => (false, false),
+            }
+        } else {
+            (true, true)
+        };
         // checkAddress
         if auto_create
-            && !self.has_address(real)
+            && !has_addr
             && self.check_auto_create(address, routing_type, creator)? == AutoCreate::NotFound
         {
             return Err(BrokerError::address_does_not_exist(real));
@@ -2212,6 +2253,7 @@ impl PostOffice {
         // simpleRoute: without a local binding, the address and its queue
         // may be created first.
         if auto_create
+            && !has_local
             && !self.has_local_bindings(address)
             && self.check_auto_create(address, routing_type, creator)? == AutoCreate::NotFound
         {
@@ -2686,11 +2728,27 @@ impl PostOffice {
         })
     }
 
+    fn has_wildcard_addresses(&self, state: &State) -> bool {
+        if self.wild_checked.load(Ordering::Acquire) {
+            return self.has_wild.load(Ordering::Relaxed);
+        }
+        let has = state
+            .addresses
+            .values()
+            .any(|e| *e.wild.get_or_init(|| self.wildcard.is_wild(&e.info.name)));
+        self.has_wild.store(has, Ordering::Relaxed);
+        self.wild_checked.store(true, Ordering::Release);
+        has
+    }
+
     /// The local bindings of `address` and of every wildcard address
     /// matching it.
     fn routing_entries<'s>(&self, state: &'s State, real: &str) -> Vec<&'s AddressEntry> {
         let mut entries: Vec<&AddressEntry> = state.addresses.get(real).into_iter().collect();
-        if self.wildcard.routing_enabled && !self.wildcard.is_wild(real) {
+        if self.wildcard.routing_enabled
+            && self.has_wildcard_addresses(state)
+            && !self.wildcard.is_wild(real)
+        {
             entries.extend(state.addresses.values().filter(|e| {
                 *e.wild.get_or_init(|| self.wildcard.is_wild(&e.info.name))
                     && self.wildcard.matches(real, &e.info.name)
@@ -2704,6 +2762,13 @@ impl PostOffice {
     fn has_local_bindings(&self, address: &str) -> bool {
         let (real, _) = split_fqqn(address);
         let state = self.read();
+        if state
+            .addresses
+            .get(real)
+            .is_some_and(|e| !e.queues.is_empty() || !e.diverts.is_empty())
+        {
+            return true;
+        }
         self.routing_entries(&state, real)
             .iter()
             .any(|e| !e.queues.is_empty() || !e.diverts.is_empty())
@@ -2723,23 +2788,41 @@ impl PostOffice {
     ) -> Option<Routes> {
         let (real, fqqn_queue) = split_fqqn(address);
         let state = self.read();
-        let entries = self.routing_entries(&state, real);
         // `MessageLoadBalancingType.LOCAL_ONLY`: no remote binding.
         let remote: &[Arc<RemoteBinding>] = match local_only {
             true => &[],
             false => state.remote.get(real).map_or(&[], Vec::as_slice),
         };
+        let target: &crate::message::ServerMessage = &message.message;
+        let accepts = |q: &Queue| {
+            let c = q.config();
+            c.enabled && !(c.purge_on_no_consumers && q.consumer_count() == 0)
+        };
+        if (!self.wildcard.routing_enabled || !self.has_wildcard_addresses(&state))
+            && let Some(e) = state.addresses.get(real)
+            && let [q] = e.queues.as_slice()
+            && e.diverts.is_empty()
+            && remote.is_empty()
+            && self.grouping().is_none()
+            && !self.balanced.load(Ordering::Relaxed)
+        {
+            let mut routes = Routes::default();
+            if fqqn_queue.is_none_or(|n| &**q.name() == n)
+                && q.filter().is_none_or(|f| f.matches(target))
+                && accepts(q)
+                && routing_type.is_none_or(|t| t == q.config().routing_type)
+            {
+                routes.queues.push(q.clone());
+            }
+            return Some(routes);
+        }
+        let entries = self.routing_entries(&state, real);
         let has_local = entries
             .iter()
             .any(|e| !e.queues.is_empty() || !e.diverts.is_empty());
         if !has_local && remote.is_empty() {
             return None;
         }
-        let target: &crate::message::ServerMessage = &message.message;
-        let accepts = |q: &Queue| {
-            let c = q.config();
-            c.enabled && !(c.purge_on_no_consumers && q.consumer_count() == 0)
-        };
         // A lone queue, with no divert, remote binding or grouping: it is
         // its routing name's only binding, which getNextBinding always
         // takes if it matches, its position staying 0. (Once a group of

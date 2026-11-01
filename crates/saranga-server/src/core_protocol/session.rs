@@ -84,13 +84,40 @@ struct Done {
     flush: bool,
 }
 
+fn send_done(
+    conn: &ConnShared,
+    channel_id: i64,
+    confirmations: &std::sync::Mutex<Confirmations>,
+    request: Request,
+    response: Option<Packet>,
+    flush: bool,
+) {
+    let failed = matches!(
+        response,
+        Some(Packet::ActiveMQExceptionMessage(_) | Packet::ActiveMQExceptionMessageV2(_))
+    );
+    if !failed {
+        let id = confirmations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .confirm(request, flush);
+        if let Some(id) = id {
+            conn.send(channel_id, PacketsConfirmedMessage { command_id: id });
+        }
+    }
+    if let Some(response) = response {
+        conn.send(channel_id, response);
+    }
+}
+
 /// Sends confirmations and responses in request order, each after the
 /// journal writes its request lined up. The session goes on with the next
 /// packets meanwhile, as Artemis's handler does.
 async fn completer(
     conn: Arc<ConnShared>,
     channel_id: i64,
-    mut confirmations: Confirmations,
+    confirmations: Arc<std::sync::Mutex<Confirmations>>,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
     mut rx: mpsc::UnboundedReceiver<Done>,
 ) {
     while let Some(done) = rx.recv().await {
@@ -102,16 +129,15 @@ async fn completer(
             )),
             Ok(()) => done.response,
         };
-        let failed = matches!(
+        send_done(
+            &conn,
+            channel_id,
+            &confirmations,
+            done.request,
             response,
-            Some(Packet::ActiveMQExceptionMessage(_) | Packet::ActiveMQExceptionMessageV2(_))
+            done.flush,
         );
-        if !failed && let Some(id) = confirmations.confirm(done.request, done.flush) {
-            conn.send(channel_id, PacketsConfirmedMessage { command_id: id });
-        }
-        if let Some(response) = response {
-            conn.send(channel_id, response);
-        }
+        in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -164,6 +190,8 @@ pub(crate) struct CoreSession {
     /// headers, and its body so far.
     large: Option<(CoreMessage, LargeWriter)>,
     completer: mpsc::UnboundedSender<Done>,
+    confirmations: Arc<std::sync::Mutex<Confirmations>>,
+    in_flight_completions: Arc<std::sync::atomic::AtomicUsize>,
     /// Whether the client confirms commands (a confirmation window).
     confirms: bool,
     /// Where the queues answer the acknowledgements sent without waiting
@@ -223,14 +251,17 @@ impl CoreSession {
         let (completer_tx, completer_rx) = mpsc::unbounded_channel();
         let (acked, acked_rx) = mpsc::unbounded_channel();
         let confirms = request.confirmation_window_size != -1;
+        let confirmations = Arc::new(std::sync::Mutex::new(Confirmations {
+            window: request.confirmation_window_size,
+            last_command_id: -1,
+            received_bytes: 0,
+        }));
+        let in_flight_completions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(completer(
             conn.clone(),
             request.channel_id,
-            Confirmations {
-                window: request.confirmation_window_size,
-                last_command_id: -1,
-                received_bytes: 0,
-            },
+            confirmations.clone(),
+            in_flight_completions.clone(),
             completer_rx,
         ));
         let session = ServerSession::new(
@@ -260,6 +291,8 @@ impl CoreSession {
             producers: HashMap::new(),
             large: None,
             completer: completer_tx,
+            confirmations,
+            in_flight_completions,
             confirms,
             acked,
             acked_rx: Some(acked_rx),
@@ -424,12 +457,44 @@ impl CoreSession {
     /// `doConfirmAndResponse`, after the journal writes this request lined
     /// up.
     fn respond(&mut self, request: Request, response: Option<Packet>, flush: bool) {
-        let _ = self.completer.send(Done {
-            completion: self.session.take_completion(),
-            request,
-            response,
-            flush,
-        });
+        let mut completion = self.session.take_completion();
+        if self
+            .in_flight_completions
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            completion.apply_if_written();
+            if completion.is_empty() {
+                if self.confirms || response.is_some() {
+                    crate::protocol::with_direct_write(|| {
+                        send_done(
+                            &self.conn,
+                            self.channel_id,
+                            &self.confirmations,
+                            request,
+                            response,
+                            flush,
+                        );
+                    });
+                }
+                return;
+            }
+        }
+        self.in_flight_completions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if self
+            .completer
+            .send(Done {
+                completion,
+                request,
+                response,
+                flush,
+            })
+            .is_err()
+        {
+            self.in_flight_completions
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
     }
 
     /// The response for a request that may fail: the given success

@@ -174,6 +174,35 @@ pub struct JournalFileInfo {
 
 pub(crate) type FileKey = u64;
 
+/// Fast non-cryptographic hasher for integer journal IDs (`i64` / `u64`).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct IntHasher(u64);
+
+impl std::hash::Hasher for IntHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x517cc1b727220a95);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        let mut x = i.wrapping_mul(0x517cc1b727220a95);
+        x ^= x >> 32;
+        self.0 = x;
+    }
+    #[inline]
+    fn write_i64(&mut self, i: i64) {
+        self.write_u64(i as u64);
+    }
+}
+
+pub(crate) type IntMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<IntHasher>>;
+
 /// `JournalFileImpl`: a journal file and its reclaim accounting.
 #[derive(Debug)]
 pub(crate) struct JFile {
@@ -189,7 +218,7 @@ pub(crate) struct JFile {
     neg_reclaim: bool,
     /// `setReclaimable`: false while a retention copy is pending.
     pub(crate) reclaimable: bool,
-    neg_counts: HashMap<FileKey, i32>,
+    neg_counts: IntMap<FileKey, i32>,
 }
 
 impl JFile {
@@ -206,7 +235,7 @@ impl JFile {
             pos_reclaim: false,
             neg_reclaim: false,
             reclaimable: true,
-            neg_counts: HashMap::new(),
+            neg_counts: IntMap::default(),
         }
     }
 
@@ -290,10 +319,10 @@ impl Tx {
 /// Files, records and transactions: everything the accounting touches.
 #[derive(Debug, Default)]
 pub(crate) struct Books {
-    pub(crate) files: HashMap<FileKey, JFile>,
+    pub(crate) files: IntMap<FileKey, JFile>,
     next_key: FileKey,
-    pub(crate) records: HashMap<i64, RecordPos>,
-    pub(crate) transactions: HashMap<i64, Tx>,
+    pub(crate) records: IntMap<i64, RecordPos>,
+    pub(crate) transactions: IntMap<i64, Tx>,
     pub(crate) replaceable: HashSet<u8>,
 }
 

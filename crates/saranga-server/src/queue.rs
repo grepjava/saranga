@@ -1158,6 +1158,10 @@ impl MessageList {
     fn len(&self) -> usize {
         self.levels.iter().map(VecDeque::len).sum()
     }
+
+    fn is_empty(&self) -> bool {
+        self.levels.iter().all(VecDeque::is_empty)
+    }
 }
 
 struct Consumer {
@@ -1434,6 +1438,9 @@ impl Actor {
     /// `ScheduledDeliveryRunnable`: references whose time has come go to the
     /// head of the queue, in delivery-time order.
     fn deliver_scheduled(&mut self) {
+        if self.scheduled.is_empty() {
+            return;
+        }
         let now = now_millis();
         let mut due = Vec::new();
         while let Some(entry) = self.scheduled.first_entry() {
@@ -2196,7 +2203,7 @@ impl Actor {
             .find(|r| message::group_id(r.message.core()).is_none())
         {
             let r = self.messages.get(at);
-            if r.message.is_expired(now_millis()) {
+            if r.message.core().expiration != 0 && r.message.is_expired(now_millis()) {
                 let r = self.messages.remove(at);
                 self.expire(r);
                 continue;
@@ -2246,11 +2253,10 @@ impl Actor {
             self.deliver_to_browsers();
             return;
         }
-        while self.messages.len() > 0 {
+        let exclusive = self.shared.config().exclusive;
+        while !self.messages.is_empty() {
             // An exclusive queue delivers only to its chosen consumer.
-            if self.shared.config().exclusive
-                && let Some(id) = self.exclusive_consumer
-            {
+            if exclusive && let Some(id) = self.exclusive_consumer {
                 match self.consumers.iter().position(|c| c.reg.id == id) {
                     Some(i) if self.try_deliver(i) => continue,
                     Some(_) => break,
@@ -2303,20 +2309,19 @@ impl Actor {
         if !c.can_take() {
             return false;
         }
-        let non_destructive = self.shared.config().non_destructive;
+        let cfg = self.shared.config();
+        let non_destructive = cfg.non_destructive;
         let id = c.reg.id;
         let groups = &self.groups;
-        let shared = &self.shared;
         let group_ok = |r: &MessageRef| {
-            let c = shared.config();
-            if c.exclusive || c.group_buckets == 0 {
+            if cfg.exclusive || cfg.group_buckets == 0 {
                 return true;
             }
             let Some(g) = message::group_id(r.message.core()) else {
                 return true;
             };
-            let key = if c.group_buckets > 0 {
-                GroupKey::Bucket((java_hash(&g) & i32::MAX) as u32 % c.group_buckets as u32)
+            let key = if cfg.group_buckets > 0 {
+                GroupKey::Bucket((java_hash(&g) & i32::MAX) as u32 % cfg.group_buckets as u32)
             } else {
                 GroupKey::Id(g)
             };
@@ -2339,7 +2344,7 @@ impl Actor {
             self.messages.remove(at)
         };
         // An expired message is never delivered (`checkExpired`).
-        if r.message.is_expired(now_millis()) {
+        if r.message.core().expiration != 0 && r.message.is_expired(now_millis()) {
             if non_destructive {
                 r = self.messages.remove(at);
             }
@@ -2349,12 +2354,14 @@ impl Actor {
         // handleMessageGroup: a new group is pinned to this consumer and its
         // first message flagged; sequence -1 closes the group.
         let mut first = false;
-        if self.shared.config().exclusive {
+        if cfg.exclusive {
             if self.exclusive_consumer.is_none() {
                 self.exclusive_consumer = Some(id);
                 first = true;
             }
-        } else if let Some(g) = self.group_of(&r) {
+        } else if cfg.group_buckets != 0
+            && let Some(g) = self.group_of(&r)
+        {
             if message::group_sequence(r.message.core()) == -1 {
                 self.groups.remove(&g);
             } else if let std::collections::hash_map::Entry::Vacant(e) = self.groups.entry(g) {
@@ -2362,7 +2369,7 @@ impl Actor {
                 first = true;
             }
         }
-        let flagged = match (&self.shared.config().group_first_key, first) {
+        let flagged = match (&cfg.group_first_key, first) {
             (Some(key), true) => {
                 let mut core = r.message.core().clone();
                 core.properties
@@ -2371,9 +2378,16 @@ impl Actor {
             }
             _ => None,
         };
+        let last_in_queue =
+            self.messages.is_empty() && self.shared.adds_pending.load(Ordering::Relaxed) == 0;
         let c = &mut self.consumers[index];
         r.delivery_count += 1;
-        c.send(flagged.as_ref().unwrap_or(&r.message), r.delivery_count);
+        let msg = flagged.as_ref().unwrap_or(&r.message);
+        if last_in_queue {
+            crate::protocol::with_direct_write(|| c.send(msg, r.delivery_count));
+        } else {
+            c.send(msg, r.delivery_count);
+        }
         if c.large.is_some() && c.continue_large() {
             self.shared.tx.send(Cmd::ResumeLarge).ok();
         }
@@ -2410,15 +2424,19 @@ impl Actor {
     /// queue holds fewer than `max-read-page-messages` and
     /// `max-read-page-bytes` of them (`needsDepage`).
     fn depage(&mut self) {
-        let Some(sub) = self.shared.paging.clone() else {
+        let Some(sub) = self.shared.paging.as_ref() else {
             return;
         };
         let Some(store) = sub.store() else {
             return;
         };
+        if !store.is_paging() && !sub.has_redeliveries() {
+            return;
+        }
         if self.shared.adds_pending.load(Ordering::SeqCst) > 0 {
             return;
         }
+        let sub = sub.clone();
         let s = self.queue().settings();
         let now = now_millis();
         loop {

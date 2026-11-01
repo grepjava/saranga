@@ -1113,6 +1113,20 @@ impl AmqpMessage {
 }
 
 impl AmqpMessage {
+    /// Like [`AmqpMessage::send_buffer_with`], borrowing `self.data` when
+    /// the stored bytes can go out unchanged.
+    pub fn send_buffer_cow(
+        &self,
+        delivery_count: i32,
+        da: Option<&Annotations>,
+    ) -> std::borrow::Cow<'_, [u8]> {
+        if !self.large && da.is_none() && delivery_count <= 1 && self.delivery_annotations.is_none()
+        {
+            return std::borrow::Cow::Borrowed(&self.data);
+        }
+        std::borrow::Cow::Owned(self.send_buffer_with(delivery_count, da))
+    }
+
     /// `getSendBuffer(deliveryCount, reference)` for a reference carrying
     /// delivery annotations (a mirror's): they replace the message's own.
     pub fn send_buffer_with(&self, delivery_count: i32, da: Option<&Annotations>) -> Vec<u8> {

@@ -94,7 +94,7 @@ pub struct PagingManager {
     global_max_messages: i64,
     global_size: AtomicI64,
     global_messages: AtomicI64,
-    stores: Mutex<HashMap<Name, Arc<PagingStore>>>,
+    stores: std::sync::RwLock<HashMap<Name, Arc<PagingStore>>>,
     /// Page transactions by transaction ID (`transactions`).
     transactions: Mutex<HashMap<i64, Arc<PageTx>>>,
     /// Stores holding producers back until global memory is freed.
@@ -137,7 +137,7 @@ impl PagingManager {
             disk_full: AtomicBool::new(false),
             disk_usable: AtomicU64::new(0),
             disk_total: AtomicU64::new(0),
-            stores: Mutex::default(),
+            stores: std::sync::RwLock::default(),
             transactions: Mutex::default(),
             blocked: Mutex::default(),
             memory_callbacks: Mutex::default(),
@@ -210,7 +210,10 @@ impl PagingManager {
             let address: Name = address.into();
             let store = PagingStore::new(&address, self.me.clone(), settings(&address));
             store.start(folder)?;
-            lock(&self.stores).insert(address, store);
+            self.stores
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(address, store);
         }
         Ok(())
     }
@@ -221,7 +224,16 @@ impl PagingManager {
         address: &str,
         settings: impl FnOnce() -> Arc<AddressSettings>,
     ) -> Arc<PagingStore> {
-        let mut stores = lock(&self.stores);
+        if let Some(s) = self
+            .stores
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(address)
+            .cloned()
+        {
+            return s;
+        }
+        let mut stores = self.stores.write().unwrap_or_else(|e| e.into_inner());
         if let Some(s) = stores.get(address) {
             return s.clone();
         }
@@ -232,11 +244,20 @@ impl PagingManager {
     }
 
     pub fn existing_store(&self, address: &str) -> Option<Arc<PagingStore>> {
-        lock(&self.stores).get(address).cloned()
+        self.stores
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(address)
+            .cloned()
     }
 
     pub fn stores(&self) -> Vec<Arc<PagingStore>> {
-        lock(&self.stores).values().cloned().collect()
+        self.stores
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// The subscription of a queue, whatever its address.
@@ -735,9 +756,10 @@ impl BlockedRunnables {
 pub struct PagingStore {
     address: Name,
     manager: Weak<PagingManager>,
-    settings: Mutex<Arc<AddressSettings>>,
+    settings: std::sync::RwLock<Arc<AddressSettings>>,
     size: AtomicI64,
     messages: AtomicI64,
+    paging: AtomicBool,
     state: Mutex<StoreState>,
     /// Grants waiting for memory (`onMemoryFreedRunnables`), each with
     /// its session's cancellation.
@@ -776,9 +798,10 @@ impl PagingStore {
         let store = Arc::new_cyclic(|me| Self {
             address: address.clone(),
             manager,
-            settings: Mutex::new(settings.clone()),
+            settings: std::sync::RwLock::new(settings.clone()),
             size: AtomicI64::new(0),
             messages: AtomicI64::new(0),
+            paging: AtomicBool::new(false),
             state: Mutex::new(StoreState {
                 folder: None,
                 paging: false,
@@ -912,31 +935,41 @@ impl PagingStore {
     }
 
     fn settings(&self) -> Arc<AddressSettings> {
-        let s = lock(&self.settings).clone();
-        match *lock(&self.enforced) {
-            Some(p) if s.address_full_policy != p => {
-                let mut enforced = (*s).clone();
-                enforced.address_full_policy = p;
-                Arc::new(enforced)
-            }
-            _ => s,
-        }
+        self.settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// `enforceAddressFullMessagePolicy`: `policy` from now on, whatever
     /// the address settings say.
     pub fn enforce_policy(&self, policy: AddressFullPolicy) {
-        *lock(&self.enforced) = Some(policy);
+        let mut enforced_lock = lock(&self.enforced);
+        *enforced_lock = Some(policy);
+        let mut s = self.settings.write().unwrap_or_else(|e| e.into_inner());
+        if s.address_full_policy != policy {
+            let mut enforced = (**s).clone();
+            enforced.address_full_policy = policy;
+            *s = Arc::new(enforced);
+        }
     }
 
     /// `applySetting`.
-    pub fn apply_settings(&self, settings: Arc<AddressSettings>) {
-        *lock(&self.settings) = settings;
+    pub fn apply_settings(&self, mut settings: Arc<AddressSettings>) {
+        let enforced_lock = lock(&self.enforced);
+        if let Some(p) = *enforced_lock
+            && settings.address_full_policy != p
+        {
+            let mut enforced = (*settings).clone();
+            enforced.address_full_policy = p;
+            settings = Arc::new(enforced);
+        }
+        *self.settings.write().unwrap_or_else(|e| e.into_inner()) = settings;
     }
 
     /// `isPaging`, as the routing sees it.
     pub fn is_paging(&self) -> bool {
-        lock(&self.state).paging
+        self.paging.load(Ordering::Acquire)
     }
 
     pub fn address_size(&self) -> i64 {
@@ -1022,6 +1055,7 @@ impl PagingStore {
             st.number_of_pages == 1 && st.current.as_ref().is_some_and(|c| c.entries.is_empty());
         if st.current.is_some() && !single_empty {
             st.paging = true;
+            self.paging.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -1183,6 +1217,7 @@ impl PagingStore {
             return;
         }
         st.paging = true;
+        self.paging.store(true, Ordering::Release);
         drop(st);
         tracing::info!(
             "AMQ222038: Starting paging on address '{}'; {}",
@@ -1198,6 +1233,7 @@ impl PagingStore {
             return;
         }
         st.paging = false;
+        self.paging.store(false, Ordering::Release);
         st.drop_warned = false;
         self.page_full.store(false, Ordering::SeqCst);
         for sub in st.subscriptions.values() {
@@ -1463,7 +1499,11 @@ impl PagingStore {
                 return Ok(Paged::Dropped);
             }
             AddressFullPolicy::Block => return Ok(Paged::No),
-            AddressFullPolicy::Page => {}
+            AddressFullPolicy::Page => {
+                if !self.paging.load(Ordering::Acquire) {
+                    return Ok(Paged::No);
+                }
+            }
         }
         let Some(manager) = self.manager.upgrade() else {
             return Ok(Paged::No);
@@ -1743,6 +1783,7 @@ impl PagingStore {
             queue_id,
             persistent,
             store: self.me.clone(),
+            has_redeliveries: AtomicBool::new(false),
             state: Mutex::new(SubState {
                 consumed: BTreeMap::new(),
                 last_acked: None,
@@ -1809,8 +1850,14 @@ impl PagingStore {
             return None;
         }
         loop {
-            if let Some(r) = lock(&sub.state).redeliveries.pop_front() {
-                return Some(r);
+            if sub.has_redeliveries.load(Ordering::Acquire) {
+                let mut s = lock(&sub.state);
+                let r = s.redeliveries.pop_front();
+                sub.has_redeliveries
+                    .store(!s.redeliveries.is_empty(), Ordering::Release);
+                if let Some(r) = r {
+                    return Some(r);
+                }
             }
             let (page, entry) = {
                 let mut st = lock(&self.state);
@@ -2483,6 +2530,7 @@ pub struct PageSubscription {
     /// Durable queues journal their cursor.
     persistent: bool,
     store: Weak<PagingStore>,
+    has_redeliveries: AtomicBool,
     state: Mutex<SubState>,
     /// Tells the queue there is something to read.
     waker: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -2495,6 +2543,10 @@ impl PageSubscription {
 
     pub fn store(&self) -> Option<Arc<PagingStore>> {
         self.store.upgrade()
+    }
+
+    pub fn has_redeliveries(&self) -> bool {
+        self.has_redeliveries.load(Ordering::Acquire)
     }
 
     pub fn set_waker(&self, waker: Box<dyn Fn() + Send + Sync>) {
@@ -2618,6 +2670,7 @@ impl PageSubscription {
                 info.pending_tx -= 1;
             }
             s.redeliveries.push_back(r);
+            self.has_redeliveries.store(true, Ordering::Release);
         }
         self.wake();
     }
@@ -2652,10 +2705,11 @@ impl PageSubscription {
     /// The acknowledgement of a recovered prepared transaction rolled back:
     /// the message is delivered again.
     pub fn unremove(&self, r: PagedRef) {
-        lock(&self.state)
-            .removed
-            .remove(&(r.position.page, r.position.message_nr));
-        lock(&self.state).redeliveries.push_back(r);
+        let mut s = lock(&self.state);
+        s.removed.remove(&(r.position.page, r.position.message_nr));
+        s.redeliveries.push_back(r);
+        self.has_redeliveries.store(true, Ordering::Release);
+        drop(s);
         self.wake();
     }
 }

@@ -271,6 +271,11 @@ impl SessionEntry {
         lock(&self.producers).clear();
     }
 
+    /// Whether `producer_sent` will record metrics for `sender`.
+    pub(crate) fn tracks_producer(&self, sender: Option<&str>) -> bool {
+        self.legacy_producers.load(Ordering::Relaxed) || sender.is_some()
+    }
+
     /// `updateProducerMetrics`: the producer named `sender` sent a message,
     /// or for a legacy client, the session's producer for its address.
     pub(crate) fn producer_sent(
@@ -278,7 +283,7 @@ impl SessionEntry {
         registry: &Registry,
         sender: Option<&str>,
         address: &str,
-        user_id: Option<String>,
+        user_id: Option<[u8; 16]>,
         size: i64,
     ) {
         let producer = if self.legacy_producers.load(Ordering::Relaxed) {
@@ -366,7 +371,7 @@ pub struct ProducerEntry {
     pub created: i64,
     sent: AtomicI64,
     sent_size: AtomicI64,
-    last_message_id: Mutex<Option<String>>,
+    last_message_id: Mutex<Option<[u8; 16]>>,
 }
 
 impl ProducerEntry {
@@ -393,6 +398,6 @@ impl ProducerEntry {
 
     /// `getLastProducedMessageID`: the last message's user ID.
     pub fn last_message_id(&self) -> Option<String> {
-        lock(&self.last_message_id).clone()
+        lock(&self.last_message_id).map(|u| uuid::Uuid::from_bytes(u).to_string())
     }
 }

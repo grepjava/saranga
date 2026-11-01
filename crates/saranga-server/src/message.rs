@@ -115,6 +115,20 @@ pub fn is_expired(message: &CoreMessage, now: i64) -> bool {
     message.expiration != 0 && now - message.expiration >= 0
 }
 
+/// `PostOfficeImpl.applyExpiryDelay`, reading the clock only when `s`
+/// adjusts expiration.
+pub fn apply_expiry_delay_now(message: &mut CoreMessage, s: &AddressSettings) {
+    let unset = AddressSettings::NO_EXPIRY_DELAY;
+    if !s.no_expiry
+        && s.expiry_delay < 0
+        && s.min_expiry_delay == unset
+        && s.max_expiry_delay == unset
+    {
+        return;
+    }
+    apply_expiry_delay(message, s, now_millis());
+}
+
 /// `PostOfficeImpl.applyExpiryDelay`: the address's expiry settings applied
 /// to a message being routed.
 pub fn apply_expiry_delay(message: &mut CoreMessage, s: &AddressSettings, now: i64) {

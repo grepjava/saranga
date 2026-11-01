@@ -88,13 +88,14 @@ impl WritePart {
 }
 
 /// What a connection's tasks hand its writer task. What the connection's
-/// own task sends while the writer has nothing left to write goes straight
-/// to the socket instead: the writer, on another thread, is not woken for
-/// each response or acknowledgement, and the task has its own output
-/// gathered by then. What other tasks send (a queue's deliveries) goes to
-/// the writer still, which gathers what arrives meanwhile into one write:
-/// written one at a time, each would cost the queue's task a system call,
-/// and under load it fell behind its producers.
+/// own task (or a caller inside [`with_direct_write`]) sends while the
+/// writer has nothing left to write goes straight to the socket instead:
+/// the writer, on another thread, is not woken for each response,
+/// confirmation, or single-message delivery when the queue is drained.
+/// Multi-message bursts from a queue go to the writer still, which gathers
+/// what arrives meanwhile into one write: written one at a time, each would
+/// cost the queue's task a system call, and under load it fell behind its
+/// producers.
 pub struct DirectOut {
     direct: Option<DirectWrite>,
     /// The connection's task, the one that made this.
@@ -112,6 +113,26 @@ pub struct DirectOut {
 /// which goes on with its work faster with the writer, on another thread,
 /// making the system calls.
 const DIRECT_MAX: usize = 4 * 1024;
+
+std::thread_local! {
+    static ALLOW_DIRECT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with direct socket writes enabled on the current thread, even
+/// when called from a task other than the connection's owner task (for
+/// example, a session task sending a response or confirmation, or a queue
+/// task delivering its last queued message).
+pub fn with_direct_write<R>(f: impl FnOnce() -> R) -> R {
+    struct Guard(bool);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ALLOW_DIRECT_WRITE.set(self.0);
+        }
+    }
+    let prev = ALLOW_DIRECT_WRITE.replace(true);
+    let _guard = Guard(prev);
+    f()
+}
 
 /// The writer's side of a [`DirectOut`].
 pub struct Written(Arc<AtomicUsize>);
@@ -145,8 +166,8 @@ impl DirectOut {
         let _sending = self.sending.lock().unwrap_or_else(|e| e.into_inner());
         let mut from = 0;
         if let Some(direct) = &self.direct
-            && self.owner.is_some()
-            && tokio::task::try_id() == self.owner
+            && ((self.owner.is_some() && tokio::task::try_id() == self.owner)
+                || ALLOW_DIRECT_WRITE.get())
             && bytes.len() <= DIRECT_MAX
             && self.queued.load(Ordering::Acquire) == 0
         {

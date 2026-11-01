@@ -428,6 +428,16 @@ fn append<T>(a: &mut Vec<T>, b: Vec<T>) {
     }
 }
 
+/// Decrements a session's in-flight completion count once its deferred
+/// queue updates have run (or the completion is dropped).
+struct PendingWrite(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for PendingWrite {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// The journal writes a request lined up, and the queue updates that must
 /// wait for them (`OperationContext`).
 #[derive(Default)]
@@ -439,6 +449,7 @@ pub struct Completion {
     /// What `sync` mirrors' peers complete once they have what the queue
     /// updates sent them (`replicationLineUp`), waited for after those.
     replicated: Vec<Replicated>,
+    pending: Vec<PendingWrite>,
 }
 
 /// Mirror waits a request lines up, some of them as its queue updates are
@@ -460,15 +471,22 @@ impl Completion {
         self.waits.push(wait);
     }
 
-    /// With no journal write to wait for, makes the queue updates now, as
+    /// With no journal write to wait for and no earlier completion on the
+    /// same session still in flight, makes the queue updates now, as
     /// `OperationContext.executeOnCompletion` runs a task at once when no
     /// store is pending. What is left (the mirrors' waits) is still to be
     /// waited for.
     pub fn apply_if_written(&mut self) {
-        if self.waits.is_empty() {
+        if self.waits.is_empty()
+            && self
+                .pending
+                .iter()
+                .all(|p| p.0.load(std::sync::atomic::Ordering::Acquire) <= 1)
+        {
             for action in std::mem::take(&mut self.actions) {
                 action();
             }
+            self.pending.clear();
         }
     }
 
@@ -477,6 +495,7 @@ impl Completion {
         append(&mut self.waits, other.waits);
         append(&mut self.actions, other.actions);
         append(&mut self.replicated, other.replicated);
+        append(&mut self.pending, other.pending);
     }
 
     /// Waits for the journal writes, then makes the queue updates; after a
@@ -494,6 +513,7 @@ impl Completion {
                 for action in self.actions {
                     action();
                 }
+                drop(self.pending);
                 for r in self.replicated {
                     let waits = std::mem::take(&mut *lock_replicated(&r));
                     for w in waits {
@@ -579,6 +599,9 @@ pub struct ServerSession {
     ops: Vec<Pending>,
     /// Queue updates to make once those writes are done.
     actions: Vec<Box<dyn FnOnce() + Send>>,
+    /// Completions from this session whose journal writes or deferred
+    /// queue updates have not yet finished.
+    pending_writes: Arc<std::sync::atomic::AtomicUsize>,
     /// Permission checks are off (a send the broker makes).
     unchecked: bool,
     /// Routing a message the broker took from elsewhere
@@ -698,6 +721,7 @@ impl ServerSession {
             timeout_seconds: -1,
             ops: Vec::new(),
             actions: Vec::new(),
+            pending_writes: Arc::default(),
             unchecked: false,
             direct: false,
             internal: false,
@@ -755,6 +779,7 @@ impl ServerSession {
             timeout_seconds: -1,
             ops: Vec::new(),
             actions: Vec::new(),
+            pending_writes: Arc::default(),
             unchecked: false,
             direct: false,
             internal: false,
@@ -818,7 +843,7 @@ impl ServerSession {
             return Err(BrokerError::no_address());
         };
         let settings = po.settings(crate::postoffice::split_fqqn(&address).0);
-        crate::message::apply_expiry_delay(&mut message, &settings, crate::message::now_millis());
+        crate::message::apply_expiry_delay_now(&mut message, &settings);
         let scheduled_time = crate::message::scheduled_delivery_time(&message);
         let n = native.updated(&view, &message);
         let mut r = MessageRef::new(match body {
@@ -939,13 +964,39 @@ impl ServerSession {
         self.auto_commit_acks
     }
 
+    /// Whether this request or an earlier completion from this session
+    /// still has journal writes or deferred queue updates pending.
+    fn has_pending_writes(&self) -> bool {
+        !self.ops.is_empty()
+            || !self.actions.is_empty()
+            || self
+                .pending_writes
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0
+    }
+
     /// The journal writes and queue updates the requests so far lined up;
     /// the protocol answers its client once they are done.
     pub fn take_completion(&mut self) -> Completion {
+        let waits = std::mem::take(&mut self.ops);
+        let actions = std::mem::take(&mut self.actions);
+        let replicated = if actions.is_empty() && lock_replicated(&self.replicated).is_empty() {
+            Vec::new()
+        } else {
+            vec![std::mem::take(&mut self.replicated)]
+        };
+        let pending = if waits.is_empty() && actions.is_empty() {
+            Vec::new()
+        } else {
+            self.pending_writes
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            vec![PendingWrite(self.pending_writes.clone())]
+        };
         Completion {
-            waits: std::mem::take(&mut self.ops),
-            actions: std::mem::take(&mut self.actions),
-            replicated: vec![std::mem::take(&mut self.replicated)],
+            waits,
+            actions,
+            replicated,
+            pending,
         }
     }
 
@@ -1043,15 +1094,19 @@ impl ServerSession {
         if let Some(p) = outcome.write(storage.as_deref())? {
             self.ops.push(p);
         }
-        if defer && storage.is_some() {
+        if defer && self.has_pending_writes() {
             let replicated = self.replicated.clone();
             self.actions.push(Box::new(move || {
                 let waits = outcome.apply();
-                lock_replicated(&replicated).extend(waits);
+                if !waits.is_empty() {
+                    lock_replicated(&replicated).extend(waits);
+                }
             }));
         } else {
             let waits = outcome.apply();
-            lock_replicated(&self.replicated).extend(waits);
+            if !waits.is_empty() {
+                lock_replicated(&self.replicated).extend(waits);
+            }
         }
         Ok(())
     }
@@ -1383,7 +1438,7 @@ impl ServerSession {
             .broker
             .post_office()
             .settings(crate::postoffice::split_fqqn(&address).0);
-        crate::message::apply_expiry_delay(&mut message, &settings, crate::message::now_millis());
+        crate::message::apply_expiry_delay_now(&mut message, &settings);
         let scheduled_time = crate::message::scheduled_delivery_time(&message);
         // checkDuplicateID: a bridge's duplicate ID comes off the message and
         // is checked, in place of the message's own, in the bridge cache of
@@ -1417,21 +1472,16 @@ impl ServerSession {
         });
         r.scheduled_time = scheduled_time;
         // updateProducerMetrics, with the size before routing.
-        if !self.unchecked {
+        if !self.unchecked && self.entry.tracks_producer(self.sender.as_deref()) {
             let size = match r.message.large() {
                 Some(body) => body.size() as i64,
                 None => r.message.encode_size() as i64,
             };
-            let user_id = r
-                .message
-                .core()
-                .user_id
-                .map(|u| uuid::Uuid::from_bytes(u).to_string());
             self.entry.producer_sent(
                 self.broker.registry(),
                 self.sender.as_deref(),
                 &address,
-                user_id,
+                r.message.core().user_id,
                 size,
             );
         }
@@ -1675,6 +1725,9 @@ impl ServerSession {
             None => {
                 if let Some(s) = &storage {
                     for (r, queues) in &routed {
+                        if !r.message.is_durable() || r.paged.is_some() {
+                            continue;
+                        }
                         let message = &r.message;
                         let scheduled_time = r.scheduled_time;
                         let durable: Vec<&Queue> =
@@ -1718,6 +1771,8 @@ impl ServerSession {
                     if let Some((jtx, true)) = own_tx {
                         self.ops.push(s.commit(jtx).map_err(io_error)?);
                     }
+                }
+                if self.has_pending_writes() {
                     // The references count against their addresses now,
                     // and join their queues once journaled.
                     for (r, queues) in &routed {
@@ -1726,16 +1781,22 @@ impl ServerSession {
                         }
                     }
                     self.actions.push(Box::new(move || {
-                        for (r, queues) in routed {
-                            for q in queues {
-                                q.add_counted(r.clone());
+                        for (r, mut queues) in routed {
+                            if let Some(last) = queues.pop() {
+                                for q in queues {
+                                    q.add_counted(r.clone());
+                                }
+                                last.add_counted(r);
                             }
                         }
                     }));
                 } else {
-                    for (r, queues) in routed {
-                        for q in queues {
-                            q.add(r.clone());
+                    for (r, mut queues) in routed {
+                        if let Some(last) = queues.pop() {
+                            for q in queues {
+                                q.add(r.clone());
+                            }
+                            last.add(r);
                         }
                     }
                 }
@@ -3254,4 +3315,95 @@ fn create_check(durable: bool) -> CheckType {
 /// A journal failure as the client sees it (`ActiveMQIOErrorException`).
 pub(crate) fn io_error(e: saranga_journal::JournalError) -> BrokerError {
     BrokerError::new(ErrorType::IoError, e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BrokerConfig;
+    use crate::postoffice::{QueueSpec, SelectorFilters};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn alternating_persistent_and_non_persistent_sends_keep_session_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = saranga_config::BrokerConfig::parse(
+            r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+                 <persistence-enabled>true</persistence-enabled>
+                 <journal-file-size>65536</journal-file-size>
+               </core></configuration>"#,
+        )
+        .unwrap();
+        let config =
+            BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path()).unwrap();
+        let broker = Broker::start(config).await.unwrap();
+
+        let mut spec = QueueSpec::new("orders", "orders");
+        spec.routing_type = Some(RoutingType::Anycast);
+        spec.durable = true;
+        spec.auto_create_address = Some(true);
+        let queue = broker.post_office().create_queue(spec, false).unwrap();
+
+        let conn = Arc::new(ClientConnection::new(
+            Transport::internal("test"),
+            Arc::default(),
+            Vec::new(),
+        ));
+        let mut session = ServerSession::new(
+            broker.clone(),
+            conn,
+            SessionOptions {
+                name: "test-session".to_owned(),
+                username: None,
+                password: None,
+                xa: false,
+                auto_commit_sends: true,
+                auto_commit_acks: true,
+                pre_acknowledge: false,
+                default_address: None,
+            },
+            Authenticated::default(),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Completion>();
+        let completer = tokio::spawn(async move {
+            while let Some(c) = rx.recv().await {
+                c.wait().await.unwrap();
+            }
+        });
+
+        let total = 200i32;
+        for seq in 0..total {
+            let mut msg = CoreMessage {
+                address: Some(SimpleString::from("orders")),
+                durable: seq % 2 == 0,
+                ..Default::default()
+            };
+            msg.properties
+                .insert("seq".into(), saranga_buffer::PropertyValue::Int(seq));
+            session.send(msg, None).await.unwrap();
+            let mut completion = session.take_completion();
+            // Simulate CoreSession::respond: apply_if_written only when no
+            // earlier completions are in flight, otherwise hand to completer.
+            completion.apply_if_written();
+            if !completion.is_empty() {
+                tx.send(completion).unwrap();
+            }
+        }
+        drop(tx);
+        completer.await.unwrap();
+
+        let refs = queue.browse().await;
+        let received: Vec<i32> = refs
+            .iter()
+            .map(|r| match r.message.core().properties.get(&"seq".into()) {
+                Some(saranga_buffer::PropertyValue::Int(v)) => *v,
+                other => panic!("unexpected seq property: {other:?}"),
+            })
+            .collect();
+        let expected: Vec<i32> = (0..total).collect();
+        assert_eq!(received, expected);
+
+        session.close(false).await;
+        broker.stop().unwrap();
+    }
 }
