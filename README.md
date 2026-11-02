@@ -14,9 +14,9 @@ Saranga is a high-performance, memory-safe message broker built in Rust, designe
 
 - **Seamless Artemis Compatibility.** Saranga targets full compatibility with Apache ActiveMQ Artemis 2.57.0, preserving wire protocols, `broker.xml` configuration, journal, paging and large-message formats, management interfaces and command-line tooling. Existing Artemis clients, tools, configurations and data files are intended to work unchanged; [COMPAT.md](COMPAT.md) lists where Saranga still differs. Saranga's compatibility roadmap tracks upstream Artemis releases to maintain interoperability as the platform evolves.
 - **High Availability and Clustering Across Both Brokers.** Saranga is designed to operate interchangeably with Artemis in high-availability configurations, serving as either primary or backup through shared storage, replication or pluggable quorum mechanisms. Mixed Artemis–Saranga clusters support message load balancing, redistribution, grouping, federation, bridges, broker connections and bidirectional mirroring. This enables incremental, node-by-node migration without planned downtime, while preserving failover and failback capabilities.
-- **Native Performance, Without JVM Overhead.** Compiled into a standalone native executable, Saranga eliminates JVM startup, warm-up and tuning requirements. Benchmarks show startup times of approximately 140 ms versus 2.7 seconds for Artemis—about 19 times faster—with throughput matching or exceeding Artemis across all tested scenarios.
+- **Native Performance, Without JVM Overhead.** Compiled into a standalone native executable, Saranga eliminates JVM startup, warm-up and tuning requirements. Benchmarks show startup in under 200 ms versus 2.7 seconds for Artemis, about 14 times faster, lower latency in every tested scenario, and higher throughput in all but one.
 - **Memory Safety Without Garbage Collection.** Built in Rust, Saranga uses compile-time ownership, borrowing and type-safety guarantees to prevent common memory-safety defects and data races in safe code. With no garbage collector, it also avoids garbage-collection pauses. The limited use of `unsafe` is isolated to operating-system integrations, including file locking, disk-space queries, local-time handling and terminal operations.
-- **Greater Resource Efficiency.** Saranga uses less broker CPU per message in all 13 benchmark scenarios, with CPU reductions of 41–58% for persistent and large-message workloads. Its initial memory footprint is approximately 42 MiB compared with Artemis's 209 MiB, while OpenWire, STOMP and MQTT workloads consume only 5–20% of Artemis's memory in the measured scenarios. This translates into greater workload density and more efficient infrastructure utilization.
+- **Greater Resource Efficiency.** Saranga uses less broker CPU per message in all 13 benchmark scenarios, with CPU reductions of 43–60% for persistent and large-message workloads. Its initial memory footprint is approximately 42 MiB compared with Artemis's 206 MiB, while OpenWire, STOMP and MQTT workloads consume only 5–20% of Artemis's memory in the measured scenarios. This translates into greater workload density and more efficient infrastructure utilization.
 - **Engineered for Edge Deployments.** With a compact memory footprint, rapid startup and no JVM dependency, Saranga extends enterprise-grade messaging to edge gateways, resource-constrained devices and distributed environments where conventional JVM-based brokers may be impractical.
 - **Lower Cloud Infrastructure Costs.** Reduced CPU and memory consumption enables smaller compute instances, higher broker density per host and more efficient container deployments. For equivalent messaging workloads, these improvements create opportunities to reduce infrastructure spending without sacrificing protocol compatibility or throughput.
 
@@ -56,66 +56,71 @@ The benchmark machine:
 | Storage                        | SATA SSD, ext4                                    |
 | Operating system               | Linux, kernel 7.3, dedicated to the run           |
 | Java (Artemis and the clients) | OpenJDK 25.0.4.1, Artemis with a 2 GiB heap       |
-| Versions                       | Artemis 2.57.0, Saranga at `40329ba` (2026-11-02) |
+| Versions                       | Artemis 2.57.0, Saranga at `bfd6752` (2026-11-02)    |
 
 |                     | Artemis  | Saranga |
 | ------------------- | -------- | ------- |
-| Startup             | 2,706 ms | 143 ms  |
-| Memory when started | 209 MiB  | 42 MiB  |
+| Startup             | 2,735 ms | 190 ms  |
+| Memory when started | 206 MiB  | 42 MiB  |
 
-**Throughput (messages a second) and peak memory** with an unbounded producer, over 60 s after a 15 s warmup:
+**Throughput (messages a second) and peak memory** with an unbounded producer, over 60 s after a 15 s warmup, with the Java clients (Artemis's own perf client for Core and AMQP):
 
 | Scenario               | Artemis msg/s | Saranga msg/s | Saranga/Artemis | Artemis peak RSS | Saranga peak RSS |
 | ---------------------- | ------------- | ------------- | --------------- | ---------------- | ---------------- |
-| Core                   | 74,607        | 80,232        | 1.08            | 605 MiB          | 663 MiB          |
-| Core, persistent       | 65,077        | 73,589        | 1.13            | 625 MiB          | 403 MiB          |
-| Core, 1 MiB persistent | 60            | 78            | 1.30            | 562 MiB          | 88 MiB           |
-| AMQP                   | 31,344        | 31,682        | 1.01            | 2,233 MiB        | 1,617 MiB        |
-| AMQP, persistent       | 27,067        | 30,919        | 1.14            | 586 MiB          | 1,156 MiB        |
-| AMQP, 1 MiB persistent | 99            | 106           | 1.07            | 813 MiB          | 191 MiB          |
-| OpenWire               | 49,977        | 51,716        | 1.03            | 628 MiB          | 71 MiB           |
-| OpenWire, persistent   | 285           | 642           | 2.25            | 588 MiB          | 53 MiB           |
-| STOMP                  | 88,556        | 106,239       | 1.20            | 688 MiB          | 64 MiB           |
-| STOMP, persistent      | 68,863        | 83,307        | 1.21            | 629 MiB          | 124 MiB          |
-| MQTT, QoS 0            | 91,019        | 118,634       | 1.30            | 581 MiB          | 60 MiB           |
-| MQTT, QoS 1            | 44,531        | 94,725        | 2.13            | 2,343 MiB        | 114 MiB          |
+| Core                   | 75,688        | 80,959        | 1.07            | 618 MiB          | 857 MiB          |
+| Core, persistent       | 64,336        | 77,820        | 1.21            | 644 MiB          | 263 MiB          |
+| Core, 1 MiB persistent | 62            | 83            | 1.34            | 570 MiB          | 72 MiB           |
+| AMQP                   | 31,205        | 29,166        | 0.93            | 2,213 MiB        | 1,727 MiB        |
+| AMQP, persistent       | 26,502        | 32,216        | 1.22            | 585 MiB          | 1,186 MiB        |
+| AMQP, 1 MiB persistent | 97            | 114           | 1.18            | 804 MiB          | 154 MiB          |
+| OpenWire               | 50,556        | 68,598        | 1.36            | 684 MiB          | 65 MiB           |
+| OpenWire, persistent   | 284           | 668           | 2.35            | 609 MiB          | 54 MiB           |
+| STOMP                  | 87,400        | 128,752       | 1.47            | 619 MiB          | 58 MiB           |
+| STOMP, persistent      | 71,878        | 92,120        | 1.28            | 621 MiB          | 117 MiB          |
+| MQTT, QoS 0            | 95,303        | 158,602       | 1.66            | 608 MiB          | 60 MiB           |
+| MQTT, QoS 1            | 44,872        | 96,067        | 2.14            | 2,294 MiB        | 111 MiB          |
 
 **Broker CPU a message and latency (p50 / p99, send to receipt)** with both brokers at the same rate, half the lower of their two throughputs:
 
 | Scenario                     | Rate, msg/s | Artemis CPU a message | Saranga CPU a message | Artemis p50 / p99 | Saranga p50 / p99 |
 | ---------------------------- | ----------- | --------------------- | --------------------- | ----------------- | ----------------- |
-| Core                         | 37,303      | 64 µs                 | 43 µs                 | 141 µs / 607 µs   | 138 µs / 295 µs   |
-| Core, persistent             | 32,538      | 76 µs                 | 41 µs                 | 4.1 ms / 11.6 ms  | 1.2 ms / 9.9 ms   |
-| Core, 1 MiB persistent       | 30          | 19.5 ms               | 10.3 ms               | 22.9 ms / 39.2 ms | 17.9 ms / 29.3 ms |
-| Core, 100 queues, persistent | 10,000      | 237 µs                | 108 µs                | 1.1 ms / 4.5 ms   | 995 µs / 2.8 ms   |
-| AMQP                         | 15,672      | 81 µs                 | 71 µs                 | 128 µs / 391 µs   | 129 µs / 295 µs   |
-| AMQP, persistent             | 13,533      | 116 µs                | 64 µs                 | 3.6 ms / 26.9 ms  | 1.6 ms / 34.0 ms  |
-| AMQP, 1 MiB persistent       | 49          | 16.4 ms               | 9.2 ms                | 23.3 ms / 37.6 ms | 20.0 ms / 33.8 ms |
-| OpenWire                     | 24,988      | 112 µs                | 89 µs                 | 188 µs / 1.4 ms   | 244 µs / 2.7 ms   |
-| OpenWire, persistent         | 142         | 3.6 ms                | 1.9 ms                | 4.5 ms / 6.6 ms   | 2.5 ms / 2.8 ms   |
-| STOMP                        | 44,278      | 44 µs                 | 37 µs                 | 82 µs / 551 µs    | 117 µs / 786 µs   |
-| STOMP, persistent            | 34,431      | 64 µs                 | 38 µs                 | 4.1 ms / 12.4 ms  | 1.3 ms / 10.6 ms  |
-| MQTT, QoS 0                  | 45,509      | 41 µs                 | 37 µs                 | 85 µs / 393 µs    | 110 µs / 238 µs   |
-| MQTT, QoS 1                  | 22,265      | 112 µs                | 47 µs                 | 2.9 ms / 12.4 ms  | 862 µs / 7.0 ms   |
+| Core                         | 37,844      | 64 µs                 | 34 µs                 | 146 µs / 739 µs   | 111 µs / 233 µs   |
+| Core, persistent             | 32,168      | 77 µs                 | 31 µs                 | 4.1 ms / 12.0 ms  | 1.2 ms / 9.7 ms   |
+| Core, 1 MiB persistent       | 31          | 19.6 ms               | 9.9 ms                | 22.9 ms / 39.4 ms | 17.8 ms / 31.6 ms |
+| Core, 100 queues, persistent | 10,000      | 192 µs                | 121 µs                | 3.2 ms / 6.1 ms   | 1.1 ms / 3.2 ms   |
+| AMQP                         | 14,583      | 82 µs                 | 64 µs                 | 125 µs / 311 µs   | 114 µs / 196 µs   |
+| AMQP, persistent             | 13,251      | 114 µs                | 56 µs                 | 3.6 ms / 35.3 ms  | 1.6 ms / 28.9 ms  |
+| AMQP, 1 MiB persistent       | 48          | 16.3 ms               | 9.2 ms                | 22.9 ms / 37.9 ms | 20.2 ms / 34.3 ms |
+| OpenWire                     | 25,278      | 114 µs                | 63 µs                 | 184 µs / 1.6 ms   | 148 µs / 688 µs   |
+| OpenWire, persistent         | 142         | 3.6 ms                | 1.7 ms                | 4.5 ms / 6.6 ms   | 2.5 ms / 2.8 ms   |
+| STOMP                        | 43,700      | 43 µs                 | 26 µs                 | 81 µs / 562 µs    | 60 µs / 147 µs    |
+| STOMP, persistent            | 35,939      | 61 µs                 | 26 µs                 | 4.1 ms / 12.2 ms  | 1.4 ms / 11.1 ms  |
+| MQTT, QoS 0                  | 47,651      | 41 µs                 | 27 µs                 | 84 µs / 501 µs    | 62 µs / 139 µs    |
+| MQTT, QoS 1                  | 22,436      | 112 µs                | 47 µs                 | 2.9 ms / 13.6 ms  | 805 µs / 7.9 ms   |
 
-Saranga is behind on latency in some scenarios without persistence: p50 is 25 to 56 µs higher on OpenWire, STOMP and MQTT (level on Core and AMQP), and p99 is higher on OpenWire and STOMP. Persistent AMQP's p99 is higher in this run too (34.0 against 26.9 ms); it moves a lot from run to run, and another run the same morning gave Saranga 6.9 ms and Artemis 36.6 ms.
+Saranga's p50 and p99 are lower in every scenario. Its throughput is lower on non-persistent AMQP (0.93): it took sends at 51,398 a second there, against Artemis's 31,221, but delivered fewer, and the event loop running the producer's connection was saturated.
 
-Its peak memory is higher on non-persistent Core (663 against 605 MiB) and persistent AMQP (1,156 against 586 MiB). This is not memory per message, which is about 2 KB in both. It is a backlog that the benchmark's client leaves behind.
-
-- **The client is the limit.** Its producer and consumer share the client's four CPUs, and in these runs the client used all of them.
-- **Saranga takes sends faster than that client can receive them.** The producer then gets more of the client's CPU, its consumer falls behind, and the difference waits in the broker.
-- **In these two scenarios, Artemis takes sends no faster than the client receives them**, so nothing accumulates.
-
-Saranga still delivers more messages a second than Artemis in each of these runs:
+Its peak memory is higher on non-persistent Core (857 against 618 MiB) and persistent AMQP (1,186 against 585 MiB). This is not memory per message, which is about 2 KB in both. It is a backlog: Saranga took sends faster than the Java client's consumer received them, and the difference waited in the broker. In these two scenarios Artemis took sends no faster than they were received, so nothing accumulated:
 
 | Scenario         | Broker  | Sent/s | Received/s | Backlog grows by |
 | ---------------- | ------- | ------ | ---------- | ---------------- |
-| Core             | Artemis | 74,608 | 74,607     | 0/s              |
-| Core             | Saranga | 84,941 | 80,232     | 4,709/s          |
-| AMQP, persistent | Artemis | 27,068 | 27,067     | 0/s              |
-| AMQP, persistent | Saranga | 36,997 | 30,919     | 6,078/s          |
+| Core             | Artemis | 75,684 | 75,688     | 0/s              |
+| Core             | Saranga | 87,151 | 80,959     | 6,192/s          |
+| AMQP, persistent | Artemis | 26,501 | 26,502     | 0/s              |
+| AMQP, persistent | Saranga | 38,154 | 32,216     | 5,938/s          |
 
-Over a 75 s run, that comes to about 350,000 to 460,000 messages held at the peak.
+**Without a JVM in the client.** To find out whether the client was the limit, the Core, STOMP and MQTT scenarios were run again with a client written in Rust, [scripts/bench/load](scripts/bench/load), which keeps at most 1,000 messages sent and not yet received:
+
+| Scenario          | Artemis msg/s | Saranga msg/s | Saranga/Artemis | Artemis p50 / p99 | Saranga p50 / p99 | Artemis CPU a message | Saranga CPU a message |
+| ----------------- | ------------- | ------------- | --------------- | ----------------- | ----------------- | --------------------- | --------------------- |
+| Core              | 92,934        | 176,402       | 1.90            | 121 µs / 389 µs   | 73 µs / 116 µs    | 59 µs                 | 22 µs                 |
+| Core, persistent  | 87,521        | 122,920       | 1.40            | 1.6 ms / 12.0 ms  | 1.2 ms / 10.8 ms  | 67 µs                 | 18 µs                 |
+| STOMP             | 90,223        | 139,747       | 1.55            | 75 µs / 173 µs    | 56 µs / 113 µs    | 42 µs                 | 25 µs                 |
+| STOMP, persistent | 72,179        | 96,565        | 1.34            | 4.1 ms / 12.6 ms  | 1.3 ms / 11.2 ms  | 59 µs                 | 25 µs                 |
+| MQTT, QoS 0       | 94,201        | 159,523       | 1.69            | 83 µs / 293 µs    | 63 µs / 126 µs    | 40 µs                 | 26 µs                 |
+| MQTT, QoS 1       | 44,652        | 96,857        | 2.17            | 2.9 ms / 41.9 ms  | 793 µs / 7.2 ms   | 110 µs                | 45 µs                 |
+
+On Core, Saranga delivered 176,402 messages a second, more than twice what the JMS client received from it, with 65 MiB at the peak: the JMS client, not the broker, set Saranga's Core figure. Artemis went from 75,688 to 92,934. On STOMP and MQTT the two clients gave about the same figures, so the Java client was not the limit there. The latency and CPU columns are at the same rate for both brokers, half the lower throughput, as above.
 
 Runs on this machine vary by up to 5%. The method, the machine and how to run [scripts/bench.sh](https://github.com/grepjava/saranga/blob/main/scripts/bench.sh) yourself are in [docs/benchmarks.md](docs/benchmarks.md).
 
