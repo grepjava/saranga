@@ -21,6 +21,7 @@ How Saranga treats an acceptor:
 - **Protocols.** Saranga serves all six of Artemis's: `CORE`, `AMQP`, `STOMP`, `HORNETQ`, `MQTT` and `OPENWIRE`. A name that is no protocol at all gets Artemis's `AMQ222203` warning and is ignored.
 - **Host names.** A host binds to the first address the name resolves to, IPv4 first, as Java's `InetAddress.getByName` does. So `localhost` means 127.0.0.1.
 - **Socket options.** `tcpNoDelay`, `tcpSendBufferSize` and `tcpReceiveBufferSize` are honoured. Netty's own options, such as `useEpoll`, are accepted and have no effect.
+- **Remoting threads.** As in Artemis, each connection runs on one of the acceptor's event loops, taken in turn: `remotingThreads` (or `nioRemotingThreads`) of them. The default is one a processor, where Artemis has three. A loop's thread starts with its first connection. What a connection creates, such as a queue it auto-creates, stays on that connection's loop.
 - **Address prefixes.** `anycastPrefix` and `multicastPrefix` work on every protocol, as in Artemis.
 - **Handshake timeout.** `handshake-timeout` (10 seconds by default) closes a connection that does not send enough bytes to be recognised.
 - **Connection routers.** `router` names the connection router that routes the acceptor's connections. See [Connection routers](clustering.md#connection-routers).

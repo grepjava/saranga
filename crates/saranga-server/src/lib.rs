@@ -19,6 +19,7 @@ pub mod discovery;
 pub mod disk;
 pub mod duplicate;
 pub mod error;
+mod event_loops;
 pub mod federation;
 pub mod grouping;
 pub mod interceptor;
@@ -1596,25 +1597,29 @@ impl Broker {
     }
 
     /// Accepts connections the way `acceptor` says: with TLS, under a
-    /// security domain, for the protocols it enables.
+    /// security domain, for the protocols it enables. They run on the
+    /// caller's runtime, not on event loops.
     pub async fn serve_acceptor(
         self: Arc<Self>,
         listener: TcpListener,
         acceptor: Acceptor,
     ) -> std::io::Result<()> {
         let closing = Arc::new(tokio::sync::Notify::new());
-        self.serve_shared(listener, Arc::new(acceptor), closing)
+        self.serve_shared(listener, Arc::new(acceptor), closing, None)
             .await;
         Ok(())
     }
 
-    /// Accepts until aborted. `closing` ends the connections still in
-    /// their TLS handshake or protocol detection; the others are failed.
+    /// Accepts until aborted, each connection on the next of `loops`, or
+    /// on the current runtime without them. `closing` ends the connections
+    /// still in their TLS handshake or protocol detection; the others are
+    /// failed.
     async fn serve_shared(
         self: Arc<Self>,
         listener: TcpListener,
         acceptor: Arc<Acceptor>,
         closing: Arc<tokio::sync::Notify>,
+        loops: Option<event_loops::EventLoops>,
     ) {
         // NettyAcceptor.start: ACCEPTOR_STARTED with the port it listens on.
         let port = listener
@@ -1656,7 +1661,7 @@ impl Broker {
             let broker = self.clone();
             let acceptor = acceptor.clone();
             let closing = closing.clone();
-            tokio::spawn(async move {
+            let connection = move |stream: tokio::net::TcpStream| async move {
                 let closed = closing.notified();
                 let context = audit::Context::Remote(info.remote_address.clone());
                 let detector = broker.clone();
@@ -1691,7 +1696,13 @@ impl Broker {
                     }
                 };
                 audit::scoped(context, serve).await;
-            });
+            };
+            match &loops {
+                Some(loops) => loops.spawn(stream, connection),
+                None => {
+                    tokio::spawn(connection(stream));
+                }
+            }
         }
     }
 }

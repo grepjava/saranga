@@ -239,13 +239,18 @@ impl Broker {
                     .map(|(_, p)| p.params_text())
                     .unwrap_or_default();
                 tracing::error!("AMQ224104: Error starting the Acceptor {} {params}", r.name);
-                // The IllegalStateException NettyAcceptor.start throws.
+                // The IllegalStateException NettyAcceptor.start throws, or
+                // the IllegalArgumentException of its event loop group.
                 first_error.get_or_insert_with(|| {
-                    format!(
-                        "java.lang.IllegalStateException: {}\nCaused by: {}",
-                        failed_to_bind(&r),
-                        bind_exception(&e)
-                    )
+                    if e.kind() == std::io::ErrorKind::InvalidInput {
+                        format!("java.lang.IllegalArgumentException: {e}")
+                    } else {
+                        format!(
+                            "java.lang.IllegalStateException: {}\nCaused by: {}",
+                            failed_to_bind(&r),
+                            bind_exception(&e)
+                        )
+                    }
                 });
             }
         }
@@ -258,6 +263,8 @@ impl Broker {
         if running.listening().is_some() {
             return Ok(());
         }
+        // The event loop group is made before the bind.
+        let loops = crate::event_loops::remoting_threads(&running.acceptor.params)?;
         let listener = bind(&running.address).await?;
         // Artemis's log ID, so log-based tooling keeps working (ADR 0003).
         let names: Vec<&str> = self
@@ -274,6 +281,7 @@ impl Broker {
             listener,
             running.acceptor.clone(),
             running.closing.clone(),
+            Some(crate::event_loops::EventLoops::new(loops)),
         ));
         *running.listening() = Some(task);
         Ok(())
@@ -298,7 +306,13 @@ impl Broker {
     /// `AcceptorControl.start`.
     pub async fn start_acceptor(self: &Arc<Self>, name: &str) -> Result<(), String> {
         let r = self.acceptors.find(name).ok_or_else(|| unknown(name))?;
-        self.listen(&r).await.map_err(|_| failed_to_bind(&r))
+        self.listen(&r).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                e.to_string()
+            } else {
+                failed_to_bind(&r)
+            }
+        })
     }
 
     /// `AcceptorControl.stop`: ACCEPTOR_STOPPED, then no more connections,
@@ -346,11 +360,14 @@ impl Broker {
             tls.reload().map_err(|e| e.to_string())?;
         }
         if was_listening {
+            let loops = crate::event_loops::remoting_threads(&r.acceptor.params)
+                .map_err(|e| e.to_string())?;
             let listener = bind(&r.address).await.map_err(|_| failed_to_bind(&r))?;
             let task = tokio::spawn(self.clone().serve_shared(
                 listener,
                 r.acceptor.clone(),
                 r.closing.clone(),
+                Some(crate::event_loops::EventLoops::new(loops)),
             ));
             *r.listening() = Some(task);
         }
