@@ -47,7 +47,7 @@ Both brokers ran on the same machine, with the same clients, in instances made b
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench/throughput-dark.svg">
-  <img alt="Throughput as a multiple of Artemis's, each broker's best figure with either client: Saranga is faster in all 12 scenarios, from 1.18 times on AMQP with 1 MiB messages to 2.35 times on persistent OpenWire, and 1.22 times on non-persistent AMQP." src="docs/images/bench/throughput.svg">
+  <img alt="Saranga's throughput as a multiple of Artemis's with the same client. With the Java clients it is faster in 11 of 12 scenarios and 0.93 times on non-persistent AMQP, where the client was the limit; with the Rust clients it is faster in all 8 they run, from 1.22 times on AMQP to 2.36 times on persistent AMQP." src="docs/images/bench/throughput.svg">
 </picture>
 
 <picture>

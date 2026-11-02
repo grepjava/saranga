@@ -46,18 +46,22 @@ const NAMES = {
   "mqtt-persistent": "MQTT, QoS 1",
 };
 
-// The reference palette's tokens: Saranga takes categorical slot 1 (blue),
-// Artemis slot 2 (orange), validated in both modes.
+// The reference palette's tokens, its first two categorical slots (blue and
+// orange) validated in both modes.
 const THEMES = {
   light: {
     surface: "#fcfcfb", primary: "#0b0b0b", secondary: "#52514e", muted: "#898781",
-    grid: "#e1e0d9", axis: "#c3c2b7", saranga: "#2a78d6", artemis: "#eb6834",
+    grid: "#e1e0d9", axis: "#c3c2b7", blue: "#2a78d6", orange: "#eb6834",
   },
   dark: {
     surface: "#1a1a19", primary: "#f0efec", secondary: "#c3c2b7", muted: "#898781",
-    grid: "#2c2c2a", axis: "#383835", saranga: "#3987e5", artemis: "#d95926",
+    grid: "#2c2c2a", axis: "#383835", blue: "#3987e5", orange: "#d95926",
   },
 };
+// Each series' colour: Artemis blue and Saranga orange; in the chart of the
+// two clients, the Java client blue and the Rust client orange.
+const COLOURS = { Artemis: "blue", Saranga: "orange", "Java client": "blue", "Rust client": "orange" };
+const colour = (t, name) => t[COLOURS[name]];
 
 const W = 760;
 const LABEL_W = 200; // the scenario names
@@ -96,7 +100,7 @@ function panel(t, p, top) {
   const thick = series.length > 1 ? 14 : 16;
   const gap = 2; // the surface between a row's bars
   const band = series.length * thick + (series.length - 1) * gap + 14;
-  const max = Math.max(p.ref ?? 0, ...p.rows.flatMap((r) => r.values));
+  const max = Math.max(p.ref ?? 0, ...p.rows.flatMap((r) => r.values).filter((v) => v !== undefined));
   const tk = ticks(max);
   const x0 = LABEL_W, x1 = W - RIGHT;
   const x = (v) => x0 + (v / tk.at(-1)) * (x1 - x0);
@@ -124,7 +128,12 @@ function panel(t, p, top) {
     r.values.forEach((v, j) => {
       const yy = by + j * (thick + gap);
       const name = series[j];
-      s += bar(x0, yy, Math.max(0, x(v) - x0), thick, t[name.toLowerCase()], `${r.label}, ${name}: ${p.value(v)}`);
+      if (v === undefined) {
+        // Not run with that series: said, not drawn.
+        s += `<text x="${x0 + 6}" y="${yy + thick / 2 + 4}" font-size="11.5" fill="${t.muted}">${esc(p.missing ?? "not run")}</text>`;
+        return;
+      }
+      s += bar(x0, yy, Math.max(0, x(v) - x0), thick, colour(t, name), `${r.label}, ${name}: ${p.value(v)}`);
       // A value ending just short of the reference line is written past it.
       const lx = p.ref !== undefined && v < p.ref && x(p.ref) - x(v) < 40 ? x(p.ref) + 6 : x(v) + 6;
       s += `<text x="${lx}" y="${yy + thick / 2 + 4}" font-size="11.5" fill="${t.secondary}" stroke="${t.surface}" stroke-width="3" paint-order="stroke" style="font-variant-numeric: tabular-nums">${esc(p.value(v))}</text>`;
@@ -148,7 +157,7 @@ function chart(t, c) {
     y += 6;
     let lx = 24;
     for (const name of series) {
-      s += `<rect x="${lx}" y="${y + 2}" width="12" height="12" rx="3" fill="${t[name.toLowerCase()]}"/>`;
+      s += `<rect x="${lx}" y="${y + 2}" width="12" height="12" rx="3" fill="${colour(t, name)}"/>`;
       s += `<text x="${lx + 18}" y="${y + 12}" font-size="12.5" fill="${t.primary}">${esc(name)}</text>`;
       lx += 18 + name.length * 7.5 + 22;
     }
@@ -168,7 +177,7 @@ function chart(t, c) {
   }
   const h = y + 8;
   const desc = c.panels
-    .flatMap((p) => p.rows.map((r) => `${p.title ? p.title + ", " : ""}${r.label}: ${r.values.map((v, j) => `${p.series[j]} ${p.value(v)}`).join(", ")}`))
+    .flatMap((p) => p.rows.map((r) => `${p.title ? p.title + ", " : ""}${r.label}: ${r.values.map((v, j) => `${p.series[j]} ${v === undefined ? (p.missing ?? "not run") : p.value(v)}`).join(", ")}`))
     .join("; ");
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${h}" viewBox="0 0 ${W} ${h}" role="img" aria-labelledby="title desc" font-family='${FONT}'>
 <title id="title">${esc(c.title)}</title>
@@ -189,18 +198,19 @@ const charts = {};
 const unbounded = ["core", "core-persistent", "core-large", "amqp", "amqp-persistent", "amqp-large",
   "openwire", "openwire-persistent", "stomp", "stomp-persistent", "mqtt", "mqtt-persistent"]
   .filter((s) => java[s]?.saranga?.throughput && java[s]?.artemis?.throughput);
-// Each broker's best figure from either client, so neither is judged by a
-// client that held it back.
-const best = (s, kind) => Math.max(java[s][kind].throughput, rust?.[s]?.[kind]?.throughput ?? 0);
+// Saranga's throughput over Artemis's with the same client: the Java
+// clients, and the Rust ones where there are.
+const ratio = (r, s) => (r?.[s]?.saranga?.throughput && r?.[s]?.artemis?.throughput
+  ? r[s].saranga.throughput / r[s].artemis.throughput : undefined);
 charts.throughput = {
   title: "Throughput: Saranga against Artemis",
-  subtitle: [`Messages received a second with an unbounded producer, as a multiple of Artemis's${rust ? ", each broker's" : "."}`,
-    ...(rust ? ["best figure with either client (Java or Rust). Past the line Saranga is faster; short of it, slower."]
-      : ["Past the line Saranga is faster; short of it, slower."])],
+  subtitle: ["Messages received a second with an unbounded producer, Saranga's as a multiple of Artemis's with the same",
+    "client. Past the line Saranga is faster; short of it, slower."],
   panels: [{
-    series: ["Saranga"],
-    rows: unbounded.map((s) => ({ label: NAMES[s], values: [best(s, "saranga") / best(s, "artemis")] })),
+    series: rust ? ["Java client", "Rust client"] : ["Java client"],
+    rows: unbounded.map((s) => ({ label: NAMES[s], values: rust ? [ratio(java, s), ratio(rust, s)] : [ratio(java, s)] })),
     ref: 1, refLabel: "Artemis",
+    missing: "no Rust client",
     tick: (v) => `${v}×`, value: (v) => `${v.toFixed(2)}×`,
   }],
 };

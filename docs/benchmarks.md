@@ -34,7 +34,7 @@ The machine was a dedicated Linux box (Ubuntu 26.10, kernel 7.3) with an i5-8250
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/bench/throughput-dark.svg">
-  <img alt="Throughput as a multiple of Artemis's in each unbounded scenario, each broker's best figure with either client" src="images/bench/throughput.svg">
+  <img alt="Saranga's throughput as a multiple of Artemis's in each unbounded scenario, with the Java clients and, where there is one, the Rust client" src="images/bench/throughput.svg">
 </picture>
 
 <picture>
