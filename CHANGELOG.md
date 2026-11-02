@@ -2,6 +2,37 @@
 
 Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Artemis 2.57.0 and works interchangeably with it. [COMPAT.md](COMPAT.md) lists where the two differ.
 
+## 1.2.0 (2026-11-02)
+
+Faster under load, connection routers, and the rest of Artemis's login modules and SASL mechanisms.
+
+### Performance
+
+- **Connections run on event loops**, as Netty runs Artemis's: each connection an acceptor takes runs on one of `remotingThreads` (or `nioRemotingThreads`) single-threaded loops, with what it creates. The default is one a processor, where Artemis has three (see COMPAT.md). A delivery no longer moves between threads at each step, and p50 latency is now lower than Artemis's in every benchmark scenario, OpenWire, STOMP and MQTT without persistence included.
+- **Cheaper hot paths**: sends and acknowledgements with no journal write, Core responses written straight to the socket, routing to a lone queue, paging checks, the journal's maps, and AMQP transfers sent without copying. A non-persistent message no longer overtakes a persistent one sent before it on the same session, as in Artemis.
+- **Benchmarks** rerun, with charts in the README and docs/benchmarks.md, and a second run with clients written in Rust (`CLIENT=rust scripts/bench.sh`), which showed that the JVM clients, not the broker, set Saranga's Core and AMQP figures.
+
+### Connection routers
+
+- **An acceptor's `router`** routes each connection, once authenticated, by client ID, user, role, source address or TLS SNI host, with Artemis's five policies, pools of static connectors, discovery groups or cluster connections, a cache that can be persisted, and the redirects each protocol's clients follow (Core, AMQP, MQTT 5 and OpenWire). `ConnectionRouterControl` answers over management messages and Jolokia. `saranga-client` follows a Core redirect as the Java client does.
+
+### Security
+
+- **Login modules**: `OIDCLoginModule`, `KubernetesLoginModule`, `PrincipalConversionLoginModule` and the JDK's `Krb5LoginModule` with Artemis's own `Krb5LoginModule`, as Artemis 2.57.0 has them. The system's Kerberos library (MIT Kerberos, or SSPI on Windows) is loaded when first used.
+- **`LDAPLoginModule`** binds with GSSAPI (`authentication=GSSAPI`), over `ldap://` and `ldaps://`.
+- **AMQP SASL**: `GSSAPI`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `OAUTHBEARER` and `XOAUTH2`.
+
+### Protocols
+
+- **AMQP**: `maxTransfersPerDelivery`, and the broker's Open gives `failover-server-list` when this node has a backup.
+- **OpenWire**: the slow-consumer advisory, `updateClusterClients` and `rebalanceClusterClients`, and a `ConsumerControl` with prefetch 0 for a queue whose `queuePrefetch` is 0 (now taken from broker properties).
+- **WebSockets**: `webSocketCompressionSupported` (permessage-deflate and deflate-frame).
+- **Interceptors**: `<remoting-incoming-interceptors>` and `<remoting-outgoing-interceptors>` name interceptors an embedding application registers.
+
+### Packaging
+
+- **A FreeBSD image** for podman with ocijail: `docker/Dockerfile.freebsd`.
+
 ## 1.1.0 (2026-10-23)
 
 Saranga's own console.
