@@ -248,7 +248,7 @@ if (java.startup) {
 
 if (rust) {
   const rows = [];
-  for (const s of ["core", "core-persistent", "stomp", "mqtt"]) {
+  for (const s of ["core", "core-persistent", "amqp", "amqp-persistent", "stomp", "mqtt"]) {
     for (const [client, r] of [["Java client", java], ["Rust client", rust]]) {
       if (r[s]?.saranga?.throughput && r[s]?.artemis?.throughput) {
         rows.push({ label: `${NAMES[s]}, ${client}`, values: [r[s].saranga.throughput, r[s].artemis.throughput] });
@@ -258,7 +258,8 @@ if (rust) {
   charts.clients = {
     title: "Throughput with a JVM client and with a Rust one",
     subtitle: ["Messages received a second with an unbounded producer: higher is better.",
-      "The Java clients are Artemis's perf client for Core and Load.java for STOMP and MQTT."],
+      "The Java clients are Artemis's perf client for Core and AMQP and Load.java for STOMP and MQTT; the Rust ones,",
+      "scripts/bench/load for Core, STOMP and MQTT and saranga perf client for AMQP."],
     panels: [{ series: SA, rows, tick: (v) => (v >= 1000 ? `${v / 1000}K` : `${v}`), value: n }],
   };
 }

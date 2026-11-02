@@ -26,12 +26,13 @@
 # and not yet received, over the ActiveMQ 5 JMS client for OpenWire and
 # plain STOMP 1.2 and MQTT 3.1.1 over a socket.
 #
-# CLIENT=rust gives both brokers scripts/bench/load instead, Load.java's
-# work without a JVM (LOAD_BIN, else built with cargo), in the scenarios it
-# speaks: core and core-persistent (through saranga-client, with Load.java's
-# bound of LOAD_INFLIGHT sent and not yet received rather than the perf
-# client's MAX_PENDING), stomp, stomp-persistent, mqtt and mqtt-persistent,
-# which are its default.
+# CLIENT=rust runs clients without a JVM, in core and core-persistent,
+# amqp and amqp-persistent, stomp, stomp-persistent, mqtt and
+# mqtt-persistent, which are its default: scripts/bench/load, Load.java's
+# work in Rust (LOAD_BIN, else built with cargo), for Core (through
+# saranga-client, with Load.java's bound of LOAD_INFLIGHT sent and not yet
+# received rather than the perf client's MAX_PENDING), STOMP and MQTT, and
+# for AMQP "saranga perf client", Saranga's port of Artemis's perf client.
 #
 # DURATION (default 60) and WARMUP (default 15) are each run's seconds;
 # STARTS (default 5); NUM_QUEUES (default 100); MAX_PENDING (default 100),
@@ -59,7 +60,7 @@ ALL="core core-persistent amqp amqp-persistent core-large amqp-large many-queues
 CLIENT="${CLIENT:-java}"
 case "$CLIENT" in
   java) ;;
-  rust) ALL="core core-persistent stomp stomp-persistent mqtt mqtt-persistent" ;;
+  rust) ALL="core core-persistent amqp amqp-persistent stomp stomp-persistent mqtt mqtt-persistent" ;;
   *) echo "CLIENT is java or rust" >&2; exit 2 ;;
 esac
 SCENARIOS="${*:-$ALL}"
@@ -157,7 +158,10 @@ perf() {
     many-queues) persistent=(--persistent) dests=(--num-destinations "$NUM_QUEUES") spread=(--threads 2) ;;
   esac
   local out="$WORK/runs/$scenario-$kind-$run"
-  taskset -c "$CLIENT_CPUS" "$ARTEMIS" perf client --protocol "$protocol" --url "$url" \
+  # Under CLIENT=rust, saranga's own perf client, Artemis's in Rust.
+  local perf_client=("$ARTEMIS" perf client)
+  [[ "$CLIENT" == rust ]] && perf_client=("$SARANGA" perf client)
+  taskset -c "$CLIENT_CPUS" "${perf_client[@]}" --protocol "$protocol" --url "$url" \
     --user admin --password admin --message-size "$size" "${persistent[@]}" "${dests[@]}" "${spread[@]}" \
     --max-pending "$MAX_PENDING" --duration "$((WARMUP + DURATION))" --warmup "$WARMUP" \
     --json "$out.json" "$@" queue://BENCH > "$out.out" 2>&1 &

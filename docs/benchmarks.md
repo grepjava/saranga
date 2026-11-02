@@ -9,7 +9,7 @@ Saranga against Apache Artemis 2.57.0, on the same machine and in the same scena
   - Artemis's perf client speaks no other protocol, so for OpenWire, STOMP and MQTT both brokers get [scripts/bench/Load.java](https://github.com/grepjava/saranga/blob/main/scripts/bench/Load.java). It runs a producer and a consumer on one queue with 1 KiB messages, with at most 1,000 sent and not yet received.
     - OpenWire goes through the ActiveMQ 5 JMS client in Artemis's `lib`.
     - STOMP 1.2 and MQTT 3.1.1 go over a plain socket. The STOMP producer asks for a receipt every 100 sends, with up to 10 outstanding. The MQTT producer has up to 100 QoS 1 sends unacknowledged.
-  - **A second run without a JVM in the client.** [scripts/bench/load](https://github.com/grepjava/saranga/tree/main/scripts/bench/load) does Load.java's work in Rust, for Core (through saranga-client, Saranga's Core client, which speaks to Artemis as to Saranga), STOMP and MQTT. Its Core producer sends BYTES messages, as the perf client does, and its consumer acknowledges each one, with at most 1,000 sent and not yet received. It does not speak AMQP or OpenWire.
+  - **A second run without a JVM in the client.** [scripts/bench/load](https://github.com/grepjava/saranga/tree/main/scripts/bench/load) does Load.java's work in Rust, for Core (through saranga-client, Saranga's Core client, which speaks to Artemis as to Saranga), STOMP and MQTT. Its Core producer sends BYTES messages, as the perf client does, and its consumer acknowledges each one, with at most 1,000 sent and not yet received. It does not speak AMQP or OpenWire. For AMQP the second run uses `saranga perf client`, Saranga's port of Artemis's perf client, with the same options as the first. OpenWire has no Rust client here.
 - **Instances made by each broker's own `create`**, with `--nio --no-autotune --no-web` and otherwise their defaults. Both use the NIO journal, which is the one Saranga writes, with `journal-datasync` on. Artemis has its default heap (`-Xms512M -Xmx2G`).
 - **Separate cores.** The broker runs on half the CPUs and the client on the other half (`taskset`). Both brokers run from a copy on the same local file system, and every run starts on an empty data directory.
 - **Throughput:** messages received a second with the producer unbounded. It is the mean of the per-second samples from the end of a 15 s warmup to the producer's last send, over 60 s of sending. The backlog a broker drains after the producer stops is not counted.
@@ -77,7 +77,7 @@ In `mqtt-persistent`'s latency run, neither broker quite kept the rate: Artemis 
 
 ### With the Rust client
 
-The same scenarios, where [scripts/bench/load](https://github.com/grepjava/saranga/tree/main/scripts/bench/load) speaks the protocol (`CLIENT=rust`):
+The scenarios a Rust client speaks (`CLIENT=rust`): [scripts/bench/load](https://github.com/grepjava/saranga/tree/main/scripts/bench/load) for Core, STOMP and MQTT, and `saranga perf client` for AMQP. The AMQP rows are from a run of those two scenarios later the same day.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/bench/clients-dark.svg">
@@ -93,6 +93,8 @@ The same scenarios, where [scripts/bench/load](https://github.com/grepjava/saran
 |---|---|---|---|---|---|---|---|---|---|---|
 | core | 92,934 | 176,402 | 1.90 | 46,467 | 121 us / 389 us | 73 us / 116 us | 59 us | 22 us | 611 MiB | 65 MiB |
 | core-persistent | 87,521 | 122,920 | 1.40 | 43,760 | 1.6 ms / 12.0 ms | 1.2 ms / 10.8 ms | 67 us | 18 us | 597 MiB | 100 MiB |
+| amqp | 52,685 | 64,457 | 1.22 | 26,342 | 123 us / 369 us | 115 us / 245 us | 77 us | 53 us | 571 MiB | 65 MiB |
+| amqp-persistent | 18,651 | 44,020 | 2.36 | 9,325 | 2.8 ms / 4.5 ms | 1.2 ms / 2.5 ms | 93 us | 52 us | 582 MiB | 87 MiB |
 | stomp | 90,223 | 139,747 | 1.55 | 45,111 | 75 us / 173 us | 56 us / 113 us | 42 us | 25 us | 647 MiB | 55 MiB |
 | stomp-persistent | 72,179 | 96,565 | 1.34 | 36,089 | 4.1 ms / 12.6 ms | 1.3 ms / 11.2 ms | 59 us | 25 us | 668 MiB | 105 MiB |
 | mqtt | 94,201 | 159,523 | 1.69 | 47,100 | 83 us / 293 us | 63 us / 126 us | 40 us | 26 us | 593 MiB | 63 MiB |
@@ -104,17 +106,17 @@ In `mqtt-persistent`'s latency run, Artemis received 21,816 msg/s and Saranga 22
 
 - **Throughput.**
   - With the Java clients it is higher for Saranga in 11 of the 12 unbounded scenarios: 7% on Core, 18 to 34% with persistent Core and AMQP and with large messages, 28 to 66% on OpenWire, STOMP and MQTT, and 2.1 and 2.35 times on persistent MQTT and OpenWire. Both keep up with 100 queues at 10,000 messages a second.
-  - On non-persistent AMQP it is 7% lower. Saranga took sends at 51,398 a second there, against Artemis's 31,221, but delivered 29,166, and the backlog grew. The event loop running the producer's connection was saturated: decoding, routing and, once the backlog passed `global-max-size`, paging.
-  - With the Rust client it is 1.34 to 2.17 times Artemis's. On Core it is 176,402 a second, where the Java client got 80,959: on Core the JMS client, not the broker, set Saranga's figure. Artemis gains less from the change (75,688 to 92,934). On STOMP and MQTT both clients give about the same figures for both brokers, so Load.java was not the limit there.
+  - On non-persistent AMQP it is 7% lower, and the client, not the broker, was the limit: the Qpid JMS client used 387% of its four CPUs and its consumer received about 30,000 a second from either broker. Saranga took sends at 51,398 a second, against Artemis's 31,221, and the rest waited in it. In a shorter run the same day Saranga came out ahead (30,889 against 30,051), and at a fixed 30,000 a second Saranga kept up while Artemis fell behind.
+  - With the Rust clients it is 1.22 to 2.36 times Artemis's. On AMQP it is 64,457 a second against 52,685, and 44,020 persistent against 18,651; Artemis's persistent AMQP figure was higher with Qpid JMS (26,502), and against that Saranga's is 1.66 times. On Core it is 176,402 a second, where the Java client got 80,959: on Core the JMS client, not the broker, set Saranga's figure. Artemis gains less from the change (75,688 to 92,934). On STOMP and MQTT both clients give about the same figures for both brokers, so Load.java was not the limit there.
 - **Startup** is about 14 times faster, at a fifth of the memory. It varies from start to start: the medians in the two runs were 190 and 169 ms, and 143 ms in the previous run.
 - **CPU a message at the same rate.**
   - It is lower for Saranga in every scenario, with either client: by 43 to 60% with persistent and large messages, 37% with 100 queues, 34 to 47% on non-persistent Core, OpenWire, STOMP and MQTT, and 22% on non-persistent AMQP. With the Rust client, 63% lower on non-persistent Core and 73% on persistent Core.
 - **Latency at the same rate.**
-  - Without persistence, p50 is 9 to 26% lower with the Java clients and 24 to 40% lower with the Rust client.
+  - Without persistence, p50 is 9 to 26% lower with the Java clients and 7 to 40% lower with the Rust clients.
   - With persistent 1 KiB messages, p50 is 28 to 44% of Artemis's, and a little over half on persistent OpenWire. Persistent Core with the Rust client is the exception: Artemis's p50 was 1.6 ms there, and Saranga's 1.2 ms.
   - With large messages it is 12 and 22% lower, and with 100 queues a third of Artemis's (Artemis's was 1.1 ms in the previous run, so that one moves a lot).
   - p99 is lower in every scenario, with either client. `amqp-persistent`'s p99 moves a lot from run to run: in an earlier run, Artemis's was 36.6 ms and Saranga's 6.9 ms.
-- **Peak memory** is a twentieth to a fifth of Artemis's on OpenWire, STOMP and MQTT, an eighth to a quarter with large messages and many queues, and two fifths with persistent Core. With the Rust client, which bounds what is sent and not yet received, it is 65 and 100 MiB on Core. With the Java clients, where the producer outran the consumer during the run, a backlog of messages was held in memory, and the peaks are high:
+- **Peak memory** is a twentieth to a fifth of Artemis's on OpenWire, STOMP and MQTT, an eighth to a quarter with large messages and many queues, and two fifths with persistent Core. With the Rust clients, under which no backlog formed, it is 65 and 100 MiB on Core and 65 and 87 MiB on AMQP. With the Java clients, where the producer outran the consumer during the run, a backlog of messages was held in memory, and the peaks are high:
   - Saranga's non-persistent Core and AMQP;
   - Saranga's persistent AMQP.
 
@@ -129,6 +131,6 @@ In `mqtt-persistent`'s latency run, Artemis received 21,816 msg/s and Saranga 22
 
 The script runs on Linux. It needs the Artemis distribution that `scripts/build-artemis.sh` builds, and Java 17 or later. `WORK` should be on a local file system: in WSL, not under `/mnt`. `DURATION`, `WARMUP`, `STARTS`, `NUM_QUEUES`, `MANY_RATE`, `MAX_PENDING`, `LOAD_INFLIGHT`, `BROKER_CPUS` and `CLIENT_CPUS` change the runs. On a machine without Rust, `SARANGA_BIN` names a `saranga` binary built elsewhere, and `ARTEMIS_DIST` the Artemis distribution. The results are written to `$WORK/results.md` and `$WORK/results.tsv`, and each run's client output and report to `$WORK/runs`.
 
-`CLIENT=rust` runs the Rust client's six scenarios instead, building it with cargo unless `LOAD_BIN` names a `load` binary built elsewhere.
+`CLIENT=rust` runs the eight scenarios with Rust clients instead: `saranga perf client` for AMQP, and scripts/bench/load for the rest, built with cargo unless `LOAD_BIN` names a `load` binary built elsewhere.
 
 The charts are drawn from the results by [scripts/bench/charts.mjs](https://github.com/grepjava/saranga/blob/main/scripts/bench/charts.mjs), with Node.js: `node scripts/bench/charts.mjs JAVA_RESULTS.tsv [RUST_RESULTS.tsv] docs/images/bench` writes each as an SVG for a light page and another for a dark one.
