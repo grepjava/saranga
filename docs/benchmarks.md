@@ -32,6 +32,26 @@ The machine was a dedicated Linux box (Ubuntu 26.10, kernel 7.3) with an i5-8250
 
 ### With the Java clients
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/bench/throughput-dark.svg">
+  <img alt="Throughput as a multiple of Artemis's in each unbounded scenario" src="images/bench/throughput.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/bench/latency-dark.svg">
+  <img alt="p50 latency of each broker at the same rate, without persistence and persistent" src="images/bench/latency.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/bench/cpu-dark.svg">
+  <img alt="Broker CPU a message of each broker at the same rate" src="images/bench/cpu.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/bench/startup-dark.svg">
+  <img alt="Startup time and resident memory of each broker" src="images/bench/startup.svg">
+</picture>
+
 | Startup | Artemis | Saranga |
 |---|---|---|
 | Time to the acceptor (median of 5) | 2,735 ms | 190 ms |
@@ -58,6 +78,11 @@ In `mqtt-persistent`'s latency run, neither broker quite kept the rate: Artemis 
 ### With the Rust client
 
 The same scenarios, where [scripts/bench/load](https://github.com/grepjava/saranga/tree/main/scripts/bench/load) speaks the protocol (`CLIENT=rust`):
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/bench/clients-dark.svg">
+  <img alt="Throughput of each broker with the Java clients and with the Rust client" src="images/bench/clients.svg">
+</picture>
 
 | Startup | Artemis | Saranga |
 |---|---|---|
@@ -105,3 +130,5 @@ In `mqtt-persistent`'s latency run, Artemis received 21,816 msg/s and Saranga 22
 The script runs on Linux. It needs the Artemis distribution that `scripts/build-artemis.sh` builds, and Java 17 or later. `WORK` should be on a local file system: in WSL, not under `/mnt`. `DURATION`, `WARMUP`, `STARTS`, `NUM_QUEUES`, `MANY_RATE`, `MAX_PENDING`, `LOAD_INFLIGHT`, `BROKER_CPUS` and `CLIENT_CPUS` change the runs. On a machine without Rust, `SARANGA_BIN` names a `saranga` binary built elsewhere, and `ARTEMIS_DIST` the Artemis distribution. The results are written to `$WORK/results.md` and `$WORK/results.tsv`, and each run's client output and report to `$WORK/runs`.
 
 `CLIENT=rust` runs the Rust client's six scenarios instead, building it with cargo unless `LOAD_BIN` names a `load` binary built elsewhere.
+
+The charts are drawn from the results by [scripts/bench/charts.mjs](https://github.com/grepjava/saranga/blob/main/scripts/bench/charts.mjs), with Node.js: `node scripts/bench/charts.mjs JAVA_RESULTS.tsv [RUST_RESULTS.tsv] docs/images/bench` writes each as an SVG for a light page and another for a dark one.

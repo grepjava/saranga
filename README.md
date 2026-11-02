@@ -45,7 +45,57 @@ It is in Saranga 1.1.0 and later; [docs/console-design.md](docs/console-design.m
 
 Both brokers ran on the same machine, with the same clients, in instances made by their own `create`, each on an empty NIO journal with `journal-datasync` on. Messages are 1 KiB except in the large-message rows, which are 1 MiB.
 
-The benchmark machine:
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench/throughput-dark.svg">
+  <img alt="Throughput as a multiple of Artemis's: Saranga is faster in 11 of 12 scenarios, from 1.07 times on Core to 2.35 times on persistent OpenWire, and slower on non-persistent AMQP at 0.93 times." src="docs/images/bench/throughput.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench/latency-dark.svg">
+  <img alt="p50 latency at the same rate: Saranga's is lower in every scenario, 60 against 81 µs on STOMP without persistence and 1.2 against 4.1 ms on persistent Core." src="docs/images/bench/latency.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench/cpu-dark.svg">
+  <img alt="Broker CPU a message at the same rate: Saranga uses less in every scenario, for example 34 against 64 µs on Core and 31 against 77 µs on persistent Core." src="docs/images/bench/cpu.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench/startup-dark.svg">
+  <img alt="Startup: Saranga reaches its acceptor in 190 ms with 42 MiB resident; Artemis in 2,735 ms with 206 MiB." src="docs/images/bench/startup.svg">
+</picture>
+
+### Without a JVM in the client
+
+Artemis's perf client and Load.java run on a JVM, on the client's four CPUs. To find out whether they, rather than the broker, were the limit, the Core, STOMP and MQTT scenarios were run again with a client written in Rust, [scripts/bench/load](scripts/bench/load), which keeps at most 1,000 messages sent and not yet received:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench/clients-dark.svg">
+  <img alt="Throughput with each client: on Core, Saranga goes from 80,959 messages a second with the Java client to 176,402 with the Rust one, and Artemis from 75,688 to 92,934; on STOMP and MQTT both clients give about the same figures." src="docs/images/bench/clients.svg">
+</picture>
+
+On Core, Saranga delivered 176,402 messages a second, more than twice what the JMS client received from it: the JMS client, not the broker, set Saranga's Core figure. Artemis went from 75,688 to 92,934. On STOMP and MQTT the two clients gave about the same figures, so the Java client was not the limit there.
+
+### Where Saranga falls short
+
+**Throughput on non-persistent AMQP**, 0.93 of Artemis's (29,166 messages a second against 31,205). Saranga took the producer's sends faster than Artemis did, 51,398 a second against 31,221, but delivered fewer of them, and the rest waited in the broker. The event loop running the producer's connection was saturated: decoding, routing and, once the backlog passed `global-max-size`, paging.
+
+**Peak memory in two of the Java-client runs**: 857 against 618 MiB on non-persistent Core, and 1,186 against 585 MiB on persistent AMQP. It is not that Saranga needs more memory for a message (about 2 KB in both brokers). It is a backlog:
+
+- The benchmark's producer sends as fast as the broker takes its messages, and its consumer receives as fast as it can. Both share the client's four CPUs.
+- Saranga took sends faster than the JMS consumer could receive them. The messages it had taken and not yet delivered waited in memory, and the queue grew through the run.
+- Artemis took sends no faster than they were received, so nothing accumulated.
+
+| Scenario         | Broker  | Sent/s | Received/s | Backlog grows by |
+| ---------------- | ------- | ------ | ---------- | ---------------- |
+| Core             | Artemis | 75,684 | 75,688     | 0/s              |
+| Core             | Saranga | 87,151 | 80,959     | 6,192/s          |
+| AMQP, persistent | Artemis | 26,501 | 26,502     | 0/s              |
+| AMQP, persistent | Saranga | 38,154 | 32,216     | 5,938/s          |
+
+With a client that keeps up, there is no backlog: with the Rust client, Saranga's peak on Core was 65 MiB, against Artemis's 611 MiB. In production, a queue whose consumers fall behind grows in either broker until `global-max-size`, after which both page to disk.
+
+### The machine and the full figures
 
 |                                |                                                   |
 | ------------------------------ | ------------------------------------------------- |
@@ -56,7 +106,10 @@ The benchmark machine:
 | Storage                        | SATA SSD, ext4                                    |
 | Operating system               | Linux, kernel 7.3, dedicated to the run           |
 | Java (Artemis and the clients) | OpenJDK 25.0.4.1, Artemis with a 2 GiB heap       |
-| Versions                       | Artemis 2.57.0, Saranga at `bfd6752` (2026-11-02)    |
+| Versions                       | Artemis 2.57.0, Saranga at `bfd6752` (2026-11-02) |
+
+<details>
+<summary>Every figure, as tables</summary>
 
 |                     | Artemis  | Saranga |
 | ------------------- | -------- | ------- |
@@ -98,18 +151,7 @@ The benchmark machine:
 | MQTT, QoS 0                  | 47,651      | 41 µs                 | 27 µs                 | 84 µs / 501 µs    | 62 µs / 139 µs    |
 | MQTT, QoS 1                  | 22,436      | 112 µs                | 47 µs                 | 2.9 ms / 13.6 ms  | 805 µs / 7.9 ms   |
 
-Saranga's p50 and p99 are lower in every scenario. Its throughput is lower on non-persistent AMQP (0.93): it took sends at 51,398 a second there, against Artemis's 31,221, but delivered fewer, and the event loop running the producer's connection was saturated.
-
-Its peak memory is higher on non-persistent Core (857 against 618 MiB) and persistent AMQP (1,186 against 585 MiB). This is not memory per message, which is about 2 KB in both. It is a backlog: Saranga took sends faster than the Java client's consumer received them, and the difference waited in the broker. In these two scenarios Artemis took sends no faster than they were received, so nothing accumulated:
-
-| Scenario         | Broker  | Sent/s | Received/s | Backlog grows by |
-| ---------------- | ------- | ------ | ---------- | ---------------- |
-| Core             | Artemis | 75,684 | 75,688     | 0/s              |
-| Core             | Saranga | 87,151 | 80,959     | 6,192/s          |
-| AMQP, persistent | Artemis | 26,501 | 26,502     | 0/s              |
-| AMQP, persistent | Saranga | 38,154 | 32,216     | 5,938/s          |
-
-**Without a JVM in the client.** To find out whether the client was the limit, the Core, STOMP and MQTT scenarios were run again with a client written in Rust, [scripts/bench/load](scripts/bench/load), which keeps at most 1,000 messages sent and not yet received:
+**With the Rust client**, throughput and, at the same rate, latency and CPU a message:
 
 | Scenario          | Artemis msg/s | Saranga msg/s | Saranga/Artemis | Artemis p50 / p99 | Saranga p50 / p99 | Artemis CPU a message | Saranga CPU a message |
 | ----------------- | ------------- | ------------- | --------------- | ----------------- | ----------------- | --------------------- | --------------------- |
@@ -120,7 +162,7 @@ Its peak memory is higher on non-persistent Core (857 against 618 MiB) and persi
 | MQTT, QoS 0       | 94,201        | 159,523       | 1.69            | 83 µs / 293 µs    | 63 µs / 126 µs    | 40 µs                 | 26 µs                 |
 | MQTT, QoS 1       | 44,652        | 96,857        | 2.17            | 2.9 ms / 41.9 ms  | 793 µs / 7.2 ms   | 110 µs                | 45 µs                 |
 
-On Core, Saranga delivered 176,402 messages a second, more than twice what the JMS client received from it, with 65 MiB at the peak: the JMS client, not the broker, set Saranga's Core figure. Artemis went from 75,688 to 92,934. On STOMP and MQTT the two clients gave about the same figures, so the Java client was not the limit there. The latency and CPU columns are at the same rate for both brokers, half the lower throughput, as above.
+</details>
 
 Runs on this machine vary by up to 5%. The method, the machine and how to run [scripts/bench.sh](https://github.com/grepjava/saranga/blob/main/scripts/bench.sh) yourself are in [docs/benchmarks.md](docs/benchmarks.md).
 
