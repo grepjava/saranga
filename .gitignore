@@ -1,4 +1,5 @@
 /target
+/scripts/bench/load/target
 /reference
 /.claude
 tests/golden/data/

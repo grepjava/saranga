@@ -26,6 +26,13 @@
 # and not yet received, over the ActiveMQ 5 JMS client for OpenWire and
 # plain STOMP 1.2 and MQTT 3.1.1 over a socket.
 #
+# CLIENT=rust gives both brokers scripts/bench/load instead, Load.java's
+# work without a JVM (LOAD_BIN, else built with cargo), in the scenarios it
+# speaks: core and core-persistent (through saranga-client, with Load.java's
+# bound of LOAD_INFLIGHT sent and not yet received rather than the perf
+# client's MAX_PENDING), stomp, stomp-persistent, mqtt and mqtt-persistent,
+# which are its default.
+#
 # DURATION (default 60) and WARMUP (default 15) are each run's seconds;
 # STARTS (default 5); NUM_QUEUES (default 100); MAX_PENDING (default 100),
 # the sends a producer has outstanding; BROKER_CPUS and CLIENT_CPUS (default
@@ -49,9 +56,15 @@ BROKER_CPUS="${BROKER_CPUS:-0-$((CPUS / 2 - 1))}"
 CLIENT_CPUS="${CLIENT_CPUS:-$((CPUS / 2))-$((CPUS - 1))}"
 PORT=61616
 ALL="core core-persistent amqp amqp-persistent core-large amqp-large many-queues openwire openwire-persistent stomp stomp-persistent mqtt mqtt-persistent"
+CLIENT="${CLIENT:-java}"
+case "$CLIENT" in
+  java) ;;
+  rust) ALL="core core-persistent stomp stomp-persistent mqtt mqtt-persistent" ;;
+  *) echo "CLIENT is java or rust" >&2; exit 2 ;;
+esac
 SCENARIOS="${*:-$ALL}"
 for s in $SCENARIOS; do
-  [[ " $ALL " == *" $s "* ]] || { echo "unknown scenario: $s" >&2; exit 2; }
+  [[ " $ALL " == *" $s "* ]] || { echo "unknown scenario for the $CLIENT client: $s" >&2; exit 2; }
 done
 [[ "$(uname -s)" == Linux ]] || { echo "bench.sh runs on Linux" >&2; exit 2; }
 [[ -d "$DIST/lib" ]] || { echo "no Artemis distribution at $DIST (scripts/build-artemis.sh)" >&2; exit 2; }
@@ -59,6 +72,10 @@ done
 # SARANGA_BIN: a saranga built elsewhere (a machine without Rust).
 if [[ -z "${SARANGA_BIN:-}" ]]; then
   cargo build -q --release -p saranga-cli --manifest-path "$ROOT/Cargo.toml" || exit 1
+fi
+if [[ "$CLIENT" == rust && -z "${LOAD_BIN:-}" ]]; then
+  CARGO_TARGET_DIR="$TARGET" cargo build -q --release --manifest-path "$ROOT/scripts/bench/load/Cargo.toml" || exit 1
+  LOAD_BIN="$TARGET/release/load"
 fi
 # Both brokers run from the same file system, so neither loads its code
 # from a slower one.
@@ -127,8 +144,8 @@ record() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$RESULTS"; }
 # Runs the perf client: scenario, broker, run name, then its options.
 perf() {
   local scenario="$1" kind="$2" run="$3"; shift 3
-  case "$scenario" in
-    openwire* | stomp* | mqtt*) load "$scenario" "$kind" "$run" "$@"; return ;;
+  case "$CLIENT:$scenario" in
+    *:openwire* | *:stomp* | *:mqtt* | rust:core*) load "$scenario" "$kind" "$run" "$@"; return ;;
   esac
   local protocol=core url="tcp://localhost:$PORT" size=1024 persistent=() dests=() spread=()
   case "$scenario" in
@@ -156,8 +173,9 @@ perf() {
 }
 cpu_ticks() { awk '{ print $14 + $15 }' "/proc/$1/stat" 2>/dev/null || echo 0; }
 
-# Runs Load.java as perf runs the perf client (its options: --rate N or
-# none), leaving its RESULT line in the run's .result file.
+# Runs Load.java (or with CLIENT=rust scripts/bench/load) as perf runs the
+# perf client (its options: --rate N or none), leaving its RESULT line in
+# the run's .result file.
 load() {
   local scenario="$1" kind="$2" run="$3" rate=0 proto persistent=false; shift 3
   [[ "${1:-}" == --rate ]] && rate="$2"
@@ -166,12 +184,20 @@ load() {
     stomp*) proto=stomp ;;
     mqtt-persistent) proto=mqtt1 ;;
     mqtt) proto=mqtt0 ;;
+    core*) proto=core ;;
   esac
   [[ "$scenario" == *-persistent ]] && persistent=true
   local out="$WORK/runs/$scenario-$kind-$run"
-  taskset -c "$CLIENT_CPUS" java -Dinflight="$LOAD_INFLIGHT" -Dpersistent="$persistent" \
-    -cp "$WORK/brokers/dist/lib/*" "$ROOT/scripts/bench/Load.java" \
-    "$proto" 127.0.0.1 "$PORT" "$((WARMUP + DURATION))" "$WARMUP" "$rate" > "$out.out" 2>&1 &
+  if [[ "$CLIENT" == rust ]]; then
+    local opts=(-inflight "$LOAD_INFLIGHT")
+    [[ "$persistent" == true ]] && opts+=(-persistent)
+    taskset -c "$CLIENT_CPUS" "$LOAD_BIN" "${opts[@]}" \
+      "$proto" 127.0.0.1 "$PORT" "$((WARMUP + DURATION))" "$WARMUP" "$rate" > "$out.out" 2>&1 &
+  else
+    taskset -c "$CLIENT_CPUS" java -Dinflight="$LOAD_INFLIGHT" -Dpersistent="$persistent" \
+      -cp "$WORK/brokers/dist/lib/*" "$ROOT/scripts/bench/Load.java" \
+      "$proto" 127.0.0.1 "$PORT" "$((WARMUP + DURATION))" "$WARMUP" "$rate" > "$out.out" 2>&1 &
+  fi
   local client=$!
   sleep $((WARMUP + 3))
   local t0 c0 t1 c1
@@ -212,7 +238,7 @@ report() {
   ' "$1"
 }
 
-echo "Brokers on CPUs $BROKER_CPUS, client on $CLIENT_CPUS; ${DURATION}s runs after ${WARMUP}s warmup"
+echo "Brokers on CPUs $BROKER_CPUS, $CLIENT client on $CLIENT_CPUS; ${DURATION}s runs after ${WARMUP}s warmup"
 for kind in artemis saranga; do make_instance "$kind" || exit 1; done
 
 # Startup, each broker started STARTS times on empty data.

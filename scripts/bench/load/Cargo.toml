@@ -1,0 +1,17 @@
+[package]
+name = "load"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+saranga-client = { path = "../../../crates/saranga-client" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# Not a workspace member: built on its own.
+[workspace]
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
