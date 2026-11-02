@@ -25,52 +25,51 @@ Saranga against Apache Artemis 2.57.0, on the same machine and in the same scena
 
 ## Results
 
-Run on 2026-10-17 at Saranga commit `bc9efdd`, every scenario in one run, with no failures.
+Run on 2026-11-02 at Saranga commit `40329ba`, every scenario in one run, with no failures.
 
-The machine was a dedicated Linux box (kernel 7.0) with an i5-8250U: four cores, eight threads. The broker had CPUs 0, 1, 4 and 5 (two cores and their hyperthreads), and the client the rest. It had 3.3 GiB of memory and ext4 on a SATA SSD. Artemis and the clients ran on OpenJDK 25.0.4.1.
+The machine was a dedicated Linux box (Ubuntu 26.10, kernel 7.3) with an i5-8250U: four cores, eight threads. The broker had CPUs 0, 1, 4 and 5 (two cores and their hyperthreads), and the client the rest. It had 3.3 GiB of memory and ext4 on a SATA SSD. Artemis and the clients ran on OpenJDK 25.0.4.1.
 
 | Startup | Artemis | Saranga |
 |---|---|---|
-| Time to the acceptor (median of 5) | 2,717 ms | 145 ms |
-| Resident memory when started | 209 MiB | 36 MiB |
+| Time to the acceptor (median of 5) | 2,706 ms | 143 ms |
+| Resident memory when started | 209 MiB | 42 MiB |
 
 | Scenario | Artemis msg/s | Saranga msg/s | Saranga/Artemis | Latency at msg/s | Artemis p50 / p99 | Saranga p50 / p99 | Artemis CPU a message | Saranga CPU a message | Artemis peak RSS | Saranga peak RSS |
 |---|---|---|---|---|---|---|---|---|---|---|
-| core | 74,878 | 75,891 | 1.01 | 37,439 | 139 us / 667 us | 156 us / 343 us | 64 us | 59 us | 601 MiB | 881 MiB |
-| core-persistent | 64,674 | 72,621 | 1.12 | 32,337 | 4.1 ms / 15.0 ms | 1.2 ms / 9.1 ms | 77 us | 43 us | 576 MiB | 288 MiB |
-| amqp | 30,961 | 33,155 | 1.07 | 15,480 | 129 us / 329 us | 133 us / 281 us | 81 us | 76 us | 2,238 MiB | 1,577 MiB |
-| amqp-persistent | 27,307 | 31,645 | 1.16 | 13,653 | 3.6 ms / 41.2 ms | 1.6 ms / 36.6 ms | 111 us | 64 us | 591 MiB | 1,116 MiB |
-| core-large | 61 | 78 | 1.28 | 30 | 22.9 ms / 41.2 ms | 17.8 ms / 30.3 ms | 19.4 ms | 10.5 ms | 576 MiB | 81 MiB |
-| amqp-large | 95 | 104 | 1.09 | 47 | 22.1 ms / 40.2 ms | 20.2 ms / 32.8 ms | 16.2 ms | 9.3 ms | 809 MiB | 197 MiB |
-| many-queues | 9,999 | 9,999 | 1.00 | 10,000 | 3.2 ms / 7.8 ms | 1.1 ms / 4.2 ms | 188 us | 144 us | 584 MiB | 118 MiB |
-| openwire | 49,575 | 52,375 | 1.06 | 24,787 | 182 us / 1.6 ms | 245 us / 2.6 ms | 117 us | 92 us | 719 MiB | 65 MiB |
-| openwire-persistent | 283 | 634 | 2.24 | 141 | 4.5 ms / 6.7 ms | 2.5 ms / 2.8 ms | 3.6 ms | 1.9 ms | 586 MiB | 45 MiB |
-| stomp | 87,287 | 99,570 | 1.14 | 43,643 | 80 us / 738 us | 124 us / 1.0 ms | 43 us | 38 us | 619 MiB | 50 MiB |
-| stomp-persistent | 70,023 | 78,592 | 1.12 | 35,011 | 4.2 ms / 13.2 ms | 1.3 ms / 11.7 ms | 65 us | 39 us | 651 MiB | 118 MiB |
-| mqtt | 91,683 | 121,195 | 1.32 | 45,841 | 83 us / 631 us | 116 us / 289 us | 40 us | 39 us | 583 MiB | 51 MiB |
-| mqtt-persistent | 43,183 | 90,555 | 2.10 | 21,591 | 2.9 ms / 18.4 ms | 855 us / 6.6 ms | 115 us | 49 us | 2,340 MiB | 105 MiB |
+| core | 74,607 | 80,232 | 1.08 | 37,303 | 141 us / 607 us | 138 us / 295 us | 64 us | 43 us | 605 MiB | 663 MiB |
+| core-persistent | 65,077 | 73,589 | 1.13 | 32,538 | 4.1 ms / 11.6 ms | 1.2 ms / 9.9 ms | 76 us | 41 us | 625 MiB | 403 MiB |
+| amqp | 31,344 | 31,682 | 1.01 | 15,672 | 128 us / 391 us | 129 us / 295 us | 81 us | 71 us | 2,233 MiB | 1,617 MiB |
+| amqp-persistent | 27,067 | 30,919 | 1.14 | 13,533 | 3.6 ms / 26.9 ms | 1.6 ms / 34.0 ms | 116 us | 64 us | 586 MiB | 1,156 MiB |
+| core-large | 60 | 78 | 1.30 | 30 | 22.9 ms / 39.2 ms | 17.9 ms / 29.3 ms | 19.5 ms | 10.3 ms | 562 MiB | 88 MiB |
+| amqp-large | 99 | 106 | 1.07 | 49 | 23.3 ms / 37.6 ms | 20.0 ms / 33.8 ms | 16.4 ms | 9.2 ms | 813 MiB | 191 MiB |
+| many-queues | 9,999 | 9,999 | 1.00 | 10,000 | 1.1 ms / 4.5 ms | 995 us / 2.8 ms | 237 us | 108 us | 621 MiB | 120 MiB |
+| openwire | 49,977 | 51,716 | 1.03 | 24,988 | 188 us / 1.4 ms | 244 us / 2.7 ms | 112 us | 89 us | 628 MiB | 71 MiB |
+| openwire-persistent | 285 | 642 | 2.25 | 142 | 4.5 ms / 6.6 ms | 2.5 ms / 2.8 ms | 3.6 ms | 1.9 ms | 588 MiB | 53 MiB |
+| stomp | 88,556 | 106,239 | 1.20 | 44,278 | 82 us / 551 us | 117 us / 786 us | 44 us | 37 us | 688 MiB | 64 MiB |
+| stomp-persistent | 68,863 | 83,307 | 1.21 | 34,431 | 4.1 ms / 12.4 ms | 1.3 ms / 10.6 ms | 64 us | 38 us | 629 MiB | 124 MiB |
+| mqtt | 91,019 | 118,634 | 1.30 | 45,509 | 85 us / 393 us | 110 us / 238 us | 41 us | 37 us | 581 MiB | 60 MiB |
+| mqtt-persistent | 44,531 | 94,725 | 2.13 | 22,265 | 2.9 ms / 12.4 ms | 862 us / 7.0 ms | 112 us | 47 us | 2,343 MiB | 114 MiB |
 
-In `mqtt-persistent`'s latency run, neither broker quite kept the rate: Artemis received 21,140 msg/s and Saranga 21,334.
+In `mqtt-persistent`'s latency run, neither broker quite kept the rate: Artemis received 21,805 msg/s and Saranga 21,995.
 
 ## Reading them
 
 - **Throughput.**
-  - It is higher for Saranga in 11 of the 12 unbounded scenarios and level on Core (1.01): 6 to 16% higher on AMQP, OpenWire, STOMP and persistent Core, 9 to 28% with large messages, 32% on MQTT, and 2.1 and 2.2 times on persistent MQTT and OpenWire. Both keep up with 100 queues at 10,000 messages a second.
-  - On non-persistent Core the difference is within this machine's noise.
-- **Startup** is about 19 times faster, at a sixth of the memory.
+  - It is higher for Saranga in 10 of the 12 unbounded scenarios: 8 to 21% on Core, STOMP and persistent Core and AMQP, 7 and 30% with large messages, 30% on MQTT, and 2.1 and 2.25 times on persistent MQTT and OpenWire. Both keep up with 100 queues at 10,000 messages a second.
+  - On non-persistent AMQP and OpenWire (1.01 and 1.03) the difference is within this machine's noise.
+- **Startup** is about 19 times faster, at a fifth of the memory.
 - **CPU a message at the same rate.**
-  - It is lower for Saranga in 12 of the 13 scenarios: by 40 to 57% with persistent and large messages, a quarter with 100 queues, a fifth on OpenWire, an eighth on STOMP, and 6 to 8% on non-persistent Core and AMQP.
-  - On non-persistent MQTT the two are level (39 against 40 microseconds).
+  - It is lower for Saranga in all 13 scenarios: by 41 to 58% with persistent and large messages, 54% with 100 queues, a third on non-persistent Core, a fifth on OpenWire, and 10 to 16% on non-persistent AMQP, STOMP and MQTT.
 - **Latency at the same rate.**
-  - With persistent 1 KiB messages, p50 is 30 to 45% of Artemis's, and a little over half on persistent OpenWire. With large messages it is 9 to 22% lower.
-  - Without persistence, p50 is 4 to 63 microseconds higher.
-  - p99 is lower in every scenario but non-persistent OpenWire and STOMP. `amqp-persistent`'s p99 moves a lot from run to run: runs on the same day have given 8.8 to 41 ms.
-- **Peak memory** is a twenty-second to a fifth of Artemis's on OpenWire, STOMP and MQTT, and a seventh to a half with persistent Core, large messages and many queues. Where the producer outran the consumer during the run, a backlog of messages was held in memory, and the peaks are high:
+  - With persistent 1 KiB messages, p50 is 30 to 43% of Artemis's, and a little over half on persistent OpenWire. With large messages it is 14 to 22% lower, and with 100 queues 6% lower.
+  - Without persistence, p50 is level on Core and AMQP and 25 to 56 microseconds higher on OpenWire, STOMP and MQTT.
+  - p99 is lower in every scenario but non-persistent OpenWire and STOMP and persistent AMQP. `amqp-persistent`'s p99 moves a lot from run to run: in another run the same morning, Artemis's was 36.6 ms and Saranga's 6.9 ms.
+- **Peak memory** is a twentieth to a fifth of Artemis's on OpenWire, STOMP and MQTT, a sixth to a quarter with large messages and many queues, and two thirds with persistent Core. Where the producer outran the consumer during the run, a backlog of messages was held in memory, and the peaks are high:
   - non-persistent Core and AMQP, for both brokers (Saranga's higher on Core, lower on AMQP);
   - Saranga's persistent AMQP.
 
   Neither broker pages these backlogs: both page only beyond `global-max-size`, which is 1 GiB for each here (half of Artemis's 2 GiB heap, and Saranga's default).
-- **The noise.** Runs on this machine moved by up to 5% between runs on the same day. Its CPU also throttles once warm: both brokers lose about a tenth of their rate after the first 30 s, which the 15 s warmup only partly excludes.
+- **The noise.** Runs on this machine move by up to 5% between runs on the same day. Its CPU also throttles once warm: both brokers lose about a tenth of their rate after the first 30 s, which the 15 s warmup only partly excludes.
 
 ## Running it
 
