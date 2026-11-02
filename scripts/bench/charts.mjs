@@ -153,6 +153,8 @@ function chart(t, c) {
       lx += 18 + name.length * 7.5 + 22;
     }
     y += 20;
+  } else {
+    y += 10; // room for a reference line's label
   }
   y += 18;
   for (const p of c.panels) {
@@ -187,13 +189,17 @@ const charts = {};
 const unbounded = ["core", "core-persistent", "core-large", "amqp", "amqp-persistent", "amqp-large",
   "openwire", "openwire-persistent", "stomp", "stomp-persistent", "mqtt", "mqtt-persistent"]
   .filter((s) => java[s]?.saranga?.throughput && java[s]?.artemis?.throughput);
+// Each broker's best figure from either client, so neither is judged by a
+// client that held it back.
+const best = (s, kind) => Math.max(java[s][kind].throughput, rust?.[s]?.[kind]?.throughput ?? 0);
 charts.throughput = {
   title: "Throughput: Saranga against Artemis",
-  subtitle: ["Messages received a second with an unbounded producer, as a multiple of Artemis's.",
-    "Past the line Saranga is faster; short of it, slower."],
+  subtitle: [`Messages received a second with an unbounded producer, as a multiple of Artemis's${rust ? ", each broker's" : "."}`,
+    ...(rust ? ["best figure with either client (Java or Rust). Past the line Saranga is faster; short of it, slower."]
+      : ["Past the line Saranga is faster; short of it, slower."])],
   panels: [{
     series: ["Saranga"],
-    rows: unbounded.map((s) => ({ label: NAMES[s], values: [java[s].saranga.throughput / java[s].artemis.throughput] })),
+    rows: unbounded.map((s) => ({ label: NAMES[s], values: [best(s, "saranga") / best(s, "artemis")] })),
     ref: 1, refLabel: "Artemis",
     tick: (v) => `${v}×`, value: (v) => `${v.toFixed(2)}×`,
   }],
