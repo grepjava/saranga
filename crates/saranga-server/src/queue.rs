@@ -327,6 +327,12 @@ enum Cmd {
         filter: Option<FilterRef>,
         reply: oneshot::Sender<usize>,
     },
+    /// The queued messages the filter accepts, taken out and still
+    /// counted, for a transaction to acknowledge.
+    TakeMatching {
+        filter: Option<FilterRef>,
+        reply: oneshot::Sender<Vec<MessageRef>>,
+    },
     /// The queued messages, for browsing (`iterator`).
     Browse {
         reply: oneshot::Sender<Vec<MessageRef>>,
@@ -967,6 +973,16 @@ impl Queue {
         let (reply, wait) = oneshot::channel();
         self.send(Cmd::DeleteMatching { filter, reply });
         wait.await.unwrap_or(0)
+    }
+
+    /// [`delete_matching`](Self::delete_matching) in a transaction: the
+    /// queued messages `filter` accepts, or all of them, taken out of the
+    /// queue and still counted. The transaction acknowledges them; its
+    /// rollback returns them with [`Queue::reinsert`].
+    pub async fn take_matching(&self, filter: Option<FilterRef>) -> Vec<MessageRef> {
+        let (reply, wait) = oneshot::channel();
+        self.send(Cmd::TakeMatching { filter, reply });
+        wait.await.unwrap_or_default()
     }
 
     /// The messages queued now, in delivery order (`browserIterator`).
@@ -1965,6 +1981,15 @@ impl Actor {
                 let n = refs.len();
                 refs.into_iter().for_each(|r| self.kill(r));
                 let _ = reply.send(n);
+            }
+            Cmd::TakeMatching { filter, reply } => {
+                let refs = self
+                    .messages
+                    .take_where(|r| filter.as_ref().is_none_or(|f| f.matches(&*r.message)));
+                if let Err(refs) = reply.send(refs) {
+                    // The caller went: the messages stay.
+                    self.return_refs(refs);
+                }
             }
             Cmd::Browse { reply } => {
                 let mut refs: Vec<MessageRef> = self.messages.iter().cloned().collect();

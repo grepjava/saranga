@@ -2139,6 +2139,7 @@ dependencies = [
  "saranga-buffer",
  "saranga-config",
  "saranga-core-protocol",
+ "saranga-fault",
  "saranga-message",
  "saranga-security",
  "saranga-server",

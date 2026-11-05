@@ -1130,7 +1130,7 @@ impl ServerSession {
 
     /// `LargeServerMessageImpl.checkLargeMessage`: a message too big for a
     /// journal record becomes a large message.
-    fn check_large_message(&self, message: &mut CoreMessage) -> Result<Option<Arc<LargeBody>>> {
+    pub fn check_large_message(&self, message: &mut CoreMessage) -> Result<Option<Arc<LargeBody>>> {
         let Some(max) = self.broker.max_record_size() else {
             return Ok(None);
         };

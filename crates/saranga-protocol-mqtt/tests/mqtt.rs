@@ -139,11 +139,23 @@ impl Client {
     }
 
     async fn publish(&mut self, topic: &str, payload: &[u8], packet_id: u16) {
+        self.publish_with(0x32, topic, payload, packet_id).await;
+        let puback = self.packet().await.unwrap();
+        assert_eq!(puback[0], 0x40);
+    }
+
+    /// A QoS 1 PUBLISH with `flags`, unanswered yet.
+    async fn publish_with(&mut self, flags: u8, topic: &str, payload: &[u8], packet_id: u16) {
         let mut body = string(topic);
         body.extend(packet_id.to_be_bytes());
         body.extend_from_slice(payload);
-        self.send(&packet(0x32, &body)).await;
-        let puback = self.packet().await.unwrap();
+        self.send(&packet(flags, &body)).await;
+    }
+
+    /// A retained QoS 1 PUBLISH, acknowledged.
+    async fn retain(&mut self, topic: &str, payload: &[u8], packet_id: u16) {
+        self.publish_with(0x33, topic, payload, packet_id).await;
+        let puback = self.packet().await.expect("a PUBACK");
         assert_eq!(puback[0], 0x40);
     }
 }
@@ -247,5 +259,49 @@ async fn a_publish_while_the_disk_is_full_closes_the_connection() {
     body.extend_from_slice(b"m");
     publisher.send(&packet(0x32, &body)).await;
     assert_eq!(publisher.packet().await, None, "closed without a PUBACK");
+    broker.stop().unwrap();
+}
+
+/// A retained message too big for a journal record (64 KiB here) is kept
+/// as a large message, as the message itself is.
+#[tokio::test]
+async fn a_retained_message_larger_than_a_journal_record_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, address, _task) = start(Some(dir.path())).await;
+    let big: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
+    let (mut publisher, _) = Client::open(address, "big-pub", true).await;
+    publisher.retain("big/t", &big, 1).await;
+    let (mut sub, _) = Client::open(address, "big-sub", true).await;
+    sub.subscribe("big/t", 1).await;
+    let (flags, _, payload) = parse_publish(&sub.packet().await.unwrap());
+    assert_eq!(flags & 1, 1, "retained");
+    assert_eq!(payload, big);
+    broker.stop().unwrap();
+}
+
+/// A retained message whose replacement fails stays: it is removed in
+/// the replacement's transaction, which rolls back.
+#[tokio::test]
+async fn a_failed_replacement_keeps_the_retained_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, address, _task) = start(Some(dir.path())).await;
+    let (mut publisher, _) = Client::open(address, "r-pub", true).await;
+    publisher.retain("r/t", b"v1", 1).await;
+    // The replacement is large: the message's file opens, its retained
+    // copy's file does not.
+    let fault = saranga_fault::Fault::new(saranga_fault::Op::Open, dir.path())
+        .named(".msg")
+        .after(1)
+        .arm();
+    let big = vec![7u8; 100_000];
+    publisher.publish_with(0x33, "r/t", &big, 2).await;
+    assert_eq!(publisher.packet().await, None, "closed without a PUBACK");
+    assert_eq!(fault.hits(), 1, "the retained copy's file failed");
+    drop(fault);
+    let (mut sub, _) = Client::open(address, "r-sub", true).await;
+    sub.subscribe("r/t", 1).await;
+    let (flags, _, payload) = parse_publish(&sub.packet().await.expect("the old message"));
+    assert_eq!(flags & 1, 1, "retained");
+    assert_eq!(payload, b"v1");
     broker.stop().unwrap();
 }

@@ -851,12 +851,37 @@ impl Core {
                 po.create_queue(spec, false)?
             }
         };
-        queue.delete_matching(None).await;
+        // The message replaced goes in the same transaction as its
+        // replacement: if that fails, the rollback returns it.
+        match tx {
+            Some(tx) => {
+                let old = queue.take_matching(None).await;
+                let mut t = saranga_server::transaction::lock(tx);
+                let t = &mut *t;
+                let mut stored = Ok(());
+                for mut r in old {
+                    if stored.is_ok() {
+                        match queue.store_ack_tx(t.id, &mut r, &mut t.paging) {
+                            Ok(written) => t.persistent |= written,
+                            Err(e) => stored = Err(e),
+                        }
+                    }
+                    t.acks.push((queue.clone(), r));
+                }
+                stored.map_err(|e| BrokerError::new(ErrorType::IoError, e.to_string()))?;
+            }
+            None => {
+                queue.delete_matching(None).await;
+            }
+        }
         if !reset {
             let mut copy = message;
             copy.message_id = po.ids().next();
+            // `LargeServerMessageImpl.checkLargeMessage`, as the message
+            // itself was sent.
+            let large = self.session.check_large_message(&mut copy)?;
             self.session
-                .send_to_queue(copy, None, &queue, tx.cloned())?;
+                .send_to_queue(copy, large, &queue, tx.cloned())?;
         }
         Ok(())
     }
