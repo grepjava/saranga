@@ -46,15 +46,16 @@ impl LockFile {
                 .open(path)?;
         }
         let key = std::fs::canonicalize(path)?;
-        let file = OpenOptions::new().read(true).write(true).open(&key)?;
         let mut open = open_files().lock().unwrap_or_else(|e| e.into_inner());
         // The handle opened before, unless the file it has was moved away
-        // or replaced since.
+        // or replaced since. Looked up before any other descriptor is
+        // opened: closing one would drop the process's lock on the file.
         if let Some(shared) = open.get(&key).and_then(Weak::upgrade)
-            && sys::same_file(&shared.file, &file)?
+            && sys::is_at(&shared.file, &key)?
         {
             return Ok(Self { shared });
         }
+        let file = OpenOptions::new().read(true).write(true).open(&key)?;
         let shared = Arc::new(Shared {
             file,
             locked: Mutex::new(false),
@@ -99,6 +100,7 @@ mod sys {
     use std::fs::File;
     use std::io;
     use std::os::fd::AsRawFd;
+    use std::path::Path;
 
     fn set(file: &File, kind: libc::c_short) -> io::Result<bool> {
         // SAFETY: a zeroed `flock` is valid; the fields set describe the
@@ -127,9 +129,10 @@ mod sys {
         set(file, libc::F_UNLCK as libc::c_short).map(|_| ())
     }
 
-    pub fn same_file(a: &File, b: &File) -> io::Result<bool> {
+    /// Whether `file` is the file at `path`, found without opening `path`.
+    pub fn is_at(file: &File, path: &Path) -> io::Result<bool> {
         use std::os::unix::fs::MetadataExt;
-        let (a, b) = (a.metadata()?, b.metadata()?);
+        let (a, b) = (file.metadata()?, std::fs::metadata(path)?);
         Ok(a.dev() == b.dev() && a.ino() == b.ino())
     }
 }
@@ -138,6 +141,7 @@ mod sys {
 mod sys {
     use std::fs::{File, TryLockError};
     use std::io;
+    use std::path::Path;
 
     pub fn try_lock(file: &File) -> io::Result<bool> {
         match file.try_lock() {
@@ -169,8 +173,11 @@ mod sys {
         ))
     }
 
-    pub fn same_file(a: &File, b: &File) -> io::Result<bool> {
-        Ok(id(a)? == id(b)?)
+    /// Whether `file` is the file at `path`. A lock belongs to its handle
+    /// here, so another handle may be opened and closed.
+    pub fn is_at(file: &File, path: &Path) -> io::Result<bool> {
+        let other = std::fs::OpenOptions::new().read(true).open(path)?;
+        Ok(id(file)? == id(&other)?)
     }
 }
 
@@ -205,5 +212,52 @@ mod tests {
         // Both lockable: they are different files.
         let _ha = a.try_lock().unwrap().expect("free");
         assert!(b.try_lock().unwrap().is_some());
+    }
+
+    const PROBE: &str = "SARANGA_FILELOCK_PROBE";
+
+    /// Whether another process can take the lock on `path`: a record lock
+    /// is the process's, so only another process sees it go.
+    fn free_elsewhere(path: &Path) -> bool {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "filelock::tests::probe", "--nocapture"])
+            .env(PROBE, path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("probe ran"),
+            "the probe did not run: {stdout}"
+        );
+        out.status.success()
+    }
+
+    /// Run by `free_elsewhere` in another process: passes if it takes the
+    /// lock.
+    #[test]
+    fn probe() {
+        let Some(path) = std::env::var_os(PROBE) else {
+            return;
+        };
+        println!("probe ran");
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        assert!(sys::try_lock(&f).unwrap(), "held by another process");
+    }
+
+    #[test]
+    fn reopening_a_locked_file_keeps_its_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("server.lock");
+        let a = LockFile::open(&p).unwrap();
+        let held = a.try_lock().unwrap().expect("free");
+        assert!(!free_elsewhere(&p));
+        drop(LockFile::open(&p).unwrap());
+        assert!(!free_elsewhere(&p), "opening it again released the lock");
+        drop(held);
+        assert!(free_elsewhere(&p));
     }
 }
