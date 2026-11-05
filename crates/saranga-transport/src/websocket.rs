@@ -17,6 +17,11 @@ pub const DEFAULT_MAX_FRAME_PAYLOAD_LENGTH: usize = 65536;
 
 /// The most of a request's head Saranga reads.
 const MAX_REQUEST_HEAD: usize = 64 * 1024;
+/// An upgrade has no use for a body, and this is read before any login.
+const MAX_REQUEST_BODY: usize = 64 * 1024;
+/// How many times a frame's maximum payload it may inflate to: more than
+/// real messages compress by, and well under deflate's limit of about 1,000.
+const MAX_INFLATION: usize = 64;
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -103,6 +108,12 @@ pub async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<(R
         .header("content-length")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
+    if length > MAX_REQUEST_BODY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HTTP request body too long",
+        ));
+    }
     while rest.len() < length {
         let mut chunk = [0u8; 4096];
         let n = stream.read(&mut chunk).await?;
@@ -413,7 +424,14 @@ impl Deflate {
 
     /// `decompressContent`: a frame's payload inflated, the tail added
     /// first when `tail`. `continuation`: whether it continues a message.
-    fn inflate(&mut self, payload: &[u8], tail: bool, continuation: bool) -> io::Result<Vec<u8>> {
+    /// More than `limit` bytes of output is a `FileTooLarge` error.
+    fn inflate(
+        &mut self,
+        payload: &[u8],
+        tail: bool,
+        continuation: bool,
+        limit: usize,
+    ) -> io::Result<Vec<u8>> {
         let err = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_owned());
         let d = match &mut self.decompress {
             Some(d) => d,
@@ -439,6 +457,12 @@ impl Deflate {
             let status = d
                 .decompress_vec(&input[done..], &mut out, flate2::FlushDecompress::Sync)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if out.len() > limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    format!("Max frame length of {limit} has been exceeded."),
+                ));
+            }
             let all_in = (d.total_in() - start) as usize == input.len();
             if status == flate2::Status::StreamEnd
                 || (all_in && out.len() < out.capacity())
@@ -550,6 +574,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
     /// with RSV1 and the continuations of its message, adding the tail to
     /// the last; `PerFrameDeflateDecoder` takes every data frame with RSV1.
     fn inflated(&mut self, fin_opcode: u8, payload: Vec<u8>) -> io::Result<Vec<u8>> {
+        let limit = self.max_payload.saturating_mul(MAX_INFLATION);
         let Some(d) = &mut self.deflate else {
             return Ok(payload);
         };
@@ -563,13 +588,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
             if !d.inflating {
                 return Ok(payload);
             }
-            let out = d.inflate(&payload, fin, continuation);
+            let out = d.inflate(&payload, fin, continuation, limit);
             if fin {
                 d.inflating = false;
             }
             out
         } else if rsv1 {
-            d.inflate(&payload, true, continuation)
+            d.inflate(&payload, true, continuation, limit)
         } else {
             Ok(payload)
         }
@@ -644,6 +669,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
                         Ok(p) => p,
                         Err(e) => {
                             // The decoder's exception closes the channel.
+                            if e.kind() == io::ErrorKind::FileTooLarge {
+                                close_frame(&mut self.out, 1009, &e.to_string());
+                            }
                             self.closed = true;
                             return Err(e);
                         }
@@ -927,6 +955,49 @@ mod tests {
         let mut got = Vec::new();
         ws.read_to_end(&mut got).await.unwrap();
         assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_frame_that_inflates_past_the_limit_closes() {
+        let (_client, server) = tokio::io::duplex(1 << 16);
+        let mut c = flate2::Compress::new(flate2::Compression::default(), false);
+        let zeros = vec![0u8; 1 << 20];
+        let compressed = client_deflate(&mut c, &zeros, true);
+        assert!(compressed.len() < 4096);
+        let input = masked_rsv(0x2, true, RSV1, &compressed);
+        let mut ws = WebSocketStream::new(server, input, 4096, EncoderType::Binary)
+            .with_compression(Some(&Extension::PerMessageDeflate));
+        let mut got = Vec::new();
+        let read = ws.read_to_end(&mut got);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), read).await;
+        assert!(got.is_empty());
+        assert!(ws.closed);
+    }
+
+    #[tokio::test]
+    async fn a_message_within_the_limit_may_inflate_past_the_frame_size() {
+        let (_client, server) = tokio::io::duplex(1 << 16);
+        let mut c = flate2::Compress::new(flate2::Compression::default(), false);
+        let zeros = vec![0u8; 100_000];
+        let input = masked_rsv(0x2, true, RSV1, &client_deflate(&mut c, &zeros, true));
+        let mut ws = WebSocketStream::new(server, input, 4096, EncoderType::Binary)
+            .with_compression(Some(&Extension::PerMessageDeflate));
+        let mut got = vec![1u8; zeros.len()];
+        ws.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, zeros);
+    }
+
+    #[tokio::test]
+    async fn a_request_body_over_the_limit_is_refused_before_it_is_read() {
+        let head = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_REQUEST_BODY + 1
+        );
+        let e = read_request(&mut head.as_bytes()).await.unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        let head = "POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi";
+        let (request, _) = read_request(&mut head.as_bytes()).await.unwrap();
+        assert_eq!(request.body, b"hi");
     }
 
     fn masked_rsv(opcode: u8, fin: bool, rsv: u8, payload: &[u8]) -> Vec<u8> {
