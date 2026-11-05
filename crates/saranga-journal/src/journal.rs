@@ -1033,7 +1033,8 @@ impl Journal {
 
     /// Flushes and closes the journal (`stop`).
     pub fn stop(&self) -> Result<()> {
-        let r = self.writer.wait_idle();
+        // Synced, as a file left by a rollover may have no handle below.
+        let r = self.sync();
         let mut inner = self.lock();
         // A file still being made is finished, not left as a `.tmp`.
         let r = r.and(inner.finish_all_creating());

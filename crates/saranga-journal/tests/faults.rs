@@ -88,6 +88,38 @@ fn a_failed_sync_fails_the_journal() {
     assert!(loaded.len() <= 6);
 }
 
+fn written(j: &Journal) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    j.on_written(Box::new(move |r| tx.send(r).unwrap()))
+        .unwrap();
+    rx.recv().unwrap().unwrap();
+}
+
+#[test]
+fn a_sync_covers_appends_already_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let (j, _) = open(&config(dir.path()));
+    j.append_add(1, 45, vec![1; 100], false, None).unwrap();
+    written(&j);
+    let fault = Fault::new(Op::Sync, dir.path()).arm();
+    assert!(j.sync().is_err());
+    assert_eq!(fault.hits(), 1);
+}
+
+#[test]
+fn a_commit_after_a_rollover_syncs_the_file_left_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let (j, _) = open(&config(dir.path()));
+    j.append_add_tx(100, 1, 45, vec![1; 100]).unwrap();
+    written(&j);
+    j.force_move_next_file().unwrap();
+    let fault = Fault::new(Op::Sync, dir.path())
+        .named("activemq-data-1.amq")
+        .arm();
+    assert!(j.append_commit(100, true, None).is_err());
+    assert_eq!(fault.hits(), 1);
+}
+
 #[test]
 fn a_full_disk_fails_the_completion() {
     let dir = tempfile::tempdir().unwrap();

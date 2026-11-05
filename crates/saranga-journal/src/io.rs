@@ -355,6 +355,9 @@ impl Drop for Writer {
 }
 
 fn flusher(s: Arc<Shared>) {
+    // Written and not yet synced, across batches: a sync covers what earlier
+    // unsynced appends left behind, not just what it arrived with.
+    let mut dirty = None;
     loop {
         let (batches, sync, completions, upto) = {
             let mut p = s.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -376,7 +379,7 @@ fn flusher(s: Arc<Shared>) {
         let started = s.epoch.elapsed().as_nanos() as u64 + 1;
         s.busy_since
             .store(started, std::sync::atomic::Ordering::Release);
-        let result = write_batches(&batches, sync && s.datasync);
+        let result = write_batches(&batches, sync, s.datasync, &mut dirty);
         s.busy_since.store(0, std::sync::atomic::Ordering::Release);
         drop(batches);
         if let Err((e, path)) = &result {
@@ -399,21 +402,29 @@ fn flusher(s: Arc<Shared>) {
     }
 }
 
-fn write_batches(batches: &[Batch], sync: bool) -> Result<(), (JournalError, PathBuf)> {
+/// Writes `batches`. With `datasync`, `dirty` holds the file written and not
+/// yet synced: leaving a file syncs it (`NIOSequentialFile.close` on a
+/// rollover), so only one can be dirty, and `sync` syncs that one.
+fn write_batches(
+    batches: &[Batch],
+    sync: bool,
+    datasync: bool,
+    dirty: &mut Option<Arc<DataFile>>,
+) -> Result<(), (JournalError, PathBuf)> {
     fn failed(f: &DataFile) -> impl FnOnce(io::Error) -> (JournalError, PathBuf) + '_ {
         move |e| (JournalError::io(e), f.path.clone())
     }
-    let mut touched: Vec<&Arc<DataFile>> = Vec::new();
     for b in batches {
+        if datasync && !dirty.as_ref().is_some_and(|f| Arc::ptr_eq(f, &b.file)) {
+            if let Some(f) = dirty.take() {
+                sync_data(&f.file, &f.path).map_err(failed(&f))?;
+            }
+            *dirty = Some(b.file.clone());
+        }
         write_at(&b.file.file, &b.file.path, &b.bytes, b.offset).map_err(failed(&b.file))?;
-        if !touched.iter().any(|f| Arc::ptr_eq(f, &b.file)) {
-            touched.push(&b.file);
-        }
     }
-    if sync {
-        for f in touched {
-            sync_data(&f.file, &f.path).map_err(failed(f))?;
-        }
+    if sync && let Some(f) = dirty.take() {
+        sync_data(&f.file, &f.path).map_err(failed(&f))?;
     }
     Ok(())
 }
