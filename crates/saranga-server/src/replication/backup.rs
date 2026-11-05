@@ -12,15 +12,16 @@ use std::time::Duration;
 
 use saranga_buffer::{Codec, Writer};
 use saranga_client::{Connection, ConnectionOptions, Connector};
-use saranga_core_protocol::Packet;
 use saranga_core_protocol::packets::cluster::{
     BackupRegistrationMessage, backup_registration_problem,
 };
+use saranga_core_protocol::packets::connection::ActiveMQExceptionMessage;
 use saranga_core_protocol::packets::replication::{
     AddOperationType, JournalContent, PrimaryStopping, ReplicationResponseMessage,
     ReplicationResponseMessageV2, ReplicationStartSyncMessage, ReplicationSyncFileMessage,
     SyncDataType, SyncFileType,
 };
+use saranga_core_protocol::{ErrorType, Packet};
 use saranga_journal::format::Record;
 use saranga_journal::{Journal, JournalConfig, SyncJournal};
 
@@ -329,15 +330,24 @@ async fn attempt(cfg: &BackupConfig, conn: Connection, primary_node: String) -> 
     }
     let up_to_date = endpoint.up_to_date;
     let refused = endpoint.refused.take();
+    let failed = endpoint.failed.take();
     let node_id = endpoint.node_id.clone().unwrap_or(primary_node);
     let topology = conn.topology();
     conn.close().await;
     let c = cfg.clone();
-    tokio::task::spawn_blocking(move || endpoint.close(&c))
+    let closed = tokio::task::spawn_blocking(move || endpoint.close(&c))
         .await
         .map_err(io::Error::other)?;
     if let Some(e) = refused {
         // `WrongNodeId`, `WrongActivationSequence`: the broker stops.
+        return Err(io::Error::other(e));
+    }
+    if let Some(e) = failed.or(closed.err()) {
+        // The copy lacks records the primary was told it has: it must not
+        // activate. The broker stops, as on a critical I/O error.
+        tracing::error!(
+            "AMQ222010: Critical IO Error, shutting down the server. file=null, message={e}"
+        );
         return Err(io::Error::other(e));
     }
     if !up_to_date {
@@ -449,6 +459,9 @@ struct Endpoint {
     /// Why the primary's copy cannot be taken (`ReplicationObserver`'s
     /// `WrongNodeId`, `WrongActivationSequence`).
     refused: Option<String>,
+    /// Why the copy could not be written: replication ends, and the copy
+    /// is no longer up to date.
+    failed: Option<String>,
     pages: Pages,
     large: Large,
     /// Told the primary's node ID once the copy is complete.
@@ -467,7 +480,33 @@ impl Endpoint {
             up_to_date: false,
             node_id: None,
             refused: None,
+            failed: None,
         }
+    }
+
+    /// The packet could not be applied: the copy is no longer up to date,
+    /// and the primary is answered with the error rather than a response,
+    /// so it does not count the packet as replicated.
+    fn fail(&mut self, e: io::Error) -> Packet {
+        tracing::warn!("AMQ222185: Error handling replication packet: {e}");
+        self.up_to_date = false;
+        let message = e.to_string();
+        self.failed.get_or_insert_with(|| message.clone());
+        ActiveMQExceptionMessage {
+            code: ErrorType::IoError as i32,
+            message: Some(message.as_str().into()),
+        }
+        .into()
+    }
+
+    /// A write the journals took earlier may fail after it was answered.
+    fn journals_intact(&self) -> io::Result<()> {
+        for j in self.journals.iter().flatten() {
+            if let Some(e) = j.failure() {
+                return Err(io::Error::other(e.to_string()));
+            }
+        }
+        Ok(())
     }
 
     fn journal_config(&self, journal: usize) -> JournalConfig {
@@ -502,7 +541,7 @@ impl Endpoint {
             if let Some(r) = response {
                 let _ = conn.send_packet(CHANNEL_REPLICATION, r);
             }
-            if self.refused.is_some() {
+            if self.refused.is_some() || self.failed.is_some() {
                 return End::Disconnected;
             }
             match stopping {
@@ -522,7 +561,10 @@ impl Endpoint {
         let ok = || Some(Packet::from(ReplicationResponseMessage {}));
         let result = match packet {
             Packet::ReplicationStartSyncMessage(m) => {
-                return Some(self.start_sync(m).into());
+                return Some(match self.start_sync(m) {
+                    Ok(r) => r.into(),
+                    Err(e) => self.fail(e),
+                });
             }
             Packet::ReplicationSyncFileMessage(m) => self.sync_file(m),
             Packet::ReplicationAddMessage(m) => {
@@ -653,14 +695,17 @@ impl Endpoint {
                 Ok(())
             }
         };
-        if let Err(e) = result {
-            tracing::warn!("AMQ222185: Error handling replication packet: {e}");
+        match result.and_then(|()| self.journals_intact()) {
+            Ok(()) => ok(),
+            Err(e) => Some(self.fail(e)),
         }
-        ok()
     }
 
     /// `handleStartReplicationSynchronization`.
-    fn start_sync(&mut self, m: ReplicationStartSyncMessage) -> ReplicationResponseMessageV2 {
+    fn start_sync(
+        &mut self,
+        m: ReplicationStartSyncMessage,
+    ) -> io::Result<ReplicationResponseMessageV2> {
         if m.synchronization_is_finished {
             // The version of the data copied, which this backup activates
             // with.
@@ -668,18 +713,13 @@ impl Endpoint {
                 Some(d) if d.ids.len() == 1 => d.ids[0],
                 _ => 0,
             };
-            if let Err(e) = self.finish_sync(m.node_id.to_string_lossy(), sequence) {
-                tracing::warn!("AMQ222185: Error handling replication packet: {e}");
-                return ReplicationResponseMessageV2 {
-                    synchronization_is_finished_acknowledgement: false,
-                };
-            }
-            return ReplicationResponseMessageV2 {
+            self.finish_sync(m.node_id.to_string_lossy(), sequence)?;
+            return Ok(ReplicationResponseMessageV2 {
                 synchronization_is_finished_acknowledgement: true,
-            };
+            });
         }
         let Some(data) = m.data else {
-            return ReplicationResponseMessageV2::default();
+            return Ok(ReplicationResponseMessageV2::default());
         };
         let result = match data.data_type {
             SyncDataType::LargeMessages => self.large.start_sync(&data.ids),
@@ -696,7 +736,7 @@ impl Endpoint {
                 if !node_id.is_empty() {
                     if let Some(e) = self.wrong_node_id(&node_id) {
                         self.refused = Some(e);
-                        return ReplicationResponseMessageV2::default();
+                        return Ok(ReplicationResponseMessageV2::default());
                     }
                     self.node_id = Some(node_id);
                 }
@@ -706,10 +746,7 @@ impl Endpoint {
             }
             SyncDataType::ActivationSequence => Ok(()),
         };
-        if let Err(e) = result {
-            tracing::warn!("AMQ222185: Error handling replication packet: {e}");
-        }
-        ReplicationResponseMessageV2::default()
+        result.map(|()| ReplicationResponseMessageV2::default())
     }
 
     /// `finishSynchronization`: the copies are complete; the journals are
@@ -871,20 +908,26 @@ impl Endpoint {
     }
 
     /// `ActiveMQServerImpl.stopComponent(replicationEndpoint)`: everything
-    /// written out and closed.
-    fn close(mut self, _cfg: &BackupConfig) {
+    /// written out and closed. An error if a journal of the complete copy
+    /// failed, so that what it answered may not be on disk.
+    fn close(mut self, _cfg: &BackupConfig) -> Result<(), String> {
         for s in self.syncing.iter_mut() {
             if let Some(s) = s.take() {
                 let _ = s.finish();
             }
         }
+        let mut failed = Ok(());
         for j in self.journals.iter_mut() {
-            if let Some(j) = j.take() {
-                let _ = j.stop();
+            if let Some(j) = j.take()
+                && let Err(e) = j.stop()
+                && failed.is_ok()
+            {
+                failed = Err(e.to_string());
             }
         }
         self.pages.close_all();
         self.large.close_all();
+        failed
     }
 }
 
@@ -1260,6 +1303,9 @@ fn move_data(dir: &Path, max: i32, preserve: &[&str]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use saranga_core_protocol::packets::replication::{
+        ReplicationAddMessage, ReplicationPrimaryIsStoppingMessage,
+    };
 
     #[test]
     fn old_data_moves_aside_keeping_at_most_the_maximum() {
@@ -1283,5 +1329,120 @@ mod tests {
         fs::write(dir.join("b.amq"), "x").unwrap();
         move_data(dir, 0, &[]).unwrap();
         assert_eq!(fs::read_dir(dir).unwrap().count(), 0);
+    }
+
+    fn backup_config(dir: &Path) -> BackupConfig {
+        let uri =
+            saranga_config::AcceptorConfig::parse(Some("artemis"), "tcp://localhost:1").unwrap();
+        BackupConfig {
+            name: "backup".into(),
+            policy: saranga_config::Replication::default(),
+            cluster: ClusterConfig {
+                name: "my-cluster".into(),
+                connector: crate::cluster::transport_configuration("artemis", &uri),
+                static_connectors: Vec::new(),
+                discovery_group: None,
+                discovery: None,
+                retry_interval: Duration::from_millis(500),
+                call_timeout: Duration::from_secs(30),
+                check_period: Duration::from_secs(30),
+                connection_ttl: Duration::from_secs(60),
+                notification_interval: Duration::from_secs(1),
+                notification_attempts: 0,
+                cluster_user: "u".into(),
+                cluster_password: "p".into(),
+                settings: saranga_config::ClusterConnectionConfig::new("my-cluster", "artemis"),
+            },
+            messages: JournalConfig {
+                file_size: 64 * 1024,
+                min_files: 2,
+                pool_size: 10,
+                compact_min_files: 0,
+                datasync: true,
+                ..JournalConfig::messages(dir.join("journal"))
+            },
+            bindings: JournalConfig::bindings(dir.join("bindings")),
+            paging: dir.join("paging"),
+            large_messages: dir.join("large"),
+            fail_back: false,
+            pluggable: None,
+        }
+    }
+
+    fn add(id: i64) -> Packet {
+        ReplicationAddMessage {
+            journal_id: 1,
+            operation: AddOperationType::Add,
+            id,
+            journal_record_type: 45,
+            record_data: vec![id as u8; 100],
+        }
+        .into()
+    }
+
+    fn is_exception(response: Option<Packet>) -> bool {
+        matches!(response, Some(Packet::ActiveMQExceptionMessage(_)))
+    }
+
+    /// The copy complete, its message journal open.
+    fn synced(cfg: &BackupConfig) -> Endpoint {
+        let (synced, _) = tokio::sync::watch::channel(None);
+        let mut e = Endpoint::new(cfg.clone(), synced);
+        let journal = Journal::open(e.journal_config(1)).unwrap();
+        journal.load_sync_only().unwrap();
+        e.journals[1] = Some(journal);
+        e.up_to_date = true;
+        e
+    }
+
+    #[test]
+    fn a_record_the_copy_cannot_write_is_not_acknowledged() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = backup_config(d.path());
+        let mut e = synced(&cfg);
+        assert!(matches!(
+            e.handle(add(1)),
+            Some(Packet::ReplicationResponseMessage(_))
+        ));
+        let fault =
+            saranga_fault::Fault::new(saranga_fault::Op::Write, &cfg.messages.directory).arm();
+        // Answered before its write, as Artemis's backup answers: the write
+        // fails behind it.
+        e.handle(add(2));
+        assert!(e.journals[1].as_ref().unwrap().sync().is_err());
+        assert!(fault.hits() >= 1);
+        drop(fault);
+        assert!(is_exception(e.handle(add(3))));
+        assert!(!e.up_to_date, "a copy missing records must not activate");
+        assert!(e.failed.is_some(), "replication ends");
+        assert!(e.close(&cfg).is_err());
+    }
+
+    #[test]
+    fn a_failed_write_is_caught_on_the_next_packet() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = backup_config(d.path());
+        let mut e = synced(&cfg);
+        let fault =
+            saranga_fault::Fault::new(saranga_fault::Op::Write, &cfg.messages.directory).arm();
+        e.handle(add(1));
+        let _ = e.journals[1].as_ref().unwrap().sync();
+        drop(fault);
+        // A packet that writes nothing still finds the journal failed.
+        let stopping = ReplicationPrimaryIsStoppingMessage {
+            primary_stopping: PrimaryStopping::StopCalled,
+        };
+        assert!(is_exception(e.handle(stopping.into())));
+        assert!(!e.up_to_date);
+    }
+
+    #[test]
+    fn a_record_before_the_copy_ends_replication() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = backup_config(d.path());
+        let (synced, _) = tokio::sync::watch::channel(None);
+        let mut e = Endpoint::new(cfg.clone(), synced);
+        assert!(is_exception(e.handle(add(1))));
+        assert!(e.failed.is_some());
     }
 }
