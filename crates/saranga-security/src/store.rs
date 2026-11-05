@@ -488,7 +488,7 @@ impl SecurityStore {
         let target = fqqn.as_deref().unwrap_or(bare_address);
 
         if let (Some(user), Some(cache)) = (user, &self.authorization_cache)
-            && with_cache_key(user, check, |key| {
+            && with_cache_key(user, check, &auth.connection, |key| {
                 cache.test(key, |granted| granted.contains(target))
             })
         {
@@ -508,10 +508,13 @@ impl SecurityStore {
         };
         let validated = self.manager.authorize(&subject, &roles, check, target);
         if validated && let (Some(user), Some(cache)) = (user, &self.authorization_cache) {
-            cache.update(authorization_cache_key(user, check), |set| {
-                set.get_or_insert_with(HashSet::new)
-                    .insert(target.to_owned());
-            });
+            cache.update(
+                authorization_cache_key(user, check, &auth.connection),
+                |set| {
+                    set.get_or_insert_with(HashSet::new)
+                        .insert(target.to_owned());
+                },
+            );
         }
         validated
     }
@@ -606,8 +609,8 @@ fn unable_to_validate(
     ))
 }
 
-/// `createAuthenticationCacheKey`: SHA-256 of user, password and
-/// certificate subject, in hex.
+/// `createAuthenticationCacheKey`: SHA-256 of what decides a login's subject
+/// (user, password, certificate subject, realm and SASL identity), in hex.
 fn authentication_cache_key(
     user: Option<&str>,
     password: Option<&str>,
@@ -626,24 +629,64 @@ fn authentication_cache_key(
     if dn != CERT_SUBJECT_DN_UNAVAILABLE {
         md.update(dn.as_bytes());
     }
+    md.update([0]);
+    if let Some(domain) = &connection.security_domain {
+        md.update(domain.as_bytes());
+    }
+    md.update([0]);
+    if let Some(principals) = &connection.sasl_principals {
+        md.update(format!("{principals:?}").as_bytes());
+    }
     saranga_config::bytes_to_hex(&md.finalize())
 }
 
-fn authorization_cache_key(user: &str, check: CheckType) -> String {
-    format!("{user}.{}", check.name())
+/// `createAuthorizationCacheKey`: a grant holds for one identity, so the key
+/// has what tells the same user name's logins apart, as the authentication
+/// key does.
+fn write_authorization_cache_key(
+    key: &mut String,
+    user: &str,
+    check: CheckType,
+    connection: &ConnectionInfo,
+) {
+    key.push_str(user);
+    key.push('.');
+    key.push_str(check.name());
+    key.push('\0');
+    if let Some(domain) = &connection.security_domain {
+        key.push_str(domain);
+    }
+    key.push('\0');
+    let dn = connection.cert_subject_dn();
+    if dn != CERT_SUBJECT_DN_UNAVAILABLE {
+        key.push_str(dn);
+    }
+    if let Some(principals) = &connection.sasl_principals {
+        use std::fmt::Write;
+        let _ = write!(key, "\0{principals:?}");
+    }
+}
+
+fn authorization_cache_key(user: &str, check: CheckType, connection: &ConnectionInfo) -> String {
+    let mut key = String::new();
+    write_authorization_cache_key(&mut key, user, check, connection);
+    key
 }
 
 /// [`authorization_cache_key`] made in a buffer kept for the thread, for a
 /// lookup each message makes.
-fn with_cache_key<R>(user: &str, check: CheckType, f: impl FnOnce(&str) -> R) -> R {
+fn with_cache_key<R>(
+    user: &str,
+    check: CheckType,
+    connection: &ConnectionInfo,
+    f: impl FnOnce(&str) -> R,
+) -> R {
     thread_local! {
         static KEY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     }
     KEY.with_borrow_mut(|key| {
         key.clear();
-        key.push_str(user);
-        key.push('.');
-        key.push_str(check.name());
+        write_authorization_cache_key(key, user, check, connection);
         f(key)
     })
 }

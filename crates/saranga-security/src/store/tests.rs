@@ -280,3 +280,93 @@ fn ttl_cache_expires_and_evicts() {
     std::thread::sleep(Duration::from_millis(60));
     assert_eq!(cache.get(&3), None, "expired");
 }
+
+/// The same user name holds role admins in realm admin, guests in
+/// restricted, and cannot log in to any other.
+struct Realms;
+
+impl SecurityManager for Realms {
+    fn authenticate(
+        &self,
+        user: Option<&str>,
+        _: Option<&str>,
+        connection: &ConnectionInfo,
+    ) -> Result<Option<Subject>, NoCache> {
+        let role = match connection.security_domain.as_deref() {
+            Some("admin") => "admins",
+            Some("restricted") => "guests",
+            _ => return Ok(None),
+        };
+        let mut s = Subject::default();
+        s.add(Principal::User(user.unwrap_or("guest").into()));
+        s.add(Principal::Role(role.into()));
+        Ok(Some(s))
+    }
+
+    fn authorize(&self, subject: &Subject, roles: &[Role], check: CheckType, _: &str) -> bool {
+        authorize_roles(subject, roles, check)
+    }
+}
+
+fn realm_store(authentication_cache: usize, authorization_cache: usize) -> SecurityStore {
+    let mut cfg = SecurityStoreConfig::from_broker(&BrokerConfig::default());
+    cfg.enabled = true;
+    cfg.authentication_cache_size = authentication_cache;
+    cfg.authorization_cache_size = authorization_cache;
+    let mut repo = HierarchicalRepository::new(Default::default());
+    repo.add_match(
+        "secret",
+        SecuritySetting {
+            roles: vec![Role::new("admins", [CheckType::Send])],
+        },
+    )
+    .unwrap();
+    SecurityStore::new(cfg, repo, Arc::new(Realms))
+}
+
+fn in_realm(realm: &str) -> SecurityAuth {
+    SecurityAuth {
+        username: Some("same".into()),
+        connection: Arc::new(ConnectionInfo {
+            security_domain: Some(realm.into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_cached_login_holds_only_in_its_realm() {
+    let store = realm_store(100, 0);
+    let send = |realm| store.has_permission("secret", None, CheckType::Send, &in_realm(realm));
+    assert!(send("admin"));
+    assert!(!send("restricted"));
+    assert!(!send("missing"));
+    assert!(send("admin"));
+}
+
+#[test]
+fn a_cached_grant_holds_only_in_its_realm() {
+    let store = realm_store(0, 100);
+    let send = |realm| store.has_permission("secret", None, CheckType::Send, &in_realm(realm));
+    assert!(!send("restricted"));
+    assert!(send("admin"));
+    assert!(!send("restricted"));
+    assert_eq!(store.authorization_cache_size(), 1);
+}
+
+#[test]
+fn a_cached_grant_holds_only_for_its_sasl_identity() {
+    let store = realm_store(0, 100);
+    let sasl = |name: &str| SecurityAuth {
+        connection: Arc::new(ConnectionInfo {
+            security_domain: Some("admin".into()),
+            sasl_principals: Some(Arc::from([Principal::User(name.into())])),
+            ..Default::default()
+        }),
+        ..in_realm("admin")
+    };
+    assert!(store.has_permission("secret", None, CheckType::Send, &sasl("a")));
+    assert!(store.has_permission("secret", None, CheckType::Send, &sasl("b")));
+    assert_eq!(store.authorization_cache_size(), 2);
+}
