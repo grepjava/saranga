@@ -74,7 +74,7 @@ impl DuplicateIdCache {
                 excess -= 1;
                 if let Some(s) = &self.storage {
                     let t = *tx.get_or_insert_with(&next_id);
-                    s.messages.append_delete_tx(t, record, Vec::new())?;
+                    s.delete_record_tx(t, record)?;
                 }
                 continue;
             }
@@ -82,7 +82,7 @@ impl DuplicateIdCache {
             self.slots.push(Some((id, record)));
         }
         if let (Some(s), Some(t)) = (&self.storage, tx) {
-            s.messages.append_commit(t, false, Some(Box::new(|_| {})))?;
+            s.commit_unsynced(t, false)?;
         }
         self.pos = if self.slots.len() == self.size {
             0
@@ -105,7 +105,7 @@ impl DuplicateIdCache {
                     self.index.remove(&old);
                 }
                 if let Some(s) = &self.storage
-                    && let Err(e) = s.messages.append_delete(old_record, false, None)
+                    && let Err(e) = s.delete_record(old_record)
                 {
                     tracing::warn!("AMQ222057: Error deleting duplicate cache: {e}");
                 }
@@ -128,7 +128,7 @@ impl DuplicateIdCache {
         };
         if let Some((_, record)) = self.slots[slot].take()
             && let Some(s) = &self.storage
-            && let Err(e) = s.messages.append_delete(record, false, None)
+            && let Err(e) = s.delete_record(record)
         {
             tracing::warn!("AMQ222057: Error deleting duplicate cache: {e}");
         }
@@ -168,8 +168,8 @@ impl DuplicateIdCache {
         let tx = next_id();
         let written = records
             .into_iter()
-            .try_for_each(|r| s.messages.append_delete_tx(tx, r, Vec::new()))
-            .and_then(|()| s.messages.append_commit(tx, false, None));
+            .try_for_each(|r| s.delete_record_tx(tx, r))
+            .and_then(|()| s.commit_unsynced(tx, true));
         if let Err(e) = written {
             tracing::warn!("AMQ222057: Error deleting duplicate cache: {e}");
         }
@@ -185,8 +185,7 @@ impl DuplicateIdCache {
             duplicate_id: id.to_vec(),
         }
         .encode();
-        s.messages
-            .append_add_tx(tx, record, ids::DUPLICATE_ID, body)
+        s.add_record_tx(tx, record, ids::DUPLICATE_ID, body)
     }
 }
 

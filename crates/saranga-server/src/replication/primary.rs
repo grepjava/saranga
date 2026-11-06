@@ -120,6 +120,9 @@ impl Broker {
             .storage
             .clone()
             .ok_or_else(|| std::io::Error::other("no journals"))?;
+        let (messages, bindings) = storage
+            .journals()
+            .ok_or_else(|| std::io::Error::other("replication needs the file journals"))?;
         let node_id = self.node_id.clone();
         let io = |e: saranga_journal::JournalError| std::io::Error::other(e.to_string());
         let start =
@@ -137,16 +140,8 @@ impl Broker {
         // to a new file, and the backup reserves the ones before it.
         let mut journals = Vec::new();
         for (content, id, journal) in [
-            (
-                SyncDataType::JournalMessages,
-                MESSAGES,
-                storage.messages_journal(),
-            ),
-            (
-                SyncDataType::JournalBindings,
-                BINDINGS,
-                storage.bindings_journal(),
-            ),
+            (SyncDataType::JournalMessages, MESSAGES, messages),
+            (SyncDataType::JournalBindings, BINDINGS, bindings),
         ] {
             let replicator = Arc::new(JournalReplicator {
                 journal: id,
@@ -244,8 +239,8 @@ impl Broker {
                 timeout.as_millis()
             )));
         }
-        storage.messages_journal().sync_finished();
-        storage.bindings_journal().sync_finished();
+        messages.sync_finished();
+        bindings.sync_finished();
         paging.sync_finished();
         self.large_messages.sync_finished();
         r.synchronized
@@ -432,9 +427,9 @@ impl Broker {
                 return;
             }
         }
-        if let Some(s) = &self.storage {
-            s.messages_journal().stop_replication();
-            s.bindings_journal().stop_replication();
+        if let Some((messages, bindings)) = self.storage.as_ref().and_then(|s| s.journals()) {
+            messages.stop_replication();
+            bindings.stop_replication();
         }
         self.post_office.paging().stop_replication();
         self.large_messages.stop_replication();
