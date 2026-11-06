@@ -1908,38 +1908,67 @@ fn store_bean(s: &StoreConfiguration) -> Bean {
             .first(None, "FILE")
             .v("bindingsTableName", "BINDINGS")
             .v("messageTableName", "MESSAGES"),
-        StoreConfiguration::Database(d) => Bean::new()
-            .first(None, "DATABASE")
-            .v("bindingsTableName", &d.bindings_table_name)
-            .v("dataSourceClassName", &d.data_source_class_name)
-            .n(
-                "dataSourceProperties",
-                java_map(&d.data_source_properties, |v| Node::Text(v.clone())),
-            )
-            .v("jdbcAllowedTimeDiff", d.jdbc_allowed_time_diff)
-            .o("jdbcConnectionUrl", d.jdbc_connection_url.as_deref())
-            .v("jdbcDriverClassName", &d.jdbc_driver_class_name)
-            .v(
-                "jdbcJournalSyncPeriodMillis",
-                d.jdbc_journal_sync_period_millis,
-            )
-            .v(
-                "jdbcLockAcquisitionTimeoutMillis",
-                d.jdbc_lock_acquisition_timeout_millis,
-            )
-            .v("jdbcLockExpirationMillis", d.jdbc_lock_expiration_millis)
-            .v("jdbcLockRenewPeriodMillis", d.jdbc_lock_renew_period_millis)
-            .v("jdbcNetworkTimeout", d.jdbc_network_timeout)
-            .o("jdbcPassword", d.jdbc_password.as_deref())
-            .o("jdbcUser", d.jdbc_user.as_deref())
-            .v("largeMessageTableName", &d.large_messages_table_name)
-            .v("maxPageSizeBytes", d.max_page_size_bytes)
-            .v("messageTableName", &d.message_table_name)
-            .v(
+        StoreConfiguration::Database(d) => {
+            let new = d.database_storage;
+            let bean = Bean::new()
+                .first(None, if new { "NEW_DATABASE" } else { "DATABASE" })
+                .v("bindingsTableName", &d.bindings_table_name)
+                .v("dataSourceClassName", &d.data_source_class_name)
+                .n(
+                    "dataSourceProperties",
+                    java_map(&d.data_source_properties, |v| Node::Text(v.clone())),
+                );
+            let bean = if new {
+                bean.v("databaseConnections", d.database_connections)
+                    .v("databaseFlushPeriodNanos", d.database_flush_period_nanos)
+                    .v(
+                        "databaseMaxReadConnections",
+                        d.database_max_read_connections,
+                    )
+                    .v("databaseMaxRetries", d.database_max_retries)
+                    .v("databaseReadIdleTimeout", d.database_read_idle_timeout)
+                    .v(
+                        "databaseRetryIntervalMillis",
+                        d.database_retry_interval_millis,
+                    )
+            } else {
+                bean
+            };
+            let bean = bean
+                .v("jdbcAllowedTimeDiff", d.jdbc_allowed_time_diff)
+                .o("jdbcConnectionUrl", d.jdbc_connection_url.as_deref())
+                .v("jdbcDriverClassName", &d.jdbc_driver_class_name)
+                .v(
+                    "jdbcJournalSyncPeriodMillis",
+                    d.jdbc_journal_sync_period_millis,
+                )
+                .v(
+                    "jdbcLockAcquisitionTimeoutMillis",
+                    d.jdbc_lock_acquisition_timeout_millis,
+                )
+                .v("jdbcLockExpirationMillis", d.jdbc_lock_expiration_millis)
+                .v("jdbcLockRenewPeriodMillis", d.jdbc_lock_renew_period_millis)
+                .v("jdbcNetworkTimeout", d.jdbc_network_timeout)
+                .o("jdbcPassword", d.jdbc_password.as_deref())
+                .o("jdbcUser", d.jdbc_user.as_deref())
+                .v("largeMessageTableName", &d.large_messages_table_name)
+                .v("maxPageSizeBytes", d.max_page_size_bytes);
+            let bean = if new {
+                bean.v("maxPendingWrites", d.max_pending_writes)
+            } else {
+                bean
+            };
+            let bean = bean.v("messageTableName", &d.message_table_name).v(
                 "nodeManagerStoreTableName",
                 &d.node_manager_store_table_name,
-            )
-            .v("pageStoreTableName", &d.page_store_table_name),
+            );
+            let bean = if new {
+                bean.v("pageJoinFetch", d.page_join_fetch)
+            } else {
+                bean
+            };
+            bean.v("pageStoreTableName", &d.page_store_table_name)
+        }
     }
 }
 

@@ -842,6 +842,18 @@ pub struct DatabaseStorage {
     pub jdbc_journal_sync_period_millis: i64,
     pub jdbc_allowed_time_diff: i64,
     pub max_page_size_bytes: i32,
+    /// `database-storage`: the relational store (`NEW_DATABASE`), not the
+    /// JDBC journal.
+    pub database_storage: bool,
+    pub database_connections: i32,
+    /// Negative for half of `database_connections`.
+    pub database_max_read_connections: i32,
+    pub database_read_idle_timeout: i64,
+    pub database_max_retries: i32,
+    pub database_retry_interval_millis: i64,
+    pub database_flush_period_nanos: i64,
+    pub max_pending_writes: i32,
+    pub page_join_fetch: bool,
 }
 
 impl Default for DatabaseStorage {
@@ -865,6 +877,15 @@ impl Default for DatabaseStorage {
             jdbc_journal_sync_period_millis: 5,
             jdbc_allowed_time_diff: 250,
             max_page_size_bytes: 100 * 1024,
+            database_storage: false,
+            database_connections: 6,
+            database_max_read_connections: -1,
+            database_read_idle_timeout: 5000,
+            database_max_retries: 5,
+            database_retry_interval_millis: 5000,
+            database_flush_period_nanos: 3_333_333,
+            max_pending_writes: 100_000,
+            page_join_fetch: false,
         }
     }
 }

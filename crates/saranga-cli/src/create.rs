@@ -34,6 +34,7 @@ const TEMPLATES: &[(&str, &str)] = &[
     template!("etc/cluster-settings.txt"),
     template!("etc/cluster-static-settings.txt"),
     template!("etc/commented-ping-settings.txt"),
+    template!("etc/database-store.txt"),
     template!("etc/global-max-default.txt"),
     template!("etc/global-max-specified.txt"),
     template!("etc/hornetq-acceptor.txt"),
@@ -327,7 +328,7 @@ pub struct CreateArgs {
     #[command(flatten)]
     cluster: Clustering,
     #[command(flatten)]
-    unsupported: Unsupported,
+    database: Database,
 }
 
 /// `artemis create`'s clustering and shared-store options.
@@ -378,12 +379,16 @@ struct Clustering {
 /// `PrintWriter.println`'s line separator.
 const LINE_SEPARATOR: &str = if cfg!(windows) { "\r\n" } else { "\n" };
 
-/// `artemis create` options for what Saranga does not do: JDBC storage.
+/// `artemis create`'s database options: `--database-storage` and its
+/// settings, and `--jdbc`, which Saranga refuses alone (it has no JDBC
+/// journal).
 #[derive(clap::Args, Debug)]
-struct Unsupported {
+struct Database {
     #[arg(long, hide = true)]
     jdbc: bool,
-    // The JDBC store's settings, unused without --jdbc.
+    #[arg(long = "database-storage", hide = true)]
+    database_storage: bool,
+    // The store's settings, unused without --database-storage.
     #[arg(long = "jdbc-bindings-table-name", hide = true)]
     jdbc_bindings_table_name: Option<String>,
     #[arg(long = "jdbc-message-table-name", hide = true)]
@@ -404,22 +409,180 @@ struct Unsupported {
     jdbc_lock_renew_period: Option<String>,
     #[arg(long = "jdbc-lock-expiration", hide = true)]
     jdbc_lock_expiration: Option<String>,
+    #[arg(long = "database-connections", hide = true, default_value_t = 6)]
+    database_connections: i32,
+    #[arg(long = "database-max-read-connections", hide = true, default_value_t = -1, allow_negative_numbers = true)]
+    database_max_read_connections: i32,
+    #[arg(
+        long = "database-read-idle-timeout",
+        hide = true,
+        default_value_t = 5000
+    )]
+    database_read_idle_timeout: i64,
 }
 
-impl Unsupported {
+impl Database {
     fn check(&self) -> anyhow::Result<()> {
-        if self.jdbc {
+        if self.database_storage {
+            match self.jdbc_connection_url.as_deref() {
+                Some(url) if url.starts_with("jdbc:postgresql:") => {}
+                Some(url) => bail!(
+                    "saranga create --database-storage takes a PostgreSQL --jdbc-connection-url (jdbc:postgresql:...), not {url}"
+                ),
+                None => bail!(
+                    "saranga create --database-storage needs a PostgreSQL --jdbc-connection-url"
+                ),
+            }
+        } else if self.jdbc {
             bail!(
-                "saranga create does not support --jdbc: Saranga does not store messages in a database"
+                "saranga create does not support --jdbc: Saranga has no JDBC journal; --database-storage stores messages in PostgreSQL"
             );
         }
         Ok(())
+    }
+
+    /// `database-store.txt`'s filters, as `Create.run` puts them.
+    fn put(&self, f: &mut Filters) {
+        let defaults = saranga_config::configuration::DatabaseStorage::default();
+        let or = |v: &Option<String>, default: String| v.clone().unwrap_or(default);
+        let element = |name: &str, value: String| format!("<{name}>{value}</{name}>");
+        f.put(
+            "${jdbcBindings}",
+            or(&self.jdbc_bindings_table_name, defaults.bindings_table_name),
+        );
+        f.put(
+            "${jdbcMessages}",
+            or(&self.jdbc_message_table_name, defaults.message_table_name),
+        );
+        f.put(
+            "${jdbcLargeMessages}",
+            or(
+                &self.jdbc_large_message_table_name,
+                defaults.large_messages_table_name,
+            ),
+        );
+        f.put(
+            "${jdbcPageStore}",
+            or(
+                &self.jdbc_page_store_table_name,
+                defaults.page_store_table_name,
+            ),
+        );
+        f.put(
+            "${jdbcNodeManager}",
+            or(
+                &self.jdbc_node_manager_table_name,
+                defaults.node_manager_store_table_name,
+            ),
+        );
+        // An ampersand between URL parameters would end the XML.
+        f.put(
+            "${jdbcURL}",
+            self.jdbc_connection_url
+                .as_deref()
+                .unwrap_or_default()
+                .replace('&', "&amp;"),
+        );
+        f.put(
+            "${jdbcClassName}",
+            or(
+                &self.jdbc_driver_class_name,
+                "org.postgresql.Driver".to_owned(),
+            ),
+        );
+        f.put(
+            "${jdbcNetworkTimeout}",
+            or(
+                &self.jdbc_network_timeout,
+                defaults.jdbc_network_timeout.to_string(),
+            ),
+        );
+        f.put(
+            "${jdbcLockRenewPeriod}",
+            or(
+                &self.jdbc_lock_renew_period,
+                defaults.jdbc_lock_renew_period_millis.to_string(),
+            ),
+        );
+        f.put(
+            "${jdbcLockExpiration}",
+            or(
+                &self.jdbc_lock_expiration,
+                defaults.jdbc_lock_expiration_millis.to_string(),
+            ),
+        );
+        f.put(
+            "${databaseStorage}",
+            element("database-storage", true.to_string()),
+        );
+        f.put(
+            "${databaseConnections}",
+            element(
+                "database-connections",
+                self.database_connections.to_string(),
+            ),
+        );
+        let read = if self.database_max_read_connections < 0 {
+            self.database_connections / 2
+        } else {
+            self.database_max_read_connections
+        };
+        f.put(
+            "${databaseMaxReadConnections}",
+            element("database-max-read-connections", read.to_string()),
+        );
+        f.put(
+            "${databaseReadIdleTimeout}",
+            element(
+                "database-read-idle-timeout",
+                self.database_read_idle_timeout.to_string(),
+            ),
+        );
+        f.put(
+            "${databaseMaxRetries}",
+            element(
+                "database-max-retries",
+                defaults.database_max_retries.to_string(),
+            ),
+        );
+        f.put(
+            "${databaseRetryIntervalMillis}",
+            element(
+                "database-retry-interval-millis",
+                defaults.database_retry_interval_millis.to_string(),
+            ),
+        );
+        f.put(
+            "${databaseFlushPeriodNanos}",
+            element(
+                "database-flush-period-nanos",
+                defaults.database_flush_period_nanos.to_string(),
+            ),
+        );
+        f.put(
+            "${maxPendingWrites}",
+            element(
+                "max-pending-writes",
+                defaults.max_pending_writes.to_string(),
+            ),
+        );
+        f.put(
+            "${databasePageJoinFetch}",
+            format!(
+                "<!-- Controls how paged messages are read from the database. When true, a single JOIN query fetches\n            message IDs and data together. When false, two separate queries are used: first for IDs, then for data. -->\n            {}",
+                element("database-page-join-fetch", defaults.page_join_fetch.to_string())
+            ),
+        );
     }
 }
 
 /// `Create.run`.
 pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
-    args.unsupported.check()?;
+    args.database.check()?;
+    if args.database.database_storage {
+        // The journal's write speed means nothing to a database.
+        args.no_autotune = true;
+    }
     // `-Dartemis.discovery.enabled=true` first in both profiles' options.
     if args.cluster.discovery_enabled {
         let flag = format!(
@@ -642,7 +805,13 @@ pub fn run(mut args: CreateArgs) -> anyhow::Result<()> {
             f.put("${global-max-section}", text);
         }
     }
-    f.put("${jdbc}", "");
+    if args.database.database_storage {
+        args.database.put(&mut f);
+        let text = f.read("etc/database-store.txt")?;
+        f.put("${jdbc}", text);
+    } else {
+        f.put("${jdbc}", "");
+    }
     if clustered {
         if cluster.static_cluster.is_none() && !cluster.discovery_enabled {
             bail!(UsageError(
@@ -1260,7 +1429,66 @@ pub(crate) fn make_exec(_: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Filters, decimal_format, file_uri};
+    use clap::Parser;
+
+    use super::{Database, Filters, decimal_format, file_uri};
+
+    #[derive(Parser)]
+    struct Options {
+        #[command(flatten)]
+        database: Database,
+    }
+
+    fn database(args: &[&str]) -> Database {
+        Options::try_parse_from(std::iter::once("create").chain(args.iter().copied()))
+            .unwrap()
+            .database
+    }
+
+    #[test]
+    fn jdbc_alone_and_other_databases_are_refused() {
+        assert!(database(&[]).check().is_ok());
+        assert!(database(&["--jdbc"]).check().is_err());
+        assert!(database(&["--database-storage"]).check().is_err());
+        let mysql = [
+            "--database-storage",
+            "--jdbc-connection-url",
+            "jdbc:mysql://h/d",
+        ];
+        assert!(database(&mysql).check().is_err());
+        let postgres = [
+            "--database-storage",
+            "--jdbc-connection-url",
+            "jdbc:postgresql://h/d",
+        ];
+        assert!(database(&postgres).check().is_ok());
+    }
+
+    #[test]
+    fn the_store_section_is_written_as_artemis_writes_it() {
+        let d = database(&[
+            "--database-storage",
+            "--database-connections",
+            "12",
+            "--jdbc-connection-url",
+            "jdbc:postgresql://h/d?user=a&password=b",
+        ]);
+        let mut f = Filters::default();
+        d.put(&mut f);
+        let text = f.read("etc/database-store.txt").unwrap();
+        for line in [
+            "<jdbc-connection-url>jdbc:postgresql://h/d?user=a&amp;password=b</jdbc-connection-url>",
+            "<database-storage>true</database-storage>",
+            "<database-connections>12</database-connections>",
+            // -1 is half of the connections.
+            "<database-max-read-connections>6</database-max-read-connections>",
+            "<database-flush-period-nanos>3333333</database-flush-period-nanos>",
+            "<database-page-join-fetch>false</database-page-join-fetch>",
+        ] {
+            assert!(text.contains(line), "{line} in {text}");
+        }
+        assert!(!text.contains("${"), "{text}");
+    }
 
     #[test]
     fn decimal_format_like_java() {

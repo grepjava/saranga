@@ -1205,6 +1205,9 @@ fn parse_store(e: Node<'_, '_>, config: &mut Configuration) -> Result<()> {
 fn database_store(n: Node<'_, '_>, config: &Configuration) -> Result<DatabaseStorage> {
     let s = Settings { core: n };
     let mut c = DatabaseStorage::default();
+    if let Some(v) = s.bool("database-storage") {
+        c.database_storage = v;
+    }
     if let Some(v) = s.string("bindings-table-name") {
         c.bindings_table_name = v;
     }
@@ -1253,6 +1256,30 @@ fn database_store(n: Node<'_, '_>, config: &Configuration) -> Result<DatabaseSto
         c.max_page_size_bytes,
         Check::Any,
     )?;
+    if let Some(v) = s.i32("database-connections", Check::Any)? {
+        c.database_connections = v;
+    }
+    if let Some(v) = s.i32("database-max-read-connections", Check::Any)? {
+        c.database_max_read_connections = v;
+    }
+    if let Some(v) = s.i64("database-read-idle-timeout", Check::Any)? {
+        c.database_read_idle_timeout = v;
+    }
+    if let Some(v) = s.i32("database-max-retries", Check::Any)? {
+        c.database_max_retries = v;
+    }
+    if let Some(v) = s.i64("database-retry-interval-millis", Check::Any)? {
+        c.database_retry_interval_millis = v;
+    }
+    if let Some(v) = s.i64("database-flush-period-nanos", Check::Any)? {
+        c.database_flush_period_nanos = v;
+    }
+    if let Some(v) = s.i32("max-pending-writes", Check::Any)? {
+        c.max_pending_writes = v;
+    }
+    if let Some(v) = s.bool("database-page-join-fetch") {
+        c.page_join_fetch = v;
+    }
     if let Some(user) = s.string("jdbc-user") {
         c.jdbc_user = Some(resolve(config, "jdbc-user", &user)?);
     }
