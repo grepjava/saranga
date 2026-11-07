@@ -1233,7 +1233,10 @@ impl PagingStore {
     }
 
     /// `page` on a store that keeps paged messages itself: the message waits
-    /// in the store, each queue counting it once it is committed.
+    /// in the store. A consumer may be waiting on its queues, with nothing
+    /// else to send them there, so they look once it can be read, and by then
+    /// they must have counted it: outside a transaction before the write, and
+    /// in one at the commit.
     fn page_in_store(
         &self,
         manager: &Arc<PagingManager>,
@@ -1245,14 +1248,22 @@ impl PagingStore {
     ) -> Result<Paged, BrokerError> {
         let storage = manager.storage.as_ref().expect("a store that pages");
         let ids: Vec<i64> = queues.iter().map(|q| q.id()).collect();
+        let size = persistent_size(message);
+        if tx.is_none() {
+            subs.iter().for_each(|sub| sub.stored_add(1, size));
+        }
+        let waiting = queues.to_vec();
+        let written = Box::new(move || waiting.iter().for_each(crate::queue::Queue::paged_written));
         let pending = storage
-            .store_paged(tx.map(|_| tx_id), message, &ids)
+            .store_paged(tx.map(|_| tx_id), message, &ids, written)
             .map_err(|e| {
+                if tx.is_none() {
+                    subs.iter().for_each(|sub| sub.counter_add(-1, -size));
+                }
                 BrokerError::new(saranga_core_protocol::ErrorType::IoError, e.to_string())
             })?;
-        let size = persistent_size(message);
         match tx {
-            None => subs.iter().for_each(|sub| sub.stored_add(1, size)),
+            None => {}
             Some(tx) => {
                 // The store holds the message until the commit: without
                 // this, a transaction of paged messages alone has no commit
@@ -1262,6 +1273,11 @@ impl PagingStore {
                 t.paging
                     .stored
                     .extend(subs.into_iter().map(|sub| (sub, size)));
+                for q in queues {
+                    if !t.paging.waiting.iter().any(|w| w.id() == q.id()) {
+                        t.paging.waiting.push(q.clone());
+                    }
+                }
             }
         }
         Ok(Paged::Yes(pending))
@@ -3072,6 +3088,8 @@ pub struct TxPaging {
     stored_records: bool,
     /// Messages paged in the store: counted once they are committed.
     pub stored: Vec<(Arc<PageSubscription>, i64)>,
+    /// Their queues, which look for them after the commit.
+    pub waiting: Vec<crate::queue::Queue>,
 }
 
 impl std::fmt::Debug for PageSubscription {
@@ -3128,6 +3146,9 @@ impl TxPaging {
         for (sub, size) in self.stored {
             sub.stored_add(1, size);
         }
+        self.waiting
+            .iter()
+            .for_each(crate::queue::Queue::paged_written);
     }
 
     /// `afterRollback`.

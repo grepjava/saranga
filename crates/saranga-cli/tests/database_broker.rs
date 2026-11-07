@@ -193,18 +193,25 @@ impl Instance {
     }
 
     fn client(&self, command: &str, args: &[String]) -> String {
-        let out = Command::new(BINARY)
-            .arg(command)
-            .args(["--url", &format!("tcp://localhost:{}", self.port)])
-            .args(["--user", "a", "--password", "b"])
-            .args(["--destination", "queue://KILLED"])
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
+        self.client_of("KILLED", command, args)
+    }
+
+    fn client_of(&self, queue: &str, command: &str, args: &[String]) -> String {
+        let out = self.command(queue, command, args).output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(out.status.success(), "{command}: {text}");
         text
+    }
+
+    fn command(&self, queue: &str, command: &str, args: &[String]) -> Command {
+        let mut c = Command::new(BINARY);
+        c.arg(command)
+            .args(["--url", &format!("tcp://localhost:{}", self.port)])
+            .args(["--user", "a", "--password", "b"])
+            .args(["--destination", &format!("queue://{queue}")])
+            .args(args)
+            .stdin(Stdio::null());
+        c
     }
 }
 
@@ -478,4 +485,67 @@ fn replication_is_refused_with_the_store() {
         "{}",
         read(&instance.log())
     );
+}
+
+/// A paged message reaches a consumer already waiting once it is in the
+/// tables, with or without a transaction. Another address holds the broker
+/// over its limit, so this one pages while its queue is empty, and with the
+/// reaper off nothing else is going to look at the queue: the client forces
+/// a delivery when its receive runs out, so the time is what shows it.
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn a_waiting_consumer_gets_what_is_paged() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let database = Database::new();
+    database.empty();
+    let mut instance = Instance::new(Some(1_000_000));
+    let file = instance.home.join("etc/broker.xml");
+    let xml = std::fs::read_to_string(&file).unwrap();
+    assert!(!xml.contains("<message-expiry-scan-period>"));
+    let xml = xml.replace(
+        "<max-disk-usage>100</max-disk-usage>",
+        "<message-expiry-scan-period>-1</message-expiry-scan-period>         <max-disk-usage>100</max-disk-usage>",
+    );
+    std::fs::write(&file, xml).unwrap();
+    instance.start();
+    let strings = |args: &[&str]| args.iter().map(|&a| a.to_owned()).collect::<Vec<_>>();
+    instance.client(
+        "producer",
+        &strings(&["--message-count", "3000", "--message-size", "512"]),
+    );
+    assert!(database.paged() > 0, "nothing paged");
+
+    let consumer = instance
+        .command(
+            "WAITING",
+            "consumer",
+            &strings(&["--message-count", "10", "--receive-timeout", "30000"]),
+        )
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    let send = [
+        "--message-count",
+        "5",
+        "--message-size",
+        "100",
+        "--sleep",
+        "200",
+    ];
+    instance.client_of("WAITING", "producer", &strings(&send));
+    let mut transacted = strings(&send);
+    transacted.extend(strings(&["--commit-interval", "1"]));
+    instance.client_of("WAITING", "producer", &transacted);
+    let sent = Instant::now();
+
+    let out = consumer.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Consumed: 10 messages"), "{text}");
+    let late = sent.elapsed();
+    assert!(
+        late < Duration::from_secs(10),
+        "{late:?} after the last send"
+    );
+    assert!(read(&instance.log()).contains("paging on address 'WAITING'"));
 }

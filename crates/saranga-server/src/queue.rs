@@ -966,6 +966,14 @@ impl Queue {
         self.send(Cmd::ForceDelivery { id, sequence });
     }
 
+    /// Messages paged in the store can be read now. A consumer may be waiting
+    /// for them, and without one they stay paged.
+    pub fn paged_written(&self) {
+        if self.consumer_count() > 0 {
+            self.send(Cmd::Depage);
+        }
+    }
+
     /// `promptDelivery`: a consumer that refused a message may take it now.
     pub fn prompt_delivery(&self) {
         self.send(Cmd::Prompt);

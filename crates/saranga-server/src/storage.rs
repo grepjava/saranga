@@ -530,11 +530,13 @@ pub trait Store: Send + Sync {
     }
 
     /// Keeps a message for its queues as paged, in the transaction if any.
+    /// Outside one, `written` runs once a read can find it.
     fn store_paged(
         &self,
         _tx: Option<i64>,
         _message: &ServerMessage,
         _queue_ids: &[i64],
+        _written: Box<dyn FnOnce() + Send>,
     ) -> StoreResult<Option<Pending>> {
         Err(JournalError::IllegalState(
             "this store pages to files".into(),

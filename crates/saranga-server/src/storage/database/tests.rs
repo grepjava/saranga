@@ -475,7 +475,11 @@ fn paged_messages_are_read_in_order_and_stay_out_of_memory() {
     let f = Fixture::new();
     let (s, _) = f.start();
     for id in 60..70 {
-        wait(s.store_paged(None, &message(id), &[1, 2]).unwrap().unwrap());
+        wait(
+            s.store_paged(None, &message(id), &[1, 2], Box::new(|| ()))
+                .unwrap()
+                .unwrap(),
+        );
     }
     assert_eq!(ids_of(&s.read_paged(1, 3).unwrap()), vec![60, 61, 62]);
     s.stop().unwrap();
@@ -555,9 +559,17 @@ fn a_scan_leaves_paged_messages_paged() {
     let f = Fixture::new();
     let (s, _) = f.start();
     for id in 1..=5 {
-        wait(s.store_paged(None, &message(id), &[1]).unwrap().unwrap());
+        wait(
+            s.store_paged(None, &message(id), &[1], Box::new(|| ()))
+                .unwrap()
+                .unwrap(),
+        );
     }
-    wait(s.store_paged(None, &message(6), &[2]).unwrap().unwrap());
+    wait(
+        s.store_paged(None, &message(6), &[2], Box::new(|| ()))
+            .unwrap()
+            .unwrap(),
+    );
     assert_eq!(ids_of(&s.scan_paged(1, 2, i64::MIN).unwrap()), [1, 2]);
     assert_eq!(ids_of(&s.scan_paged(1, 2, 2).unwrap()), [3, 4]);
     assert_eq!(ids_of(&s.scan_paged(1, 10, 4).unwrap()), [5]);
@@ -572,7 +584,11 @@ fn a_settled_acknowledgement_keeps_a_read_from_its_row() {
     let f = Fixture::new();
     let (s, _) = f.start();
     for id in 1..=2000 {
-        wait(s.store_paged(None, &message(id), &[1]).unwrap().unwrap());
+        wait(
+            s.store_paged(None, &message(id), &[1], Box::new(|| ()))
+                .unwrap()
+                .unwrap(),
+        );
     }
     for id in 1..=1999 {
         drop(s.store_acknowledge(1, id).unwrap());
@@ -589,7 +605,7 @@ fn paged_messages_of_a_transaction_appear_at_its_commit() {
     let (s, _) = f.start();
     let tx = s.generate_id();
     assert!(
-        s.store_paged(Some(tx), &message(80), &[1])
+        s.store_paged(Some(tx), &message(80), &[1], Box::new(|| ()))
             .unwrap()
             .is_none()
     );
@@ -598,7 +614,8 @@ fn paged_messages_of_a_transaction_appear_at_its_commit() {
     wait(s.commit(tx).unwrap());
     assert_eq!(ids_of(&s.read_paged(1, 10).unwrap()), vec![80]);
     let tx = s.generate_id();
-    s.store_paged(Some(tx), &message(81), &[1]).unwrap();
+    s.store_paged(Some(tx), &message(81), &[1], Box::new(|| ()))
+        .unwrap();
     wait(s.rollback(tx).unwrap());
     assert!(s.read_paged(1, 10).unwrap().is_empty());
 }
@@ -609,7 +626,11 @@ fn paged_messages_of_a_transaction_appear_at_its_commit() {
 fn a_deleted_queue_leaves_no_paged_references() {
     let f = Fixture::new();
     let (s, _) = f.start();
-    wait(s.store_paged(None, &message(90), &[5]).unwrap().unwrap());
+    wait(
+        s.store_paged(None, &message(90), &[5], Box::new(|| ()))
+            .unwrap()
+            .unwrap(),
+    );
     s.delete_binding(5).unwrap();
     assert!(s.read_paged(5, 10).unwrap().is_empty());
     s.stop().unwrap();

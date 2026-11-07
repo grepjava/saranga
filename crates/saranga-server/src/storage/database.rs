@@ -1631,6 +1631,7 @@ impl Store for DatabaseStorage {
         tx: Option<i64>,
         message: &ServerMessage,
         queue_ids: &[i64],
+        written: Box<dyn FnOnce() + Send>,
     ) -> StoreResult<Option<Pending>> {
         let mut ops = vec![Self::message_op(message, None)?];
         ops.extend(queue_ids.iter().map(|&queue| Op::Reference {
@@ -1644,7 +1645,18 @@ impl Store for DatabaseStorage {
                 ops.into_iter().for_each(|op| self.in_tx(tx, op));
                 Ok(None)
             }
-            None => self.pending(ops).map(Some),
+            None => {
+                let (c, p) = Pending::new();
+                self.writes.send(Unit {
+                    ops,
+                    done: Some(Box::new(move |r| {
+                        c(r);
+                        written();
+                    })),
+                    barrier: false,
+                })?;
+                Ok(Some(p))
+            }
         }
     }
 
