@@ -19,8 +19,10 @@ use crate::transaction::Xid;
 
 pub use saranga_storage::ids;
 
+mod database;
 mod journal;
 
+pub use database::{DatabaseConfig, DatabaseStorage};
 pub use journal::JournalStorage;
 
 /// `CoreMessagePersister.ID`.
@@ -69,6 +71,8 @@ pub struct StorageConfig {
     pub paging: std::path::PathBuf,
     /// `large-message-sync`.
     pub large_message_sync: bool,
+    /// The relational store in place of the journals.
+    pub database: Option<DatabaseConfig>,
 }
 
 /// A durable message's record body (`ADD_MESSAGE_PROTOCOL`), from the
@@ -259,6 +263,8 @@ pub struct RecoveredMessages {
     pub page_completes: Vec<RecoveredCursorRecord>,
     /// Page transactions with messages left to consume.
     pub page_txs: Vec<RecoveredPageTx>,
+    /// Per queue, the (messages, bytes) paged in the store, not read here.
+    pub paged: HashMap<i64, (i64, i64)>,
     /// Records of types the broker does not know, for the protocols that
     /// wrote them (`journalRecordsListener`).
     pub extra: Vec<ExtraRecord>,
@@ -515,6 +521,29 @@ pub trait Store: Send + Sync {
     /// `storeAddressStatus` with `PAUSED`.
     fn store_address_status(&self, address_id: i64) -> StoreResult<i64>;
 
+    /// Whether paged messages stay here rather than in page files.
+    fn pages_in_store(&self) -> bool {
+        false
+    }
+
+    /// Keeps a message for its queues as paged, in the transaction if any.
+    fn store_paged(
+        &self,
+        _tx: Option<i64>,
+        _message: &ServerMessage,
+        _queue_ids: &[i64],
+    ) -> StoreResult<Option<Pending>> {
+        Err(JournalError::IllegalState(
+            "this store pages to files".into(),
+        ))
+    }
+
+    /// Takes up to `limit` of a queue's paged messages out of paging, oldest
+    /// first, each with whether it is large.
+    fn read_paged(&self, _queue_id: i64, _limit: i64) -> StoreResult<Vec<(StoredMessage, bool)>> {
+        Ok(Vec::new())
+    }
+
     /// A commit that is not synced, as a housekeeping delete's is. With
     /// `wait` false it does not wait for the write either.
     fn commit_unsynced(&self, tx: i64, wait: bool) -> StoreResult<()>;
@@ -530,7 +559,10 @@ pub struct Storage(Box<dyn Store>);
 impl Storage {
     /// Opens the store `cfg` names; nothing is loaded yet.
     pub fn open(cfg: StorageConfig) -> StoreResult<Self> {
-        Ok(Self(Box::new(JournalStorage::open(cfg)?)))
+        Ok(match cfg.database.clone() {
+            Some(database) => Self(Box::new(DatabaseStorage::open(cfg, &database)?)),
+            None => Self(Box::new(JournalStorage::open(cfg)?)),
+        })
     }
 }
 

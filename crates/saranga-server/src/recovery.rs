@@ -300,6 +300,7 @@ pub async fn load_messages(
         page_txs,
         extra,
         heuristics,
+        paged,
     } = storage
         .load_messages()
         .map_err(|e| corrupt("loading the message journal", e))?;
@@ -387,8 +388,14 @@ pub async fn load_messages(
                 persisted_count: r.delivery_count,
                 scheduled_time,
                 paged: None,
+                stored: storage.pages_in_store(),
                 rejected_consumers: Vec::new(),
             });
+        }
+    }
+    for (queue_id, (count, size)) in paged {
+        if let Some(sub) = by_id.get(&queue_id).and_then(Queue::page_subscription) {
+            sub.stored_found(count, size);
         }
     }
     for p in prepared {

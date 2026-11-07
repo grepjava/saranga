@@ -817,6 +817,9 @@ impl GroupingHandlerConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BrokerConfig {
     pub name: String,
+    /// `<database-store>` with `database-storage`: the store in place of
+    /// the journals.
+    pub database_store: Option<crate::configuration::DatabaseStorage>,
     pub persistence_enabled: bool,
     pub security_enabled: bool,
     pub journal_directory: String,
@@ -1171,6 +1174,7 @@ impl Default for BrokerConfig {
             id_cache_size: Self::DEFAULT_ID_CACHE_SIZE,
             persist_id_cache: Self::DEFAULT_PERSIST_ID_CACHE,
             large_message_sync: true,
+            database_store: None,
             configuration_file_refresh_period: Self::DEFAULT_CONFIGURATION_FILE_REFRESH_PERIOD,
             security_invalidation_interval: Self::DEFAULT_SECURITY_INVALIDATION_INTERVAL,
             authentication_cache_size: Self::DEFAULT_AUTHENTICATION_CACHE_SIZE,

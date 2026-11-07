@@ -819,6 +819,7 @@ mod tests {
             large_messages: dir.join("largemessages"),
             paging: dir.join("paging"),
             large_message_sync: false,
+            database: None,
         }
     }
 

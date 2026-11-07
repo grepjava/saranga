@@ -110,6 +110,10 @@ const LARGE_BYTES_PER_PASS: usize = 1024 * 1024;
 /// `max-read-page-messages` nor `max-read-page-bytes` limits it.
 const MAX_DEPAGE_NUM: i64 = 1000;
 
+/// Paged messages read from the store at a time, so that the limits on what
+/// a queue holds are checked as it fills.
+const DEPAGE_CHUNK: i64 = 200;
+
 /// A queue's settings (`QueueConfiguration` with every default applied).
 /// Name, address, durability and the kind of queue (last-value,
 /// temporary) are fixed when it is created; `updateQueue` may change the
@@ -629,7 +633,7 @@ impl Queue {
     /// Whether this reference is journaled: a persistent message on a
     /// durable queue, not read from a page.
     pub fn is_durable_ref(&self, r: &MessageRef) -> bool {
-        r.paged.is_none() && self.is_durable_ref_of(&r.message)
+        r.paged.is_none() && (r.stored || self.is_durable_ref_of(&r.message))
     }
 
     /// Whether a message routed here is journaled.
@@ -2448,6 +2452,16 @@ impl Actor {
         let Some(store) = sub.store() else {
             return;
         };
+        if self
+            .shared
+            .ids
+            .storage()
+            .is_some_and(|s| s.pages_in_store())
+        {
+            let sub = sub.clone();
+            self.depage_stored(&sub, &store);
+            return;
+        }
         if !store.is_paging() && !sub.has_redeliveries() {
             return;
         }
@@ -2480,6 +2494,49 @@ impl Actor {
             }
             self.add_tail(r);
         }
+    }
+
+    /// `DatabaseStorageMessageReader.fetchMessages`: brings the queue's paged
+    /// messages out of the store while it holds fewer than
+    /// `max-read-page-messages`.
+    fn depage_stored(
+        &mut self,
+        sub: &Arc<crate::paging::PageSubscription>,
+        store: &Arc<crate::paging::PagingStore>,
+    ) {
+        let s = self.queue().settings();
+        let most = if s.max_read_page_messages > 0 {
+            s.max_read_page_messages
+        } else {
+            MAX_DEPAGE_NUM
+        };
+        let queue = self.queue();
+        let now = now_millis();
+        while sub.message_count() > 0 {
+            let room = most - self.messages.len() as i64;
+            if room <= 0
+                || (s.max_read_page_bytes > 0 && store.memory_size() >= s.max_read_page_bytes)
+            {
+                return;
+            }
+            let read = store.read_stored(sub, room.min(DEPAGE_CHUNK));
+            if read.is_empty() {
+                break;
+            }
+            for message in read {
+                message.durable_up();
+                let mut r = MessageRef::new(message);
+                r.stored = true;
+                let t = message::scheduled_delivery_time(r.message.core());
+                if t > now {
+                    r.scheduled_time = t;
+                }
+                self.shared.message_count.fetch_add(1, Ordering::SeqCst);
+                queue.ref_up(&r);
+                self.add_tail(r);
+            }
+        }
+        store.check_stored_drained();
     }
 
     /// `deleteAllReferences`: the deleted queue's durable messages are

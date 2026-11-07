@@ -118,6 +118,11 @@ pub struct PagingManager {
 }
 
 impl PagingManager {
+    /// Whether paged messages stay in the store, not in page files.
+    fn pages_in_store(&self) -> bool {
+        self.storage.as_ref().is_some_and(|s| s.pages_in_store())
+    }
+
     pub fn new(
         dir: Option<PathBuf>,
         storage: Option<Arc<Storage>>,
@@ -1211,6 +1216,7 @@ impl PagingStore {
             return;
         }
         if st.current.is_none()
+            && !manager.pages_in_store()
             && let Err(e) = self.open_new_page(&mut st)
         {
             tracing::warn!("AMQ222037: IO Error, impossible to start paging: {e}");
@@ -1224,6 +1230,108 @@ impl PagingStore {
             self.address,
             self.page_info()
         );
+    }
+
+    /// `page` on a store that keeps paged messages itself: the message waits
+    /// in the store, each queue counting it once it is committed.
+    fn page_in_store(
+        &self,
+        manager: &Arc<PagingManager>,
+        message: &Arc<ServerMessage>,
+        tx: Option<&crate::transaction::TxRef>,
+        tx_id: i64,
+        queues: &[crate::queue::Queue],
+        subs: Vec<Arc<PageSubscription>>,
+    ) -> Result<Paged, BrokerError> {
+        let storage = manager.storage.as_ref().expect("a store that pages");
+        let ids: Vec<i64> = queues.iter().map(|q| q.id()).collect();
+        let pending = storage
+            .store_paged(tx.map(|_| tx_id), message, &ids)
+            .map_err(|e| {
+                BrokerError::new(saranga_core_protocol::ErrorType::IoError, e.to_string())
+            })?;
+        let size = persistent_size(message);
+        match tx {
+            None => subs.iter().for_each(|sub| sub.stored_add(1, size)),
+            Some(tx) => {
+                // The store holds the message until the commit: without
+                // this, a transaction of paged messages alone has no commit
+                // to write, and they would never reach the tables.
+                let mut t = crate::transaction::lock(tx);
+                t.persistent = true;
+                t.paging
+                    .stored
+                    .extend(subs.into_iter().map(|sub| (sub, size)));
+            }
+        }
+        Ok(Paged::Yes(pending))
+    }
+
+    /// Reads a queue's next paged messages from the store: they are ordinary
+    /// messages from then on.
+    pub fn read_stored(&self, sub: &Arc<PageSubscription>, limit: i64) -> Vec<Arc<ServerMessage>> {
+        let Some(manager) = self.manager.upgrade() else {
+            return Vec::new();
+        };
+        if !manager.loaded.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let Some(storage) = manager.storage.clone() else {
+            return Vec::new();
+        };
+        let rows = match storage.read_paged(sub.queue_id, limit) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("AMQ222037: IO Error reading paged messages: {e}");
+                return Vec::new();
+            }
+        };
+        let decoders = manager.decoders.get_or_init(MessageDecoders::default);
+        let mut out = Vec::with_capacity(rows.len());
+        for (stored, large) in rows {
+            let id = stored.message_id();
+            let message = match stored {
+                crate::storage::StoredMessage::Core(m) if !large => Ok(ServerMessage::new(m)),
+                crate::storage::StoredMessage::Core(m) => {
+                    Ok(ServerMessage::new_large(m, manager.large.existing(id)))
+                }
+                crate::storage::StoredMessage::Native(r) if large => {
+                    decoders.decode_large(&r, manager.large.existing(id))
+                }
+                crate::storage::StoredMessage::Native(r) => decoders.decode(&r),
+            };
+            match message {
+                Ok(m) => {
+                    sub.counter_add(-1, -persistent_size(&m));
+                    out.push(m);
+                }
+                Err(e) => tracing::warn!("AMQ222037: Cannot read paged message {id}: {e}"),
+            }
+        }
+        out
+    }
+
+    /// Paging ends once no queue has a message left in the store and the
+    /// address has room: a full address that stopped would take the next
+    /// message into memory.
+    pub fn check_stored_drained(&self) {
+        if self.is_full() {
+            return;
+        }
+        let mut st = lock(&self.state);
+        if st.paging
+            && st
+                .subscriptions
+                .values()
+                .all(|s| lock(&s.state).counter <= 0)
+        {
+            self.stop_paging(&mut st);
+        }
+    }
+
+    /// The bytes of the address's messages in memory.
+    pub fn memory_size(&self) -> i64 {
+        self.size.load(Ordering::SeqCst)
     }
 
     /// `stopPaging`, with `onPageModeCleared`: the subscriptions' counters
@@ -1535,6 +1643,14 @@ impl PagingStore {
             return Ok(Paged::Dropped);
         }
         let tx_id = tx.map(|t| crate::transaction::lock(t).id).unwrap_or(-1);
+        if manager.pages_in_store() {
+            let subs: Vec<Arc<PageSubscription>> = queues
+                .iter()
+                .filter_map(|q| st.subscriptions.get(&q.id()).cloned())
+                .collect();
+            drop(st);
+            return self.page_in_store(&manager, message, tx, tx_id, queues, subs);
+        }
         let paged = PagedMessage {
             transaction_id: tx_id,
             body: match (message.large(), message.native()) {
@@ -2226,6 +2342,9 @@ impl PagingStore {
         let Some(storage) = manager.storage.clone() else {
             return;
         };
+        if storage.pages_in_store() {
+            return;
+        }
         let mut deleted: Vec<(i64, Option<PathBuf>)> = Vec::new();
         let subs: Vec<Arc<PageSubscription>>;
         {
@@ -2586,6 +2705,21 @@ impl PageSubscription {
         if s.empty { 0 } else { s.counter.max(0) }
     }
 
+    /// Messages paged in the store for this queue, found there or just
+    /// committed.
+    pub fn stored_add(&self, n: i64, size: i64) {
+        lock(&self.state).empty = false;
+        self.counter_add(n, size);
+    }
+
+    /// Paging resumes for what a restart found in the store.
+    pub fn stored_found(&self, n: i64, size: i64) {
+        self.stored_add(n, size);
+        if let Some(store) = self.store.upgrade() {
+            store.start_paging();
+        }
+    }
+
     /// A paged message read into the queue's memory.
     pub fn read_in(&self, size: i64) {
         let mut s = lock(&self.state);
@@ -2872,7 +3006,15 @@ pub struct TxPaging {
     /// (page transaction, messages) its acknowledgements consumed.
     pub updates: Vec<(i64, i32)>,
     /// Written already, at prepare.
-    stored: bool,
+    stored_records: bool,
+    /// Messages paged in the store: counted once they are committed.
+    pub stored: Vec<(Arc<PageSubscription>, i64)>,
+}
+
+impl std::fmt::Debug for PageSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PageSubscription({})", self.queue_id)
+    }
 }
 
 impl std::fmt::Debug for PagingStore {
@@ -2886,7 +3028,7 @@ impl TxPaging {
     /// the journal already.
     pub fn recovered(&mut self, manager: Arc<PagingManager>) {
         self.manager = Some(manager);
-        self.stored = true;
+        self.stored_records = true;
     }
 
     /// `beforePrepare` / `beforeCommit`: the page files are synced, the
@@ -2896,7 +3038,7 @@ impl TxPaging {
             s.sync()
                 .map_err(|e| saranga_journal::JournalError::Io(Arc::new(e)))?;
         }
-        if std::mem::replace(&mut self.stored, true) {
+        if std::mem::replace(&mut self.stored_records, true) {
             return Ok(());
         }
         for p in &self.page_txs {
@@ -2919,6 +3061,9 @@ impl TxPaging {
     pub fn after_commit(self) {
         for p in self.page_txs {
             p.commit();
+        }
+        for (sub, size) in self.stored {
+            sub.stored_add(1, size);
         }
     }
 

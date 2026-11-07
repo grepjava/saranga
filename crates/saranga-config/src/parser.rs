@@ -493,6 +493,9 @@ fn parse_core(
     check_unsupported(core, warnings)?;
     parse_ha_policy(core, config, warnings)?;
     parse_scalars(core, config, warnings)?;
+    if let Some(store) = first(core, "store").and_then(|s| first(s, "database-store")) {
+        config.database_store = Some(crate::configuration::database_store(store, &*config)?);
+    }
     parse_acceptors(core, config, warnings)?;
     parse_connectors(core, config, warnings)?;
     parse_broadcast_groups(core, config)?;
@@ -783,15 +786,19 @@ fn coordination_id(id: &str) -> String {
     id.replace('-', ".")
 }
 
-/// Refuses what would make the broker something Saranga cannot be (a JDBC
-/// store) and warns about features it does not act on.
+/// Refuses what would make the broker something Saranga cannot be (the JDBC
+/// journal; `database-storage` is the relational store, which it has) and
+/// warns about features it does not act on.
 fn check_unsupported(core: Node<'_, '_>, warnings: &mut Vec<Warning>) -> Result<()> {
     if let Some(store) = first(core, "store")
-        && first(store, "database-store").is_some()
+        && let Some(database) = first(store, "database-store")
+        && !(Settings { core: database })
+            .bool("database-storage")
+            .unwrap_or(false)
     {
         return Err(ConfigError::Unsupported {
             element: "database-store".to_owned(),
-            reason: "JDBC persistence is not supported; use the file journal",
+            reason: "the JDBC journal is not supported; use the file journal or database-storage",
         });
     }
     for (name, reason) in NOT_ACTED_ON {

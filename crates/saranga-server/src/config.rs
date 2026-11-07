@@ -14,7 +14,7 @@ use crate::postoffice::{
 use crate::settings::{
     AddressFullPolicy, AddressSettings, DiskFullPolicy, PageFullPolicy, SettingsRepository,
 };
-use crate::storage::StorageConfig;
+use crate::storage::{DatabaseConfig, StorageConfig};
 use crate::wildcard::WildcardConfig;
 use crate::{AddressDeployment, BrokerConfig, RoutingType};
 
@@ -356,6 +356,16 @@ pub fn storage_config(config: &cfg::BrokerConfig, instance: &Path) -> StorageCon
         large_messages: dir(&config.large_messages_directory),
         paging: dir(&config.paging_directory),
         large_message_sync: config.large_message_sync,
+        database: config.database_store.as_ref().map(|d| DatabaseConfig {
+            url: d.jdbc_connection_url.clone().unwrap_or_default(),
+            user: d.jdbc_user.clone(),
+            password: d.jdbc_password.clone(),
+            connections: d.database_connections,
+            network_timeout_millis: d.jdbc_network_timeout,
+            max_retries: d.database_max_retries,
+            retry_interval_millis: d.database_retry_interval_millis,
+            max_pending_writes: d.max_pending_writes,
+        }),
     }
 }
 

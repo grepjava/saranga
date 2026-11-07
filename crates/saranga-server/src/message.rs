@@ -664,6 +664,8 @@ pub struct MessageRef {
     pub scheduled_time: i64,
     /// Set for a message read from a page: it is not in the journal.
     pub paged: Option<PagePosition>,
+    /// In the store whatever its durability: read from the store's pages.
+    pub stored: bool,
     /// Consumers the message is not given to again
     /// (`Message.rejectConsumer`).
     pub rejected_consumers: Vec<crate::queue::ConsumerId>,
@@ -677,6 +679,7 @@ impl MessageRef {
             persisted_count: 0,
             scheduled_time: 0,
             paged: None,
+            stored: false,
             rejected_consumers: Vec::new(),
         }
     }

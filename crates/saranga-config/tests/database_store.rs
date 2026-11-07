@@ -72,3 +72,22 @@ fn the_schema_takes_them() {
     )
     .unwrap();
 }
+
+/// `database-storage` is the store Saranga has; without it, the JDBC journal
+/// it does not.
+#[test]
+fn only_the_jdbc_journal_is_refused() {
+    let parse =
+        |store: &str| BrokerConfig::parse_validated(&document(store), |_| None, Validation::Reload);
+    assert!(matches!(
+        parse("<jdbc-connection-url>x</jdbc-connection-url>"),
+        Err(saranga_config::ConfigError::Unsupported { .. })
+    ));
+    let c = parse(SETTINGS).unwrap();
+    let d = c.database_store.expect("the store's settings");
+    assert_eq!(d.database_connections, 12);
+    assert_eq!(
+        d.jdbc_connection_url.as_deref(),
+        Some("jdbc:postgresql://h/d")
+    );
+}

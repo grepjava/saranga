@@ -16,6 +16,7 @@ mod parse;
 pub use apply::apply_property;
 pub(crate) use apply::{connection_router, scalar_element};
 pub use export::{ExportContext, ExportError, export_as_properties};
+pub(crate) use parse::database_store;
 pub(crate) use parse::parse_connection_router;
 pub use parse::parse_main_config;
 

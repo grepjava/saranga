@@ -1202,7 +1202,10 @@ fn parse_store(e: Node<'_, '_>, config: &mut Configuration) -> Result<()> {
 }
 
 /// `createDatabaseStoreConfig`.
-fn database_store(n: Node<'_, '_>, config: &Configuration) -> Result<DatabaseStorage> {
+pub(crate) fn database_store(
+    n: Node<'_, '_>,
+    config: &impl MaskSettings,
+) -> Result<DatabaseStorage> {
     let s = Settings { core: n };
     let mut c = DatabaseStorage::default();
     if let Some(v) = s.bool("database-storage") {
