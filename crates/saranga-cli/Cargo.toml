@@ -46,6 +46,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 tempfile = "3"
+tokio-postgres = "0.7"
 
 [features]
 default = ["mimalloc"]

@@ -2070,6 +2070,7 @@ dependencies = [
  "saranga-transport",
  "tempfile",
  "tokio",
+ "tokio-postgres",
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
