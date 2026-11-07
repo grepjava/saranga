@@ -50,6 +50,9 @@ pub struct ExportArgs {
 pub fn run(args: ExportArgs) -> anyhow::Result<()> {
     let _lock = args.db.lock()?;
     let out = args.db.out()?;
+    if let Some(store) = args.dirs.unchecked()?.database() {
+        return from_tables(&args, out, &store);
+    }
     let d = args.dirs.resolve()?;
     let file_size = d
         .config
@@ -58,6 +61,7 @@ pub fn run(args: ExportArgs) -> anyhow::Result<()> {
         .map(|n| n.max(0) as usize);
     let mut exporter = Exporter {
         args: &args,
+        source: "journal",
         large_messages: d.large_messages.clone(),
         queue_bindings: HashMap::new(),
         queue_order: Vec::new(),
@@ -74,6 +78,37 @@ pub fn run(args: ExportArgs) -> anyhow::Result<()> {
     exporter.warn_unknown_queues();
     exporter.message_journal(&d.journal, file_size)?;
     exporter.print(&d.paging)?;
+    Ok(())
+}
+
+/// `RelationalDatabaseXmlDataExporter`: the same document, from the tables.
+/// Paged messages are rows like the others. Large bodies go through files, as
+/// the printing reads them from there.
+fn from_tables(
+    args: &ExportArgs,
+    out: Box<dyn Write + '_>,
+    store: &saranga_server::storage::DatabaseConfig,
+) -> anyhow::Result<()> {
+    let tables = saranga_server::storage::read_tables(store)?;
+    let bodies = tempfile::tempdir().context("a directory for large bodies")?;
+    let mut exporter = Exporter {
+        args,
+        source: "database",
+        large_messages: bodies.path().to_path_buf(),
+        queue_bindings: HashMap::new(),
+        queue_order: Vec::new(),
+        address_bindings: HashMap::new(),
+        address_order: Vec::new(),
+        messages: BTreeMap::new(),
+        refs: HashMap::new(),
+        cursor_acks: HashMap::new(),
+        page_txs: HashSet::new(),
+        xml: Xml::new(std::io::BufWriter::new(out)),
+        amqp: saranga_protocol_amqp::native::decoder(),
+    };
+    exporter.tables(&tables)?;
+    exporter.warn_unknown_queues();
+    exporter.print(bodies.path())?;
     Ok(())
 }
 
@@ -96,6 +131,8 @@ struct Exported {
 
 struct Exporter<'a> {
     args: &'a ExportArgs,
+    /// Where the messages come from, for the log.
+    source: &'static str,
     large_messages: PathBuf,
     queue_bindings: HashMap<i64, QueueBinding>,
     /// The queue IDs as first put (for `HashMap<Long, _>` order).
@@ -182,6 +219,58 @@ impl Exporter<'_> {
                 }
                 _ => {}
             }
+        }
+        Ok(())
+    }
+
+    /// What the tables hold. A transaction not committed exports nothing, as
+    /// its records are not among a journal's committed ones.
+    fn tables(&mut self, tables: &saranga_server::storage::Tables) -> anyhow::Result<()> {
+        for a in &tables.addresses {
+            // An EnumSet: MULTICAST, then ANYCAST.
+            let mut types = Vec::new();
+            if a.multicast {
+                types.push("MULTICAST");
+            }
+            if a.anycast {
+                types.push("ANYCAST");
+            }
+            self.address_order.push(a.id);
+            self.address_bindings.insert(a.id, (a.name.clone(), types));
+        }
+        for q in &tables.queues {
+            let address = self
+                .address_bindings
+                .get(&q.address)
+                .map(|(name, _)| name.clone())
+                .unwrap_or_default();
+            self.queue_order.push(q.id);
+            self.queue_bindings.insert(
+                q.id,
+                QueueBinding {
+                    name: q.name.clone(),
+                    address,
+                    filter: q.filter.clone().unwrap_or_default(),
+                    routing_type: routing_type_name(u8::from(!q.multicast)),
+                },
+            );
+        }
+        for m in tables.messages.iter().filter(|m| m.tx.is_none()) {
+            if let Some(body) = &m.body {
+                std::fs::write(self.large_file(m.id), body)
+                    .with_context(|| format!("the body of message {}", m.id))?;
+            }
+            let exported = if m.large && m.core {
+                self.large(m.id, &m.record)?
+            } else if m.large {
+                self.persisted(&m.record, Some(m.id))?
+            } else {
+                self.persisted(&m.record, None)?
+            };
+            self.messages.insert(m.id, exported);
+        }
+        for r in tables.references.iter().filter(|r| r.tx.is_none()) {
+            self.refs.entry(r.message).or_default().push(r.queue);
         }
         Ok(())
     }
@@ -351,7 +440,7 @@ impl Exporter<'_> {
         self.xml.start("messages")?;
         let interval = self.args.log_interval;
         if interval > 0 {
-            eprintln!("Processing journal messages");
+            eprintln!("Processing {} messages", self.source);
         }
         let mut count = 0i64;
         let messages = std::mem::take(&mut self.messages);

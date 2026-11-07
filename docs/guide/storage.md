@@ -15,7 +15,7 @@ An instance made by `saranga create` (or `artemis create`) keeps its data under 
 
 Relative directories are resolved against the instance directory, as Artemis resolves them. `persistence-enabled` set to `false` keeps every message in memory; see [Paging](#paging) for what that means for full addresses.
 
-Saranga does not have the JDBC store. A `broker.xml` with `<database-store>` does not start, with a reason (see [COMPAT.md, Configuration differences](../../COMPAT.md#configuration-differences)).
+Saranga can also keep all of this in PostgreSQL: see [The relational store](#the-relational-store). It does not have Artemis's older JDBC journal, and a `<database-store>` without `database-storage` does not start, with a reason (see [COMPAT.md, Configuration differences](../../COMPAT.md#configuration-differences)).
 
 The Artemis documentation on [persistence](https://activemq.apache.org/components/artemis/documentation/latest/persistence.html) describes the journal and its settings; it applies to Saranga except where this page says otherwise.
 
@@ -150,6 +150,56 @@ saranga data imp --input export.xml --url tcp://newhost:61616 --user admin --pas
 ```
 
 `data imp` sends over Core only. On the data directories of the golden corpus, `data exp` writes Artemis's XML byte for byte, and `data encode` its text. Failures are reported as Artemis's tools report them, `Error:<message>` with status 0. The differences, such as `--jdbc` being refused, are listed in [COMPAT.md, CLI differences](../../COMPAT.md#cli-differences). Artemis's [data tools](https://activemq.apache.org/components/artemis/documentation/latest/data-tools.html) page describes the formats. See [cli.md](cli.md) for the rest of the command line.
+
+## The relational store
+
+With `<database-storage>true</database-storage>` under `<database-store>`, a broker keeps its addresses, queues, messages, paged messages and large bodies in PostgreSQL instead of in the data directory. This is the store of [Artemis pull request 6838](https://github.com/apache/artemis/pull/6838), not yet in an Artemis release, with the same tables as its commit `5206d7e7de`, so Artemis and Saranga open each other's databases.
+
+```sh
+saranga create mybroker --database-storage \
+  --jdbc-connection-url 'jdbc:postgresql://db.example:5432/broker?user=broker&password=secret'
+```
+
+The broker creates its tables on the first start: `DB_MESSAGES`, `DB_REFERENCES`, `DB_ADDRESS`, `DB_QUEUE`, `DB_BROKER_DATA`, `DB_CONFIG_DATA` and `DB_PREP_TX`. Their names are fixed. Only PostgreSQL is supported, and a URL for another database is refused.
+
+A database holds one broker. The store takes a lock on a database session of its own, and a second broker on the same database stops after five seconds. Losing that session stops the broker too, as a critical I/O error does.
+
+### Settings
+
+| `<database-store>` element | Default | What it does |
+|---|---|---|
+| `jdbc-connection-url` | | The database, as a `jdbc:postgresql:` URL |
+| `jdbc-user`, `jdbc-password` | | Override the URL's `user` and `password` |
+| `database-connections` | 6 | Connections that write |
+| `max-pending-writes` | 100000 | Operations sent and not yet committed, past which writers wait |
+| `database-max-retries`, `database-retry-interval-millis` | 5, 5000 | How often and how long apart a failed batch is tried again. After the last, the broker stops as on a critical I/O error |
+| `jdbc-network-timeout` | 20000 | The time allowed to connect, in milliseconds |
+
+Artemis's other settings are accepted and have no effect. `database-flush-period-nanos` is one: batches start when a connection is free, with no timer. So are `database-max-read-connections`, `database-read-idle-timeout` and `database-page-join-fetch`.
+
+### TLS
+
+The URL takes the JDBC driver's parameters. As with the driver, a connection is encrypted if the server can do it, unless the URL says otherwise.
+
+| Parameter | Meaning |
+|---|---|
+| `sslmode=disable` or `ssl=false` | Not encrypted |
+| `sslmode=prefer` or `allow` | Encrypted if the server can; the default |
+| `sslmode=require` | Encrypted, or no connection. The server's certificate is not checked |
+| `sslmode=verify-ca` | Also checks the certificate's chain |
+| `sslmode=verify-full` or `ssl=true` | Also checks the host name |
+| `sslrootcert` | A PEM file of the roots to trust. Otherwise `~/.postgresql/root.crt` if it is there, else the platform's |
+| `sslcert`, `sslkey` | A PEM client certificate and key, given together |
+
+### What differs from the journal
+
+- **Paging** stays in the tables. A paged message is a row in `DB_REFERENCES` with `PAGED` set to `Y`, read back as the queue has room. There are no page files, and `paging-directory` is not used.
+- **Large messages** have their bodies in `DB_MESSAGES`, and a body is copied to a file in `large-messages-directory` while the broker works with it.
+- **Management operations** that remove, move or count messages reach paged messages too, without reading them into the queue. Browsing shows what is in memory, as it does with page files.
+- **Transactions** are written when they commit. A prepared XA transaction is in the tables with its ID, and survives a crash until it is committed or rolled back.
+- **Durability** is PostgreSQL's: a message is acknowledged to its producer once its transaction has committed there. Reading paged messages back does not wait for a sync, as a crash then only means reading them again.
+- **Replication** is not available, as there are no journals to copy. See [Shared store on the relational store](ha.md#shared-store-on-the-relational-store).
+- **`data print` and `data exp`** read the tables. See [The data tools](#the-data-tools).
 
 ## Moving data between Artemis and Saranga
 

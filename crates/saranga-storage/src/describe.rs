@@ -1004,6 +1004,11 @@ fn describe_object(
 }
 
 /// `DescribeJournal.toXid`: `null` when the data is not an Xid.
+/// An encoded Xid as `XidImpl.toString` gives it.
+pub fn xid_text(data: &[u8]) -> String {
+    to_xid(data)
+}
+
 fn to_xid(data: &[u8]) -> String {
     let mut r = saranga_buffer::Reader::new(data);
     match Xid::read(&mut r) {

@@ -3,7 +3,7 @@
 //! ID selects (`iterQueue`). Each operation runs in the queue's actor.
 
 use super::*;
-use crate::paging::PageIterator;
+use crate::paging::{IN_STORE, PageIterator, PagedRef};
 
 /// The statistics a queue works out from its lists (`QueueImpl`'s
 /// `pendingMetrics`, `deliveringMetrics` and scheduled handler). Sizes
@@ -501,22 +501,51 @@ impl Actor {
             if in_memory.contains(&(p.position.page, p.position.message_nr)) {
                 continue;
             }
-            let mut r = MessageRef::new(p.message);
-            r.paged = Some(p.position);
+            let r = scanned(p);
             let key = supplied_key(&r, local_node);
             if let Some(reason) = wanted.remove(&key) {
                 paged.push((r, reason));
                 found.push(key);
             }
         }
+        let settle = paged.iter().any(|(r, _)| r.stored);
         for (r, reason) in paged {
-            // Counted as read in, so its acknowledgement balances.
-            if let Some(p) = &r.paged {
-                sub.read_in(p.size);
-            }
+            self.claim(&sub, &store, &r);
             self.ack_with(r, reason);
         }
+        if settle {
+            self.settle();
+        }
         found
+    }
+
+    /// A reference a scan found is taken off its page, so that its
+    /// acknowledgement balances: one in a page file counts as read in, one in
+    /// the store as depaged.
+    fn claim(
+        &mut self,
+        sub: &crate::paging::PageSubscription,
+        store: &crate::paging::PagingStore,
+        r: &MessageRef,
+    ) {
+        if let Some(p) = &r.paged {
+            sub.read_in(p.size);
+        } else if r.stored {
+            store.claim_stored(sub, &r.message);
+            r.message.durable_up();
+            self.shared.message_count.fetch_add(1, Ordering::SeqCst);
+            self.queue().ref_up(r);
+        }
+    }
+
+    /// The rows acted on are gone before paged messages are read again: the
+    /// read would otherwise find them, their deletes still being written.
+    fn settle(&self) {
+        if let Some(s) = self.shared.ids.storage()
+            && let Err(e) = s.settle()
+        {
+            tracing::warn!("AMQ222037: IO Error reading paged messages: {e}");
+        }
     }
 
     /// `AckManager.doACK`: an expired message is expired, any other
@@ -686,8 +715,7 @@ impl Actor {
                 if in_memory.contains(&(p.position.page, p.position.message_nr)) {
                     continue;
                 }
-                let mut r = MessageRef::new(p.message);
-                r.paged = Some(p.position);
+                let r = scanned(p);
                 if !sel.matches(&r) {
                     continue;
                 }
@@ -702,12 +730,13 @@ impl Actor {
                 }
                 found.push(r);
             }
+            let settle = found.iter().any(|r| r.stored);
             for r in found {
-                // Counted as read in, so its acknowledgement balances.
-                if let Some(p) = &r.paged {
-                    sub.read_in(p.size);
-                }
+                self.claim(&sub, &store, &r);
                 self.act_on(r, action);
+            }
+            if settle {
+                self.settle();
             }
         }
         hits
@@ -829,4 +858,16 @@ fn group_key(group: &str) -> GroupKey {
             .as_bytes()
             .to_vec(),
     )
+}
+
+/// What a scan of the pages found, as a reference.
+fn scanned(p: PagedRef) -> MessageRef {
+    let in_store = p.position.page == IN_STORE;
+    let mut r = MessageRef::new(p.message);
+    if in_store {
+        r.stored = true;
+    } else {
+        r.paged = Some(p.position);
+    }
+    r
 }

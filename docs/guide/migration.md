@@ -13,7 +13,7 @@ Saranga is inspired by Apache ActiveMQ Artemis 2.57.0 and works interchangeably 
 These stop the broker from starting:
 
 - a colocated backup (`<colocated>` in `<ha-policy>`);
-- the JDBC store (`<database-store>`);
+- the JDBC journal (`<database-store>` without `<database-storage>true</database-storage>`), and replication with `database-storage`;
 - a JGroups discovery group or broadcast group (`jgroups-file`);
 - a `<broker-plugin>` naming a class other than the four plugins Saranga ports (see [Plugins and extensions](#plugins-and-extensions));
 - a `<security-manager>` class other than `ActiveMQBasicSecurityManager` (the JAAS manager, `<jaas-security>`, is supported);

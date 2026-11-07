@@ -419,6 +419,73 @@ impl ResolvesClientCert for Sent {
     }
 }
 
+/// What a client checks of a server's certificate, as a database driver's
+/// `sslmode` asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerCheck {
+    /// Encrypted only.
+    Nothing,
+    /// The chain, up to a trusted root.
+    Chain,
+    /// The chain and the host name.
+    Host,
+}
+
+/// A client configuration for a connection outside the broker's own:
+/// `roots` is a PEM file, else the platform's roots are used, and `client`
+/// the PEM certificate chain and key to present, if any.
+pub fn client_tls(
+    check: ServerCheck,
+    roots: Option<&std::path::Path>,
+    client: Option<(&std::path::Path, &std::path::Path)>,
+) -> Result<ClientConfig, TlsError> {
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::pem::PemObject;
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier: Arc<dyn ServerCertVerifier> = if check == ServerCheck::Nothing {
+        Arc::new(TrustAll(provider.clone()))
+    } else {
+        let mut store = RootCertStore::empty();
+        match roots {
+            Some(file) => {
+                let certs = CertificateDer::pem_file_iter(file)
+                    .and_then(|i| i.collect::<Result<Vec<_>, _>>())
+                    .map_err(|e| TlsError::Config(format!("{}: {e}", file.display())))?;
+                store.add_parsable_certificates(certs);
+            }
+            None => {
+                store.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+            }
+        }
+        let webpki = WebPkiServerVerifier::builder_with_provider(Arc::new(store), provider.clone())
+            .build()
+            .map_err(|e| TlsError::Config(format!("server certificate verifier: {e}")))?;
+        if check == ServerCheck::Host {
+            webpki
+        } else {
+            Arc::new(AnyHost(webpki))
+        }
+    };
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier);
+    match client {
+        Some((cert, key)) => {
+            let chain = CertificateDer::pem_file_iter(cert)
+                .and_then(|i| i.collect::<Result<Vec<_>, _>>())
+                .map_err(|e| TlsError::Config(format!("{}: {e}", cert.display())))?;
+            let key = PrivateKeyDer::from_pem_file(key)
+                .map_err(|e| TlsError::Config(format!("{}: {e}", key.display())))?;
+            builder
+                .with_client_auth_cert(chain, key)
+                .map_err(|e| TlsError::Config(format!("client certificate: {e}")))
+        }
+        None => Ok(builder.with_no_client_auth()),
+    }
+}
+
 /// `InsecureTrustManagerFactory`: any certificate, the handshake's
 /// signatures still checked.
 #[derive(Debug)]

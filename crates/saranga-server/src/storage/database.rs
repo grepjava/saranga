@@ -21,7 +21,11 @@ use saranga_storage::codec::{
     PersistentAddressBindingEncoding, PersistentQueueBindingEncoding, ScheduledDeliveryEncoding,
 };
 use saranga_storage::{BatchingIdGenerator, CHECKPOINT_BATCH_SIZE, IdCounterStore};
+use saranga_transport::connector::ServerCheck;
+use std::path::PathBuf;
 use tokio_postgres::Config;
+use tokio_postgres::config::SslMode;
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 use super::*;
 
@@ -32,6 +36,9 @@ use writer::{Generic, Op, Settings, Unit, Writes, io_error};
 /// A page transaction's consumed messages. The journal updates the record
 /// in place; here it is a record of its own, Saranga's.
 const PAGE_TRANSACTION_UPDATE: u8 = 200;
+/// A record a prepared transaction deletes when it commits: the ID, as eight
+/// bytes. A delete has no row of its own to wait in, so this is one.
+pub(super) const PREPARED_DELETE: u8 = 201;
 
 /// The session lock that keeps a database to one Saranga broker: the bytes of "SARANGA".
 const LOCK_KEY: i64 = 0x5341_5241_4e47_4100;
@@ -77,9 +84,10 @@ pub struct DatabaseConfig {
 }
 
 /// A `jdbc:postgresql:` URL as a client configuration: `//host:port/database`
-/// or `database`, with `user` and `password` parameters. The other
-/// parameters are the JDBC driver's.
-pub fn client_config(d: &DatabaseConfig) -> Result<Config, String> {
+/// or `database`, with `user` and `password` parameters and those of TLS, as
+/// the JDBC driver takes them: `ssl`, `sslmode`, `sslrootcert`, `sslcert` and
+/// `sslkey`. Its other parameters are its own.
+pub fn client_config(d: &DatabaseConfig) -> Result<writer::Target, String> {
     let rest = d
         .url
         .strip_prefix("jdbc:postgresql:")
@@ -116,20 +124,30 @@ pub fn client_config(d: &DatabaseConfig) -> Result<Config, String> {
     if !database.is_empty() {
         config.dbname(database);
     }
+    let (mut ssl, mut root, mut cert, mut key) = (None, None, None, None);
     for parameter in query.split('&').filter(|p| !p.is_empty()) {
-        let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
-        match key {
+        let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+        match name {
             "user" => {
                 config.user(value);
             }
             "password" => {
                 config.password(value);
             }
-            "ssl" | "sslmode" if !matches!(value, "false" | "disable") => {
-                return Err(format!(
-                    "{key}={value}: Saranga does not connect to PostgreSQL over TLS yet"
-                ));
+            "ssl" => {
+                ssl = Some(
+                    if value == "false" {
+                        "disable"
+                    } else {
+                        "verify-full"
+                    }
+                    .to_owned(),
+                )
             }
+            "sslmode" => ssl = Some(value.to_owned()),
+            "sslrootcert" => root = Some(PathBuf::from(decoded(value))),
+            "sslcert" => cert = Some(PathBuf::from(decoded(value))),
+            "sslkey" => key = Some(PathBuf::from(decoded(value))),
             other => tracing::debug!("JDBC URL parameter {other} ignored"),
         }
     }
@@ -142,7 +160,59 @@ pub fn client_config(d: &DatabaseConfig) -> Result<Config, String> {
     if d.network_timeout_millis > 0 {
         config.connect_timeout(Duration::from_millis(d.network_timeout_millis as u64));
     }
-    Ok(config)
+    // As the JDBC driver: encrypted if the server can, unless told otherwise.
+    let (mode, check) = match ssl.as_deref().unwrap_or("prefer") {
+        "disable" => (SslMode::Disable, None),
+        "allow" | "prefer" => (SslMode::Prefer, Some(ServerCheck::Nothing)),
+        "require" => (SslMode::Require, Some(ServerCheck::Nothing)),
+        "verify-ca" => (SslMode::Require, Some(ServerCheck::Chain)),
+        "verify-full" => (SslMode::Require, Some(ServerCheck::Host)),
+        other => return Err(format!("sslmode={other}: not an sslmode")),
+    };
+    config.ssl_mode(mode);
+    let client = match (&cert, &key) {
+        (Some(c), Some(k)) => Some((c.as_path(), k.as_path())),
+        (None, None) => None,
+        _ => return Err("sslcert and sslkey go together".to_owned()),
+    };
+    // The driver's default for the roots, where that file is.
+    let root = root.or_else(|| {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+        let file = Path::new(&home).join(".postgresql/root.crt");
+        file.is_file().then_some(file)
+    });
+    let tls = check
+        .map(|check| {
+            saranga_transport::connector::client_tls(check, root.as_deref(), client)
+                .map(MakeRustlsConnect::new)
+                .map_err(|e| format!("TLS to the database: {e}"))
+        })
+        .transpose()?;
+    Ok(writer::Target { config, tls })
+}
+
+/// A URL parameter's `%xx`, as a path has them.
+fn decoded(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = (bytes[i] == b'%')
+            .then(|| value.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex {
+            Some(b) => {
+                out.push(b);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The URL for a message, without what follows the `?`: it may hold a
@@ -244,7 +314,7 @@ struct Side {
 pub struct DatabaseStorage {
     cfg: StorageConfig,
     runtime: Background,
-    connection: Config,
+    connection: writer::Target,
     writes: Arc<Writes>,
     ids: BatchingIdGenerator<DatabaseIdStore>,
     critical: Arc<OnceLock<CriticalListener>>,
@@ -256,7 +326,7 @@ pub struct DatabaseStorage {
     /// would step over every row already read and not yet vacuumed.
     read_from: Mutex<HashMap<i64, i64>>,
     /// The connection queues read paged messages on.
-    reader: tokio::sync::Mutex<Option<(tokio_postgres::Client, tokio_postgres::Statement)>>,
+    reader: tokio::sync::Mutex<Option<PagedReader>>,
 }
 
 /// Takes a queue's next paged references out of paging, and returns their
@@ -270,7 +340,21 @@ const READ_PAGED: &str = "WITH picked AS (\
     SELECT m.MESSAGE_ID, m.MESSAGE_RECORD, m.IS_LARGE::text, m.IS_CORE::text, m.LARGE_BODY \
     FROM flipped f JOIN DB_MESSAGES m ON m.MESSAGE_ID = f.MESSAGE_ID";
 
-/// The reader's session, which runs nothing but `READ_PAGED`. A flip lost in
+/// A queue's paged messages, left paged. Sorted as `READ_PAGED`'s are.
+const SCAN_PAGED: &str = "SELECT m.MESSAGE_ID, m.MESSAGE_RECORD, m.IS_LARGE::text, m.IS_CORE::text, m.LARGE_BODY \
+    FROM (SELECT MESSAGE_ID FROM DB_REFERENCES \
+      WHERE QUEUE_ID = $1 AND PAGED = 'Y' AND TX_ID IS NULL AND MESSAGE_ID > $3 \
+      ORDER BY MESSAGE_ID LIMIT $2) p \
+    JOIN DB_MESSAGES m ON m.MESSAGE_ID = p.MESSAGE_ID";
+
+/// The session paged messages are read on, and its two statements.
+struct PagedReader {
+    client: tokio_postgres::Client,
+    read: tokio_postgres::Statement,
+    scan: tokio_postgres::Statement,
+}
+
+/// The reader's session, which runs nothing but `READ_PAGED` and `SCAN_PAGED`. A flip lost in
 /// a crash leaves the row paged, to be read again, so the queue need not wait
 /// for its fsync. That statement has one right plan, an index in order as far
 /// as the limit and then each message by key: statistics taken
@@ -287,7 +371,7 @@ const READER_SESSION: &str = "SET synchronous_commit = off; SET jit = off;     S
 /// the session loses the lock, and the store stops.
 async fn hold_lock(
     wait: Duration,
-    config: &Config,
+    config: &writer::Target,
     lost: Arc<dyn Fn(&JournalError) + Send + Sync>,
 ) -> StoreResult<()> {
     let client = writer::connect(config).await.map_err(io_error)?;
@@ -361,6 +445,11 @@ impl DatabaseStorage {
             let work = async move {
                 let client = writer::connect(&schema).await.map_err(io_error)?;
                 hold_lock(client_lock, &schema, lost).await?;
+                // `IF NOT EXISTS` otherwise notes every table already there.
+                client
+                    .batch_execute("SET client_min_messages = warning")
+                    .await
+                    .map_err(io_error)?;
                 for statement in SCHEMA {
                     client
                         .batch_execute(statement)
@@ -592,6 +681,17 @@ impl DatabaseStorage {
         limit: i64,
         after: i64,
     ) -> StoreResult<Vec<(StoredMessage, bool)>> {
+        self.paged_rows(false, queue_id, limit, after)
+    }
+
+    /// `READ_PAGED`, or with `scan` `SCAN_PAGED`.
+    fn paged_rows(
+        &self,
+        scan: bool,
+        queue_id: i64,
+        limit: i64,
+        after: i64,
+    ) -> StoreResult<Vec<(StoredMessage, bool)>> {
         let rows = {
             let (done, result) = std::sync::mpsc::channel();
             let reader = &self.reader;
@@ -600,7 +700,7 @@ impl DatabaseStorage {
             // runtime for as long as the query takes.
             self.runtime.block_in(async {
                 let mut slot = reader.lock().await;
-                if slot.as_ref().is_none_or(|(c, _)| c.is_closed()) {
+                if slot.as_ref().is_none_or(|r| r.client.is_closed()) {
                     let client = writer::connect(config).await.map_err(io_error);
                     let client = match client {
                         Ok(c) => c,
@@ -609,20 +709,25 @@ impl DatabaseStorage {
                             return;
                         }
                     };
-                    let prepared = match client.batch_execute(READER_SESSION).await {
-                        Ok(()) => client.prepare(READ_PAGED).await,
-                        Err(e) => Err(e),
+                    let prepared = async {
+                        client.batch_execute(READER_SESSION).await?;
+                        Ok::<_, tokio_postgres::Error>((
+                            client.prepare(READ_PAGED).await?,
+                            client.prepare(SCAN_PAGED).await?,
+                        ))
                     };
-                    match prepared {
-                        Ok(statement) => *slot = Some((client, statement)),
+                    match prepared.await {
+                        Ok((read, scan)) => *slot = Some(PagedReader { client, read, scan }),
                         Err(e) => {
                             let _ = done.send(Err(io_error(e)));
                             return;
                         }
                     }
                 }
-                let (client, statement) = slot.as_ref().expect("a reader");
-                let read = client
+                let r = slot.as_ref().expect("a reader");
+                let statement = if scan { &r.scan } else { &r.read };
+                let read = r
+                    .client
                     .query(statement, &[&queue_id, &limit, &after])
                     .await
                     .map_err(|e| table_error("reading paged messages", e));
@@ -845,10 +950,195 @@ struct BindingRows {
     config: Vec<(i64, i16, Option<Vec<u8>>)>,
 }
 
+/// `DB_ADDRESS`, as the data tools read it.
+#[derive(Debug)]
+pub struct AddressRow {
+    pub id: i64,
+    pub name: String,
+    pub multicast: bool,
+    pub anycast: bool,
+}
+
+/// `DB_QUEUE`.
+#[derive(Debug)]
+pub struct QueueRow {
+    pub id: i64,
+    pub address: i64,
+    pub name: String,
+    pub multicast: bool,
+    pub anycast: bool,
+    pub filter: Option<String>,
+    /// `QueueConfiguration.toJSON`.
+    pub config: String,
+}
+
+/// `DB_MESSAGES`.
+#[derive(Debug)]
+pub struct StoredRow {
+    pub id: i64,
+    pub tx: Option<i64>,
+    pub record: Vec<u8>,
+    pub memory_estimate: i32,
+    pub large: bool,
+    pub core: bool,
+    pub body: Option<Vec<u8>>,
+}
+
+/// `DB_REFERENCES`.
+#[derive(Debug)]
+pub struct ReferenceRow {
+    pub message: i64,
+    pub queue: i64,
+    pub paged: bool,
+    pub tx: Option<i64>,
+    pub ack_tx: Option<i64>,
+}
+
+/// `DB_CONFIG_DATA` or `DB_BROKER_DATA`.
+#[derive(Debug)]
+pub struct GenericRow {
+    pub id: i64,
+    pub record_type: i16,
+    pub tx: Option<i64>,
+    pub data: Vec<u8>,
+}
+
+/// What the store's tables hold, for the data tools.
+#[derive(Debug, Default)]
+pub struct Tables {
+    pub addresses: Vec<AddressRow>,
+    pub queues: Vec<QueueRow>,
+    pub messages: Vec<StoredRow>,
+    pub references: Vec<ReferenceRow>,
+    pub config: Vec<GenericRow>,
+    pub broker: Vec<GenericRow>,
+    /// Transaction and encoded Xid.
+    pub prepared: Vec<(i64, Vec<u8>)>,
+}
+
+fn is_y(row: &tokio_postgres::Row, column: usize) -> bool {
+    row.get::<_, Option<String>>(column).as_deref() == Some("Y")
+}
+
+fn text_of(bytes: Option<Vec<u8>>) -> Option<String> {
+    bytes.map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Reads the tables, without taking the store: nothing here writes.
+pub fn read_tables(d: &DatabaseConfig) -> StoreResult<Tables> {
+    // On a thread of its own, as the tools run on a runtime already.
+    std::thread::scope(|s| {
+        s.spawn(|| tables_of(d)).join().unwrap_or_else(|_| {
+            Err(JournalError::IllegalState(
+                "reading the store failed".into(),
+            ))
+        })
+    })
+}
+
+fn tables_of(d: &DatabaseConfig) -> StoreResult<Tables> {
+    let config = client_config(d).map_err(JournalError::IllegalState)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| JournalError::Io(Arc::new(e)))?;
+    runtime.block_on(async {
+        let client = writer::connect(&config).await.map_err(io_error)?;
+        let rows = async |sql: &str| {
+            client
+                .query(sql, &[])
+                .await
+                .map_err(|e| table_error("reading the store", e))
+        };
+        let generic = async |table: &str| -> StoreResult<Vec<GenericRow>> {
+            let sql =
+                format!("SELECT ID, RECORD_TYPE, TX_ID, DATA_RECORD FROM {table} ORDER BY ID");
+            Ok(rows(&sql)
+                .await?
+                .iter()
+                .map(|r| GenericRow {
+                    id: r.get(0),
+                    record_type: r.get(1),
+                    tx: r.get(2),
+                    data: r.get::<_, Option<Vec<u8>>>(3).unwrap_or_default(),
+                })
+                .collect())
+        };
+        Ok(Tables {
+            addresses: rows(
+                "SELECT ADDRESS_ID, ADDRESS_NAME, IS_MULTICAST::text, IS_ANYCAST::text \
+                 FROM DB_ADDRESS ORDER BY ADDRESS_ID",
+            )
+            .await?
+            .iter()
+            .map(|r| AddressRow {
+                id: r.get(0),
+                name: r.get(1),
+                multicast: is_y(r, 2),
+                anycast: is_y(r, 3),
+            })
+            .collect(),
+            queues: rows(
+                "SELECT QUEUE_ID, ADDRESS_ID, QUEUE_NAME, IS_MULTICAST::text, IS_ANYCAST::text, \
+                 FILTER_STRING, QUEUE_CONFIG FROM DB_QUEUE ORDER BY QUEUE_ID",
+            )
+            .await?
+            .iter()
+            .map(|r| QueueRow {
+                id: r.get(0),
+                address: r.get(1),
+                name: r.get::<_, Option<String>>(2).unwrap_or_default(),
+                multicast: is_y(r, 3),
+                anycast: is_y(r, 4),
+                filter: text_of(r.get(5)),
+                config: text_of(r.get(6)).unwrap_or_default(),
+            })
+            .collect(),
+            messages: rows(
+                "SELECT MESSAGE_ID, TX_ID, MESSAGE_RECORD, MEMORY_ESTIMATE, IS_LARGE::text, \
+                 IS_CORE::text, LARGE_BODY FROM DB_MESSAGES ORDER BY MESSAGE_ID",
+            )
+            .await?
+            .iter()
+            .map(|r| StoredRow {
+                id: r.get(0),
+                tx: r.get(1),
+                record: r.get::<_, Option<Vec<u8>>>(2).unwrap_or_default(),
+                memory_estimate: r.get::<_, Option<i32>>(3).unwrap_or(0),
+                large: is_y(r, 4),
+                core: is_y(r, 5),
+                body: r.get(6),
+            })
+            .collect(),
+            references: rows(
+                "SELECT MESSAGE_ID, QUEUE_ID, PAGED::text, TX_ID, ACK_TX_ID \
+                 FROM DB_REFERENCES ORDER BY MESSAGE_ID, QUEUE_ID",
+            )
+            .await?
+            .iter()
+            .map(|r| ReferenceRow {
+                message: r.get(0),
+                queue: r.get(1),
+                paged: is_y(r, 2),
+                tx: r.get(3),
+                ack_tx: r.get(4),
+            })
+            .collect(),
+            config: generic("DB_CONFIG_DATA").await?,
+            broker: generic("DB_BROKER_DATA").await?,
+            prepared: rows("SELECT TX_ID, XID FROM DB_PREP_TX ORDER BY TX_ID")
+                .await?
+                .iter()
+                .map(|r| (r.get(0), r.get::<_, Option<Vec<u8>>>(1).unwrap_or_default()))
+                .collect(),
+        })
+    })
+}
+
 /// A `DB_MESSAGES` row: ID, transaction, record, large, core, large body.
 type MessageRow = (i64, Option<i64>, Vec<u8>, bool, bool, Option<Vec<u8>>);
 /// A `DB_REFERENCES` row: message, queue, paged, transaction, ack transaction.
-type ReferenceRow = (i64, i64, bool, Option<i64>, Option<i64>);
+type ReferenceTuple = (i64, i64, bool, Option<i64>, Option<i64>);
 /// A `DB_BROKER_DATA` row: ID, type, transaction, data.
 type RecordRow = (i64, i16, Option<i64>, Option<Vec<u8>>);
 /// What a side record changes on its reference.
@@ -858,7 +1148,7 @@ type SideUpdate = Box<dyn Fn(&mut RecoveredRef)>;
 struct MessageRows {
     messages: Vec<MessageRow>,
     paged: Vec<(i64, i64, i64)>,
-    references: Vec<ReferenceRow>,
+    references: Vec<ReferenceTuple>,
     records: Vec<RecordRow>,
     prepared: Vec<(i64, Vec<u8>)>,
 }
@@ -1383,6 +1673,28 @@ impl Store for DatabaseStorage {
         Ok(read)
     }
 
+    fn scan_paged(
+        &self,
+        queue_id: i64,
+        limit: i64,
+        after: i64,
+    ) -> StoreResult<Vec<(StoredMessage, bool)>> {
+        self.paged_rows(true, queue_id, limit, after)
+    }
+
+    fn settle(&self) -> StoreResult<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.writes.send(Unit {
+            ops: Vec::new(),
+            done: Some(Box::new(move |r| {
+                let _ = tx.send(r);
+            })),
+            barrier: true,
+        })?;
+        rx.recv()
+            .unwrap_or_else(|_| Err(JournalError::IllegalState("the store stopped".into())))
+    }
+
     fn store_reference(&self, queue_id: i64, message_id: i64, _last: bool) -> StoreResult<Pending> {
         self.pending(vec![Op::Reference {
             message: message_id,
@@ -1709,7 +2021,27 @@ impl Store for DatabaseStorage {
                     other => marked.push(other),
                 }
             }
-            open.deletes = deletes;
+            // Deletes that must survive a crash before the commit.
+            let (records, others): (Vec<Op>, Vec<Op>) = deletes.into_iter().partition(|op| {
+                matches!(
+                    op,
+                    Op::DeleteRecord {
+                        table: Generic::Broker,
+                        ..
+                    }
+                )
+            });
+            for op in records {
+                if let Op::DeleteRecord { id, .. } = op {
+                    marked.push(Self::broker_record(
+                        self.generate_id(),
+                        PREPARED_DELETE,
+                        Some(tx),
+                        id.to_be_bytes().to_vec(),
+                    ));
+                }
+            }
+            open.deletes = others;
             marked
         };
         self.prepared

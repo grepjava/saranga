@@ -75,7 +75,7 @@ saranga create /tmp/b2 --silent --user admin --password admin --allow-anonymous 
 | `--force` | Overwrites an existing instance's configuration. |
 | `--windows`, `--cygwin` (or `--linux`) | Which scripts to write. Default: those of the system you run on. |
 
-Where it differs from `artemis create`: the journal type is `NIO` unless `--aio`, `--nio` or `--mapped` is given, and the auto-tuning of `journal-buffer-timeout` measures NIO writes; `--jdbc` is refused; Windows gets no `artemis-service.exe`. The Java options (`--java-options`, `--java-memory`) are written to the profiles. Saranga reads their `-D` options, and `-Xmx` for the default `global-max-size`; the others are for an Artemis that later runs the instance. `--encoding` takes only UTF-8. See [Getting started](getting-started.md#creating-an-instance) for the layout of an instance.
+Where it differs from `artemis create`: the journal type is `NIO` unless `--aio`, `--nio` or `--mapped` is given, and the auto-tuning of `journal-buffer-timeout` measures NIO writes; `--jdbc` (the JDBC journal) is refused, while `--database-storage` with `--jdbc-connection-url` makes an instance on the [relational store](storage.md#the-relational-store); Windows gets no `artemis-service.exe`. The Java options (`--java-options`, `--java-memory`) are written to the profiles. Saranga reads their `-D` options, and `-Xmx` for the default `global-max-size`; the others are for an Artemis that later runs the instance. `--encoding` takes only UTF-8. See [Getting started](getting-started.md#creating-an-instance) for the layout of an instance.
 
 ### upgrade
 
@@ -266,7 +266,7 @@ saranga data imp --input /backup/messages.xml --url tcp://other:61616 --user adm
 
 `--f` on `print`, `exp` and `recover` skips the lock so a running broker's data can be read; changing data under a running broker can damage it. The folder options (`--journal`, `--bindings`, `--paging`, `--large-messages`) and `--broker` override what `broker.xml` says.
 
-Where they differ from Artemis's: `--jdbc` is refused, since Saranga has no JDBC store; a failed tool prints `Error:<message>` as Artemis's does, without a Java stack trace. The files are the same either way, so Artemis's tools read Saranga's data and Saranga's read Artemis's.
+Where they differ from Artemis's: `--jdbc` is refused, since Saranga has no JDBC journal, though `data print` and `data exp` read the tables of a broker on the [relational store](storage.md#the-relational-store); a failed tool prints `Error:<message>` as Artemis's does, without a Java stack trace. The files are the same either way, so Artemis's tools read Saranga's data and Saranga's read Artemis's.
 
 ### activation
 

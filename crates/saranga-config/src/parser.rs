@@ -495,6 +495,16 @@ fn parse_core(
     parse_scalars(core, config, warnings)?;
     if let Some(store) = first(core, "store").and_then(|s| first(s, "database-store")) {
         config.database_store = Some(crate::configuration::database_store(store, &*config)?);
+        if matches!(
+            config.ha_policy,
+            HaPolicy::ReplicationPrimary(_) | HaPolicy::ReplicationBackup(_)
+        ) {
+            return Err(ConfigError::Unsupported {
+                element: "ha-policy".to_owned(),
+                reason: "replication copies the journals, and database-storage has none; \
+                         use shared-store",
+            });
+        }
     }
     parse_acceptors(core, config, warnings)?;
     parse_connectors(core, config, warnings)?;

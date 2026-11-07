@@ -129,8 +129,27 @@ fn urls() {
     );
     assert!(of("jdbc:mysql://h/d").is_err());
     assert!(of("jdbc:postgresql://a,b/d").is_err());
-    let tls = of("jdbc:postgresql://h/d?sslmode=require").unwrap_err();
-    assert!(tls.contains("TLS"), "{tls}");
+    assert!(of("jdbc:postgresql://h/d").unwrap().tls.is_some());
+    assert!(
+        of("jdbc:postgresql://h/d?sslmode=disable")
+            .unwrap()
+            .tls
+            .is_none()
+    );
+    assert!(of("jdbc:postgresql://h/d?ssl=false").unwrap().tls.is_none());
+    assert!(
+        of("jdbc:postgresql://h/d?sslmode=require")
+            .unwrap()
+            .tls
+            .is_some()
+    );
+    let wrong = of("jdbc:postgresql://h/d?sslmode=maybe").unwrap_err();
+    assert!(wrong.contains("sslmode"), "{wrong}");
+    let half = of("jdbc:postgresql://h/d?sslcert=c.pem").unwrap_err();
+    assert!(half.contains("sslkey"), "{half}");
+    let missing = of("jdbc:postgresql://h/d?sslmode=verify-full&sslrootcert=/no/such.pem");
+    assert!(missing.unwrap_err().contains("TLS"));
+    assert_eq!(decoded("C%3A%5Cca.pem"), "C:\\ca.pem");
     // A password stays out of the message.
     let other = of("jdbc:mysql://h/d?password=secret").unwrap_err();
     assert!(!other.contains("secret"), "{other}");
@@ -484,6 +503,85 @@ fn paged_messages_are_read_in_order_and_stay_out_of_memory() {
     assert_eq!(r.paged[&2].0, 8);
 }
 
+/// A record a prepared transaction deletes goes at its commit, even after a
+/// crash in between, and stays at its rollback.
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn a_prepared_delete_survives_a_crash() {
+    let f = Fixture::new();
+    let (s, _) = f.start();
+    let rows = |s: &DatabaseStorage| {
+        let connection = s.connection.clone();
+        s.run(async move {
+            let client = writer::connect(&connection).await.map_err(io_error)?;
+            let rows = client
+                .query(
+                    "SELECT ID FROM DB_BROKER_DATA WHERE ID IN (5001, 5002) OR RECORD_TYPE = 201 ORDER BY ID",
+                    &[],
+                )
+                .await
+                .map_err(io_error)?;
+            Ok(rows.iter().map(|r| r.get::<_, i64>(0)).collect::<Vec<_>>())
+        })
+        .unwrap()
+    };
+    let xid = |b: &[u8]| Xid {
+        format_id: 5,
+        branch_qualifier: b.to_vec(),
+        global_transaction_id: b"g".to_vec(),
+    };
+    s.add_record(5001, 199, vec![1], false).unwrap();
+    s.add_record(5002, 199, vec![2], false).unwrap();
+    let (a, b) = (s.generate_id(), s.generate_id());
+    s.delete_record_tx(a, 5001).unwrap();
+    s.delete_record_tx(b, 5002).unwrap();
+    wait(s.prepare(a, &xid(b"a")).unwrap());
+    wait(s.prepare(b, &xid(b"b")).unwrap());
+    assert_eq!(rows(&s).len(), 4, "the records and what will delete them");
+    drop(s); // a crash
+
+    let (s, r) = f.start();
+    assert_eq!(r.prepared.len(), 2);
+    wait(s.commit(a).unwrap());
+    wait(s.rollback(b).unwrap());
+    assert_eq!(rows(&s), [5002]);
+}
+
+/// What a management operation looks through stays paged, for the queue to
+/// read as if nothing had looked.
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn a_scan_leaves_paged_messages_paged() {
+    let f = Fixture::new();
+    let (s, _) = f.start();
+    for id in 1..=5 {
+        wait(s.store_paged(None, &message(id), &[1]).unwrap().unwrap());
+    }
+    wait(s.store_paged(None, &message(6), &[2]).unwrap().unwrap());
+    assert_eq!(ids_of(&s.scan_paged(1, 2, i64::MIN).unwrap()), [1, 2]);
+    assert_eq!(ids_of(&s.scan_paged(1, 2, 2).unwrap()), [3, 4]);
+    assert_eq!(ids_of(&s.scan_paged(1, 10, 4).unwrap()), [5]);
+    assert_eq!(ids_of(&s.read_paged(1, 10).unwrap()), [1, 2, 3, 4, 5]);
+    assert!(s.scan_paged(1, 10, i64::MIN).unwrap().is_empty());
+}
+
+/// A row a scan acted on is gone once the store has settled.
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn a_settled_acknowledgement_keeps_a_read_from_its_row() {
+    let f = Fixture::new();
+    let (s, _) = f.start();
+    for id in 1..=2000 {
+        wait(s.store_paged(None, &message(id), &[1]).unwrap().unwrap());
+    }
+    for id in 1..=1999 {
+        drop(s.store_acknowledge(1, id).unwrap());
+        s.delete_message(id).unwrap();
+    }
+    s.settle().unwrap();
+    assert_eq!(ids_of(&s.read_paged(1, 10).unwrap()), [2000]);
+}
+
 #[test]
 #[ignore = "needs PostgreSQL"]
 fn paged_messages_of_a_transaction_appear_at_its_commit() {
@@ -621,4 +719,78 @@ fn no_statement_walks_the_backlog_whatever_the_statistics() {
             "{read}"
         );
     }
+}
+
+/// The modes against a server with TLS, its certificate for `localhost` only:
+/// `SARANGA_TEST_POSTGRES_TLS` names the directory with `ca.crt`, `other.crt`,
+/// `client.crt` and `client.key`.
+#[test]
+#[ignore = "needs PostgreSQL with TLS"]
+fn tls_is_what_the_url_asks_for() {
+    let Ok(dir) = std::env::var("SARANGA_TEST_POSTGRES_TLS") else {
+        panic!("SARANGA_TEST_POSTGRES_TLS is not set");
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // Whether it connected, and over TLS, with the client's name if it gave one.
+    let attempt = |host: &str, parameters: String| {
+        let target = client_config(&DatabaseConfig {
+            url: format!(
+                "jdbc:postgresql://{host}:5432/saranga?user=saranga&password=saranga&{parameters}"
+            ),
+            ..database()
+        })
+        .unwrap();
+        runtime.block_on(async {
+            let client = writer::connect(&target).await?;
+            let row = client
+                .query_one(
+                    "SELECT ssl, client_dn FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+                    &[],
+                )
+                .await?;
+            Ok::<(bool, Option<String>), tokio_postgres::Error>((row.get(0), row.get(1)))
+        })
+    };
+    let ca = format!("sslrootcert={dir}/ca.crt");
+    let other = format!("sslrootcert={dir}/other.crt");
+
+    assert!(!attempt("localhost", "sslmode=disable".into()).unwrap().0);
+    assert!(attempt("localhost", "sslmode=prefer".into()).unwrap().0);
+    assert!(
+        attempt("localhost", String::new()).unwrap().0,
+        "the default"
+    );
+    // Encrypted, whoever it is.
+    assert!(
+        attempt("127.0.0.1", format!("sslmode=require&{other}"))
+            .unwrap()
+            .0
+    );
+    // The chain and not the name.
+    assert!(
+        attempt("127.0.0.1", format!("sslmode=verify-ca&{ca}"))
+            .unwrap()
+            .0
+    );
+    assert!(attempt("localhost", format!("sslmode=verify-ca&{other}")).is_err());
+    // Both.
+    assert!(
+        attempt("localhost", format!("sslmode=verify-full&{ca}"))
+            .unwrap()
+            .0
+    );
+    assert!(attempt("localhost", format!("ssl=true&{ca}")).unwrap().0);
+    assert!(attempt("127.0.0.1", format!("sslmode=verify-full&{ca}")).is_err());
+    assert!(attempt("localhost", format!("sslmode=verify-full&{other}")).is_err());
+    // A client certificate reaches the server.
+    let (ssl, name) = attempt(
+        "localhost",
+        format!("sslmode=verify-full&{ca}&sslcert={dir}/client.crt&sslkey={dir}/client.key"),
+    )
+    .unwrap();
+    assert!(ssl);
+    assert!(name.is_some_and(|n| n.contains("broker-client")));
 }

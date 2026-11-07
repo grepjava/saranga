@@ -22,7 +22,10 @@ pub use saranga_storage::ids;
 mod database;
 mod journal;
 
-pub use database::{DatabaseConfig, DatabaseStorage};
+pub use database::{
+    AddressRow, DatabaseConfig, DatabaseStorage, GenericRow, QueueRow, ReferenceRow, StoredRow,
+    Tables, read_tables,
+};
 pub use journal::JournalStorage;
 
 /// `CoreMessagePersister.ID`.
@@ -542,6 +545,23 @@ pub trait Store: Send + Sync {
     /// first, each with whether it is large.
     fn read_paged(&self, _queue_id: i64, _limit: i64) -> StoreResult<Vec<(StoredMessage, bool)>> {
         Ok(Vec::new())
+    }
+
+    /// Up to `limit` of a queue's paged messages after the ID `after`, oldest
+    /// first, left paged: what a management operation looks through.
+    fn scan_paged(
+        &self,
+        _queue_id: i64,
+        _limit: i64,
+        _after: i64,
+    ) -> StoreResult<Vec<(StoredMessage, bool)>> {
+        Ok(Vec::new())
+    }
+
+    /// Returns once what was sent is written: rows a scan acted on are gone
+    /// before the queue reads paged messages again.
+    fn settle(&self) -> StoreResult<()> {
+        Ok(())
     }
 
     /// A commit that is not synced, as a housekeeping delete's is. With

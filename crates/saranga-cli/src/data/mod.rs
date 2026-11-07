@@ -3,6 +3,7 @@
 use std::io::Write;
 
 mod compact;
+mod database;
 pub mod dirs;
 mod export;
 mod import;
@@ -125,6 +126,13 @@ fn parameter_dirs(args: &dirs::DataDirArgs) -> anyhow::Result<dirs::DataDirs> {
 fn print(a: &PrintArgs) -> anyhow::Result<()> {
     let _lock = a.db.lock()?;
     let mut out = std::io::BufWriter::new(a.db.out()?);
+    if let Some(store) = a.dirs.unchecked()?.database() {
+        saranga_protocol_amqp::describe::register();
+        let tables = saranga_server::storage::read_tables(&store)?;
+        database::print(&mut out, &tables, a.safe)?;
+        out.flush()?;
+        return Ok(());
+    }
     let d = parameter_dirs(&a.dirs)?;
     let opts = PrintDataOptions {
         safe: a.safe,

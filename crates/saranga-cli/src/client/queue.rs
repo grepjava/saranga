@@ -684,7 +684,25 @@ impl TableOut {
         self.print_lines(&split, centre);
     }
 
+    /// The lines of a row.
+    pub fn lines(&self, columns: &[String]) -> Vec<String> {
+        let split: Vec<Vec<String>> = columns
+            .iter()
+            .zip(&self.sizes)
+            .map(|(c, size)| self.split_line(c, *size))
+            .collect();
+        self.rendered(&split, None)
+    }
+
     pub fn print_lines(&self, columns: &[Vec<String>], centre: Option<&[bool]>) {
+        for line in self.rendered(columns, centre) {
+            println!("{line}");
+        }
+    }
+
+    /// The lines of a row already split into them.
+    pub fn rendered(&self, columns: &[Vec<String>], centre: Option<&[bool]>) -> Vec<String> {
+        let mut lines = Vec::new();
         let mut line_number = 0;
         loop {
             let mut more = false;
@@ -709,12 +727,13 @@ impl TableOut {
                 out.push_str(&cell);
                 out.push_str(self.separator);
             }
-            println!("{out}");
+            lines.push(out);
             line_number += 1;
             if !more {
                 break;
             }
         }
+        lines
     }
 
     /// `splitLine`.

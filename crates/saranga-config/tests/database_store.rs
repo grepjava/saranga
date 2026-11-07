@@ -76,6 +76,17 @@ fn the_schema_takes_them() {
 /// `database-storage` is the store Saranga has; without it, the JDBC journal
 /// it does not.
 #[test]
+fn replication_is_refused_with_the_store() {
+    let xml = document(SETTINGS).replace(
+        "</core>",
+        "<ha-policy><replication><primary/></replication></ha-policy></core>",
+    );
+    let e = BrokerConfig::parse_validated(&xml, |_| None, Validation::Deploy { jms: true })
+        .unwrap_err();
+    assert!(e.to_string().contains("replication"), "{e}");
+}
+
+#[test]
 fn only_the_jdbc_journal_is_refused() {
     let parse =
         |store: &str| BrokerConfig::parse_validated(&document(store), |_| None, Validation::Reload);

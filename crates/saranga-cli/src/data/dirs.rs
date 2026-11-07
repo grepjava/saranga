@@ -52,7 +52,7 @@ pub struct DbArgs {
     pub jdbc: JdbcArgs,
 }
 
-/// `DBOption`'s JDBC store options. Saranga stores messages in files only:
+/// `DBOption`'s JDBC journal options. Saranga has no JDBC journal:
 /// `--jdbc` is refused, and the others are taken and unused, as Artemis
 /// leaves them unused without it.
 #[derive(Args, Clone, Debug, Default)]
@@ -114,7 +114,7 @@ impl DbArgs {
     pub fn lock(&self) -> anyhow::Result<CliLock> {
         if self.jdbc.jdbc == Some(true) {
             return Err(crate::client::CliError(
-                "saranga data does not support --jdbc: Saranga does not store messages in a database".to_owned(),
+                "saranga data does not support --jdbc: that is Artemis's JDBC journal; a broker with database-storage is read from its broker.xml".to_owned(),
             )
             .into());
         }
@@ -149,6 +149,15 @@ pub struct DataDirs {
     pub config: Option<saranga_config::BrokerConfig>,
     /// The broker instance, if the tool runs in one.
     pub instance: Option<PathBuf>,
+}
+
+impl DataDirs {
+    /// The relational store of the instance's broker.xml, if it uses one.
+    pub fn database(&self) -> Option<saranga_server::storage::DatabaseConfig> {
+        let config = self.config.as_ref()?;
+        let dir = self.instance.as_deref()?;
+        saranga_server::config::storage_config(config, dir).database
+    }
 }
 
 impl DataDirArgs {

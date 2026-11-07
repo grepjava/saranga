@@ -223,7 +223,8 @@ The critical analyzer settings are accepted. See [Operations](operations.md).
 These stop the broker from starting, with a reason. Starting anyway would make it something it is not:
 
 - a colocated backup (`<colocated>` in the HA policy);
-- the JDBC store (`<database-store>`);
+- the JDBC journal (`<database-store>` without `<database-storage>true</database-storage>`; the [relational store](storage.md#the-relational-store) is supported);
+- replication with the relational store, which has no journals to copy;
 - a JGroups broadcast or discovery group (`jgroups-file`): discovery is over UDP only;
 - broadcast or discovery groups while neither the `artemis.discovery.enabled` system property nor the `ARTEMIS_DISCOVERY_ENABLED` environment variable is `true` (`AMQ229262`, `AMQ229263`), as in Artemis 2.57;
 - a `<security-manager>` class other than `ActiveMQBasicSecurityManager`;

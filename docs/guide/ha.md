@@ -210,6 +210,11 @@ Each policy works with Artemis 2.57.0 on one side and Saranga on the other, eith
 - **Colocated backups.** `<colocated>` under `shared-store` or `replication` stops the broker from starting, with a reason.
 - **Scale-down.** `<scale-down>` is read and logged as a warning. A backup becomes active on the primary's data, and a primary does not scale its messages down to another broker when it stops.
 - **Lock coordinators.** `<lock-coordinators>`, a technical preview in Artemis 2.57, is not implemented: it is ignored with a warning. An acceptor or broker connection that names a lock coordinator is not held back by it, and `listLockCoordinatorsAsJSON` answers with an empty list.
-- **The JDBC store,** and so a JDBC shared store. `<database-store>` stops the broker from starting.
+- **The JDBC journal,** and so a JDBC shared store with its lease in the database. `<database-store>` without `database-storage` stops the broker from starting.
+- **Replication on the relational store.** It copies journals, and that store has none, so the broker does not start. Use `shared-store` as below.
+
+## Shared store on the relational store
+
+With `database-storage`, the database is what the pair shares. As in Artemis, the primary and backup still take the lock files, so give both the same `node-manager-lock-directory` on a shared file system. The backup does not open the store until it takes over. Once the primary is gone, the backup opens the tables, recovers from them and goes on with the paged messages still in them. The store's own lock is held on a database session, so a primary that died has given it up by then; if the database still sees that session, the backup waits five seconds for it and then stops rather than run beside another broker.
 
 The full list of differences is in [Persistence differences](../../COMPAT.md#persistence-differences) and [Configuration differences](../../COMPAT.md#configuration-differences).

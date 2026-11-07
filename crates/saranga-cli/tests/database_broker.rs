@@ -128,11 +128,26 @@ impl Instance {
         }
     }
 
-    fn start(&mut self) {
+    /// Shared-store HA: this `role` of a pair locking in `locks`.
+    fn shared_store(&self, role: &str, locks: &Path) {
+        let file = self.home.join("etc/broker.xml");
+        let xml = std::fs::read_to_string(&file).unwrap();
+        let locks = locks.display().to_string().replace('\\', "/");
+        let policy = format!(
+            "<ha-policy><shared-store><{role}/></shared-store></ha-policy>\
+             <node-manager-lock-directory>{locks}</node-manager-lock-directory>\
+             <max-disk-usage>100</max-disk-usage>"
+        );
+        let xml = xml.replace("<max-disk-usage>100</max-disk-usage>", &policy);
+        std::fs::write(&file, xml).unwrap();
+    }
+
+    /// Starts the broker, which is not live yet if it is a backup.
+    fn launch(&mut self) {
         self.starts += 1;
-        let log = self.home.join(format!("log/run-{}.out", self.starts));
+        let log = self.log();
         let file = std::fs::File::create(&log).unwrap();
-        let mut child = Command::new(BINARY)
+        let child = Command::new(BINARY)
             .arg("run")
             .env("ARTEMIS_INSTANCE", &self.home)
             .env("ARTEMIS_INSTANCE_ETC", self.home.join("etc"))
@@ -140,15 +155,34 @@ impl Instance {
             .stderr(file)
             .spawn()
             .unwrap();
+        self.broker = Some(child);
+    }
+
+    fn log(&self) -> PathBuf {
+        self.home.join(format!("log/run-{}.out", self.starts))
+    }
+
+    /// Waits for what the broker logs once it is live.
+    fn live(&mut self) {
+        let log = self.log();
+        let child = self.broker.as_mut().expect("a broker");
         let deadline = Instant::now() + Duration::from_secs(60);
-        while !read(&log).contains("AMQ221007") {
+        // A primary's, or a backup's that has taken over.
+        while !["AMQ221007", "AMQ221010"]
+            .iter()
+            .any(|m| read(&log).contains(m))
+        {
             if let Some(status) = child.try_wait().unwrap() {
                 panic!("the broker ended with {status}:\n{}", read(&log));
             }
             assert!(Instant::now() < deadline, "not live:\n{}", read(&log));
             std::thread::sleep(Duration::from_millis(100));
         }
-        self.broker = Some(child);
+    }
+
+    fn start(&mut self) {
+        self.launch();
+        self.live();
     }
 
     /// As `kill -9`: nothing gets to finish.
@@ -260,4 +294,188 @@ fn large_messages_survive_a_kill_through_paging() {
 #[ignore = "needs PostgreSQL"]
 fn transactions_of_paged_messages_survive_a_kill() {
     survives_a_kill(5000, 512, Some(1_000_000), &["--txt-size", "100"], true);
+}
+
+/// Messages still in the table are found by a purge, and none comes back: a
+/// read that ran ahead of their deletes would hand them out again.
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn a_purge_reaches_paged_messages() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let database = Database::new();
+    database.empty();
+    let mut instance = Instance::new(Some(1_000_000));
+    instance.start();
+    let send = |n: i64| {
+        instance.client(
+            "producer",
+            &[
+                "--message-count".to_owned(),
+                n.to_string(),
+                "--message-size".to_owned(),
+                "512".to_owned(),
+            ],
+        );
+    };
+    send(5000);
+    assert!(database.paged() > 0, "nothing paged");
+
+    let out = Command::new(BINARY)
+        .args(["queue", "purge", "--name", "KILLED"])
+        .args(["--url", &format!("tcp://localhost:{}", instance.port)])
+        .args(["--user", "a", "--password", "b"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(database.messages(), 0, "{out:?}");
+    assert_eq!(database.references(), 0);
+
+    // A purged message that came back would take a new one's place, and
+    // leave that one's rows behind.
+    send(100);
+    let out = instance.client(
+        "consumer",
+        &[
+            "--message-count".to_owned(),
+            "100".to_owned(),
+            "--receive-timeout".to_owned(),
+            "30000".to_owned(),
+        ],
+    );
+    assert!(out.contains("Consumed: 100 messages"), "{out}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while database.references() + database.messages() > 0 {
+        assert!(Instant::now() < deadline, "rows left behind");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The data tools read the tables, paged messages and all, with no broker.
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn the_data_tools_read_the_tables() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let database = Database::new();
+    database.empty();
+    let mut instance = Instance::new(Some(200_000));
+    instance.start();
+    instance.client(
+        "producer",
+        &[
+            "--message-count".to_owned(),
+            "1000".to_owned(),
+            "--message-size".to_owned(),
+            "300".to_owned(),
+        ],
+    );
+    assert!(database.paged() > 0, "nothing paged");
+    instance.kill();
+
+    let data = |args: &[&str]| {
+        let out = Command::new(BINARY)
+            .arg("data")
+            .args(args)
+            .args(["--f"])
+            .env("ARTEMIS_INSTANCE", &instance.home)
+            .env("ARTEMIS_INSTANCE_ETC", instance.home.join("etc"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let printed = data(&["print"]);
+    assert!(printed.contains("Total messages: 1000"), "{printed}");
+    assert!(printed.contains("Q U E U E S"));
+    let exported = data(&["exp"]);
+    assert_eq!(exported.matches("<message ").count(), 1000);
+    assert!(exported.contains("name=\"KILLED\""));
+}
+
+/// Shared store on the database, as Artemis has it: the pair lock in a shared
+/// directory and the backup opens the store when it takes over, which is when
+/// the primary's session, and its lock on the store, are gone.
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn a_backup_takes_over_the_store() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let database = Database::new();
+    database.empty();
+    let locks = tempfile::tempdir().unwrap();
+    let mut primary = Instance::new(Some(1_000_000));
+    let mut backup = Instance::new(Some(1_000_000));
+    primary.shared_store("primary", locks.path());
+    backup.shared_store("backup", locks.path());
+    primary.start();
+    primary.client(
+        "producer",
+        &[
+            "--message-count".to_owned(),
+            "3000".to_owned(),
+            "--message-size".to_owned(),
+            "512".to_owned(),
+        ],
+    );
+    assert!(database.paged() > 0, "nothing paged");
+
+    backup.launch();
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        !read(&backup.log()).contains("AMQ221010"),
+        "two live brokers"
+    );
+
+    primary.kill();
+    backup.live();
+    let out = backup.client(
+        "consumer",
+        &[
+            "--message-count".to_owned(),
+            "3000".to_owned(),
+            "--receive-timeout".to_owned(),
+            "30000".to_owned(),
+        ],
+    );
+    assert!(out.contains("Consumed: 3000 messages"), "{out}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while database.references() + database.messages() > 0 {
+        assert!(Instant::now() < deadline, "rows left behind");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Replication copies journals, and the store has none: the broker says so
+/// rather than start.
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn replication_is_refused_with_the_store() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut instance = Instance::new(None);
+    let file = instance.home.join("etc/broker.xml");
+    let xml = std::fs::read_to_string(&file).unwrap().replace(
+        "<max-disk-usage>100</max-disk-usage>",
+        "<ha-policy><replication><primary/></replication></ha-policy>\
+         <max-disk-usage>100</max-disk-usage>",
+    );
+    std::fs::write(&file, xml).unwrap();
+    instance.launch();
+    let mut child = instance.broker.take().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("it started:\n{}", read(&instance.log()));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(!status.success());
+    assert!(
+        read(&instance.log()).contains("replication"),
+        "{}",
+        read(&instance.log())
+    );
 }

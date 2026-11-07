@@ -100,7 +100,7 @@ The options most people use:
 - `--no-amqp-acceptor`, `--no-stomp-acceptor`, `--no-mqtt-acceptor` and `--no-hornetq-acceptor` leave those acceptors out; `--no-web` leaves out the web server.
 - `--clustered`, `--replicated`, `--shared-store` and `--backup` write cluster and HA settings (see [Clustering](clustering.md) and [High availability](ha.md)).
 
-`saranga create --help` lists every option. They are Artemis's; see [Artemis's CLI documentation](https://activemq.apache.org/components/artemis/documentation/latest/using-cli.html). The differences: the journal type is `NIO` unless you pass `--aio`, `--nio` or `--mapped`, `--jdbc` is refused, and there is no Windows service wrapper. See [COMPAT.md, CLI differences](../../COMPAT.md#cli-differences).
+`saranga create --help` lists every option. They are Artemis's; see [Artemis's CLI documentation](https://activemq.apache.org/components/artemis/documentation/latest/using-cli.html). The differences: the journal type is `NIO` unless you pass `--aio`, `--nio` or `--mapped`, `--jdbc` is refused (`--database-storage` makes an instance on the [relational store](storage.md#the-relational-store)), and there is no Windows service wrapper. See [COMPAT.md, CLI differences](../../COMPAT.md#cli-differences).
 
 ## Starting the broker
 

@@ -1286,6 +1286,59 @@ impl PagingStore {
                 return Vec::new();
             }
         };
+        let out = Self::decode_stored(&manager, rows);
+        for m in &out {
+            sub.counter_add(-1, -persistent_size(m));
+        }
+        out
+    }
+
+    /// A paged message a scan found leaves paging: it counts as read.
+    pub fn claim_stored(&self, sub: &PageSubscription, message: &ServerMessage) {
+        sub.counter_add(-1, -persistent_size(message));
+    }
+
+    /// The next of a queue's paged messages in the store, left paged.
+    fn scan_stored(
+        manager: &PagingManager,
+        storage: &Storage,
+        sub: &PageSubscription,
+        it: &mut PageIterator,
+    ) -> Option<PagedRef> {
+        if !it.started {
+            it.started = true;
+            it.after = i64::MIN;
+        }
+        if it.stored.is_empty() {
+            let rows = match storage.scan_paged(sub.queue_id, SCAN_CHUNK, it.after) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!("AMQ222037: IO Error reading paged messages: {e}");
+                    return None;
+                }
+            };
+            if let Some((last, _)) = rows.last() {
+                it.after = last.message_id();
+            }
+            it.stored.extend(Self::decode_stored(manager, rows));
+        }
+        let message = it.stored.pop_front()?;
+        Some(PagedRef {
+            position: PagePosition {
+                page: IN_STORE,
+                message_nr: 0,
+                tx_id: 0,
+                size: persistent_size(&message),
+                ack_record: -1,
+            },
+            message,
+        })
+    }
+
+    fn decode_stored(
+        manager: &PagingManager,
+        rows: Vec<(crate::storage::StoredMessage, bool)>,
+    ) -> Vec<Arc<ServerMessage>> {
         let decoders = manager.decoders.get_or_init(MessageDecoders::default);
         let mut out = Vec::with_capacity(rows.len());
         for (stored, large) in rows {
@@ -1301,10 +1354,7 @@ impl PagingStore {
                 crate::storage::StoredMessage::Native(r) => decoders.decode(&r),
             };
             match message {
-                Ok(m) => {
-                    sub.counter_add(-1, -persistent_size(&m));
-                    out.push(m);
-                }
+                Ok(m) => out.push(m),
                 Err(e) => tracing::warn!("AMQ222037: Cannot read paged message {id}: {e}"),
             }
         }
@@ -2051,6 +2101,11 @@ impl PagingStore {
         if !manager.loaded.load(Ordering::SeqCst) {
             return None;
         }
+        if let Some(storage) = manager.storage.clone()
+            && storage.pages_in_store()
+        {
+            return Self::scan_stored(&manager, &storage, sub, it);
+        }
         loop {
             let (page, entry) = {
                 let mut st = lock(&self.state);
@@ -2533,7 +2588,15 @@ pub struct PageIterator {
     page: i64,
     nr: i32,
     started: bool,
+    /// Where a scan of the store has got to, and what it has read ahead.
+    after: i64,
+    stored: VecDeque<Arc<ServerMessage>>,
 }
+
+/// The page of a [`PagedRef`] in the store rather than in a page file.
+pub const IN_STORE: i64 = -1;
+/// The messages a scan of the store reads at a time.
+const SCAN_CHUNK: i64 = 500;
 
 /// A paged message for a queue (`PagedReferenceImpl`).
 #[derive(Debug, Clone)]

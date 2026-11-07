@@ -2,6 +2,15 @@
 
 Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Artemis 2.57.0 and works interchangeably with it. [COMPAT.md](COMPAT.md) lists where the two differ.
 
+## Unreleased
+
+### Storage
+
+- **The relational store**: with `database-storage`, a broker keeps its messages, paging and large bodies in PostgreSQL, in the tables of Artemis pull request 6838, so that either broker opens what the other wrote. `saranga create --database-storage` makes such an instance. See docs/guide/storage.md.
+- **TLS to the database**, with the JDBC driver's `sslmode` and its certificate parameters.
+- **Shared-store HA** on the store: the backup opens the tables when it takes over. Replication is refused with a reason, as there are no journals to copy.
+- **`data print` and `data exp`** read the tables, and `data exp` writes what Artemis's exporter writes.
+
 ## 1.2.0 (2026-11-02)
 
 Faster under load, connection routers, and the rest of Artemis's login modules and SASL mechanisms.

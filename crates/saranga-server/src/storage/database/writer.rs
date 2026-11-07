@@ -1,11 +1,8 @@
 //! Writes the database store's operations. Artemis's `DataManager` hands one
 //! batch to one worker per timer tick, so its writers in use are the batch's
 //! time over the flush period, however many connections there are. Here a
-//! batch starts when no connection is writing and there is work, with no
-//! timer. Another connection starts only for work worth a transaction of its
-//! own: small transactions side by side cost the database more than one
-//! large one, each its own commit, all of them inserting at the same end of
-//! the same indexes.
+//! batch starts when a connection is free and there is work, with no timer,
+//! and the work is shared between the free connections.
 //!
 //! Work arrives as [`Unit`]s, in order; a unit is atomic. Units on different
 //! connections commit in any order, so a unit waits while a key of its own
@@ -27,11 +24,10 @@ use std::time::Duration;
 use saranga_journal::{Completion, JournalError};
 use tokio::sync::mpsc;
 use tokio_postgres::{Client, Config, NoTls, Statement};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 /// The most units in a batch.
 const MAX_BATCH: usize = 2048;
-/// The operations that justify a second transaction beside a running one.
-const MIN_SPLIT: usize = 512;
 /// How far past a waiting unit a batch looks for others.
 const MAX_SCAN: usize = 8192;
 
@@ -232,10 +228,35 @@ impl Writes {
     }
 }
 
+/// Where the database is, and how to talk to it.
+#[derive(Clone)]
+pub struct Target {
+    pub config: Config,
+    /// `None` with `sslmode=disable`.
+    pub tls: Option<MakeRustlsConnect>,
+}
+
+impl std::ops::Deref for Target {
+    type Target = Config;
+
+    fn deref(&self) -> &Config {
+        &self.config
+    }
+}
+
+impl std::fmt::Debug for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Target")
+            .field("config", &self.config)
+            .field("tls", &self.tls.is_some())
+            .finish()
+    }
+}
+
 /// How to reach the database, and what to do when it fails.
 #[derive(Debug, Clone)]
 pub struct Settings {
-    pub config: Config,
+    pub config: Target,
     pub connections: usize,
     pub max_retries: u32,
     pub retry_interval: Duration,
@@ -247,14 +268,28 @@ pub fn io_error(e: impl std::fmt::Display) -> JournalError {
 }
 
 /// Connects, the connection driven on the runtime it is called on.
-pub async fn connect(config: &Config) -> Result<Client, tokio_postgres::Error> {
-    let (client, connection) = config.connect(NoTls).await?;
-    tokio::spawn(async move {
+pub async fn connect(target: &Target) -> Result<Client, tokio_postgres::Error> {
+    async fn run<S, T>(connection: tokio_postgres::Connection<S, T>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         if let Err(e) = connection.await {
             tracing::debug!("database connection ended: {e}");
         }
-    });
-    Ok(client)
+    }
+    Ok(match &target.tls {
+        Some(tls) => {
+            let (client, connection) = target.config.connect(tls.clone()).await?;
+            tokio::spawn(run(connection));
+            client
+        }
+        None => {
+            let (client, connection) = target.config.connect(NoTls).await?;
+            tokio::spawn(run(connection));
+            client
+        }
+    })
 }
 
 /// Starts the writers on the current runtime.
@@ -314,13 +349,9 @@ async fn dispatch(mut receiver: mpsc::UnboundedReceiver<Unit>, writers: Vec<Writ
     let mut open = true;
     loop {
         while !idle.is_empty() {
-            let all_idle = idle.len() == total;
             let queued: usize = queue.iter().map(|u| u.ops.len().max(1)).sum();
-            if !all_idle && queued < MIN_SPLIT {
-                break;
-            }
-            let share = queued.div_ceil(idle.len()).max(MIN_SPLIT);
-            let batch = form(&mut queue, &in_flight, all_idle, share, &run);
+            let share = queued.div_ceil(idle.len()).max(1);
+            let batch = form(&mut queue, &in_flight, idle.len() == total, share, &run);
             if batch.is_empty() {
                 break;
             }
@@ -626,7 +657,7 @@ impl Changes {
 
 /// A connection and its prepared statements.
 struct Writer {
-    config: Config,
+    config: Target,
     connection: Option<Prepared>,
 }
 
@@ -652,6 +683,8 @@ struct Prepared {
     commit_messages: Statement,
     commit_references: Statement,
     commit_acks: Statement,
+    commit_deletes: Statement,
+    commit_marks: Statement,
     commit_broker: Statement,
     rollback_references: Statement,
     rollback_acks: Statement,
@@ -765,6 +798,17 @@ impl Prepared {
         let commit_acks = c
             .prepare("DELETE FROM DB_REFERENCES WHERE ACK_TX_ID = ANY($1)")
             .await?;
+        // What `PREPARED_DELETE` rows name, as their bytes are big-endian.
+        let commit_deletes = c
+            .prepare(
+                "DELETE FROM DB_BROKER_DATA WHERE ID IN \
+                 (SELECT ('x' || encode(DATA_RECORD, 'hex'))::bit(64)::bigint FROM DB_BROKER_DATA \
+                 WHERE TX_ID = ANY($1) AND RECORD_TYPE = 201)",
+            )
+            .await?;
+        let commit_marks = c
+            .prepare("DELETE FROM DB_BROKER_DATA WHERE TX_ID = ANY($1) AND RECORD_TYPE = 201")
+            .await?;
         let commit_broker = c
             .prepare("UPDATE DB_BROKER_DATA SET TX_ID = NULL WHERE TX_ID = ANY($1)")
             .await?;
@@ -804,6 +848,8 @@ impl Prepared {
             commit_messages,
             commit_references,
             commit_acks,
+            commit_deletes,
+            commit_marks,
             commit_broker,
             rollback_references,
             rollback_acks,
@@ -818,7 +864,7 @@ impl Prepared {
 type Step<'a> = Pin<Box<dyn Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>>;
 
 impl Writer {
-    async fn connect(config: Config) -> Result<Self, JournalError> {
+    async fn connect(config: Target) -> Result<Self, JournalError> {
         let client = connect(&config).await.map_err(io_error)?;
         let connection = Some(Prepared::new(client).await.map_err(io_error)?);
         Ok(Self { config, connection })
@@ -935,6 +981,8 @@ impl Writer {
                 &p.commit_messages,
                 &p.commit_references,
                 &p.commit_acks,
+                &p.commit_deletes,
+                &p.commit_marks,
                 &p.commit_broker,
                 &p.delete_prepared,
             ] {
