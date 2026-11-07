@@ -77,10 +77,21 @@ pub struct DatabaseConfig {
     pub user: Option<String>,
     pub password: Option<String>,
     pub connections: i32,
+    /// `database-max-read-connections`: at least one, and half of
+    /// `connections` if negative.
+    pub read_connections: i32,
     pub network_timeout_millis: i32,
     pub max_retries: i32,
     pub retry_interval_millis: i64,
     pub max_pending_writes: i32,
+}
+
+fn read_connections_of(database: &DatabaseConfig) -> usize {
+    let read = match database.read_connections {
+        n if n < 0 => database.connections / 2,
+        n => n,
+    };
+    read.max(1) as usize
 }
 
 /// A `jdbc:postgresql:` URL as a client configuration: `//host:port/database`
@@ -325,8 +336,9 @@ pub struct DatabaseStorage {
     /// Per queue, the last paged message read. An index scan from the start
     /// would step over every row already read and not yet vacuumed.
     read_from: Mutex<HashMap<i64, i64>>,
-    /// The connection queues read paged messages on.
-    reader: tokio::sync::Mutex<Option<PagedReader>>,
+    /// The connections queues read paged messages on, each opened when it is
+    /// first needed.
+    readers: Vec<tokio::sync::Mutex<Option<PagedReader>>>,
 }
 
 /// Takes a queue's next paged references out of paging, and returns their
@@ -479,7 +491,9 @@ impl DatabaseStorage {
             addresses: Mutex::new(HashMap::new()),
             sides: Mutex::new(HashMap::new()),
             read_from: Mutex::new(HashMap::new()),
-            reader: tokio::sync::Mutex::new(None),
+            readers: (0..read_connections_of(database))
+                .map(|_| tokio::sync::Mutex::new(None))
+                .collect(),
         })
     }
 
@@ -694,12 +708,19 @@ impl DatabaseStorage {
     ) -> StoreResult<Vec<(StoredMessage, bool)>> {
         let rows = {
             let (done, result) = std::sync::mpsc::channel();
-            let reader = &self.reader;
+            let readers = &self.readers;
             let config = &self.connection;
             // The reader is the store's own, so this stays on the store's
             // runtime for as long as the query takes.
             self.runtime.block_in(async {
-                let mut slot = reader.lock().await;
+                // The first that is free, or else this queue's turn on one.
+                let mut slot = match readers.iter().find_map(|r| r.try_lock().ok()) {
+                    Some(free) => free,
+                    None => {
+                        let at = queue_id.rem_euclid(readers.len() as i64) as usize;
+                        readers[at].lock().await
+                    }
+                };
                 if slot.as_ref().is_none_or(|r| r.client.is_closed()) {
                     let client = writer::connect(config).await.map_err(io_error);
                     let client = match client {
@@ -1330,6 +1351,14 @@ impl Store for DatabaseStorage {
                 .execute(
                     "DELETE FROM DB_MESSAGES m WHERE NOT EXISTS \
                      (SELECT 1 FROM DB_REFERENCES r WHERE r.MESSAGE_ID = m.MESSAGE_ID)",
+                    &[],
+                )
+                .await
+                .map_err(q)?;
+            // Artemis finishes a prepared transaction without knowing these.
+            client
+                .execute(
+                    "DELETE FROM DB_BROKER_DATA WHERE RECORD_TYPE = 201 AND TX_ID NOT IN                      (SELECT TX_ID FROM DB_PREP_TX)",
                     &[],
                 )
                 .await

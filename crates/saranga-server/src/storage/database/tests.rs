@@ -25,6 +25,7 @@ fn database() -> DatabaseConfig {
         user: None,
         password: None,
         connections: 6,
+        read_connections: 3,
         network_timeout_millis: 20_000,
         max_retries: 0,
         retry_interval_millis: 10,
@@ -549,6 +550,25 @@ fn a_prepared_delete_survives_a_crash() {
     wait(s.commit(a).unwrap());
     wait(s.rollback(b).unwrap());
     assert_eq!(rows(&s), [5002]);
+
+    // One left by Artemis, which finished its transaction without it.
+    let connection = s.connection.clone();
+    s.run(async move {
+        let client = writer::connect(&connection).await.map_err(io_error)?;
+        client
+            .execute(
+                "INSERT INTO DB_BROKER_DATA (ID, RECORD_TYPE, TX_ID) VALUES (5003, 201, 999999)",
+                &[],
+            )
+            .await
+            .map_err(io_error)?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(rows(&s), [5002, 5003]);
+    drop(s);
+    let (s, _) = f.start();
+    assert_eq!(rows(&s), [5002]);
 }
 
 /// What a management operation looks through stays paged, for the queue to
@@ -814,4 +834,20 @@ fn tls_is_what_the_url_asks_for() {
     .unwrap();
     assert!(ssl);
     assert!(name.is_some_and(|n| n.contains("broker-client")));
+}
+
+/// `database-max-read-connections`, whose default is half of the writers.
+#[test]
+fn read_connections_follow_the_setting() {
+    let of = |connections, read_connections| {
+        read_connections_of(&DatabaseConfig {
+            connections,
+            read_connections,
+            ..database()
+        })
+    };
+    assert_eq!(of(6, -1), 3);
+    assert_eq!(of(1, -1), 1);
+    assert_eq!(of(6, 0), 1);
+    assert_eq!(of(6, 5), 5);
 }

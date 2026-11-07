@@ -549,3 +549,78 @@ fn a_waiting_consumer_gets_what_is_paged() {
     );
     assert!(read(&instance.log()).contains("paging on address 'WAITING'"));
 }
+
+/// With the basic security manager, users and their roles are rows of the
+/// store: one added through management outlives a kill, and so does its
+/// removal.
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn persisted_users_outlive_a_kill() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let database = Database::new();
+    database.empty();
+    let mut instance = Instance::new(None);
+    let file = instance.home.join("etc/bootstrap.xml");
+    let xml = std::fs::read_to_string(&file).unwrap();
+    let jaas = "<jaas-security domain=\"activemq\"/>";
+    assert!(xml.contains(jaas), "{xml}");
+    let basic = "<security-manager class-name=\"org.apache.activemq.artemis.spi.core.security.ActiveMQBasicSecurityManager\">         <property key=\"bootstrapUser\" value=\"a\"/>         <property key=\"bootstrapPassword\" value=\"b\"/>         <property key=\"bootstrapRole\" value=\"amq\"/>         </security-manager>";
+    std::fs::write(&file, xml.replace(jaas, basic)).unwrap();
+    instance.start();
+
+    let url = format!("tcp://localhost:{}", instance.port);
+    let manage = |action: &str| {
+        let mut c = Command::new(BINARY);
+        c.args([
+            "user",
+            action,
+            "--url",
+            &url,
+            "--user",
+            "a",
+            "--password",
+            "b",
+        ])
+        .args(["--user-command-user", "kept"])
+        .stdin(Stdio::null());
+        if action == "add" {
+            c.args(["--user-command-password", "secret", "--role", "amq"]);
+        }
+        let out = c.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+    };
+    let login = |password: &str| {
+        Command::new(BINARY)
+            .args(["producer", "--url", &url, "--user", "kept"])
+            .args(["--password", password, "--message-count", "1"])
+            .args(["--destination", "queue://KILLED"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    // `USER_RECORD` and `ROLE_RECORD`.
+    let rows =
+        || database.count("SELECT count(*) FROM DB_CONFIG_DATA WHERE RECORD_TYPE IN (47, 48)");
+    let bootstrap = rows();
+    assert_eq!(bootstrap, 2, "the bootstrap user and its roles");
+
+    manage("add");
+    assert_eq!(rows(), bootstrap + 2);
+    assert!(login("secret").status.success());
+    assert!(!login("wrong").status.success());
+
+    instance.kill();
+    instance.start();
+    assert_eq!(rows(), bootstrap + 2, "another start adds no rows");
+    let out = login("secret");
+    assert!(out.status.success(), "{out:?}");
+    assert!(!login("wrong").status.success());
+
+    manage("rm");
+    assert_eq!(rows(), bootstrap);
+    // As in Artemis, the login may stay in the cache until it expires.
+    instance.kill();
+    instance.start();
+    assert!(!login("secret").status.success(), "back after a kill");
+    assert_eq!(rows(), bootstrap);
+}

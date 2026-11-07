@@ -171,11 +171,12 @@ A database holds one broker. The store takes a lock on a database session of its
 | `jdbc-connection-url` | | The database, as a `jdbc:postgresql:` URL |
 | `jdbc-user`, `jdbc-password` | | Override the URL's `user` and `password` |
 | `database-connections` | 6 | Connections that write |
+| `database-max-read-connections` | half of `database-connections` | Connections that read paged messages, opened as queues need them. At least one |
 | `max-pending-writes` | 100000 | Operations sent and not yet committed, past which writers wait |
 | `database-max-retries`, `database-retry-interval-millis` | 5, 5000 | How often and how long apart a failed batch is tried again. After the last, the broker stops as on a critical I/O error |
 | `jdbc-network-timeout` | 20000 | The time allowed to connect, in milliseconds |
 
-Artemis's other settings are accepted and have no effect. `database-flush-period-nanos` is one: batches start when a connection is free, with no timer. So are `database-max-read-connections`, `database-read-idle-timeout` and `database-page-join-fetch`.
+Artemis's other settings are accepted and have no effect. `database-flush-period-nanos` is one: batches start when a connection is free, with no timer. So are `database-read-idle-timeout` and `database-page-join-fetch`.
 
 ### TLS
 
@@ -196,7 +197,7 @@ The URL takes the JDBC driver's parameters. As with the driver, a connection is 
 - **Paging** stays in the tables. A paged message is a row in `DB_REFERENCES` with `PAGED` set to `Y`, read back as the queue has room. There are no page files, and `paging-directory` is not used.
 - **Large messages** have their bodies in `DB_MESSAGES`, and a body is copied to a file in `large-messages-directory` while the broker works with it.
 - **Management operations** that remove, move or count messages reach paged messages too, without reading them into the queue. Browsing shows what is in memory, as it does with page files.
-- **Transactions** are written when they commit. A prepared XA transaction is in the tables with its ID, and survives a crash until it is committed or rolled back.
+- **Transactions** are written when they commit. A prepared XA transaction is in the tables with its ID, and survives a crash until it is committed or rolled back, by this broker or by Artemis on the same database.
 - **Durability** is PostgreSQL's: a message is acknowledged to its producer once its transaction has committed there. Reading paged messages back does not wait for a sync, as a crash then only means reading them again.
 - **Replication** is not available, as there are no journals to copy. See [Shared store on the relational store](ha.md#shared-store-on-the-relational-store).
 - **`data print` and `data exp`** read the tables. See [The data tools](#the-data-tools).
