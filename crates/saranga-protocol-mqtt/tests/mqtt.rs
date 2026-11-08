@@ -510,3 +510,51 @@ async fn a_restored_session_that_expires_stays_gone_after_a_restart() {
         .collect();
     assert!(queues.is_empty(), "subscription queues left: {queues:?}");
 }
+
+/// A message straight onto `queue`, as a producer without a client ID
+/// (STOMP, the Core API) leaves it.
+fn enqueue(queue: &saranga_server::queue::Queue, address: &str, id: i64) {
+    let message = saranga_message::CoreMessage {
+        message_id: id,
+        address: Some(address.into()),
+        body: vec![0, 0, 0, 0].into(),
+        ..Default::default()
+    };
+    queue.add(saranga_server::message::MessageRef::new(
+        saranga_server::message::ServerMessage::new(message),
+    ));
+}
+
+/// A no-local subscription takes a client ID with a quote, and gets the
+/// messages that came without a client ID.
+#[tokio::test]
+async fn no_local_quotes_the_client_id_and_takes_messages_without_one() {
+    let (broker, address, _task) = start(None).await;
+    let (mut c, _) = Client::open_with(address, &connect5("reader'one", true, 0, None)).await;
+    let mut body = vec![0, 1, 0];
+    body.extend(string("nl/t"));
+    body.push(0x05); // QoS 1, no local
+    c.send(&packet(0x82, &body)).await;
+    let suback = c.packet().await.expect("a SUBACK");
+    assert_eq!(
+        (suback[0], *suback.last().unwrap()),
+        (0x90, 1),
+        "{suback:?}"
+    );
+    let queue = broker
+        .post_office()
+        .queues()
+        .into_iter()
+        .find(|q| q.name().to_string().ends_with("nl.t"))
+        .expect("the subscription queue");
+    enqueue(&queue, "nl.t", 3);
+    let p = c.packet().await.expect("the message without a client ID");
+    assert_eq!(p[0] & 0xF0, 0x30, "a PUBLISH");
+    // Its own still do not come back.
+    let mut own = string("nl/t");
+    own.extend([0, 9, 0]);
+    own.extend_from_slice(b"own");
+    c.send(&packet(0x32, &own)).await;
+    assert_eq!(c.packet().await.expect("a PUBACK")[0], 0x40);
+    assert!(c.silent_for(500).await, "its own message came back");
+}

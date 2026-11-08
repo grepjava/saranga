@@ -1007,7 +1007,7 @@ impl Core {
             )));
         }
         let parsed = util::decompose_shared(&raw).1.to_owned();
-        let queue = self
+        let (queue, created) = self
             .queue_for_subscription(&raw, &parsed, util::is_fully_qualified(&filter))
             .await?;
         let result: Result<(), BrokerError> = async {
@@ -1054,11 +1054,13 @@ impl Core {
         }
         .await;
         if let Err(e) = result {
-            // Whatever broke, the subscription's queue goes.
-            let _ = self
-                .broker()
-                .post_office()
-                .delete_queue(queue.name(), false, false);
+            // Whatever broke, a queue this subscription made goes.
+            if created {
+                let _ = self
+                    .broker()
+                    .post_office()
+                    .delete_queue(queue.name(), false, false);
+            }
             return Err(e);
         }
         Ok(())
@@ -1070,14 +1072,14 @@ impl Core {
         raw: &str,
         parsed: &str,
         fully_qualified: bool,
-    ) -> Result<Queue, BrokerError> {
+    ) -> Result<(Queue, bool), BrokerError> {
         let broker = self.broker();
         let po = broker.post_office();
         let wildcard = *po.wildcard();
         let core_address = util::core_address(parsed, &wildcard);
         let core_queue = util::core_queue(raw, &self.client_id, &wildcard);
         if let Some(q) = po.queue(&core_queue) {
-            return Ok(q);
+            return Ok((q, false));
         }
         let bq = self.session.binding_query(&core_address, true);
         if fully_qualified && !bq.auto_create_queues {
@@ -1108,7 +1110,7 @@ impl Core {
             spec.routing_type = Some(RoutingType::Multicast);
             spec.filter_string = Some(filter);
             spec.durable = durable;
-            return self.session.create_queue(spec);
+            return self.session.create_queue(spec).map(|q| (q, true));
         }
         if info.routing_types.anycast {
             if !bq.queue_names.is_empty() {
@@ -1121,6 +1123,7 @@ impl Core {
                 let name = name.expect("not empty");
                 return po
                     .queue(&name)
+                    .map(|q| (q, false))
                     .ok_or_else(|| BrokerError::no_such_queue(&name));
             }
             let mut spec = QueueSpec::new(address, address);
@@ -1130,8 +1133,9 @@ impl Core {
             return match self.session.create_queue(spec) {
                 Err(e) if e.kind == ErrorType::QueueExists => po
                     .queue(address)
+                    .map(|q| (q, false))
                     .ok_or_else(|| BrokerError::no_such_queue(address)),
-                other => other,
+                other => other.map(|q| (q, true)),
             };
         }
         Err(BrokerError::invalid_routing_type_for_address(
@@ -1163,8 +1167,15 @@ impl Core {
     ) -> Result<i64, BrokerError> {
         let broker = self.broker();
         let cid = existing.unwrap_or_else(|| broker.post_office().ids().next());
-        let filter =
-            no_local.then(|| format!("{} <> '{}'", util::CONNECTION_ID_PROPERTY, self.client_id));
+        // A message no client ID came with (STOMP, a Core producer) is not
+        // the client's own; the ID is a string literal, quotes doubled.
+        let filter = no_local.then(|| {
+            let p = util::CONNECTION_ID_PROPERTY;
+            format!(
+                "{p} IS NULL OR {p} <> '{}'",
+                self.client_id.replace('\'', "''")
+            )
+        });
         let sink = Arc::new(MqttSink {
             shared: self.shared.clone(),
             consumer_id: cid,
