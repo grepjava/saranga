@@ -21,6 +21,9 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **A message sent again after a refusal is delivered.** A send outside a transaction that an address refused (full under `FAIL`, say) kept its duplicate ID, so sending it again was dropped as a duplicate.
 - **A move or copy whose journal write fails** reports the error and leaves the message where it was. Before, the copy was seen and the original acknowledged, and management reported success.
 - **JSON and OpenWire nested too deeply** are refused, where they overflowed the stack and ended the broker: an OIDC token, or an OpenWire frame, before its connection logs in.
+- **A cached permission holds only for the credentials it was granted to**, not for every login under the same user name.
+- **An XA commit of the wrong kind** leaves the branch to be committed or rolled back properly. Before, it was lost until a restart.
+- **`handshake-timeout` covers a WebSocket upgrade**: the HTTP request and the protocol header inside the WebSocket.
 
 ## 1.2.0 (2026-11-02)
 

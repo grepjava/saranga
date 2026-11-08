@@ -706,6 +706,7 @@ impl ServerSession {
                 connection: security_info,
                 subject: authenticated.subject,
                 management: false,
+                credential: Default::default(),
             },
             validated_user: authenticated.validated_user,
             xa: options.xa,
@@ -764,6 +765,7 @@ impl ServerSession {
                 connection: info,
                 subject: None,
                 management: false,
+                credential: Default::default(),
             },
             validated_user: None,
             xa: false,
@@ -2388,7 +2390,15 @@ impl ServerSession {
             .into());
         }
         let result = t.commit(one_phase);
+        // Refused as the wrong kind of commit (one phase for a prepared
+        // branch, two for one not prepared), the branch is as it was: it
+        // goes back, to be committed or rolled back properly, and recovered.
+        // Artemis leaves it out until a restart.
+        let untouched = result.is_err() && matches!(t.state, TxState::Active | TxState::Prepared);
         drop(t);
+        if untouched {
+            rm.put(xid, tx);
+        }
         match result {
             Ok(outcome) => {
                 self.finish(outcome, true)?;

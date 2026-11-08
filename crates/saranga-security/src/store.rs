@@ -41,6 +41,23 @@ pub struct SecurityAuth {
     /// web login guarded by `ArtemisRbacMBeanServerBuilder`: without a user
     /// name and password, its subject is authorized as it is.
     pub management: bool,
+    /// [`SecurityAuth::credential_key`], worked out once.
+    pub credential: std::sync::OnceLock<String>,
+}
+
+impl SecurityAuth {
+    /// The authentication cache's key for these credentials, which the
+    /// authorization cache keys its grants by. Made once: the fields do not
+    /// change after a session starts.
+    pub fn credential_key(&self) -> &str {
+        self.credential.get_or_init(|| {
+            authentication_cache_key(
+                self.username.as_deref(),
+                self.password.as_deref(),
+                &self.connection,
+            )
+        })
+    }
 }
 
 /// A successful authentication.
@@ -438,11 +455,7 @@ impl SecurityStore {
         if auth.management && auth.username.is_none() && auth.password.is_none() {
             return auth.subject.clone();
         }
-        let key = authentication_cache_key(
-            auth.username.as_deref(),
-            auth.password.as_deref(),
-            &auth.connection,
-        );
+        let key = auth.credential_key().to_owned();
         if let Some(cached) = self.authentication_cache.as_ref().and_then(|c| c.get(&key)) {
             return cached;
         }
@@ -487,8 +500,8 @@ impl SecurityStore {
         let fqqn = bare_queue.map(|q| format!("{bare_address}::{q}"));
         let target = fqqn.as_deref().unwrap_or(bare_address);
 
-        if let (Some(user), Some(cache)) = (user, &self.authorization_cache)
-            && with_cache_key(user, check, &auth.connection, |key| {
+        if let (Some(_), Some(cache)) = (user, &self.authorization_cache)
+            && with_cache_key(check, auth, |key| {
                 cache.test(key, |granted| granted.contains(target))
             })
         {
@@ -507,14 +520,11 @@ impl SecurityStore {
             return false;
         };
         let validated = self.manager.authorize(&subject, &roles, check, target);
-        if validated && let (Some(user), Some(cache)) = (user, &self.authorization_cache) {
-            cache.update(
-                authorization_cache_key(user, check, &auth.connection),
-                |set| {
-                    set.get_or_insert_with(HashSet::new)
-                        .insert(target.to_owned());
-                },
-            );
+        if validated && let (Some(_), Some(cache)) = (user, &self.authorization_cache) {
+            cache.update(authorization_cache_key(check, auth), |set| {
+                set.get_or_insert_with(HashSet::new)
+                    .insert(target.to_owned());
+            });
         }
         validated
     }
@@ -647,53 +657,32 @@ fn authentication_cache_key(
     saranga_config::bytes_to_hex(&md.finalize())
 }
 
-/// `createAuthorizationCacheKey`: a grant holds for one identity, so the key
-/// has what tells the same user name's logins apart, as the authentication
-/// key does.
-fn write_authorization_cache_key(
-    key: &mut String,
-    user: &str,
-    check: CheckType,
-    connection: &ConnectionInfo,
-) {
-    key.push_str(user);
+/// `createAuthorizationCacheKey`: a grant holds for the login it was made
+/// for, so the key is that login's credentials as the authentication cache
+/// keys them (user, password or token, realm, certificate, SASL identity),
+/// not the user name a client gives: with a token login, two tokens under
+/// one name can have different roles.
+fn write_authorization_cache_key(key: &mut String, check: CheckType, auth: &SecurityAuth) {
+    key.push_str(auth.credential_key());
     key.push('.');
     key.push_str(check.name());
-    key.push('\0');
-    if let Some(domain) = &connection.security_domain {
-        key.push_str(domain);
-    }
-    key.push('\0');
-    let dn = connection.cert_subject_dn();
-    if dn != CERT_SUBJECT_DN_UNAVAILABLE {
-        key.push_str(dn);
-    }
-    if let Some(principals) = &connection.sasl_principals {
-        use std::fmt::Write;
-        let _ = write!(key, "\0{principals:?}");
-    }
 }
 
-fn authorization_cache_key(user: &str, check: CheckType, connection: &ConnectionInfo) -> String {
+fn authorization_cache_key(check: CheckType, auth: &SecurityAuth) -> String {
     let mut key = String::new();
-    write_authorization_cache_key(&mut key, user, check, connection);
+    write_authorization_cache_key(&mut key, check, auth);
     key
 }
 
 /// [`authorization_cache_key`] made in a buffer kept for the thread, for a
 /// lookup each message makes.
-fn with_cache_key<R>(
-    user: &str,
-    check: CheckType,
-    connection: &ConnectionInfo,
-    f: impl FnOnce(&str) -> R,
-) -> R {
+fn with_cache_key<R>(check: CheckType, auth: &SecurityAuth, f: impl FnOnce(&str) -> R) -> R {
     thread_local! {
         static KEY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     }
     KEY.with_borrow_mut(|key| {
         key.clear();
-        write_authorization_cache_key(key, user, check, connection);
+        write_authorization_cache_key(key, check, auth);
         f(key)
     })
 }

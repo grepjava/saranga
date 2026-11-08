@@ -148,3 +148,51 @@ async fn a_client_too_slow_to_say_who_it_is_is_closed() {
         .unwrap_or(0);
     assert_eq!(n, 0);
 }
+
+/// Reads until the broker closes the connection, within 5 s: what it sent.
+async fn closed(s: &mut TcpStream) -> Vec<u8> {
+    let mut out = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), s.read_to_end(&mut out))
+        .await
+        .expect("closed by the broker")
+        .ok();
+    out
+}
+
+/// `handshake-timeout` covers an HTTP request too: one sent in part is
+/// closed, as one that never says who it is.
+#[tokio::test]
+async fn a_partial_http_request_is_closed() {
+    let address = start(Acceptor {
+        handshake_timeout: Some(std::time::Duration::from_millis(200)),
+        ..Acceptor::default()
+    })
+    .await;
+    let mut s = TcpStream::connect(address).await.unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+    assert_eq!(closed(&mut s).await, b"");
+}
+
+/// And the protocol header inside the WebSocket, as Artemis's decoder
+/// times it.
+#[tokio::test]
+async fn a_websocket_that_never_says_who_it_is_is_closed() {
+    let address = start(Acceptor {
+        handshake_timeout: Some(std::time::Duration::from_millis(200)),
+        ..Acceptor::default()
+    })
+    .await;
+    let mut s = TcpStream::connect(address).await.unwrap();
+    s.write_all(
+        b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let answer = closed(&mut s).await;
+    assert!(
+        answer.starts_with(b"HTTP/1.1 101"),
+        "{}",
+        String::from_utf8_lossy(&answer)
+    );
+}

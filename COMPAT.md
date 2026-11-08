@@ -101,6 +101,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **Duplicate detection** checks the message a client sends. Copies a divert makes are not checked against the forwarding address's cache.
 - **A prepared XA branch's duplicate IDs** keep their own journal record IDs after recovery. Artemis files them under the transaction's ID.
 - **A prepared XA branch's record deletes** on the relational store wait in `DB_BROKER_DATA` as rows of type 201, where Artemis deletes at the prepare and cannot undo it at a rollback. Artemis warns of such a row and finishes the transaction without that delete; the next Saranga start removes the row.
+- **An XA commit of the wrong kind** (one phase for a prepared branch, two phase for one not prepared) is refused and leaves the branch as it was, to be committed or rolled back properly and recovered. Artemis takes the branch out of its resource manager before it checks, so the branch is gone until a restart.
 - **Large-message files** are deleted once nothing holds the message any more, which is when Artemis's reference count releases it. When the broker stops, the files of messages still in memory are kept, as Artemis keeps them.
 - **Divert transformers** are Rust plugins, not Java classes. The embedding application registers a `Transformer` under the class name that `broker.xml` gives. A divert whose transformer is not registered is not deployed, and a warning is logged.
 

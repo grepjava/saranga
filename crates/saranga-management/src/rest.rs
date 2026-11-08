@@ -123,6 +123,7 @@ fn login(
         connection,
         subject: authenticated.subject,
         management: false,
+        credential: Default::default(),
     };
     store
         .check(

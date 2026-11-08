@@ -553,8 +553,21 @@ pub(crate) async fn detect(
     // An HTTP request: a WebSocket upgrade, inside which the protocol is
     // detected again (`switchToHttp`, `WebSocketServerHandler`).
     if saranga_transport::websocket::is_http(&header) {
-        stream = upgrade(stream, header, &acceptor, &enabled).await?;
-        header = read_header(&mut stream, None).await?;
+        // The request and the header inside the WebSocket each have the
+        // same time again, so a client that sends part of either does not
+        // stay.
+        let upgraded = upgrade(stream, header, &acceptor, &enabled);
+        stream = match acceptor.handshake_timeout {
+            Some(t) => match tokio::time::timeout(t, upgraded).await {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::debug!(?peer, "HTTP upgrade not done within the handshake timeout");
+                    None
+                }
+            },
+            None => upgraded.await,
+        }?;
+        header = read_header(&mut stream, acceptor.handshake_timeout).await?;
     }
     let manager = enabled
         .iter()

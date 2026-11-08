@@ -513,6 +513,7 @@ fn may_see_notifications(state: &ApiState, u: &User) -> bool {
         }),
         subject: u.caller.subject.clone(),
         management: true,
+        credential: Default::default(),
     };
     store.has_permission(
         &broker.management().config().notification_address,

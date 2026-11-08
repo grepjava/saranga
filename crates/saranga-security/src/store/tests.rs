@@ -93,6 +93,7 @@ fn auth(user: &str) -> SecurityAuth {
         }),
         subject: None,
         management: false,
+        credential: Default::default(),
     }
 }
 
@@ -226,6 +227,7 @@ fn caller_falls_back_to_the_subject() {
         connection: Arc::default(),
         subject: Some(Arc::new(subject)),
         management: false,
+        credential: Default::default(),
     };
     let e = store.check("x", None, CheckType::Send, &a).unwrap_err();
     assert!(e.0.starts_with("AMQ229032: User: guest does"), "{e}");
@@ -401,4 +403,62 @@ fn a_cached_grant_holds_only_for_its_sasl_identity() {
     assert!(store.has_permission("secret", None, CheckType::Send, &sasl("a")));
     assert!(store.has_permission("secret", None, CheckType::Send, &sasl("b")));
     assert_eq!(store.authorization_cache_size(), 2);
+}
+
+/// A token login: any user name, the token decides the roles.
+struct Tokens;
+
+impl SecurityManager for Tokens {
+    fn authenticate(
+        &self,
+        _: Option<&str>,
+        password: Option<&str>,
+        _: &ConnectionInfo,
+    ) -> Result<Option<Subject>, NoCache> {
+        let role = match password {
+            Some("admin-token") => "a",
+            Some("viewer-token") => "viewer",
+            _ => return Ok(None),
+        };
+        let mut s = Subject::default();
+        s.add(Principal::User("from-token".into()));
+        s.add(Principal::Role(role.into()));
+        Ok(Some(s))
+    }
+
+    fn authorize(&self, subject: &Subject, roles: &[Role], check: CheckType, _: &str) -> bool {
+        authorize_roles(subject, roles, check)
+    }
+}
+
+/// A grant is cached for the credentials it was made for, not the user name
+/// a client gives: two tokens under one name keep their own roles.
+#[test]
+fn a_cached_grant_holds_only_for_its_credentials() {
+    let mut config = SecurityStoreConfig::from_broker(&BrokerConfig::default());
+    config.enabled = true;
+    let mut repo = HierarchicalRepository::new(Default::default());
+    repo.add_match(
+        "#",
+        SecuritySetting {
+            roles: vec![Role::new("a", [CheckType::Send])],
+        },
+    )
+    .unwrap();
+    let store = SecurityStore::new(config, repo, Arc::new(Tokens));
+    let auth = |token: &str| SecurityAuth {
+        username: Some("same-name".into()),
+        password: Some(token.into()),
+        ..Default::default()
+    };
+    let (admin, viewer) = (auth("admin-token"), auth("viewer-token"));
+    assert!(store.has_permission("q", None, CheckType::Send, &admin));
+    assert!(
+        !store.has_permission("q", None, CheckType::Send, &viewer),
+        "the viewer used the admin's cached grant"
+    );
+    assert!(
+        store.has_permission("q", None, CheckType::Send, &admin),
+        "still cached"
+    );
 }

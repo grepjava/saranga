@@ -407,6 +407,7 @@ async fn security_violations_are_notified() {
         connection: Arc::new(info),
         subject: None,
         management: false,
+        credential: Default::default(),
     };
     assert!(
         store
