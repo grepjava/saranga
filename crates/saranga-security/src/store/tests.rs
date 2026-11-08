@@ -335,8 +335,8 @@ fn in_realm(realm: &str) -> SecurityAuth {
     }
 }
 
-/// A login module can bind a login to the client certificate (OIDC's
-/// `x5t#S256`), so a cached login holds only for the same certificate, not
+/// A login module can bind a login to the client certificate,
+/// so a cached login holds only for the same certificate, not
 /// for another one with the same subject.
 #[test]
 fn a_cached_login_holds_only_for_its_certificate() {

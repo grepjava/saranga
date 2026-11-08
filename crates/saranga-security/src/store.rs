@@ -638,7 +638,7 @@ fn authentication_cache_key(
         md.update(format!("{principals:?}").as_bytes());
     }
     // The certificate itself, not only its subject: a login module may bind
-    // the login to the certificate (OIDC's `x5t#S256`), and another one with
+    // the login to the certificate, and another one with
     // the same subject must not reuse it.
     md.update([0]);
     if let Some(cert) = connection.certificates.as_deref().and_then(|c| c.first()) {
