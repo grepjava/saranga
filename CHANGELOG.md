@@ -22,6 +22,8 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **Duplicate detection holds in three more cases.** One transaction sending the same duplicate ID twice is now rolled back, where both messages were delivered. A refused send no longer pushes the oldest ID out of a full cache, so that ID is still a duplicate. And an ID held twice in the cache stays a duplicate until its newer copy leaves it, where it was forgotten when the older one did.
 - **A move or copy whose journal write fails** reports the error and leaves the message where it was. Before, the copy was seen and the original acknowledged, and management reported success.
 - **JSON and OpenWire nested too deeply** are refused, where they overflowed the stack and ended the broker: an OIDC token, or an OpenWire frame, before its connection logs in.
+- **A duplicate ID is a duplicate from the moment its transaction commits**, not only once the commit's journal record is written. A pipelined retry in that window was delivered a second time.
+- **An OpenWire body allocates what it holds, not what it declares.** A stream byte array longer than the rest of the frame is refused rather than padded out to its declared length, and a compressed body is inflated only up to 100 MiB and no further than the length it declares, so a small frame can no longer make the broker allocate gigabytes.
 - **A cached permission holds only for the credentials it was granted to**, not for every login under the same user name.
 - **An XA commit of the wrong kind** leaves the branch to be committed or rolled back properly. Before, it was lost until a restart.
 - **`handshake-timeout` covers a WebSocket upgrade**: the HTTP request and the protocol header inside the WebSocket.

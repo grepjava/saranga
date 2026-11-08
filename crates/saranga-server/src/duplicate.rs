@@ -241,8 +241,31 @@ impl std::fmt::Debug for PendingId {
 }
 
 impl PendingId {
+    /// Holds the ID as a duplicate while its committed transaction waits
+    /// for its record to be written, until the guard is dropped: after
+    /// [`Self::apply`] has given it its slot, or when the write failed.
+    pub fn reserve(&self) -> Reservation {
+        lock(&self.cache).reserve(&self.id);
+        Reservation {
+            cache: self.cache.clone(),
+            id: self.id.clone(),
+        }
+    }
+
     pub fn apply(self) {
         lock(&self.cache).add_in_memory(self.id, self.record);
+    }
+}
+
+/// An ID [`PendingId::reserve`] holds, given back when this is dropped.
+pub struct Reservation {
+    cache: CacheRef,
+    id: Vec<u8>,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        lock(&self.cache).release(&self.id);
     }
 }
 

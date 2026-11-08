@@ -235,3 +235,41 @@ async fn one_transaction_cannot_send_an_id_twice() {
         broker.stop().unwrap();
     }
 }
+
+/// A send of an ID a commit took, before that commit's record is written,
+/// is already a duplicate.
+#[tokio::test]
+async fn an_id_is_a_duplicate_from_its_commit_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(dir.path(), true).await;
+    create_full_queue(&broker).await;
+    let mut tx = session_with(&broker, false);
+    let mut retry = session(&broker);
+    let mut message = CoreMessage {
+        address: Some(SimpleString::from("full")),
+        durable: true,
+        body: vec![7u8; 100].into(),
+        ..Default::default()
+    };
+    message.properties.insert(
+        SimpleString::from("_AMQ_DUPL_ID"),
+        PropertyValue::String(SimpleString::from("c1")),
+    );
+    tx.send(message, None).await.unwrap();
+    tx.commit().unwrap();
+    // Not waited for: the commit's record may not be written yet.
+    let pending = tx.take_completion();
+    send(&mut retry, Some("c1")).await.unwrap();
+    pending.wait().await.unwrap();
+    assert_eq!(
+        count(&broker).await,
+        Json::Long(1),
+        "the retry was delivered too"
+    );
+    // Once applied, the ID is in the cache.
+    send(&mut retry, Some("c1")).await.unwrap();
+    assert_eq!(count(&broker).await, Json::Long(1));
+    tx.close(false).await;
+    retry.close(false).await;
+    broker.stop().unwrap();
+}

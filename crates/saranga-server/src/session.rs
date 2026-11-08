@@ -1099,9 +1099,14 @@ impl ServerSession {
             self.ops.push(p);
         }
         if defer && self.broker.storage().is_some() {
+            // A send of one of the commit's duplicate IDs before its record
+            // is written is a duplicate already; if the write fails, the
+            // IDs are given back with the dropped update.
+            let reserved: Vec<_> = outcome.duplicates.iter().map(|d| d.reserve()).collect();
             let replicated = self.replicated.clone();
             self.actions.push(Box::new(move || {
                 let waits = outcome.apply();
+                drop(reserved);
                 if !waits.is_empty() {
                     lock_replicated(&replicated).extend(waits);
                 }

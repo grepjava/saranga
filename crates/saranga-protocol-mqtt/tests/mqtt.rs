@@ -346,3 +346,29 @@ async fn a_failed_replacement_keeps_the_retained_message() {
     assert_eq!(payload, b"v1");
     broker.stop().unwrap();
 }
+
+/// A QoS 2 PUBLISH sent again with its packet ID before the first is
+/// written (pipelined, both in one write) is the same message: the
+/// subscriber gets it once, and the publisher a PUBREC for each.
+#[tokio::test]
+async fn a_qos2_publish_sent_twice_at_once_is_delivered_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_broker, address, _task) = start(Some(dir.path())).await;
+    let (mut sub, _) = Client::open(address, "sub2", true).await;
+    sub.subscribe("twice/t", 1).await;
+    let (mut publisher, _) = Client::open(address, "pub2", true).await;
+    let mut body = string("twice/t");
+    body.extend(5u16.to_be_bytes());
+    body.extend_from_slice(b"once");
+    let one = packet(0x34, &body);
+    publisher.send(&[one.clone(), one].concat()).await;
+    for _ in 0..2 {
+        assert_eq!(publisher.packet().await.unwrap()[0], 0x50, "a PUBREC");
+    }
+    let (_, id, payload) = parse_publish(&sub.packet().await.unwrap());
+    assert_eq!(payload, b"once");
+    sub.send(&[0x40, 2, (id >> 8) as u8, id as u8]).await;
+    // No second copy.
+    let again = tokio::time::timeout(Duration::from_millis(500), sub.0.read_u8()).await;
+    assert!(again.is_err(), "delivered twice");
+}

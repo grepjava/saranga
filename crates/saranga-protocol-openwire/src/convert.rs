@@ -86,12 +86,29 @@ pub fn to_core_type(data_type: u8) -> R<u8> {
     })
 }
 
-/// `InflaterInputStream` over everything.
+/// The most a compressed body may inflate to: 100 MiB, ActiveMQ's default
+/// `maxFrameSize`. A few kilobytes of deflated zeros would otherwise take
+/// the broker's memory.
+pub const MAX_INFLATED_BODY: usize = 100 * 1024 * 1024;
+
+/// `InflaterInputStream` over everything, up to [`MAX_INFLATED_BODY`].
 fn inflate(data: &[u8]) -> R<Vec<u8>> {
+    inflate_at_most(data, MAX_INFLATED_BODY, true)
+}
+
+/// Inflates `data` to at most `limit` bytes. Past it, the rest is an error
+/// when `refuse`, or left out (`Inflater.inflate` into a buffer that size).
+fn inflate_at_most(data: &[u8], limit: usize, refuse: bool) -> R<Vec<u8>> {
     let mut out = Vec::new();
     flate2::read::ZlibDecoder::new(data)
+        .take(limit as u64 + u64::from(refuse))
         .read_to_end(&mut out)
         .map_err(|e| err(e.to_string()))?;
+    if out.len() > limit {
+        return Err(err(format!(
+            "compressed body inflates to more than {MAX_INFLATED_BODY} bytes"
+        )));
+    }
     Ok(out)
 }
 
@@ -475,12 +492,15 @@ fn inflate_bytes_message(contents: &[u8]) -> R<Vec<u8>> {
     if length < 0 {
         return Err(err("java.lang.NegativeArraySizeException"));
     }
-    let mut d = flate2::Decompress::new(true);
-    let mut out = vec![0u8; length as usize];
-    d.decompress(&contents[4..], &mut out, flate2::FlushDecompress::None)
-        .map_err(|e| err(e.to_string()))?;
-    out.truncate(d.total_out() as usize);
-    Ok(out)
+    let length = length as usize;
+    if length > MAX_INFLATED_BODY {
+        return Err(err(format!(
+            "compressed body declares {length} bytes, more than {MAX_INFLATED_BODY}"
+        )));
+    }
+    // What the body holds, up to the length it declares; memory grows with
+    // what is inflated, not with the length declared.
+    inflate_at_most(&contents[4..], length, false)
 }
 
 /// `writeStreamType`: OpenWire stream items as Core's.
@@ -502,11 +522,10 @@ fn write_stream(data: &[u8], body: &mut Writer) -> R<()> {
                 if len < 0 {
                     return Err(err("java.lang.NegativeArraySizeException"));
                 }
-                // read() fills what is there; the rest stays zero.
-                let n = (len as usize).min(data.len() - input.position());
-                let mut bytes = input.take(n)?.to_vec();
-                bytes.resize(len as usize, 0);
-                body.u8(dc::BYTES).i32(len).bytes(&bytes);
+                // An array longer than what is left of the body is refused:
+                // it would be padded with zeros to whatever it declares.
+                let bytes = input.take(len as usize).map_err(eof)?;
+                body.u8(dc::BYTES).i32(len).bytes(bytes);
             }
             p::CHAR_TYPE => {
                 let v = input.i16().map_err(eof)?;
@@ -1141,5 +1160,52 @@ mod tests {
         assert_eq!(message_id_string(&id), "ID:host-1-2-3:4:5:6");
         assert_eq!(java_split("a,b,,"), vec!["a", "b"]);
         assert_eq!(java_split(",a"), vec!["", "a"]);
+    }
+
+    fn deflate(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// A stream byte array longer than the body is refused, not padded out
+    /// to the length it declares.
+    #[test]
+    fn a_stream_byte_array_longer_than_the_body_is_refused() {
+        let mut data = vec![p::BYTE_ARRAY_TYPE];
+        data.extend_from_slice(&16_000_000i32.to_be_bytes());
+        let mut body = Writer::new();
+        assert!(write_stream(&data, &mut body).is_err());
+        // One that fits is copied.
+        let mut data = vec![p::BYTE_ARRAY_TYPE];
+        data.extend_from_slice(&2i32.to_be_bytes());
+        data.extend_from_slice(&[7, 8]);
+        let mut body = Writer::new();
+        write_stream(&data, &mut body).unwrap();
+    }
+
+    /// A compressed bytes body declaring more than the limit is refused;
+    /// one declaring more than it holds gives what it holds.
+    #[test]
+    fn a_compressed_bytes_body_allocates_what_it_inflates_to() {
+        let mut contents = (i32::MAX).to_be_bytes().to_vec();
+        contents.extend(deflate(b"abc"));
+        assert!(inflate_bytes_message(&contents).is_err());
+        let mut contents = 1_000_000i32.to_be_bytes().to_vec();
+        contents.extend(deflate(b"abc"));
+        assert_eq!(inflate_bytes_message(&contents).unwrap(), b"abc");
+        // Inflating past its declared length stops there, as Java's does.
+        let mut contents = 2i32.to_be_bytes().to_vec();
+        contents.extend(deflate(b"abc"));
+        assert_eq!(inflate_bytes_message(&contents).unwrap(), b"ab");
+    }
+
+    /// Inflating past the limit is refused rather than read to the end.
+    #[test]
+    fn inflating_past_the_limit_is_refused() {
+        let zeros = deflate(&[0u8; 4096]);
+        assert!(inflate_at_most(&zeros, 1000, true).is_err());
+        assert_eq!(inflate_at_most(&zeros, 4096, true).unwrap().len(), 4096);
     }
 }
