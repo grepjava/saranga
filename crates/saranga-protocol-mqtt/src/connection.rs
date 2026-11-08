@@ -1226,7 +1226,8 @@ impl Core {
 
     fn store_durable_state(&mut self) -> Result<(), BrokerError> {
         let state = self.state.clone();
-        let s = lock(&state);
+        let mut s = lock(&state);
+        s.stored = true;
         self.manager.store_durable_state(&mut self.session, &s)
     }
 
@@ -1286,7 +1287,15 @@ impl Core {
 
     /// `MQTTSession.clean`: every subscription goes, then the state.
     async fn clean(&mut self, enforce_security: bool) {
-        let topics: Vec<String> = lock(&self.state).subscriptions.keys().cloned().collect();
+        let (topics, stored) = {
+            let mut s = lock(&self.state);
+            let topics: Vec<String> = s.subscriptions.keys().cloned().collect();
+            (topics, std::mem::take(&mut s.stored))
+        };
+        if topics.is_empty() && stored {
+            // A session stored without subscriptions has a record too.
+            self.manager.remove_durable_state(&self.client_id).await;
+        }
         self.remove_subscriptions(&topics, enforce_security).await;
         let broker = self.broker();
         self.manager.correlations.clear(&broker, &self.client_id);
@@ -1465,14 +1474,18 @@ impl Core {
         self.stop_subscriptions().await;
         self.session.set_started(false).await;
         self.session.close(failure).await;
-        let (expiry, is_will) = {
+        let (expiry, is_will, will_delay) = {
             let mut s = lock(&self.state);
             s.attached = false;
             s.disconnected_time = now_millis();
             s.clear_topic_aliases();
             s.send_quota = 0;
             s.clear_core_delivery_info();
-            (s.client_session_expiry_interval, s.is_will)
+            (
+                s.client_session_expiry_interval,
+                s.is_will,
+                s.will.delay_interval,
+            )
         };
         let mut removed = false;
         if self.version == Version::V5 {
@@ -1484,6 +1497,10 @@ impl Core {
                 self.clean(false).await;
                 self.manager.remove_session_state(&self.client_id);
                 removed = true;
+            } else if is_will && failure && will_delay <= 0 {
+                // No Will Delay Interval (5.0 3.1.3.2.2): the will goes now, not when the
+                // session ends; the scan sends only delayed ones.
+                self.send_will_message().await;
             }
         } else {
             if is_will && failure {
@@ -2334,6 +2351,14 @@ impl Conn {
             core.clean(true).await;
             core.clean = true;
         }
+        {
+            // Each CONNECT sets the will afresh: a resumed session keeps
+            // none of its last connection's.
+            let mut s = lock(&state);
+            s.is_will = false;
+            s.will = crate::state::Will::default();
+            s.will_status = WillStatus::NotSent;
+        }
         if let Some(will) = &connect.will {
             let mut s = lock(&state);
             s.is_will = true;
@@ -2453,11 +2478,10 @@ pub async fn expire_detached(manager: &StateManager, state: &StateRef) {
             s.client_id().to_owned(),
         )
     };
-    let _ = manager;
     let Some(mut core) = core else {
-        tracing::error!(
-            "AMQ834008: Failed to remove session state for client with ID: {client_id}"
-        );
+        // Restored from the session store and not connected since: no
+        // connection to clean up through, so the broker does it.
+        clean_restored(manager, state, &client_id).await;
         return;
     };
     if send_will {
@@ -2465,4 +2489,41 @@ pub async fn expire_detached(manager: &StateManager, state: &StateRef) {
     }
     core.clean(false).await;
     state::wait(core.session.take_completion()).await;
+}
+
+/// `MQTTSession.clean` for a session with no connection: its subscription
+/// queues, packet ID correlations and stored record go.
+async fn clean_restored(manager: &StateManager, state: &StateRef, client_id: &str) {
+    let Some(broker) = manager.broker() else {
+        return;
+    };
+    let po = broker.post_office();
+    let wildcard = *po.wildcard();
+    let topics: Vec<String> = lock(state).subscriptions.keys().cloned().collect();
+    for topic in &topics {
+        if util::is_shared(topic) && !topic[util::SHARED_SUBSCRIPTION_PREFIX.len()..].contains('/')
+        {
+            continue;
+        }
+        let name = util::core_queue(topic, client_id, &wildcard);
+        let Some(queue) = po.queue(&name) else {
+            continue;
+        };
+        if queue.config().configuration_managed {
+            queue.delete_matching(None).await;
+        } else if !util::is_shared(topic) || queue.consumer_count() == 0 {
+            let address = queue.config().address.clone();
+            match po.delete_queue_reporting(&name, true).await {
+                Ok(durable) => {
+                    if po.address_auto_deletable(&address, durable) {
+                        po.remove_address(&address);
+                    }
+                }
+                Err(e) => tracing::error!("AMQ834000: Error removing subscription. {}", e.message),
+            }
+        }
+    }
+    manager.correlations.clear(&broker, client_id);
+    lock(state).clear(&broker);
+    manager.remove_durable_state(client_id).await;
 }

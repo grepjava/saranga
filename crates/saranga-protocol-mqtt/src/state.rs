@@ -211,6 +211,8 @@ pub struct SessionState {
     server_topic_aliases: HashMap<String, i32>,
     core_delivery_infos: HashMap<i32, CoreDeliveryInfo>,
     pub send_quota: i32,
+    /// The session store may hold a record of this session.
+    pub stored: bool,
     /// The session of the client's last connection (`getSession`), kept
     /// once it disconnects to send a delayed will and to clean up when the
     /// session expires.
@@ -238,6 +240,7 @@ impl SessionState {
             server_topic_aliases: HashMap::new(),
             core_delivery_infos: HashMap::new(),
             send_quota: 0,
+            stored: false,
             session: None,
         }
     }
@@ -286,6 +289,7 @@ impl SessionState {
             state.client_session_expiry_interval = r.i32().map_err(e)?;
             state.disconnected_time = now_millis();
         }
+        state.stored = true;
         Ok(state)
     }
 

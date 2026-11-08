@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use saranga_config as cfg;
-use saranga_protocol_mqtt::MqttProtocol;
+use saranga_protocol_mqtt::{MqttConfig, MqttProtocol};
 use saranga_server::postoffice::SelectorFilters;
 use saranga_server::{Acceptor, Broker, BrokerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,6 +15,18 @@ use tokio::net::{TcpListener, TcpStream};
 
 async fn start(
     instance: Option<&Path>,
+) -> (
+    Arc<Broker>,
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<()>,
+) {
+    start_scanning(instance, 5000).await
+}
+
+/// [`start`] with sessions scanned every `scan_ms`.
+async fn start_scanning(
+    instance: Option<&Path>,
+    scan_ms: i64,
 ) -> (
     Arc<Broker>,
     std::net::SocketAddr,
@@ -34,7 +46,10 @@ async fn start(
         }
         None => BrokerConfig::new(Arc::new(SelectorFilters)),
     };
-    config.protocols = vec![Arc::new(MqttProtocol::default())];
+    config.protocols = vec![Arc::new(MqttProtocol::new(MqttConfig {
+        session_scan_interval: scan_ms,
+        ..MqttConfig::default()
+    }))];
     let broker = Broker::start(config).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -88,9 +103,55 @@ fn connect(client_id: &str, clean: bool) -> Vec<u8> {
     packet(0x10, &body)
 }
 
+/// A 3.1.1 CONNECT with a QoS 0 will.
+fn connect_will(client_id: &str, clean: bool, topic: &str, message: &[u8]) -> Vec<u8> {
+    let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 4];
+    body.push(if clean { 0x06 } else { 0x04 });
+    body.extend([0, 60]);
+    body.extend(string(client_id));
+    body.extend(string(topic));
+    body.extend((message.len() as u16).to_be_bytes());
+    body.extend_from_slice(message);
+    packet(0x10, &body)
+}
+
+/// An MQTT 5 CONNECT with a session expiry interval and, maybe, a QoS 0
+/// will without a delay.
+fn connect5(client_id: &str, clean: bool, expiry: u32, will: Option<(&str, &[u8])>) -> Vec<u8> {
+    let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 5];
+    body.push(u8::from(clean) << 1 | if will.is_some() { 0x04 } else { 0 });
+    body.extend([0, 60]);
+    body.extend([5, 0x11]);
+    body.extend(expiry.to_be_bytes());
+    body.extend(string(client_id));
+    if let Some((topic, message)) = will {
+        body.push(0);
+        body.extend(string(topic));
+        body.extend((message.len() as u16).to_be_bytes());
+        body.extend_from_slice(message);
+    }
+    packet(0x10, &body)
+}
+
 struct Client(TcpStream);
 
 impl Client {
+    /// Connects with `connect`, a CONNECT packet; the CONNACK comes back.
+    async fn open_with(address: std::net::SocketAddr, connect: &[u8]) -> (Self, Vec<u8>) {
+        let mut c = Self(TcpStream::connect(address).await.unwrap());
+        c.send(connect).await;
+        let connack = c.packet().await.expect("CONNACK");
+        assert_eq!(connack[0], 0x20, "a CONNACK");
+        (c, connack)
+    }
+
+    /// Nothing comes within `ms`.
+    async fn silent_for(&mut self, ms: u64) -> bool {
+        tokio::time::timeout(Duration::from_millis(ms), self.0.read_u8())
+            .await
+            .is_err()
+    }
+
     async fn open(address: std::net::SocketAddr, client_id: &str, clean: bool) -> (Self, Vec<u8>) {
         let mut c = Self(TcpStream::connect(address).await.unwrap());
         c.send(&connect(client_id, clean)).await;
@@ -371,4 +432,81 @@ async fn a_qos2_publish_sent_twice_at_once_is_delivered_once() {
     // No second copy.
     let again = tokio::time::timeout(Duration::from_millis(500), sub.0.read_u8()).await;
     assert!(again.is_err(), "delivered twice");
+}
+
+/// An MQTT 5 client that fails with a will and no Will Delay Interval has
+/// its will published at once, though its session outlives the
+/// connection (5.0 section 3.1.3.2.2): not when the session expires.
+#[tokio::test]
+async fn a_will_without_a_delay_goes_at_once_though_the_session_stays() {
+    let (_broker, address, _task) = start_scanning(None, 100).await;
+    let (mut watch, _) = Client::open(address, "watch5", true).await;
+    watch.subscribe("will5/t", 0).await;
+    let (dying, connack) = Client::open_with(
+        address,
+        &connect5("dying5", true, 60, Some(("will5/t", b"gone"))),
+    )
+    .await;
+    assert_eq!(connack[3], 0, "accepted");
+    drop(dying);
+    let will = watch.packet().await.expect("the will, at once");
+    assert_eq!(will[0], 0x30, "a QoS 0 PUBLISH");
+    assert!(will.ends_with(b"will5/tgone"), "the will: {will:?}");
+}
+
+/// A session resumed by a CONNECT without a will has none: the will of
+/// the connection before it, which disconnected normally, is not sent
+/// when the new connection fails.
+#[tokio::test]
+async fn a_resumed_session_keeps_no_will_from_its_last_connection() {
+    let (_broker, address, _task) = start(None).await;
+    let (mut watch, _) = Client::open(address, "watch3", true).await;
+    watch.subscribe("will3/t", 0).await;
+    let (mut first, _) =
+        Client::open_with(address, &connect_will("resumed", false, "will3/t", b"old")).await;
+    first.send(&[0xE0, 0]).await;
+    assert_eq!(first.packet().await, None);
+    let (second, connack) = Client::open(address, "resumed", false).await;
+    assert_eq!(connack, vec![0x20, 2, 1, 0], "session present");
+    drop(second);
+    assert!(watch.silent_for(1000).await, "the old will was sent");
+}
+
+/// A session restored from the store that expires before its client comes
+/// back is gone for good: after a second restart it is not there.
+#[tokio::test]
+async fn a_restored_session_that_expires_stays_gone_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, address, task) = start_scanning(Some(dir.path()), 100).await;
+    let (mut c, _) = Client::open_with(address, &connect5("expiring", true, 1, None)).await;
+    let mut body = vec![0, 1, 0];
+    body.extend(string("expiring/t"));
+    body.push(1);
+    c.send(&packet(0x82, &body)).await;
+    assert_eq!(c.packet().await.unwrap()[0], 0x90, "a SUBACK");
+    c.send(&[0xE0, 0]).await;
+    assert_eq!(c.packet().await, None);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    broker.stop().unwrap();
+    task.abort();
+    drop(broker);
+
+    // Restored, never connected to, and expired by the scan.
+    let (broker, _, task) = start_scanning(Some(dir.path()), 100).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    broker.stop().unwrap();
+    task.abort();
+    drop(broker);
+
+    let (broker, address, _task) = start_scanning(Some(dir.path()), 100).await;
+    let (_c, connack) = Client::open_with(address, &connect5("expiring", false, 60, None)).await;
+    assert_eq!(connack[2], 0, "no session present");
+    let queues: Vec<String> = broker
+        .post_office()
+        .queues()
+        .into_iter()
+        .map(|q| q.name().to_string())
+        .filter(|q| q.contains("expiring"))
+        .collect();
+    assert!(queues.is_empty(), "subscription queues left: {queues:?}");
 }

@@ -27,6 +27,7 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **A cached permission holds only for the credentials it was granted to**, not for every login under the same user name.
 - **An XA commit of the wrong kind** leaves the branch to be committed or rolled back properly. Before, it was lost until a restart.
 - **`handshake-timeout` covers a WebSocket upgrade**: the HTTP request and the protocol header inside the WebSocket.
+- **MQTT wills and expired sessions.** An MQTT 5 will without a delay is published as soon as its client fails, not when its session expires. A session resumed without a will no longer publishes the will of the connection before. A session restored at start that expires before its client returns stays gone after the next restart.
 
 ## 1.2.0 (2026-11-02)
 
