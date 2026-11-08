@@ -964,6 +964,13 @@ impl ServerSession {
         self.auto_commit_acks
     }
 
+    /// Runs `f` after the queue updates lined up so far, as they are made
+    /// once their journal writes are done; dropped without running if a
+    /// write fails.
+    pub fn after_completion(&mut self, f: Box<dyn FnOnce() + Send>) {
+        self.actions.push(f);
+    }
+
     /// The journal writes and queue updates the requests so far lined up;
     /// the protocol answers its client once they are done.
     pub fn take_completion(&mut self) -> Completion {

@@ -11,6 +11,13 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **Shared-store HA** on the store: the backup opens the tables when it takes over. Replication is refused with a reason, as there are no journals to copy.
 - **`data print` and `data exp`** read the tables, and `data exp` writes what Artemis's exporter writes.
 
+### Fixes
+
+- **A cached login is for one certificate.** A login cached for one client certificate also held for another with the same subject, getting past `OIDCLoginModule`'s check that a token belongs to the certificate.
+- **One retained message per MQTT topic.** Clients publishing retained messages to one topic at the same time could leave it several.
+- **STOMP frames with `content-length`** wait for their NUL. Before, how a frame was read depended on how its bytes arrived.
+- **The relational store** writes a queue or address changed twice at once. PostgreSQL refused the batch, and the store failed after its retries.
+
 ## 1.2.0 (2026-11-02)
 
 Faster under load, connection routers, and the rest of Artemis's login modules and SASL mechanisms.

@@ -494,6 +494,10 @@ struct Changes {
     deleted_messages: Vec<i64>,
     broker: Records,
     config: Records,
+    /// Where each address and queue ID is in its columns: the last write
+    /// of one wins, as one statement cannot change a row twice.
+    address_at: HashMap<i64, usize>,
+    queue_at: HashMap<i64, usize>,
     address_ids: Vec<i64>,
     address_names: Vec<String>,
     address_multicast: Vec<String>,
@@ -610,12 +614,20 @@ impl Changes {
                     name,
                     multicast,
                     anycast,
-                } => {
-                    c.address_ids.push(id);
-                    c.address_names.push(name);
-                    c.address_multicast.push(flag(multicast));
-                    c.address_anycast.push(flag(anycast));
-                }
+                } => match c.address_at.get(&id) {
+                    Some(&at) => {
+                        c.address_names[at] = name;
+                        c.address_multicast[at] = flag(multicast);
+                        c.address_anycast[at] = flag(anycast);
+                    }
+                    None => {
+                        c.address_at.insert(id, c.address_ids.len());
+                        c.address_ids.push(id);
+                        c.address_names.push(name);
+                        c.address_multicast.push(flag(multicast));
+                        c.address_anycast.push(flag(anycast));
+                    }
+                },
                 Op::Queue {
                     id,
                     address,
@@ -624,15 +636,26 @@ impl Changes {
                     anycast,
                     filter,
                     config,
-                } => {
-                    c.queue_ids.push(id);
-                    c.queue_addresses.push(address);
-                    c.queue_names.push(name);
-                    c.queue_multicast.push(flag(multicast));
-                    c.queue_anycast.push(flag(anycast));
-                    c.queue_filters.push(filter);
-                    c.queue_configs.push(config);
-                }
+                } => match c.queue_at.get(&id) {
+                    Some(&at) => {
+                        c.queue_addresses[at] = address;
+                        c.queue_names[at] = name;
+                        c.queue_multicast[at] = flag(multicast);
+                        c.queue_anycast[at] = flag(anycast);
+                        c.queue_filters[at] = filter;
+                        c.queue_configs[at] = config;
+                    }
+                    None => {
+                        c.queue_at.insert(id, c.queue_ids.len());
+                        c.queue_ids.push(id);
+                        c.queue_addresses.push(address);
+                        c.queue_names.push(name);
+                        c.queue_multicast.push(flag(multicast));
+                        c.queue_anycast.push(flag(anycast));
+                        c.queue_filters.push(filter);
+                        c.queue_configs.push(config);
+                    }
+                },
                 Op::DeleteBinding { id } => c.deleted_bindings.push(id),
                 Op::Prepare { tx, xid } => {
                     c.prepared_txs.push(tx);

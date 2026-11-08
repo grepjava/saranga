@@ -279,6 +279,47 @@ async fn a_retained_message_larger_than_a_journal_record_is_kept() {
     broker.stop().unwrap();
 }
 
+/// Clients replacing one topic's retained message at once leave it one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_replacements_leave_one_retained_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, address, _task) = start(Some(dir.path())).await;
+    let queue = "$sys.mqtt.retain.race.t";
+    for round in 0..5u16 {
+        let mut clients = Vec::new();
+        for n in 0..16 {
+            clients.push(Client::open(address, &format!("race-{n}"), true).await.0);
+        }
+        let barrier = Arc::new(tokio::sync::Barrier::new(clients.len()));
+        let publishes: Vec<_> = clients
+            .into_iter()
+            .enumerate()
+            .map(|(n, mut c)| {
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    c.retain("race/t", format!("v{round}-{n}").as_bytes(), 1)
+                        .await;
+                })
+            })
+            .collect();
+        for p in publishes {
+            p.await.unwrap();
+        }
+        let q = broker.post_office().queue(queue).expect("the retain queue");
+        let mut count = 0;
+        for _ in 0..50 {
+            count = q.message_count();
+            if count <= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(count, 1, "round {round}");
+    }
+    broker.stop().unwrap();
+}
+
 /// A retained message whose replacement fails stays: it is removed in
 /// the replacement's transaction, which rolls back.
 #[tokio::test]

@@ -335,6 +335,38 @@ fn in_realm(realm: &str) -> SecurityAuth {
     }
 }
 
+/// A login module can bind a login to the client certificate (OIDC's
+/// `x5t#S256`), so a cached login holds only for the same certificate, not
+/// for another one with the same subject.
+#[test]
+fn a_cached_login_holds_only_for_its_certificate() {
+    let (store, manager) = store(true);
+    let with = |der: u8| ConnectionInfo {
+        certificates: Some(Arc::from(vec![crate::jaas::PeerCertificate {
+            der: vec![der; 8],
+            subject_dn: "CN=client".into(),
+            subject_dn_legacy: "CN=client".into(),
+            san_uris: Vec::new(),
+        }])),
+        ..Default::default()
+    };
+    store
+        .authenticate(Some("u1"), Some("pw"), &with(1))
+        .unwrap();
+    store
+        .authenticate(Some("u1"), Some("pw"), &with(1))
+        .unwrap();
+    assert_eq!(manager.logins.load(Ordering::SeqCst), 1, "same certificate");
+    store
+        .authenticate(Some("u1"), Some("pw"), &with(2))
+        .unwrap();
+    assert_eq!(
+        manager.logins.load(Ordering::SeqCst),
+        2,
+        "same subject, another certificate"
+    );
+}
+
 #[test]
 fn a_cached_login_holds_only_in_its_realm() {
     let store = realm_store(100, 0);

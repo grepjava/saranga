@@ -261,6 +261,19 @@ impl From<BrokerError> for Failure {
 
 type Handled = Result<(), Failure>;
 
+/// The lock a publish holds while it replaces a topic's retained message,
+/// one of a fixed set chosen by the topic, for every MQTT acceptor.
+/// Artemis has none, and there concurrent publishes can leave a topic more
+/// than one retained message.
+fn retain_lock(topic: &str) -> Arc<tokio::sync::Mutex<()>> {
+    use std::hash::{Hash, Hasher};
+    static LOCKS: std::sync::LazyLock<Vec<Arc<tokio::sync::Mutex<()>>>> =
+        std::sync::LazyLock::new(|| (0..64).map(|_| Arc::default()).collect());
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    topic.hash(&mut h);
+    LOCKS[(h.finish() % LOCKS.len() as u64) as usize].clone()
+}
+
 fn is_security(e: &BrokerError) -> bool {
     e.kind == ErrorType::SecurityException
 }
@@ -735,6 +748,13 @@ impl Core {
         }
         let tx =
             ((qos == 2 && !internal) || publish.retain).then(|| self.session.new_transaction());
+        // One topic's retained message is replaced by one publish at a time,
+        // until its replacement is in the queue: two at once would each find
+        // the queue empty and both stay.
+        let retaining = match publish.retain {
+            true => Some(retain_lock(&topic).lock_owned().await),
+            false => None,
+        };
         let result: Result<(), BrokerError> = async {
             let po = broker.post_office();
             let info = po.address_info(&core_address);
@@ -782,10 +802,20 @@ impl Core {
             Ok(())
         }
         .await;
+        if result.is_err()
+            && let Some(tx) = &tx
+        {
+            let _ = self.session.rollback_tx(tx);
+        }
+        // Let go once the queue has the replacement, as the commit's queue
+        // updates are made; a rollback gives back what it took at once.
+        if let Some(guard) = retaining
+            && result.is_ok()
+        {
+            self.session.after_completion(Box::new(move || drop(guard)));
+            self.flush();
+        }
         if let Err(e) = result {
-            if let Some(tx) = &tx {
-                let _ = self.session.rollback_tx(tx);
-            }
             if !is_security(&e) {
                 tracing::error!(
                     "AMQ834006: Failed to publish MQTT message. Client ID: {}. Packet ID: {}. Exception message: {}",

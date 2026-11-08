@@ -897,3 +897,78 @@ fn an_idle_read_connection_closes() {
     assert_eq!(ids_of(&s.read_paged(1, 1).unwrap()), vec![102]);
     assert_eq!(readers(&s), 1);
 }
+
+/// Bindings updated from several threads at once go out in one batch, with
+/// the same queue or address more than once: one statement cannot change a
+/// row twice, so the batch keeps the last of each.
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn a_binding_updated_twice_in_a_batch_is_written_once() {
+    let f = Fixture::new();
+    let (s, _) = f.start();
+    let address = |n: usize| PersistentAddressBindingEncoding {
+        name: "a".into(),
+        routing_types: if n.is_multiple_of(2) {
+            vec![ANYCAST]
+        } else {
+            vec![MULTICAST]
+        },
+        auto_created: true,
+        internal: Some(false),
+    };
+    let queue = |n: usize| PersistentQueueBindingEncoding {
+        name: "q".into(),
+        address: "a".into(),
+        filter_string: Some(format!("n = {n}").as_str().into()),
+        metadata: Some(PersistentQueueBindingEncoding::metadata_for(None)),
+        auto_created: false,
+        consumers: Some((-1, false, ANYCAST)),
+        exclusive: Some(n.is_multiple_of(2)),
+        last_value: None,
+        configuration_managed: None,
+        consumers_before_dispatch: None,
+        delay_before_dispatch: None,
+        last_value_key: None,
+        non_destructive: None,
+        group_rebalance: None,
+        group_buckets: None,
+        auto_delete: None,
+        auto_delete_delay: None,
+        auto_delete_message_count: None,
+        group_first_key: None,
+        ring_size: None,
+        enabled: None,
+        group_rebalance_pause_dispatch: None,
+        internal: None,
+    };
+    s.add_binding(100, ids::ADDRESS_BINDING_RECORD, address(0).encode())
+        .unwrap();
+    s.add_binding(101, ids::QUEUE_BINDING_RECORD, queue(0).encode())
+        .unwrap();
+    std::thread::scope(|scope| {
+        for t in 0..8 {
+            let s = &s;
+            scope.spawn(move || {
+                for i in 0..50 {
+                    let n = t * 50 + i;
+                    s.update_binding(101, ids::QUEUE_BINDING_RECORD, queue(n).encode())
+                        .unwrap();
+                    s.update_binding(100, ids::ADDRESS_BINDING_RECORD, address(n).encode())
+                        .unwrap();
+                }
+            });
+        }
+    });
+    s.update_binding(101, ids::QUEUE_BINDING_RECORD, queue(7).encode())
+        .unwrap();
+    s.stop().unwrap();
+    drop(s);
+
+    let s = f.open();
+    let records = s.load_bindings().unwrap();
+    let of = |t: u8| records.iter().find(|r| r.user_record_type == t).unwrap();
+    assert_eq!(
+        PersistentQueueBindingEncoding::decode(&of(ids::QUEUE_BINDING_RECORD).data).unwrap(),
+        queue(7)
+    );
+}

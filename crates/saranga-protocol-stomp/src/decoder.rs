@@ -415,16 +415,15 @@ fn parse_body(rules: Rules, buf: &[u8], pos: &mut usize, length: Option<usize>) 
                 return None;
             }
             let content = buf[*pos..end].to_vec();
-            *pos = end;
             match rules {
-                Rules::V10 => *pos += 1,
+                Rules::V10 => *pos = end + 1,
+                // The frame ends at the NUL, which may not be here yet:
+                // Artemis takes the frame anyway and reads the rest of it
+                // as the next one, so what it does depends on how the bytes
+                // arrive.
                 Rules::V11 | Rules::V12 => {
-                    while *pos < buf.len() {
-                        *pos += 1;
-                        if buf[*pos - 1] == 0 {
-                            break;
-                        }
-                    }
+                    let nul = buf[end..].iter().position(|&b| b == 0)?;
+                    *pos = end + nul + 1;
                 }
             }
             Some(content)
@@ -552,6 +551,24 @@ mod tests {
         let (f, n) = one(Rules::V11, b"SEND\ncontent-length:2\n\nabcd\0X");
         assert_eq!(f.body, b"ab");
         assert_eq!(n, 28);
+    }
+
+    /// The frame ends at its NUL however the bytes arrive: until it is
+    /// there, there is no frame.
+    #[test]
+    fn content_length_waits_for_the_nul() {
+        let whole = b"SEND\ncontent-length:2\n\nabcd\0SEND\n\n\0";
+        for rules in [Rules::V11, Rules::V12] {
+            for cut in 0..28 {
+                assert_eq!(decode(rules, &whole[..cut]), Ok(None), "{rules:?} at {cut}");
+            }
+            let (f, n) = one(rules, whole);
+            assert_eq!((f.body.as_slice(), n), (&b"ab"[..], 28));
+            let (next, _) = one(rules, &whole[n..]);
+            assert_eq!(next.command, "SEND");
+        }
+        // 1.0 takes the byte after the body as the NUL, as Artemis does.
+        assert_eq!(one(Rules::V10, b"SEND\ncontent-length:2\n\nab\0").1, 26);
     }
 
     #[test]

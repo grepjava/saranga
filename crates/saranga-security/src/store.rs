@@ -637,6 +637,13 @@ fn authentication_cache_key(
     if let Some(principals) = &connection.sasl_principals {
         md.update(format!("{principals:?}").as_bytes());
     }
+    // The certificate itself, not only its subject: a login module may bind
+    // the login to the certificate (OIDC's `x5t#S256`), and another one with
+    // the same subject must not reuse it.
+    md.update([0]);
+    if let Some(cert) = connection.certificates.as_deref().and_then(|c| c.first()) {
+        md.update(Sha256::digest(&cert.der));
+    }
     saranga_config::bytes_to_hex(&md.finalize())
 }
 
