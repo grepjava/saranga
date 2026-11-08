@@ -1351,8 +1351,9 @@ impl Consumer {
     }
 }
 
-/// What to take back when a move fails: the duplicate ID it reserved.
-type Undo = Box<dyn FnOnce() + Send>;
+/// Told whether a move happened: the duplicate ID it reserved is then
+/// taken or given back.
+type Settle = Box<dyn FnOnce(bool) + Send>;
 
 struct Actor {
     shared: Arc<Shared>,
@@ -1824,10 +1825,13 @@ impl Actor {
         r: MessageRef,
         reason: AckReason,
         target: Option<Queue>,
-        undo: Option<Undo>,
+        settle: Option<Settle>,
     ) {
         let expiry = reason == AckReason::Expired;
         let Some(po) = self.shared.post_office.upgrade() else {
+            if let Some(settle) = settle {
+                settle(false);
+            }
             self.kill_for(r, reason);
             return;
         };
@@ -1847,7 +1851,7 @@ impl Actor {
             Some(q) => vec![(copy.clone(), vec![q])],
             None => po.route_internal(&copy, address),
         };
-        self.commit_move(&po, r, routed, reason, address, undo);
+        self.commit_move(&po, r, routed, reason, address, settle);
     }
 
     /// The end of `move` and of a redistribution: the routed copy is
@@ -1860,7 +1864,7 @@ impl Actor {
         routed: crate::postoffice::Routed,
         reason: AckReason,
         address: &str,
-        undo: Option<Undo>,
+        settle: Option<Settle>,
     ) {
         // A paging address takes the copy in its pages. An expired
         // message's copy is not mirrored: the peer expires it too.
@@ -1905,7 +1909,7 @@ impl Actor {
                 Ok(p) => committed = p,
                 Err(e) => {
                     let _ = s.rollback(tx);
-                    self.move_failed(r, format!("{what}: {e}"), undo);
+                    self.move_failed(r, format!("{what}: {e}"), settle);
                     return;
                 }
             }
@@ -1914,31 +1918,40 @@ impl Actor {
         // once the transaction is in the journal; if it never is, the
         // original stays, as Artemis's transaction leaves it.
         match committed {
-            None => self.moved(routed, &r, reason),
+            None => self.moved(routed, &r, reason, settle),
             Some(p) => self.after_commit(p, what, move |a, failed| match failed {
-                None => a.moved(routed, &r, reason),
-                Some(e) => a.move_failed(r, e, undo),
+                None => a.moved(routed, &r, reason, settle),
+                Some(e) => a.move_failed(r, e, settle),
             }),
         }
     }
 
-    /// A move in the journal: the copy joins its queues and the original
-    /// is acknowledged.
-    fn moved(&mut self, routed: crate::postoffice::Routed, r: &MessageRef, reason: AckReason) {
+    /// A move in the journal: the copy joins its queues, the original is
+    /// acknowledged, and the duplicate ID it reserved is taken.
+    fn moved(
+        &mut self,
+        routed: crate::postoffice::Routed,
+        r: &MessageRef,
+        reason: AckReason,
+        settle: Option<Settle>,
+    ) {
         for (m, targets) in routed {
             for q in targets {
                 q.add(m.clone());
             }
         }
         self.queue().post_acknowledge_for(r, reason);
+        if let Some(settle) = settle {
+            settle(true);
+        }
     }
 
     /// A move whose journal write failed: the message stays, the ID a
     /// duplicate check took for it is given back, and the failure is kept.
-    fn move_failed(&mut self, r: MessageRef, e: String, undo: Option<Undo>) {
+    fn move_failed(&mut self, r: MessageRef, e: String, settle: Option<Settle>) {
         tracing::warn!("{e}");
-        if let Some(undo) = undo {
-            undo();
+        if let Some(settle) = settle {
+            settle(false);
         }
         self.write_failed(e);
         self.add_sorted(r);

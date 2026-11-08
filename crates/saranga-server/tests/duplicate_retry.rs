@@ -1,6 +1,7 @@
 //! A send refused does not keep its duplicate ID: sending it again once the
 //! address has room delivers it, as in Artemis, where the ID joins the cache
-//! only when the send commits.
+//! only when the send commits. Nor does it push an older ID out of the
+//! cache, and one transaction cannot send one ID twice.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,9 +15,14 @@ use saranga_server::session::{ClientConnection, ServerSession, SessionOptions, T
 use saranga_server::{Broker, BrokerConfig};
 
 async fn start(dir: &Path, persistence: bool) -> Arc<Broker> {
+    start_with(dir, persistence, "").await
+}
+
+async fn start_with(dir: &Path, persistence: bool, extra: &str) -> Arc<Broker> {
     let file = cfg::BrokerConfig::parse(&format!(
         r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
              <persistence-enabled>{persistence}</persistence-enabled>
+             {extra}
              <address-settings>
                <address-setting match="full">
                  <max-size-bytes>10000</max-size-bytes>
@@ -40,6 +46,11 @@ async fn op(broker: &Arc<Broker>, resource: &str, operation: &str, params: Vec<J
 
 /// A session whose connection has flow control, as a Core client's has.
 fn session(broker: &Arc<Broker>) -> ServerSession {
+    session_with(broker, true)
+}
+
+/// A session sending in transactions unless `auto_commit_sends`.
+fn session_with(broker: &Arc<Broker>, auto_commit_sends: bool) -> ServerSession {
     let conn = Arc::new(ClientConnection::new(
         Transport::internal("test"),
         Arc::new(saranga_security::ConnectionInfo {
@@ -60,7 +71,7 @@ fn session(broker: &Arc<Broker>) -> ServerSession {
             username: None,
             password: None,
             xa: false,
-            auto_commit_sends: true,
+            auto_commit_sends,
             auto_commit_acks: true,
             pre_acknowledge: false,
             default_address: None,
@@ -146,4 +157,81 @@ async fn a_send_refused_as_full_can_be_sent_again() {
 #[tokio::test]
 async fn a_send_refused_as_full_can_be_sent_again_without_persistence() {
     retry_after_full(false).await;
+}
+
+async fn create_full_queue(broker: &Arc<Broker>) {
+    op(
+        broker,
+        "broker",
+        "createQueue",
+        vec![
+            Json::from("full"),
+            Json::from("ANYCAST"),
+            Json::from("full"),
+            Json::Null,
+            Json::Bool(true),
+            Json::Long(-1),
+            Json::Bool(false),
+            Json::Bool(true),
+        ],
+    )
+    .await;
+}
+
+async fn count(broker: &Arc<Broker>) -> Json {
+    op(broker, "queue.full", "countMessages", vec![]).await
+}
+
+/// With room for one ID, a send refused with another ID leaves the first in
+/// the cache: sent again, it is still a duplicate.
+#[tokio::test]
+async fn a_send_refused_keeps_the_ids_before_it() {
+    for persistence in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = start_with(dir.path(), persistence, "<id-cache-size>1</id-cache-size>").await;
+        create_full_queue(&broker).await;
+        let mut s = session(&broker);
+        send(&mut s, Some("d1")).await.unwrap();
+        let mut filled = 1;
+        while send(&mut s, None).await.is_ok() {
+            filled += 1;
+            assert!(filled < 10, "the address never filled");
+        }
+        let e = send(&mut s, Some("d2")).await.unwrap_err();
+        assert!(e.contains("AMQ229102"), "{e}");
+        op(&broker, "queue.full", "removeAllMessages", vec![]).await;
+        send(&mut s, Some("d1")).await.unwrap();
+        assert_eq!(
+            count(&broker).await,
+            Json::Long(0),
+            "d1 was delivered again"
+        );
+        s.close(false).await;
+        broker.stop().unwrap();
+    }
+}
+
+/// The second send of an ID in one transaction is a duplicate: the
+/// transaction is rolled back, as when the ID was in the cache before.
+#[tokio::test]
+async fn one_transaction_cannot_send_an_id_twice() {
+    for persistence in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = start(dir.path(), persistence).await;
+        create_full_queue(&broker).await;
+        let mut s = session_with(&broker, false);
+        send(&mut s, Some("t1")).await.unwrap();
+        send(&mut s, Some("t1")).await.unwrap();
+        let e = s.commit().expect_err("the commit took both");
+        s.take_completion().wait().await.unwrap();
+        assert!(e.message.contains("Duplicate"), "{}", e.message);
+        assert_eq!(count(&broker).await, Json::Long(0));
+        // The ID was not taken: a new transaction sends it.
+        send(&mut s, Some("t1")).await.unwrap();
+        s.commit().unwrap();
+        s.take_completion().wait().await.unwrap();
+        assert_eq!(count(&broker).await, Json::Long(1));
+        s.close(false).await;
+        broker.stop().unwrap();
+    }
 }

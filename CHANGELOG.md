@@ -19,6 +19,7 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **STOMP frames with `content-length`** wait for their NUL. Before, how a frame was read depended on how its bytes arrived.
 - **The relational store** writes a queue or address changed twice at once. PostgreSQL refused the batch, and the store failed after its retries.
 - **A message sent again after a refusal is delivered.** A send outside a transaction that an address refused (full under `FAIL`, say) kept its duplicate ID, so sending it again was dropped as a duplicate.
+- **Duplicate detection holds in three more cases.** One transaction sending the same duplicate ID twice is now rolled back, where both messages were delivered. A refused send no longer pushes the oldest ID out of a full cache, so that ID is still a duplicate. And an ID held twice in the cache stays a duplicate until its newer copy leaves it, where it was forgotten when the older one did.
 - **A move or copy whose journal write fails** reports the error and leaves the message where it was. Before, the copy was seen and the original acknowledged, and management reported success.
 - **JSON and OpenWire nested too deeply** are refused, where they overflowed the stack and ended the broker: an OIDC token, or an OpenWire frame, before its connection logs in.
 - **A cached permission holds only for the credentials it was granted to**, not for every login under the same user name.

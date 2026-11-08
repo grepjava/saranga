@@ -35,6 +35,9 @@ pub struct DuplicateIdCache {
     slots: Vec<Option<(Vec<u8>, i64)>>,
     /// The next slot to fill.
     pos: usize,
+    /// IDs taken by sends not yet done, with how many: they count as
+    /// present, but take no slot until the send succeeds.
+    reserved: HashMap<Vec<u8>, usize>,
     /// `None` for an in-memory cache.
     storage: Option<Arc<Storage>>,
 }
@@ -47,6 +50,7 @@ impl DuplicateIdCache {
             index: HashMap::new(),
             slots: Vec::new(),
             pos: 0,
+            reserved: HashMap::new(),
             storage,
         }
     }
@@ -60,8 +64,31 @@ impl DuplicateIdCache {
         self.storage.is_some()
     }
 
+    /// Whether the ID is held, or taken by a send not yet done.
     pub fn contains(&self, id: &[u8]) -> bool {
-        self.index.contains_key(id)
+        self.index.contains_key(id) || self.reserved.contains_key(id)
+    }
+
+    /// Takes an ID for a send under way: another send of it is a duplicate
+    /// from now on, but nothing leaves the cache until [`Self::confirm`].
+    pub fn reserve(&mut self, id: &[u8]) {
+        *self.reserved.entry(id.to_vec()).or_default() += 1;
+    }
+
+    /// Gives back an ID [`Self::reserve`] took, for a send that failed.
+    pub fn release(&mut self, id: &[u8]) {
+        if let Some(n) = self.reserved.get_mut(id) {
+            *n -= 1;
+            if *n == 0 {
+                self.reserved.remove(id);
+            }
+        }
+    }
+
+    /// The send that reserved the ID succeeded: it takes its slot.
+    pub fn confirm(&mut self, id: Vec<u8>, record: i64) {
+        self.release(&id);
+        self.add_in_memory(id, record);
     }
 
     /// `load`: the IDs found in the journal, oldest first. Those beyond the
@@ -98,10 +125,11 @@ impl DuplicateIdCache {
         if self.size == 0 {
             return;
         }
-        self.index.insert(id.clone(), self.pos);
         if self.pos < self.slots.len() {
             if let Some((old, old_record)) = self.slots[self.pos].take() {
-                if old != id {
+                // The ID may be held again in a later slot: the index then
+                // points there, and keeps it.
+                if self.index.get(&old) == Some(&self.pos) {
                     self.index.remove(&old);
                 }
                 if let Some(s) = &self.storage
@@ -110,24 +138,15 @@ impl DuplicateIdCache {
                     tracing::warn!("AMQ222057: Error deleting duplicate cache: {e}");
                 }
             }
+            self.index.insert(id.clone(), self.pos);
             self.slots[self.pos] = Some((id, record));
         } else {
+            self.index.insert(id.clone(), self.pos);
             self.slots.push(Some((id, record)));
         }
         self.pos += 1;
         if self.pos == self.size {
             self.pos = 0;
-        }
-    }
-
-    /// Takes back an ID added for a send that then failed, whose record was
-    /// never committed: the slot is left empty, and nothing is deleted.
-    pub fn forget(&mut self, id: &[u8], record: i64) {
-        if let Some(&slot) = self.index.get(id)
-            && matches!(&self.slots[slot], Some((_, r)) if *r == record)
-        {
-            self.index.remove(id);
-            self.slots[slot] = None;
         }
     }
 
@@ -296,6 +315,43 @@ mod tests {
         c.add_in_memory(b"3".to_vec(), 12);
         assert!(!c.contains(b"1"));
         assert!(c.contains(b"2") && c.contains(b"3"));
+    }
+
+    /// An ID held twice stays until its newer slot is evicted.
+    #[test]
+    fn an_id_held_twice_stays_until_its_newer_slot_goes() {
+        let mut c = DuplicateIdCache::new("a", 3, None);
+        c.add_in_memory(b"same".to_vec(), 1);
+        c.add_in_memory(b"same".to_vec(), 2);
+        c.add_in_memory(b"other".to_vec(), 3);
+        c.add_in_memory(b"new".to_vec(), 4);
+        assert!(c.contains(b"same"), "evicting the older slot dropped it");
+        c.add_in_memory(b"newer".to_vec(), 5);
+        assert!(!c.contains(b"same"));
+        // The same ID replacing itself in its own slot is kept.
+        let mut c = DuplicateIdCache::new("a", 1, None);
+        c.add_in_memory(b"x".to_vec(), 1);
+        c.add_in_memory(b"x".to_vec(), 2);
+        assert!(c.contains(b"x"));
+    }
+
+    /// A reserved ID counts as present but takes no slot: giving it back
+    /// leaves the cache as it was, confirming it takes the next slot.
+    #[test]
+    fn a_reservation_takes_a_slot_only_once_confirmed() {
+        let mut c = DuplicateIdCache::new("a", 1, None);
+        c.add_in_memory(b"1".to_vec(), 1);
+        c.reserve(b"2");
+        assert!(c.contains(b"1") && c.contains(b"2"));
+        c.release(b"2");
+        assert!(c.contains(b"1") && !c.contains(b"2"));
+        c.reserve(b"2");
+        c.reserve(b"2");
+        c.release(b"2");
+        assert!(c.contains(b"2"), "one of two reservations is left");
+        c.confirm(b"2".to_vec(), 2);
+        assert!(!c.contains(b"1") && c.contains(b"2"));
+        assert_eq!(c.len(), 1);
     }
 
     #[test]

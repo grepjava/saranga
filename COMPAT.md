@@ -99,6 +99,10 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **Message groups.** While a group's consumer has no credit, only that group's messages wait. Artemis ends the whole delivery pass at that point.
 - **Clustered grouping.** When the queue a grouping handler named is gone, Saranga retries only that routing name, so the message's other routing names do not get it twice.
 - **Duplicate detection** checks the message a client sends. Copies a divert makes are not checked against the forwarding address's cache.
+- **Duplicate detection where Artemis lets a duplicate through:**
+  - A transaction that sends one duplicate ID twice is rolled back. Artemis adds the ID to the cache only at commit, and checks each send against the cache alone, so it delivers both.
+  - A send refused after its duplicate check (an address full under `FAIL`) leaves the cache as it was. Artemis has already added the ID, pushing the oldest one out of a full cache, and takes back only the new one.
+  - An ID the cache holds twice (two transactions that sent it committed) stays a duplicate until its newer copy leaves the cache. Artemis drops it when the older copy leaves.
 - **A prepared XA branch's duplicate IDs** keep their own journal record IDs after recovery. Artemis files them under the transaction's ID.
 - **A prepared XA branch's record deletes** on the relational store wait in `DB_BROKER_DATA` as rows of type 201, where Artemis deletes at the prepare and cannot undo it at a rollback. Artemis warns of such a row and finishes the transaction without that delete; the next Saranga start removes the row.
 - **An XA commit of the wrong kind** (one phase for a prepared branch, two phase for one not prepared) is refused and leaves the branch as it was, to be committed or rolled back properly and recovered. Artemis takes the branch out of its resource manager before it checks, so the branch is gone until a restart.
@@ -116,7 +120,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 ## MQTT differences
 - **Artemis bugs not copied.**
   - **Live retained messages to MQTT 5 wildcard subscriptions:** a retained PUBLISH sent while a client is subscribed by a filter other than the exact topic (such as `a/#`) never reaches that client in Artemis, because `publishToClient` looks the subscription up by topic name and fails. Saranga delivers it. The retain flag is set only when the subscription found under the topic name asks for retain-as-published.
-  - **Retained messages replaced at once:** Artemis removes a topic's retained message and adds the new one without a lock, so clients publishing retained messages to one topic at the same time can leave it several. Saranga replaces one topic's retained message one publish at a time, so it always has one.
+  - **Retained messages published at once:** Artemis looks up a topic's retained-message queue and creates it if missing without a lock. When the first retained messages to a new topic arrive together, all but one publisher fail with `AMQ229019` (queue already exists): the client gets no PUBACK and the message is lost. Saranga handles one topic's retained messages one publish at a time, from creating the queue to replacing the message.
   - **Packet-ID records on a clean start:** Artemis's `JournalHashMap.clear` removes the client's packet-ID correlations from memory but leaves their records in the journal, so they come back after a restart. Saranga deletes them. Either broker reads the other's journal.
 - **A second CONNECT** on a connection closes it, after a DISCONNECT 0x8E (session taken over) for MQTT 5. That is what Artemis's link stealing ends up doing when the client ID is the same. Artemis would instead start a second session if the client ID differed.
 - **The connection TTL** closes a silent connection when it runs out. Artemis notices at its next `connection-ttl-check-interval`, up to that much later.

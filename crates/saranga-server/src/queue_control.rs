@@ -821,12 +821,18 @@ impl Actor {
                         return;
                     }
                     let record = po.ids().next();
-                    c.add_in_memory(id.clone(), record);
+                    c.reserve(&id);
                     drop(c);
-                    // Not moved: the ID is not taken.
-                    let undo: super::Undo =
-                        Box::new(move || crate::duplicate::lock(&cache).forget(&id, record));
-                    self.move_to(address, r, AckReason::Normal, target.clone(), Some(undo));
+                    // The ID is taken once the message is moved, given back
+                    // if it is not.
+                    let settle: super::Settle = Box::new(move |moved| {
+                        let mut c = crate::duplicate::lock(&cache);
+                        match moved {
+                            true => c.confirm(id, record),
+                            false => c.release(&id),
+                        }
+                    });
+                    self.move_to(address, r, AckReason::Normal, target.clone(), Some(settle));
                     return;
                 }
                 self.move_to(address, r, AckReason::Normal, target.clone(), None);

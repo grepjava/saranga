@@ -1506,7 +1506,15 @@ impl ServerSession {
                 po.duplicate_cache(name)
             };
             let mut c = crate::duplicate::lock(&cache);
-            if c.contains(&id) {
+            // An ID this transaction already sent counts too, though it
+            // joins the cache only when the transaction commits.
+            let in_tx = tx.as_ref().is_some_and(|tx| {
+                transaction::lock(tx)
+                    .duplicates
+                    .iter()
+                    .any(|d| Arc::ptr_eq(&d.cache, &cache) && d.id == id)
+            });
+            if in_tx || c.contains(&id) {
                 if bridge {
                     tracing::trace!("Message {} hit a bridge duplicate", r.message.message_id());
                 } else {
@@ -1543,7 +1551,7 @@ impl ServerSession {
                     let jtx = po.ids().next();
                     c.store_tx(jtx, &id, record).map_err(io_error)?;
                     own_tx = Some((jtx, c.is_persistent()));
-                    c.add_in_memory(id.clone(), record);
+                    c.reserve(&id);
                     reserved = Some((cache.clone(), id, record));
                 }
                 Some(tx) => {
@@ -1584,6 +1592,8 @@ impl ServerSession {
             // the ID was not.
             let own_tx = own_tx.map(|(jtx, _)| (jtx, true));
             undo_reserved(own_tx, reserved, storage.as_deref());
+        } else if let Some((cache, id, record)) = reserved {
+            crate::duplicate::lock(&cache).confirm(id, record);
         }
         let (Some(plugins), Some(status)) = (plugins, status) else {
             return sent;
@@ -3338,8 +3348,8 @@ fn undo_reserved(
     if let (Some((jtx, true)), Some(s)) = (own_tx, storage) {
         let _ = s.rollback(jtx);
     }
-    if let Some((cache, id, record)) = reserved {
-        crate::duplicate::lock(&cache).forget(&id, record);
+    if let Some((cache, id, _)) = reserved {
+        crate::duplicate::lock(&cache).release(&id);
     }
 }
 
