@@ -362,6 +362,7 @@ pub fn storage_config(config: &cfg::BrokerConfig, instance: &Path) -> StorageCon
             password: d.jdbc_password.clone(),
             connections: d.database_connections,
             read_connections: d.database_max_read_connections,
+            read_idle_millis: d.database_read_idle_timeout,
             network_timeout_millis: d.jdbc_network_timeout,
             max_retries: d.database_max_retries,
             retry_interval_millis: d.database_retry_interval_millis,

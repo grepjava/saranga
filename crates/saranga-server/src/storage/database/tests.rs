@@ -26,6 +26,7 @@ fn database() -> DatabaseConfig {
         password: None,
         connections: 6,
         read_connections: 3,
+        read_idle_millis: 5000,
         network_timeout_millis: 20_000,
         max_retries: 0,
         retry_interval_millis: 10,
@@ -850,4 +851,49 @@ fn read_connections_follow_the_setting() {
     assert_eq!(of(1, -1), 1);
     assert_eq!(of(6, 0), 1);
     assert_eq!(of(6, 5), 5);
+}
+
+/// `database-read-idle-timeout`: a read connection left unused is closed, on
+/// the server too, and the next read opens one again.
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn an_idle_read_connection_closes() {
+    let f = Fixture::new();
+    let database = DatabaseConfig {
+        read_idle_millis: 300,
+        ..database()
+    };
+    let s = DatabaseStorage::open(config(f.dir.path()), &database).unwrap();
+    s.load_bindings().unwrap();
+    s.load_messages().unwrap();
+    for id in [101, 102] {
+        wait(
+            s.store_paged(None, &message(id), &[1], Box::new(|| ()))
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    // The sessions whose last statement read paged messages.
+    let readers = |s: &DatabaseStorage| {
+        let connection = s.connection.clone();
+        s.run(async move {
+            let client = writer::connect(&connection).await.map_err(io_error)?;
+            let row = client
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity \
+                     WHERE pid <> pg_backend_pid() AND query LIKE 'WITH picked AS%'",
+                    &[],
+                )
+                .await
+                .map_err(io_error)?;
+            Ok(row.get::<_, i64>(0))
+        })
+        .unwrap()
+    };
+    assert_eq!(ids_of(&s.read_paged(1, 1).unwrap()), vec![101]);
+    assert_eq!(readers(&s), 1);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(readers(&s), 0, "still open");
+    assert_eq!(ids_of(&s.read_paged(1, 1).unwrap()), vec![102]);
+    assert_eq!(readers(&s), 1);
 }

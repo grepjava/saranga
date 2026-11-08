@@ -80,6 +80,9 @@ pub struct DatabaseConfig {
     /// `database-max-read-connections`: at least one, and half of
     /// `connections` if negative.
     pub read_connections: i32,
+    /// `database-read-idle-timeout`: a read connection unused this long is
+    /// closed. Never, if not positive.
+    pub read_idle_millis: i64,
     pub network_timeout_millis: i32,
     pub max_retries: i32,
     pub retry_interval_millis: i64,
@@ -336,9 +339,8 @@ pub struct DatabaseStorage {
     /// Per queue, the last paged message read. An index scan from the start
     /// would step over every row already read and not yet vacuumed.
     read_from: Mutex<HashMap<i64, i64>>,
-    /// The connections queues read paged messages on, each opened when it is
-    /// first needed.
-    readers: Vec<tokio::sync::Mutex<Option<PagedReader>>>,
+    /// The connections queues read paged messages on.
+    readers: Arc<Readers>,
 }
 
 /// Takes a queue's next paged references out of paging, and returns their
@@ -364,6 +366,30 @@ struct PagedReader {
     client: tokio_postgres::Client,
     read: tokio_postgres::Statement,
     scan: tokio_postgres::Statement,
+    /// When a read last ended on it.
+    used: std::time::Instant,
+}
+
+/// The read connections, each opened when it is first needed.
+type Readers = Vec<tokio::sync::Mutex<Option<PagedReader>>>;
+
+/// Closes the read connections unused for `idle`, as long as the store is
+/// there. One is opened again for the next read.
+async fn close_idle(readers: std::sync::Weak<Readers>, idle: Duration) {
+    let mut tick = tokio::time::interval((idle / 2).max(Duration::from_millis(10)));
+    loop {
+        tick.tick().await;
+        let Some(readers) = readers.upgrade() else {
+            break;
+        };
+        for r in readers.iter() {
+            if let Ok(mut slot) = r.try_lock()
+                && slot.as_ref().is_some_and(|p| p.used.elapsed() >= idle)
+            {
+                *slot = None;
+            }
+        }
+    }
 }
 
 /// The reader's session, which runs nothing but `READ_PAGED` and `SCAN_PAGED`. A flip lost in
@@ -475,6 +501,15 @@ impl DatabaseStorage {
         let writes = Arc::new(setup.recv().unwrap_or_else(|_| {
             Err(JournalError::IllegalState("the store did not start".into()))
         })?);
+        let readers: Arc<Readers> = Arc::new(
+            (0..read_connections_of(database))
+                .map(|_| tokio::sync::Mutex::new(None))
+                .collect(),
+        );
+        if database.read_idle_millis > 0 {
+            let idle = Duration::from_millis(database.read_idle_millis as u64);
+            runtime.spawn(close_idle(Arc::downgrade(&readers), idle));
+        }
         Ok(Self {
             cfg,
             connection,
@@ -491,9 +526,7 @@ impl DatabaseStorage {
             addresses: Mutex::new(HashMap::new()),
             sides: Mutex::new(HashMap::new()),
             read_from: Mutex::new(HashMap::new()),
-            readers: (0..read_connections_of(database))
-                .map(|_| tokio::sync::Mutex::new(None))
-                .collect(),
+            readers,
         })
     }
 
@@ -738,7 +771,14 @@ impl DatabaseStorage {
                         ))
                     };
                     match prepared.await {
-                        Ok((read, scan)) => *slot = Some(PagedReader { client, read, scan }),
+                        Ok((read, scan)) => {
+                            *slot = Some(PagedReader {
+                                client,
+                                read,
+                                scan,
+                                used: std::time::Instant::now(),
+                            });
+                        }
                         Err(e) => {
                             let _ = done.send(Err(io_error(e)));
                             return;
@@ -752,6 +792,9 @@ impl DatabaseStorage {
                     .query(statement, &[&queue_id, &limit, &after])
                     .await
                     .map_err(|e| table_error("reading paged messages", e));
+                if let Some(r) = slot.as_mut() {
+                    r.used = std::time::Instant::now();
+                }
                 let _ = done.send(read);
             });
             result

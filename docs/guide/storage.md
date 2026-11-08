@@ -172,11 +172,12 @@ A database holds one broker. The store takes a lock on a database session of its
 | `jdbc-user`, `jdbc-password` | | Override the URL's `user` and `password` |
 | `database-connections` | 6 | Connections that write |
 | `database-max-read-connections` | half of `database-connections` | Connections that read paged messages, opened as queues need them. At least one |
+| `database-read-idle-timeout` | 5000 | Milliseconds a read connection stays open unused. Not closed if 0 or less |
 | `max-pending-writes` | 100000 | Operations sent and not yet committed, past which writers wait |
 | `database-max-retries`, `database-retry-interval-millis` | 5, 5000 | How often and how long apart a failed batch is tried again. After the last, the broker stops as on a critical I/O error |
 | `jdbc-network-timeout` | 20000 | The time allowed to connect, in milliseconds |
 
-Artemis's other settings are accepted and have no effect. `database-flush-period-nanos` is one: batches start when a connection is free, with no timer. So are `database-read-idle-timeout` and `database-page-join-fetch`.
+Artemis's other settings are accepted and have no effect. `database-flush-period-nanos` is one: batches start when a connection is free, with no timer. So is `database-page-join-fetch`. Artemis's read connections are lent from its writing ones and `database-read-idle-timeout` is how long a queue keeps one; here they are their own and the setting closes them.
 
 ### TLS
 
