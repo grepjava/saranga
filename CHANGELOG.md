@@ -28,6 +28,8 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **An XA commit of the wrong kind** leaves the branch to be committed or rolled back properly. Before, it was lost until a restart.
 - **`handshake-timeout` covers a WebSocket upgrade**: the HTTP request and the protocol header inside the WebSocket.
 - **MQTT wills and expired sessions.** An MQTT 5 will without a delay is published as soon as its client fails, not when its session expires. A session resumed without a will no longer publishes the will of the connection before. A session restored at start that expires before its client returns stays gone after the next restart.
+- **A STOMP frame has a size limit**: 64 KiB before the connection logs in, 100 MiB after. A larger one gets an ERROR and the connection closes.
+- **`jdbc:postgresql:` URLs are read as the JDBC driver reads them**: parameter values and the database name are URL-decoded (`%26` is `&`, `+` a space), and an IPv6 host in brackets works with a port or without one.
 
 ## 1.2.0 (2026-11-02)
 

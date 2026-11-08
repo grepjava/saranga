@@ -114,15 +114,30 @@ pub fn client_config(d: &DatabaseConfig) -> Result<writer::Target, String> {
             if server.contains(',') {
                 return Err("a URL with several hosts is not supported".to_owned());
             }
-            let (host, port) = match server.rsplit_once(':') {
-                Some((host, port)) if !host.ends_with(']') || server.starts_with('[') => (
-                    host,
-                    Some(
-                        port.parse::<u16>()
-                            .map_err(|_| format!("not a port: {port}"))?,
-                    ),
-                ),
-                _ => (server, None),
+            let port_of = |port: &str| {
+                port.parse::<u16>()
+                    .map_err(|_| format!("not a port: {port}"))
+            };
+            // An IPv6 address is in brackets, which are not part of it.
+            let (host, port) = match server.strip_prefix('[') {
+                Some(v6) => {
+                    let (host, after) = v6
+                        .split_once(']')
+                        .ok_or_else(|| format!("not a host: {server}"))?;
+                    let port = match after {
+                        "" => None,
+                        _ => Some(port_of(
+                            after
+                                .strip_prefix(':')
+                                .ok_or_else(|| format!("not a host: {server}"))?,
+                        )?),
+                    };
+                    (host, port)
+                }
+                None => match server.rsplit_once(':') {
+                    Some((host, port)) => (host, Some(port_of(port)?)),
+                    None => (server, None),
+                },
             };
             config.host(if host.is_empty() { "localhost" } else { host });
             if let Some(port) = port {
@@ -135,12 +150,14 @@ pub fn client_config(d: &DatabaseConfig) -> Result<writer::Target, String> {
             location
         }
     };
+    // The driver decodes the database and each parameter's value.
     if !database.is_empty() {
-        config.dbname(database);
+        config.dbname(decoded(database));
     }
     let (mut ssl, mut root, mut cert, mut key) = (None, None, None, None);
     for parameter in query.split('&').filter(|p| !p.is_empty()) {
         let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+        let value = &decoded(value);
         match name {
             "user" => {
                 config.user(value);
@@ -159,9 +176,9 @@ pub fn client_config(d: &DatabaseConfig) -> Result<writer::Target, String> {
                 )
             }
             "sslmode" => ssl = Some(value.to_owned()),
-            "sslrootcert" => root = Some(PathBuf::from(decoded(value))),
-            "sslcert" => cert = Some(PathBuf::from(decoded(value))),
-            "sslkey" => key = Some(PathBuf::from(decoded(value))),
+            "sslrootcert" => root = Some(PathBuf::from(value)),
+            "sslcert" => cert = Some(PathBuf::from(value)),
+            "sslkey" => key = Some(PathBuf::from(value)),
             other => tracing::debug!("JDBC URL parameter {other} ignored"),
         }
     }
@@ -205,7 +222,8 @@ pub fn client_config(d: &DatabaseConfig) -> Result<writer::Target, String> {
     Ok(writer::Target { config, tls })
 }
 
-/// A URL parameter's `%xx`, as a path has them.
+/// A URL parameter decoded as the JDBC driver decodes it (`URLDecoder`):
+/// `%xx` is a byte and `+` a space.
 fn decoded(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -221,7 +239,7 @@ fn decoded(value: &str) -> String {
                 i += 3;
             }
             None => {
-                out.push(bytes[i]);
+                out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
                 i += 1;
             }
         }

@@ -116,6 +116,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **The connection TTL** closes a silent connection when it runs out. Artemis notices at its next `connection-ttl-check-interval`, up to that much later.
 - **A `\r` that is the last byte read** waits for its `\n`. Artemis reports `There is a CR not followed by an LF` when the two arrive in different packets.
 - **A STOMP 1.1 or 1.2 frame with `content-length`** ends at the NUL after its body, as in Artemis, but Saranga waits for that NUL. When the bytes between the body and the NUL arrive in a later packet, Artemis has already taken the frame and reads them as the start of the next one.
+- **Frame size:** a frame still arriving may hold up to 64 KiB before the connection logs in and 100 MiB after (ActiveMQ's default `maxFrameSize`). A larger one gets an ERROR and the connection closes.
 
 ## MQTT differences
 - **Artemis bugs not copied.**

@@ -27,6 +27,13 @@ use tokio::sync::mpsc;
 
 use crate::convert;
 use crate::decoder::{self, DecodeError, Rules};
+
+/// The most a frame may be before the connection logs in: a CONNECT
+/// with its headers.
+pub const MAX_FRAME_BEFORE_LOGIN: usize = 64 * 1024;
+/// The most a frame may be once logged in (ActiveMQ's default
+/// `maxFrameSize`).
+pub const MAX_FRAME: usize = 100 * 1024 * 1024;
 use crate::frame::{Frame, Kind, names};
 
 /// The protocol versions (`StompVersions`).
@@ -729,6 +736,18 @@ impl Connection {
         let mut at = 0;
         let open = self.process_from(buf, &mut at).await;
         buf.drain(..at);
+        // What is left is a frame still arriving: it may hold only so much.
+        let limit = if self.valid {
+            MAX_FRAME
+        } else {
+            MAX_FRAME_BEFORE_LOGIN
+        };
+        if open && !self.closing && buf.len() > limit {
+            self.on_decode_error(StompError::bundle(format!(
+                "STOMP frame larger than {limit} bytes"
+            )));
+            return false;
+        }
         open
     }
 

@@ -270,3 +270,50 @@ async fn a_send_while_the_disk_is_full_fails_the_connection() {
     assert_eq!(n, 0, "the connection closed");
     broker.stop().unwrap();
 }
+
+/// A frame that keeps coming before the client logs in is refused once it
+/// passes 64 KiB: the client gets an ERROR and the connection closes.
+#[tokio::test]
+async fn an_endless_frame_before_login_is_refused() {
+    let address = start().await;
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(b"CONNECT\naccept-version:1.2\nhost:localhost\n")
+        .await
+        .unwrap();
+    let line = format!("x:{}\n", "y".repeat(1000));
+    for _ in 0..100 {
+        if stream.write_all(line.as_bytes()).await.is_err() {
+            break;
+        }
+    }
+    let mut got = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut got)).await;
+    let got = String::from_utf8_lossy(&got);
+    assert!(read.is_ok(), "still open");
+    assert!(got.starts_with("ERROR\n"), "{got}");
+}
+
+/// Once logged in, a client sends frames larger than that.
+#[tokio::test]
+async fn a_large_frame_after_login_is_taken() {
+    let address = start().await;
+    let mut c = Client::connect(address, "1.2").await;
+    c.send(
+        "SUBSCRIBE\ndestination:big\ndestination-type:ANYCAST\nsubscription-type:ANYCAST\nid:s\n\n",
+    )
+    .await;
+    let body = "z".repeat(200 * 1024);
+    c.send(&format!(
+        "SEND\ndestination:big\ndestination-type:ANYCAST\nreceipt:r\n\n{body}"
+    ))
+    .await;
+    let mut message = String::new();
+    for _ in 0..2 {
+        let f = c.frame().await;
+        if f.starts_with("MESSAGE\n") {
+            message = f;
+        }
+    }
+    assert!(message.ends_with(&body), "the large message");
+}

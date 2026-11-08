@@ -152,6 +152,34 @@ fn urls() {
     let missing = of("jdbc:postgresql://h/d?sslmode=verify-full&sslrootcert=/no/such.pem");
     assert!(missing.unwrap_err().contains("TLS"));
     assert_eq!(decoded("C%3A%5Cca.pem"), "C:\\ca.pem");
+    // Values and the database decoded as the driver does.
+    let c = of("jdbc:postgresql://h/my%20db?user=a%40b&password=a%26b%3Dc+d").unwrap();
+    assert_eq!(c.get_user(), Some("a@b"));
+    assert_eq!(c.get_password(), Some(&b"a&b=c d"[..]));
+    assert_eq!(c.get_dbname(), Some("my db"));
+    // IPv6 hosts, without their brackets, with a port or not.
+    let host = |url: &str| {
+        let c = of(url).unwrap();
+        #[allow(irrefutable_let_patterns)] // only TCP outside Unix
+        let tokio_postgres::config::Host::Tcp(h) = &c.get_hosts()[0] else {
+            panic!("not a TCP host");
+        };
+        (h.clone(), c.get_ports().to_vec())
+    };
+    assert_eq!(
+        host("jdbc:postgresql://[::1]/d"),
+        ("::1".to_owned(), vec![])
+    );
+    assert_eq!(
+        host("jdbc:postgresql://[::1]:6000/d"),
+        ("::1".to_owned(), vec![6000])
+    );
+    assert_eq!(
+        host("jdbc:postgresql://h:6000/d"),
+        ("h".to_owned(), vec![6000])
+    );
+    assert!(of("jdbc:postgresql://[::1/d").is_err());
+    assert!(of("jdbc:postgresql://[::1]x/d").is_err());
     // A password stays out of the message.
     let other = of("jdbc:mysql://h/d?password=secret").unwrap_err();
     assert!(!other.contains("secret"), "{other}");
