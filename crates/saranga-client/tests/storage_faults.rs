@@ -428,3 +428,57 @@ async fn queue_if_missing(session: &Session, name: &str) {
         assert!(e.to_string().contains("AMQ229019"), "{e}");
     }
 }
+
+/// A move or copy whose journal write fails is answered with the error, as
+/// Artemis's transaction fails: the copy is not seen and the original stays
+/// on its queue, then and after a restart.
+async fn a_failed_move_or_copy(
+    operation: &str,
+    params: impl FnOnce(i64) -> Vec<saranga_server::management::Json>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, address) = start(dir.path()).await;
+    let (conn, s) = session(&address, Default::default()).await;
+    queue(&s, "src").await;
+    queue(&s, "dst").await;
+    s.create_producer(Some("src"))
+        .await
+        .unwrap()
+        .send(numbered(1, b"durable"))
+        .await
+        .unwrap();
+    let src = broker.post_office().queue("src").unwrap();
+    let dst = broker.post_office().queue("dst").unwrap();
+    let params = params(src.browse().await[0].message_id());
+    let armed = Fault::new(Op::Write, dir.path()).named(".amq").arm();
+    let answered = broker
+        .management()
+        .invoke(&broker, "queue.src", operation, &params, Default::default())
+        .await;
+    assert!(answered.is_err(), "{operation} succeeded: {answered:?}");
+    assert!(armed.hits() > 0);
+    assert_critical(&broker).await;
+    assert_eq!(dst.browse().await.len(), 0, "a copy is seen");
+    assert_eq!(src.browse().await.len(), 1, "the original left");
+    drop(armed);
+    drop((src, dst));
+    drop(conn);
+    stop(broker).await;
+
+    let (broker, address) = start(dir.path()).await;
+    assert_eq!(drain(&address, "src").await, vec![1]);
+    assert_eq!(drain(&address, "dst").await, Vec::<i32>::new());
+    stop(broker).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_whose_journal_write_fails() {
+    use saranga_server::management::Json;
+    a_failed_move_or_copy("moveMessages", |_| vec![Json::Null, Json::from("dst")]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_whose_journal_write_fails() {
+    use saranga_server::management::Json;
+    a_failed_move_or_copy("copyMessage", |id| vec![Json::Long(id), Json::from("dst")]).await;
+}

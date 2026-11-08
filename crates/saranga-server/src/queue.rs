@@ -526,6 +526,11 @@ impl Queue {
             dispatch_start: None,
             page_iter: PageIterator::default(),
             removing: None,
+            write_failure: None,
+            write_failures: 0,
+            commits: Vec::new(),
+            collecting_commits: false,
+            last_commit: None,
             redistributor: false,
             redistribute_at: None,
         };
@@ -1346,6 +1351,9 @@ impl Consumer {
     }
 }
 
+/// What to take back when a move fails: the duplicate ID it reserved.
+type Undo = Box<dyn FnOnce() + Send>;
+
 struct Actor {
     shared: Arc<Shared>,
     messages: MessageList,
@@ -1378,6 +1386,19 @@ struct Actor {
     /// While management removes messages with the message audit log on:
     /// those removed, logged when the removal ends.
     removing: Option<Vec<Arc<ServerMessage>>>,
+    /// The first journal write a move or copy failed on, since management
+    /// last asked: the message stayed where it was, and the operation
+    /// reports the error.
+    write_failure: Option<String>,
+    /// How many moves and copies have failed their journal write.
+    write_failures: u64,
+    /// The journal commits of moves and copies not yet answered, each
+    /// with its error if it failed: management waits for them.
+    commits: Vec<tokio::sync::oneshot::Receiver<Option<String>>>,
+    collecting_commits: bool,
+    /// Handed to the actor when the latest commit's outcome is: the next
+    /// waits for it.
+    last_commit: Option<tokio::sync::oneshot::Receiver<()>>,
     /// `redistributor`: the queue's messages go to other nodes of the
     /// cluster that have consumers for them.
     redistributor: bool,
@@ -1701,7 +1722,7 @@ impl Actor {
                 "AMQ222149: Sending message {} to Dead Letter Address {dla} from {name}",
                 r.message_id()
             );
-            self.move_to(&dla, r, AckReason::Killed, None);
+            self.move_to(&dla, r, AckReason::Killed, None, None);
         }
     }
 
@@ -1738,7 +1759,7 @@ impl Actor {
                     &s.expiry_queue_suffix,
                 );
                 if self.has_bindings(&expiry) {
-                    self.move_to(&expiry, r, AckReason::Expired, None);
+                    self.move_to(&expiry, r, AckReason::Expired, None, None);
                 } else {
                     if !self.expiry_warned {
                         self.expiry_warned = true;
@@ -1797,7 +1818,14 @@ impl Actor {
     /// `move`: a copy of the message goes to `address` (to the queue
     /// `target` only, when given) and the reference is acknowledged under
     /// `reason`, in one transaction.
-    fn move_to(&mut self, address: &str, r: MessageRef, reason: AckReason, target: Option<Queue>) {
+    fn move_to(
+        &mut self,
+        address: &str,
+        r: MessageRef,
+        reason: AckReason,
+        target: Option<Queue>,
+        undo: Option<Undo>,
+    ) {
         let expiry = reason == AckReason::Expired;
         let Some(po) = self.shared.post_office.upgrade() else {
             self.kill_for(r, reason);
@@ -1819,7 +1847,7 @@ impl Actor {
             Some(q) => vec![(copy.clone(), vec![q])],
             None => po.route_internal(&copy, address),
         };
-        self.commit_move(&po, r, routed, reason, address);
+        self.commit_move(&po, r, routed, reason, address, undo);
     }
 
     /// The end of `move` and of a redistribution: the routed copy is
@@ -1832,6 +1860,7 @@ impl Actor {
         routed: crate::postoffice::Routed,
         reason: AckReason,
         address: &str,
+        undo: Option<Undo>,
     ) {
         // A paging address takes the copy in its pages. An expired
         // message's copy is not mirrored: the peer expires it too.
@@ -1847,10 +1876,12 @@ impl Actor {
             }
         };
         let queue = self.queue();
+        let what = format!("moving message {} to {address}", r.message_id());
+        let mut committed = None;
         if let Some(s) = self.shared.ids.storage() {
             let tx = self.shared.ids.next();
             let mut persistent = false;
-            let mut written = || -> crate::storage::StoreResult<()> {
+            let mut written = || -> crate::storage::StoreResult<Option<crate::storage::Pending>> {
                 for (m, targets) in &routed {
                     for q in targets.iter().filter(|q| q.is_durable_ref(m)) {
                         if m.message.durable_up() == 1 {
@@ -1864,22 +1895,93 @@ impl Actor {
                 if queue.store_ack_tx(tx, &mut r, &mut paging)? {
                     persistent = true;
                 }
-                if persistent {
-                    paging.before_commit(s, tx)?;
-                    s.commit(tx)?;
+                if !persistent {
+                    return Ok(None);
                 }
-                Ok(())
+                paging.before_commit(s, tx)?;
+                s.commit(tx).map(Some)
             };
-            if let Err(e) = written() {
-                tracing::warn!("moving message {} to {address}: {e}", r.message_id());
+            match written() {
+                Ok(p) => committed = p,
+                Err(e) => {
+                    let _ = s.rollback(tx);
+                    self.move_failed(r, format!("{what}: {e}"), undo);
+                    return;
+                }
             }
         }
+        // `afterCommit`: the copy joins its queues and the original leaves
+        // once the transaction is in the journal; if it never is, the
+        // original stays, as Artemis's transaction leaves it.
+        match committed {
+            None => self.moved(routed, &r, reason),
+            Some(p) => self.after_commit(p, what, move |a, failed| match failed {
+                None => a.moved(routed, &r, reason),
+                Some(e) => a.move_failed(r, e, undo),
+            }),
+        }
+    }
+
+    /// A move in the journal: the copy joins its queues and the original
+    /// is acknowledged.
+    fn moved(&mut self, routed: crate::postoffice::Routed, r: &MessageRef, reason: AckReason) {
         for (m, targets) in routed {
             for q in targets {
                 q.add(m.clone());
             }
         }
-        queue.post_acknowledge_for(&r, reason);
+        self.queue().post_acknowledge_for(r, reason);
+    }
+
+    /// A move whose journal write failed: the message stays, the ID a
+    /// duplicate check took for it is given back, and the failure is kept.
+    fn move_failed(&mut self, r: MessageRef, e: String, undo: Option<Undo>) {
+        tracing::warn!("{e}");
+        if let Some(undo) = undo {
+            undo();
+        }
+        self.write_failed(e);
+        self.add_sorted(r);
+    }
+
+    /// Runs `then` on this actor once the journal has `p`, with the error
+    /// if it failed. Management's moves and copies wait for these.
+    fn after_commit(
+        &mut self,
+        p: crate::storage::Pending,
+        what: String,
+        then: impl FnOnce(&mut Actor, Option<String>) + Send + 'static,
+    ) {
+        let queue = self.queue();
+        let (reply, wait) = tokio::sync::oneshot::channel();
+        // Kept only while management waits on its operation.
+        if self.collecting_commits {
+            self.commits.push(wait);
+        }
+        // In the order they were made: each waits for the one before to be
+        // handed to the actor, so that moved messages keep their order.
+        let before = self.last_commit.take();
+        let (handed, next) = tokio::sync::oneshot::channel::<()>();
+        self.last_commit = Some(next);
+        tokio::spawn(async move {
+            let failed = p.wait().await.err().map(|e| format!("{what}: {e}"));
+            if let Some(before) = before {
+                let _ = before.await;
+            }
+            queue.send(Cmd::Manage(Box::new(move |a| {
+                let report = failed.clone();
+                then(a, failed);
+                let _ = reply.send(report);
+            })));
+            let _ = handed.send(());
+        });
+    }
+
+    /// A move or copy whose journal write failed: kept for management to
+    /// report, and counted, so that a loop stops at a message it put back.
+    fn write_failed(&mut self, e: String) {
+        self.write_failures += 1;
+        self.write_failure.get_or_insert(e);
     }
 
     /// Handles one command; returns false to stop the actor.
@@ -2239,10 +2341,15 @@ impl Actor {
             .messages
             .find(|r| message::group_id(r.message.core()).is_none())
         {
+            // A message a failed write put back would be found again.
+            let failures = self.write_failures;
             let r = self.messages.get(at);
             if r.message.core().expiration != 0 && r.message.is_expired(now_millis()) {
                 let r = self.messages.remove(at);
                 self.expire(r);
+                if self.write_failures != failures {
+                    break;
+                }
                 continue;
             }
             tracing::debug!(
@@ -2265,7 +2372,10 @@ impl Actor {
                 .as_ref()
                 .map(|a| a.to_string_lossy())
                 .unwrap_or_default();
-            self.commit_move(&po, r, routed, AckReason::Normal, &address);
+            self.commit_move(&po, r, routed, AckReason::Normal, &address, None);
+            if self.write_failures != failures {
+                break;
+            }
         }
     }
 
@@ -2385,8 +2495,10 @@ impl Actor {
             if non_destructive {
                 r = self.messages.remove(at);
             }
+            let failures = self.write_failures;
             self.expire(r);
-            return true;
+            // Put back by a failed write: trying again now would find it.
+            return self.write_failures == failures;
         }
         // handleMessageGroup: a new group is pinned to this consumer and its
         // first message flagged; sequence -1 closes the group.

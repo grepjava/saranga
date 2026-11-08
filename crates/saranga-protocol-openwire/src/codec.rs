@@ -627,6 +627,8 @@ impl WireFormat {
                 bs,
                 input,
                 budget,
+                depth: 0,
+                causes: 0,
             };
             DataStructure::read_body(data_type, version, &mut r).map(Some)
         } else {
@@ -634,6 +636,8 @@ impl WireFormat {
                 wf: self,
                 input,
                 budget,
+                depth: 0,
+                causes: 0,
             };
             DataStructure::read_body(data_type, version, &mut r).map(Some)
         }
@@ -1023,10 +1027,43 @@ struct TightReader<'a, 'b> {
     bs: BooleanStream,
     input: Input<'b>,
     budget: Budget,
+    /// The structures being read, one inside another.
+    depth: usize,
+    /// The throwable causes being read, one inside another.
+    causes: usize,
+}
+
+/// How deep structures may nest in a frame (a message's `dataStructure`
+/// another message, and so on); clients nest a few. Each level is a call,
+/// some 28 KiB of stack in a debug build and 4 KiB in a release one: a
+/// deeper frame would overflow the stack, which ends the process, so it is
+/// refused, as Java's `StackOverflowError` fails only the connection.
+pub const MAX_DEPTH: usize = 32;
+
+/// How long a chain of throwable causes a frame may carry, for the same
+/// reason; a cause costs far less stack than a structure.
+pub const MAX_CAUSES: usize = 256;
+
+/// One level deeper into a frame, or the error past `max`.
+fn deeper(depth: &mut usize, max: usize, what: &str) -> R<()> {
+    if *depth == max {
+        return Err(CodecError::Io(format!(
+            "OpenWire {what} nested more than {max} deep"
+        )));
+    }
+    *depth += 1;
+    Ok(())
 }
 
 impl TightReader<'_, '_> {
     fn nested_ds(&mut self) -> R<Option<DataStructure>> {
+        deeper(&mut self.depth, MAX_DEPTH, "structures")?;
+        let r = self.nested_ds_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn nested_ds_inner(&mut self) -> R<Option<DataStructure>> {
         if !self.bs.read()? {
             return Ok(None);
         }
@@ -1137,7 +1174,10 @@ impl Reader for TightReader<'_, '_> {
                     line_number: self.input.i32()?,
                 });
             }
-            t.cause = self.throwable()?;
+            deeper(&mut self.causes, MAX_CAUSES, "throwable causes")?;
+            let cause = self.throwable();
+            self.causes -= 1;
+            t.cause = cause?;
         }
         Ok(Some(Box::new(t)))
     }
@@ -1298,10 +1338,21 @@ struct LooseReader<'a, 'b> {
     wf: &'a mut WireFormat,
     input: Input<'b>,
     budget: Budget,
+    /// The structures being read, one inside another.
+    depth: usize,
+    /// The throwable causes being read, one inside another.
+    causes: usize,
 }
 
 impl LooseReader<'_, '_> {
     fn nested_ds(&mut self) -> R<Option<DataStructure>> {
+        deeper(&mut self.depth, MAX_DEPTH, "structures")?;
+        let r = self.nested_ds_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn nested_ds_inner(&mut self) -> R<Option<DataStructure>> {
         if !self.bool()? {
             return Ok(None);
         }
@@ -1367,7 +1418,10 @@ impl Reader for LooseReader<'_, '_> {
                     line_number: self.input.i32()?,
                 });
             }
-            t.cause = self.throwable()?;
+            deeper(&mut self.causes, MAX_CAUSES, "throwable causes")?;
+            let cause = self.throwable();
+            self.causes -= 1;
+            t.cause = cause?;
         }
         Ok(Some(Box::new(t)))
     }

@@ -80,6 +80,7 @@ impl Json {
         let mut p = Parser {
             s: text.as_bytes(),
             i: 0,
+            depth: 0,
         };
         p.ws();
         let v = p.value()?;
@@ -280,9 +281,16 @@ pub fn java_double(d: f64) -> String {
     }
 }
 
+/// How deep arrays and objects may nest. Text from clients is parsed (an
+/// OIDC token before its login), and each level is a call: deeper text would
+/// overflow the stack, which ends the process, so it is refused instead.
+pub const MAX_DEPTH: usize = 256;
+
 struct Parser<'a> {
     s: &'a [u8],
     i: usize,
+    /// The arrays and objects open.
+    depth: usize,
 }
 
 impl Parser<'_> {
@@ -306,6 +314,20 @@ impl Parser<'_> {
     }
 
     fn value(&mut self) -> Result<Json, String> {
+        if matches!(self.s.get(self.i), Some(b'{' | b'[')) {
+            if self.depth == MAX_DEPTH {
+                return self.err("Nested too deeply");
+            }
+            self.depth += 1;
+            let v = self.any();
+            self.depth -= 1;
+            return v;
+        }
+        self.any()
+    }
+
+    /// Any value, once [`value`](Self::value) has counted its depth.
+    fn any(&mut self) -> Result<Json, String> {
         match self.s.get(self.i) {
             None => self.err("Unexpected end of input"),
             Some(b'{') => {
@@ -454,6 +476,22 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nesting past [`MAX_DEPTH`] is refused, not followed until the stack
+    /// runs out.
+    #[test]
+    fn deep_nesting_is_refused() {
+        let nested = |n: usize| "[".repeat(n) + "0" + &"]".repeat(n);
+        assert!(Json::parse(&nested(MAX_DEPTH)).is_ok());
+        let e = Json::parse(&nested(MAX_DEPTH + 1)).unwrap_err();
+        assert!(e.starts_with("Nested too deeply"), "{e}");
+        assert!(Json::parse(&nested(20_000)).is_err());
+        let objects = "{\"a\":".repeat(20_000) + "0" + &"}".repeat(20_000);
+        assert!(Json::parse(&objects).is_err());
+        // Siblings do not add up.
+        let wide = format!("[{}]", vec![nested(MAX_DEPTH - 1); 100].join(","));
+        assert!(Json::parse(&wide).is_ok());
+    }
 
     #[test]
     fn round_trip() {

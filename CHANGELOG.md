@@ -18,6 +18,9 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **One retained message per MQTT topic.** Clients publishing retained messages to one topic at the same time could leave it several.
 - **STOMP frames with `content-length`** wait for their NUL. Before, how a frame was read depended on how its bytes arrived.
 - **The relational store** writes a queue or address changed twice at once. PostgreSQL refused the batch, and the store failed after its retries.
+- **A message sent again after a refusal is delivered.** A send outside a transaction that an address refused (full under `FAIL`, say) kept its duplicate ID, so sending it again was dropped as a duplicate.
+- **A move or copy whose journal write fails** reports the error and leaves the message where it was. Before, the copy was seen and the original acknowledged, and management reported success.
+- **JSON and OpenWire nested too deeply** are refused, where they overflowed the stack and ended the broker: an OIDC token, or an OpenWire frame, before its connection logs in.
 
 ## 1.2.0 (2026-11-02)
 

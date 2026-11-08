@@ -120,6 +120,17 @@ impl DuplicateIdCache {
         }
     }
 
+    /// Takes back an ID added for a send that then failed, whose record was
+    /// never committed: the slot is left empty, and nothing is deleted.
+    pub fn forget(&mut self, id: &[u8], record: i64) {
+        if let Some(&slot) = self.index.get(id)
+            && matches!(&self.slots[slot], Some((_, r)) if *r == record)
+        {
+            self.index.remove(id);
+            self.slots[slot] = None;
+        }
+    }
+
     /// `deleteFromCache`: removes an ID and deletes its record. False when
     /// it was not there.
     pub fn remove(&mut self, id: &[u8]) -> bool {

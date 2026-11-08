@@ -140,6 +140,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
   - A copy to a dead-letter or expiry address copies the file as it is. Artemis rewrites the copy's header and properties without the expiry.
 
 ## OpenWire differences
+- **A frame nesting structures more than 32 deep, or throwable causes more than 256 deep**, fails its connection. Artemis follows it until the thread's stack runs out, which also fails only the connection; in Saranga a stack overflow would end the process. Clients nest structures a few deep.
 - **`brokerName`** defaults to the host name from `HOSTNAME`, `COMPUTERNAME` or `/etc/hostname`, lowercased, then to the node ID. Artemis asks the JVM for the local host name.
 - **Browsers** get a snapshot of the queue when they are created, all of it at once, then the end-of-browse dispatch. Artemis walks the live queue within the browser's prefetch.
 - **A pull with no timeout** (prefetch 0, `receive()` or `receiveNoWait()`) gets its null dispatch when the forced-delivery marker reaches the consumer. Artemis blocks the connection's commands until then, for up to 10 seconds.
@@ -172,6 +173,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **`management-message-rbac`** checks the permission before it looks for the operation. For an operation that does not exist, a caller without the permission gets the permission error; Artemis looks for the operation's method first and answers `AMQ229069: no operation`.
 - **Slow consumers** are checked by one task for all queues, within 200 ms of each queue's check period. Artemis schedules a task for each queue.
 - **JSON numbers beyond a double's range** (such as `1e400`), in management arguments or JSON configuration, are an error. Artemis's Johnzon reads them as a `BigDecimal`.
+- **JSON nested more than 256 deep**, in management arguments, JSON configuration or an OIDC token, is an error. Johnzon follows it as deep as the thread's stack allows; in Saranga a stack overflow would end the process.
 - **Records.** Paused queues and addresses, address settings and diverts are journaled as Artemis journals them (`QUEUE_STATUS_RECORD`, `ADDRESS_STATUS_RECORD`, `ADDRESS_SETTING_RECORD_JSON`, `DIVERT_RECORD`), so they move with the data directory in both directions. Like Artemis, Saranga journals every deployed divert, configured ones included.
 
 ## Connection router differences

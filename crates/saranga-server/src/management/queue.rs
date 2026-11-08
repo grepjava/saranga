@@ -214,30 +214,45 @@ pub(super) async fn invoke(broker: &Arc<Broker>, q: &Queue, call: &Call<'_>) -> 
         return count(remove(q, None, FLUSH_LIMIT).await);
     }
     if let Some(a) = call.is("expireMessage", &[L]) {
-        let n = q.act(Selection::id(a.l(0)), SelectionAction::Expire).await;
+        let n = try_op!(
+            q.act_or_fail(Selection::id(a.l(0)), SelectionAction::Expire)
+                .await
+        );
         return Some(Ok(Json::from(n == 1)));
     }
     if let Some(a) = call.is("expireMessages", &[S]) {
         let f = try_op!(filter(broker, a.s(0)));
-        return count(q.act(Selection::filter(f), SelectionAction::Expire).await);
+        return count(try_op!(
+            q.act_or_fail(Selection::filter(f), SelectionAction::Expire)
+                .await
+        ));
     }
     if let Some(a) = call.is("retryMessage", &[L]) {
-        let n = q.act(Selection::id(a.l(0)), SelectionAction::Retry).await;
+        let n = try_op!(
+            q.act_or_fail(Selection::id(a.l(0)), SelectionAction::Retry)
+                .await
+        );
         return Some(Ok(Json::from(n > 0)));
     }
     if call.is("retryMessages", &[]).is_some() {
-        return count(q.act(Selection::default(), SelectionAction::Retry).await);
+        return count(try_op!(
+            q.act_or_fail(Selection::default(), SelectionAction::Retry)
+                .await
+        ));
     }
     if let Some(a) = call.is("retryMessages", &[S]) {
         let f = try_op!(filter(broker, a.s(0)));
-        return count(q.act(Selection::filter(f), SelectionAction::Retry).await);
+        return count(try_op!(
+            q.act_or_fail(Selection::filter(f), SelectionAction::Retry)
+                .await
+        ));
     }
     let move_one = |id: i64, other: Option<String>, reject: bool| async move {
         let other = other.unwrap_or_default();
         let t = target(broker, &other)?;
         let address = t.config().address.to_string();
         let n = q
-            .act(
+            .act_or_fail(
                 Selection::id(id),
                 SelectionAction::Move {
                     address,
@@ -245,7 +260,7 @@ pub(super) async fn invoke(broker: &Arc<Broker>, q: &Queue, call: &Call<'_>) -> 
                     reject_duplicates: reject,
                 },
             )
-            .await;
+            .await?;
         Ok(Json::from(n == 1))
     };
     if let Some(a) = call.is("moveMessage", &[L, S]) {
@@ -271,7 +286,7 @@ pub(super) async fn invoke(broker: &Arc<Broker>, q: &Queue, call: &Call<'_>) -> 
             max: (message_count > 0).then_some(message_count as usize),
         };
         let n = q
-            .act(
+            .act_or_fail(
                 sel,
                 SelectionAction::Move {
                     address,
@@ -279,7 +294,7 @@ pub(super) async fn invoke(broker: &Arc<Broker>, q: &Queue, call: &Call<'_>) -> 
                     reject_duplicates: reject,
                 },
             )
-            .await;
+            .await?;
         Ok(Json::from(n as i32))
     };
     if let Some(a) = call.is("moveMessages", &[S, S]) {
@@ -298,24 +313,26 @@ pub(super) async fn invoke(broker: &Arc<Broker>, q: &Queue, call: &Call<'_>) -> 
         let t = try_op!(target(broker, &a.s_or_empty(1)));
         let address = t.config().address.to_string();
         let n = q
-            .act(
+            .act_or_fail(
                 Selection::id(a.l(0)),
                 SelectionAction::Copy { address, target: t },
             )
             .await;
+        let n = try_op!(n);
         return Some(Ok(Json::from(n == 1)));
     }
     if let Some(a) = call.is("sendMessagesToDeadLetterAddress", &[S]) {
         let f = try_op!(filter(broker, a.s(0)));
-        return count(
-            q.act(Selection::filter(f), SelectionAction::SendToDeadLetter)
-                .await,
-        );
+        return count(try_op!(
+            q.act_or_fail(Selection::filter(f), SelectionAction::SendToDeadLetter)
+                .await
+        ));
     }
     if let Some(a) = call.is("sendMessageToDeadLetterAddress", &[L]) {
         let n = q
-            .act(Selection::id(a.l(0)), SelectionAction::SendToDeadLetter)
+            .act_or_fail(Selection::id(a.l(0)), SelectionAction::SendToDeadLetter)
             .await;
+        let n = try_op!(n);
         return Some(Ok(Json::from(n == 1)));
     }
     if let Some(a) = call.is("changeMessagesPriority", &[S, I]) {

@@ -1491,6 +1491,10 @@ impl ServerSession {
         // checkDuplicateID: a send outside a transaction gets one of its own
         // so the ID is journaled with the message.
         let mut own_tx: Option<(i64, bool)> = None;
+        // The ID a send outside a transaction put in the cache before it is
+        // routed, so that another send of it waits; taken back if the send
+        // fails, as Artemis adds it only once the send commits.
+        let mut reserved: Option<(crate::duplicate::CacheRef, Vec<u8>, i64)> = None;
         if let Some((id, bridge)) = duplicate_id {
             let po = self.broker.post_office();
             let name = crate::postoffice::split_fqqn(&address).0;
@@ -1537,7 +1541,8 @@ impl ServerSession {
                     let jtx = po.ids().next();
                     c.store_tx(jtx, &id, record).map_err(io_error)?;
                     own_tx = Some((jtx, c.is_persistent()));
-                    c.add_in_memory(id, record);
+                    c.add_in_memory(id.clone(), record);
+                    reserved = Some((cache.clone(), id, record));
                 }
                 Some(tx) => {
                     let mut t = transaction::lock(tx);
@@ -1561,20 +1566,26 @@ impl ServerSession {
                 if let Some(tx) = &tx {
                     transaction::lock(tx).mark_rollback_only(&e);
                 }
-                if let (Some((jtx, true)), Some(s)) = (own_tx, &storage) {
-                    let _ = s.rollback(jtx);
-                }
+                undo_reserved(own_tx, reserved, storage.as_deref());
                 if let Some(plugins) = &plugins {
                     plugins.each(|p| p.on_send_exception(&entry, r.message.core(), &e));
                 }
                 return Err(e);
             }
         };
-        let Some(plugins) = plugins else {
-            return self.deliver_routed(routed, tx, own_tx);
-        };
-        let status = crate::plugin::RoutingStatus::of(&routed);
+        let status = plugins
+            .as_ref()
+            .map(|_| crate::plugin::RoutingStatus::of(&routed));
         let sent = self.deliver_routed(routed, tx.clone(), own_tx);
+        if sent.is_err() {
+            // The message may be in the send's journal transaction, though
+            // the ID was not.
+            let own_tx = own_tx.map(|(jtx, _)| (jtx, true));
+            undo_reserved(own_tx, reserved, storage.as_deref());
+        }
+        let (Some(plugins), Some(status)) = (plugins, status) else {
+            return sent;
+        };
         match &sent {
             Ok(()) => {
                 let t = tx.as_ref().map(transaction::lock);
@@ -3306,6 +3317,22 @@ fn session_notification(
 impl ServerSession {}
 
 /// The check that creating a queue of this durability needs.
+/// After a send outside a transaction failed: its journal transaction is
+/// rolled back and its duplicate ID taken out of the cache, so that sending
+/// it again is not taken for a duplicate.
+fn undo_reserved(
+    own_tx: Option<(i64, bool)>,
+    reserved: Option<(crate::duplicate::CacheRef, Vec<u8>, i64)>,
+    storage: Option<&Storage>,
+) {
+    if let (Some((jtx, true)), Some(s)) = (own_tx, storage) {
+        let _ = s.rollback(jtx);
+    }
+    if let Some((cache, id, record)) = reserved {
+        crate::duplicate::lock(&cache).forget(&id, record);
+    }
+}
+
 fn create_check(durable: bool) -> CheckType {
     if durable {
         CheckType::CreateDurableQueue

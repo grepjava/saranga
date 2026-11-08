@@ -379,6 +379,40 @@ impl Queue {
         n.unwrap_or(0)
     }
 
+    /// [`act`](Self::act) for a move or a copy, which fails, as Artemis's
+    /// transaction does, if one of its journal writes failed. The messages
+    /// it could not move stay where they were.
+    pub async fn act_or_fail(
+        &self,
+        sel: Selection,
+        action: SelectionAction,
+    ) -> Result<usize, String> {
+        let done = self
+            .manage(move |a| {
+                a.write_failure = None;
+                a.commits.clear();
+                a.collecting_commits = true;
+                let n = a.act(&sel, &action);
+                a.collecting_commits = false;
+                (n, a.write_failure.take(), std::mem::take(&mut a.commits))
+            })
+            .await;
+        self.prompt_delivery();
+        let Some((n, mut failed, commits)) = done else {
+            return Ok(0);
+        };
+        // As Artemis's transaction commits before the operation returns.
+        for c in commits {
+            if let Ok(Some(e)) = c.await {
+                failed.get_or_insert(e);
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(n),
+        }
+    }
+
     /// `removeWithSuppliedID` then `acknowledge` (or `expire`), as a mirror
     /// target's `AckManager` does: the queued messages with these node and
     /// message IDs (`ReferenceIDSupplier`'s: the broker the message came
@@ -787,16 +821,22 @@ impl Actor {
                         return;
                     }
                     let record = po.ids().next();
-                    c.add_in_memory(id, record);
+                    c.add_in_memory(id.clone(), record);
+                    drop(c);
+                    // Not moved: the ID is not taken.
+                    let undo: super::Undo =
+                        Box::new(move || crate::duplicate::lock(&cache).forget(&id, record));
+                    self.move_to(address, r, AckReason::Normal, target.clone(), Some(undo));
+                    return;
                 }
-                self.move_to(address, r, AckReason::Normal, target.clone());
+                self.move_to(address, r, AckReason::Normal, target.clone(), None);
             }
             SelectionAction::Copy { address, target } => self.copy_to(address, &r, target),
             SelectionAction::Retry => {
                 let po = self.shared.post_office.upgrade();
                 match retry_target(po.as_deref(), &r) {
                     Some((address, target)) => {
-                        self.move_to(&address, r, AckReason::Normal, target);
+                        self.move_to(&address, r, AckReason::Normal, target, None);
                     }
                     None => self.add_sorted(r),
                 }
@@ -826,13 +866,30 @@ impl Actor {
         {
             copy.message.durable_up();
             let tx = self.shared.ids.next();
+            let what = format!("copying message {} to {address}", r.message_id());
             let written = s
                 .store_message_tx(tx, &copy.message)
                 .and_then(|()| s.store_reference_tx(tx, target.id(), copy.message_id()))
-                .and_then(|()| s.commit(tx).map(|_| ()));
-            if let Err(e) = written {
-                tracing::warn!("copying message {} to {address}: {e}", r.message_id());
+                .and_then(|()| s.commit(tx));
+            match written {
+                // The copy is seen once it is in the journal.
+                Ok(p) => {
+                    let target = target.clone();
+                    self.after_commit(p, what, move |a, failed| match failed {
+                        None => target.add(copy),
+                        Some(e) => {
+                            tracing::warn!("{e}");
+                            a.write_failed(e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    let _ = s.rollback(tx);
+                    tracing::warn!("{what}: {e}");
+                    self.write_failed(format!("{what}: {e}"));
+                }
             }
+            return;
         }
         target.add(copy);
     }
