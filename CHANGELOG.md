@@ -14,6 +14,7 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 ### Fixes
 
 - **A cached login holds only for the client certificate it was made with**, not for another certificate with the same subject.
+- **`OIDCLoginModule` reads RFC 8705's `cnf.x5t#S256`**: a token bound to a certificate that way logs in only with that certificate.
 - **One retained message per MQTT topic.** Clients publishing retained messages to one topic at the same time could leave it several.
 - **STOMP frames with `content-length`** wait for their NUL. Before, how a frame was read depended on how its bytes arrived.
 - **The relational store** writes a queue or address changed twice at once. PostgreSQL refused the batch, and the store failed after its retries.

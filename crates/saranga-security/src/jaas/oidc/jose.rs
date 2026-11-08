@@ -568,9 +568,24 @@ fn java_split_whitespace(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// `OIDCSupport.getThumbprint`: `cnf.x5t#256`.
-pub(crate) fn thumbprint(claims: &Claims) -> Option<&str> {
-    claims.get("cnf")?.get("x5t#256")?.as_str()
+/// `OIDCSupport.getThumbprint`: the certificate thumbprints a token is bound
+/// to, RFC 8705's `cnf.x5t#S256`, and `cnf.x5t#256` as some tokens carry
+/// it. Empty if it is bound to none; a member that is not a
+/// string counts, so that it never matches.
+pub(crate) fn thumbprints(claims: &Claims) -> Vec<Option<&str>> {
+    let Some(cnf) = claims.get("cnf") else {
+        return Vec::new();
+    };
+    ["x5t#S256", "x5t#256"]
+        .iter()
+        .filter_map(|m| cnf.get(m).map(Json::as_str))
+        .collect()
+}
+
+/// Whether a certificate, DER-encoded, is the one every thumbprint names.
+pub(crate) fn bound_to(thumbprints: &[Option<&str>], der: &[u8]) -> bool {
+    let digest = base64url_encode(&crate::scram::Scram::Sha256.digest(der));
+    !thumbprints.is_empty() && thumbprints.iter().all(|t| *t == Some(digest.as_str()))
 }
 
 /// `OIDCSupport.getTokenSummary`, for messages.
@@ -603,4 +618,46 @@ pub(crate) fn summary(claims: Option<&Claims>) -> Option<String> {
         _ => {}
     }
     Some(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claims(cnf: &str) -> Claims {
+        Claims::new(Json::parse(&format!(r#"{{"sub":"x","cnf":{cnf}}}"#)).unwrap()).unwrap()
+    }
+
+    /// A token is bound to a certificate by RFC 8705's `x5t#S256`, or by
+    /// `x5t#256`; to it, and only to it.
+    #[test]
+    fn a_token_is_bound_by_either_thumbprint() {
+        let der = b"a certificate";
+        let other = b"another certificate";
+        let t = base64url_encode(&crate::scram::Scram::Sha256.digest(der));
+        for member in ["x5t#S256", "x5t#256"] {
+            let c = claims(&format!(r#"{{"{member}":"{t}"}}"#));
+            assert!(bound_to(&thumbprints(&c), der), "{member}");
+            assert!(
+                !bound_to(&thumbprints(&c), other),
+                "{member} with another certificate"
+            );
+        }
+        let both = claims(&format!(r#"{{"x5t#S256":"{t}","x5t#256":"{t}"}}"#));
+        assert!(bound_to(&thumbprints(&both), der));
+        let mixed = claims(&format!(r#"{{"x5t#S256":"{t}","x5t#256":"other"}}"#));
+        assert!(
+            !bound_to(&thumbprints(&mixed), der),
+            "every thumbprint must match"
+        );
+        assert!(
+            !bound_to(&thumbprints(&claims(r#"{"x5t#S256":1}"#)), der),
+            "not a string"
+        );
+        assert!(
+            thumbprints(&claims(r#"{"jkt":"k"}"#)).is_empty(),
+            "bound by another method"
+        );
+        assert!(!bound_to(&[], der), "bound to nothing");
+    }
 }

@@ -3,8 +3,8 @@
 //! `/.well-known/openid-configuration` names its issuer and `jwks_uri`),
 //! its claims checked, and its identities and roles taken from claim paths
 //! (`identityPaths`, `rolesPaths`, `roleMapping`). With `requireOAuth2MTLS`,
-//! or a `cnf.x5t#256` claim, the client's TLS certificate must be the one
-//! the token names (RFC 8705).
+//! or a `cnf.x5t#S256` claim (or `cnf.x5t#256`), the client's TLS
+//! certificate must be the one the token names (RFC 8705).
 //!
 //! As in Artemis, each provider's metadata and keys are kept for every
 //! module that names it (`SharedOIDCMetadataAccess`): metadata that failed
@@ -410,19 +410,14 @@ impl LoginModule for OidcLoginModule {
         let Some(claims) = claims else {
             return Err(self.error("JWT processing error: no claims".into()));
         };
-        let thumbprint = jose::thumbprint(&claims).map(str::to_owned);
-        if self.require_mtls || thumbprint.is_some() {
+        let thumbprints = jose::thumbprints(&claims);
+        if self.require_mtls || !thumbprints.is_empty() {
             let first = callbacks.certificates.and_then(|c| c.first());
-            let matching = match (first, &thumbprint) {
-                (Some(cert), Some(t)) => {
-                    *t == jose::base64url_encode(&crate::scram::Scram::Sha256.digest(&cert.der))
-                }
-                _ => false,
-            };
+            let matching = first.is_some_and(|cert| jose::bound_to(&thumbprints, &cert.der));
             if !matching {
-                let message = match (first, &thumbprint) {
-                    (None, None) => "OAuth2 mTLS failed - no certificates found in transport layer".to_owned(),
-                    (None, Some(_)) => {
+                let message = match (first, thumbprints.is_empty()) {
+                    (None, true) => "OAuth2 mTLS failed - no certificates found in transport layer".to_owned(),
+                    (None, false) => {
                         "OAuth2 mTLS failed - cnf/x5t#256 present, but no certificates found in transport layer"
                             .to_owned()
                     }
