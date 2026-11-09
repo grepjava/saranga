@@ -163,3 +163,42 @@ async fn route_to_ids_pick_the_queues() {
             .is_none()
     );
 }
+
+/// An anycast address with a queue that takes nothing now: every message
+/// goes to the queue that does, none is lost to the other's turn.
+#[tokio::test]
+async fn a_queue_that_takes_nothing_gives_up_its_turn() {
+    for (case, set) in [
+        (
+            "disabled",
+            (|q: &mut QueueSpec| q.enabled = Some(false)) as fn(&mut QueueSpec),
+        ),
+        ("purging", |q: &mut QueueSpec| {
+            q.purge_on_no_consumers = Some(true)
+        }),
+    ] {
+        let mut config = BrokerConfig::new(Arc::new(SelectorFilters));
+        let mut address = anycast("orders");
+        let mut idle = QueueSpec::new("idle", "orders");
+        idle.routing_type = Some(RoutingType::Anycast);
+        set(&mut idle);
+        address.queues.insert(0, idle);
+        config.addresses = vec![address];
+        let b = Broker::start(config).await.unwrap();
+        let mut to = Vec::new();
+        for id in 1..=4 {
+            let m = MessageRef::new(ServerMessage::new(CoreMessage {
+                message_id: id,
+                address: Some(SimpleString::from("orders")),
+                ..Default::default()
+            }));
+            let routed = b
+                .post_office()
+                .route(&m, "orders", None, Default::default())
+                .unwrap();
+            to.extend(queues(&routed));
+        }
+        assert_eq!(to, ["orders"; 4], "{case}");
+        b.stop().unwrap();
+    }
+}

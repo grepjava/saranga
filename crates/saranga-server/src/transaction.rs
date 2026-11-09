@@ -628,6 +628,14 @@ impl ResourceManager {
         self.map().remove(xid)
     }
 
+    /// Removes `xid` only while it is `tx`, not another session's.
+    pub fn remove_own(&self, xid: &Xid, tx: &TxRef) {
+        let mut map = self.map();
+        if map.get(xid).is_some_and(|t| Arc::ptr_eq(t, tx)) {
+            map.remove(xid);
+        }
+    }
+
     /// `getInDoubtTransactions`: the prepared ones, then those management
     /// committed, then those it rolled back.
     pub fn in_doubt(&self) -> Vec<Xid> {

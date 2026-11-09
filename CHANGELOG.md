@@ -33,6 +33,8 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **MQTT No Local** takes a client ID with a quote, and a No Local subscriber gets messages that came without a client ID (from STOMP or the Core API).
 - **MQTT shared subscriptions on a configured queue** keep their backlog when a member leaves; the queue is emptied only when no member or other consumer is left on it.
 - **MQTT 5 Message Expiry and Will Delay Intervals** are read as unsigned counts of seconds: a message expiry longer than about 24.8 days no longer expires the message at once, and a will delay over 2^31 seconds no longer sends the will at once.
+- **A disabled queue no longer takes an anycast address's routing turns.** A message to an anycast address goes to a queue that can take it, instead of being lost to a disabled queue's turn in the round robin. The same holds for a queue that purges when it has no consumers.
+- **An MQTT 5 Maximum Packet Size** is read as an unsigned four-byte value, so a client that advertises a large one (over 2^31) still receives its messages.
 
 ## 1.2.0 (2026-11-02)
 

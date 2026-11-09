@@ -705,3 +705,26 @@ async fn a_long_message_expiry_is_far_off() {
     );
     assert!(expirations[1] >= 4_294_966_000_000, "{expirations:?}");
 }
+
+/// A Maximum Packet Size is an unsigned four-byte count: the largest there
+/// is lets every message through.
+#[tokio::test]
+async fn the_largest_maximum_packet_size_takes_every_message() {
+    let (_broker, address, _task) = start(None).await;
+    let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 5, 2, 0, 60, 5, 0x27];
+    body.extend(u32::MAX.to_be_bytes());
+    body.extend(string("max-size"));
+    let (mut c, _) = Client::open_with(address, &packet(0x10, &body)).await;
+    let mut sub = vec![0, 1, 0];
+    sub.extend(string("sized/t"));
+    sub.push(0);
+    c.send(&packet(0x82, &sub)).await;
+    assert_eq!(c.packet().await.expect("a SUBACK")[0], 0x90);
+    let (mut publisher, _) = Client::open(address, "publisher", true).await;
+    let mut publish = string("sized/t");
+    publish.extend(b"hello");
+    publisher.send(&packet(0x30, &publish)).await;
+    let p = c.packet().await.expect("the message");
+    assert_eq!(p[0] & 0xF0, 0x30, "a PUBLISH");
+    assert!(p.ends_with(b"hello"));
+}

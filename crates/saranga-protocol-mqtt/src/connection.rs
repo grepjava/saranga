@@ -2401,7 +2401,7 @@ impl Conn {
             if version == Version::V5 {
                 s.client_session_expiry_interval =
                     props.int(prop::SESSION_EXPIRY_INTERVAL).unwrap_or(0);
-                s.client_max_packet_size = props.int(prop::MAXIMUM_PACKET_SIZE).unwrap_or(0);
+                s.client_max_packet_size = props.int(prop::MAXIMUM_PACKET_SIZE).unwrap_or(0) as u32;
                 s.client_topic_alias_maximum = props.int(prop::TOPIC_ALIAS_MAXIMUM);
                 self.connack_properties(&client_id)
             } else {

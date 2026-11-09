@@ -2910,8 +2910,11 @@ impl PostOffice {
                 return false;
             }
             match b {
+                // A queue that takes nothing now (disabled, or purging with
+                // no consumers) is passed over, so the turn goes to another.
                 Bound::Local(q) => {
-                    fqqn_queue.is_none_or(|n| &**q.name() == n)
+                    accepts(q)
+                        && fqqn_queue.is_none_or(|n| &**q.name() == n)
                         && q.filter().is_none_or(|f| f.matches(target))
                 }
                 Bound::Remote(r) => {

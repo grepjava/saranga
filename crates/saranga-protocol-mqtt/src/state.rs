@@ -205,7 +205,7 @@ pub struct SessionState {
     pub will: Will,
     pub will_status: WillStatus,
     pub failed: bool,
-    pub client_max_packet_size: i32,
+    pub client_max_packet_size: u32,
     client_topic_aliases: HashMap<i32, String>,
     pub client_topic_alias_maximum: Option<i32>,
     server_topic_aliases: HashMap<String, i32>,

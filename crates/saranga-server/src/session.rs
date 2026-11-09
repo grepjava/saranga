@@ -2200,7 +2200,7 @@ impl ServerSession {
             );
             if t.state != TxState::Prepared {
                 if let Some(x) = &t.xid {
-                    self.broker.resource_manager().remove(x);
+                    self.broker.resource_manager().remove_own(x, &old);
                 }
                 if let Ok(outcome) = t.rollback() {
                     drop(t);
@@ -2210,8 +2210,9 @@ impl ServerSession {
         }
         let tx = self.new_tx(Some(xid.clone()));
         transaction::lock(&tx).timeout_seconds = self.timeout_seconds;
-        self.tx = Some(tx.clone());
-        if !self.broker.resource_manager().put(xid.clone(), tx) {
+        if !self.broker.resource_manager().put(xid.clone(), tx.clone()) {
+            // Refused: the transaction under this Xid is another's.
+            self.tx = None;
             return Err(XaError::new(
                 xa_code::XAER_DUPID,
                 format!(
@@ -2221,6 +2222,7 @@ impl ServerSession {
             )
             .into());
         }
+        self.tx = Some(tx);
         Ok(())
     }
 
@@ -3215,7 +3217,7 @@ impl ServerSession {
                         tracing::warn!(session = %self.name, "AMQ222207: Unable to rollback on close: {e}");
                     }
                     if let Some(xid) = xid {
-                        self.broker.resource_manager().remove(&xid);
+                        self.broker.resource_manager().remove_own(&xid, &tx);
                     }
                 }
             }

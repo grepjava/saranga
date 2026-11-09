@@ -310,6 +310,16 @@ impl SecurityStore {
         }
     }
 
+    /// Whether these are the cluster credentials, the only ones a
+    /// `CLUSTER_CONNECT` takes when security is on.
+    pub fn is_cluster_user(&self, user: Option<&str>, password: Option<&str>) -> bool {
+        !self.config.enabled
+            || matches!(
+                self.check_cluster_credentials(user, password),
+                ClusterCheck::Valid
+            )
+    }
+
     /// `authenticate`: the user these credentials validate as. Fails with
     /// `AMQ229031` when they do not.
     pub fn authenticate(

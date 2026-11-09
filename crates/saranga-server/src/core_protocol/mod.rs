@@ -939,13 +939,12 @@ impl Connection {
                 );
                 return Ok(());
             }
-            let valid = self
-                .authenticate(
-                    Some(msg.cluster_user.to_string_lossy()),
-                    Some(msg.cluster_password.to_string_lossy()),
+            let valid = self.broker.security().is_none_or(|s| {
+                s.is_cluster_user(
+                    Some(&msg.cluster_user.to_string_lossy()),
+                    Some(&msg.cluster_password.to_string_lossy()),
                 )
-                .await
-                .is_ok();
+            });
             self.cluster_authorized = valid;
             self.shared.send(
                 CHANNEL_CLUSTER,
