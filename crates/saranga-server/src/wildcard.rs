@@ -33,11 +33,13 @@ impl Default for WildcardConfig {
 
 impl WildcardConfig {
     /// `isWild`: an any-words or single-word character not escaped with
-    /// `\`.
+    /// `\`. Only a syntax that escapes (`uses_escape`) reads a `\` as an
+    /// escape; in an MQTT topic a `\` is a literal, so `\#` is still wild.
     pub fn is_wild(&self, address: &str) -> bool {
         let mut previous = None;
         for c in address.chars() {
-            if (c == self.any_words || c == self.single_word) && previous != Some(ESCAPE) {
+            let escaped = self.uses_escape && previous == Some(ESCAPE);
+            if (c == self.any_words || c == self.single_word) && !escaped {
                 return true;
             }
             previous = Some(c);
@@ -45,11 +47,14 @@ impl WildcardConfig {
         false
     }
 
-    /// Splits an address into words on the delimiter, leaving an escaped
-    /// delimiter (`\.`) part of its word rather than a word boundary, so a
-    /// literal delimiter in a word (as an MQTT topic level containing a `.`
-    /// becomes) keeps the word whole. (`AddressImpl` splits on every
-    /// delimiter, so `a\.b.c` is read as three words instead of two.)
+    /// Splits an address into words on the delimiter. In a syntax that
+    /// escapes (`uses_escape`), an escaped delimiter (`\.`) stays part of its
+    /// word rather than a word boundary, so a literal delimiter in a word (as
+    /// an MQTT topic level containing a `.` becomes) keeps the word whole.
+    /// (`AddressImpl` splits on every delimiter, so `a\.b.c` is read as three
+    /// words instead of two.) In a syntax that does not escape (an MQTT
+    /// topic), a `\` is a literal and every delimiter splits, so the MQTT
+    /// topic `a\/b/c` is three words as `AddressImpl` reads it, not two.
     fn words<'a>(&self, address: &'a str) -> Vec<&'a str> {
         let mut parts = Vec::new();
         let mut start = 0;
@@ -57,7 +62,7 @@ impl WildcardConfig {
         for (i, c) in address.char_indices() {
             if escaped {
                 escaped = false;
-            } else if c == ESCAPE {
+            } else if self.uses_escape && c == ESCAPE {
                 escaped = true;
             } else if c == self.delimiter {
                 parts.push(&address[start..i]);
@@ -203,6 +208,34 @@ mod tests {
                 "{address} vs {pattern}"
             );
         }
+    }
+
+    /// A syntax without an escape (an MQTT topic, `uses_escape: false`) reads
+    /// a `\` as an ordinary character: every delimiter splits and a wildcard
+    /// after a `\` is still a wildcard, as `AddressImpl` (which never escapes)
+    /// reads an MQTT topic. (The escape-aware `words` for core addresses would
+    /// absorb the `\/` and miscount the words.)
+    #[test]
+    fn a_literal_backslash_is_not_an_escape_without_uses_escape() {
+        const MQTT: WildcardConfig = WildcardConfig {
+            routing_enabled: true,
+            delimiter: '/',
+            any_words: '#',
+            single_word: '+',
+            uses_escape: false,
+        };
+        // `a\/b/c` is three levels (`a\`, `b`, `c`): a `\` does not hide the
+        // `/`, so the subscription `+/+/+` (three single words) matches it.
+        assert!(MQTT.matches("a\\/b/c", "+/+/+"));
+        assert!(MQTT.matches("a\\/b/c", "a\\/#"));
+        // A different level count does not match.
+        assert!(!MQTT.matches("a\\/b/c", "+/+"));
+        // A `\` before a wildcard does not escape it.
+        assert!(MQTT.is_wild("a/\\#"));
+        assert!(MQTT.is_wild("\\+/b"));
+        // With escaping on, the same `\#` is an escaped literal, not wild.
+        let core = WildcardConfig::default();
+        assert!(!core.is_wild("a.\\#"));
     }
 
     /// A deep address and pattern match in constant space: a client-controlled
