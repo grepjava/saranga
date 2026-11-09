@@ -203,6 +203,11 @@ impl Claims {
         members(&self.0).iter().map(|(k, _)| k.as_str()).collect()
     }
 
+    /// `getIssuer`: the `iss` claim, if it is a string.
+    fn issuer(&self) -> Option<&str> {
+        self.get("iss").and_then(Json::as_str)
+    }
+
     /// `getAudience`.
     fn audience(&self) -> Vec<String> {
         match self.get("aud") {
@@ -236,6 +241,9 @@ fn members(json: &Json) -> &[(String, Json)] {
 /// The verifier's settings (`DefaultJWTClaimsVerifier`).
 #[derive(Debug, Clone)]
 pub(crate) struct ClaimsRules {
+    /// The provider's issuer: a token's `iss` must match it exactly (OIDC
+    /// Core 3.1.3.7).
+    pub issuer: String,
     pub audience: Option<BTreeSet<String>>,
     pub required: BTreeSet<String>,
     pub max_clock_skew_seconds: i64,
@@ -257,6 +265,10 @@ impl ClaimsRules {
                 "JWT missing required claims: [{}]",
                 missing.join(", ")
             ));
+        }
+        match claims.issuer() {
+            Some(iss) if iss == self.issuer => {}
+            _ => return rejected(format!("JWT issuer rejected: expected [{}]", self.issuer)),
         }
         if let Some(accepted) = &self.audience {
             let aud = claims.audience();

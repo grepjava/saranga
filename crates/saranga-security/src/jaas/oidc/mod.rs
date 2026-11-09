@@ -359,6 +359,7 @@ impl OidcLoginModule {
             require_mtls: bool_option(entry, key::REQUIRE_OAUTH_MTLS),
             allow_plain: bool_option(entry, key::ALLOW_PLAIN_JWT),
             rules: ClaimsRules {
+                issuer: provider.url.clone(),
                 audience,
                 required,
                 max_clock_skew_seconds,

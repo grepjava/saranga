@@ -208,6 +208,20 @@ impl Properties {
         &self.subscription_ids
     }
 
+    /// Whether every string and binary property fits the two-byte length each
+    /// is encoded with, so the block cannot be written with a wrapped length.
+    pub fn fits_wire(&self) -> bool {
+        let fits = |n: usize| n <= u16::MAX as usize;
+        self.single.iter().all(|(_, v)| match v {
+            Value::Str(s) => fits(s.len()),
+            Value::Binary(b) => fits(b.len()),
+            Value::Int(_) => true,
+        }) && self
+            .user
+            .iter()
+            .all(|(k, v)| fits(k.len()) && fits(v.len()))
+    }
+
     pub fn user_properties(&self) -> &[(String, String)] {
         &self.user
     }
@@ -1215,7 +1229,14 @@ pub fn publish(
     properties: &Properties,
     payload: &[u8],
 ) -> Option<Vec<u8>> {
-    if topic.contains(['#', '+', '\0']) {
+    // [MQTT-3.3.2-2] a published topic carries no wildcard, and every wire
+    // string is length-prefixed with two bytes: a topic or property that does
+    // not fit cannot be encoded without a wrapped length, so the message is
+    // unrepresentable and the caller discards it.
+    if topic.contains(['#', '+', '\0'])
+        || topic.len() > u16::MAX as usize
+        || !properties.fits_wire()
+    {
         return None;
     }
     let mut body = Vec::with_capacity(topic.len() + payload.len() + 16);

@@ -1567,3 +1567,108 @@ async fn a_persistent_session_survives_its_final_unsubscribe() {
     );
     broker2.stop().unwrap();
 }
+
+/// A Core message whose address cannot be represented as an MQTT topic (a
+/// literal '+') is discarded, not left to stall the connection: its Receive
+/// Maximum slot frees, so a following deliverable message arrives.
+#[tokio::test]
+async fn an_unrepresentable_core_topic_is_discarded_and_frees_its_slot() {
+    use saranga_protocol_mqtt::codec::{Decoder, Packet, Version};
+    let (broker, address, _task) = start(None).await;
+    let (mut s, _) =
+        Client::open_with(address, &connect5_props("badtopic", &[0x21, 0, 1], None)).await;
+    s.send(&subscribe_option("#", 1)).await;
+    assert_eq!(s.packet().await.unwrap()[0], 0x90);
+
+    let mut producer = core_producer(&broker, "badtopic-producer").await;
+    // A Core address with a literal '+' is an MQTT wildcard character, so the
+    // topic cannot be published to this subscriber.
+    send_core(
+        &mut producer,
+        saranga_message::CoreMessage {
+            address: Some("orders+east".into()),
+            body: b"dropped".to_vec().into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    // A following deliverable message on an ordinary address.
+    send_core(
+        &mut producer,
+        saranga_message::CoreMessage {
+            address: Some("other".into()),
+            body: b"second".to_vec().into(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Only the deliverable message arrives — the unrepresentable one was
+    // discarded and freed its slot rather than stranding the connection.
+    let mut first = s.packet().await.expect("the deliverable PUBLISH");
+    let Packet::Publish(msg) = Decoder::for_version(Version::V5)
+        .decode(&mut first)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("a PUBLISH");
+    };
+    assert_eq!(
+        msg.topic, "other",
+        "the deliverable message, not the dropped one"
+    );
+    assert_eq!(msg.payload, b"second");
+    broker.stop().unwrap();
+}
+
+/// A Core address too long for an MQTT topic's two-byte length is discarded
+/// rather than encoded with a wrapped length into a malformed packet: the slot
+/// frees and the next deliverable message arrives intact.
+#[tokio::test]
+async fn a_core_topic_over_the_wire_length_is_discarded() {
+    use saranga_protocol_mqtt::codec::{Decoder, Packet, Version};
+    let (broker, address, _task) = start(None).await;
+    let (mut s, _) =
+        Client::open_with(address, &connect5_props("longtopic", &[0x21, 0, 1], None)).await;
+    s.send(&subscribe_option("#", 1)).await;
+    assert_eq!(s.packet().await.unwrap()[0], 0x90);
+
+    let mut producer = core_producer(&broker, "longtopic-producer").await;
+    // 65,536 bytes: one past the u16 topic-length limit.
+    let long = "a".repeat(65_536);
+    send_core(
+        &mut producer,
+        saranga_message::CoreMessage {
+            address: Some(long.into()),
+            body: b"dropped".to_vec().into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    send_core(
+        &mut producer,
+        saranga_message::CoreMessage {
+            address: Some("other".into()),
+            body: b"second".to_vec().into(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // The over-long topic is discarded; the next message arrives, decoding
+    // cleanly (no wrapped topic length corrupting the packet).
+    let mut first = s.packet().await.expect("the deliverable PUBLISH");
+    let Packet::Publish(msg) = Decoder::for_version(Version::V5)
+        .decode(&mut first)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("a PUBLISH");
+    };
+    assert_eq!(
+        msg.topic, "other",
+        "the deliverable message, not the dropped one"
+    );
+    assert_eq!(msg.payload, b"second");
+    broker.stop().unwrap();
+}

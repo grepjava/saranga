@@ -57,6 +57,8 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **Overlapping MQTT subscriptions keep their packet IDs across a reconnect.** One message delivered to several of a client's overlapping subscriptions now records a separate correlation per delivery, so a redelivery reuses each exchange's own packet ID instead of keeping only the last and generating fresh IDs for the rest, which broke client duplicate handling.
 - **A Session Expiry Interval lowered (or raised) on DISCONNECT is persisted.** An MQTT 5 DISCONNECT that changes the session expiry now writes the revised interval, so after a restart the session expires on the interval the client last asked for, not the one from CONNECT.
 - **A persistent MQTT session survives unsubscribing from its last topic.** Removing the final subscription keeps the durable session record (with an empty subscription set) instead of deleting it, so a resumed or restarted session is still found; only a clean session or an actual expiry ends it.
+- **An MQTT message whose topic cannot be represented is discarded, not left to stall the connection.** When a Core address reaches a subscriber as a topic that has an MQTT wildcard character, the message is discarded (its Receive Maximum slot freed and its reference settled) the way an oversized one is, rather than failing the delivery and stranding the slot so later messages cannot flow.
+- **An MQTT topic or property too long for its two-byte wire length is rejected, not truncated.** A converted topic or string property over 65535 bytes is discarded rather than encoded with a wrapped length that would corrupt the packet.
 
 ## 1.2.0 (2026-11-02)
 

@@ -564,6 +564,13 @@ fn publish_after(
                 is_retain = true;
             }
         }
+        // Discard an unrepresentable message before taking a topic alias for
+        // it, so a topic that is never sent leaves no alias the client did not
+        // learn (a later message would otherwise reference it).
+        if !topic_representable(&topic) || !properties.fits_wire() {
+            drop(s);
+            return discard_unrepresentable(shared, wait, packet_id, qos);
+        }
         let mut added_alias = None;
         if s.client_topic_alias_maximum.is_some() {
             match s.server_topic_alias(&topic) {
@@ -613,12 +620,33 @@ fn publish_after(
         &payload,
     ) {
         Some(bytes) => shared.out.send(wait, Some(bytes)),
-        None => {
-            shared.out.send(wait, None);
-            return Err(format!("invalid topicName {topic}"));
-        }
+        None => return discard_unrepresentable(shared, wait, packet_id, qos),
     }
     Ok(true)
+}
+
+/// Whether an MQTT topic can be put on the wire: no wildcard or NUL
+/// ([MQTT-3.3.2-2]) and within the two-byte length every wire string carries.
+fn topic_representable(topic: &str) -> bool {
+    !topic.contains(['#', '+', '\0']) && topic.len() <= u16::MAX as usize
+}
+
+/// Discards a message whose topic or properties cannot be encoded, settling
+/// its reference and freeing its reserved Receive Maximum slot the way the
+/// Maximum Packet Size path does, so an unrepresentable delivery cannot strand
+/// the connection. QoS 0 carries no slot, so it is simply dropped.
+fn discard_unrepresentable(
+    shared: &Shared,
+    wait: Completion,
+    packet_id: i32,
+    qos: i32,
+) -> Result<bool, String> {
+    shared.out.send(wait, None);
+    if qos == 0 {
+        return Ok(true);
+    }
+    let _ = shared.events.send(Event::Discard { packet_id });
+    Ok(false)
 }
 
 /// The encoded size of the PUBLISH, to compare against the client's Maximum
