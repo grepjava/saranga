@@ -101,3 +101,54 @@ async fn a_two_phase_commit_of_a_branch_not_prepared_keeps_it() {
     assert!(broker.resource_manager().get(&x).is_none(), "committed");
     broker.stop().unwrap();
 }
+
+/// `xa_start` replacing an unprepared branch must not hold the transaction lock
+/// while taking the resource-manager map lock: the reaper takes them in the
+/// opposite order, so the old ordering could deadlock. This hammers both paths
+/// at once and must finish well inside the timeout.
+#[tokio::test]
+async fn xa_start_does_not_deadlock_with_the_reaper() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(dir.path()).await;
+
+    // The reaper: take_timed_out locks the map, then each transaction. A huge
+    // `now` makes every unprepared branch look timed out, so it reaches them.
+    // Both run on plain threads so a regression (a real deadlock) times out and
+    // fails here rather than hanging the runtime's shutdown.
+    let stop = Arc::new(AtomicBool::new(false));
+    let reaper = {
+        let broker = broker.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = broker.resource_manager().take_timed_out(i64::MAX / 2);
+            }
+        })
+    };
+
+    // The worker: each xa_start replaces the previous, unprepared branch, which
+    // takes the transaction lock and then the map lock (remove_own).
+    let (tx, rx) = mpsc::channel();
+    {
+        let broker = broker.clone();
+        std::thread::spawn(move || {
+            let mut s = xa_session(&broker);
+            for i in 0..20_000 {
+                let _ = s.xa_start(xid(&format!("branch-{i}")));
+            }
+            let _ = tx.send(());
+        });
+    }
+
+    let finished = rx.recv_timeout(Duration::from_secs(25)).is_ok();
+    stop.store(true, Ordering::Relaxed);
+    assert!(finished, "xa_start deadlocked with the reaper");
+    // Only safe once the worker finished: otherwise the reaper is blocked on a
+    // transaction the worker holds and this would hang too.
+    reaper.join().unwrap();
+    broker.stop().unwrap();
+}

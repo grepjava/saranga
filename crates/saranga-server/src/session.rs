@@ -2189,21 +2189,30 @@ impl ServerSession {
     /// (unless prepared) and replaced.
     pub fn xa_start(&mut self, xid: Xid) -> Result<(), TxError> {
         if let Some(old) = self.tx.take() {
-            let mut t = transaction::lock(&old);
-            tracing::warn!(
-                "AMQ222210: Session already had a transaction {} when xaStart {} was called",
-                t.xid
-                    .as_ref()
-                    .map(transaction::xid_string)
-                    .unwrap_or_default(),
-                transaction::xid_string(&xid)
-            );
-            if t.state != TxState::Prepared {
-                if let Some(x) = &t.xid {
+            // Capture what is needed, then release the transaction lock before
+            // taking the resource-manager map lock. The reaper (take_timed_out)
+            // and the read paths (prepared, in_doubt) take the map first and
+            // each transaction second; holding the transaction here while
+            // remove_own takes the map inverts that order and can deadlock.
+            let (prepared, old_xid) = {
+                let t = transaction::lock(&old);
+                tracing::warn!(
+                    "AMQ222210: Session already had a transaction {} when xaStart {} was called",
+                    t.xid
+                        .as_ref()
+                        .map(transaction::xid_string)
+                        .unwrap_or_default(),
+                    transaction::xid_string(&xid)
+                );
+                (t.state == TxState::Prepared, t.xid.clone())
+            };
+            if !prepared {
+                if let Some(x) = &old_xid {
                     self.broker.resource_manager().remove_own(x, &old);
                 }
-                if let Ok(outcome) = t.rollback() {
-                    drop(t);
+                // rollback() is a no-op once the reaper has rolled it back, so a
+                // concurrent timeout here is harmless.
+                if let Ok(outcome) = transaction::lock(&old).rollback() {
                     self.finish(outcome, false)?;
                 }
             }

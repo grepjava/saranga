@@ -1072,3 +1072,55 @@ async fn nonpersistent_core_messages_respect_receive_maximum() {
     assert_eq!(second[0] & 0xF0, 0x30, "a PUBLISH");
     broker.stop().unwrap();
 }
+
+/// A will keeps its MQTT 5 publication properties: when published, the will
+/// carries its Content Type and a Message Expiry Interval (started at publish),
+/// not an empty property block.
+#[tokio::test]
+async fn a_will_keeps_its_expiry_and_content_properties() {
+    use saranga_protocol_mqtt::codec::{Decoder, Packet, Version, prop};
+    let (broker, address, _task) = start(None).await;
+    let (mut watcher, _) = Client::open_with(address, &connect5_props("w", &[], None)).await;
+    watcher.send(&subscribe_option("will/t", 0)).await;
+    assert_eq!(watcher.packet().await.unwrap()[0], 0x90);
+
+    // CONNECT v5 with a will on will/t carrying will properties:
+    // Message Expiry Interval 60 and Content Type "application/json".
+    let mut will_props = vec![0x02, 0, 0, 0, 60]; // Message Expiry Interval = 60
+    will_props.push(0x03); // Content Type
+    will_props.extend(string("application/json"));
+    let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 5];
+    body.push(0x02 | 0x04); // clean start + will flag
+    body.extend([0, 60]);
+    body.push(0); // CONNECT properties
+    body.extend(string("willer"));
+    body.push(will_props.len() as u8); // will properties length
+    body.extend(will_props);
+    body.extend(string("will/t"));
+    body.extend((b"bye".len() as u16).to_be_bytes());
+    body.extend_from_slice(b"bye");
+    let (mut willer, _) = Client::open_with(address, &packet(0x10, &body)).await;
+
+    // DISCONNECT with reason 0x04 publishes the will at once.
+    willer.send(&[0xE0, 1, 4]).await;
+
+    let mut bytes = watcher.packet().await.expect("the will publication");
+    let Packet::Publish(msg) = Decoder::for_version(Version::V5)
+        .decode(&mut bytes)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("a PUBLISH");
+    };
+    assert_eq!(
+        msg.properties.string(prop::CONTENT_TYPE),
+        Some("application/json"),
+        "the will keeps its Content Type"
+    );
+    assert!(
+        msg.properties.int(prop::MESSAGE_EXPIRY_INTERVAL).is_some(),
+        "the will keeps a Message Expiry Interval, started at publish"
+    );
+    assert!(msg.payload.ends_with(b"bye"), "the will payload");
+    broker.stop().unwrap();
+}

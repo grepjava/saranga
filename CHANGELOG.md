@@ -47,6 +47,8 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **An MQTT 5 delivery larger than the client's Maximum Packet Size is discarded.** The size check counts every property length prefix, and a packet ID only when the QoS carries one, so a packet whose true size exceeds the limit is no longer sent for the client to reject.
 - **A queue's `max-consumers` holds under a race.** Two sessions adding their last consumer at the same moment can no longer both be admitted: the limit is checked and the slot reserved as one atomic step.
 - **A large MQTT 5 Message Expiry Interval is forwarded whole.** The remaining seconds keep their unsigned value, rather than being cut to about 24.8 days when the interval is over 2^31.
+- **An MQTT 5 will keeps its publication properties.** A published will carries its Message Expiry Interval (started when the will is published), Payload Format Indicator, Content Type, Response Topic and Correlation Data, not only its user properties — so an expiring will no longer stays queued or retained indefinitely.
+- **`xaStart` no longer risks a deadlock with the transaction reaper.** Replacing an open, unprepared branch releases the transaction before it touches the resource-manager table, the order the reaper and recovery already take the two locks.
 
 ## 1.2.0 (2026-11-02)
 

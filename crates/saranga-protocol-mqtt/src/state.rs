@@ -98,6 +98,13 @@ pub struct Will {
     pub retain: bool,
     pub delay_interval: i64,
     pub user_properties: Option<Vec<(String, String)>>,
+    /// The MQTT 5 will publication properties, kept so the will PUBLISH
+    /// carries them and its Message Expiry Interval starts when it is sent.
+    pub message_expiry_interval: Option<i32>,
+    pub payload_format_indicator: Option<i32>,
+    pub content_type: Option<String>,
+    pub response_topic: Option<String>,
+    pub correlation_data: Option<Vec<u8>>,
 }
 
 /// `CoreDeliveryInfo`: the consumer an in-flight packet ID came from and

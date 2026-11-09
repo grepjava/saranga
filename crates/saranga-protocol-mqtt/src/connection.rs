@@ -1362,6 +1362,23 @@ impl Core {
             s.will.clone()
         };
         let mut properties = Properties::default();
+        if let Some(v) = will.payload_format_indicator {
+            properties.add_int(prop::PAYLOAD_FORMAT_INDICATOR, v);
+        }
+        if let Some(v) = will.message_expiry_interval {
+            // Forwarded as-is; publish_to_core turns it into an expiration set
+            // from now, so the will's lifetime starts when it is published.
+            properties.add_int(prop::MESSAGE_EXPIRY_INTERVAL, v);
+        }
+        if let Some(v) = &will.content_type {
+            properties.add(prop::CONTENT_TYPE, Value::Str(v.clone()));
+        }
+        if let Some(v) = &will.response_topic {
+            properties.add(prop::RESPONSE_TOPIC, Value::Str(v.clone()));
+        }
+        if let Some(v) = &will.correlation_data {
+            properties.add(prop::CORRELATION_DATA, Value::Binary(v.clone()));
+        }
         for (k, v) in will.user_properties.iter().flatten() {
             properties.add_user(k.clone(), v.clone());
         }
@@ -2447,6 +2464,24 @@ impl Conn {
                 if !user.is_empty() {
                     s.will.user_properties = Some(user.to_vec());
                 }
+                // Keep the will's publication properties so the will PUBLISH
+                // carries them; its Message Expiry Interval starts counting
+                // when the will is published, not at CONNECT.
+                s.will.message_expiry_interval = will.properties.int(prop::MESSAGE_EXPIRY_INTERVAL);
+                s.will.payload_format_indicator =
+                    will.properties.int(prop::PAYLOAD_FORMAT_INDICATOR);
+                s.will.content_type = will
+                    .properties
+                    .string(prop::CONTENT_TYPE)
+                    .map(str::to_owned);
+                s.will.response_topic = will
+                    .properties
+                    .string(prop::RESPONSE_TOPIC)
+                    .map(str::to_owned);
+                s.will.correlation_data = will
+                    .properties
+                    .binary(prop::CORRELATION_DATA)
+                    .map(<[u8]>::to_vec);
             }
         }
         let connack_properties = {
