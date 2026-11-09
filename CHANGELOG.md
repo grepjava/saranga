@@ -31,6 +31,8 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **A STOMP frame has a size limit**: 64 KiB before the connection logs in, 100 MiB after. A larger one gets an ERROR and the connection closes.
 - **`jdbc:postgresql:` URLs are read as the JDBC driver reads them**: parameter values and the database name are URL-decoded (`%26` is `&`, `+` a space), and an IPv6 host in brackets works with a port or without one.
 - **MQTT No Local** takes a client ID with a quote, and a No Local subscriber gets messages that came without a client ID (from STOMP or the Core API).
+- **MQTT shared subscriptions on a configured queue** keep their backlog when a member leaves; the queue is emptied only when no member or other consumer is left on it.
+- **MQTT 5 Message Expiry and Will Delay Intervals** are read as unsigned counts of seconds: a message expiry longer than about 24.8 days no longer expires the message at once, and a will delay over 2^31 seconds no longer sends the will at once.
 
 ## 1.2.0 (2026-11-02)
 

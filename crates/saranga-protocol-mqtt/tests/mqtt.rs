@@ -558,3 +558,150 @@ async fn no_local_quotes_the_client_id_and_takes_messages_without_one() {
     assert_eq!(c.packet().await.expect("a PUBACK")[0], 0x40);
     assert!(c.silent_for(500).await, "its own message came back");
 }
+
+/// A CONNECT for MQTT 5 with a Receive Maximum of 1, so each client holds
+/// one message at a time.
+fn connect5_one_at_a_time(client_id: &str) -> Vec<u8> {
+    let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 5, 2, 0, 60, 3, 0x21, 0, 1];
+    body.extend(string(client_id));
+    packet(0x10, &body)
+}
+
+/// User properties go out in the order of their positions.
+#[tokio::test]
+async fn user_properties_go_out_in_order() {
+    let (broker, address, _task) = start(None).await;
+    let (mut c, _) = Client::open_with(address, &connect5("props", true, 0, None)).await;
+    let mut body = vec![0, 1, 0];
+    body.extend(string("up/t"));
+    body.push(0);
+    c.send(&packet(0x82, &body)).await;
+    assert_eq!(c.packet().await.expect("a SUBACK")[0], 0x90);
+    let queue = broker
+        .post_office()
+        .queues()
+        .into_iter()
+        .find(|q| q.name().to_string().ends_with("up.t"))
+        .expect("the subscription queue");
+    let mut message = saranga_message::CoreMessage {
+        message_id: 7,
+        address: Some("up.t".into()),
+        body: vec![0, 0, 0, 0].into(),
+        ..Default::default()
+    };
+    let props = &mut message.properties;
+    props.insert(
+        "mqtt.user.property.exists".into(),
+        saranga_buffer::PropertyValue::Int(2),
+    );
+    for (i, v) in [(1, "second"), (0, "first")] {
+        props.insert(
+            format!("mqtt.ordered.user.property.{i}.k").as_str().into(),
+            saranga_buffer::PropertyValue::String(v.into()),
+        );
+    }
+    queue.add(saranga_server::message::MessageRef::new(
+        saranga_server::message::ServerMessage::new(message),
+    ));
+    let p = c.packet().await.expect("the message");
+    assert_eq!(p[0] & 0xF0, 0x30, "a PUBLISH");
+    let at = |s: &[u8]| p.windows(s.len()).position(|w| w == s);
+    let first = at(b"\x26\x00\x01k\x00\x05first").expect("the first property");
+    let second = at(b"\x26\x00\x01k\x00\x06second").expect("the second property");
+    assert!(first < second, "out of order");
+}
+
+/// A member leaving a shared subscription on a configured queue leaves the
+/// backlog to the members still on it; the last one leaving empties it.
+#[tokio::test]
+async fn a_member_leaving_keeps_a_configured_shared_backlog() {
+    let (broker, address, _task) = start(None).await;
+    let mut spec = saranga_server::postoffice::QueueSpec::new("g.orders", "orders");
+    spec.configuration_managed = true;
+    spec.auto_create_address = Some(true);
+    let queue = broker.post_office().create_queue(spec, false).unwrap();
+    let mut subscribe = vec![0, 1, 0];
+    subscribe.extend(string("$share/g/orders"));
+    subscribe.push(1);
+    let (mut a, _) = Client::open_with(address, &connect5_one_at_a_time("member-a")).await;
+    a.send(&packet(0x82, &subscribe)).await;
+    assert_eq!(a.packet().await.expect("a SUBACK")[0], 0x90);
+    let (mut b, _) = Client::open_with(address, &connect5_one_at_a_time("member-b")).await;
+    b.send(&packet(0x82, &subscribe)).await;
+    assert_eq!(b.packet().await.expect("a SUBACK")[0], 0x90);
+    for id in 1..=4 {
+        let mut message = saranga_message::CoreMessage {
+            message_id: id,
+            durable: true,
+            address: Some("orders".into()),
+            body: vec![0, 0, 0, 0].into(),
+            ..Default::default()
+        };
+        message.properties.insert(
+            "mqtt.qos.level".into(),
+            saranga_buffer::PropertyValue::Int(1),
+        );
+        queue.add(saranga_server::message::MessageRef::new(
+            saranga_server::message::ServerMessage::new(message),
+        ));
+    }
+    // Both hold messages they have not acknowledged.
+    assert_eq!(a.packet().await.expect("a message for A")[0] & 0xF0, 0x30);
+    let mut held = b.packet().await.expect("a message for B");
+
+    let mut unsubscribe = vec![0, 2, 0];
+    unsubscribe.extend(string("$share/g/orders"));
+    a.send(&packet(0xA2, &unsubscribe)).await;
+    while a.packet().await.expect("an UNSUBACK")[0] != 0xB0 {}
+
+    // B gets all four: what A held goes back to the queue, and the rest stay.
+    for got in 1..=4 {
+        assert_eq!(held[0] & 0xF0, 0x30, "a PUBLISH");
+        let id = parse_publish(&held).1;
+        b.send(&packet(0x40, &id.to_be_bytes())).await;
+        if got < 4 {
+            held = b.packet().await.expect("the backlog after A left");
+        }
+    }
+    assert!(b.silent_for(300).await);
+
+    // The last member leaving ends the subscription: nothing is kept.
+    enqueue(&queue, "orders", 9);
+    assert_eq!(b.packet().await.expect("one more")[0] & 0xF0, 0x30);
+    b.send(&packet(0xA2, &unsubscribe)).await;
+    assert_eq!(b.packet().await.expect("an UNSUBACK")[0], 0xB0);
+    assert_eq!(queue.message_count(), 0, "the last member left");
+}
+
+/// A Message Expiry Interval is an unsigned count of seconds, however long.
+#[tokio::test]
+async fn a_long_message_expiry_is_far_off() {
+    let (broker, address, _task) = start(None).await;
+    let mut spec = saranga_server::postoffice::QueueSpec::new("kept", "long.t");
+    spec.auto_create_address = Some(true);
+    let queue = broker.post_office().create_queue(spec, false).unwrap();
+    let (mut c, _) = Client::open_with(address, &connect5("expiry", true, 0, None)).await;
+    for (id, seconds) in [(1u16, 3_000_000u32), (2, u32::MAX)] {
+        let mut body = string("long/t");
+        body.extend(id.to_be_bytes());
+        body.extend([5, 0x02]);
+        body.extend(seconds.to_be_bytes());
+        body.extend_from_slice(b"payload");
+        c.send(&packet(0x32, &body)).await;
+        assert_eq!(c.packet().await.expect("a PUBACK")[0], 0x40);
+    }
+    let now = saranga_server::message::now_millis();
+    let mut expirations: Vec<i64> = queue
+        .browse()
+        .await
+        .iter()
+        .map(|m| m.message.core().expiration - now)
+        .collect();
+    expirations.sort_unstable();
+    assert_eq!(expirations.len(), 2, "both messages kept");
+    assert!(
+        (2_999_000_000..=3_000_000_000).contains(&expirations[0]),
+        "{expirations:?}"
+    );
+    assert!(expirations[1] >= 4_294_966_000_000, "{expirations:?}");
+}

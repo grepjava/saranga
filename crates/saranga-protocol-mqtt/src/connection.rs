@@ -627,7 +627,8 @@ fn publish_properties(
         props.add(prop::CORRELATION_DATA, Value::Binary(b.clone()));
     }
     if let Some(n) = get(util::MQTT_USER_PROPERTY_EXISTS_KEY).and_then(int_value) {
-        let mut ordered: Vec<Option<(String, String)>> = vec![None; n.max(0) as usize];
+        // By position, from the properties the message holds.
+        let mut ordered = std::collections::BTreeMap::new();
         for (name, value) in message.properties.entries() {
             let name = saranga_storage::java::simple_string(name);
             let Some(rest) = name.strip_prefix(util::MQTT_USER_PROPERTY_KEY_PREFIX) else {
@@ -637,12 +638,15 @@ fn publish_properties(
             let position: usize = index
                 .parse()
                 .map_err(|_| format!("For input string: \"{index}\""))?;
-            let slot = ordered
-                .get_mut(position)
-                .ok_or_else(|| format!("Index {position} out of bounds for length {n}"))?;
-            *slot = Some((key.to_owned(), string_value(value).unwrap_or_default()));
+            if position >= n.max(0) as usize {
+                return Err(format!("Index {position} out of bounds for length {n}"));
+            }
+            ordered.insert(
+                position,
+                (key.to_owned(), string_value(value).unwrap_or_default()),
+            );
         }
-        for (k, v) in ordered.into_iter().flatten() {
+        for (k, v) in ordered.into_values() {
             props.add_user(k, v);
         }
     }
@@ -1270,7 +1274,11 @@ impl Core {
                 let name = util::core_queue(topic, &self.client_id, &wildcard);
                 if let Some(queue) = po.queue(&name) {
                     if queue.config().configuration_managed {
-                        queue.delete_matching(None).await;
+                        // Emptied in place of a delete, and only when it would
+                        // be deleted: no other member or consumer is on it.
+                        if queue.consumer_count() == 0 {
+                            queue.delete_matching(None).await;
+                        }
                     } else if !util::is_shared(topic) || queue.consumer_count() == 0 {
                         self.session
                             .delete_queue_with(&name, enforce_security)
@@ -1608,8 +1616,8 @@ fn create_server_message(
         put(util::MQTT_CONTENT_TYPE_KEY, PropertyValue::String(v.into()));
     }
     if let Some(v) = props.int(prop::MESSAGE_EXPIRY_INTERVAL) {
-        // Seconds times 1000 as a Java int, overflow and all.
-        m.expiration = now + i64::from(v.wrapping_mul(1000));
+        // A four-byte unsigned count of seconds.
+        m.expiration = now + i64::from(v as u32) * 1000;
     }
     m
 }
@@ -2380,7 +2388,7 @@ impl Conn {
             s.will_status = WillStatus::NotSent;
             if version == Version::V5 {
                 if let Some(d) = will.properties.int(prop::WILL_DELAY_INTERVAL) {
-                    s.will.delay_interval = i64::from(d);
+                    s.will.delay_interval = i64::from(d as u32);
                 }
                 let user = will.properties.user_properties();
                 if !user.is_empty() {
