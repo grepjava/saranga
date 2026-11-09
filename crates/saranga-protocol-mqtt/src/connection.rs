@@ -1487,8 +1487,11 @@ impl Core {
     /// `MQTTSession.stop`: the session closes; a clean or expiring session
     /// goes, and a failed client's will goes out unless it waits for its
     /// delay. False when the state was removed.
-    async fn stop(&mut self, failure: bool) -> bool {
-        lock(&self.state).failed = failure;
+    async fn stop(&mut self, failure: bool, publish_will: bool) -> bool {
+        // 5.0 3.14.2.1: a reason-0x04 DISCONNECT publishes the will as an
+        // abnormal close would, though the session close itself is clean.
+        let want_will = failure || publish_will;
+        lock(&self.state).failed = want_will;
         self.shared.closed.store(true, Ordering::SeqCst);
         self.stop_subscriptions().await;
         self.session.set_started(false).await;
@@ -1510,19 +1513,19 @@ impl Core {
         if self.version == Version::V5 {
             if expiry == 0 {
                 // A session that ends now sends its will whatever its delay.
-                if is_will && failure {
+                if is_will && want_will {
                     self.send_will_message().await;
                 }
                 self.clean(false).await;
                 self.manager.remove_session_state(&self.client_id);
                 removed = true;
-            } else if is_will && failure && will_delay <= 0 {
+            } else if is_will && want_will && will_delay <= 0 {
                 // No Will Delay Interval (5.0 3.1.3.2.2): the will goes now, not when the
                 // session ends; the scan sends only delayed ones.
                 self.send_will_message().await;
             }
         } else {
-            if is_will && failure {
+            if is_will && want_will {
                 self.send_will_message().await;
             }
             if self.clean || expiry == 0 {
@@ -1646,6 +1649,8 @@ struct Conn {
     stopped: bool,
     /// The connection is closing: nothing more is read.
     closing: bool,
+    /// A DISCONNECT with reason 0x04 asked for the will to be published.
+    disconnect_with_will: bool,
 }
 
 /// Serves an MQTT connection until it closes.
@@ -1702,6 +1707,7 @@ pub async fn serve(
         core: None,
         stopped: false,
         closing: false,
+        disconnect_with_will: false,
     };
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut last_read = tokio::time::Instant::now();
@@ -1865,12 +1871,15 @@ impl Conn {
                 self.handle_connect(*c).await;
                 Ok(())
             }
-            Packet::Disconnect { properties, .. } => {
+            Packet::Disconnect { reason, properties } => {
                 if let Some(v) = properties.int(prop::SESSION_EXPIRY_INTERVAL)
                     && let Some(core) = &self.core
                 {
                     lock(&core.state).client_session_expiry_interval = v;
                 }
+                // 5.0 3.14.2.1: reason 0x04 is a clean disconnect that still
+                // asks for the will to be published.
+                self.disconnect_with_will = reason == reason::DISCONNECT_WITH_WILL;
                 self.disconnect(false).await;
                 Ok(())
             }
@@ -2409,8 +2418,10 @@ impl Conn {
                 Properties::default()
             }
         };
+        // Any nonzero interval is kept (an unsigned count of seconds, or -1
+        // for never); only 0, expire-on-disconnect, is not.
         let expiry = lock(&state).client_session_expiry_interval;
-        if (expiry == -1 || expiry > 0)
+        if expiry as u32 > 0
             && let Err(e) = core.store_durable_state()
         {
             tracing::warn!("{}", e.message);
@@ -2458,9 +2469,11 @@ impl Conn {
             return;
         }
         self.stopped = true;
+        let will = self.disconnect_with_will;
+        self.disconnect_with_will = false;
         if let Some(mut core) = self.core.take() {
             let state = core.state.clone();
-            let kept = core.stop(failure).await;
+            let kept = core.stop(failure, will).await;
             if kept {
                 // The state keeps the session for a delayed will and expiry.
                 lock(&state).session = Some(Box::new(core));

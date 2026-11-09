@@ -35,6 +35,10 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **MQTT 5 Message Expiry and Will Delay Intervals** are read as unsigned counts of seconds: a message expiry longer than about 24.8 days no longer expires the message at once, and a will delay over 2^31 seconds no longer sends the will at once.
 - **A disabled queue no longer takes an anycast address's routing turns.** A message to an anycast address goes to a queue that can take it, instead of being lost to a disabled queue's turn in the round robin. The same holds for a queue that purges when it has no consumers.
 - **An MQTT 5 Maximum Packet Size** is read as an unsigned four-byte value, so a client that advertises a large one (over 2^31) still receives its messages.
+- **An MQTT 5 property block of 128 bytes or more keeps the payload whole.** The property length is the count of the property bytes alone, so the last property is no longer read as the start of the payload.
+- **A reused session-local consumer ID is refused** instead of leaving the first consumer registered on its queue with nothing to reach it.
+- **An MQTT 5 DISCONNECT with reason 0x04** (Disconnect with Will Message) publishes the will, while a normal DISCONNECT still holds it back.
+- **A large MQTT 5 Session Expiry Interval** (one with the high bit set) is read as an unsigned count of seconds rather than a negative that never expires; `0xFFFFFFFF` still means never.
 
 ## 1.2.0 (2026-11-02)
 

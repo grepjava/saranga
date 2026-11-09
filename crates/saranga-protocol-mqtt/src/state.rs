@@ -822,8 +822,11 @@ impl StateManager {
         let mut wills = Vec::new();
         for (client_id, state) in self.session_states() {
             let s = lock(&state);
-            let expiry = i64::from(s.client_session_expiry_interval);
-            if !s.attached && expiry > 0 && s.disconnected_time + expiry * 1000 < now {
+            // The interval is an unsigned four-byte count of seconds; -1
+            // (0xFFFFFFFF) means never expire, as does the broker default.
+            let raw = s.client_session_expiry_interval;
+            let expiry = i64::from(raw as u32);
+            if !s.attached && raw != -1 && expiry > 0 && s.disconnected_time + expiry * 1000 < now {
                 to_remove.push(client_id.clone());
             }
             if s.is_will

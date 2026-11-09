@@ -55,6 +55,8 @@ pub mod reason {
     pub const BAD_USER_NAME_OR_PASSWORD_3: u8 = 0x04;
     pub const NOT_AUTHORIZED_3: u8 = 0x05;
     pub const SUCCESS: u8 = 0x00;
+    /// A DISCONNECT asking the server to publish the will (5.0 3.14.2.1).
+    pub const DISCONNECT_WITH_WILL: u8 = 0x04;
     pub const NO_SUBSCRIPTION_EXISTED: u8 = 0x11;
     pub const UNSPECIFIED_ERROR: u8 = 0x80;
     pub const MALFORMED_PACKET: u8 = 0x81;

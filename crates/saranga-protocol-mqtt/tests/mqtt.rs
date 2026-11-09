@@ -728,3 +728,79 @@ async fn the_largest_maximum_packet_size_takes_every_message() {
     assert_eq!(p[0] & 0xF0, 0x30, "a PUBLISH");
     assert!(p.ends_with(b"hello"));
 }
+
+/// A DISCONNECT with reason 0x04 is a clean disconnect that still asks for
+/// the will to be published (5.0 3.14.2.1).
+#[tokio::test]
+async fn a_disconnect_with_reason_4_publishes_the_will() {
+    let (broker, address, _task) = start(None).await;
+    let (mut watcher, _) = Client::open(address, "watcher", true).await;
+    watcher.subscribe("wills/t", 0).await;
+    // MQTT 5, clean start, will flag; empty CONNECT and will properties.
+    let (mut willing, _) = Client::open_with(
+        address,
+        &connect5("willing", true, 0, Some(("wills/t", b"bye"))),
+    )
+    .await;
+    // 0xE0 0x01 0x04: DISCONNECT with reason 0x04.
+    willing.send(&[0xE0, 0x01, 0x04]).await;
+    let p = watcher.packet().await.expect("the will after reason 0x04");
+    assert_eq!(p[0] & 0xF0, 0x30, "a PUBLISH");
+    assert!(p.ends_with(b"bye"), "{p:?}");
+    broker.stop().unwrap();
+}
+
+/// A normal DISCONNECT (reason 0x00) still suppresses the will.
+#[tokio::test]
+async fn a_normal_disconnect_keeps_the_will_back() {
+    let (broker, address, _task) = start(None).await;
+    let (mut watcher, _) = Client::open(address, "watcher", true).await;
+    watcher.subscribe("wills/t", 0).await;
+    let (mut willing, _) = Client::open_with(
+        address,
+        &connect5("willing2", true, 0, Some(("wills/t", b"bye"))),
+    )
+    .await;
+    willing.send(&[0xE0, 0x00]).await; // reason 0x00
+    assert!(
+        watcher.silent_for(500).await,
+        "the will should not be published"
+    );
+    broker.stop().unwrap();
+}
+
+/// A session expiry interval with the high bit set is a large unsigned count
+/// of seconds, not a negative that never expires.
+#[tokio::test]
+async fn a_high_bit_session_expiry_still_expires() {
+    use saranga_protocol_mqtt::state::StateManager;
+    let (broker, _address, _task) = start(None).await;
+    let manager = StateManager::new(&broker, false, "scan".into());
+    let state = manager.session_state("expired");
+    {
+        let mut s = state.lock().unwrap();
+        s.client_session_expiry_interval = 0x8000_0000u32 as i32; // ~68 years
+        s.attached = false;
+        s.disconnected_time =
+            saranga_server::message::now_millis() - (i64::from(0x8000_0000u32) + 1) * 1000;
+    }
+    manager.scan_sessions().await;
+    assert!(
+        !manager.has_session_state("expired"),
+        "a finite (if large) expiry that has passed should remove the session"
+    );
+    // 0xFFFFFFFF (-1) never expires.
+    let never = manager.session_state("never");
+    {
+        let mut s = never.lock().unwrap();
+        s.client_session_expiry_interval = -1;
+        s.attached = false;
+        s.disconnected_time = 0;
+    }
+    manager.scan_sessions().await;
+    assert!(
+        manager.has_session_state("never"),
+        "0xFFFFFFFF never expires"
+    );
+    broker.stop().unwrap();
+}

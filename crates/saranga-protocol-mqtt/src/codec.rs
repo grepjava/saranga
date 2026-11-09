@@ -671,14 +671,16 @@ impl Cursor<'_> {
         Ok(self.bytes(size as usize)?.to_vec())
     }
 
-    /// `decodeProperties`. Like Netty, the loop counts the length's own
-    /// bytes as property bytes.
+    /// `decodeProperties`. `total` is the Property Length: the count of the
+    /// property bytes that follow, not of its own encoding. The whole block
+    /// is read, and its full span (length prefix included) returned.
     fn properties(&mut self) -> Result<(Properties, i32), Stop> {
-        let (total, mut consumed) = self.var_int()?;
+        let (total, prefix) = self.var_int()?;
         if total > 0 && self.buf.len() - self.pos < total as usize {
             return Err(Stop::More);
         }
         let mut props = Properties::default();
+        let mut consumed = 0;
         while consumed < total {
             let (id, n) = self.var_int()?;
             consumed += n;
@@ -719,7 +721,13 @@ impl Cursor<'_> {
                 }
             }
         }
-        Ok((props, consumed))
+        if consumed > total {
+            // A property ran past the declared block into the payload.
+            return Err(Stop::Bad(
+                "MQTT property block overran its declared length".into(),
+            ));
+        }
+        Ok((props, prefix + consumed))
     }
 }
 
@@ -1428,6 +1436,29 @@ mod tests {
             connack(Version::V3_1_1, true, 5, &props),
             vec![0x20, 2, 1, 5]
         );
+    }
+
+    #[test]
+    fn a_property_block_over_128_bytes_keeps_the_payload_whole() {
+        // A 128-byte property block (a 126-byte User Property, then a 2-byte
+        // Payload Format Indicator), so its length takes two bytes, followed
+        // by the payload `hello`.
+        let mut body = vec![0, 1, b't', 0x80, 1, 0x26, 0, 1, b'k', 0, 120];
+        body.extend(vec![b'v'; 120]);
+        body.extend([1, 0]); // Payload Format Indicator = 0
+        body.extend(b"hello");
+        let mut wire = vec![0x30];
+        write_var_int(&mut wire, body.len() as u32);
+        wire.extend(body);
+        let packet = Decoder::for_version(Version::V5)
+            .decode(&mut wire)
+            .unwrap()
+            .unwrap();
+        let Packet::Publish(p) = packet else {
+            panic!("a PUBLISH")
+        };
+        assert_eq!(p.payload, b"hello");
+        assert_eq!(p.properties.int(prop::PAYLOAD_FORMAT_INDICATOR), Some(0));
     }
 
     #[test]

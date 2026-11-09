@@ -2683,6 +2683,14 @@ impl ServerSession {
         if self.closed {
             return Err(BrokerError::consumer_on_closed_session(queue_name));
         }
+        // A session-local ID identifies one consumer. Reusing it would leave
+        // the first registered on its queue, reachable by nothing.
+        if self.consumers.contains_key(&consumer_id) {
+            return Err(BrokerError::new(
+                ErrorType::IllegalState,
+                format!("Consumer {consumer_id} already exists on the session"),
+            ));
+        }
         let c = queue.config();
         if !browse_only && c.max_consumers != -1 && queue.consumer_count() >= c.max_consumers {
             return Err(BrokerError::max_consumer_limit_reached(&c.address, &c.name));
