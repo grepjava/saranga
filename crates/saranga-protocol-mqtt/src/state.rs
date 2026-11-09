@@ -527,9 +527,17 @@ struct MapRecord {
 /// `JournalHashMapProvider` of packet-ID correlations: per client, which
 /// packet ID each in-flight message went out with, journalled so a
 /// redelivery after a restart reuses it.
+///
+/// A message routed through one address to several overlapping subscriptions
+/// is delivered once per subscription, each exchange with its own packet ID
+/// but the same key, so a key maps to a list of records rather than one: the
+/// records are kept apart (by packet ID) instead of the later exchange
+/// overwriting the earlier one and costing it its identity on a redelivery.
+/// The journal record format is unchanged — one record per packet ID — so the
+/// journal stays compatible with Artemis (which keeps only the last).
 #[derive(Default)]
 pub struct Correlations {
-    maps: Mutex<HashMap<String, HashMap<CorrelationKey, MapRecord>>>,
+    maps: Mutex<HashMap<String, HashMap<CorrelationKey, Vec<MapRecord>>>>,
 }
 
 impl Correlations {
@@ -556,25 +564,32 @@ impl Correlations {
         let message_id = r.i64().map_err(e)?;
         let address = r.simple_string().map_err(e)?;
         let packet_id = r.i32().map_err(e)?;
-        lock(&self.maps).entry(client_id).or_default().insert(
-            CorrelationKey {
+        lock(&self.maps)
+            .entry(client_id)
+            .or_default()
+            .entry(CorrelationKey {
                 message_id,
                 address,
-            },
-            MapRecord { id, packet_id },
-        );
+            })
+            .or_default()
+            .push(MapRecord { id, packet_id });
         Ok(())
     }
 
-    pub fn get(&self, client_id: &str, key: &CorrelationKey) -> Option<i32> {
+    /// The packet IDs an in-flight message already has for this key, newest
+    /// last. A redelivery reuses one of these whose delivery is not already
+    /// in flight, so each of a message's overlapping-subscription exchanges
+    /// keeps its own ID.
+    pub fn packet_ids(&self, client_id: &str, key: &CorrelationKey) -> Vec<i32> {
         lock(&self.maps)
-            .get(client_id)?
-            .get(key)
-            .map(|r| r.packet_id)
+            .get(client_id)
+            .and_then(|m| m.get(key))
+            .map(|v| v.iter().map(|r| r.packet_id).collect())
+            .unwrap_or_default()
     }
 
-    /// `put`: journals the new record (synced; the delivery waits for it)
-    /// and deletes the one it replaces.
+    /// `put`: journals a new record (synced; the delivery waits for it) and
+    /// adds it to the key's list, keeping any record already there.
     pub fn put(
         &self,
         broker: &Broker,
@@ -595,37 +610,42 @@ impl Correlations {
                 Err(e) => tracing::warn!("{e}"),
             }
         }
-        let old = lock(&self.maps)
+        lock(&self.maps)
             .entry(client_id.to_owned())
             .or_default()
-            .insert(key, MapRecord { id, packet_id });
-        if let (Some(old), Some(s)) = (old, broker.storage())
-            && let Err(e) = s.delete_record(old.id)
-        {
-            tracing::warn!("{e}");
-        }
+            .entry(key)
+            .or_default()
+            .push(MapRecord { id, packet_id });
         pending
     }
 
-    /// `remove(key, txID)`: gone from the map at once; the record's delete
-    /// is part of `tx`.
+    /// `remove(key, txID)`: the one record for this key's `packet_id` is gone
+    /// from the map at once; its delete is part of `tx`. A sibling exchange of
+    /// the same message on another subscription keeps its own record.
     pub fn remove_in(
         &self,
         session: &ServerSession,
         client_id: &str,
         key: &CorrelationKey,
+        packet_id: i32,
         tx: &TxRef,
     ) -> Result<Option<i32>, BrokerError> {
-        let removed = lock(&self.maps)
-            .get_mut(client_id)
-            .and_then(|m| m.remove(key));
-        match removed {
-            Some(r) => {
-                session.delete_record_in(tx, r.id)?;
-                Ok(Some(r.packet_id))
+        let removed = {
+            let mut maps = lock(&self.maps);
+            let Some(records) = maps.get_mut(client_id).and_then(|m| m.get_mut(key)) else {
+                return Ok(None);
+            };
+            let Some(pos) = records.iter().position(|r| r.packet_id == packet_id) else {
+                return Ok(None);
+            };
+            let r = records.remove(pos);
+            if records.is_empty() {
+                maps.get_mut(client_id).map(|m| m.remove(key));
             }
-            None => Ok(None),
-        }
+            r
+        };
+        session.delete_record_in(tx, removed.id)?;
+        Ok(Some(removed.packet_id))
     }
 
     /// `clear`: the client's map is emptied and its records deleted.
@@ -636,7 +656,7 @@ impl Correlations {
             .map(std::mem::take)
             .unwrap_or_default();
         if let Some(s) = broker.storage() {
-            for r in removed.into_values() {
+            for r in removed.into_values().flatten() {
                 if let Err(e) = s.delete_record(r.id) {
                     tracing::warn!("{e}");
                 }
@@ -646,9 +666,10 @@ impl Correlations {
 
     /// `containsValue`.
     pub fn contains_value(&self, client_id: &str, packet_id: i32) -> bool {
-        lock(&self.maps)
-            .get(client_id)
-            .is_some_and(|m| m.values().any(|r| r.packet_id == packet_id))
+        lock(&self.maps).get(client_id).is_some_and(|m| {
+            m.values()
+                .any(|v| v.iter().any(|r| r.packet_id == packet_id))
+        })
     }
 }
 

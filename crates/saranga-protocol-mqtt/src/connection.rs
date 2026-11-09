@@ -444,12 +444,17 @@ fn publish_to_client(shared: &Shared, message: &CoreMessage, consumer: i64) -> R
             let mut pending = None;
             let (packet_id, redelivery) = {
                 let mut s = lock(&shared.state);
-                let existing = correlations.get(&shared.client_id, &key);
-                let chosen = match existing {
-                    // A redelivery after a reconnect or restart reuses the
-                    // packet ID.
-                    Some(id) if !s.core_delivery_info_exists(id) => (id, true),
-                    _ => {
+                // A redelivery after a reconnect or restart reuses a packet ID
+                // already recorded for this message whose exchange is not
+                // currently in flight, so each of a message's overlapping
+                // subscriptions keeps its own identity across the reconnect.
+                let reuse = correlations
+                    .packet_ids(&shared.client_id, &key)
+                    .into_iter()
+                    .find(|id| !s.core_delivery_info_exists(*id));
+                let chosen = match reuse {
+                    Some(id) => (id, true),
+                    None => {
                         let id = s.generate_packet_id(
                             &broker,
                             correlations,
@@ -1295,8 +1300,16 @@ impl Core {
         self.manager.store_durable_state(&mut self.session, &s)
     }
 
-    /// `removeSubscriptions`: a reason code for each topic.
-    async fn remove_subscriptions(&mut self, topics: &[String], enforce_security: bool) -> Vec<u8> {
+    /// `removeSubscriptions`: a reason code for each topic. `retain_session`
+    /// keeps the durable session record even when the last subscription goes
+    /// (an UNSUBSCRIBE does not end a persistent session); the clean-up paths
+    /// pass false so a session that is actually ending removes its record.
+    async fn remove_subscriptions(
+        &mut self,
+        topics: &[String],
+        enforce_security: bool,
+        retain_session: bool,
+    ) -> Vec<u8> {
         if topics.is_empty() {
             return Vec::new();
         }
@@ -1345,10 +1358,14 @@ impl Core {
                 }
             });
         }
-        if lock(&self.state).subscriptions.is_empty() {
+        if !lock(&self.state).subscriptions.is_empty() || retain_session {
+            // A retained session keeps its record with the subscriptions it has
+            // left, empty or not; an empty subscription set does not end it.
+            if let Err(e) = self.store_durable_state() {
+                tracing::warn!("{}", e.message);
+            }
+        } else {
             self.manager.remove_durable_state(&self.client_id).await;
-        } else if let Err(e) = self.store_durable_state() {
-            tracing::warn!("{}", e.message);
         }
         codes
     }
@@ -1364,7 +1381,8 @@ impl Core {
             // A session stored without subscriptions has a record too.
             self.manager.remove_durable_state(&self.client_id).await;
         }
-        self.remove_subscriptions(&topics, enforce_security).await;
+        self.remove_subscriptions(&topics, enforce_security, false)
+            .await;
         let broker = self.broker();
         self.manager.correlations.clear(&broker, &self.client_id);
         lock(&self.state).clear(&broker);
@@ -1469,9 +1487,13 @@ impl Core {
                     .pubrec_cache(&prefix)
                     .add(&self.session, packet_id, &tx)?;
             }
-            self.manager
-                .correlations
-                .remove_in(&self.session, &self.client_id, &info.key, &tx)?;
+            self.manager.correlations.remove_in(
+                &self.session,
+                &self.client_id,
+                &info.key,
+                packet_id,
+                &tx,
+            )?;
             let events = self.shared.events.clone();
             let held = tx.clone();
             let consumer = info.consumer_id;
@@ -1519,9 +1541,13 @@ impl Core {
                     .pubrec_cache(&prefix)
                     .add(&self.session, packet_id, &tx)?;
             }
-            self.manager
-                .correlations
-                .remove_in(&self.session, &self.client_id, &key, &tx)?;
+            self.manager.correlations.remove_in(
+                &self.session,
+                &self.client_id,
+                &key,
+                packet_id,
+                &tx,
+            )?;
             self.session.commit_tx(&tx)
         })();
         match result {
@@ -2020,9 +2046,20 @@ impl Conn {
             }
             Packet::Disconnect { reason, properties } => {
                 if let Some(v) = properties.int(prop::SESSION_EXPIRY_INTERVAL)
-                    && let Some(core) = &self.core
+                    && let Some(core) = &mut self.core
                 {
-                    lock(&core.state).client_session_expiry_interval = v;
+                    // A retained session keeps its revised expiry across a
+                    // restart: persist the new interval now, while the session
+                    // is still open. An expiry of 0 ends the session, so stop()
+                    // removes its record instead.
+                    let persist = {
+                        let mut st = lock(&core.state);
+                        st.client_session_expiry_interval = v;
+                        v as u32 > 0 && st.stored
+                    };
+                    if persist && let Err(e) = core.store_durable_state() {
+                        tracing::warn!("{}", e.message);
+                    }
                 }
                 // 5.0 3.14.2.1: reason 0x04 is a clean disconnect that still
                 // asks for the will to be published.
@@ -2164,7 +2201,7 @@ impl Conn {
                 properties,
                 topics,
             } => {
-                let codes = core.remove_subscriptions(&topics, true).await;
+                let codes = core.remove_subscriptions(&topics, true, true).await;
                 let bytes = codec::unsuback(core.version, packet_id, &properties, &codes);
                 core.send(bytes);
                 Ok(())

@@ -1474,3 +1474,96 @@ async fn a_null_text_body_is_delivered_empty_and_frees_its_slot() {
     assert_eq!(second[0] & 0xF0, 0x30, "a PUBLISH");
     broker.stop().unwrap();
 }
+
+/// Overlapping subscriptions keep their packet IDs across a reconnect. One
+/// message routed to two overlapping subscriptions is delivered twice, each
+/// exchange with its own packet ID; after a reconnect without acknowledging
+/// either, the same two IDs come back rather than one being reused and a
+/// fresh one generated for the other.
+#[tokio::test]
+async fn overlapping_subscriptions_keep_their_packet_ids_on_reconnect() {
+    let (broker, address, _task) = start(None).await;
+    let (mut s, _) = Client::open(address, "overlap", false).await;
+    s.subscribe("review/+", 1).await;
+    s.subscribe("review/t", 1).await;
+    let (mut p, _) = Client::open(address, "pub", true).await;
+    p.publish("review/t", b"m", 1).await;
+    // One delivery per overlapping subscription, each with its own packet ID.
+    let (_, id1, _) = parse_publish(&s.packet().await.expect("the first delivery"));
+    let (_, id2, _) = parse_publish(&s.packet().await.expect("the second delivery"));
+    let mut before = [id1, id2];
+    before.sort();
+
+    // Reconnect without acknowledging either delivery.
+    drop(s);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (mut s, connack) = Client::open(address, "overlap", false).await;
+    assert_eq!(connack[2], 1, "the session is present");
+    let (_, r1, _) = parse_publish(&s.packet().await.expect("the first redelivery"));
+    let (_, r2, _) = parse_publish(&s.packet().await.expect("the second redelivery"));
+    let mut after = [r1, r2];
+    after.sort();
+    assert_eq!(
+        after, before,
+        "the redelivered packet IDs are the originals, not a reused ID and a fresh one"
+    );
+    broker.stop().unwrap();
+}
+
+/// A Session Expiry Interval lowered on DISCONNECT is persisted: after a
+/// restart the session expires on the revised interval, not the one from
+/// CONNECT.
+#[tokio::test]
+async fn a_disconnect_persists_a_shortened_session_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, address, task) = start_scanning(Some(dir.path()), 20).await;
+    // CONNECT v5 with Session Expiry Interval 60.
+    let (mut c, _) = Client::open_with(address, &connect5("exp", true, 60, None)).await;
+    // DISCONNECT lowering the expiry to 1 second.
+    c.send(&packet(0xE0, &[0x00, 5, 0x11, 0, 0, 0, 1])).await;
+    assert_eq!(c.packet().await, None);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    broker.stop().unwrap();
+    task.abort();
+    drop(broker);
+
+    // Restart and wait past the revised one-second expiry.
+    let (broker2, address, _task) = start_scanning(Some(dir.path()), 20).await;
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    let (_c, connack) = Client::open_with(address, &connect5("exp", false, 1, None)).await;
+    assert_eq!(
+        connack[2], 0,
+        "the one-second expiry elapsed, so no session is present"
+    );
+    broker2.stop().unwrap();
+}
+
+/// A persistent session survives unsubscribing from its last topic: an empty
+/// subscription set does not end the session, so after a restart the session
+/// is still present.
+#[tokio::test]
+async fn a_persistent_session_survives_its_final_unsubscribe() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, address, task) = start(Some(dir.path())).await;
+    let (mut c, _) = Client::open(address, "keep", false).await;
+    c.subscribe("review/t", 1).await;
+    // Unsubscribe from the only topic (MQTT 3.1.1 UNSUBSCRIBE: no properties).
+    let mut unsub = vec![0, 1];
+    unsub.extend(string("review/t"));
+    c.send(&packet(0xA2, &unsub)).await;
+    assert_eq!(c.packet().await.expect("an UNSUBACK")[0], 0xB0);
+    c.send(&[0xE0, 0]).await;
+    assert_eq!(c.packet().await, None);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    broker.stop().unwrap();
+    task.abort();
+    drop(broker);
+
+    let (broker2, address, _task) = start(Some(dir.path())).await;
+    let (_c, connack) = Client::open(address, "keep", false).await;
+    assert_eq!(
+        connack[2], 1,
+        "the persistent session survives its final unsubscribe"
+    );
+    broker2.stop().unwrap();
+}
