@@ -152,13 +152,26 @@ fn details_html(details: &[Json]) -> String {
 /// heuristic completion. False when there is none.
 async fn complete(broker: &Arc<Broker>, base64: &str, commit: bool) -> Outcome {
     let rm = broker.resource_manager();
-    let Some((xid, _)) = rm
+    // A base64 Xid is the branch qualifier, global ID and format ID
+    // concatenated without lengths, so distinct Xids can share one (branch
+    // `[1,2]`+global `[3]` and branch `[1]`+global `[2,3]` both give the same
+    // bytes). Completing the first match would commit or roll back the wrong
+    // branch, so an ambiguous id completes nothing.
+    let mut matches = rm
         .prepared()
         .into_iter()
-        .find(|(x, _)| xid_base64(x) == base64)
-    else {
+        .filter(|(x, _)| xid_base64(x) == base64);
+    let Some((xid, _)) = matches.next() else {
         return Ok(Json::from(false));
     };
+    if matches.next().is_some() {
+        tracing::warn!(
+            "Refusing to {} prepared transaction with base64 id {base64}: more than one \
+             prepared branch shares this id",
+            if commit { "commit" } else { "roll back" }
+        );
+        return Ok(Json::from(false));
+    }
     let Some(tx) = rm.remove(&xid) else {
         return Ok(Json::from(false));
     };

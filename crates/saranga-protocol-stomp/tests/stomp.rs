@@ -317,3 +317,38 @@ async fn a_large_frame_after_login_is_taken() {
     }
     assert!(message.ends_with(&body), "the large message");
 }
+
+/// An ACK naming the wrong subscription is rejected, but under STOMP 1.1 the
+/// connection stays open, so the pending acknowledgement must survive for the
+/// client to retry with the right subscription. (Before, the entry was removed
+/// before the subscription was checked, so the retry failed as "no message" and
+/// the individual delivery was stuck, uncredited, until disconnect.)
+#[tokio::test]
+async fn a_rejected_ack_can_be_retried() {
+    let address = start().await;
+    let mut c = Client::connect(address, "1.1").await;
+    c.send("SEND\ndestination:q_retry\ndestination-type:ANYCAST\n\none")
+        .await;
+    c.send("SUBSCRIBE\ndestination:q_retry\ndestination-type:ANYCAST\nsubscription-type:ANYCAST\nid:s\nack:client-individual\n\n")
+        .await;
+    let m = c.frame().await;
+    assert!(m.starts_with("MESSAGE\n"), "{m}");
+    let id = header(&m, "message-id").unwrap().to_owned();
+
+    // ACK naming the wrong subscription: rejected, connection stays open.
+    c.send(&format!(
+        "ACK\nmessage-id:{id}\nsubscription:wrong\nreceipt:bad\n\n"
+    ))
+    .await;
+    let err = c.frame().await;
+    assert!(err.starts_with("ERROR\n"), "{err}");
+
+    // Retry with the right subscription: the entry is still there, so it acks.
+    c.send(&format!(
+        "ACK\nmessage-id:{id}\nsubscription:s\nreceipt:good\n\n"
+    ))
+    .await;
+    let ok = c.frame().await;
+    assert!(ok.starts_with("RECEIPT\n"), "{ok}");
+    assert_eq!(header(&ok, "receipt-id"), Some("good"));
+}

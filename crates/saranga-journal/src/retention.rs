@@ -169,11 +169,10 @@ impl Inner {
                 continue;
             };
             let id = FileHeader::decode(&h, self.cfg.user_version)?.file_id;
-            let tail = format!("{id}.{}", self.cfg.file_extension);
             if let Ok(dir) = std::fs::read_dir(&retention.directory) {
                 for e in dir.flatten() {
                     let n = e.file_name().to_string_lossy().into_owned();
-                    if n.starts_with(&self.cfg.file_prefix) && n.ends_with(&tail) {
+                    if is_history_of(&self.cfg.file_prefix, &self.cfg.file_extension, id, &n) {
                         tracing::warn!(
                             "File {} was partially copied before, removing the file",
                             e.path().display()
@@ -197,6 +196,14 @@ impl Inner {
 /// `getDatePortionMillis`: the instant a retention copy's name
 /// (`<prefix>-<yyyyMMddHHmmss>-<id>.<ext>`) gives, read in local time;
 /// `None` for a name that is not a copy's.
+/// Whether `name` is a history copy of journal file `id`. A copy is named
+/// `<prefix>-<date>-<id>.<ext>`, so the ID is preceded by `-`; anchoring on it
+/// keeps `1` from matching `11`, `21`, and so on (which would make recovering
+/// file 1's backup delete the unrelated history of 11, 21, ...).
+fn is_history_of(prefix: &str, extension: &str, id: i64, name: &str) -> bool {
+    name.starts_with(prefix) && name.ends_with(&format!("-{id}.{extension}"))
+}
+
 pub fn history_file_millis(prefix: &str, name: &str, local_offset: fn(i64) -> i64) -> Option<i64> {
     let rest = name.get(prefix.len() + 1..)?;
     local_date_millis(&rest[..rest.find('-')?], local_offset)
@@ -275,7 +282,20 @@ impl Civil {
 
 #[cfg(test)]
 mod tests {
-    use super::Civil;
+    use super::{Civil, is_history_of};
+
+    /// Recovering a partially copied backup of file `id` must delete only
+    /// that file's history copy, not the copy of a file whose ID merely ends
+    /// in the same digits (`1` vs `11`, `21`).
+    #[test]
+    fn history_match_anchors_on_the_whole_file_id() {
+        let name_of = |id: i64| format!("activemq-data-20260101000000-{id}.amq");
+        assert!(is_history_of("activemq-data", "amq", 1, &name_of(1)));
+        assert!(!is_history_of("activemq-data", "amq", 1, &name_of(11)));
+        assert!(!is_history_of("activemq-data", "amq", 1, &name_of(21)));
+        assert!(is_history_of("activemq-data", "amq", 11, &name_of(11)));
+        assert!(!is_history_of("activemq-data", "amq", 2, &name_of(12)));
+    }
 
     #[test]
     fn civil_round_trips() {

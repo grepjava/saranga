@@ -501,3 +501,55 @@ async fn destroy_queue_keeps_an_address_its_journaled_messages_hold() {
     assert!(po.address_info("durable").is_some());
     broker.stop().unwrap();
 }
+
+/// A base64 Xid is the branch qualifier, global ID and format ID concatenated
+/// with no lengths, so two distinct Xids can share one. Completing by base64
+/// then has to pick, and must not silently complete the wrong branch: an
+/// ambiguous id completes nothing and leaves both prepared.
+#[tokio::test]
+async fn an_ambiguous_base64_transaction_is_not_completed() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(dir.path()).await;
+    // Distinct Xids (different branch/global split) with identical bytes.
+    let a = Xid {
+        format_id: 7,
+        branch_qualifier: vec![1, 2],
+        global_transaction_id: vec![3],
+    };
+    let b = Xid {
+        format_id: 7,
+        branch_qualifier: vec![1],
+        global_transaction_id: vec![2, 3],
+    };
+    let b64 = saranga_server::transaction::xid_base64(&a);
+    assert_eq!(
+        b64,
+        saranga_server::transaction::xid_base64(&b),
+        "they collide"
+    );
+
+    for x in [&a, &b] {
+        let mut session = xa_session(&broker);
+        session.xa_start(x.clone()).unwrap();
+        session.xa_end(x.clone()).unwrap();
+        session.xa_prepare(x.clone()).unwrap();
+        session.take_completion().wait().await.unwrap();
+    }
+    assert_eq!(broker.resource_manager().prepared().len(), 2);
+
+    // Neither commit nor rollback completes an ambiguous id, and both branches
+    // stay prepared.
+    for op_name in ["commitPreparedTransaction", "rollbackPreparedTransaction"] {
+        assert_eq!(
+            op(&broker, "broker", op_name, vec![s(&b64)]).await,
+            Json::from(false),
+            "{op_name} refused the ambiguous id"
+        );
+    }
+    assert_eq!(
+        broker.resource_manager().prepared().len(),
+        2,
+        "both branches are still prepared"
+    );
+    broker.stop().unwrap();
+}

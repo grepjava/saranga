@@ -1504,13 +1504,13 @@ impl Connection {
             .and_then(|(c, m)| c.parse::<i64>().ok().zip(m.parse::<i64>().ok()))
             .ok_or_else(error)?;
         let session = self.session().await?;
-        let Some(length) = lock(&session.to_ack).remove(&pair) else {
-            return Err(StompError::bundle(format!(
-                "AMQ339025: failed to ack because no message with id: {}",
-                message_id.unwrap_or("null")
-            )));
-        };
         let (consumer, id) = pair;
+        // Validate the subscription before consuming the pending-ack entry. A
+        // rejected ACK (an id header naming the wrong subscription) leaves the
+        // connection open under STOMP 1.1+, so the entry must survive for the
+        // client to retry correctly. Artemis removes it first, so the retry
+        // then fails as "no message with id" and the delivery stays stuck
+        // (never credited back) until the connection closes.
         let sub = session
             .subscriptions
             .get(&consumer)
@@ -1524,6 +1524,12 @@ impl Connection {
                 sub.id
             )));
         }
+        let Some(length) = lock(&session.to_ack).remove(&pair) else {
+            return Err(StompError::bundle(format!(
+                "AMQ339025: failed to ack because no message with id: {}",
+                message_id.unwrap_or("null")
+            )));
+        };
         let credit = |session: &StompSession, n: i64| {
             if let Some(grant) = session.session.credit_granter(consumer) {
                 grant(n as i32);

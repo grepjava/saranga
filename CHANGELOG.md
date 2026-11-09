@@ -13,6 +13,10 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **Journal history recovery deletes only the recovered file's own copies.** A backup file left by a broker that stopped mid-copy is matched to its history copies by the whole file ID, so recovering file 1 no longer deletes the retained history of files 11, 21, and every other ID ending in 1.
+- **XA management refuses an ambiguous prepared transaction.** A base64 Xid id (branch qualifier, global ID and format ID with no lengths) can be shared by distinct Xids; when more than one prepared branch shares the id given to commit or roll back, none is completed, rather than silently completing the wrong one.
+- **A routing-cache entry refreshed as it expires keeps its persisted record.** The in-memory and journal views of a key are updated under one lock order, so a `put` that renews a key no longer races its expiry and leaves the entry live in memory with its journal record deleted (lost on restart).
+- **A rejected STOMP acknowledgement can be retried.** The subscription is validated before the pending acknowledgement is consumed, so an ACK that names the wrong subscription (which leaves a STOMP 1.1+ connection open) no longer discards the entry, and a corrected retry acknowledges the message instead of failing as missing.
 - **A cached login holds only for the client certificate it was made with**, not for another certificate with the same subject.
 - **`OIDCLoginModule` reads RFC 8705's `cnf.x5t#S256`**: a token bound to a certificate that way logs in only with that certificate.
 - **One retained message per MQTT topic.** Clients publishing retained messages to one topic at the same time could leave it several.

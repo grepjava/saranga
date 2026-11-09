@@ -96,17 +96,21 @@ impl Cache {
     /// stored first.
     pub fn put(&self, key: &str, node_id: &str) {
         self.evict_expired();
-        if self.persisted {
-            let mut persisted = self.persisted_entries();
-            if persisted.get(key).map(String::as_str) != Some(node_id) {
-                if let Err(e) = self.store.store(&self.id, key, node_id) {
-                    tracing::warn!(
-                        "Failed to persist the cache entry {key} of {}: {e}",
-                        self.id
-                    );
-                }
-                persisted.insert(key.to_owned(), node_id.to_owned());
+        // Hold the persisted lock (taken first, as `evict_expired` does) across
+        // the entries insert too, so this refresh and a concurrent expiry of
+        // the key cannot interleave between the two maps and leave the entry in
+        // memory without its journal record.
+        let mut persisted = self.persisted.then(|| self.persisted_entries());
+        if let Some(persisted) = persisted.as_mut()
+            && persisted.get(key).map(String::as_str) != Some(node_id)
+        {
+            if let Err(e) = self.store.store(&self.id, key, node_id) {
+                tracing::warn!(
+                    "Failed to persist the cache entry {key} of {}: {e}",
+                    self.id
+                );
             }
+            persisted.insert(key.to_owned(), node_id.to_owned());
         }
         self.entries()
             .insert(key.to_owned(), (node_id.to_owned(), Instant::now()));
@@ -119,26 +123,28 @@ impl Cache {
         let Some(timeout) = self.timeout else {
             return;
         };
-        let expired: Vec<String> = {
-            let mut entries = self.entries();
-            let now = Instant::now();
-            let keys: Vec<String> = entries
-                .iter()
-                .filter(|(_, (_, at))| now.duration_since(*at) >= timeout)
-                .map(|(k, _)| k.clone())
-                .collect();
-            for k in &keys {
-                entries.remove(k);
-            }
-            keys
-        };
-        if self.running.load(Ordering::Acquire) && self.persisted {
-            for key in expired {
-                if self.persisted_entries().remove(&key).is_some()
-                    && let Err(e) = self.store.delete(&self.id, &key)
-                {
-                    tracing::warn!("Failed to delete the cache entry {key} of {}: {e}", self.id);
-                }
+        let delete_persisted = self.running.load(Ordering::Acquire) && self.persisted;
+        // Take the persisted lock before the entries lock (the order `put`
+        // uses) and hold both across the whole eviction, so a key's expiry and
+        // a concurrent refresh of it cannot interleave between the two maps.
+        // Otherwise a `put` that refreshes a key after it is dropped from
+        // `entries` but before its journal record is deleted leaves the entry
+        // live in memory with no persisted record, and it is lost on restart.
+        let mut persisted = delete_persisted.then(|| self.persisted_entries());
+        let mut entries = self.entries();
+        let now = Instant::now();
+        let expired: Vec<String> = entries
+            .iter()
+            .filter(|(_, (_, at))| now.duration_since(*at) >= timeout)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &expired {
+            entries.remove(key);
+            if let Some(persisted) = persisted.as_mut()
+                && persisted.remove(key).is_some()
+                && let Err(e) = self.store.delete(&self.id, key)
+            {
+                tracing::warn!("Failed to delete the cache entry {key} of {}: {e}", self.id);
             }
         }
     }
