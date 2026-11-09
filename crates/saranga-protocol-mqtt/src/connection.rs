@@ -300,7 +300,6 @@ pub struct Shared {
 struct MqttSink {
     shared: Arc<Shared>,
     consumer_id: i64,
-    durable_queue: bool,
 }
 
 impl DeliverySink for MqttSink {
@@ -345,8 +344,12 @@ impl DeliverySink for MqttSink {
         });
     }
 
-    /// `hasCredits`: no more durable QoS 1 and 2 messages than the client's
-    /// Receive Maximum may be in flight ([MQTT-3.3.4-9]).
+    /// `hasCredits`: no more QoS 1 and 2 PUBLISH than the client's Receive
+    /// Maximum may be in flight unacknowledged ([MQTT-3.3.4-9]). The quota
+    /// bounds QoS 1 and 2 whatever their persistence: a non-durable Core
+    /// message delivered at QoS 1 counts the same as a durable one. (Artemis
+    /// gates on `ref.isDurable()`, so a non-durable QoS 1/2 message slips past
+    /// its Receive Maximum.)
     fn has_credits(&self, message: &ServerMessage) -> bool {
         let s = &self.shared;
         let max = if s.receive_maximum > 0 {
@@ -354,7 +357,12 @@ impl DeliverySink for MqttSink {
         } else {
             s.default_max_in_flight
         };
-        !(message.is_durable() && self.durable_queue && max > 0 && lock(&s.state).send_quota >= max)
+        if max <= 0 {
+            return true;
+        }
+        // QoS 0 carries no packet ID and never counts against the quota.
+        let qos = decide_qos(s, message.delivery_core(), self.consumer_id);
+        !(qos >= 1 && lock(&s.state).send_quota >= max)
     }
 }
 
@@ -549,7 +557,7 @@ fn publish_after(
         }
         let max = s.client_max_packet_size;
         if max != 0 {
-            let size = artemis_message_size(&topic, &properties, payload.len());
+            let size = encoded_publish_size(&topic, qos, &properties, payload.len());
             if size > i64::from(max) {
                 // [MQTT-3.1.2-25] discard it, as if sent. An alias this call
                 // registered is undone, since its defining packet never goes.
@@ -589,10 +597,16 @@ fn publish_after(
     Ok(true)
 }
 
-/// `MQTTUtil.calculateMessageSize` of the PUBLISH as Artemis estimates it:
-/// a packet ID even at QoS 0, no topic length, and properties counted
-/// without their string lengths.
-fn artemis_message_size(topic: &str, properties: &Properties, payload: usize) -> i64 {
+/// The encoded size of the PUBLISH, to compare against the client's Maximum
+/// Packet Size ([MQTT-3.1.2-25]). Artemis's `MQTTUtil.calculateMessageSize`
+/// undercounts: its `calculatePublishPropertiesSize` omits the two-byte
+/// length of each UTF-8 string property (Content Type, Response Topic) and
+/// the four bytes of lengths in each User Property pair, and its
+/// `calculateRemainingLength` always counts a two-byte packet identifier even
+/// at QoS 0 while dropping the topic's own two-byte length. Saranga counts the
+/// bytes actually sent: every length prefix, and a packet identifier only when
+/// the QoS carries one.
+fn encoded_publish_size(topic: &str, qos: i32, properties: &Properties, payload: usize) -> i64 {
     let mut props = 0i64;
     if properties.has(prop::PAYLOAD_FORMAT_INDICATOR) {
         props += 2;
@@ -608,17 +622,18 @@ fn artemis_message_size(topic: &str, properties: &Properties, payload: usize) ->
     }
     for k in [prop::CONTENT_TYPE, prop::RESPONSE_TOPIC] {
         if let Some(s) = properties.string(k) {
-            props += 1 + s.len() as i64;
+            props += 1 + 2 + s.len() as i64;
         }
     }
     for (k, v) in properties.user_properties() {
-        props += 1 + k.len() as i64 + v.len() as i64;
+        props += 1 + 2 + k.len() as i64 + 2 + v.len() as i64;
     }
     if let Some(b) = properties.binary(prop::CORRELATION_DATA) {
         props += 1 + 2 + b.len() as i64;
     }
     props += util::variable_byte_integer_size(props);
-    let remaining = 2 + topic.len() as i64 + props + payload as i64;
+    let packet_id = if qos > 0 { 2 } else { 0 };
+    let remaining = 2 + topic.len() as i64 + packet_id + props + payload as i64;
     1 + util::variable_byte_integer_size(remaining) + remaining
 }
 
@@ -671,7 +686,10 @@ fn publish_properties(
     }
     if message.expiration != 0 {
         // [MQTT-3.3.2-6] what is left of the expiry, to the nearest second.
-        let left = ((message.expiration - now_millis()) as f64 / 1000.0).round() as i32;
+        // The interval is unsigned; keep its bits by wrapping into the codec's
+        // i32 (Java's `(int)` truncates), not by saturating as `f64 as i32`
+        // would, so a value over i32::MAX is forwarded whole and not shortened.
+        let left = (((message.expiration - now_millis()) as f64 / 1000.0).round() as i64) as i32;
         props.add_int(prop::MESSAGE_EXPIRY_INTERVAL, left);
     }
     Ok(props)
@@ -1196,7 +1214,6 @@ impl Core {
         let sink = Arc::new(MqttSink {
             shared: self.shared.clone(),
             consumer_id: cid,
-            durable_queue: queue.is_durable(),
         });
         self.session
             .create_consumer(cid, queue.name(), filter, 0, false, move |_: &Queue| {

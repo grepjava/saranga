@@ -1144,17 +1144,21 @@ impl Bridge {
         };
         let id = b.next_consumer_id();
         self.inner.consumer_id.store(id, Ordering::SeqCst);
-        self.inner.queue.add_consumer(ConsumerRegistration {
-            id,
-            client_id: id as i64,
-            sink: Arc::new(Sink(self.inner.clone())),
-            filter: self.filter.clone(),
-            priority: 0,
-            browse_only: false,
-            pre_acknowledge: false,
-            started: true,
-            metrics: Arc::new(ConsumerMetrics::default()),
-        });
+        // An internal bridge consumer is not bound by max-consumers.
+        let _ = self.inner.queue.add_consumer(
+            ConsumerRegistration {
+                id,
+                client_id: id as i64,
+                sink: Arc::new(Sink(self.inner.clone())),
+                filter: self.filter.clone(),
+                priority: 0,
+                browse_only: false,
+                pre_acknowledge: false,
+                started: true,
+                metrics: Arc::new(ConsumerMetrics::default()),
+            },
+            -1,
+        );
         self.inner.queue.credits(id, -1);
     }
 

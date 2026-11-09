@@ -935,3 +935,140 @@ async fn a_takeover_publishes_the_immediate_will() {
     assert!(p.ends_with(b"bye"), "{p:?}");
     broker.stop().unwrap();
 }
+
+/// The outgoing Maximum Packet Size check counts every property length prefix,
+/// so a packet whose true encoded size exceeds the client's limit is discarded
+/// even when Artemis's undercounting estimate would have let it through.
+#[tokio::test]
+async fn an_oversized_publication_counts_property_lengths_and_is_discarded() {
+    let (broker, address, _task) = start(None).await;
+    // Maximum Packet Size 25.
+    let (mut sub, _) =
+        Client::open_with(address, &connect5_props("s", &[0x27, 0, 0, 0, 25], None)).await;
+    sub.send(&subscribe_option("orders", 1)).await;
+    assert_eq!(sub.packet().await.unwrap()[0], 0x90);
+    // A v5 publisher sends a QoS 1 PUBLISH with a User Property key=value and
+    // payload "hello". Rebuilt for the subscriber this encodes to 31 bytes;
+    // undercounted (as Artemis does) it is 25 and would be sent.
+    let (mut publisher, _) = Client::open_with(address, &connect5_props("p", &[], None)).await;
+    let mut props = vec![0x26]; // User Property
+    props.extend(string("key"));
+    props.extend(string("value"));
+    let mut body = string("orders");
+    body.extend(1u16.to_be_bytes());
+    body.push(props.len() as u8);
+    body.extend(props);
+    body.extend_from_slice(b"hello");
+    publisher.send(&packet(0x32, &body)).await;
+    assert_eq!(
+        publisher.packet().await.unwrap()[0],
+        0x40,
+        "the publisher is acknowledged"
+    );
+    assert!(
+        sub.silent_for(400).await,
+        "the oversized delivery is discarded, so the subscriber receives nothing"
+    );
+    broker.stop().unwrap();
+}
+
+/// A large Message Expiry Interval is forwarded whole. The remaining seconds
+/// are an unsigned value kept by its bits in the codec's signed field, not
+/// saturated at i32::MAX.
+#[tokio::test]
+async fn a_large_outgoing_expiry_interval_is_forwarded_whole() {
+    use saranga_protocol_mqtt::codec::{Decoder, Packet, Version, prop};
+    let (broker, address, _task) = start(None).await;
+    let (mut sub, _) = Client::open_with(address, &connect5_props("s", &[], None)).await;
+    sub.send(&subscribe_option("orders", 1)).await;
+    assert_eq!(sub.packet().await.unwrap()[0], 0x90);
+    // A v5 QoS 1 PUBLISH with Message Expiry Interval 0xFFFFFFFF, payload "hi".
+    let (mut publisher, _) = Client::open_with(address, &connect5_props("p", &[], None)).await;
+    let mut body = string("orders");
+    body.extend(1u16.to_be_bytes());
+    let props = [0x02, 0xFF, 0xFF, 0xFF, 0xFF]; // Message Expiry Interval
+    body.push(props.len() as u8);
+    body.extend_from_slice(&props);
+    body.extend_from_slice(b"hi");
+    publisher.send(&packet(0x32, &body)).await;
+    assert_eq!(publisher.packet().await.unwrap()[0], 0x40, "a PUBACK");
+    let mut bytes = sub.packet().await.expect("the forwarded publication");
+    let Packet::Publish(msg) = Decoder::for_version(Version::V5)
+        .decode(&mut bytes)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("a PUBLISH");
+    };
+    let forwarded = msg.properties.int(prop::MESSAGE_EXPIRY_INTERVAL).unwrap() as u32;
+    assert!(
+        forwarded > i32::MAX as u32,
+        "the unsigned interval is kept whole, not saturated to i32::MAX: {forwarded}"
+    );
+    broker.stop().unwrap();
+}
+
+/// Receive Maximum bounds QoS 1 and 2 PUBLISH whatever their persistence: a
+/// non-durable Core message delivered at QoS 1 counts against the quota, so a
+/// second is held until the first is acknowledged.
+#[tokio::test]
+async fn nonpersistent_core_messages_respect_receive_maximum() {
+    use saranga_server::session::{ClientConnection, ServerSession, SessionOptions, Transport};
+    let (broker, address, _task) = start(None).await;
+    // Receive Maximum 1.
+    let (mut sub, _) =
+        Client::open_with(address, &connect5_props("quota", &[0x21, 0, 1], None)).await;
+    sub.send(&subscribe_option("orders", 1)).await;
+    assert_eq!(sub.packet().await.unwrap()[0], 0x90);
+
+    let conn = Arc::new(ClientConnection::new(
+        Transport::internal("probe"),
+        Arc::new(saranga_security::ConnectionInfo::default()),
+        vec![],
+    ));
+    let mut producer = ServerSession::new(
+        broker.clone(),
+        conn,
+        SessionOptions {
+            name: "core-producer".into(),
+            username: None,
+            password: None,
+            xa: false,
+            auto_commit_sends: true,
+            auto_commit_acks: true,
+            pre_acknowledge: false,
+            default_address: None,
+        },
+        Default::default(),
+    );
+    for _ in 0..2 {
+        producer
+            .send(
+                saranga_message::CoreMessage {
+                    address: Some("orders".into()),
+                    durable: false,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        producer.take_completion().wait().await.unwrap();
+    }
+    // The first PUBLISH arrives; the second is held by the single quota slot.
+    let first = sub.packet().await.expect("the first PUBLISH");
+    assert_eq!(first[0] & 0xF0, 0x30, "a PUBLISH");
+    assert!(
+        sub.silent_for(300).await,
+        "the second is held until the first is acknowledged"
+    );
+    // Acknowledge the first; the freed slot lets the second through.
+    let (_, id, _) = parse_publish(&first);
+    sub.send(&packet(0x40, &id.to_be_bytes())).await;
+    let second = sub
+        .packet()
+        .await
+        .expect("the second PUBLISH after the ack");
+    assert_eq!(second[0] & 0xF0, 0x30, "a PUBLISH");
+    broker.stop().unwrap();
+}

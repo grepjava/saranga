@@ -856,14 +856,38 @@ impl Queue {
         }
     }
 
-    pub fn add_consumer(&self, reg: ConsumerRegistration) {
-        self.0.consumer_count.fetch_add(1, Ordering::SeqCst);
+    /// Registers a consumer, reserving its slot atomically against
+    /// `max_consumers` (`-1` for no limit) so two sessions cannot both pass the
+    /// check and exceed the limit. Returns `false` without registering when the
+    /// queue is already full.
+    #[must_use]
+    pub fn add_consumer(&self, reg: ConsumerRegistration, max_consumers: i32) -> bool {
+        if max_consumers < 0 {
+            self.0.consumer_count.fetch_add(1, Ordering::SeqCst);
+        } else {
+            let mut cur = self.0.consumer_count.load(Ordering::SeqCst);
+            loop {
+                if cur >= max_consumers {
+                    return false;
+                }
+                match self.0.consumer_count.compare_exchange_weak(
+                    cur,
+                    cur + 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
+            }
+        }
         self.0
             .consumer_filters
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .push((reg.id, reg.filter.clone()));
         self.send(Cmd::AddConsumer(Box::new(reg)));
+        true
     }
 
     /// `hasMatchingConsumer`: a consumer without a filter, or whose filter

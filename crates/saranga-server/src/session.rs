@@ -2692,9 +2692,6 @@ impl ServerSession {
             ));
         }
         let c = queue.config();
-        if !browse_only && c.max_consumers != -1 && queue.consumer_count() >= c.max_consumers {
-            return Err(BrokerError::max_consumer_limit_reached(&c.address, &c.name));
-        }
         let id = self.broker.next_consumer_id();
         // Its deliveries go through the audit log's message logger, which
         // can be turned on while it consumes.
@@ -2721,17 +2718,26 @@ impl ServerSession {
             sink: sink.clone(),
         });
         let _ = audited.consumer.set(Arc::downgrade(&consumer));
-        queue.add_consumer(ConsumerRegistration {
-            id,
-            client_id: consumer_id,
-            sink: sink.clone(),
-            filter,
-            priority,
-            browse_only,
-            pre_acknowledge: self.pre_acknowledge,
-            started: self.started,
-            metrics: metrics.clone(),
-        });
+        // A browse-only consumer is not bound by max-consumers. The limit is
+        // checked and the slot reserved atomically here, so two sessions
+        // racing to the last slot cannot both be admitted.
+        let effective_max = if browse_only { -1 } else { c.max_consumers };
+        if !queue.add_consumer(
+            ConsumerRegistration {
+                id,
+                client_id: consumer_id,
+                sink: sink.clone(),
+                filter,
+                priority,
+                browse_only,
+                pre_acknowledge: self.pre_acknowledge,
+                started: self.started,
+                metrics: metrics.clone(),
+            },
+            effective_max,
+        ) {
+            return Err(BrokerError::max_consumer_limit_reached(&c.address, &c.name));
+        }
         self.entry.add_consumer(consumer.clone());
         self.broker.registry().consumer_created();
         post_office

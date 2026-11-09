@@ -43,6 +43,10 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **An MQTT 5 acknowledgement wakes a message waiting on any of the connection's subscriptions.** A QoS 1 or 2 message held back by Receive Maximum on one subscription is delivered as soon as an acknowledgement on another frees a slot.
 - **An MQTT client taken over by a new connection with the same client ID has its will published**, as any other abnormal close does.
 - **An MQTT 5 wildcard subscription with Retain As Published keeps the RETAIN flag** on the messages forwarded to it live, instead of the publication being dropped.
+- **Receive Maximum bounds QoS 1 and 2 messages whatever their persistence.** A non-durable message — from a non-persistent Core or STOMP producer — delivered to an MQTT subscriber at QoS 1 now counts against the client's Receive Maximum instead of slipping past it.
+- **An MQTT 5 delivery larger than the client's Maximum Packet Size is discarded.** The size check counts every property length prefix, and a packet ID only when the QoS carries one, so a packet whose true size exceeds the limit is no longer sent for the client to reject.
+- **A queue's `max-consumers` holds under a race.** Two sessions adding their last consumer at the same moment can no longer both be admitted: the limit is checked and the slot reserved as one atomic step.
+- **A large MQTT 5 Message Expiry Interval is forwarded whole.** The remaining seconds keep their unsigned value, rather than being cut to about 24.8 days when the interval is over 2^31.
 
 ## 1.2.0 (2026-11-02)
 
