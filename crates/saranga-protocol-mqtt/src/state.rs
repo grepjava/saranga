@@ -357,6 +357,12 @@ impl SessionState {
         self.server_topic_aliases.get(topic).copied()
     }
 
+    /// Undoes an [`Self::add_server_topic_alias`] whose defining packet was
+    /// not sent, so the client is never told an alias it did not learn.
+    pub fn remove_server_topic_alias(&mut self, topic: &str) {
+        self.server_topic_aliases.remove(topic);
+    }
+
     pub fn clear_topic_aliases(&mut self) {
         self.client_topic_aliases.clear();
         self.server_topic_aliases.clear();

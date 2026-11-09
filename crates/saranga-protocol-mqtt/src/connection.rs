@@ -404,7 +404,7 @@ fn publish_to_client(shared: &Shared, message: &CoreMessage, consumer: i64) -> R
     match qos {
         0 => {
             // [MQTT-2.2.1-2] and [MQTT-3.3.1-2]: no packet ID, no DUP.
-            if publish(shared, 0, message, false, 0)? {
+            if publish(shared, 0, message, false, 0, consumer)? {
                 let _ = shared.events.send(Event::Ack {
                     consumer,
                     message: message.message_id,
@@ -451,7 +451,7 @@ fn publish_to_client(shared: &Shared, message: &CoreMessage, consumer: i64) -> R
             if let Some(p) = pending {
                 wait.push(p);
             }
-            publish_after(shared, wait, packet_id, message, redelivery, qos)?;
+            publish_after(shared, wait, packet_id, message, redelivery, qos, consumer)?;
             Ok(())
         }
         _ => {
@@ -471,6 +471,7 @@ fn publish(
     message: &CoreMessage,
     redelivery: bool,
     qos: i32,
+    consumer: i64,
 ) -> Result<bool, String> {
     publish_after(
         shared,
@@ -479,6 +480,7 @@ fn publish(
         message,
         redelivery,
         qos,
+        consumer,
     )
 }
 
@@ -491,6 +493,7 @@ fn publish_after(
     message: &CoreMessage,
     redelivery: bool,
     qos: i32,
+    consumer: i64,
 ) -> Result<bool, String> {
     let address = message
         .address
@@ -513,24 +516,29 @@ fn publish_after(
     let mut is_retain = has(util::MQTT_MESSAGE_RETAIN_INITIAL_DISTRIBUTION_KEY);
     let mut properties = Properties::default();
     if shared.version == Version::V5 {
+        // The lock is held across the alias decision and the size check, so a
+        // discarded message's alias is never left in the state.
         let mut s = lock(&shared.state);
         properties = publish_properties(&s, message, &topic)?;
         if !is_retain && bool_value(message.properties.get_str(util::MQTT_MESSAGE_RETAIN_KEY)) {
-            // Artemis looks the subscription up by the topic and fails when
-            // it was made with a filter that is not the topic itself; here
-            // that subscription just is not retain-as-published.
+            // Retain As Published belongs to the subscription that delivered
+            // this message, found by its consumer, not by the topic (a
+            // wildcard subscription is not stored under the concrete topic).
             if s.subscriptions
-                .get(&topic)
+                .values()
+                .find(|i| i.consumer == Some(consumer))
                 .is_some_and(|i| i.subscription.option.retain_as_published)
             {
                 is_retain = true;
             }
         }
+        let mut added_alias = None;
         if s.client_topic_alias_maximum.is_some() {
             match s.server_topic_alias(&topic) {
                 None => {
                     if let Some(alias) = s.add_server_topic_alias(&topic) {
                         properties.add_int(prop::TOPIC_ALIAS, alias);
+                        added_alias = Some(topic.clone());
                     }
                 }
                 Some(alias) => {
@@ -539,21 +547,26 @@ fn publish_after(
                 }
             }
         }
-    }
-    let max = lock(&shared.state).client_max_packet_size;
-    if shared.version == Version::V5 && max != 0 {
-        let size = artemis_message_size(&topic, &properties, payload.len());
-        if size > i64::from(max) {
-            // [MQTT-3.1.2-25] discard it, as if sent.
-            tracing::debug!(
-                "Not sending message {} to client as its size ({size}) exceeds the max ({max})",
-                message.message_id
-            );
-            if qos == 0 {
-                return Ok(true);
+        let max = s.client_max_packet_size;
+        if max != 0 {
+            let size = artemis_message_size(&topic, &properties, payload.len());
+            if size > i64::from(max) {
+                // [MQTT-3.1.2-25] discard it, as if sent. An alias this call
+                // registered is undone, since its defining packet never goes.
+                if let Some(t) = added_alias {
+                    s.remove_server_topic_alias(&t);
+                }
+                drop(s);
+                tracing::debug!(
+                    "Not sending message {} to client as its size ({size}) exceeds the max ({max})",
+                    message.message_id
+                );
+                if qos == 0 {
+                    return Ok(true);
+                }
+                let _ = shared.events.send(Event::Discard { packet_id });
+                return Ok(false);
             }
-            let _ = shared.events.send(Event::Discard { packet_id });
-            return Ok(false);
         }
     }
     let dup = qos != 0 && redelivery;
@@ -1454,10 +1467,20 @@ impl Core {
             .and_then(|_| self.session.commit_tx(&tx));
         match result {
             Ok(()) => {
-                {
+                let others = {
                     let mut s = lock(&self.state);
                     s.remove_core_delivery_info(packet_id);
                     s.send_quota -= 1;
+                    // The send quota is the connection's, so the freed slot
+                    // can belong to any subscription: wake them all, not only
+                    // the one just acknowledged.
+                    s.subscriptions
+                        .values()
+                        .filter_map(|i| i.consumer)
+                        .collect::<Vec<_>>()
+                };
+                for c in others {
+                    self.session.prompt_delivery(c);
                 }
                 self.session.prompt_delivery(consumer);
                 self.ack_reply(packet_id, reason::SUCCESS, needs_pubrel);
@@ -2277,6 +2300,10 @@ impl Conn {
         if self.v5() {
             self.send_disconnect(reason::SESSION_TAKEN_OVER);
         }
+        // 5.0 3.1.4: a takeover is not a clean disconnect, so an immediate
+        // will is published. A delayed will is cancelled when the taking-over
+        // CONNECT resumes the session (it resets `failed`).
+        self.disconnect_with_will = true;
         self.disconnect(false).await;
     }
 

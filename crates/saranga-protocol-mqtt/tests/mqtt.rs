@@ -804,3 +804,134 @@ async fn a_high_bit_session_expiry_still_expires() {
     );
     broker.stop().unwrap();
 }
+
+/// An MQTT 5 CONNECT with a raw property block and, maybe, a QoS 0 will.
+fn connect5_props(client_id: &str, props: &[u8], will: Option<(&str, &[u8])>) -> Vec<u8> {
+    let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 5];
+    body.push(0x02 | if will.is_some() { 0x04 } else { 0 }); // clean start
+    body.extend([0, 60]);
+    body.push(props.len() as u8);
+    body.extend_from_slice(props);
+    body.extend(string(client_id));
+    if let Some((topic, message)) = will {
+        body.push(0); // will properties
+        body.extend(string(topic));
+        body.extend((message.len() as u16).to_be_bytes());
+        body.extend_from_slice(message);
+    }
+    packet(0x10, &body)
+}
+
+/// A SUBSCRIBE with a raw subscription-options byte (QoS, No Local, Retain As
+/// Published, Retain Handling).
+fn subscribe_option(filter: &str, option: u8) -> Vec<u8> {
+    let mut body = vec![0, 1, 0];
+    body.extend(string(filter));
+    body.push(option);
+    packet(0x82, &body)
+}
+
+/// A publication discarded for its size leaves no topic alias behind: the
+/// next publication on the topic still carries the full topic that defines
+/// the alias.
+#[tokio::test]
+async fn a_discarded_publication_leaves_no_topic_alias() {
+    let (broker, address, _task) = start(None).await;
+    // Maximum Packet Size 40, Topic Alias Maximum 1.
+    let (mut sub, _) = Client::open_with(
+        address,
+        &connect5_props("s", &[0x27, 0, 0, 0, 40, 0x22, 0, 1], None),
+    )
+    .await;
+    sub.send(&subscribe_option("topic", 0)).await;
+    assert_eq!(sub.packet().await.unwrap()[0], 0x90);
+    let (mut publisher, _) = Client::open(address, "p", true).await;
+    // Over 40 bytes: discarded. Then a small one that is sent.
+    publisher
+        .send(&packet(0x30, &{
+            let mut b = string("topic");
+            b.extend(vec![b'x'; 100]);
+            b
+        }))
+        .await;
+    publisher
+        .send(&packet(0x30, &{
+            let mut b = string("topic");
+            b.extend_from_slice(b"ok");
+            b
+        }))
+        .await;
+    let p = sub.packet().await.expect("the ok publication");
+    // Topic length 5 ("topic"), i.e. not aliased away to empty, and it still
+    // carries alias 1 as the defining packet.
+    assert_eq!(&p[2..4], &[0, 5], "the full topic defines the alias: {p:?}");
+    assert!(
+        p.windows(3).any(|w| w == [0x23, 0, 1]),
+        "alias 1 present: {p:?}"
+    );
+    broker.stop().unwrap();
+}
+
+/// Acknowledging on one subscription frees the connection's send slot and
+/// wakes a message waiting on another subscription.
+#[tokio::test]
+async fn an_ack_wakes_a_message_on_another_subscription() {
+    let (broker, address, _task) = start(None).await;
+    // Receive Maximum 1.
+    let (mut sub, _) = Client::open_with(address, &connect5_props("s", &[0x21, 0, 1], None)).await;
+    sub.send(&subscribe_option("a", 1)).await;
+    assert_eq!(sub.packet().await.unwrap()[0], 0x90);
+    sub.send(&subscribe_option("b", 1)).await;
+    assert_eq!(sub.packet().await.unwrap()[0], 0x90);
+    let (mut publisher, _) = Client::open(address, "p", true).await;
+    publisher.publish("a", b"one", 1).await;
+    let first = sub.packet().await.expect("a/one");
+    let (_, first_id, _) = parse_publish(&first);
+    publisher.publish("b", b"two", 1).await;
+    // Only one slot: b/two waits.
+    assert!(sub.silent_for(200).await);
+    // Acknowledge a/one; the freed slot must let b/two through.
+    sub.send(&packet(0x40, &first_id.to_be_bytes())).await;
+    let p = sub.packet().await.expect("b/two after the ack");
+    assert!(parse_publish(&p).2.ends_with(b"two"), "{p:?}");
+    broker.stop().unwrap();
+}
+
+/// A wildcard subscription with Retain As Published keeps the RETAIN flag on
+/// a live retained publication.
+#[tokio::test]
+async fn a_wildcard_retain_as_published_keeps_the_flag() {
+    let (broker, address, _task) = start(None).await;
+    let (mut sub, _) = Client::open_with(address, &connect5_props("s", &[], None)).await;
+    sub.send(&subscribe_option("a/#", 0x08)).await; // Retain As Published
+    assert_eq!(sub.packet().await.unwrap()[0], 0x90);
+    let (mut publisher, _) = Client::open(address, "p", true).await;
+    // A retained QoS 0 publish to a/b.
+    publisher
+        .send(&packet(0x31, &{
+            let mut b = string("a/b");
+            b.extend_from_slice(b"retained");
+            b
+        }))
+        .await;
+    let p = sub.packet().await.expect("the publication");
+    assert_eq!(p[0] & 0xF0, 0x30, "a PUBLISH");
+    assert_eq!(p[0] & 0x01, 0x01, "RETAIN kept: {p:?}");
+    broker.stop().unwrap();
+}
+
+/// A client takeover publishes the replaced client's immediate will.
+#[tokio::test]
+async fn a_takeover_publishes_the_immediate_will() {
+    let (broker, address, _task) = start(None).await;
+    let (mut watcher, _) = Client::open(address, "watcher", true).await;
+    watcher.subscribe("will/t", 0).await;
+    let (_old, _) =
+        Client::open_with(address, &connect5_props("p", &[], Some(("will/t", b"bye")))).await;
+    // A second connection with the same client ID takes over.
+    let (_replacement, _) = Client::open_with(address, &connect5_props("p", &[], None)).await;
+    let p = watcher.packet().await.expect("the will on takeover");
+    assert_eq!(p[0] & 0xF0, 0x30, "a PUBLISH");
+    assert!(p.ends_with(b"bye"), "{p:?}");
+    broker.stop().unwrap();
+}

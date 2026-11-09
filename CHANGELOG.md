@@ -39,6 +39,10 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **A reused session-local consumer ID is refused** instead of leaving the first consumer registered on its queue with nothing to reach it.
 - **An MQTT 5 DISCONNECT with reason 0x04** (Disconnect with Will Message) publishes the will, while a normal DISCONNECT still holds it back.
 - **A large MQTT 5 Session Expiry Interval** (one with the high bit set) is read as an unsigned count of seconds rather than a negative that never expires; `0xFFFFFFFF` still means never.
+- **A publication discarded for a client's MQTT 5 Maximum Packet Size takes back its topic alias**, so the next message to that topic carries the full topic name rather than an alias whose defining packet the client never received.
+- **An MQTT 5 acknowledgement wakes a message waiting on any of the connection's subscriptions.** A QoS 1 or 2 message held back by Receive Maximum on one subscription is delivered as soon as an acknowledgement on another frees a slot.
+- **An MQTT client taken over by a new connection with the same client ID has its will published**, as any other abnormal close does.
+- **An MQTT 5 wildcard subscription with Retain As Published keeps the RETAIN flag** on the messages forwarded to it live, instead of the publication being dropped.
 
 ## 1.2.0 (2026-11-02)
 
