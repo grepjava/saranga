@@ -49,6 +49,11 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **A large MQTT 5 Message Expiry Interval is forwarded whole.** The remaining seconds keep their unsigned value, rather than being cut to about 24.8 days when the interval is over 2^31.
 - **An MQTT 5 will keeps its publication properties.** A published will carries its Message Expiry Interval (started when the will is published), Payload Format Indicator, Content Type, Response Topic and Correlation Data, not only its user properties — so an expiring will no longer stays queued or retained indefinitely.
 - **`xaStart` no longer risks a deadlock with the transaction reaper.** Replacing an open, unprepared branch releases the transaction before it touches the resource-manager table, the order the reaper and recovery already take the two locks.
+- **MQTT Receive Maximum is reserved as one atomic step.** A publication fanning out to several of a connection's subscription queues at once can no longer have two of them both pass the check and send past the limit.
+- **A QoS 2 message holds its Receive Maximum slot until PUBCOMP.** The slot is freed when the exchange completes, not at PUBREC, so a slow receiver cannot accumulate more incomplete QoS 2 exchanges than its Receive Maximum (an error PUBREC still frees it early).
+- **A resumed QoS 2 exchange grants no extra Receive Maximum credit.** Completing an exchange that outlived its connection — a PUBCOMP for a PUBREL retransmitted on a resumed session — releases a slot only when the current connection reserved one, so the quota can no longer be driven below zero into letting an extra PUBLISH past Receive Maximum.
+- **An acknowledgement after an unsubscribe still frees its slot.** A PUBACK or PUBREC whose subscription's consumer has gone (unsubscribed or closed) now completes packet-level settlement — freeing the Receive Maximum slot and waking the connection's other subscriptions — instead of leaving the slot held until the client reconnects.
+- **A null Core text body is delivered as an empty MQTT payload.** A TEXT message with no body (a JMS text message without text, or a management import without a `text` member) is sent on as an empty payload rather than failing the publish and stranding its reserved Receive Maximum slot.
 
 ## 1.2.0 (2026-11-02)
 

@@ -2518,8 +2518,26 @@ impl Actor {
         }) else {
             return false;
         };
+        // An expired message is never delivered (`checkExpired`). Drop it before
+        // the credit check below, which reserves a flow-control slot for what it
+        // admits; a reserved slot must always be spent on a delivery.
+        {
+            let m = &self.messages.get(at).message;
+            if m.core().expiration != 0 && m.is_expired(now_millis()) {
+                let r = self.messages.remove(at);
+                let failures = self.write_failures;
+                self.expire(r);
+                // Put back by a failed write: trying again now would find it.
+                return self.write_failures == failures;
+            }
+        }
         // handle: a consumer whose protocol holds this message back is busy.
-        if !c.reg.sink.has_credits(&self.messages.get(at).message) {
+        // For MQTT this also reserves the Receive Maximum slot.
+        if !self.consumers[index]
+            .reg
+            .sink
+            .has_credits(&self.messages.get(at).message)
+        {
             return false;
         }
         let mut r = if non_destructive {
@@ -2527,16 +2545,6 @@ impl Actor {
         } else {
             self.messages.remove(at)
         };
-        // An expired message is never delivered (`checkExpired`).
-        if r.message.core().expiration != 0 && r.message.is_expired(now_millis()) {
-            if non_destructive {
-                r = self.messages.remove(at);
-            }
-            let failures = self.write_failures;
-            self.expire(r);
-            // Put back by a failed write: trying again now would find it.
-            return self.write_failures == failures;
-        }
         // handleMessageGroup: a new group is pinned to this consumer and its
         // first message flagged; sequence -1 closes the group.
         let mut first = false;

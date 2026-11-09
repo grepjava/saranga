@@ -2,7 +2,7 @@
 //! `MQTTSessionState`, `SubscriptionItem`, `PacketIdCache` and the
 //! journalled packet-ID map (`JournalHashMap` of `PacketIdCorrelationKey`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use saranga_buffer::{JString, PropertyValue, Reader, SimpleString, Writer};
@@ -218,6 +218,12 @@ pub struct SessionState {
     server_topic_aliases: HashMap<String, i32>,
     core_delivery_infos: HashMap<i32, CoreDeliveryInfo>,
     pub send_quota: i32,
+    /// Outbound QoS 2 packet IDs that hold a Receive Maximum slot on the
+    /// current connection awaiting PUBCOMP. Unlike the durable PUBREC cache,
+    /// this is reset when the connection drops, so a PUBCOMP for an exchange
+    /// resumed from the persisted cache does not release a slot the new
+    /// connection never reserved.
+    pub pubcomp_slots: HashSet<i32>,
     /// The session store may hold a record of this session.
     pub stored: bool,
     /// The session of the client's last connection (`getSession`), kept
@@ -247,6 +253,7 @@ impl SessionState {
             server_topic_aliases: HashMap::new(),
             core_delivery_infos: HashMap::new(),
             send_quota: 0,
+            pubcomp_slots: HashSet::new(),
             stored: false,
             session: None,
         }
@@ -393,6 +400,7 @@ impl SessionState {
 
     pub fn clear_core_delivery_info(&mut self) {
         self.core_delivery_infos.clear();
+        self.pubcomp_slots.clear();
     }
 
     /// `getMatchingSubscriptionIdentifiers` for an MQTT topic.

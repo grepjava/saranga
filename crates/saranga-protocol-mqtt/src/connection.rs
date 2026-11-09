@@ -350,6 +350,12 @@ impl DeliverySink for MqttSink {
     /// message delivered at QoS 1 counts the same as a durable one. (Artemis
     /// gates on `ref.isDurable()`, so a non-durable QoS 1/2 message slips past
     /// its Receive Maximum.)
+    ///
+    /// Admitting a QoS 1 or 2 message reserves its slot in the same locked
+    /// step, so two subscription queues of one connection cannot both pass the
+    /// check and send past the Receive Maximum. The caller delivers every
+    /// admitted message (an expired one is dropped before this check), so a
+    /// reservation is never left unspent.
     fn has_credits(&self, message: &ServerMessage) -> bool {
         let s = &self.shared;
         let max = if s.receive_maximum > 0 {
@@ -362,7 +368,15 @@ impl DeliverySink for MqttSink {
         }
         // QoS 0 carries no packet ID and never counts against the quota.
         let qos = decide_qos(s, message.delivery_core(), self.consumer_id);
-        !(qos >= 1 && lock(&s.state).send_quota >= max)
+        if qos < 1 {
+            return true;
+        }
+        let mut st = lock(&s.state);
+        if st.send_quota >= max {
+            return false;
+        }
+        st.send_quota += 1;
+        true
     }
 }
 
@@ -452,7 +466,7 @@ fn publish_to_client(shared: &Shared, message: &CoreMessage, consumer: i64) -> R
                         key,
                     },
                 );
-                s.send_quota += 1;
+                // The send quota was reserved atomically in `has_credits`.
                 chosen
             };
             let mut wait = Completion::default();
@@ -512,11 +526,16 @@ fn publish_after(
     let payload = match message.message_type {
         message_type::TEXT => {
             let mut r = Reader::new(&message.body);
-            let text = r
-                .nullable_simple_string()
-                .map_err(|e| e.to_string())?
-                .ok_or("null text body")?;
-            saranga_storage::java::simple_string(&text).into_bytes()
+            // A null text body is a valid Core/JMS representation (a JMS
+            // TextMessage with no text, or a management import without a
+            // `text` member); carry it as an empty MQTT payload rather than
+            // failing the publish and stranding the reserved Receive Maximum
+            // slot. (Artemis passes the null to `ByteBufUtil.utf8Bytes` and
+            // throws, leaking the slot.)
+            match r.nullable_simple_string().map_err(|e| e.to_string())? {
+                Some(text) => saranga_storage::java::simple_string(&text).into_bytes(),
+                None => Vec::new(),
+            }
         }
         _ => message.body.to_vec(),
     };
@@ -1430,7 +1449,7 @@ impl Core {
         };
         if !self.session.has_consumer(info.consumer_id) {
             tracing::warn!(
-                "AMQ834014: MQTT client {} sent PUBREC for packet {packet_id}, but acknowledgement failed. Internal consumer {} not found. Internal session is {}.",
+                "AMQ834014: MQTT client {} acknowledged packet {packet_id}, but internal consumer {} is gone (session {}). Completing packet-level settlement so the Receive Maximum slot is freed.",
                 self.client_id,
                 info.consumer_id,
                 if self.session.is_closed() {
@@ -1439,7 +1458,7 @@ impl Core {
                     "not closed"
                 }
             );
-            self.ack_reply(packet_id, reason::PACKET_IDENTIFIER_NOT_FOUND, needs_pubrel);
+            self.ack_without_consumer(packet_id, needs_pubrel, info.key);
             return;
         }
         let tx = self.session.new_transaction();
@@ -1484,6 +1503,33 @@ impl Core {
         }
     }
 
+    /// Settles a QoS 1 or 2 acknowledgement whose originating subscription
+    /// consumer is gone (unsubscribed or closed) while the delivery was still
+    /// in flight. The Core message was already returned to its queue when the
+    /// consumer closed, so there is nothing to acknowledge there; the packet
+    /// still owns connection state — its delivery info, its Receive Maximum
+    /// slot, and (for QoS 2) its PUBREC exchange — which must be settled so the
+    /// slot is freed and the connection's other subscriptions keep delivering.
+    fn ack_without_consumer(&mut self, packet_id: i32, needs_pubrel: bool, key: CorrelationKey) {
+        let tx = self.session.new_transaction();
+        let result: Result<(), BrokerError> = (|| {
+            if needs_pubrel {
+                let prefix = self.prefix();
+                lock(&self.state)
+                    .pubrec_cache(&prefix)
+                    .add(&self.session, packet_id, &tx)?;
+            }
+            self.manager
+                .correlations
+                .remove_in(&self.session, &self.client_id, &key, &tx)?;
+            self.session.commit_tx(&tx)
+        })();
+        match result {
+            Ok(()) => self.settle_acked(packet_id, needs_pubrel, None),
+            Err(e) => self.ack_failed(packet_id, needs_pubrel, &tx, e),
+        }
+    }
+
     /// The rest of [`acknowledge_delivery`](Self::acknowledge_delivery)
     /// once the queue answered.
     fn acked(
@@ -1500,26 +1546,70 @@ impl Core {
             .acknowledged_tx(pending, &tx, result)
             .and_then(|_| self.session.commit_tx(&tx));
         match result {
-            Ok(()) => {
-                let others = {
-                    let mut s = lock(&self.state);
-                    s.remove_core_delivery_info(packet_id);
-                    s.send_quota -= 1;
-                    // The send quota is the connection's, so the freed slot
-                    // can belong to any subscription: wake them all, not only
-                    // the one just acknowledged.
-                    s.subscriptions
-                        .values()
-                        .filter_map(|i| i.consumer)
-                        .collect::<Vec<_>>()
-                };
-                for c in others {
-                    self.session.prompt_delivery(c);
-                }
-                self.session.prompt_delivery(consumer);
-                self.ack_reply(packet_id, reason::SUCCESS, needs_pubrel);
-            }
+            Ok(()) => self.settle_acked(packet_id, needs_pubrel, Some(consumer)),
             Err(e) => self.ack_failed(packet_id, needs_pubrel, &tx, e),
+        }
+    }
+
+    /// The packet-level settlement shared by [`acked`](Self::acked) and
+    /// [`ack_without_consumer`](Self::ack_without_consumer): drop the delivery
+    /// info and, for QoS 1, release the Receive Maximum slot; for QoS 2 record
+    /// the slot so only this connection's PUBCOMP releases it. `wake` is the
+    /// just-acknowledged consumer, woken for QoS 1 (it is gone in the
+    /// no-consumer path).
+    fn settle_acked(&mut self, packet_id: i32, needs_pubrel: bool, wake: Option<i64>) {
+        let others = {
+            let mut s = lock(&self.state);
+            s.remove_core_delivery_info(packet_id);
+            if needs_pubrel {
+                // A successful QoS 2 PUBREC keeps its Receive Maximum slot
+                // until PUBCOMP ([MQTT] 4.9); record the packet ID so the
+                // PUBCOMP handler releases only a slot this connection
+                // reserved, never one resumed from the persisted PUBREC cache.
+                // (An error PUBREC takes the `!needs_pubrel` path and releases
+                // it now.)
+                s.pubcomp_slots.insert(packet_id);
+                Vec::new()
+            } else {
+                s.send_quota -= 1;
+                // The send quota is the connection's, so the freed slot can
+                // belong to any subscription: wake them all, not only the one
+                // just acknowledged.
+                s.subscriptions
+                    .values()
+                    .filter_map(|i| i.consumer)
+                    .collect::<Vec<_>>()
+            }
+        };
+        for c in others {
+            self.session.prompt_delivery(c);
+        }
+        if !needs_pubrel && let Some(c) = wake {
+            self.session.prompt_delivery(c);
+        }
+        self.ack_reply(packet_id, reason::SUCCESS, needs_pubrel);
+    }
+
+    /// Releases the Receive Maximum slot a QoS 2 exchange held until PUBCOMP
+    /// and wakes every subscription on the connection, since the freed slot
+    /// can belong to any of them. A PUBCOMP whose packet ID holds no slot on
+    /// this connection — a PUBREL retransmitted for a session resumed from the
+    /// persisted PUBREC cache — releases nothing, so the quota cannot go
+    /// negative and grant unearned credit.
+    fn release_send_slot(&mut self, packet_id: i32) {
+        let others = {
+            let mut s = lock(&self.state);
+            if !s.pubcomp_slots.remove(&packet_id) {
+                return;
+            }
+            s.send_quota -= 1;
+            s.subscriptions
+                .values()
+                .filter_map(|i| i.consumer)
+                .collect::<Vec<_>>()
+        };
+        for c in others {
+            self.session.prompt_delivery(c);
         }
     }
 
@@ -2051,6 +2141,11 @@ impl Conn {
                 lock(&core.state)
                     .pubrec_cache(&prefix)
                     .remove(&broker, packet_id);
+                // [MQTT] 4.9: the QoS 2 slot is held until PUBCOMP. Release it
+                // now and wake any subscription waiting for a slot — but only
+                // if this connection actually reserved the slot (see
+                // `release_send_slot`).
+                core.release_send_slot(packet_id);
                 Ok(())
             }
             Packet::Subscribe {

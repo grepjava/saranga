@@ -1124,3 +1124,353 @@ async fn a_will_keeps_its_expiry_and_content_properties() {
     assert!(msg.payload.ends_with(b"bye"), "the will payload");
     broker.stop().unwrap();
 }
+
+/// Receive Maximum is reserved atomically, so one publication fanning out to
+/// many overlapping subscription queues at once still puts only one QoS 1
+/// PUBLISH in flight until it is acknowledged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_subscription_queues_respect_receive_maximum() {
+    let (broker, address, _task) = start(None).await;
+    let (mut s, _) = Client::open_with(address, &connect5_props("rq", &[0x21, 0, 1], None)).await;
+    // 128 overlapping filters that all match one topic, so a single publish
+    // dispatches on many subscription queues concurrently.
+    for mask in 0..128u32 {
+        let filter = (0..7)
+            .map(|i| if mask & (1 << i) == 0 { "a" } else { "+" })
+            .collect::<Vec<_>>()
+            .join("/");
+        s.send(&subscribe_option(&filter, 1)).await;
+        assert_eq!(s.packet().await.unwrap()[0], 0x90);
+    }
+    let (mut p, _) = Client::open(address, "pp", true).await;
+    p.publish("a/a/a/a/a/a/a", b"hello", 1).await;
+    // Exactly one PUBLISH is in flight; the rest wait for a PUBACK.
+    let first = s.packet().await.expect("the first PUBLISH");
+    assert_eq!(first[0] & 0xF0, 0x30, "a PUBLISH");
+    assert!(
+        s.silent_for(500).await,
+        "Receive Maximum 1 holds the rest until a PUBACK"
+    );
+    broker.stop().unwrap();
+}
+
+/// A successful QoS 2 exchange holds its Receive Maximum slot until PUBCOMP: a
+/// PUBREC frees nothing, and the next publication waits until the client
+/// completes the exchange.
+#[tokio::test]
+async fn a_qos2_slot_is_held_until_pubcomp() {
+    use saranga_protocol_mqtt::codec::{Decoder, Packet, Version};
+    use saranga_server::session::{ClientConnection, ServerSession, SessionOptions, Transport};
+    let (broker, address, _task) = start(None).await;
+    let (mut s, _) = Client::open_with(address, &connect5_props("q2", &[0x21, 0, 1], None)).await;
+    s.send(&subscribe_option("orders", 2)).await;
+    assert_eq!(s.packet().await.unwrap()[0], 0x90);
+
+    // A Core producer gives these deliveries effective QoS 2.
+    let conn = Arc::new(ClientConnection::new(
+        Transport::internal("probe"),
+        Arc::new(saranga_security::ConnectionInfo::default()),
+        vec![],
+    ));
+    let mut producer = ServerSession::new(
+        broker.clone(),
+        conn,
+        SessionOptions {
+            name: "q2-producer".into(),
+            username: None,
+            password: None,
+            xa: false,
+            auto_commit_sends: true,
+            auto_commit_acks: true,
+            pre_acknowledge: false,
+            default_address: None,
+        },
+        Default::default(),
+    );
+    for _ in 0..2 {
+        producer
+            .send(
+                saranga_message::CoreMessage {
+                    address: Some("orders".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        producer.take_completion().wait().await.unwrap();
+    }
+
+    // The first QoS 2 PUBLISH; the second is held by the single quota slot.
+    let mut first = s.packet().await.expect("the first PUBLISH");
+    let Packet::Publish(msg) = Decoder::for_version(Version::V5)
+        .decode(&mut first)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("a PUBLISH");
+    };
+    assert_eq!(msg.qos, 2, "QoS 2");
+    assert!(s.silent_for(200).await, "the second waits");
+    let pid = msg.packet_id as u16;
+
+    // PUBREC: the server replies with PUBREL, and the slot is still held.
+    s.send(&packet(0x50, &pid.to_be_bytes())).await;
+    let pubrel = s.packet().await.expect("a PUBREL");
+    assert_eq!(
+        pubrel[0] & 0xF0,
+        0x60,
+        "PUBREL, not a second PUBLISH: {pubrel:?}"
+    );
+    assert!(
+        s.silent_for(300).await,
+        "the slot is held until PUBCOMP, so no second PUBLISH yet"
+    );
+
+    // PUBCOMP frees the slot; the second PUBLISH now arrives.
+    s.send(&packet(0x70, &pid.to_be_bytes())).await;
+    let second = s.packet().await.expect("the second PUBLISH after PUBCOMP");
+    assert_eq!(second[0] & 0xF0, 0x30, "a PUBLISH: {second:?}");
+    broker.stop().unwrap();
+}
+
+/// A Core producer session for giving MQTT subscribers effective QoS 1/2
+/// deliveries.
+async fn core_producer(broker: &Arc<Broker>, name: &str) -> saranga_server::session::ServerSession {
+    use saranga_server::session::{ClientConnection, ServerSession, SessionOptions, Transport};
+    let conn = Arc::new(ClientConnection::new(
+        Transport::internal("probe"),
+        Arc::new(saranga_security::ConnectionInfo::default()),
+        vec![],
+    ));
+    ServerSession::new(
+        broker.clone(),
+        conn,
+        SessionOptions {
+            name: name.into(),
+            username: None,
+            password: None,
+            xa: false,
+            auto_commit_sends: true,
+            auto_commit_acks: true,
+            pre_acknowledge: false,
+            default_address: None,
+        },
+        Default::default(),
+    )
+}
+
+/// Sends one Core message and waits for it to be routed.
+async fn send_core(
+    producer: &mut saranga_server::session::ServerSession,
+    message: saranga_message::CoreMessage,
+) {
+    producer.send(message, None).await.unwrap();
+    producer.take_completion().wait().await.unwrap();
+}
+
+/// A resumed session's PUBCOMP for a QoS 2 exchange that outlived its
+/// connection releases no Receive Maximum slot: the durable PUBREC cache is
+/// not the new connection's credit, so completing an old exchange cannot push
+/// the quota below zero and let an extra PUBLISH slip past Receive Maximum.
+#[tokio::test]
+async fn a_resumed_qos2_pubcomp_grants_no_extra_credit() {
+    use saranga_protocol_mqtt::codec::{Decoder, Packet, Version};
+    let (broker, address, _task) = start(None).await;
+
+    // Receive Maximum 1 and a session expiry, so the session and its PUBREC
+    // cache survive a reconnect.
+    let props: &[u8] = &[0x11, 0, 0, 1, 0x2C, 0x21, 0, 1];
+    let connect = |clean: bool| {
+        let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 5];
+        body.push(if clean { 0x02 } else { 0x00 });
+        body.extend([0, 60]);
+        body.push(props.len() as u8);
+        body.extend_from_slice(props);
+        body.extend(string("q2resume"));
+        packet(0x10, &body)
+    };
+
+    let (mut s, _) = Client::open_with(address, &connect(true)).await;
+    s.send(&subscribe_option("orders", 2)).await;
+    assert_eq!(s.packet().await.unwrap()[0], 0x90);
+
+    let mut producer = core_producer(&broker, "q2resume-producer").await;
+    send_core(
+        &mut producer,
+        saranga_message::CoreMessage {
+            address: Some("orders".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Receive the QoS 2 PUBLISH and take the exchange as far as PUBREC/PUBREL.
+    let mut first = s.packet().await.expect("the first PUBLISH");
+    let Packet::Publish(msg) = Decoder::for_version(Version::V5)
+        .decode(&mut first)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("a PUBLISH");
+    };
+    assert_eq!(msg.qos, 2, "QoS 2");
+    let pid = msg.packet_id as u16;
+    s.send(&packet(0x50, &pid.to_be_bytes())).await; // PUBREC
+    assert_eq!(
+        s.packet().await.expect("a PUBREL")[0] & 0xF0,
+        0x60,
+        "PUBREL"
+    );
+
+    // Disconnect without PUBCOMP; the slot is reset but the PUBREC cache
+    // survives for the resumable session.
+    s.send(&[0xE0, 0]).await; // DISCONNECT, normal
+    drop(s);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Resume; the old exchange's PUBREL is retransmitted.
+    let (mut s, _) = Client::open_with(address, &connect(false)).await;
+    let pubrel = s.packet().await.expect("the retransmitted PUBREL");
+    assert_eq!(pubrel[0] & 0xF0, 0x60, "PUBREL: {pubrel:?}");
+    assert_eq!(
+        u16::from_be_bytes([pubrel[2], pubrel[3]]),
+        pid,
+        "for the old exchange"
+    );
+
+    // Two new messages arrive at the resumed subscription; Receive Maximum 1
+    // puts exactly one PUBLISH in flight.
+    send_core(
+        &mut producer,
+        saranga_message::CoreMessage {
+            address: Some("orders".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    send_core(
+        &mut producer,
+        saranga_message::CoreMessage {
+            address: Some("orders".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        s.packet().await.expect("one new PUBLISH")[0] & 0xF0,
+        0x30,
+        "a PUBLISH"
+    );
+    assert!(s.silent_for(300).await, "the second waits for a slot");
+
+    // Completing the old exchange must not free a slot the new connection
+    // never reserved: the second new PUBLISH stays held.
+    s.send(&packet(0x70, &pid.to_be_bytes())).await; // PUBCOMP for the old pid
+    assert!(
+        s.silent_for(400).await,
+        "a resumed PUBCOMP grants no extra credit, so no second PUBLISH"
+    );
+    broker.stop().unwrap();
+}
+
+/// A PUBACK that arrives after its subscription was unsubscribed still frees
+/// the connection's Receive Maximum slot, so the connection's other
+/// subscriptions keep delivering instead of stalling until reconnect.
+#[tokio::test]
+async fn an_ack_after_unsubscribe_frees_the_slot() {
+    let (broker, address, _task) = start(None).await;
+    let (mut s, _) =
+        Client::open_with(address, &connect5_props("unsub", &[0x21, 0, 1], None)).await;
+    s.send(&subscribe_option("orders", 1)).await;
+    assert_eq!(s.packet().await.unwrap()[0], 0x90);
+    s.send(&subscribe_option("other", 1)).await;
+    assert_eq!(s.packet().await.unwrap()[0], 0x90);
+
+    // A QoS 1 message on `orders` takes the single slot.
+    let (mut p, _) = Client::open(address, "pub", true).await;
+    p.publish("orders", b"first", 1).await;
+    let first = s.packet().await.expect("the orders PUBLISH");
+    assert_eq!(first[0] & 0xF0, 0x30, "a PUBLISH");
+    let (_, id, _) = parse_publish(&first);
+
+    // Unsubscribe from `orders`, closing its consumer, before acknowledging.
+    let mut unsub = vec![0, 2, 0];
+    unsub.extend(string("orders"));
+    s.send(&packet(0xA2, &unsub)).await;
+    assert_eq!(s.packet().await.expect("an UNSUBACK")[0], 0xB0);
+
+    // Acknowledge the in-flight message whose consumer is now gone.
+    s.send(&packet(0x40, &id.to_be_bytes())).await;
+
+    // The freed slot lets `other` deliver.
+    p.publish("other", b"second", 2).await;
+    let second = s
+        .packet()
+        .await
+        .expect("the other PUBLISH once the slot frees");
+    assert_eq!(second[0] & 0xF0, 0x30, "a PUBLISH");
+    broker.stop().unwrap();
+}
+
+/// A Core TEXT message with a null body reaches the client as an empty MQTT
+/// payload rather than failing the publish: its Receive Maximum slot is spent
+/// and freed normally, so a later message on the connection is not stranded
+/// behind a leaked slot.
+#[tokio::test]
+async fn a_null_text_body_is_delivered_empty_and_frees_its_slot() {
+    use saranga_protocol_mqtt::codec::{Decoder, Packet, Version};
+    let (broker, address, _task) = start(None).await;
+    let (mut s, _) =
+        Client::open_with(address, &connect5_props("nulltext", &[0x21, 0, 1], None)).await;
+    s.send(&subscribe_option("orders", 1)).await;
+    assert_eq!(s.packet().await.unwrap()[0], 0x90);
+
+    let mut producer = core_producer(&broker, "null-producer").await;
+    // A TEXT message whose body is a null nullable-SimpleString (marker 0).
+    send_core(
+        &mut producer,
+        saranga_message::CoreMessage {
+            address: Some("orders".into()),
+            message_type: saranga_message::message_type::TEXT,
+            body: vec![0u8].into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    // A following ordinary message.
+    send_core(
+        &mut producer,
+        saranga_message::CoreMessage {
+            address: Some("orders".into()),
+            body: b"second".to_vec().into(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // The null-text message arrives with an empty payload.
+    let mut first = s.packet().await.expect("the null-text PUBLISH");
+    let Packet::Publish(msg) = Decoder::for_version(Version::V5)
+        .decode(&mut first)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("a PUBLISH");
+    };
+    assert!(
+        msg.payload.is_empty(),
+        "null text becomes an empty payload: {:?}",
+        msg.payload
+    );
+
+    // Its slot frees on PUBACK, so the second message is delivered.
+    s.send(&packet(0x40, &(msg.packet_id as u16).to_be_bytes()))
+        .await;
+    let second = s
+        .packet()
+        .await
+        .expect("the second PUBLISH once the slot frees");
+    assert_eq!(second[0] & 0xF0, 0x30, "a PUBLISH");
+    broker.stop().unwrap();
+}
