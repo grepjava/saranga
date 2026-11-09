@@ -1765,3 +1765,43 @@ async fn a_colliding_subscription_queue_name_is_refused() {
 
     broker.stop().unwrap();
 }
+
+/// The topic of a PUBLISH packet (3.1.1, no v5 properties).
+fn publish_topic(p: &[u8]) -> String {
+    let mut i = 1;
+    while p[i] & 0x80 != 0 {
+        i += 1;
+    }
+    i += 1;
+    let len = usize::from(u16::from_be_bytes([p[i], p[i + 1]]));
+    String::from_utf8_lossy(&p[i + 2..i + 2 + len]).into_owned()
+}
+
+/// A wildcard-leading subscription does not see `$` topics ([MQTT-4.7.2-1]),
+/// and retained replay must match: a `#` subscriber gets a normal retained
+/// topic but not a retained `$secret/status`. (The direct queue insertion of
+/// retained replay bypasses the queue's routing filter, so the exclusion has
+/// to be applied in the replay too.)
+#[tokio::test]
+async fn a_wildcard_subscription_does_not_replay_a_dollar_retained_topic() {
+    let (_broker, address, _task) = start(None).await;
+    let (mut publisher, _) = Client::open(address, "pub", true).await;
+    publisher.retain("$secret/status", b"s", 1).await;
+    publisher.retain("news/sports", b"n", 2).await;
+
+    // `#` replays the normal topic only.
+    let (mut sub, _) = Client::open(address, "sub", true).await;
+    sub.subscribe("#", 1).await;
+    let m = sub.packet().await.expect("a retained PUBLISH");
+    assert_eq!(publish_topic(&m), "news/sports");
+    assert!(
+        sub.silent_for(400).await,
+        "the $ topic must not be replayed"
+    );
+
+    // An explicit `$`-leading subscription still gets it.
+    let (mut secret, _) = Client::open(address, "secret", true).await;
+    secret.subscribe("$secret/#", 1).await;
+    let m = secret.packet().await.expect("a retained PUBLISH");
+    assert_eq!(publish_topic(&m), "$secret/status");
+}

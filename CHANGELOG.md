@@ -13,6 +13,7 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **A retained `$` topic is not replayed to a wildcard subscription.** A subscription whose first level is a wildcard (`#`, `+/...`) does not see `$` topics ([MQTT-4.7.2-1]); the leading-`$` exclusion now applies to retained-message replay too, which inserts directly into the queue and bypassed the routing filter, so retained and live delivery agree.
 - **Journal history recovery deletes only the recovered file's own copies.** A backup file left by a broker that stopped mid-copy is matched to its history copies by the whole file ID, so recovering file 1 no longer deletes the retained history of files 11, 21, and every other ID ending in 1.
 - **XA management refuses an ambiguous prepared transaction.** A base64 Xid id (branch qualifier, global ID and format ID with no lengths) can be shared by distinct Xids; when more than one prepared branch shares the id given to commit or roll back, none is completed, rather than silently completing the wrong one.
 - **A routing-cache entry refreshed as it expires keeps its persisted record.** The in-memory and journal views of a key are updated under one lock order, so a `put` that renews a key no longer races its expiry and leaves the entry live in memory with its journal record deleted (lost on restart).

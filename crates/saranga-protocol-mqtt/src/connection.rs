@@ -1033,12 +1033,30 @@ impl Core {
             .session
             .binding_query(&retain_address, true)
             .queue_names;
+        // The destination queue's routing filter is bypassed by the direct
+        // insertion below, so apply its leading-`$` exclusion here too: a
+        // wildcard-leading subscription does not see `$` topics
+        // ([MQTT-4.7.2-1]), and retained replay must match live routing.
+        let exclude_dollar = queue.filter_string().as_deref()
+            == Some(self.settings.message_filter_no_dollar.as_str());
         let tx = self.session.new_transaction();
         let result: Result<(), BrokerError> = async {
             for name in names {
                 let Some(retained) = po.queue(&name) else {
                     continue;
                 };
+                if exclude_dollar {
+                    // The retained queue is bound to `$sys.mqtt.retain.<addr>`;
+                    // recover the original address to test its leading `$`.
+                    let cfg = retained.config();
+                    let bound: &str = &cfg.address;
+                    let topic = bound
+                        .strip_prefix(util::MQTT_RETAIN_ADDRESS_PREFIX)
+                        .unwrap_or(bound);
+                    if topic.starts_with(util::DOLLAR) {
+                        continue;
+                    }
+                }
                 let Some(last) = retained.browse().await.pop() else {
                     continue;
                 };
