@@ -59,6 +59,9 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **A persistent MQTT session survives unsubscribing from its last topic.** Removing the final subscription keeps the durable session record (with an empty subscription set) instead of deleting it, so a resumed or restarted session is still found; only a clean session or an actual expiry ends it.
 - **An MQTT message whose topic cannot be represented is discarded, not left to stall the connection.** When a Core address reaches a subscriber as a topic that has an MQTT wildcard character, the message is discarded (its Receive Maximum slot freed and its reference settled) the way an oversized one is, rather than failing the delivery and stranding the slot so later messages cannot flow.
 - **An MQTT topic or property too long for its two-byte wire length is rejected, not truncated.** A converted topic or string property over 65535 bytes is discarded rather than encoded with a wrapped length that would corrupt the packet.
+- **A wildcard address keeps a literal delimiter in its word.** An escaped delimiter (`a\.b`, as an MQTT topic level containing a `.` becomes) is one word, not split in two, so a subscription like `+/c` still matches `a.b/c`.
+- **Wildcard matching backtracks.** An any-words wildcard whose first candidate word leaves the rest of the pattern unmatched tries the next, and a wildcard following an any-words wildcard is matched as a wildcard rather than literal text, so patterns such as `a.#.b.c` and `a.#.*.c` match the addresses they should instead of silently missing the subscriber.
+- **An expiring MQTT session is not removed out from under a reconnection.** A client that reconnects while the session scan is expiring its old session keeps its session and queues: the scan re-checks and removes atomically, rather than deleting a session the client has just re-attached to.
 
 ## 1.2.0 (2026-11-02)
 

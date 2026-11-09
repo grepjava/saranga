@@ -1672,3 +1672,51 @@ async fn a_core_topic_over_the_wire_length_is_discarded() {
     assert_eq!(msg.payload, b"second");
     broker.stop().unwrap();
 }
+
+/// A session the scan chose to expire, but to which a client has since
+/// reconnected (marking its state attached), is not removed: the re-check and
+/// removal are one atomic step, so an active client keeps its session and
+/// queues.
+#[tokio::test]
+async fn a_reattached_session_is_not_expired() {
+    use saranga_protocol_mqtt::state::{StateManager, lock};
+    let (broker, _address, _task) = start(None).await;
+    let mgr = StateManager::new(&broker, false, String::new());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    // An expiry-eligible session: detached, a one-second expiry, long gone.
+    let attached = mgr.session_state("attached");
+    {
+        let mut s = lock(&attached);
+        s.client_session_expiry_interval = 1;
+        s.disconnected_time = now - 10_000;
+        s.attached = false;
+    }
+    // A client reconnects to it.
+    let (_state, present, _prev) = mgr.attach_session("attached");
+    assert!(present, "the session already existed");
+    // The scan must not claim it now that it is attached.
+    assert!(
+        mgr.claim_expired("attached", now).is_none(),
+        "an attached session is not expired"
+    );
+    assert!(mgr.has_session_state("attached"), "it is still present");
+
+    // A still-detached, expired session is claimed and removed.
+    let gone = mgr.session_state("gone");
+    {
+        let mut s = lock(&gone);
+        s.client_session_expiry_interval = 1;
+        s.disconnected_time = now - 10_000;
+        s.attached = false;
+    }
+    assert!(
+        mgr.claim_expired("gone", now).is_some(),
+        "a detached expired session is removed"
+    );
+    assert!(!mgr.has_session_state("gone"));
+    broker.stop().unwrap();
+}

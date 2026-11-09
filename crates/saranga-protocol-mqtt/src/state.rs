@@ -787,6 +787,56 @@ impl StateManager {
         lock(&self.states).remove(client_id)
     }
 
+    /// Attaches a connecting client to its session ([MQTT-3.1.2-4]), marking
+    /// the state attached under the states-map lock so the session scan cannot
+    /// expire it between the lookup and the attach. Returns the state, whether
+    /// a session already existed (for Session Present), and the previous
+    /// connection's kept session to drop.
+    pub fn attach_session(
+        &self,
+        client_id: &str,
+    ) -> (StateRef, bool, Option<Box<crate::connection::Core>>) {
+        let mut states = lock(&self.states);
+        let present = states.contains_key(client_id);
+        let state = states
+            .entry(client_id.to_owned())
+            .or_insert_with(|| {
+                tracing::debug!("Adding MQTT session state for: {client_id}");
+                Arc::new(Mutex::new(SessionState::new(client_id)))
+            })
+            .clone();
+        let previous = {
+            let mut s = lock(&state);
+            s.attached = true;
+            s.disconnected_time = 0;
+            s.failed = false;
+            s.session.take()
+        };
+        (state, present, previous)
+    }
+
+    /// Removes an expired session only if it is still detached and expired,
+    /// checked and removed under the states-map lock so a client that has
+    /// reconnected (and marked its state attached via [`Self::attach_session`])
+    /// since the scan chose it keeps its session.
+    pub fn claim_expired(&self, client_id: &str, now: i64) -> Option<StateRef> {
+        let mut states = lock(&self.states);
+        let state = states.get(client_id)?.clone();
+        let expired = {
+            let s = lock(&state);
+            let raw = s.client_session_expiry_interval;
+            let expiry = i64::from(raw as u32);
+            !s.attached && raw != -1 && expiry > 0 && s.disconnected_time + expiry * 1000 < now
+        };
+        if expired {
+            tracing::debug!("Removing MQTT session state for: {client_id}");
+            states.remove(client_id);
+            Some(state)
+        } else {
+            None
+        }
+    }
+
     pub fn session_states(&self) -> Vec<(String, StateRef)> {
         lock(&self.states)
             .iter()
@@ -884,7 +934,10 @@ impl StateManager {
             crate::connection::send_detached_will(&state).await;
         }
         for client_id in to_remove {
-            let Some(state) = self.remove_session_state(&client_id) else {
+            // Re-validate and remove atomically: a client that reconnected
+            // during the awaits above has marked its state attached, and must
+            // keep its session and queues.
+            let Some(state) = self.claim_expired(&client_id, now) else {
                 continue;
             };
             crate::connection::expire_detached(self, &state).await;

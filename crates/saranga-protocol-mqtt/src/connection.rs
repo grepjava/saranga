@@ -2534,15 +2534,10 @@ impl Conn {
         }
         // The Netty codec's "clean session" is 5's "clean start" too.
         let clean_start = connect.clean_start;
-        let session_present = self.manager.has_session_state(&client_id);
-        let state = self.manager.session_state(&client_id);
-        let previous = {
-            let mut s = lock(&state);
-            s.attached = true;
-            s.disconnected_time = 0;
-            s.failed = false;
-            s.session.take()
-        };
+        // Attaching marks the state attached under the states-map lock, so the
+        // session scan cannot expire this session between the lookup and the
+        // attach.
+        let (state, session_present, previous) = self.manager.attach_session(&client_id);
         drop(previous);
         let mut session = ServerSession::new(
             self.broker.clone(),

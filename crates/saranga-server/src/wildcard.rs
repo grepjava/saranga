@@ -39,62 +39,65 @@ impl WildcardConfig {
         false
     }
 
-    /// Whether `address` is matched by `pattern` (`AddressImpl.matches`,
-    /// with `this` = `address` and `otherAddr` = `pattern`).
+    /// Splits an address into words on the delimiter, leaving an escaped
+    /// delimiter (`\.`) part of its word rather than a word boundary, so a
+    /// literal delimiter in a word (as an MQTT topic level containing a `.`
+    /// becomes) keeps the word whole. (`AddressImpl` splits on every
+    /// delimiter, so `a\.b.c` is read as three words instead of two.)
+    fn words<'a>(&self, address: &'a str) -> Vec<&'a str> {
+        let mut parts = Vec::new();
+        let mut start = 0;
+        let mut escaped = false;
+        for (i, c) in address.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if c == ESCAPE {
+                escaped = true;
+            } else if c == self.delimiter {
+                parts.push(&address[start..i]);
+                start = i + c.len_utf8();
+            }
+        }
+        parts.push(&address[start..]);
+        parts
+    }
+
+    /// Whether `address` is matched by `pattern` (`AddressImpl.matches`, with
+    /// `this` = `address` and `otherAddr` = `pattern`).
+    ///
+    /// The single-word wildcard matches one word; the any-words wildcard
+    /// matches zero or more. Matching is a table over the two word lists so a
+    /// wildcard whose first candidate word leaves the rest unmatched tries the
+    /// next (`AddressImpl` takes the first and never backtracks, and reads a
+    /// wildcard after an any-words wildcard as a literal, so `a.b.b.c` misses
+    /// `a.#.b.c` and `a.b.c` misses `a.#.*.c`).
     pub fn matches(&self, address: &str, pattern: &str) -> bool {
         if address == pattern {
             return true;
         }
-        let this: Vec<&str> = address.split(self.delimiter).collect();
-        let other: Vec<&str> = pattern.split(self.delimiter).collect();
+        let this = self.words(address);
+        let other = self.words(pattern);
         let is = |part: &str, c: char| part.len() == c.len_utf8() && part.starts_with(c);
-
-        let (mut ti, mut oi) = (0, 0);
-        while oi < other.len() {
-            if ti >= this.len() {
-                // Only a trailing any-words wildcard matches nothing more.
-                return oi == other.len() - 1 && other[oi].starts_with(self.any_words);
-            }
-            let other_curr = other[oi];
-            if is(other_curr, self.single_word) {
-                ti += 1;
-                oi += 1;
-                continue;
-            }
-            if is(other_curr, self.any_words) {
-                if oi == other.len() - 1 {
-                    return true;
-                }
-                let other_next = other[oi + 1];
-                // Skip parts of this address until one matches the part
-                // after the wildcard.
-                let mut this_curr = Some(this[ti]);
-                let mut this_next = if ti < this.len() - 1 {
-                    Some(this[ti + 1])
+        let n = this.len();
+        let m = other.len();
+        // dp[ti][oi]: can this[ti..] be matched by other[oi..].
+        let mut dp = vec![vec![false; m + 1]; n + 1];
+        dp[n][m] = true;
+        for oi in (0..m).rev() {
+            let o = other[oi];
+            for ti in (0..=n).rev() {
+                dp[ti][oi] = if is(o, self.any_words) {
+                    // Zero words (move past the wildcard) or one more word
+                    // (consume this[ti] and stay on the wildcard).
+                    dp[ti][oi + 1] || (ti < n && dp[ti + 1][oi])
+                } else if is(o, self.single_word) {
+                    ti < n && dp[ti + 1][oi + 1]
                 } else {
-                    this_curr
+                    ti < n && this[ti] == o && dp[ti + 1][oi + 1]
                 };
-                while let Some(curr) = this_curr {
-                    if curr == other_next {
-                        break;
-                    }
-                    ti += 1;
-                    this_curr = this_next;
-                    this_next = (this.len() - 1 > ti).then(|| this[ti + 1]);
-                }
-                if this_curr.is_none() {
-                    return false;
-                }
-                oi += 1;
-                continue;
             }
-            if this[ti] != other_curr {
-                return false;
-            }
-            ti += 1;
-            oi += 1;
         }
-        ti == this.len()
+        dp[0][0]
     }
 }
 
@@ -143,6 +146,37 @@ mod tests {
             ("a.b.c.d", "a.b.c*", false),
             ("a.b.c.d", "*a.b.c", false),
             ("a.b.d", "a.b.#.d", true),
+        ];
+        let w = WildcardConfig::default();
+        for (address, pattern, expected) in cases {
+            assert_eq!(
+                w.matches(address, pattern),
+                expected,
+                "{address} vs {pattern}"
+            );
+        }
+    }
+
+    /// An escaped delimiter keeps its word whole, and matching backtracks so a
+    /// wildcard whose first candidate word leaves the rest unmatched tries the
+    /// next. (`AddressImpl` splits every delimiter and never backtracks.)
+    #[test]
+    fn escaped_delimiters_and_backtracking() {
+        let cases = [
+            // An MQTT topic `a.b/c` becomes the address `a\.b.c` (two words),
+            // and the subscription `+/c` becomes `*.c`: it matches.
+            (r"a\.b.c", "*.c", true),
+            (r"a\.b.c", r"a\.b.c", true),
+            // `a\.b.c` is two words, so a three-word pattern does not match.
+            (r"a\.b.c", "*.*.c", false),
+            (r"a\.b.c", "a.b.c", false),
+            // Any-words backtracks past its first candidate word.
+            ("a.b.b.c", "a.#.b.c", true),
+            // A wildcard after any-words is a wildcard, not a literal.
+            ("a.b.c", "a.#.*.c", true),
+            ("a.b.c.d", "a.#.*.d", true),
+            ("x.y.z", "#.*", true),
+            ("a.b.c", "a.#.x.c", false),
         ];
         let w = WildcardConfig::default();
         for (address, pattern, expected) in cases {
