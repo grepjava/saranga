@@ -45,6 +45,8 @@ pub const MQTT_WILDCARD: WildcardConfig = WildcardConfig {
     delimiter: SLASH,
     any_words: '#',
     single_word: '+',
+    // An MQTT topic has no escape character: `\` is a literal.
+    uses_escape: false,
 };
 
 /// `MQTTReasonCodes`.
@@ -75,82 +77,46 @@ pub mod reason {
 }
 
 /// `WildcardConfiguration.convert`: `input` in `from`'s syntax, in `to`'s.
-/// Characters that are wildcards or delimiters in one syntax but not the
-/// other are escaped with `\` so the conversion can be undone.
+/// A delimiter or wildcard of `from` becomes the matching one of `to`; any
+/// other character is a literal, escaped with `\` if `to` escapes and it would
+/// otherwise be special there. In `from`'s syntax a `\` is an escape only if
+/// `from` escapes (an MQTT topic has none, so its `\` is a literal); otherwise
+/// a `\` before a delimiter or wildcard introduces that character as a literal.
+/// This is injective and round-trips, where `AddressImpl`'s heuristic reads a
+/// literal `\` before a delimiter as an escape and collapses distinct topics
+/// (`a\/b` and `a\\/b` both to `a/b`).
 pub fn convert(input: &str, from: &WildcardConfig, to: &WildcardConfig) -> String {
     if from == to {
         return input.to_owned();
     }
-    let escaped = is_escaped(input, from);
-    let mut result: Vec<char> = if escaped {
-        input.chars().collect()
-    } else {
-        escape(input, to, from).chars().collect()
+    let from_special = |c: char| {
+        c == from.delimiter || c == from.single_word || c == from.any_words || c == ESCAPE
     };
-    replace_char(&mut result, from.delimiter, to.delimiter);
-    replace_char(&mut result, from.single_word, to.single_word);
-    replace_char(&mut result, from.any_words, to.any_words);
-    let result: String = result.into_iter().collect();
-    if escaped {
-        unescape(&result, from)
-    } else {
-        result
-    }
-}
-
-/// `escape`, called on the target syntax `this`.
-fn escape(input: &str, this: &WildcardConfig, from: &WildcardConfig) -> String {
-    let esc = ESCAPE.to_string();
-    let mut result = input.replace(&esc, &format!("{ESCAPE}{ESCAPE}"));
-    for (mine, theirs) in [
-        (this.delimiter, from.delimiter),
-        (this.single_word, from.single_word),
-        (this.any_words, from.any_words),
-    ] {
-        if mine != theirs {
-            result = result.replace(mine, &format!("{ESCAPE}{mine}"));
+    let emit_literal = |out: &mut String, c: char| {
+        if to.uses_escape
+            && (c == ESCAPE || c == to.delimiter || c == to.single_word || c == to.any_words)
+        {
+            out.push(ESCAPE);
+        }
+        out.push(c);
+    };
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if from.uses_escape && c == ESCAPE && chars.peek().is_some_and(|&n| from_special(n)) {
+            // A `\` before a special character introduces it as a literal.
+            emit_literal(&mut out, chars.next().unwrap());
+        } else if c == from.delimiter {
+            out.push(to.delimiter);
+        } else if c == from.single_word {
+            out.push(to.single_word);
+        } else if c == from.any_words {
+            out.push(to.any_words);
+        } else {
+            emit_literal(&mut out, c);
         }
     }
-    result
-}
-
-/// `unescape`, called on the source syntax.
-fn unescape(input: &str, this: &WildcardConfig) -> String {
-    input
-        .replace(&format!("{ESCAPE}{ESCAPE}"), &ESCAPE.to_string())
-        .replace(
-            &format!("{ESCAPE}{}", this.delimiter),
-            &this.delimiter.to_string(),
-        )
-        .replace(
-            &format!("{ESCAPE}{}", this.single_word),
-            &this.single_word.to_string(),
-        )
-        .replace(
-            &format!("{ESCAPE}{}", this.any_words),
-            &this.any_words.to_string(),
-        )
-}
-
-/// `isEscaped`: an escape before a delimiter or wildcard of `this`.
-fn is_escaped(input: &str, this: &WildcardConfig) -> bool {
-    let chars: Vec<char> = input.chars().collect();
-    chars.windows(2).any(|w| {
-        w[0] == ESCAPE
-            && (w[1] == this.delimiter || w[1] == this.single_word || w[1] == this.any_words)
-    })
-}
-
-/// `replaceChar`: every unescaped `from` becomes `to`.
-fn replace_char(result: &mut [char], from: char, to: char) {
-    if from == to {
-        return;
-    }
-    for i in 0..result.len() {
-        if result[i] == from && (i == 0 || result[i - 1] != ESCAPE) {
-            result[i] = to;
-        }
-    }
+    out
 }
 
 /// `getCoreAddressFromMqttTopic`.
@@ -248,6 +214,7 @@ mod tests {
         delimiter: '.',
         any_words: '#',
         single_word: '*',
+        uses_escape: true,
     };
 
     #[test]
@@ -260,6 +227,20 @@ mod tests {
         assert_eq!(mqtt_topic("a.b.c", &CORE), "a/b/c");
         assert_eq!(mqtt_topic("$sys.mqtt.retain.a.b", &CORE), "a/b");
         assert_eq!(core_retain_address("a/#", &CORE), "$sys.mqtt.retain.a.#");
+    }
+
+    #[test]
+    fn literal_backslashes_do_not_collide() {
+        // Distinct MQTT topics map to distinct core addresses and round-trip,
+        // where the old heuristic collapsed `a\/b` and `a\\/b` both to `a/b`.
+        assert_eq!(core_address("a\\/b", &CORE), "a\\\\.b");
+        assert_eq!(core_address("a\\\\/b", &CORE), "a\\\\\\\\.b");
+        assert_ne!(core_address("a\\/b", &CORE), core_address("a\\\\/b", &CORE));
+        assert_eq!(mqtt_topic(&core_address("a\\/b", &CORE), &CORE), "a\\/b");
+        assert_eq!(
+            mqtt_topic(&core_address("a\\\\/b", &CORE), &CORE),
+            "a\\\\/b"
+        );
     }
 
     #[test]

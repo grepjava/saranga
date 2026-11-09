@@ -415,6 +415,9 @@ impl BrokerConfig {
                 delimiter: w.delimiter,
                 any_words: w.any_words,
                 single_word: w.single_word,
+                // Core addresses escape a literal delimiter or wildcard with
+                // `\`, as Artemis's fixed `WildcardConfiguration.ESCAPE`.
+                uses_escape: true,
             },
             connection_ttl_override: -1,
             // FileBroker deploys the legacy <jms> configuration after the

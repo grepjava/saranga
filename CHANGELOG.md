@@ -62,6 +62,7 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **A wildcard address keeps a literal delimiter in its word.** An escaped delimiter (`a\.b`, as an MQTT topic level containing a `.` becomes) is one word, not split in two, so a subscription like `+/c` still matches `a.b/c`.
 - **Wildcard matching backtracks.** An any-words wildcard whose first candidate word leaves the rest of the pattern unmatched tries the next, and a wildcard following an any-words wildcard is matched as a wildcard rather than literal text, so patterns such as `a.#.b.c` and `a.#.*.c` match the addresses they should instead of silently missing the subscriber.
 - **An expiring MQTT session is not removed out from under a reconnection.** A client that reconnects while the session scan is expiring its old session keeps its session and queues: the scan re-checks and removes atomically, rather than deleting a session the client has just re-attached to.
+- **MQTT topic names convert to distinct core addresses.** A literal backslash in a topic is kept as a literal (not read as an escape), so distinct topics such as `a\/b` and `a\\/b` map to distinct addresses that round-trip, instead of colliding so a publication reaches a subscriber of a different topic.
 
 ## 1.2.0 (2026-11-02)
 

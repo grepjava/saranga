@@ -12,6 +12,11 @@ pub struct WildcardConfig {
     pub delimiter: char,
     pub any_words: char,
     pub single_word: char,
+    /// Whether this syntax escapes a literal delimiter or wildcard with `\`.
+    /// Core addresses do; an MQTT topic has no escape, so a `\` in one is a
+    /// literal character (converting between the two must not read it as an
+    /// escape, or distinct topics collapse to one address).
+    pub uses_escape: bool,
 }
 
 impl Default for WildcardConfig {
@@ -21,6 +26,7 @@ impl Default for WildcardConfig {
             delimiter: '.',
             any_words: '#',
             single_word: '*',
+            uses_escape: true,
         }
     }
 }
@@ -66,11 +72,14 @@ impl WildcardConfig {
     /// `this` = `address` and `otherAddr` = `pattern`).
     ///
     /// The single-word wildcard matches one word; the any-words wildcard
-    /// matches zero or more. Matching is a table over the two word lists so a
-    /// wildcard whose first candidate word leaves the rest unmatched tries the
-    /// next (`AddressImpl` takes the first and never backtracks, and reads a
-    /// wildcard after an any-words wildcard as a literal, so `a.b.b.c` misses
-    /// `a.#.b.c` and `a.b.c` misses `a.#.*.c`).
+    /// matches zero or more. A mismatch backtracks to let the last any-words
+    /// wildcard take one more word, so a wildcard whose first candidate word
+    /// leaves the rest unmatched tries the next and a wildcard after an
+    /// any-words wildcard is matched as a wildcard (`AddressImpl` takes the
+    /// first and never backtracks, and reads such a wildcard as a literal, so
+    /// `a.b.b.c` misses `a.#.b.c` and `a.b.c` misses `a.#.*.c`). The two
+    /// cursors use constant extra space, so a deep address cannot make a
+    /// single match allocate a table quadratic in the word counts.
     pub fn matches(&self, address: &str, pattern: &str) -> bool {
         if address == pattern {
             return true;
@@ -78,26 +87,34 @@ impl WildcardConfig {
         let this = self.words(address);
         let other = self.words(pattern);
         let is = |part: &str, c: char| part.len() == c.len_utf8() && part.starts_with(c);
-        let n = this.len();
-        let m = other.len();
-        // dp[ti][oi]: can this[ti..] be matched by other[oi..].
-        let mut dp = vec![vec![false; m + 1]; n + 1];
-        dp[n][m] = true;
-        for oi in (0..m).rev() {
-            let o = other[oi];
-            for ti in (0..=n).rev() {
-                dp[ti][oi] = if is(o, self.any_words) {
-                    // Zero words (move past the wildcard) or one more word
-                    // (consume this[ti] and stay on the wildcard).
-                    dp[ti][oi + 1] || (ti < n && dp[ti + 1][oi])
-                } else if is(o, self.single_word) {
-                    ti < n && dp[ti + 1][oi + 1]
-                } else {
-                    ti < n && this[ti] == o && dp[ti + 1][oi + 1]
-                };
+        let (n, m) = (this.len(), other.len());
+        let (mut ti, mut oi) = (0usize, 0usize);
+        // The last any-words wildcard and the address word it first stood at,
+        // for backtracking: it takes one more word each time the rest fails.
+        let mut star: Option<(usize, usize)> = None;
+        while ti < n {
+            if oi < m
+                && (is(other[oi], self.single_word)
+                    || (!is(other[oi], self.any_words) && this[ti] == other[oi]))
+            {
+                ti += 1;
+                oi += 1;
+            } else if oi < m && is(other[oi], self.any_words) {
+                star = Some((oi, ti));
+                oi += 1;
+            } else if let Some((soi, sti)) = star {
+                oi = soi + 1;
+                star = Some((soi, sti + 1));
+                ti = sti + 1;
+            } else {
+                return false;
             }
         }
-        dp[0][0]
+        // A trailing any-words wildcard matches the empty remainder.
+        while oi < m && is(other[oi], self.any_words) {
+            oi += 1;
+        }
+        oi == m
     }
 }
 
@@ -186,5 +203,24 @@ mod tests {
                 "{address} vs {pattern}"
             );
         }
+    }
+
+    /// A deep address and pattern match in constant space: a client-controlled
+    /// word count must not make one comparison allocate a table quadratic in
+    /// the depths (about a gigabyte for two 65 KB strings).
+    #[test]
+    fn a_deep_match_does_not_allocate_quadratically() {
+        let w = WildcardConfig::default();
+        let deep = vec!["a"; 40_000].join(".");
+        let stars = vec!["*"; 40_000].join(".");
+        assert!(w.matches(&deep, "#"), "any-words matches the lot");
+        assert!(
+            w.matches(&deep, &stars),
+            "one single-word per depth matches"
+        );
+        assert!(
+            !w.matches(&deep, &format!("{deep}.b")),
+            "a deeper pattern does not match"
+        );
     }
 }
