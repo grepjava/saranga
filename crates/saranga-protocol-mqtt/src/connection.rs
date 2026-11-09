@@ -278,6 +278,22 @@ fn is_security(e: &BrokerError) -> bool {
     e.kind == ErrorType::SecurityException
 }
 
+/// The start of the message of the error raised when a subscription's core
+/// queue name is already bound to a different address (the `<client>.<address>`
+/// naming is ambiguous when either half contains the delimiter). Used to turn
+/// that collision into a per-subscription SUBACK failure.
+const QUEUE_ADDRESS_COLLISION: &str = "core queue already bound to a different address";
+
+fn queue_address_collision(queue: &str, have: &str, want: &str) -> BrokerError {
+    BrokerError::illegal_state(format!(
+        "{QUEUE_ADDRESS_COLLISION}: {queue} is bound to {have}, not {want}"
+    ))
+}
+
+fn is_queue_address_collision(e: &BrokerError) -> bool {
+    e.kind == ErrorType::IllegalState && e.message.starts_with(QUEUE_ADDRESS_COLLISION)
+}
+
 /// What a client's subscriptions deliver through, shared by its sinks.
 pub struct Shared {
     out: Arc<Outbound>,
@@ -1166,6 +1182,18 @@ impl Core {
         let core_address = util::core_address(parsed, &wildcard);
         let core_queue = util::core_queue(raw, &self.client_id, &wildcard);
         if let Some(q) = po.queue(&core_queue) {
+            // The core queue name is `<client>.<address>`, and both halves can
+            // contain the delimiter, so distinct (client, topic) pairs can map
+            // to one name (client `a.b` + topic `c` and client `a` + topic
+            // `b/c` both give `a.b.c`). Artemis reuses the existing queue
+            // without checking its address and so serves one client the other's
+            // messages; refuse the subscription when the name is already bound
+            // to a different address rather than mis-delivering.
+            let want = self.session.remove_prefix(&core_address);
+            let have = q.config();
+            if &*have.address != want {
+                return Err(queue_address_collision(&core_queue, &have.address, want));
+            }
             return Ok((q, false));
         }
         let bq = self.session.binding_query(&core_address, true);
@@ -1314,6 +1342,12 @@ impl Core {
                     // MQTT 3.1 cannot say no.
                     Version::V3_1 => qos,
                 }),
+                // A queue-name collision fails just this subscription (3.1,
+                // which has no failure code, drops the connection instead of
+                // mis-delivering).
+                Err(e) if is_queue_address_collision(&e) && self.version != Version::V3_1 => {
+                    codes.push(reason::UNSPECIFIED_ERROR);
+                }
                 Err(e) => return Err(e),
             }
         }

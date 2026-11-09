@@ -199,6 +199,16 @@ impl Client {
         assert_eq!(self.packet().await.unwrap(), vec![0x90, 3, 0, 1, qos]);
     }
 
+    /// SUBSCRIBE without asserting success; returns the SUBACK packet so a
+    /// caller can read the granted-QoS-or-failure code.
+    async fn subscribe_raw(&mut self, filter: &str, qos: u8) -> Vec<u8> {
+        let mut body = vec![0, 1];
+        body.extend(string(filter));
+        body.push(qos);
+        self.send(&packet(0x82, &body)).await;
+        self.packet().await.unwrap()
+    }
+
     async fn publish(&mut self, topic: &str, payload: &[u8], packet_id: u16) {
         self.publish_with(0x32, topic, payload, packet_id).await;
         let puback = self.packet().await.unwrap();
@@ -1718,5 +1728,40 @@ async fn a_reattached_session_is_not_expired() {
         "a detached expired session is removed"
     );
     assert!(!mgr.has_session_state("gone"));
+    broker.stop().unwrap();
+}
+
+/// ISSUE 68: the core subscription queue name is `<client>.<address>`, so two
+/// distinct (client, topic) pairs can collide (client `a.b` + topic `c` and
+/// client `a` + topic `b/c` both name the queue `a.b.c`). Artemis reuses the
+/// existing queue without checking its address and serves one client the
+/// other's messages; Saranga refuses the colliding subscription (SUBACK 0x80)
+/// so it cannot be mis-delivered, while a non-colliding subscription is granted.
+#[tokio::test]
+async fn a_colliding_subscription_queue_name_is_refused() {
+    let (broker, address, _task) = start(None).await;
+
+    // Client `a.b` subscribes to `c` -> durable-enough queue `a.b.c` on
+    // address `c`; it stays connected so the queue exists.
+    let (mut ab, _) = Client::open(address, "a.b", false).await;
+    ab.subscribe("c", 0).await;
+
+    // Client `a` subscribes to `b/c` -> the same queue name `a.b.c`, but its
+    // address is `b.c`, not `c`: the subscription is refused.
+    let (mut a, _) = Client::open(address, "a", false).await;
+    assert_eq!(
+        a.subscribe_raw("b/c", 0).await,
+        vec![0x90, 3, 0, 1, 0x80],
+        "a colliding queue name is refused, not silently reused"
+    );
+
+    // A client whose name does not collide subscribes to `b/c` normally.
+    let (mut z, _) = Client::open(address, "zed", false).await;
+    assert_eq!(
+        z.subscribe_raw("b/c", 0).await,
+        vec![0x90, 3, 0, 1, 0],
+        "a non-colliding subscription is granted"
+    );
+
     broker.stop().unwrap();
 }
