@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use saranga_buffer::{JString, SimpleString};
-use saranga_client::{Connection, ConnectionOptions};
+use saranga_client::{Connection, ConnectionOptions, Connector};
 use saranga_core_protocol::packets::cluster::{QuorumVoteMessage, QuorumVoteReplyMessage};
 use saranga_core_protocol::packets::cluster_types::{ServerConnectVote, Vote};
 use saranga_core_protocol::transport::{ParamValue, TransportConfiguration};
@@ -121,7 +121,7 @@ pub(crate) struct Question {
 /// once.
 pub(crate) async fn vote(
     cluster: &ClusterConfig,
-    voters: Vec<TransportConfiguration>,
+    voters: Vec<Connector>,
     size: i32,
     question: Question,
     wait: Duration,
@@ -135,10 +135,10 @@ pub(crate) async fn vote(
     }
     let question = Arc::new(question);
     let mut tasks = tokio::task::JoinSet::new();
-    for tc in voters {
+    for connector in voters {
         let cluster = cluster.clone();
         let q = question.clone();
-        tasks.spawn(async move { ask(&cluster, &tc, &q).await });
+        tasks.spawn(async move { ask(&cluster, connector, &q).await });
     }
     let deadline = tokio::time::Instant::now() + wait;
     loop {
@@ -174,10 +174,12 @@ pub(crate) async fn vote(
 /// `VoteRunnable`: connects to one broker as the cluster user and asks.
 async fn ask(
     cluster: &ClusterConfig,
-    tc: &TransportConfiguration,
+    connector: Connector,
     question: &Question,
 ) -> Option<ServerConnectVote> {
-    let connector = crate::cluster::dial(tc)?;
+    // The connector carries the peer's TLS settings; voting dials it directly
+    // rather than rebuilding it from host and port, which would drop TLS and
+    // use plaintext against a TLS-only peer.
     let options = ConnectionOptions {
         client_failure_check_period: Some(cluster.check_period),
         connection_ttl: Some(cluster.connection_ttl),
@@ -242,6 +244,7 @@ pub(crate) async fn is_still_active(
         .into_iter()
         .filter(|m| m.node_id != broker.node_id())
         .filter_map(|m| m.primary)
+        .filter_map(|tc| crate::cluster::dial(&tc))
         .collect();
     vote(
         cluster.config(),

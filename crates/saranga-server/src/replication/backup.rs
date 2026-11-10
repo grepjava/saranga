@@ -232,10 +232,16 @@ pub async fn is_node_id_used(cluster: &ClusterConfig, node_id: &str) -> bool {
             .find(|(id, _, _)| id == node_id)
             .and_then(|(_, primary, _)| primary);
         conn.close().await;
-        return match primary {
-            Some(p) => is_active(cluster, &p).await,
-            None => false,
-        };
+        // This peer may not know the node even though a later connector's does,
+        // so a negative result keeps checking the rest: only a positively
+        // identified active node ends the search. Returning here after the first
+        // reachable peer would let a restarting primary miss an active backup
+        // reachable through another connector and activate alongside it.
+        if let Some(p) = primary
+            && is_active(cluster, &p).await
+        {
+            return true;
+        }
     }
     false
 }
@@ -398,7 +404,6 @@ async fn primary_is_down(
         .iter()
         .filter(|(id, _, _)| id != node_id)
         .filter_map(|(_, p, _)| p.clone())
-        .map(|p| connector_transport(&p))
         .collect();
     for attempt in 0..cfg.policy.vote_retries.max(1) {
         if attempt > 0 {
@@ -423,19 +428,6 @@ async fn primary_is_down(
         }
     }
     false
-}
-
-/// A connector to vote through.
-fn connector_transport(c: &Connector) -> saranga_core_protocol::transport::TransportConfiguration {
-    use saranga_core_protocol::transport::{ParamValue, TransportConfiguration};
-    TransportConfiguration {
-        name: c.to_string().as_str().into(),
-        factory_class_name: crate::cluster::NETTY_CONNECTOR_FACTORY.into(),
-        params: vec![
-            ("port".into(), ParamValue::Int(c.port as i32)),
-            ("host".into(), ParamValue::String(c.host.as_str().into())),
-        ],
-    }
 }
 
 /// How the replication ended.

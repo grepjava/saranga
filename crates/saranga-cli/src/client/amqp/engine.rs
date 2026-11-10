@@ -1159,6 +1159,11 @@ fn incoming(state: &mut State, f: frame::Frame, out: &mut Vec<u8>) {
                 return;
             }
             let last = d.last.unwrap_or(d.first);
+            // `first > last` would panic `BTreeMap::range`; a malformed
+            // disposition from the peer disposes nothing rather than crashing.
+            if d.first > last {
+                return;
+            }
             let ids: Vec<u32> = s
                 .unsettled
                 .range(d.first..=last)

@@ -4859,6 +4859,19 @@ impl Conn {
         }
         let treat_reject = self.settings.treat_reject_as_unmodified_delivery_failed;
         let last = d.last.unwrap_or(d.first);
+        // `first` and `last` are peer-controlled; `first > last` would panic
+        // `BTreeMap::range`, unwinding the connection task past its consumer
+        // cleanup. Reject it as a protocol error, which closes the connection
+        // through the normal path.
+        if d.first > last {
+            return Err(Fatal::new(
+                condition::DECODE_ERROR,
+                format!(
+                    "AMQ119000: invalid disposition range: first {} is greater than last {last}",
+                    d.first
+                ),
+            ));
+        }
         let ids: Vec<u32> = {
             let Some(s) = self.sessions.get(&channel) else {
                 return Ok(());
