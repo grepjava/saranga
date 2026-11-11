@@ -273,6 +273,22 @@ impl AmqpMessage {
         }
         m.message_annotations = self.message_annotations.clone();
         m.message_id = self.message_id;
+        // A slim large message holds no body, and often no bytes at all, in
+        // `data`; its durability, header, properties and application
+        // properties live in its decoded sections, which a conversion to Core
+        // reads. Carry them over so the Core message is not reported as
+        // non-durable with no properties. (For a reconstituted message these
+        // match what `data` already decoded to.)
+        m.reloaded = self.reloaded;
+        if self.header.is_some() {
+            m.header = self.header.clone();
+        }
+        if self.properties.is_some() {
+            m.properties = self.properties.clone();
+        }
+        if self.application_properties.is_some() {
+            m.application_properties = self.application_properties.clone();
+        }
         m.set_priority(self.priority);
         Ok(m)
     }
@@ -1039,23 +1055,23 @@ impl AmqpMessage {
     /// `copy(newID)`: the same encoding with a copy of the extra
     /// properties, scanned afresh.
     pub fn copy(&self, new_id: i64, now: i64) -> Self {
-        let mut c = Self::empty(self.message_format, self.data.clone());
-        c.message_id = new_id;
-        // A large message's copy starts without extra properties.
-        c.extra = if self.large {
-            None
-        } else {
-            self.extra
-                .as_deref()
-                .map(|e| Box::new(JavaMap::hash_copy(e)))
-        };
         if self.large {
-            if c.scan(now).is_err() {
-                return self.clone();
-            }
-            c.make_large();
+            // A large message keeps its sections decoded in memory and its
+            // body in a file, so its `data` is bodyless (often empty);
+            // rescanning that would reset its priority, durability and the
+            // rest. Keep the decoded sections, give the copy its own ID, and
+            // (as Artemis does) start it without extra properties.
+            let mut c = self.clone();
+            c.message_id = new_id;
+            c.extra = None;
             return c;
         }
+        let mut c = Self::empty(self.message_format, self.data.clone());
+        c.message_id = new_id;
+        c.extra = self
+            .extra
+            .as_deref()
+            .map(|e| Box::new(JavaMap::hash_copy(e)));
         if c.scan(now).is_err() {
             // The original scanned; the bytes are the same.
             return self.clone();

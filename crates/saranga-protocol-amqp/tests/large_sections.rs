@@ -4,9 +4,9 @@
 //! carries, and a section changed after it was spilled is rebuilt over the
 //! file's body when it is delivered rather than being dropped.
 
-use saranga_buffer::SimpleString;
+use saranga_buffer::{PropertyValue, SimpleString};
 use saranga_protocol_amqp::message::AmqpMessage;
-use saranga_protocol_amqp::{Descriptor, Symbol, Value, codec};
+use saranga_protocol_amqp::{Descriptor, Symbol, Value, codec, convert};
 
 const NOW: i64 = 1_750_000_000_000;
 
@@ -105,5 +105,64 @@ fn a_section_changed_after_a_spill_survives_delivery() {
     assert!(
         has_run(delivered.data(), 0xAB, body.len()),
         "the whole body is delivered"
+    );
+}
+
+/// A slim large message that carried a durable header, a non-default priority
+/// and an application property (its body in a file, so `data` is bodyless).
+fn slim_large_message() -> AmqpMessage {
+    let body = vec![0xABu8; 300_000];
+    let mut full = AmqpMessage::new(0, data_message(&body), NOW).unwrap();
+    full.set_durable(true);
+    full.set_priority(8);
+    full.put_property("flavour", Value::String("vanilla".to_owned()));
+    full.reencode(NOW);
+    full.make_large();
+    // As the message is stored: sections decoded, body in a file (here empty —
+    // only the metadata matters to these tests).
+    let slim = AmqpMessage::from_large_record(&full.large_record(), Vec::new(), NOW).unwrap();
+    assert!(
+        slim.is_durable() && slim.priority() == 8,
+        "the slim form itself preserves its metadata"
+    );
+    slim
+}
+
+/// Copying a large message (a management copy, move or divert) keeps its
+/// priority, durability and application properties rather than rescanning its
+/// bodyless encoding and resetting them.
+#[test]
+fn a_large_message_copy_keeps_its_metadata() {
+    let copy = slim_large_message().copy(999, NOW);
+    assert_eq!(copy.message_id(), 999, "the copy has its own ID");
+    assert_eq!(copy.priority(), 8, "the copy keeps its priority");
+    assert!(copy.is_durable(), "the copy stays durable");
+    assert_eq!(
+        copy.application_property("flavour")
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        Some("vanilla".to_owned()),
+        "the copy keeps its application properties"
+    );
+}
+
+/// Converting a slim large message to Core (what the management listing and
+/// composite views do) keeps its durability and application properties, rather
+/// than reporting a durable message as non-durable with no properties.
+#[test]
+fn a_large_message_converts_to_core_with_its_metadata() {
+    let slim = slim_large_message();
+    let standard = slim.standard_copy(NOW).unwrap();
+    let core = convert::to_core(&standard, NOW);
+    assert!(core.durable, "the Core message stays durable");
+    assert_eq!(core.priority, 8, "the Core message keeps its priority");
+    let flavour = core
+        .properties
+        .entries()
+        .iter()
+        .find(|(k, _)| k.to_string_lossy() == "flavour")
+        .map(|(_, v)| v.clone());
+    assert!(
+        matches!(flavour, Some(PropertyValue::String(ref s)) if s.to_string_lossy() == "vanilla"),
+        "the application property is kept, got {flavour:?}"
     );
 }

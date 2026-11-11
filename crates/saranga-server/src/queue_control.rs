@@ -658,10 +658,8 @@ impl Actor {
             let mut hits = 0;
             // Artemis changes the message in place (`setPriority`), keeping its
             // `RefCountMessage` state. Saranga's message is immutable, so a new
-            // one is built; the reference's paging-memory charge must move from
-            // the old message to the new, or the old charge leaks (its
-            // `addSize` is never taken back) and the new reference is counted
-            // as if it were never there.
+            // one is built and the reference's accounting moves to it (see
+            // `Queue::reprioritise`).
             let q = self.queue();
             for level in self.messages.levels.iter_mut().rev() {
                 for r in level.iter_mut() {
@@ -672,9 +670,7 @@ impl Actor {
                         hits += 1;
                         let mut core = r.message.core().clone();
                         core.priority = *p;
-                        q.ref_down(r);
-                        r.message = r.message.with_core(core);
-                        q.ref_up(r);
+                        q.reprioritise(r, core);
                     }
                 }
             }
@@ -789,12 +785,9 @@ impl Actor {
         if let SelectionAction::ChangePriority(p) = action {
             let mut core = r.message.core().clone();
             core.priority = *p;
-            // Move the reference's paging-memory charge to the rebuilt message
-            // (see the in-place path in `act_unaudited`).
-            let q = self.queue();
-            q.ref_down(&r);
-            r.message = r.message.with_core(core);
-            q.ref_up(&r);
+            // Move the reference's accounting to the rebuilt message (see the
+            // in-place path in `act_unaudited` and `Queue::reprioritise`).
+            self.queue().reprioritise(&mut r, core);
         }
         r
     }

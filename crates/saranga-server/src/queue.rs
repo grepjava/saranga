@@ -749,6 +749,26 @@ impl Queue {
         }
     }
 
+    /// `changeReferencesPriority` for Saranga's immutable messages: the
+    /// reference moves from the message it holds to one rebuilt with the new
+    /// priority, sharing the same ID and durability. Both the reference's
+    /// paging-memory charge and its durable journal reference move with it —
+    /// Artemis mutates the message in place and keeps its `RefCountMessage`
+    /// state, so without moving the durable count the rebuilt message's final
+    /// `durableDown` would return -1 and skip deleting the journal record.
+    pub(crate) fn reprioritise(&self, r: &mut MessageRef, core: CoreMessage) {
+        let durable = self.is_durable_ref(r);
+        self.ref_down(r);
+        if durable {
+            r.message.durable_down();
+        }
+        r.message = r.message.with_core(core);
+        self.ref_up(r);
+        if durable {
+            r.message.durable_up();
+        }
+    }
+
     /// Journals an acknowledgement outside a transaction: `ACKNOWLEDGE_REF`
     /// for a journaled reference; for a paged one `ACKNOWLEDGE_CURSOR` in a
     /// journal transaction of its own (`PageSubscription.ack`). Returns the
