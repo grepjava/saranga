@@ -484,6 +484,11 @@ impl Producer {
                     .await;
             }
         }
+        // The whole large send — the header and every chunk, across the credit
+        // waits between them — is serialized per session, so another producer
+        // on this session cannot replace the broker's incomplete large message
+        // with its own header in between.
+        let _large_send = session.large_send.lock().await;
         // sendInitialLargeMessageHeader: the credits are taken after the send.
         let header = message.clone();
         let used = session.send_initial_chunk_on_large_message(message).await?;

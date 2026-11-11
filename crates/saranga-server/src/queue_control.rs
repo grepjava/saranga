@@ -572,6 +572,58 @@ impl Actor {
         }
     }
 
+    /// Up to `max` queued messages matching `filter`, including those still in
+    /// pages, so a paging queue's export sees them all. The in-memory and
+    /// scheduled references come first, then the paged references not already
+    /// among them.
+    pub(crate) fn browse_matching(
+        &self,
+        filter: Option<&FilterRef>,
+        max: usize,
+    ) -> Vec<MessageRef> {
+        let matches = |r: &MessageRef| filter.is_none_or(|f| f.matches(&*r.message));
+        let mut out: Vec<MessageRef> = self
+            .messages
+            .iter()
+            .chain(self.scheduled.values())
+            .filter(|r| matches(r))
+            .take(max)
+            .cloned()
+            .collect();
+        if out.len() >= max {
+            return out;
+        }
+        let Some(sub) = self.shared.paging.clone() else {
+            return out;
+        };
+        let Some(store) = sub.store() else {
+            return out;
+        };
+        // A message read in from a page keeps its page position; do not list it
+        // again from the page it came from.
+        let in_memory: HashSet<(i64, i32)> = self
+            .messages
+            .iter()
+            .chain(self.scheduled.values())
+            .chain(self.consumers.iter().flat_map(|c| c.delivering.iter()))
+            .filter_map(|r| r.paged.as_ref().map(|p| (p.page, p.message_nr)))
+            .collect();
+        let mut it = PageIterator::default();
+        while out.len() < max {
+            let Some(p) = store.scan(&sub, &mut it) else {
+                break;
+            };
+            if in_memory.contains(&(p.position.page, p.position.message_nr)) {
+                continue;
+            }
+            let r = scanned(p);
+            if matches(&r) {
+                out.push(r);
+            }
+        }
+        out
+    }
+
     /// The rows acted on are gone before paged messages are read again: the
     /// read would otherwise find them, their deletes still being written.
     fn settle(&self) {

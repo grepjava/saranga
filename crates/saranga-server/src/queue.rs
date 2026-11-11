@@ -341,6 +341,14 @@ enum Cmd {
     Browse {
         reply: oneshot::Sender<Vec<MessageRef>>,
     },
+    /// Up to `max` queued messages matching `filter`, including those still in
+    /// pages (`totalIterator`): for export, which must not silently drop paged
+    /// messages.
+    BrowseMatching {
+        filter: Option<FilterRef>,
+        max: usize,
+        reply: oneshot::Sender<Vec<MessageRef>>,
+    },
     /// `individualCancel`: one delivering message goes back.
     CancelOne {
         id: ConsumerId,
@@ -1034,6 +1042,15 @@ impl Queue {
     pub async fn take_matching(&self, filter: Option<FilterRef>) -> Vec<MessageRef> {
         let (reply, wait) = oneshot::channel();
         self.send(Cmd::TakeMatching { filter, reply });
+        wait.await.unwrap_or_default()
+    }
+
+    /// Up to `max` queued messages matching `filter`, including those still in
+    /// pages: the whole-queue iterator a paging queue's export needs, where
+    /// [`Queue::browse`] sees only the in-memory and scheduled references.
+    pub async fn browse_matching(&self, filter: Option<FilterRef>, max: usize) -> Vec<MessageRef> {
+        let (reply, wait) = oneshot::channel();
+        self.send(Cmd::BrowseMatching { filter, max, reply });
         wait.await.unwrap_or_default()
     }
 
@@ -2204,6 +2221,10 @@ impl Actor {
             Cmd::Browse { reply } => {
                 let mut refs: Vec<MessageRef> = self.messages.iter().cloned().collect();
                 refs.extend(self.scheduled.values().cloned());
+                let _ = reply.send(refs);
+            }
+            Cmd::BrowseMatching { filter, max, reply } => {
+                let refs = self.browse_matching(filter.as_ref(), max);
                 let _ = reply.send(refs);
             }
             Cmd::CancelOne {

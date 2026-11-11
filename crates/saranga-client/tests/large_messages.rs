@@ -269,3 +269,45 @@ async fn compressed_round_trip() {
     }
     conn.close().await;
 }
+
+/// Two producers on one session each send a large message at the same time.
+/// The broker holds one incomplete large message per session, so without
+/// serializing the whole send their headers and chunks interleave and the
+/// messages stall or corrupt. Both must arrive whole.
+#[tokio::test]
+async fn concurrent_large_sends_on_one_session_stay_whole() {
+    let (conn, session) = setup(auto_ack(), "large").await;
+    let p1 = session.create_producer(Some("large")).await.unwrap();
+    let p2 = session.create_producer(Some("large")).await.unwrap();
+
+    let body1 = patterned(1024 * 1024);
+    let body2 = noise(1024 * 1024);
+    let mut m1 = message::bytes_message(&body1);
+    m1.put_property("which", PropertyValue::Int(1));
+    let mut m2 = message::bytes_message(&body2);
+    m2.put_property("which", PropertyValue::Int(2));
+
+    // Both large sends run at once on the one session; a stall never returns,
+    // so bound it.
+    let (r1, r2) = tokio::time::timeout(WAIT, async { tokio::join!(p1.send(m1), p2.send(m2)) })
+        .await
+        .expect("the concurrent large sends stalled");
+    r1.unwrap();
+    r2.unwrap();
+
+    let consumer = session.create_consumer("large", None, false).await.unwrap();
+    session.start().await.unwrap();
+    let mut got: std::collections::HashMap<i32, Vec<u8>> = std::collections::HashMap::new();
+    for _ in 0..2 {
+        let d = receive(&consumer).await;
+        let which = match d.message.property("which") {
+            Some(PropertyValue::Int(n)) => *n,
+            other => panic!("unexpected which property: {other:?}"),
+        };
+        got.insert(which, d.message.body.to_vec());
+        consumer.acknowledge(&d).await.unwrap();
+    }
+    assert_eq!(got.get(&1), Some(&body1), "the first message is whole");
+    assert_eq!(got.get(&2), Some(&body2), "the second message is whole");
+    conn.close().await;
+}

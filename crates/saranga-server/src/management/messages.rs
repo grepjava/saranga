@@ -481,13 +481,9 @@ pub async fn export(
         .ok_or_else(|| format!("AMQ229017: Queue {queue} does not exist"))?;
     let f = super::queue::filter(broker, filter)?;
     let mut out = Vec::new();
-    for r in q.browse().await.iter() {
-        if out.len() >= max {
-            break;
-        }
-        if f.as_ref().is_some_and(|f| !f.matches(&*r.message)) {
-            continue;
-        }
+    // Browse the whole queue, paged messages included, so export does not
+    // silently drop a paging queue's contents.
+    for r in q.browse_matching(f, max).await.iter() {
         let core = if let Some(large) = r.message.large() {
             let body = large.read_all().map_err(|e| e.to_string())?;
             match r.message.native() {

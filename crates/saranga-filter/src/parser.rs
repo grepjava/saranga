@@ -12,11 +12,19 @@ use crate::java::BigInt;
 use crate::lexer::{Keyword, Tok, Token, tokenize};
 use crate::like::LikePattern;
 
+/// The deepest the grammar may nest (parentheses and unary operators). A
+/// selector is tiny — real ones nest a handful of levels — so this is far
+/// above any real one yet well below where the recursive descent (every
+/// recursive path passes through `unary_expr`) would overflow the stack and
+/// abort the process on a crafted selector.
+const MAX_DEPTH: usize = 64;
+
 /// `JmsSelector()`: parses a whole selector into a boolean expression.
 pub(crate) fn parse(text: &str, hyphenated: bool) -> Result<Expr, String> {
     let mut p = Parser {
         tokens: tokenize(text, hyphenated)?,
         pos: 0,
+        depth: 0,
     };
     let e = p.or_expression()?;
     if p.peek() != &Tok::Eof {
@@ -40,6 +48,7 @@ fn as_boolean(e: Expr) -> Result<Expr, String> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
@@ -243,7 +252,20 @@ impl Parser {
         }
     }
 
+    /// Every recursive path through the grammar — a parenthesised expression
+    /// and a unary operator alike — passes through here, so bounding this
+    /// bounds the whole recursion.
     fn unary_expr(&mut self) -> Result<Expr, String> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(format!("Selector nests more than {MAX_DEPTH} levels deep"));
+        }
+        let e = self.unary_expr_inner();
+        self.depth -= 1;
+        e
+    }
+
+    fn unary_expr_inner(&mut self) -> Result<Expr, String> {
         match self.peek() {
             Tok::Plus => {
                 self.bump();

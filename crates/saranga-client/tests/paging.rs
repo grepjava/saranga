@@ -143,3 +143,47 @@ async fn a_transaction_pages_before_it_commits() {
     drop(conn);
     broker.stop().unwrap();
 }
+
+/// Exporting a paging queue returns every message, including those written to
+/// pages — not only the in-memory and scheduled references, which on a paging
+/// queue are a fraction of its contents.
+#[tokio::test]
+async fn export_includes_paged_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, address) = start(dir.path()).await;
+    let conn = Connection::connect(&address, ConnectionOptions::default())
+        .await
+        .unwrap();
+    let session = conn
+        .create_session(SessionOptions::default())
+        .await
+        .unwrap();
+    session
+        .create_queue(
+            QueueConfiguration::new("paged")
+                .routing_type(RoutingType::Anycast)
+                .durable(true),
+        )
+        .await
+        .unwrap();
+    let producer = session.create_producer(Some("paged")).await.unwrap();
+
+    // A hundred 1 KiB messages, ten times the address's 10 KiB: most end up in
+    // pages (there is no consumer to read them back in).
+    for n in 0..100 {
+        producer.send(numbered(n)).await.unwrap();
+    }
+    session.queue_query("paged").await.unwrap();
+    assert!(paging(&broker), "the queue is paging");
+
+    let exported = saranga_server::management::export_messages(&broker, "paged", None, 1000)
+        .await
+        .unwrap();
+    assert_eq!(
+        exported.len(),
+        100,
+        "export must include the paged messages, not only the in-memory ones"
+    );
+    drop(conn);
+    broker.stop().unwrap();
+}

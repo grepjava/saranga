@@ -430,6 +430,11 @@ pub(crate) struct SessionInner {
     pub(crate) credits: Mutex<CreditManager>,
     /// `ActiveMQSessionContext.sendAckHandler`.
     send_ack_handler: Mutex<Option<Arc<dyn SendAcknowledgementHandler>>>,
+    /// Held for a whole large-message send (header through its last chunk).
+    /// The broker tracks one incomplete large message per session, so two
+    /// producers sharing a session must not interleave their headers and
+    /// chunks across the credit waits between them.
+    pub(crate) large_send: tokio::sync::Mutex<()>,
 }
 
 impl SessionInner {
@@ -456,6 +461,7 @@ impl SessionInner {
             next_producer_id: AtomicI32::new(0),
             credits: Mutex::new(CreditManager::new(window)),
             send_ack_handler: Mutex::new(None),
+            large_send: tokio::sync::Mutex::new(()),
         })
     }
 

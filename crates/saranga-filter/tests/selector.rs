@@ -72,6 +72,27 @@ fn create_message() -> MockMessage {
     m
 }
 
+/// A pathologically nested selector is rejected with an error, not parsed by
+/// unbounded recursion that overflows the stack and aborts the process. A
+/// consumer filter reaches this parser, so a permitted client could otherwise
+/// crash the broker.
+#[test]
+fn deep_nesting_is_rejected_rather_than_crashing() {
+    let parens = format!("{}trueProp{}", "(".repeat(10_000), ")".repeat(10_000));
+    assert!(
+        Filter::parse(&parens).is_err(),
+        "deeply nested parentheses should be rejected"
+    );
+    let unary = format!("{}trueProp", "NOT ".repeat(10_000));
+    assert!(
+        Filter::parse(&unary).is_err(),
+        "deeply nested unary operators should be rejected"
+    );
+    // A modestly nested selector still parses.
+    let ok = format!("{}trueProp{}", "(".repeat(20), ")".repeat(20));
+    assert!(Filter::parse(&ok).is_ok(), "ordinary nesting still parses");
+}
+
 mod selector_test {
     use super::*;
 
