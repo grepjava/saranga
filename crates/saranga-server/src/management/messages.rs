@@ -488,10 +488,24 @@ pub async fn export(
         if f.as_ref().is_some_and(|f| !f.matches(&*r.message)) {
             continue;
         }
-        let mut core = full_core(&r.message).into_owned();
-        if let Some(large) = r.message.large() {
-            core.body = large.read_all().map_err(|e| e.to_string())?.into();
-        }
+        let core = if let Some(large) = r.message.large() {
+            let body = large.read_all().map_err(|e| e.to_string())?;
+            match r.message.native() {
+                // A native large message's file holds its whole native
+                // encoding; reconstituting it and converting gives the Core
+                // body, where assigning the file straight to `core.body`
+                // would leave the native framing in the body.
+                Some(n) => n.reconstitute(body).to_core(),
+                // A Core large message's file is its body.
+                None => {
+                    let mut core = r.message.core().clone();
+                    core.body = body.into();
+                    core
+                }
+            }
+        } else {
+            full_core(&r.message).into_owned()
+        };
         out.push(super::export::message_json(&core));
     }
     Ok(out)

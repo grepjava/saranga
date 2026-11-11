@@ -243,6 +243,15 @@ impl AmqpMessage {
         {
             self.application_properties = Some(self.application_properties());
         }
+        // A spilled message keeps only its headers in memory; parsing those
+        // headers alone finds no body section, so the body offset is unset.
+        // The body begins in the file where the headers end, so record that:
+        // without it a re-encoded large message's changed sections are not
+        // rebuilt over the file body at delivery (`large_send_buffer_with`),
+        // and its original sections go out unchanged.
+        if self.remaining_body_position.get().is_none() {
+            self.remaining_body_position = Pos::at(self.data.len());
+        }
     }
 
     pub fn is_large(&self) -> bool {
@@ -771,8 +780,15 @@ impl AmqpMessage {
         None
     }
 
-    /// `getEncodeSize`: the encoding without its delivery annotations.
+    /// `getEncodeSize`: the encoding without its delivery annotations. A
+    /// large message keeps its body in a file and encodes as 0, as
+    /// `AMQPLargeMessage.getEncodeSize` does; its headers in memory may not
+    /// cover the delivery-annotation length the record still carries, so
+    /// subtracting it here would underflow.
     pub fn encode_size(&self) -> usize {
+        if self.large {
+            return 0;
+        }
         self.data.len() - self.encoded_delivery_annotations_size
     }
 
