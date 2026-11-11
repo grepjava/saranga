@@ -1896,7 +1896,17 @@ impl Actor {
             AckReason::Expired => crate::mirror::Mirroring::Disabled,
             _ => crate::mirror::Mirroring::Enabled,
         };
-        let routed = match po.page_routed_mirrored(routed.clone(), None, &mirroring) {
+        // Artemis's `move` routes the copy and acknowledges the reference in
+        // one transaction. The copy is paged inside that same transaction, so
+        // a crash cannot leave the copy in the destination's pages while the
+        // reference stays unacknowledged (a duplicate), nor drop the reference
+        // before the copy is durable (a loss).
+        let move_tx = self
+            .shared
+            .ids
+            .storage()
+            .map(|_| crate::transaction::Transaction::new_ref(self.shared.ids.next(), None));
+        let routed = match po.page_routed_mirrored(routed.clone(), move_tx.as_ref(), &mirroring) {
             Ok(paged) => paged.routed,
             Err(e) => {
                 tracing::warn!("moving message {} to {address}: {e}", r.message_id());
@@ -1906,10 +1916,17 @@ impl Actor {
         let queue = self.queue();
         let what = format!("moving message {} to {address}", r.message_id());
         let mut committed = None;
-        if let Some(s) = self.shared.ids.storage() {
-            let tx = self.shared.ids.next();
-            let mut persistent = false;
-            let mut written = || -> crate::storage::StoreResult<Option<crate::storage::Pending>> {
+        let mut paging = TxPaging::default();
+        if let (Some(s), Some(move_tx)) = (self.shared.ids.storage(), &move_tx) {
+            let (tx, taken) = {
+                let mut t = crate::transaction::lock(move_tx);
+                (t.id, std::mem::take(&mut t.paging))
+            };
+            paging = taken;
+            // The copy's paging must commit even when nothing is journaled
+            // (a non-durable message paged to a full address).
+            let mut persistent = !paging.page_txs.is_empty();
+            let result = (|| -> crate::storage::StoreResult<Option<crate::storage::Pending>> {
                 for (m, targets) in &routed {
                     for q in targets.iter().filter(|q| q.is_durable_ref(m)) {
                         if m.message.durable_up() == 1 {
@@ -1919,7 +1936,6 @@ impl Actor {
                         persistent = true;
                     }
                 }
-                let mut paging = TxPaging::default();
                 if queue.store_ack_tx(tx, &mut r, &mut paging)? {
                     persistent = true;
                 }
@@ -1928,11 +1944,12 @@ impl Actor {
                 }
                 paging.before_commit(s, tx)?;
                 s.commit(tx).map(Some)
-            };
-            match written() {
+            })();
+            match result {
                 Ok(p) => committed = p,
                 Err(e) => {
                     let _ = s.rollback(tx);
+                    paging.after_rollback();
                     self.move_failed(r, format!("{what}: {e}"), settle);
                     return;
                 }
@@ -1942,10 +1959,19 @@ impl Actor {
         // once the transaction is in the journal; if it never is, the
         // original stays, as Artemis's transaction leaves it.
         match committed {
-            None => self.moved(routed, &r, reason, settle),
+            None => {
+                paging.after_commit();
+                self.moved(routed, &r, reason, settle)
+            }
             Some(p) => self.after_commit(p, what, move |a, failed| match failed {
-                None => a.moved(routed, &r, reason, settle),
-                Some(e) => a.move_failed(r, e, settle),
+                None => {
+                    paging.after_commit();
+                    a.moved(routed, &r, reason, settle)
+                }
+                Some(e) => {
+                    paging.after_rollback();
+                    a.move_failed(r, e, settle)
+                }
             }),
         }
     }
