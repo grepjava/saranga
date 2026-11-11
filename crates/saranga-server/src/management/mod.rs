@@ -156,6 +156,10 @@ pub struct Management {
     counters: counters::MessageCounters,
     /// When the broker started, in epoch milliseconds.
     started_at: i64,
+    /// Serializes file-backed user management (`addUser`/`resetUser`/
+    /// `removeUser`), whose read-modify-write of the users and roles files
+    /// would otherwise lose concurrent updates. Artemis's `userLock`.
+    user_lock: std::sync::Mutex<()>,
 }
 
 /// A resource, by its management name.
@@ -201,7 +205,13 @@ impl Management {
             ),
             config,
             started_at: crate::message::now_millis(),
+            user_lock: std::sync::Mutex::new(()),
         }
+    }
+
+    /// Guards file-backed user management against concurrent read-modify-write.
+    pub(crate) fn user_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.user_lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn config(&self) -> &ManagementConfig {

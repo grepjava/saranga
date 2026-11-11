@@ -294,6 +294,87 @@ async fn start_with_security(dir: &Path) -> Arc<Broker> {
     Broker::start(config).await.unwrap()
 }
 
+/// A broker whose users and roles live in properties files (a JAAS
+/// `PropertiesLoginModule`), so management `addUser`/`resetUser`/`removeUser`
+/// read-modify-write those files. The config file path (and so the etc
+/// directory the files live in) is `dir`.
+async fn start_with_file_users(dir: &Path) -> Arc<Broker> {
+    std::fs::write(dir.join("users.properties"), b"# users\n").unwrap();
+    std::fs::write(dir.join("roles.properties"), b"# roles\n").unwrap();
+    let file = cfg::BrokerConfig::parse(
+        r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+             <persistence-enabled>false</persistence-enabled>
+             <security-enabled>false</security-enabled>
+           </core></configuration>"#,
+    )
+    .unwrap();
+    let mut config = BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir).unwrap();
+    config.management.file_path = Some(dir.join("broker.xml"));
+    let login = saranga_security::LoginConfig::parse(
+        "activemq {\n  \
+         org.apache.activemq.artemis.spi.core.security.jaas.PropertiesLoginModule required\n    \
+         org.apache.activemq.jaas.properties.user=\"users.properties\"\n    \
+         org.apache.activemq.jaas.properties.role=\"roles.properties\";\n};",
+        |_| None,
+    )
+    .unwrap();
+    let manager = saranga_security::JaasSecurityManager::new(login, Some(dir), "activemq", None);
+    config.security = Some(Arc::new(saranga_security::SecurityStore::new(
+        saranga_security::SecurityStoreConfig::from_broker(&file),
+        file.security_repository().unwrap(),
+        Arc::new(manager),
+    )));
+    Broker::start(config).await.unwrap()
+}
+
+/// Concurrent `addUser` calls each read the users file, add their user and
+/// write the file back. Without serialization they overwrite each other and
+/// only one user survives; the management user lock must keep every one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_add_user_keeps_every_user() {
+    const N: usize = 24;
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start_with_file_users(dir.path()).await;
+
+    let mut tasks = Vec::new();
+    for i in 0..N {
+        let b = broker.clone();
+        tasks.push(tokio::spawn(async move {
+            b.management()
+                .invoke(
+                    &b,
+                    "broker",
+                    "addUser",
+                    &[
+                        Json::from(format!("user{i}")),
+                        Json::from("pw"),
+                        Json::from(""),
+                        Json::from(true),
+                    ],
+                    Default::default(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("addUser user{i}: {e}"));
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    let text = std::fs::read_to_string(dir.path().join("users.properties")).unwrap();
+    let present = (0..N)
+        .filter(|i| {
+            let key = format!("user{i}");
+            text.lines()
+                .any(|l| l.split('=').next().map(str::trim) == Some(key.as_str()))
+        })
+        .count();
+    assert_eq!(
+        present, N,
+        "every concurrently added user must persist; got:\n{text}"
+    );
+}
+
 #[tokio::test]
 async fn security_settings_survive_a_restart() {
     let dir = tempfile::tempdir().unwrap();

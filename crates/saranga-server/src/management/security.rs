@@ -449,6 +449,7 @@ fn add_user(m: &Management, broker: &Broker, a: &Args) -> Outcome {
             users: user_file,
             roles: role_file,
         } => {
+            let _guard = m.user_lock();
             let user = user.unwrap_or_else(|| "null".to_owned());
             let (mut users, mut role_doc) = read_files(&user_file, &role_file)?;
             if users.get(&user).is_some() {
@@ -475,6 +476,7 @@ fn reset_user(m: &Management, broker: &Broker, a: &Args, plaintext: bool) -> Out
             users: user_file,
             roles: role_file,
         } => {
+            let _guard = m.user_lock();
             let (mut users, mut role_doc) = read_files(&user_file, &role_file)?;
             if users.get(&user).is_none() {
                 return Err(format!("AMQ229224: User {user} does not exist"));
@@ -499,6 +501,7 @@ fn remove_user(m: &Management, broker: &Broker, user: &str) -> Outcome {
             users: user_file,
             roles: role_file,
         } => {
+            let _guard = m.user_lock();
             let (mut users, mut role_doc) = read_files(&user_file, &role_file)?;
             if users.get(user).is_none() {
                 return Err(format!("AMQ229224: User {user} does not exist"));

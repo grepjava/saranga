@@ -29,6 +29,20 @@ struct Consumers {
     filters: Vec<(String, FilterRef, i32)>,
 }
 
+impl Consumers {
+    /// Whether some consumer here would accept `message`. A consumer with no
+    /// filter takes any message; it is counted in `count` but never recorded
+    /// in `filters`, so `count` beyond the filtered consumers means an
+    /// unfiltered consumer is present. Checking only `filters` (as
+    /// `filters.is_empty()` would) misses the mixed case: one filtered
+    /// consumer leaves `filters` non-empty even though an unfiltered peer
+    /// accepts what the filter rejects.
+    fn accepts(&self, message: &dyn saranga_filter::Filterable) -> bool {
+        let filtered: i32 = self.filters.iter().map(|(_, _, n)| n).sum();
+        self.count > filtered || self.filters.iter().any(|(_, f, _)| f.matches(message))
+    }
+}
+
 /// `RemoteQueueBindingImpl`.
 pub struct RemoteBinding {
     id: i64,
@@ -140,7 +154,7 @@ impl RemoteBinding {
         if c.count <= 0 || self.load_balancing == MessageLoadBalancing::Off {
             return false;
         }
-        c.filters.is_empty() || c.filters.iter().any(|(_, f, _)| f.matches(message))
+        c.accepts(message)
     }
 
     /// `addConsumer`: one more consumer there, with its filter.
@@ -256,5 +270,37 @@ mod tests {
             "orders"
         );
         assert_eq!(strip_trailing_uuid("orders"), "orders");
+    }
+
+    /// A remote queue with both a filtered and an unfiltered consumer must
+    /// report a message the filter rejects as acceptable: the unfiltered
+    /// consumer would take it. Checking only the filters strands the message.
+    #[test]
+    fn an_unfiltered_consumer_accepts_what_a_filtered_peer_rejects() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let filter: FilterRef = Arc::new(saranga_filter::Filter::parse("color = 'red'").unwrap());
+        let mut c = Consumers::default();
+        // One consumer filtered on color='red', one with no filter.
+        c.filters.push(("color = 'red'".to_owned(), filter, 1));
+        c.count = 2;
+
+        // A message the filter rejects. The unfiltered consumer accepts it.
+        let mut blue: HashMap<String, String> = HashMap::new();
+        blue.insert("color".to_owned(), "blue".to_owned());
+        assert!(
+            c.accepts(&blue),
+            "an unfiltered consumer must accept a message its filtered peer rejects"
+        );
+
+        // With only the filtered consumer, the same message is not accepted.
+        c.count = 1;
+        assert!(!c.accepts(&blue));
+
+        // The filtered consumer still accepts a matching message.
+        let mut red: HashMap<String, String> = HashMap::new();
+        red.insert("color".to_owned(), "red".to_owned());
+        assert!(c.accepts(&red));
     }
 }

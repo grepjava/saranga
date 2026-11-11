@@ -103,7 +103,7 @@ impl Broker {
         reconcile_diverts(&self.post_office, &reload.diverts, &self.transformers);
 
         reloading("addresses");
-        undeploy_not_configured(&self.post_office, &reload.addresses);
+        undeploy_not_configured(&self.post_office, &reload.addresses, &reload.queues);
         deploy_addresses(&self.post_office, &reload.addresses);
         deploy_queue_specs(&self.post_office, &reload.queues);
 
@@ -301,7 +301,18 @@ pub(crate) fn deploy_queue_specs(
 }
 
 /// `undeployAddressesAndQueueNotInConfiguration`.
-pub(crate) fn undeploy_not_configured(post_office: &PostOffice, addresses: &[AddressDeployment]) {
+///
+/// `legacy_queues` are the deprecated top-level `<queues>`, deployed on their
+/// own addresses and configuration-managed. Artemis builds its retained set
+/// only from the queues declared under `<addresses>`, so under
+/// `config-delete-queues=FORCE` it deletes (and then re-creates) a still-
+/// configured legacy queue on reload, losing its messages. Saranga keeps the
+/// legacy queues in the retained set to avoid that.
+pub(crate) fn undeploy_not_configured(
+    post_office: &PostOffice,
+    addresses: &[AddressDeployment],
+    legacy_queues: &[crate::QueueSpec],
+) {
     let configured: HashMap<&str, &AddressDeployment> =
         addresses.iter().map(|a| (a.name.as_str(), a)).collect();
     for info in post_office.addresses() {
@@ -337,12 +348,10 @@ pub(crate) fn undeploy_not_configured(post_office: &PostOffice, addresses: &[Add
                 .filter(|q| q.config().configuration_managed)
             {
                 // A queue stays if some configured address lists it on this
-                // address.
-                let kept = addresses.iter().any(|a| {
-                    a.queues
-                        .iter()
-                        .any(|s| s.name == *q.name() && s.address == info.name)
-                });
+                // address, or a legacy `<queues>` entry declares it there.
+                let declares = |s: &crate::QueueSpec| s.name == *q.name() && s.address == info.name;
+                let kept = addresses.iter().any(|a| a.queues.iter().any(declares))
+                    || legacy_queues.iter().any(declares);
                 if !kept {
                     tracing::info!("AMQ224077: Undeploying queue {}", q.name());
                     if let Err(e) = post_office.delete_queue(q.name(), false, false) {

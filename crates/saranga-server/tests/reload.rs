@@ -209,6 +209,50 @@ async fn legacy_queues_and_jms() {
     assert!(po.queue("q1").is_some() && po.queue("jq").is_some());
 }
 
+/// A configured legacy `<queues>` entry on an address with
+/// `config-delete-queues=FORCE` must survive a reload: it is still in the
+/// configuration, so it must not be deleted and recreated (which would change
+/// its id and lose its messages).
+#[tokio::test]
+async fn reload_keeps_a_configured_legacy_queue_under_force_delete() {
+    use saranga_message::CoreMessage;
+    use saranga_server::message::{MessageRef, ServerMessage};
+
+    let body = r##"
+      <address-settings>
+        <address-setting match="forced.#">
+          <config-delete-queues>FORCE</config-delete-queues>
+        </address-setting>
+      </address-settings>
+      <queues>
+        <queue name="lq"><address>forced.lq</address></queue>
+      </queues>"##;
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(&xml(false, body), dir.path()).await;
+    let po = broker.post_office();
+    let lq = po.queue("lq").expect("legacy queue deployed at start");
+    let id = lq.id();
+    lq.add(MessageRef::new(ServerMessage::new(CoreMessage {
+        message_id: 1,
+        address: Some("forced.lq".into()),
+        ..Default::default()
+    })));
+    assert_eq!(lq.message_count(), 1);
+
+    broker
+        .reload(Reload::from_file_config(&xml(false, body)).unwrap())
+        .await
+        .unwrap();
+
+    let after = po.queue("lq").expect("legacy queue survives reload");
+    assert_eq!(
+        after.id(),
+        id,
+        "the configured legacy queue is kept, not deleted and recreated"
+    );
+    assert_eq!(after.message_count(), 1, "its message is not lost");
+}
+
 /// A port nothing listens on.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")

@@ -797,7 +797,7 @@ impl Broker {
         } else {
             paging.set_loaded();
         }
-        reload::undeploy_not_configured(&post_office, &config.addresses);
+        reload::undeploy_not_configured(&post_office, &config.addresses, &config.legacy_queues);
         if let Some(s) = &storage {
             key_values.attach(s.clone());
         }

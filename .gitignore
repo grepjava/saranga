@@ -8,3 +8,7 @@ tests/golden/data/
 # Drafts of Artemis upstream issues and PRs, kept local: they include
 # reports not yet disclosed.
 docs/upstream/
+
+# Local-only working output: graphify knowledge graphs and review/report dumps.
+/graphify-out
+/output
