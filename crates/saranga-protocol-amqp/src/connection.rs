@@ -5074,7 +5074,6 @@ async fn server_send(
 ) -> Result<bool, BrokerError> {
     // At amqpMinLargeMessageSize the message goes to a file of its own.
     let large = large_at > 0 && payload.len() >= large_at;
-    let file = large.then(|| payload.clone());
     let mut msg = AmqpMessage::new(i64::from(format), payload, now)
         .map_err(|e| BrokerError::internal(e.to_string()))?;
     let address: std::borrow::Cow<'_, str> = match &target.address {
@@ -5145,7 +5144,7 @@ async fn server_send(
         return Ok(true);
     }
     msg.set_connection_id(container);
-    if file.is_some() {
+    if large {
         msg.set_message_id(server.broker().post_office().ids().next());
         msg.make_large();
     }
@@ -5175,20 +5174,28 @@ async fn server_send(
     {
         return Ok(false);
     }
-    let body = match file {
-        Some(bytes) => {
-            let io = |e: std::io::Error| BrokerError::new(ErrorType::IoError, e.to_string());
-            let mut w = server
-                .broker()
-                .large_messages()
-                .create(msg.message_id(), msg.is_durable())
-                .map_err(io)?;
-            w.append(&bytes).map_err(io)?;
-            Some(w.finish().map_err(io)?)
-        }
-        None => None,
+    let body = if large {
+        let io = |e: std::io::Error| BrokerError::new(ErrorType::IoError, e.to_string());
+        let mut w = server
+            .broker()
+            .large_messages()
+            .create(msg.message_id(), msg.is_durable())
+            .map_err(io)?;
+        // The message's own encoding, written straight to the file (no copy).
+        w.append(msg.data()).map_err(io)?;
+        Some(w.finish().map_err(io)?)
+    } else {
+        None
     };
-    let native = AmqpNative::arc(msg);
+    // A large message keeps only its headers in memory; its body stays in the
+    // file and is read back whole when the message is delivered.
+    let native = match &body {
+        Some(_) => AmqpNative::arc(
+            AmqpMessage::from_large_record(&msg.large_record(), Vec::new(), now)
+                .map_err(|e| BrokerError::internal(e.to_string()))?,
+        ),
+        None => AmqpNative::arc(msg),
+    };
     server
         .send_native_large_to(native, body, tx, Some(&address), routing)
         .await?;

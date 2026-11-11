@@ -66,7 +66,6 @@ impl MirrorTarget {
         large_at: usize,
     ) -> Result<(), BrokerError> {
         let large = large_at > 0 && payload.len() >= large_at;
-        let file = large.then(|| payload.clone());
         let mut m = AmqpMessage::new(i64::from(format), payload, now)
             .map_err(|e| BrokerError::internal(e.to_string()))?;
         let event = m
@@ -113,24 +112,33 @@ impl MirrorTarget {
                 saranga_buffer::PropertyValue::Long(internal_id),
             ),
         }
-        let body = match file {
-            Some(bytes) => {
-                let id = self.broker.post_office().ids().next();
-                m.set_message_id(id);
-                m.make_large();
-                let io = |e: std::io::Error| BrokerError::new(ErrorType::IoError, e.to_string());
-                let mut w = self
-                    .broker
-                    .large_messages()
-                    .create(id, m.is_durable())
-                    .map_err(io)?;
-                w.append(&bytes).map_err(io)?;
-                Some(w.finish().map_err(io)?)
-            }
-            None => None,
+        let body = if large {
+            let id = self.broker.post_office().ids().next();
+            m.set_message_id(id);
+            m.make_large();
+            let io = |e: std::io::Error| BrokerError::new(ErrorType::IoError, e.to_string());
+            let mut w = self
+                .broker
+                .large_messages()
+                .create(id, m.is_durable())
+                .map_err(io)?;
+            // The message's own encoding, written straight to the file.
+            w.append(m.data()).map_err(io)?;
+            Some(w.finish().map_err(io)?)
+        } else {
+            None
+        };
+        // A large message keeps only its headers in memory; its body stays in
+        // the file and is read back whole when the message is delivered.
+        let native = match &body {
+            Some(_) => AmqpNative::arc(
+                AmqpMessage::from_large_record(&m.large_record(), Vec::new(), now)
+                    .map_err(|e| BrokerError::internal(e.to_string()))?,
+            ),
+            None => AmqpNative::arc(m),
         };
         let routed = server.send_mirrored(
-            AmqpNative::arc(m),
+            native,
             body,
             internal_address.as_deref(),
             target_queues.as_deref(),

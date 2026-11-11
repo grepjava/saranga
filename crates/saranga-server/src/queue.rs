@@ -1270,21 +1270,35 @@ impl Consumer {
     /// Hands a message to the sink; a large one starts a transfer.
     fn send(&mut self, message: &Arc<ServerMessage>, delivery_count: i32) {
         let id = self.reg.client_id;
-        // A native message holds its whole encoding: it goes as it is.
-        let size = match message.large().filter(|_| message.native().is_none()) {
+        let read_body = |body: &Arc<crate::large::LargeBody>| -> Vec<u8> {
+            body.read_all().unwrap_or_else(|e| {
+                tracing::warn!(
+                    "AMQ222110: Error on resetting large message deliver - {}: {e}",
+                    message.message_id()
+                );
+                Vec::new()
+            })
+        };
+        let size = match message.large() {
+            // Not a large message: it goes as it is.
             None => self.reg.sink.deliver(id, message, delivery_count),
+            // A large native (AMQP) message keeps only its headers in memory;
+            // its body is read from the file and the whole message rebuilt,
+            // which a native delivery takes whole.
+            Some(body) if message.native().is_some() => {
+                let whole = ServerMessage::new_native(
+                    message
+                        .native()
+                        .expect("native")
+                        .reconstitute(read_body(body)),
+                );
+                self.reg.sink.deliver(id, &whole, delivery_count)
+            }
+            // A large Core message read whole for a sink that cannot take it
+            // in chunks.
             Some(body) if !self.reg.sink.supports_large() => {
                 let mut core = message.core().clone();
-                core.body = body
-                    .read_all()
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            "AMQ222110: Error on resetting large message deliver - {}: {e}",
-                            message.message_id()
-                        );
-                        Vec::new()
-                    })
-                    .into();
+                core.body = read_body(body).into();
                 self.reg
                     .sink
                     .deliver(id, &ServerMessage::new(core), delivery_count)

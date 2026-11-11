@@ -248,6 +248,12 @@ pub trait NativeMessage: Send + Sync + fmt::Debug {
     /// `after` (`setAddress`, `setBrokerProperty`, ... then `reencode`).
     fn updated(&self, before: &CoreMessage, after: &CoreMessage) -> Arc<dyn NativeMessage>;
 
+    /// A large message whose body is kept in a file rather than in memory,
+    /// rebuilt with `body` (its file read whole) in place, for delivery or
+    /// conversion that needs the whole encoding. A message that carries its
+    /// whole encoding already returns a copy of itself.
+    fn reconstitute(&self, body: Vec<u8>) -> Arc<dyn NativeMessage>;
+
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -281,16 +287,15 @@ impl MessageDecoders {
         self.native(record, None).map(ServerMessage::new_native)
     }
 
-    /// A large message of another protocol, with its file.
+    /// A large message of another protocol, with its file. The body stays in
+    /// the file: the message keeps only its headers in memory and is read
+    /// back whole when it is delivered.
     pub fn decode_large(
         &self,
         record: &PersistedMessage,
         body: Arc<LargeBody>,
     ) -> Result<Arc<ServerMessage>, String> {
-        let data = body
-            .read_all()
-            .map_err(|e| format!("large message {}: {e}", body.id()))?;
-        self.native(record, Some(data))
+        self.native(record, Some(Vec::new()))
             .map(|n| ServerMessage::new_native_large(n, body))
     }
 

@@ -432,6 +432,23 @@ impl NativeMessage for AmqpNative {
         AmqpNative::arc(m)
     }
 
+    fn reconstitute(&self, body: Vec<u8>) -> Arc<dyn NativeMessage> {
+        // `AMQPLargeMessage.toMessage`: the headers kept in memory and the
+        // body read from the file, rebuilt into the whole encoding the
+        // message's own record describes.
+        let now = now_millis();
+        match AmqpMessage::from_large_record(&self.message.large_record(), body, now) {
+            Ok(m) => AmqpNative::arc(m),
+            Err(e) => {
+                tracing::warn!(
+                    "AMQ222110: Error on reconstituting large message {}: {e}",
+                    self.message.message_id()
+                );
+                AmqpNative::arc(self.message.clone())
+            }
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
