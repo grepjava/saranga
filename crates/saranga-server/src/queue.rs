@@ -750,23 +750,14 @@ impl Queue {
     }
 
     /// `changeReferencesPriority` for Saranga's immutable messages: the
-    /// reference moves from the message it holds to one rebuilt with the new
-    /// priority, sharing the same ID and durability. Both the reference's
-    /// paging-memory charge and its durable journal reference move with it —
-    /// Artemis mutates the message in place and keeps its `RefCountMessage`
-    /// state, so without moving the durable count the rebuilt message's final
-    /// `durableDown` would return -1 and skip deleting the journal record.
+    /// reference keeps its place but its message is rebuilt with the new
+    /// priority. Artemis mutates the message in place and keeps its
+    /// `RefCountMessage` state, so the rebuilt message shares this reference's
+    /// memory charge and journal accounting — splitting them would leak the
+    /// charge, or for a multicast message let this queue delete a journal
+    /// record another queue still holds.
     pub(crate) fn reprioritise(&self, r: &mut MessageRef, core: CoreMessage) {
-        let durable = self.is_durable_ref(r);
-        self.ref_down(r);
-        if durable {
-            r.message.durable_down();
-        }
-        r.message = r.message.with_core(core);
-        self.ref_up(r);
-        if durable {
-            r.message.durable_up();
-        }
+        r.message = r.message.with_core_keeping_refs(core);
     }
 
     /// Journals an acknowledgement outside a transaction: `ACKNOWLEDGE_REF`
@@ -1866,7 +1857,15 @@ impl Actor {
             return;
         };
         let mut spec = QueueSpec::new(format!("{prefix}{address}{suffix}"), destination);
-        spec.filter_string = Some(format!("{} = '{address}'", message::HDR_ORIGINAL_ADDRESS));
+        // The address is a selector string literal, so an apostrophe in it
+        // must be doubled or the filter does not parse and the resource queue
+        // is never created (Artemis builds the same filter unescaped, so an
+        // address with an apostrophe loses its dead-lettered messages there).
+        spec.filter_string = Some(format!(
+            "{} = '{}'",
+            message::HDR_ORIGINAL_ADDRESS,
+            address.replace('\'', "''")
+        ));
         spec.auto_created = true;
         spec.auto_create_address = Some(true);
         if let Err(e) = po.create_queue(spec, true) {
@@ -2252,7 +2251,11 @@ impl Actor {
                         for (k, v) in properties {
                             core.properties.insert(k.as_str().into(), v);
                         }
-                        r.message = r.message.with_core(core);
+                        // The reference stays the one being dead-lettered, so
+                        // the rebuilt message keeps its accounting; otherwise
+                        // acknowledging it decrements empty counters and leaks
+                        // the memory and journal record it charged.
+                        r.message = r.message.with_core_keeping_refs(core);
                     }
                     let s = self.queue().settings();
                     self.send_to_dead_letter_address(r, &s);

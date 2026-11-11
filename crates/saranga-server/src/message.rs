@@ -317,6 +317,28 @@ impl MessageDecoders {
 }
 
 /// A message after the broker has assigned its ID and address.
+/// A message's `RefCountMessage` accounting: what Artemis keeps on the one
+/// message object a journal ID has. Saranga's messages are immutable, so an
+/// in-place change (a priority change, a redelivery's failure cause) rebuilds
+/// the message; the rebuilt one shares this, so references and durable records
+/// are never split across objects that stand for the same journal ID (which
+/// would delete a multicast message's record while another queue still holds
+/// it, or leak the memory a discarded message charged).
+#[derive(Debug, Default)]
+struct RefCounts {
+    /// References on durable queues not yet acknowledged
+    /// (`RefCountMessage.durableUp/Down`); the record is deleted at zero.
+    durable_refs: AtomicI32,
+    /// References in queues (`RefCountMessage.refUp/refDown`).
+    refs: AtomicI32,
+    /// The paging store of the message's address, which counts the memory
+    /// it takes while referenced (`owner`).
+    owner: OnceLock<Arc<crate::paging::PagingStore>>,
+    /// `getMemoryEstimate`, fixed when first asked as in Artemis, so that
+    /// what a reference adds its removal takes away.
+    estimate: OnceLock<i64>,
+}
+
 #[derive(Debug)]
 pub struct ServerMessage {
     /// The message, or for a native message the broker's view of it.
@@ -331,55 +353,57 @@ pub struct ServerMessage {
     /// properties (`encodeHeadersAndProperties`), the form `ADD_LARGE_MESSAGE`
     /// and `SESS_RECEIVE_LARGE_MSG` carry.
     encoded: Bytes,
-    /// References on durable queues not yet acknowledged
-    /// (`RefCountMessage.durableUp/Down`); the record is deleted at zero.
-    durable_refs: AtomicI32,
     /// A large message's body (`LargeServerMessageImpl`); `core.body` is
     /// then empty.
     large: Option<Arc<LargeBody>>,
-    /// References in queues (`RefCountMessage.refUp/refDown`).
-    refs: AtomicI32,
-    /// The paging store of the message's address, which counts the memory
-    /// it takes while referenced (`owner`).
-    owner: OnceLock<Arc<crate::paging::PagingStore>>,
-    /// `getMemoryEstimate`, fixed when first asked as in Artemis, so that
-    /// what a reference adds its removal takes away.
-    estimate: OnceLock<i64>,
+    /// The `RefCountMessage` accounting, shared with any in-place replacement
+    /// of this message (see [`ServerMessage::with_core_keeping_refs`]).
+    counts: Arc<RefCounts>,
 }
 
 impl ServerMessage {
-    pub fn new(mut core: CoreMessage) -> Arc<Self> {
+    /// Assembles a message from its parts and its (fresh or shared) accounting.
+    fn from_parts(
+        core: CoreMessage,
+        native: Option<Arc<dyn NativeMessage>>,
+        encoded: Bytes,
+        large: Option<Arc<LargeBody>>,
+        counts: Arc<RefCounts>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            core,
+            native,
+            converted: OnceLock::new(),
+            encoded,
+            large,
+            counts,
+        })
+    }
+
+    pub fn new(core: CoreMessage) -> Arc<Self> {
+        Self::new_counted(core, Arc::default())
+    }
+
+    fn new_counted(mut core: CoreMessage, counts: Arc<RefCounts>) -> Arc<Self> {
         let encoded = exact(core.encode_size(), |w| core.encode(w));
         // The body is held once, in the encoding (after its i32 end-of-body),
         // and so are the address and the properties' names and strings:
         // slices of it rather than copies.
         core.share(&encoded);
-        Arc::new(Self {
-            core,
-            native: None,
-            converted: OnceLock::new(),
-            encoded,
-            durable_refs: AtomicI32::new(0),
-            large: None,
-            refs: AtomicI32::new(0),
-            owner: OnceLock::new(),
-            estimate: OnceLock::new(),
-        })
+        Self::from_parts(core, None, encoded, None, counts)
     }
 
     /// A message kept in its own protocol's encoding.
     pub fn new_native(native: Arc<dyn NativeMessage>) -> Arc<Self> {
-        Arc::new(Self {
-            core: native.view(),
-            native: Some(native),
-            converted: OnceLock::new(),
-            encoded: Bytes::new(),
-            durable_refs: AtomicI32::new(0),
-            large: None,
-            refs: AtomicI32::new(0),
-            owner: OnceLock::new(),
-            estimate: OnceLock::new(),
-        })
+        Self::native_counted(native, None, Arc::default())
+    }
+
+    fn native_counted(
+        native: Arc<dyn NativeMessage>,
+        large: Option<Arc<LargeBody>>,
+        counts: Arc<RefCounts>,
+    ) -> Arc<Self> {
+        Self::from_parts(native.view(), Some(native), Bytes::new(), large, counts)
     }
 
     /// A native message whose view is already made, with its large body if
@@ -389,67 +413,53 @@ impl ServerMessage {
         view: CoreMessage,
         large: Option<Arc<LargeBody>>,
     ) -> Arc<Self> {
-        Arc::new(Self {
-            core: view,
-            native: Some(native),
-            converted: OnceLock::new(),
-            encoded: Bytes::new(),
-            durable_refs: AtomicI32::new(0),
-            large,
-            refs: AtomicI32::new(0),
-            owner: OnceLock::new(),
-            estimate: OnceLock::new(),
-        })
+        Self::from_parts(view, Some(native), Bytes::new(), large, Arc::default())
     }
 
     /// A large message kept in its own protocol's encoding, whose file is
     /// `body`.
     pub fn new_native_large(native: Arc<dyn NativeMessage>, body: Arc<LargeBody>) -> Arc<Self> {
-        Arc::new(Self {
-            core: native.view(),
-            native: Some(native),
-            converted: OnceLock::new(),
-            encoded: Bytes::new(),
-            durable_refs: AtomicI32::new(0),
-            large: Some(body),
-            refs: AtomicI32::new(0),
-            owner: OnceLock::new(),
-            estimate: OnceLock::new(),
-        })
+        Self::native_counted(native, Some(body), Arc::default())
     }
 
     /// A large message: `core` holds the headers and properties, `body` the
     /// body.
     pub fn new_large(core: CoreMessage, body: Arc<LargeBody>) -> Arc<Self> {
+        Self::large_counted(core, body, Arc::default())
+    }
+
+    fn large_counted(core: CoreMessage, body: Arc<LargeBody>, counts: Arc<RefCounts>) -> Arc<Self> {
         let encoded = exact(core.headers_and_properties_size(), |w| {
             core.encode_headers_and_properties(w)
         });
-        Arc::new(Self {
-            core,
-            native: None,
-            converted: OnceLock::new(),
-            encoded,
-            durable_refs: AtomicI32::new(0),
-            large: Some(body),
-            refs: AtomicI32::new(0),
-            owner: OnceLock::new(),
-            estimate: OnceLock::new(),
-        })
+        Self::from_parts(core, None, encoded, Some(body), counts)
     }
 
     /// The same message with other headers or properties, sharing a large
-    /// body.
+    /// body: a fresh, separately accounted message for a reroute (a divert, a
+    /// dead-letter or expiry copy, a replay), which is counted into its queues
+    /// anew.
     pub fn with_core(&self, core: CoreMessage) -> Arc<Self> {
+        self.with_core_counted(core, Arc::default())
+    }
+
+    /// The same message rebuilt in place for a reference that stays in its
+    /// queue (a priority change, a redelivery's failure cause): it shares this
+    /// message's reference and journal accounting, so the change neither leaks
+    /// the memory the reference charged nor, for a multicast message, lets one
+    /// queue delete a journal record another still holds.
+    pub fn with_core_keeping_refs(&self, core: CoreMessage) -> Arc<Self> {
+        self.with_core_counted(core, self.counts.clone())
+    }
+
+    fn with_core_counted(&self, core: CoreMessage, counts: Arc<RefCounts>) -> Arc<Self> {
         if let Some(n) = &self.native {
             let n = n.updated(&self.core, &core);
-            return match &self.large {
-                Some(body) => Self::new_native_large(n, body.clone()),
-                None => Self::new_native(n),
-            };
+            return Self::native_counted(n, self.large.clone(), counts);
         }
         match &self.large {
-            Some(body) => Self::new_large(core, body.clone()),
-            None => Self::new(core),
+            Some(body) => Self::large_counted(core, body.clone(), counts),
+            None => Self::new_counted(core, counts),
         }
     }
 
@@ -557,12 +567,12 @@ impl ServerMessage {
 
     /// `durableUp`: returns the new count.
     pub fn durable_up(&self) -> i32 {
-        self.durable_refs.fetch_add(1, Ordering::SeqCst) + 1
+        self.counts.durable_refs.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// `durableDown`: returns the new count.
     pub fn durable_down(&self) -> i32 {
-        self.durable_refs.fetch_sub(1, Ordering::SeqCst) - 1
+        self.counts.durable_refs.fetch_sub(1, Ordering::SeqCst) - 1
     }
 
     /// `Message.getEncodeSize`, the size counted for memory accounting.
@@ -579,7 +589,7 @@ impl ServerMessage {
     /// a native message counts what its protocol's message does, with no
     /// conversion.
     pub fn memory_estimate(&self) -> i64 {
-        *self.estimate.get_or_init(|| match &self.native {
+        *self.counts.estimate.get_or_init(|| match &self.native {
             Some(n) => n.memory_estimate(),
             None => {
                 let props = &self.core.properties;
@@ -592,12 +602,12 @@ impl ServerMessage {
 
     /// `refUp`: returns the new count.
     pub fn ref_up(&self) -> i32 {
-        self.refs.fetch_add(1, Ordering::SeqCst) + 1
+        self.counts.refs.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// `refDown`: returns the new count.
     pub fn ref_down(&self) -> i32 {
-        self.refs.fetch_sub(1, Ordering::SeqCst) - 1
+        self.counts.refs.fetch_sub(1, Ordering::SeqCst) - 1
     }
 
     /// The store accounting the message's memory, set with its first
@@ -606,12 +616,12 @@ impl ServerMessage {
         &self,
         store: impl FnOnce() -> Option<Arc<crate::paging::PagingStore>>,
     ) -> Option<&Arc<crate::paging::PagingStore>> {
-        if self.owner.get().is_none()
+        if self.counts.owner.get().is_none()
             && let Some(s) = store()
         {
-            let _ = self.owner.set(s);
+            let _ = self.counts.owner.set(s);
         }
-        self.owner.get()
+        self.counts.owner.get()
     }
 }
 

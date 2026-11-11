@@ -103,3 +103,51 @@ async fn changing_priority_keeps_the_durable_journal_reference() {
     );
     broker.stop().unwrap();
 }
+
+/// A durable message fanned out to two queues shares one journal record.
+/// Changing its priority in one queue must not split that accounting across the
+/// rebuilt message and the one the other queue still holds, or acknowledging
+/// the one queue deletes the record the other still needs.
+#[tokio::test]
+async fn changing_priority_on_a_fanned_out_message_keeps_the_shared_record() {
+    let broker = Broker::start(BrokerConfig::new(Arc::new(SelectorFilters)))
+        .await
+        .unwrap();
+    let make = |name: &str| {
+        let mut spec = QueueSpec::new(name, "addr");
+        spec.auto_create_address = Some(true);
+        spec.durable = true;
+        broker.post_office().create_queue(spec, false).unwrap()
+    };
+    let qa = make("a");
+    let qb = make("b");
+
+    // One durable message referenced by both queues (a multicast fan-out: one
+    // journal record, a durable reference per queue).
+    let m = ServerMessage::new(CoreMessage {
+        message_id: 1,
+        address: Some(SimpleString::from("addr")),
+        durable: true,
+        priority: 4,
+        ..Default::default()
+    });
+    assert_eq!(m.durable_up(), 1, "queue a's reference");
+    assert_eq!(m.durable_up(), 2, "queue b's reference");
+    qa.add(MessageRef::new(m.clone()));
+    qb.add(MessageRef::new(m.clone()));
+
+    // Change priority in queue a only.
+    qa.act(Selection::filter(None), SelectionAction::ChangePriority(9))
+        .await;
+
+    // Acknowledging queue a's rebuilt message must not delete the shared
+    // record: its `durableDown` returns 1 (queue b still holds it), not 0.
+    let refs = qa.browse().await;
+    assert_eq!(refs.len(), 1);
+    assert_eq!(
+        refs[0].message.durable_down(),
+        1,
+        "acking one queue must not delete the record the other still holds"
+    );
+    broker.stop().unwrap();
+}
