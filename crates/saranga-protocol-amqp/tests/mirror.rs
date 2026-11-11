@@ -177,6 +177,53 @@ async fn mirrors_queues_messages_and_acks() {
     stop(b).await;
 }
 
+/// A large message is mirrored whole: the receiving broker streams its body to
+/// a file as it arrives and reads it back for the consumer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mirrors_a_large_message() {
+    let d = dirs();
+    let lb = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let la = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let pb = lb.local_addr().unwrap().port();
+    let b = start(d.1.path(), lb, "").await;
+    let a = start(d.0.path(), la, &mirror_to(pb, "to-b", false)).await;
+    wait_until("connected", || connected(&a, "to-b")).await;
+    let (_ca, sa) = session(a.port).await;
+    sa.create_queue(
+        QueueConfiguration::new("big")
+            .address("big")
+            .routing_type(RoutingType::Anycast),
+    )
+    .await
+    .unwrap();
+    wait_until("the queue mirrored", || count(&b, "big").is_some()).await;
+
+    // Well past the 100 KiB large-message threshold.
+    let body: Vec<u8> = (0..300_000).map(|i| (i * 31 % 251) as u8).collect();
+    let producer = sa.create_producer(Some("big")).await.unwrap();
+    producer.send(message::bytes_message(&body)).await.unwrap();
+    wait_until("the message mirrored", || count(&b, "big") == Some(1)).await;
+
+    // B spilled the body to a file as it arrived; reading it back gives the
+    // whole message.
+    let (_cb, sb) = session(b.port).await;
+    let consumer = sb.create_consumer("big", None, false).await.unwrap();
+    let got = consumer
+        .receive(WAIT)
+        .await
+        .unwrap()
+        .expect("a message within the timeout");
+    assert_eq!(got.message.body.len(), body.len(), "the whole body arrived");
+    assert!(
+        got.message.body == body,
+        "the body round-trips through the mirror unchanged"
+    );
+    consumer.acknowledge(&got).await.unwrap();
+    consumer.close().await;
+    stop(a).await;
+    stop(b).await;
+}
+
 /// With a mirror each way, what each sends reaches the other once, and an
 /// acknowledgement on either removes the message from both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -62,10 +62,11 @@ impl MirrorTarget {
         server: &mut ServerSession,
         format: u32,
         payload: Vec<u8>,
+        prewritten: Option<(Arc<saranga_server::large::LargeBody>, i64)>,
         now: i64,
         large_at: usize,
     ) -> Result<(), BrokerError> {
-        let large = large_at > 0 && payload.len() >= large_at;
+        let large = prewritten.is_some() || (large_at > 0 && payload.len() >= large_at);
         let mut m = AmqpMessage::new(i64::from(format), payload, now)
             .map_err(|e| BrokerError::internal(e.to_string()))?;
         let event = m
@@ -112,7 +113,12 @@ impl MirrorTarget {
                 saranga_buffer::PropertyValue::Long(internal_id),
             ),
         }
-        let body = if large {
+        let body = if let Some((body, id)) = prewritten {
+            // The body was streamed to its file as the message arrived.
+            m.set_message_id(id);
+            m.make_large();
+            Some(body)
+        } else if large {
             let id = self.broker.post_office().ids().next();
             m.set_message_id(id);
             m.make_large();

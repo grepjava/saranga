@@ -592,9 +592,23 @@ struct Incoming {
     format: u32,
     settled: bool,
     state: Option<DeliveryState>,
+    /// The whole message, or, once its body has spilled to a file, only the
+    /// headers that stay in memory.
     payload: Vec<u8>,
     /// The transfers it has taken, for `maxTransfersPerDelivery`.
     transfers: u32,
+    /// The open body file while a large message past the threshold is still
+    /// arriving: its later transfers go straight to disk.
+    spill: Option<Spill>,
+    /// Its body file and the ID it is named after, once it is complete.
+    large: Option<(Arc<saranga_server::large::LargeBody>, i64)>,
+}
+
+/// A large message's body being streamed to its file as it is received, so
+/// that the whole delivery is never held in memory at once.
+struct Spill {
+    writer: saranga_server::large::LargeWriter,
+    id: i64,
 }
 
 /// A link the client sends on (`ProtonServerReceiverContext`).
@@ -3892,15 +3906,35 @@ impl Conn {
         };
         s.next_incoming_id = s.next_incoming_id.wrapping_add(1);
         let limit = self.settings.max_transfers_per_delivery;
+        let min_large = self.settings.min_large_message_size;
+        // A large message's body is streamed to a file as it arrives, rather
+        // than held whole in memory; a coordinator's small transactions are
+        // not spilled.
+        let store = self.broker.large_messages().clone();
+        let ids = self.broker.post_office().ids().clone();
+        let next_id = move || ids.next();
         let complete = match s.links.get_mut(&t.handle) {
-            Some(Link::Receiver(rl)) => accumulate(
-                &mut rl.incoming,
-                &t,
-                payload,
-                &mut rl.credit,
-                &mut rl.delivery_count,
-                limit,
-            )?,
+            Some(Link::Receiver(rl)) => {
+                let large_at = match &rl.mode {
+                    ReceiveMode::Route | ReceiveMode::Mirror(_) => min_large,
+                    ReceiveMode::Managed(c) => c.large_threshold().max(0) as usize,
+                    ReceiveMode::Commands(_) | ReceiveMode::Events(_) => 0,
+                };
+                let spilling = (large_at > 0).then_some(Spilling {
+                    large_at,
+                    store: &store,
+                    next_id: &next_id,
+                });
+                accumulate(
+                    &mut rl.incoming,
+                    &t,
+                    payload,
+                    &mut rl.credit,
+                    &mut rl.delivery_count,
+                    limit,
+                    spilling.as_ref(),
+                )?
+            }
             Some(Link::Coordinator(cl)) => accumulate(
                 &mut cl.incoming,
                 &t,
@@ -3908,6 +3942,7 @@ impl Conn {
                 &mut cl.credit,
                 &mut cl.delivery_count,
                 limit,
+                None,
             )?,
             Some(Link::Sender(_)) => {
                 return Err(Fatal::new(
@@ -3965,6 +4000,9 @@ impl Conn {
         let mut target = rl.target.clone();
         let source = rl.source.clone();
         let mut large_at = self.settings.min_large_message_size;
+        // A body already streamed to its file: the payload here is only the
+        // headers, and the handler attaches the file instead of writing one.
+        let prewritten = incoming.large;
         let mut payload = incoming.payload;
         match &mode {
             ReceiveMode::Route => {}
@@ -4039,7 +4077,14 @@ impl Conn {
             // same (`actualDelivery`).
             ReceiveMode::Mirror(t) => {
                 let _ = t
-                    .receive(&mut s.server, incoming.format, payload, now, large_at)
+                    .receive(
+                        &mut s.server,
+                        incoming.format,
+                        payload,
+                        prewritten,
+                        now,
+                        large_at,
+                    )
                     .await;
                 Ok(true)
             }
@@ -4050,6 +4095,7 @@ impl Conn {
                     &target,
                     incoming.format,
                     payload,
+                    prewritten,
                     container,
                     tx.clone(),
                     now,
@@ -5065,6 +5111,7 @@ async fn server_send(
     target: &ReceiverTarget,
     format: u32,
     payload: Vec<u8>,
+    prewritten: Option<(Arc<saranga_server::large::LargeBody>, i64)>,
     container: Option<Arc<str>>,
     tx: Option<saranga_server::transaction::TxRef>,
     now: i64,
@@ -5072,8 +5119,9 @@ async fn server_send(
     settled: bool,
     anonymous: &mut Anonymous<'_>,
 ) -> Result<bool, BrokerError> {
-    // At amqpMinLargeMessageSize the message goes to a file of its own.
-    let large = large_at > 0 && payload.len() >= large_at;
+    // A body already streamed to its file arrives as headers only; otherwise a
+    // payload at amqpMinLargeMessageSize goes to a file of its own now.
+    let large = prewritten.is_some() || (large_at > 0 && payload.len() >= large_at);
     let mut msg = AmqpMessage::new(i64::from(format), payload, now)
         .map_err(|e| BrokerError::internal(e.to_string()))?;
     let address: std::borrow::Cow<'_, str> = match &target.address {
@@ -5145,7 +5193,12 @@ async fn server_send(
     }
     msg.set_connection_id(container);
     if large {
-        msg.set_message_id(server.broker().post_office().ids().next());
+        // A pre-written body keeps the ID its file is already named after.
+        let id = match &prewritten {
+            Some((_, id)) => *id,
+            None => server.broker().post_office().ids().next(),
+        };
+        msg.set_message_id(id);
         msg.make_large();
     }
     // The ID and the address the session would give it (setMessageID,
@@ -5174,7 +5227,10 @@ async fn server_send(
     {
         return Ok(false);
     }
-    let body = if large {
+    let body = if let Some((body, _)) = prewritten {
+        // The body was streamed to its file as the message arrived.
+        Some(body)
+    } else if large {
         let io = |e: std::io::Error| BrokerError::new(ErrorType::IoError, e.to_string());
         let mut w = server
             .broker()
@@ -5328,7 +5384,9 @@ fn accumulate(
     credit: &mut u32,
     delivery_count: &mut u32,
     limit: i32,
+    spilling: Option<&Spilling<'_>>,
 ) -> Result<Option<Incoming>, Fatal> {
+    let io_fatal = |e: std::io::Error| Fatal::new(condition::INTERNAL_ERROR, e.to_string());
     match incoming {
         Some(inc) => {
             inc.transfers += 1;
@@ -5338,7 +5396,16 @@ fn accumulate(
                     "Max transfers per delivery limit exceeded",
                 ));
             }
-            inc.payload.extend_from_slice(&payload);
+            match &mut inc.spill {
+                // A spilled message's later transfers go straight to its file.
+                Some(spill) => spill.writer.append(&payload).map_err(io_fatal)?,
+                None => {
+                    inc.payload.extend_from_slice(&payload);
+                    if let Some(sp) = spilling {
+                        try_spill(inc, sp).map_err(io_fatal)?;
+                    }
+                }
+            }
             if let Some(st) = &t.state {
                 inc.state = Some(st.clone());
             }
@@ -5349,24 +5416,70 @@ fn accumulate(
         None => {
             *credit = credit.saturating_sub(1);
             *delivery_count = delivery_count.wrapping_add(1);
-            *incoming = Some(Incoming {
+            let mut inc = Incoming {
                 delivery_id: t.delivery_id,
                 format: t.message_format.unwrap_or(0),
                 settled: t.settled.unwrap_or(false),
                 state: t.state.clone(),
                 payload,
                 transfers: 1,
-            });
+                spill: None,
+                large: None,
+            };
+            if let Some(sp) = spilling {
+                try_spill(&mut inc, sp).map_err(io_fatal)?;
+            }
+            *incoming = Some(inc);
         }
     }
     if t.aborted {
+        // An aborted delivery takes its half-written file with it.
         *incoming = None;
         return Ok(None);
     }
     if t.more {
         return Ok(None);
     }
-    Ok(incoming.take())
+    // Complete: close the body file if the message spilled.
+    let mut done = incoming.take();
+    if let Some(inc) = &mut done
+        && let Some(spill) = inc.spill.take()
+    {
+        let body = spill.writer.finish().map_err(io_fatal)?;
+        inc.large = Some((body, spill.id));
+    }
+    Ok(done)
+}
+
+/// What a receiving link needs to spill a large message to a file as it
+/// arrives: its threshold, its store, and a source of message IDs.
+struct Spilling<'a> {
+    large_at: usize,
+    store: &'a Arc<saranga_server::large::LargeMessageStore>,
+    next_id: &'a dyn Fn() -> i64,
+}
+
+/// Once the buffered bytes pass the threshold and the body's start is known,
+/// writes what has arrived to a new file and keeps only the headers in
+/// memory; later transfers are appended to the file by [`accumulate`].
+fn try_spill(inc: &mut Incoming, sp: &Spilling<'_>) -> std::io::Result<()> {
+    if sp.large_at == 0 || inc.payload.len() <= sp.large_at {
+        return Ok(());
+    }
+    let now = now_millis();
+    let Ok(parsed) = AmqpMessage::new(i64::from(inc.format), inc.payload.clone(), now) else {
+        return Ok(()); // not yet parseable: keep buffering
+    };
+    let Some(body_start) = parsed.body_position() else {
+        return Ok(()); // no body section yet: keep buffering
+    };
+    let id = (sp.next_id)();
+    let mut writer = sp.store.create(id, parsed.is_durable())?;
+    // The file holds the whole encoding; memory keeps only the headers.
+    writer.append(&inc.payload)?;
+    inc.payload.truncate(body_start);
+    inc.spill = Some(Spill { writer, id });
+    Ok(())
 }
 
 /// `topUpCreditIfNeeded`: back to `credits` once at or below `low`.
@@ -5575,4 +5688,99 @@ fn source_routing_type(source: &Source) -> RoutingType {
         }
     }
     RoutingType::Multicast
+}
+
+#[cfg(test)]
+mod spill_tests {
+    use super::*;
+    use saranga_server::large::LargeMessageStore;
+
+    /// An AMQP message that is just a Data section body: `0x00 0x53 0x75`
+    /// (described, Data descriptor) then a `vbin32` of the body.
+    fn data_message(body: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x00, 0x53, 0x75, 0xB0];
+        v.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn transfer(more: bool) -> Transfer {
+        Transfer {
+            handle: 1,
+            delivery_id: Some(1),
+            message_format: Some(0),
+            more,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_large_delivery_spills_its_body_to_a_file() {
+        let store = LargeMessageStore::in_memory();
+        let next = || 42i64;
+        let spilling = Spilling {
+            large_at: 1000,
+            store: &store,
+            next_id: &next,
+        };
+        let body = vec![0x9Au8; 50_000];
+        let full = data_message(&body);
+        let frames: Vec<&[u8]> = full.chunks(8192).collect();
+        let (mut inc, mut credit, mut dc) = (None, 10u32, 0u32);
+        let mut done = None;
+        for (i, chunk) in frames.iter().enumerate() {
+            let t = transfer(i != frames.len() - 1);
+            done = accumulate(
+                &mut inc,
+                &t,
+                chunk.to_vec(),
+                &mut credit,
+                &mut dc,
+                0,
+                Some(&spilling),
+            )
+            .unwrap_or_else(|_| panic!("accumulate returned a fatal error"));
+        }
+        let done = done.expect("the delivery completes");
+        // Only the headers stay in memory; here there are none before the body.
+        assert!(
+            done.payload.len() < 1000,
+            "the {}-byte body did not stay in memory (payload = {} bytes)",
+            body.len(),
+            done.payload.len()
+        );
+        let (large_body, id) = done.large.expect("the body spilled to a file");
+        assert_eq!(id, 42);
+        assert_eq!(
+            large_body.read_all().unwrap(),
+            full,
+            "the file holds the whole encoding"
+        );
+    }
+
+    #[test]
+    fn a_small_delivery_stays_in_memory() {
+        let store = LargeMessageStore::in_memory();
+        let next = || 1i64;
+        let spilling = Spilling {
+            large_at: 1_000_000,
+            store: &store,
+            next_id: &next,
+        };
+        let full = data_message(&[0x11u8; 100]);
+        let (mut inc, mut credit, mut dc) = (None, 10u32, 0u32);
+        let done = accumulate(
+            &mut inc,
+            &transfer(false),
+            full.clone(),
+            &mut credit,
+            &mut dc,
+            0,
+            Some(&spilling),
+        )
+        .unwrap_or_else(|_| panic!("accumulate returned a fatal error"))
+        .expect("the delivery completes");
+        assert!(done.large.is_none(), "a small message is not spilled");
+        assert_eq!(done.payload, full);
+    }
 }

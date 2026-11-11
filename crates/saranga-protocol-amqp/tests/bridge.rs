@@ -218,6 +218,38 @@ async fn to_queue() {
     stop(peer).await;
 }
 
+/// A large message bridged to the peer's `inbox` is streamed to a file as it
+/// arrives there and read back whole for the consumer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bridges_a_large_message() {
+    let d = dirs();
+    let (peer, me) = pair(&d).await;
+    wait_until("connected", || connected(&me)).await;
+    wait_until("the sender consumes outbox", || {
+        consumers(&me, "outbox") == 1
+    })
+    .await;
+    let (_cm, sm) = session(me.port).await;
+    let body: Vec<u8> = (0..300_000).map(|i| (i * 31 % 251) as u8).collect();
+    let producer = sm.create_producer(Some("outbox")).await.unwrap();
+    producer.send(message::bytes_message(&body)).await.unwrap();
+    let (_cp, sp) = session(peer.port).await;
+    let consumer = sp.create_consumer("inbox", None, false).await.unwrap();
+    let got = consumer
+        .receive(WAIT)
+        .await
+        .unwrap()
+        .expect("a message within the timeout");
+    assert_eq!(got.message.body.len(), body.len(), "the whole body arrived");
+    assert!(
+        got.message.body == body,
+        "the body round-trips through the bridge unchanged"
+    );
+    consumer.acknowledge(&got).await.unwrap();
+    stop(me).await;
+    stop(peer).await;
+}
+
 /// A local address's messages go to the peer's address, through a
 /// temporary subscription here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

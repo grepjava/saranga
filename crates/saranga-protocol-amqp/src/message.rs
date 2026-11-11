@@ -568,6 +568,13 @@ impl AmqpMessage {
         &self.data
     }
 
+    /// Where the body begins in the encoding (`remaining_body_position`), past
+    /// the header and the annotation, property and application-property
+    /// sections. `None` for a message with no body section.
+    pub fn body_position(&self) -> Option<usize> {
+        self.remaining_body_position.get()
+    }
+
     pub fn message_id(&self) -> i64 {
         self.message_id
     }
