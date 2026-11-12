@@ -1489,6 +1489,19 @@ enum GroupKey {
     Bucket(u32),
 }
 
+impl GroupKey {
+    /// The key of group `id` (its `SimpleString` bytes) under
+    /// `group-buckets`: its bucket when that is set (`BucketMessageGroups`),
+    /// else the ID itself.
+    fn of(group_buckets: i32, id: Vec<u8>) -> Self {
+        if group_buckets > 0 {
+            GroupKey::Bucket((java_hash(&id) & i32::MAX) as u32 % group_buckets as u32)
+        } else {
+            GroupKey::Id(id)
+        }
+    }
+}
+
 impl Actor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Cmd>) {
         loop {
@@ -2602,11 +2615,7 @@ impl Actor {
             return None;
         }
         let id = message::group_id(r.message.core())?;
-        Some(if c.group_buckets > 0 {
-            GroupKey::Bucket((java_hash(&id) & i32::MAX) as u32 % c.group_buckets as u32)
-        } else {
-            GroupKey::Id(id)
-        })
+        Some(GroupKey::of(c.group_buckets, id))
     }
 
     fn try_deliver(&mut self, index: usize) -> bool {
@@ -2625,12 +2634,9 @@ impl Actor {
             let Some(g) = message::group_id(r.message.core()) else {
                 return true;
             };
-            let key = if cfg.group_buckets > 0 {
-                GroupKey::Bucket((java_hash(&g) & i32::MAX) as u32 % cfg.group_buckets as u32)
-            } else {
-                GroupKey::Id(g)
-            };
-            groups.get(&key).is_none_or(|owner| *owner == id)
+            groups
+                .get(&GroupKey::of(cfg.group_buckets, g))
+                .is_none_or(|owner| *owner == id)
         };
         let Some(at) = self.messages.find(|r| {
             c.accepts(r)

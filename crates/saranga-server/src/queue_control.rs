@@ -346,7 +346,10 @@ impl Queue {
         self.manage(move |a| match group {
             None => a.groups.clear(),
             Some(g) => {
-                a.groups.remove(&group_key(&g));
+                // Under group-buckets, the group's bucket, as Artemis's
+                // BucketMessageGroups.remove hashes the ID.
+                let key = group_key(a.shared.config().group_buckets, &g);
+                a.groups.remove(&key);
             }
         })
         .await;
@@ -362,10 +365,11 @@ impl Queue {
         else {
             return;
         };
-        let key = group_key(group);
+        let group = group.to_owned();
         let name = self.name().clone();
         let full = group_id.to_owned();
         self.send(Cmd::Manage(Box::new(move |a| {
+            let key = group_key(a.shared.config().group_buckets, &group);
             if a.groups.remove(&key).is_some() {
                 tracing::debug!("Removing group after unproposal {full} from queue {name}");
             } else {
@@ -1021,9 +1025,11 @@ fn retry_target(po: Option<&PostOffice>, r: &MessageRef) -> Option<(String, Opti
     Some((address, target))
 }
 
-/// A group as the queue keys it: its ID's `SimpleString` bytes.
-fn group_key(group: &str) -> GroupKey {
-    GroupKey::Id(
+/// A group as the queue keys it under `group_buckets`: by its ID's
+/// `SimpleString` bytes, or the bucket they hash to.
+fn group_key(group_buckets: i32, group: &str) -> GroupKey {
+    GroupKey::of(
+        group_buckets,
         saranga_buffer::SimpleString::from(group)
             .as_bytes()
             .to_vec(),

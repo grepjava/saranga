@@ -18,7 +18,9 @@
 //! body is `body`, its bytes in base64. A property's `type` is `null`,
 //! `boolean`, `byte`, `short`, `int`, `long`, `float`, `double`, `char`,
 //! `bytes` or `string`; a long's value is text, which JavaScript cannot
-//! hold as a number, a char's a one-character string, bytes' base64.
+//! hold as a number, a char's a one-character string, bytes' base64. A
+//! float or double that is NaN or infinite is text too (`NaN`, `Infinity`,
+//! `-Infinity`), JSON having no number for it.
 
 use saranga_buffer::{PropertyValue, Reader, SimpleString, Writer};
 use saranga_message::{CoreMessage, message_type};
@@ -78,11 +80,26 @@ fn property(v: &PropertyValue) -> (&'static str, Json) {
         PropertyValue::Short(s) => ("short", Json::from(i32::from(*s))),
         PropertyValue::Int(i) => ("int", Json::from(*i)),
         PropertyValue::Long(l) => ("long", Json::from(l.to_string())),
-        PropertyValue::Float(f) => ("float", Json::from(f64::from(*f))),
-        PropertyValue::Double(d) => ("double", Json::from(*d)),
+        PropertyValue::Float(f) => ("float", number(f64::from(*f))),
+        PropertyValue::Double(d) => ("double", number(*d)),
         PropertyValue::Char(c) => ("char", Json::from(String::from_utf16_lossy(&[*c]))),
         PropertyValue::Bytes(b) => ("bytes", Json::from(base64(b))),
         PropertyValue::String(s) => ("string", Json::from(s.to_string_lossy())),
+    }
+}
+
+/// A float or double's value: a number, or for one JSON has no number for
+/// (NaN, an infinity) Java's name for it as text, which the import reads
+/// back as it reads any number given as text.
+fn number(f: f64) -> Json {
+    if f.is_finite() {
+        Json::from(f)
+    } else if f.is_nan() {
+        Json::from("NaN")
+    } else if f > 0.0 {
+        Json::from("Infinity")
+    } else {
+        Json::from("-Infinity")
     }
 }
 
@@ -251,6 +268,29 @@ mod tests {
         assert_eq!(back.user_id, m.user_id);
         assert_eq!(back.body, m.body);
         assert_eq!(back.properties.entries(), m.properties.entries());
+    }
+
+    #[test]
+    fn a_nan_or_infinite_property_is_exported_as_valid_json() {
+        let mut m = CoreMessage::default();
+        for (k, v) in [
+            ("fnan", PropertyValue::Float(f32::NAN)),
+            ("finf", PropertyValue::Float(f32::INFINITY)),
+            ("dnan", PropertyValue::Double(f64::NAN)),
+            ("dinf", PropertyValue::Double(f64::INFINITY)),
+            ("dneg", PropertyValue::Double(f64::NEG_INFINITY)),
+        ] {
+            m.properties.insert(SimpleString::from(k), v);
+        }
+        let text = message_json(&m).to_string();
+        let parsed = Json::parse(&text).unwrap_or_else(|e| panic!("{e:?}: {text}"));
+        let back = message_from_json(&parsed).unwrap();
+        let get = |k: &str| back.properties.get(&SimpleString::from(k)).cloned();
+        assert!(matches!(get("fnan"), Some(PropertyValue::Float(f)) if f.is_nan()));
+        assert_eq!(get("finf"), Some(PropertyValue::Float(f32::INFINITY)));
+        assert!(matches!(get("dnan"), Some(PropertyValue::Double(d)) if d.is_nan()));
+        assert_eq!(get("dinf"), Some(PropertyValue::Double(f64::INFINITY)));
+        assert_eq!(get("dneg"), Some(PropertyValue::Double(f64::NEG_INFINITY)));
     }
 
     #[test]
