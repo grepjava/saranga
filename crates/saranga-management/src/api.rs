@@ -229,7 +229,7 @@ async fn nodes(
     Extension(Peer(peer)): Extension<Peer>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = user(&state, &headers, peer) {
+    if let Err(r) = user(&state, &headers, peer).await {
         return *r;
     }
     let broker = state.broker.get();
@@ -367,7 +367,7 @@ impl User {
 
 /// The user a request runs as: its session's, unless an `Authorization:
 /// Basic` header names another user, as for Jolokia.
-pub(crate) fn user(
+pub(crate) async fn user(
     state: &ApiState,
     headers: &HeaderMap,
     peer: SocketAddr,
@@ -393,7 +393,7 @@ pub(crate) fn user(
     let Some((name, password)) = basic else {
         return Err(Box::new(error(StatusCode::UNAUTHORIZED, "not logged in")));
     };
-    match authenticate(state, &name, &password, peer) {
+    match authenticate(state, &name, &password, peer).await {
         Auth::Authorized {
             user,
             roles,
@@ -415,7 +415,7 @@ pub(crate) fn user(
     }
 }
 
-fn authenticate(state: &ApiState, user: &str, password: &str, peer: SocketAddr) -> Auth {
+async fn authenticate(state: &ApiState, user: &str, password: &str, peer: SocketAddr) -> Auth {
     console::login_user(
         &state.sessions,
         &state.broker,
@@ -424,6 +424,7 @@ fn authenticate(state: &ApiState, user: &str, password: &str, peer: SocketAddr) 
         Some(password),
         peer,
     )
+    .await
 }
 
 fn throttled(wait: i64) -> Response {
@@ -772,7 +773,7 @@ async fn login(
     let form = Json::parse(&String::from_utf8_lossy(&body)).unwrap_or(Json::Null);
     let field = |k: &str| form.get(k).and_then(Json::as_str).unwrap_or("").to_owned();
     let (name, password) = (field("user"), field("password"));
-    match authenticate(&state, &name, &password, peer) {
+    match authenticate(&state, &name, &password, peer).await {
         Auth::Authorized {
             user,
             roles,
@@ -881,7 +882,7 @@ async fn me(
     Scoped(scope): Scoped,
     headers: HeaderMap,
 ) -> Response {
-    let u = match user(&state, &headers, peer) {
+    let u = match user(&state, &headers, peer).await {
         Ok(u) => u,
         Err(r) => return *r,
     };
@@ -905,7 +906,7 @@ async fn can(
         Ok(t) => matches!(t, Target::Local),
         Err(p) => return p.response(),
     };
-    let u = match user(&state, &headers, peer) {
+    let u = match user(&state, &headers, peer).await {
         Ok(u) => u,
         Err(r) => return *r,
     };
@@ -964,7 +965,7 @@ async fn views(
     Extension(Peer(peer)): Extension<Peer>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = user(&state, &headers, peer) {
+    if let Err(r) = user(&state, &headers, peer).await {
         return *r;
     }
     let mut out = Json::object();
@@ -982,7 +983,7 @@ async fn broker(
     Scoped(scope): Scoped,
     headers: HeaderMap,
 ) -> Response {
-    let u = match user(&state, &headers, peer) {
+    let u = match user(&state, &headers, peer).await {
         Ok(u) => u,
         Err(r) => return *r,
     };
@@ -1146,7 +1147,7 @@ async fn listing(
     let Some(operation) = list_operation(&kind) else {
         return no_such_api().await;
     };
-    let u = match user(&state, &headers, peer) {
+    let u = match user(&state, &headers, peer).await {
         Ok(u) => u,
         Err(r) => return *r,
     };
@@ -1274,7 +1275,7 @@ async fn close(
     if let Err(r) = marked(headers) {
         return *r;
     }
-    let u = match user(state, headers, peer) {
+    let u = match user(state, headers, peer).await {
         Ok(u) => u,
         Err(r) => return *r,
     };
@@ -1427,7 +1428,7 @@ async fn resources(
     Scoped(scope): Scoped,
     headers: HeaderMap,
 ) -> Response {
-    let u = match user(&state, &headers, peer) {
+    let u = match user(&state, &headers, peer).await {
         Ok(u) => u,
         Err(r) => return *r,
     };
@@ -1459,7 +1460,7 @@ async fn resource(
     Path(resource): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let u = match user(&state, &headers, peer) {
+    let u = match user(&state, &headers, peer).await {
         Ok(u) => u,
         Err(r) => return *r,
     };
@@ -1612,7 +1613,7 @@ async fn attributes(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    let u = match user(&state, &headers, peer) {
+    let u = match user(&state, &headers, peer).await {
         Ok(u) => u,
         Err(r) => return *r,
     };
@@ -1663,14 +1664,14 @@ async fn attributes(
 
 /// The JSON body of a request that changes something, from a marked request
 /// of a logged-in user.
-fn change(
+async fn change(
     state: &ApiState,
     headers: &HeaderMap,
     peer: SocketAddr,
     body: &Bytes,
 ) -> Result<(User, Json), Box<Response>> {
     marked(headers)?;
-    let u = user(state, headers, peer)?;
+    let u = user(state, headers, peer).await?;
     let body = Json::parse(&String::from_utf8_lossy(body))
         .map_err(|_| Box::new(error(StatusCode::BAD_REQUEST, "the body must be JSON")))?;
     Ok((u, body))
@@ -1684,7 +1685,7 @@ async fn write(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let (u, body) = match change(&state, &headers, peer, &body) {
+    let (u, body) = match change(&state, &headers, peer, &body).await {
         Ok(c) => c,
         Err(r) => return *r,
     };
@@ -1729,7 +1730,7 @@ async fn invoke(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let (u, body) = match change(&state, &headers, peer, &body) {
+    let (u, body) = match change(&state, &headers, peer, &body).await {
         Ok(c) => c,
         Err(r) => return *r,
     };

@@ -179,6 +179,30 @@ pub struct Acceptor {
     /// Every parameter of the acceptor's URI, for the protocols' own
     /// settings.
     pub params: HashMap<String, String>,
+    /// Whether the run of the acceptor that took a connection has been
+    /// stopped: each start of the acceptor is a new run.
+    pub run: AcceptorRun,
+}
+
+/// One run of an acceptor, from its start to its stop: its connections,
+/// whenever they finish being set up, are closed once it is stopped.
+#[derive(Clone, Default, Debug)]
+pub struct AcceptorRun(Arc<std::sync::atomic::AtomicBool>);
+
+impl AcceptorRun {
+    /// The acceptor stopped: its connections are not to stay.
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Whether `other` is this same run.
+    pub fn is(&self, other: &AcceptorRun) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 impl Acceptor {
@@ -203,6 +227,7 @@ impl Default for Acceptor {
             protocols: None,
             handshake_timeout: Some(protocol::DEFAULT_HANDSHAKE_TIMEOUT),
             params: HashMap::new(),
+            run: AcceptorRun::default(),
         }
     }
 }
@@ -1660,9 +1685,11 @@ impl Broker {
             };
             let broker = self.clone();
             let acceptor = acceptor.clone();
-            let closing = closing.clone();
+            // Waiting from now, not from when its task first runs: a stop
+            // between the two would otherwise go unseen.
+            let mut closed = Box::pin(closing.clone().notified_owned());
+            closed.as_mut().enable();
             let connection = move |stream: tokio::net::TcpStream| async move {
-                let closed = closing.notified();
                 let context = audit::Context::Remote(info.remote_address.clone());
                 let detector = broker.clone();
                 let setup = async move {

@@ -88,6 +88,13 @@ impl Registry {
             ));
         }
         self.plugins.each(|p| p.after_create_connection(connection));
+        // Its acceptor stopped while it was being set up: listed after the
+        // stop's sweep of the connections, it fails here instead. The stop
+        // marks its run before sweeping, and the list's lock orders the
+        // two, so one or the other catches it.
+        if connection.acceptor_stopped() {
+            connection.fail();
+        }
         Registration {
             registry: Arc::downgrade(self),
             key,

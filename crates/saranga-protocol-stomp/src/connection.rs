@@ -604,6 +604,9 @@ struct Connection {
     passcode: Option<String>,
     main: Option<StompSession>,
     transacted: HashMap<String, StompSession>,
+    /// What the sessions of transactions ended since the last reply lined
+    /// up: the reply still waits for it.
+    ended: Completion,
     ttl: i64,
     heart_beat: Option<HeartBeat>,
     /// A reply that closes the connection is on its way; nothing more is
@@ -665,6 +668,7 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
         passcode: None,
         main: None,
         transacted: HashMap::new(),
+        ended: Completion::default(),
         ttl,
         heart_beat: None,
         closing: false,
@@ -867,7 +871,7 @@ impl Connection {
         after: Option<Box<dyn FnOnce() + Send>>,
         close: bool,
     ) {
-        let mut completion = Completion::default();
+        let mut completion = std::mem::take(&mut self.ended);
         for s in self.main.iter_mut().chain(self.transacted.values_mut()) {
             completion.merge(s.session.take_completion());
         }
@@ -980,7 +984,7 @@ impl Connection {
             names::ACK => self.on_ack(&request).await,
             names::NACK if !v10 => self.on_ack(&request).await,
             names::BEGIN => self.on_begin(&request).await,
-            names::COMMIT => self.on_commit(&request),
+            names::COMMIT => self.on_commit(&request).await,
             names::ABORT => self.on_abort(&request).await,
             names::UNSUBSCRIBE => self.on_unsubscribe(&request).await,
             names::CONNECT => Ok(Some(self.on_connect(&request).await)),
@@ -1424,7 +1428,7 @@ impl Connection {
 
     /// `onCommit`: commits the transacted session. Its errors, including
     /// that no transaction was begun, all read `Error committing`.
-    fn on_commit(&mut self, frame: &Frame) -> StompResult<Option<Frame>> {
+    async fn on_commit(&mut self, frame: &Frame) -> StompResult<Option<Frame>> {
         let Some(tx) = frame.header(names::TRANSACTION).map(str::to_owned) else {
             return Err(StompError::bundle(
                 "AMQ339030: transaction header is mandatory to COMMIT a transaction",
@@ -1436,8 +1440,21 @@ impl Connection {
         };
         let result = session.session.commit();
         session.tx_pending = false;
+        self.end_transaction(&tx).await;
         result.map_err(|_| failed())?;
         Ok(None)
+    }
+
+    /// A transaction committed or aborted: its session goes, rather than
+    /// stay until the connection closes, so that a client giving each
+    /// transaction its own ID does not pile sessions up. Artemis keeps it
+    /// (`StompSession.end` only clears `txPending`). A later frame naming
+    /// the ID makes a new one, as for an ID never seen.
+    async fn end_transaction(&mut self, tx: &str) {
+        if let Some(mut s) = self.transacted.remove(tx) {
+            s.session.close(false).await;
+            self.ended.merge(s.session.take_completion());
+        }
     }
 
     /// `onAbort`.
@@ -1453,6 +1470,7 @@ impl Connection {
         }
         session.session.rollback(false, false).await;
         session.tx_pending = false;
+        self.end_transaction(&tx).await;
         Ok(None)
     }
 
@@ -1916,7 +1934,7 @@ impl Connection {
     /// rolled back and closed, and its temporary queues removed.
     async fn destroy(&mut self) {
         self.out.destroyed.store(true, Ordering::SeqCst);
-        let mut completion = Completion::default();
+        let mut completion = std::mem::take(&mut self.ended);
         if let Some(mut s) = self.main.take() {
             for sub in s.subscriptions.values() {
                 sub.closed.store(true, Ordering::SeqCst);

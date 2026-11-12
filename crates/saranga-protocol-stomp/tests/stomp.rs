@@ -352,3 +352,50 @@ async fn a_rejected_ack_can_be_retried() {
     assert!(ok.starts_with("RECEIPT\n"), "{ok}");
     assert_eq!(header(&ok, "receipt-id"), Some("good"));
 }
+
+/// A committed or aborted transaction's session goes with it: a client
+/// giving each transaction its own ID does not pile up sessions until it
+/// disconnects. What the commits sent is there by each receipt.
+#[tokio::test]
+async fn an_ended_transaction_leaves_no_session() {
+    let mut config = BrokerConfig::new(Arc::new(SelectorFilters));
+    config.protocols = vec![Arc::new(StompProtocol)];
+    let broker = Broker::start(config).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(broker.clone().serve_acceptor(listener, Acceptor::default()));
+    let mut c = Client::connect(address, "1.2").await;
+    for i in 0..100 {
+        c.send(&format!("BEGIN\ntransaction:t{i}\n\n")).await;
+        c.send(&format!(
+            "SEND\ndestination:q9\ndestination-type:ANYCAST\ntransaction:t{i}\n\nm{i}"
+        ))
+        .await;
+        let (end, receipt) = if i % 2 == 0 {
+            ("COMMIT", "c")
+        } else {
+            ("ABORT", "a")
+        };
+        c.send(&format!(
+            "{end}\ntransaction:t{i}\nreceipt:{receipt}{i}\n\n"
+        ))
+        .await;
+        let r = c.frame().await;
+        assert_eq!(
+            header(&r, "receipt-id"),
+            Some(&*format!("{receipt}{i}")),
+            "{r}"
+        );
+    }
+    let sessions = broker.registry().sessions().len();
+    assert!(
+        sessions <= 1,
+        "{sessions} sessions left after 100 ended transactions"
+    );
+    let queued = broker.post_office().queue("q9").map(|q| q.message_count());
+    assert_eq!(
+        queued,
+        Some(50),
+        "each commit's message is there by its receipt"
+    );
+}

@@ -117,3 +117,120 @@ async fn management_stops_starts_and_reloads_an_acceptor() {
         Err("AMQ229069: no operation frobnicate/0".to_owned())
     );
 }
+
+/// A connection whose acceptor run was stopped while it was being set up
+/// (after the stop swept the connections) fails as it is listed, rather than
+/// stay open on a stopped acceptor.
+#[tokio::test]
+async fn a_connection_listed_after_its_acceptor_stopped_fails() {
+    use saranga_server::session::{ClientConnection, Transport};
+    let broker = Broker::start(BrokerConfig::new(Arc::new(SelectorFilters)))
+        .await
+        .unwrap();
+    let acceptor = Acceptor {
+        name: "artemis".into(),
+        ..Acceptor::default()
+    };
+    let connection = |acceptor: &Acceptor| {
+        Arc::new(
+            ClientConnection::new(
+                Transport::internal("test"),
+                Arc::new(Default::default()),
+                vec![],
+            )
+            .with_acceptor(acceptor),
+        )
+    };
+    let live = connection(&acceptor);
+    let _listed = broker.registry().add(&live);
+    assert!(!live.is_failed(), "a running acceptor's connection stays");
+
+    acceptor.run.stop();
+    let late = connection(&acceptor);
+    let _listed = broker.registry().add(&late);
+    assert!(late.is_failed(), "listed after the stop, it must fail");
+}
+
+/// However soon after its connection is accepted the acceptor stops, the
+/// connection is closed: none is left open on a stopped acceptor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_connection_closes_when_its_acceptor_stops() {
+    let broker = Broker::start(BrokerConfig::new(Arc::new(SelectorFilters)))
+        .await
+        .unwrap();
+    let address = format!("127.0.0.1:{}", free_port());
+    broker
+        .add_acceptor("artemis", &address, Acceptor::default())
+        .await
+        .unwrap();
+    for round in 0..30 {
+        let mut s = TcpStream::connect(&address).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut s, b"ARTEMIS")
+            .await
+            .unwrap();
+        op(&broker, "stop").await.unwrap();
+        let mut b = [0u8; 1];
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut s, &mut b),
+        )
+        .await;
+        assert!(
+            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            "round {round}: the connection stayed open: {read:?}"
+        );
+        op(&broker, "start").await.unwrap();
+    }
+}
+
+/// A broker with acceptor `artemis` (its `Acceptor` named `name`) and a Core
+/// connection through it that the broker has answered, so listed.
+async fn with_a_listed_connection(name: &str) -> (Arc<Broker>, TcpStream) {
+    let broker = Broker::start(BrokerConfig::new(Arc::new(SelectorFilters)))
+        .await
+        .unwrap();
+    let address = format!("127.0.0.1:{}", free_port());
+    let acceptor = Acceptor {
+        name: name.into(),
+        ..Acceptor::default()
+    };
+    broker
+        .add_acceptor("artemis", &address, acceptor)
+        .await
+        .unwrap();
+    let mut s = TcpStream::connect(&address).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut s, b"ARTEMIS")
+        .await
+        .unwrap();
+    ping(&mut s).await;
+    (broker, s)
+}
+
+async fn closed(mut s: TcpStream) -> bool {
+    let mut b = [0u8; 1];
+    let read = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read(&mut s, &mut b),
+    )
+    .await;
+    matches!(read, Ok(Ok(0)) | Ok(Err(_)))
+}
+
+/// Stopping an acceptor closes its connections whatever name its
+/// `Acceptor` was given, an empty one included.
+#[tokio::test]
+async fn a_stop_closes_the_connections_of_an_unnamed_acceptor() {
+    let (broker, s) = with_a_listed_connection("").await;
+    op(&broker, "stop").await.unwrap();
+    assert!(closed(s).await, "the connection stayed open");
+}
+
+/// Stopping a paused acceptor still closes its connections, as Netty's
+/// acceptor closes its channel group when stopped after a pause.
+#[tokio::test]
+async fn a_stop_after_a_pause_closes_the_connections() {
+    let (broker, s) = with_a_listed_connection("artemis").await;
+    broker.pause_acceptors().await;
+    op(&broker, "stop").await.unwrap();
+    assert!(closed(s).await, "the connection stayed open");
+}

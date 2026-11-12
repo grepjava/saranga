@@ -31,14 +31,14 @@ const EXPORT: &str = "exportConfigAsProperties";
 
 /// The user, for a request this broker answers itself, allowed `operation`
 /// on the broker.
-fn local_user(
+async fn local_user(
     state: &ApiState,
     headers: &HeaderMap,
     peer: std::net::SocketAddr,
     scope: &crate::peers::Scope,
     operation: &str,
 ) -> Result<User, Box<Response>> {
-    let u = user(state, headers, peer)?;
+    let u = user(state, headers, peer).await?;
     match Target::of(scope) {
         Ok(Target::Local) => {}
         Ok(Target::Peer(_)) => {
@@ -85,7 +85,7 @@ pub(crate) async fn address_settings(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = local_user(&state, &headers, peer, &scope, ADDRESS_SETTINGS) {
+    if let Err(r) = local_user(&state, &headers, peer, &scope, ADDRESS_SETTINGS).await {
         return *r;
     }
     let broker = state.broker.get();
@@ -152,7 +152,7 @@ pub(crate) async fn security_settings(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = local_user(&state, &headers, peer, &scope, ROLES) {
+    if let Err(r) = local_user(&state, &headers, peer, &scope, ROLES).await {
         return *r;
     }
     let broker = state.broker.get();
@@ -196,7 +196,7 @@ pub(crate) async fn export(
     if let Err(r) = marked(&headers) {
         return *r;
     }
-    let u = match user(&state, &headers, peer) {
+    let u = match user(&state, &headers, peer).await {
         Ok(u) => u,
         Err(r) => return *r,
     };
@@ -295,7 +295,7 @@ pub(crate) async fn export_messages(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    let u = match user(&state, &headers, peer) {
+    let u = match user(&state, &headers, peer).await {
         Ok(u) => u,
         Err(r) => return *r,
     };
@@ -346,7 +346,7 @@ pub(crate) async fn import_messages(
     if let Err(r) = marked(&headers) {
         return *r;
     }
-    let u = match user(&state, &headers, peer) {
+    let u = match user(&state, &headers, peer).await {
         Ok(u) => u,
         Err(r) => return *r,
     };

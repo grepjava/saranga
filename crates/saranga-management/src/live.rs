@@ -553,7 +553,7 @@ pub(crate) async fn events(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    let u = match api::user(&state, &headers, peer) {
+    let u = match api::user(&state, &headers, peer).await {
         Ok(u) => u,
         Err(r) => return *r,
     };
@@ -729,7 +729,7 @@ pub(crate) async fn watch(
     if let Err(r) = api::marked(&headers) {
         return *r;
     }
-    let u = match api::user(&state, &headers, peer) {
+    let u = match api::user(&state, &headers, peer).await {
         Ok(u) => u,
         Err(r) => return *r,
     };
@@ -781,7 +781,7 @@ pub(crate) async fn history(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    let u = match api::user(&state, &headers, peer) {
+    let u = match api::user(&state, &headers, peer).await {
         Ok(u) => u,
         Err(r) => return *r,
     };
@@ -863,7 +863,7 @@ pub(crate) async fn notifications(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    let u = match api::user(&state, &headers, peer) {
+    let u = match api::user(&state, &headers, peer).await {
         Ok(u) => u,
         Err(r) => return *r,
     };

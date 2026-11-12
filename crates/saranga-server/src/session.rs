@@ -120,6 +120,9 @@ pub struct ClientConnection {
     prefixes: Vec<(String, RoutingType)>,
     /// The name of the acceptor the connection came in on.
     acceptor: Option<String>,
+    /// The run of that acceptor: once stopped, the connection is not to
+    /// stay.
+    acceptor_run: Option<crate::AcceptorRun>,
     /// The acceptor's `router` parameter (`Connection.getRouter`): the
     /// connection router that routes the connection.
     router: Option<String>,
@@ -161,6 +164,7 @@ impl ClientConnection {
             subject: Mutex::default(),
             prefixes,
             acceptor: None,
+            acceptor_run: None,
             router: None,
             sessions: Mutex::default(),
             failed: AtomicBool::new(false),
@@ -176,8 +180,22 @@ impl ClientConnection {
     pub fn with_acceptor(mut self, acceptor: &crate::Acceptor) -> Self {
         let name = &acceptor.name;
         self.acceptor = (!name.is_empty()).then(|| name.to_owned());
+        self.acceptor_run = Some(acceptor.run.clone());
         self.router = acceptor.params.get("router").cloned();
         self
+    }
+
+    /// Whether the acceptor run the connection came in through has been
+    /// stopped.
+    pub fn acceptor_stopped(&self) -> bool {
+        self.acceptor_run
+            .as_ref()
+            .is_some_and(crate::AcceptorRun::is_stopped)
+    }
+
+    /// Whether the connection came in through acceptor run `run`.
+    pub fn came_through(&self, run: &crate::AcceptorRun) -> bool {
+        self.acceptor_run.as_ref().is_some_and(|r| r.is(run))
     }
 
     /// The connection router of the acceptor the connection came in on

@@ -52,6 +52,9 @@ struct Running {
     acceptor: Arc<Acceptor>,
     /// The task accepting connections; `None` while stopped.
     listening: Mutex<Option<JoinHandle<()>>>,
+    /// The acceptor as the current run hands it to its connections, with
+    /// that run's [`AcceptorRun`](crate::AcceptorRun).
+    current: Mutex<Option<Arc<Acceptor>>>,
     /// Ends the connections not yet given to a protocol.
     closing: Arc<tokio::sync::Notify>,
 }
@@ -63,8 +66,29 @@ impl Running {
             address: address.to_owned(),
             acceptor: Arc::new(acceptor),
             listening: Mutex::new(None),
+            current: Mutex::new(None),
             closing: Arc::new(tokio::sync::Notify::new()),
         })
+    }
+
+    /// The acceptor for a new run's connections.
+    fn new_run(&self) -> Arc<Acceptor> {
+        let acceptor = Arc::new(Acceptor {
+            run: crate::AcceptorRun::default(),
+            ..(*self.acceptor).clone()
+        });
+        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = Some(acceptor.clone());
+        acceptor
+    }
+
+    /// The current run's acceptor, its run continuing.
+    fn this_run(&self) -> Arc<Acceptor> {
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        current.unwrap_or_else(|| self.new_run())
     }
 
     fn listening(&self) -> std::sync::MutexGuard<'_, Option<JoinHandle<()>>> {
@@ -277,9 +301,10 @@ impl Broker {
             running.address,
             names.join(",")
         );
+        // A paused acceptor's run goes on: its connections are still its.
         let task = tokio::spawn(self.clone().serve_shared(
             listener,
-            running.acceptor.clone(),
+            running.this_run(),
             running.closing.clone(),
             Some(crate::event_loops::EventLoops::new(loops)),
         ));
@@ -326,7 +351,6 @@ impl Broker {
     /// `notifyStop`, `pause` and `stop`: ACCEPTOR_STOPPED, then no more
     /// connections, and those it accepted are closed.
     async fn stop_running(&self, r: &Running) {
-        let name = r.name.as_str();
         let host = r.acceptor.host.clone();
         let port = i32::from(r.acceptor.port);
         self.post_office.notify(
@@ -340,12 +364,22 @@ impl Broker {
                 ]
             },
         );
-        if !unbind(r).await {
+        unbind(r).await;
+        // The run ends whether the acceptor was listening or paused
+        // (`NettyAcceptor.stop` closes its channel group either way); one
+        // never started has no connections.
+        let run = r.current.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(run) = run else {
             return;
-        }
+        };
+        // Marked before the sweep below, so that a connection still being
+        // set up fails as it is listed (`Registry::add`).
+        run.run.stop();
         r.closing.notify_waiters();
+        // By run, not by name: an acceptor's connections are its run's
+        // whatever name the acceptor was given.
         for c in self.registry().connections() {
-            if c.acceptor() == Some(name) {
+            if c.came_through(&run.run) {
                 c.fail();
             }
         }
@@ -365,7 +399,7 @@ impl Broker {
             let listener = bind(&r.address).await.map_err(|_| failed_to_bind(&r))?;
             let task = tokio::spawn(self.clone().serve_shared(
                 listener,
-                r.acceptor.clone(),
+                r.this_run(),
                 r.closing.clone(),
                 Some(crate::event_loops::EventLoops::new(loops)),
             ));

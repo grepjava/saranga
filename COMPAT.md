@@ -128,6 +128,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
 - **A STOMP 1.1 or 1.2 frame with `content-length`** ends at the NUL after its body, as in Artemis, but Saranga waits for that NUL. When the bytes between the body and the NUL arrive in a later packet, Artemis has already taken the frame and reads them as the start of the next one.
 - **Frame size:** a frame still arriving may hold up to 64 KiB before the connection logs in and 100 MiB after (ActiveMQ's default `maxFrameSize`). A larger one gets an ERROR and the connection closes.
 - **A rejected ACK keeps its pending acknowledgement.** Saranga checks the subscription (including the `subscription` header) before it consumes the pending acknowledgement, so an ACK that names the wrong subscription — which under STOMP 1.1+ leaves the connection open — can be retried with the right one. Artemis removes the entry first, so the corrected retry fails as `failToAckMissingID` and a `client-individual` delivery stays unacknowledged and uncredited until the connection closes.
+- **A transaction's session ends with it.** COMMIT and ABORT close the session the transaction ran in, so a client that gives each transaction its own ID keeps one session, not one per transaction. Artemis keeps each transaction's session until the connection closes (`StompSession.end` only clears its pending flag), so its session count grows with every transaction ID used.
 
 ## MQTT differences
 - **Artemis bugs not copied.**

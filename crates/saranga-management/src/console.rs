@@ -307,7 +307,7 @@ pub(crate) fn basic(headers: &HeaderMap) -> Option<(String, String)> {
 /// `Authenticator.authenticate`: the broker's JAAS domain checks the user,
 /// who must hold one of the console roles (`hawtio.roles`); repeated
 /// failures are throttled.
-pub(crate) fn authenticate(
+pub(crate) async fn authenticate(
     state: &AppState,
     user: Option<&str>,
     password: Option<&str>,
@@ -321,10 +321,14 @@ pub(crate) fn authenticate(
         password,
         peer,
     )
+    .await
 }
 
 /// [`authenticate`] for any console's sessions: Artemis's or Saranga's.
-pub(crate) fn login_user(
+/// The login modules run on the blocking pool, as for a STOMP client's
+/// login: LDAP and other modules that call out to a server would otherwise
+/// hold one of the web server's workers for the whole exchange.
+pub(crate) async fn login_user(
     console: &Console,
     current: &saranga_server::Current,
     console_roles: &[String],
@@ -342,23 +346,32 @@ pub(crate) fn login_user(
         return Auth::Throttled(wait);
     }
     let broker = current.get();
-    let subject = broker.security().and_then(|store| {
-        let connection = saranga_security::ConnectionInfo {
-            remote_address: format!("/{peer}"),
-            certificates: None,
-            security_domain: None,
-            connection_id: None,
-            sasl_principals: None,
-            sni_host: None,
-        };
-        match store
-            .manager()
-            .authenticate(Some(user), Some(password), &connection)
-        {
-            Ok(Some(subject)) => Some(Arc::new(subject)),
-            _ => None,
+    let subject = match broker.security().cloned() {
+        None => None,
+        Some(store) => {
+            let connection = saranga_security::ConnectionInfo {
+                remote_address: format!("/{peer}"),
+                certificates: None,
+                security_domain: None,
+                connection_id: None,
+                sasl_principals: None,
+                sni_host: None,
+            };
+            let (u, p) = (user.to_owned(), password.to_owned());
+            tokio::task::spawn_blocking(move || {
+                match store
+                    .manager()
+                    .authenticate(Some(&u), Some(&p), &connection)
+                {
+                    Ok(Some(subject)) => Some(Arc::new(subject)),
+                    _ => None,
+                }
+            })
+            .await
+            .ok()
+            .flatten()
         }
-    });
+    };
     let authorized = subject.and_then(|subject| {
         let roles: Vec<String> = subject.roles().map(str::to_owned).collect();
         console_roles
@@ -713,7 +726,8 @@ pub(crate) async fn handle(
         &headers,
         &body,
         &mut session,
-    );
+    )
+    .await;
     state.secure(response, !cacheable(console, rel))
 }
 
@@ -730,7 +744,7 @@ fn refresh_ok() -> Response {
 
 /// The filters after the headers, and the servlets.
 #[allow(clippy::too_many_arguments)]
-fn route(
+async fn route(
     state: &AppState,
     peer: SocketAddr,
     method: &Method,
@@ -778,7 +792,7 @@ fn route(
         }
         // Pre-emptive authentication from an Authorization header.
         let (user, password) = basic(headers).unzip();
-        return match authenticate(state, user.as_deref(), password.as_deref(), peer) {
+        return match authenticate(state, user.as_deref(), password.as_deref(), peer).await {
             Auth::Authorized {
                 user,
                 roles,
@@ -807,7 +821,7 @@ fn route(
     };
     let get = method == Method::GET || method == Method::HEAD;
     if rel == "/auth/login" {
-        return login(state, peer, method, body, session);
+        return login(state, peer, method, body, session).await;
     }
     if rel == "/auth/logout" {
         if !get {
@@ -913,7 +927,7 @@ fn query(uri: &Uri, name: &str) -> Option<String> {
 
 /// `LoginServlet`, with Artemis's audit of it (its `AuthenticationFilter`
 /// on `/auth/login/*`).
-fn login(
+async fn login(
     state: &AppState,
     peer: SocketAddr,
     method: &Method,
@@ -959,7 +973,7 @@ fn login(
     };
     let field = |k: &str| form.get(k).and_then(Json::as_str).map(str::to_owned);
     let (user, password) = (field("username"), field("password"));
-    match authenticate(state, user.as_deref(), password.as_deref(), peer) {
+    match authenticate(state, user.as_deref(), password.as_deref(), peer).await {
         Auth::Authorized {
             user,
             roles,
@@ -1054,6 +1068,69 @@ mod tests {
         assert_eq!(remove_dots("/console/a/..").as_deref(), Some("/console/"));
         assert_eq!(remove_dots("/console/../../x"), None);
         assert_eq!(remove_dots("/").as_deref(), Some("/"));
+    }
+
+    /// A login module that takes its time, as LDAP over a slow network.
+    struct SlowLogin;
+
+    impl saranga_security::SecurityManager for SlowLogin {
+        fn authenticate(
+            &self,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: &saranga_security::ConnectionInfo,
+        ) -> Result<Option<saranga_security::jaas::Subject>, saranga_security::manager::NoCache>
+        {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let mut s = saranga_security::jaas::Subject::default();
+            s.add(saranga_security::jaas::Principal::User("admin".into()));
+            s.add(saranga_security::jaas::Principal::Role("amq".into()));
+            Ok(Some(s))
+        }
+
+        fn authorize(
+            &self,
+            _: &saranga_security::jaas::Subject,
+            _: &[saranga_config::Role],
+            _: saranga_config::CheckType,
+            _: &str,
+        ) -> bool {
+            true
+        }
+    }
+
+    /// A slow login leaves the web server's runtime free for other
+    /// requests: on a single-threaded runtime, a timer set as the login
+    /// starts fires long before the login ends.
+    #[tokio::test]
+    async fn a_slow_login_does_not_hold_the_runtime() {
+        let file = saranga_config::BrokerConfig::default();
+        let mut config = saranga_server::BrokerConfig::new(std::sync::Arc::new(
+            saranga_server::postoffice::SelectorFilters,
+        ));
+        config.security = Some(std::sync::Arc::new(saranga_security::SecurityStore::new(
+            saranga_security::SecurityStoreConfig::from_broker(&file),
+            saranga_config::HierarchicalRepository::new(Default::default()),
+            std::sync::Arc::new(SlowLogin),
+        )));
+        let broker = saranga_server::Broker::start(config).await.unwrap();
+        let current = saranga_server::Current::new(broker);
+        let console = Console::new("/console".into(), None, "JSESSIONID".into(), false, 0);
+        let roles = vec!["amq".to_owned()];
+        let started = std::time::Instant::now();
+        let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let (auth, ticked) = tokio::join!(
+            login_user(&console, &current, &roles, Some("admin"), Some("pw"), peer),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                started.elapsed()
+            }
+        );
+        assert!(matches!(auth, Auth::Authorized { .. }));
+        assert!(
+            ticked < std::time::Duration::from_millis(300),
+            "the runtime was held for {ticked:?} by the login"
+        );
     }
 
     #[test]

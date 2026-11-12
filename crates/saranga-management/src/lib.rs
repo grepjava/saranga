@@ -420,7 +420,7 @@ fn secure(mut r: Response) -> Response {
 /// user, when the broker's security manager validates it and the user
 /// holds a console role. Artemis's console does not audit this login (its
 /// `AuthenticationFilter` audits only the console's own login page).
-fn caller(
+async fn caller(
     state: &AppState,
     headers: &HeaderMap,
     peer: SocketAddr,
@@ -434,7 +434,7 @@ fn caller(
         }
     }
     let (user, password) = basic.unzip();
-    match console::authenticate(state, user.as_deref(), password.as_deref(), peer) {
+    match console::authenticate(state, user.as_deref(), password.as_deref(), peer).await {
         console::Auth::Authorized { roles, subject, .. } => Ok((roles, subject)),
         console::Auth::NotAuthorized | console::Auth::NoCredentials => {
             Err(Box::new(state.forbidden()))
@@ -488,7 +488,7 @@ async fn jolokia(
         }
         return cors(r);
     }
-    let (roles, subject) = match caller(state, headers, peer, session) {
+    let (roles, subject) = match caller(state, headers, peer, session).await {
         Ok(c) => c,
         Err(r) => return *r,
     };
