@@ -131,6 +131,57 @@ fn authenticate_and_cache() {
     );
 }
 
+/// Like `GuestLoginModule` with `credentialsInvalidate=true` and nothing
+/// after it: only a client that sends no credentials at all is the guest.
+struct GuestOnlyWithoutCredentials;
+
+impl SecurityManager for GuestOnlyWithoutCredentials {
+    fn authenticate(
+        &self,
+        user: Option<&str>,
+        password: Option<&str>,
+        _: &ConnectionInfo,
+    ) -> Result<Option<Subject>, NoCache> {
+        if user.is_some() || password.is_some() {
+            return Ok(None);
+        }
+        let mut s = Subject::default();
+        s.add(Principal::User("guest".into()));
+        s.add(Principal::Role("a".into()));
+        Ok(Some(s))
+    }
+
+    fn authorize(&self, subject: &Subject, roles: &[Role], check: CheckType, _: &str) -> bool {
+        authorize_roles(subject, roles, check)
+    }
+}
+
+#[test]
+fn a_cached_anonymous_login_does_not_admit_empty_credentials() {
+    let mut config = SecurityStoreConfig::from_broker(&BrokerConfig::default());
+    config.enabled = true;
+    let store = SecurityStore::new(
+        config,
+        HierarchicalRepository::new(Default::default()),
+        Arc::new(GuestOnlyWithoutCredentials),
+    );
+    let conn = ConnectionInfo::default();
+    let guest = store.authenticate(None, None, &conn).unwrap();
+    assert_eq!(guest.validated_user.as_deref(), Some("guest"));
+    // Refused when asked first, so refused after the anonymous login too.
+    for (user, password) in [(None, Some("")), (Some(""), None), (Some(""), Some(""))] {
+        assert!(
+            store.authenticate(user, password, &conn).is_err(),
+            "{user:?}/{password:?} must not reuse the anonymous login"
+        );
+    }
+    // Fields whose bytes run together differently do not share a key.
+    assert_ne!(
+        authentication_cache_key(Some("a\0"), Some(""), &conn),
+        authentication_cache_key(Some("a"), Some("\0"), &conn)
+    );
+}
+
 #[test]
 fn cluster_credentials() {
     let (store, _) = store(true);

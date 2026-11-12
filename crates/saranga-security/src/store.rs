@@ -631,39 +631,53 @@ fn unable_to_validate(
 
 /// `createAuthenticationCacheKey`: SHA-256 of what decides a login's subject
 /// (user, password, certificate subject, realm and SASL identity), in hex.
+///
+/// Each field goes in as whether it is there and its length, then its
+/// bytes, so a missing field and an empty one (`GuestLoginModule` with
+/// `credentialsInvalidate` tells them apart) never share a key, and neither
+/// do fields whose bytes run together differently. Artemis hashes the bytes
+/// with a separator only, so there they do.
 fn authentication_cache_key(
     user: Option<&str>,
     password: Option<&str>,
     connection: &ConnectionInfo,
 ) -> String {
+    fn field(md: &mut Sha256, value: Option<&[u8]>) {
+        match value {
+            Some(v) => {
+                md.update([1]);
+                md.update((v.len() as u64).to_be_bytes());
+                md.update(v);
+            }
+            None => md.update([0]),
+        }
+    }
     let mut md = Sha256::new();
-    if let Some(u) = user {
-        md.update(u.as_bytes());
-    }
-    md.update([0]);
-    if let Some(p) = password {
-        md.update(p.as_bytes());
-    }
-    md.update([0]);
+    field(&mut md, user.map(str::as_bytes));
+    field(&mut md, password.map(str::as_bytes));
     let dn = connection.cert_subject_dn();
-    if dn != CERT_SUBJECT_DN_UNAVAILABLE {
-        md.update(dn.as_bytes());
-    }
-    md.update([0]);
-    if let Some(domain) = &connection.security_domain {
-        md.update(domain.as_bytes());
-    }
-    md.update([0]);
-    if let Some(principals) = &connection.sasl_principals {
-        md.update(format!("{principals:?}").as_bytes());
-    }
+    field(
+        &mut md,
+        (dn != CERT_SUBJECT_DN_UNAVAILABLE).then_some(dn.as_bytes()),
+    );
+    field(
+        &mut md,
+        connection.security_domain.as_deref().map(str::as_bytes),
+    );
+    let principals = connection
+        .sasl_principals
+        .as_ref()
+        .map(|p| format!("{p:?}"));
+    field(&mut md, principals.as_deref().map(str::as_bytes));
     // The certificate itself, not only its subject: a login module may bind
     // the login to the certificate, and another one with
     // the same subject must not reuse it.
-    md.update([0]);
-    if let Some(cert) = connection.certificates.as_deref().and_then(|c| c.first()) {
-        md.update(Sha256::digest(&cert.der));
-    }
+    let cert = connection
+        .certificates
+        .as_deref()
+        .and_then(|c| c.first())
+        .map(|c| Sha256::digest(&c.der));
+    field(&mut md, cert.as_ref().map(|d| d.as_slice()));
     saranga_config::bytes_to_hex(&md.finalize())
 }
 

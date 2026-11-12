@@ -1944,6 +1944,7 @@ impl Conn {
                 self.close_link(&mut s, l, false).await;
             }
         }
+        self.orphaned_transactions(&mut s);
         s.server.close(true).await;
         if self.closed {
             return;
@@ -1960,10 +1961,25 @@ impl Conn {
                     self.close_link(&mut s, l, false).await;
                 }
             }
+            self.orphaned_transactions(&mut s);
             s.server.close(false).await;
         }
         self.send(channel, Performative::End(End::default()));
         Ok(())
+    }
+
+    /// A session `s`, already taken out of the connection's, is ending.
+    /// Its transactions are the connection's (`AMQPConnectionCallback`):
+    /// they outlive it, can still be discharged through another session,
+    /// and roll back with the connection, through any session still open.
+    /// With none left to do that, they roll back now, through this one.
+    fn orphaned_transactions(&mut self, s: &mut Session) {
+        if !self.sessions.is_empty() {
+            return;
+        }
+        for (_, t) in self.txns.drain() {
+            let _ = s.server.rollback_tx(&t.tx);
+        }
     }
 
     /// The connection is gone: transactions roll back, sessions close,
@@ -1981,7 +1997,12 @@ impl Conn {
         }
         let txns: Vec<Txn> = self.txns.drain().map(|(_, t)| t).collect();
         for t in txns {
-            if let Some(s) = self.sessions.get_mut(&t.channel) {
+            // Its own session, or any other once that one has ended.
+            let s = match self.sessions.contains_key(&t.channel) {
+                true => self.sessions.get_mut(&t.channel),
+                false => self.sessions.values_mut().next(),
+            };
+            if let Some(s) = s {
                 let _ = s.server.rollback_tx(&t.tx);
             }
         }
@@ -4196,6 +4217,9 @@ impl Conn {
 
     async fn coordinate(&mut self, channel: u16, handle: u32, incoming: Incoming) -> Handled {
         let now = now_millis();
+        // A discharge's queue updates lined up on the session that declared
+        // the transaction, when that is not this one.
+        let mut moved = None;
         let body = AmqpMessage::new(i64::from(incoming.format), incoming.payload, now)
             .ok()
             .and_then(|m| m.body())
@@ -4212,7 +4236,11 @@ impl Conn {
             }
             Some(v @ Value::Described(..)) if matches!(&v, Value::Described(d, _) if Discharge::is(d)) => {
                 match <Discharge as Composite>::from_value(v) {
-                    Ok(d) => self.discharge(channel, d).await,
+                    Ok(d) => {
+                        let (state, elsewhere) = self.discharge(channel, d).await;
+                        moved = elsewhere;
+                        state
+                    }
                     Err(e) => DeliveryState::Rejected(Rejected {
                         error: Some(Error::new("failed", Some(e.to_string()))),
                     }),
@@ -4226,7 +4254,12 @@ impl Conn {
             }),
         };
         let s = self.sessions.get_mut(&channel).expect("checked");
-        let wait = s.server.take_completion();
+        let mut wait = s.server.take_completion();
+        if let Some(elsewhere) = moved {
+            // Answered once they are made, as Artemis answers a discharge
+            // after the commit's I/O on the coordinator's context.
+            wait.merge(elsewhere);
+        }
         if let Some(Link::Coordinator(cl)) = s.links.get_mut(&handle)
             && cl.credit < self.settings.low_credits.max(0) as u32
         {
@@ -4255,10 +4288,16 @@ impl Conn {
         Ok(())
     }
 
-    /// Commits or rolls back (`ProtonTransactionHandler`, `discharge`).
-    async fn discharge(&mut self, coordinator_channel: u16, d: Discharge) -> DeliveryState {
+    /// Commits or rolls back (`ProtonTransactionHandler`, `discharge`);
+    /// with the outcome, the queue updates the commit or rollback lined up
+    /// on another session than the coordinator's, for the answer to wait for.
+    async fn discharge(
+        &mut self,
+        coordinator_channel: u16,
+        d: Discharge,
+    ) -> (DeliveryState, Option<Completion>) {
         let Some(txn) = self.txns.remove(&d.txn_id) else {
-            return DeliveryState::Rejected(Rejected {
+            let refused = DeliveryState::Rejected(Rejected {
                 error: Some(Error::new(
                     condition::ILLEGAL_STATE,
                     Some(format!(
@@ -4267,6 +4306,7 @@ impl Conn {
                     )),
                 )),
             });
+            return (refused, None);
         };
         let fail = d.fail.unwrap_or(false);
         // The deliveries the client acknowledged in the transaction.
@@ -4300,6 +4340,15 @@ impl Conn {
                 s.server.commit_tx(&txn.tx)
             }
         };
+        // Lined up on the declaring session, they would wait for that
+        // session's next answer: the coordinator's waits for them instead.
+        let elsewhere = (channel != coordinator_channel).then(|| {
+            self.sessions
+                .get_mut(&channel)
+                .expect("checked")
+                .server
+                .take_completion()
+        });
         for (ch, id) in &acked {
             let Some(s) = self.sessions.get_mut(ch) else {
                 continue;
@@ -4335,12 +4384,13 @@ impl Conn {
                 );
             }
         }
-        match result {
+        let state = match result {
             Ok(()) => DeliveryState::AcceptedNew,
             Err(e) => DeliveryState::Rejected(Rejected {
                 error: Some(Error::new(broker_condition(&e), Some(e.message))),
             }),
-        }
+        };
+        (state, elsewhere)
     }
 
     // -------------------------------------------------------- outgoing
