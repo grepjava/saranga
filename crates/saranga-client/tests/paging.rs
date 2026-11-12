@@ -187,3 +187,61 @@ async fn export_includes_paged_messages() {
     drop(conn);
     broker.stop().unwrap();
 }
+
+#[tokio::test]
+async fn changing_priority_reaches_paged_messages() {
+    use saranga_server::management::Json;
+    use saranga_server::queue::{Selection, SelectionAction};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, address) = start(dir.path()).await;
+    let conn = Connection::connect(&address, ConnectionOptions::default())
+        .await
+        .unwrap();
+    let session = conn
+        .create_session(SessionOptions::default())
+        .await
+        .unwrap();
+    session
+        .create_queue(
+            QueueConfiguration::new("paged")
+                .routing_type(RoutingType::Anycast)
+                .durable(true),
+        )
+        .await
+        .unwrap();
+    let producer = session.create_producer(Some("paged")).await.unwrap();
+
+    // Sixty 1 KiB messages on a 10 KiB address: more than fit in memory, so
+    // some are genuinely in pages (held in the page cache), not only in memory.
+    for n in 0..60 {
+        producer.send(numbered(n)).await.unwrap();
+    }
+    session.queue_query("paged").await.unwrap();
+    assert!(paging(&broker), "the queue is paging");
+
+    // `changeReferencesPriority` must reach the paged messages too, the way
+    // Artemis's iterQueue reads them through the page iterator — not only the
+    // ones still in memory.
+    let q = broker.post_office().queue("paged").unwrap();
+    let changed = q
+        .act(Selection::filter(None), SelectionAction::ChangePriority(9))
+        .await;
+    assert_eq!(
+        changed, 60,
+        "a priority change must reach the paged messages, not only the in-memory ones"
+    );
+
+    let exported = saranga_server::management::export_messages(&broker, "paged", None, 1000)
+        .await
+        .unwrap();
+    assert_eq!(exported.len(), 60);
+    assert!(
+        exported
+            .iter()
+            .all(|m| m.get("priority").and_then(Json::as_i64) == Some(9)),
+        "every message's priority is changed"
+    );
+    drop(conn);
+    broker.stop().unwrap();
+}

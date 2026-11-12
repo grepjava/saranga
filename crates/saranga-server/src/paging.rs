@@ -2190,6 +2190,91 @@ impl PagingStore {
         }
     }
 
+    /// `changeReferencesPriority` for the messages still in pages: each paged
+    /// message of `sub`'s queue that `matches` and is not already in memory
+    /// (`exclude`) has its priority changed in the page cache, so a browse and
+    /// a later delivery both see it. Only the pages still held in memory are
+    /// reached — the current page and the last few read (`PAGE_CACHE`); the
+    /// page files are left as they are, so a restart, or a page dropped from
+    /// the cache and read again, reads the original priority back, as Artemis
+    /// does not persist a paged message's new priority either. Returns how many
+    /// were changed, up to `budget`.
+    pub fn reprioritise(
+        &self,
+        sub: &Arc<PageSubscription>,
+        priority: u8,
+        exclude: &HashSet<(i64, i32)>,
+        mut budget: Option<usize>,
+        matches: impl Fn(&ServerMessage) -> bool,
+    ) -> usize {
+        let rebuild = |entries: &[Arc<PageEntry>],
+                       page: i64,
+                       budget: &mut Option<usize>|
+         -> Option<(Vec<Arc<PageEntry>>, usize)> {
+            let mut rebuilt: Option<Vec<Arc<PageEntry>>> = None;
+            let mut changed = 0;
+            for (i, e) in entries.iter().enumerate() {
+                if budget.is_some_and(|b| b == 0) {
+                    break;
+                }
+                let Some(m) = &e.message else { continue };
+                if !e.queue_ids.contains(&sub.queue_id)
+                    || exclude.contains(&(page, e.nr))
+                    || sub.is_acked(page, e.nr)
+                    || m.core().priority == priority
+                    || !matches(m)
+                {
+                    continue;
+                }
+                let mut core = m.core().clone();
+                core.priority = priority;
+                // Keep the message's reference accounting: for a multicast
+                // paged message the one cached message is shared by the queues
+                // that read it, so the rebuilt message must share it too, or a
+                // later acknowledgement on one queue would delete a journal
+                // record another still holds (see `with_core_keeping_refs`).
+                let v = rebuilt.get_or_insert_with(|| entries.to_vec());
+                v[i] = Arc::new(PageEntry {
+                    nr: e.nr,
+                    tx_id: e.tx_id,
+                    queue_ids: e.queue_ids.clone(),
+                    message: Some(m.with_core_keeping_refs(core)),
+                });
+                changed += 1;
+                if let Some(b) = budget {
+                    *b -= 1;
+                }
+            }
+            rebuilt.map(|v| (v, changed))
+        };
+        let mut changed = 0;
+        let mut st = lock(&self.state);
+        if !st.paging {
+            return 0;
+        }
+        if let Some(c) = st.current.take() {
+            match rebuild(&c.entries, c.id, &mut budget) {
+                Some((entries, n)) => {
+                    changed += n;
+                    st.current = Some(CurrentPage { entries, ..c });
+                }
+                None => st.current = Some(c),
+            }
+        }
+        for idx in 0..st.cache.len() {
+            if budget.is_some_and(|b| b == 0) {
+                break;
+            }
+            let page = st.cache[idx].id;
+            let entries = st.cache[idx].entries.clone();
+            if let Some((entries, n)) = rebuild(&entries, page, &mut budget) {
+                changed += n;
+                st.cache[idx] = Arc::new(LoadedPage { id: page, entries });
+            }
+        }
+        changed
+    }
+
     /// `positionIgnored`: a message the queue will never get counts as
     /// acknowledged for the page's completion.
     fn position_ignored(&self, sub: &Arc<PageSubscription>, page: i64, nr: i32) {

@@ -63,9 +63,15 @@ impl Selection {
     }
 
     fn matches(&self, r: &MessageRef) -> bool {
+        self.matches_message(&r.message)
+    }
+
+    /// [`Self::matches`] against a message directly, for a paged message that
+    /// has no reference yet.
+    fn matches_message(&self, m: &ServerMessage) -> bool {
         match self.message_id {
-            Some(id) => r.message_id() == id,
-            None => self.filter.as_ref().is_none_or(|f| f.matches(&*r.message)),
+            Some(id) => m.message_id() == id,
+            None => self.filter.as_ref().is_none_or(|f| f.matches(m)),
         }
     }
 
@@ -725,6 +731,26 @@ impl Actor {
                         q.reprioritise(r, core);
                     }
                 }
+            }
+            // Artemis's `iterQueue` reads paged messages through the page
+            // iterator too, so a priority change reaches a message still in
+            // pages. Those held in the page cache are changed there (see
+            // `PagingStore::reprioritise`); messages already read into memory
+            // are covered above, so they are left out here.
+            if !sel.reached(hits)
+                && let Some(sub) = self.shared.paging.clone()
+                && let Some(store) = sub.store()
+            {
+                let in_memory: HashSet<(i64, i32)> = self
+                    .messages
+                    .iter()
+                    .chain(self.scheduled.values())
+                    .chain(self.consumers.iter().flat_map(|c| c.delivering.iter()))
+                    .filter_map(|r| r.paged.as_ref().map(|p| (p.page, p.message_nr)))
+                    .collect();
+                let budget = sel.max.map(|m| m.saturating_sub(hits));
+                hits +=
+                    store.reprioritise(&sub, *p, &in_memory, budget, |m| sel.matches_message(m));
             }
             return hits;
         }
