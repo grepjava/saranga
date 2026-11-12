@@ -307,3 +307,102 @@ async fn sync_waits_for_the_peer() {
     stop(a).await;
     stop(b).await;
 }
+
+/// With `sync`, committing a prepared XA branch through management answers
+/// once the peer has what the commit sends — as Artemis's
+/// `commitPreparedTransaction` waits on the operation context (where a sync
+/// mirror's acknowledgement is pending) before reporting success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committing_a_prepared_branch_waits_for_a_sync_mirror() {
+    use saranga_buffer::SimpleString;
+    use saranga_message::CoreMessage;
+    use saranga_server::management::Json;
+    use saranga_server::session::{ClientConnection, ServerSession, SessionOptions, Transport};
+    use saranga_server::transaction::{Xid, xid_base64};
+
+    const N: i64 = 200;
+    let d = dirs();
+    let lb = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let la = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let pb = lb.local_addr().unwrap().port();
+    let queue = r#"<addresses>
+        <address name="jobs"><anycast><queue name="jobs"/></anycast></address>
+      </addresses>"#;
+    let b = start(d.1.path(), lb, queue).await;
+    let a = start(
+        d.0.path(),
+        la,
+        &format!("{queue}{}", mirror_to(pb, "to-b", true)),
+    )
+    .await;
+    wait_until("connected", || connected(&a, "to-b")).await;
+
+    // An XA branch on A that sends N messages, prepared but not committed.
+    let conn = Arc::new(ClientConnection::new(
+        Transport::internal("test"),
+        Arc::new(saranga_security::ConnectionInfo {
+            remote_address: "test".into(),
+            certificates: None,
+            security_domain: None,
+            connection_id: None,
+            sasl_principals: None,
+            sni_host: None,
+        }),
+        Vec::new(),
+    ));
+    let mut session = ServerSession::new(
+        a.broker.clone(),
+        conn,
+        SessionOptions {
+            name: "xa".into(),
+            username: None,
+            password: None,
+            xa: true,
+            auto_commit_sends: false,
+            auto_commit_acks: false,
+            pre_acknowledge: false,
+            default_address: None,
+        },
+        Default::default(),
+    );
+    let xid = Xid {
+        format_id: 7,
+        branch_qualifier: b"bq".to_vec(),
+        global_transaction_id: b"gtx".to_vec(),
+    };
+    session.xa_start(xid.clone()).unwrap();
+    for _ in 0..N {
+        let message = CoreMessage {
+            address: Some(SimpleString::from("jobs")),
+            durable: true,
+            ..Default::default()
+        };
+        session.send(message, None).await.unwrap();
+    }
+    session.xa_end(xid.clone()).unwrap();
+    session.xa_prepare(xid.clone()).unwrap();
+    session.take_completion().wait().await.unwrap();
+    assert_eq!(count(&b, "jobs"), Some(0), "nothing is committed yet");
+
+    let committed = a
+        .broker
+        .management()
+        .invoke(
+            &a.broker,
+            "broker",
+            "commitPreparedTransaction",
+            &[Json::from(xid_base64(&xid))],
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed, Json::from(true));
+    assert_eq!(
+        count(&b, "jobs"),
+        Some(N),
+        "a sync mirror's peer has every committed message when the call returns"
+    );
+    drop(session);
+    stop(a).await;
+    stop(b).await;
+}

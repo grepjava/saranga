@@ -19,6 +19,64 @@ use crate::like::LikePattern;
 /// abort the process on a crafted selector.
 const MAX_DEPTH: usize = 64;
 
+/// The deepest expression tree a selector may build. The binary operators are
+/// parsed in loops, not by recursion, so `a + a + … + a` builds a chain as deep
+/// as it is long while the grammar's recursion stays shallow — and evaluating,
+/// printing, comparing, cloning or dropping the tree all recurse over it, which
+/// a few hundred levels are enough to overflow. `OR` and `AND` build flat lists
+/// and do not deepen a chain. A real selector is a handful of levels deep.
+const MAX_TREE_DEPTH: usize = 128;
+
+/// The depth of an expression tree. Only called on trees the parser has
+/// already bounded, so its own recursion stays shallow.
+fn depth(e: &Expr) -> usize {
+    1 + match e {
+        Expr::Arith(_, l, r) | Expr::Compare(_, l, r) => depth(l).max(depth(r)),
+        Expr::Negate(e) | Expr::Not(e) | Expr::Like(e, _) | Expr::BooleanCast(e) => depth(e),
+        Expr::And(list) | Expr::Or(list) => list.iter().map(depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Refuses a tree deeper than [`MAX_TREE_DEPTH`]. Checked as each node is
+/// added, so a crafted chain is refused long before it is built (dropping a
+/// very deep tree would overflow the stack as surely as evaluating it).
+fn within(d: usize) -> Result<usize, String> {
+    if d > MAX_TREE_DEPTH {
+        Err(format!(
+            "Selector expression is more than {MAX_TREE_DEPTH} levels deep"
+        ))
+    } else {
+        Ok(d)
+    }
+}
+
+/// `OR`/`AND` of `left` (of depth `d`) and `right`: extends a flat list, so
+/// the depth is that of the deepest operand plus the list itself.
+fn join(left: Expr, d: usize, right: Expr, or: bool) -> Result<(Expr, usize), String> {
+    let cast = matches!(left, Expr::Property(_));
+    let left = as_boolean(left)?;
+    let right = as_boolean(right)?;
+    let dl = if cast { d + 1 } else { d };
+    let dr = depth(&right);
+    let extends = if or {
+        matches!(left, Expr::Or(_))
+    } else {
+        matches!(left, Expr::And(_))
+    };
+    let d = within(if extends {
+        dl.max(1 + dr)
+    } else {
+        1 + dl.max(dr)
+    })?;
+    let e = if or {
+        create_or(left, right)
+    } else {
+        create_and(left, right)
+    };
+    Ok((e, d))
+}
+
 /// `JmsSelector()`: parses a whole selector into a boolean expression.
 pub(crate) fn parse(text: &str, hyphenated: bool) -> Result<Expr, String> {
     let mut p = Parser {
@@ -30,7 +88,11 @@ pub(crate) fn parse(text: &str, hyphenated: bool) -> Result<Expr, String> {
     if p.peek() != &Tok::Eof {
         return Err(p.unexpected());
     }
-    as_boolean(e)
+    // The loops bound what they add; unary operators and parentheses (bounded
+    // by `MAX_DEPTH`) can still wrap a bounded subtree, so check the whole.
+    let e = as_boolean(e)?;
+    within(depth(&e))?;
+    Ok(e)
 }
 
 /// `asBooleanExpression`: properties become boolean casts; anything else
@@ -95,40 +157,46 @@ impl Parser {
 
     fn or_expression(&mut self) -> Result<Expr, String> {
         let mut left = self.and_expression()?;
+        let mut d = depth(&left);
         while self.eat(&Tok::Kw(Keyword::Or)) {
             let right = self.and_expression()?;
-            left = create_or(as_boolean(left)?, as_boolean(right)?);
+            (left, d) = join(left, d, right, true)?;
         }
         Ok(left)
     }
 
     fn and_expression(&mut self) -> Result<Expr, String> {
         let mut left = self.equality_expression()?;
+        let mut d = depth(&left);
         while self.eat(&Tok::Kw(Keyword::And)) {
             let right = self.equality_expression()?;
-            left = create_and(as_boolean(left)?, as_boolean(right)?);
+            (left, d) = join(left, d, right, false)?;
         }
         Ok(left)
     }
 
     fn equality_expression(&mut self) -> Result<Expr, String> {
         let mut left = self.comparison_expression()?;
+        let mut d = depth(&left);
         loop {
             match self.peek() {
                 Tok::Eq => {
                     self.bump();
                     let right = self.comparison_expression()?;
+                    d = within(1 + d.max(depth(&right)))?;
                     left = create_equal(left, right)?;
                 }
                 Tok::Ne => {
                     self.bump();
                     let right = self.comparison_expression()?;
+                    d = within(2 + d.max(depth(&right)))?;
                     left = Expr::Not(Box::new(create_equal(left, right)?));
                 }
                 Tok::Kw(Keyword::Is) => {
                     self.bump();
                     let not = self.eat(&Tok::Kw(Keyword::Not));
                     self.expect(&Tok::Kw(Keyword::Null))?;
+                    d = within(1 + d + usize::from(not))?;
                     let is_null = compare(CmpOp::Eq, left, Expr::BoolConst(None));
                     left = if not {
                         Expr::Not(Box::new(is_null))
@@ -143,6 +211,7 @@ impl Parser {
 
     fn comparison_expression(&mut self) -> Result<Expr, String> {
         let mut left = self.add_expression()?;
+        let mut d = depth(&left);
         loop {
             let op = match self.peek() {
                 Tok::Gt => Some(CmpOp::Gt),
@@ -154,6 +223,7 @@ impl Parser {
             if let Some(op) = op {
                 self.bump();
                 let right = self.add_expression()?;
+                d = within(1 + d.max(depth(&right)))?;
                 left = create_ordering(op, left, right)?;
                 continue;
             }
@@ -176,6 +246,7 @@ impl Parser {
                     } else {
                         None
                     };
+                    d = within(1 + d + usize::from(not))?;
                     let like = Expr::Like(
                         Box::new(left),
                         LikePattern::new(&pattern, escape.as_deref())?,
@@ -187,6 +258,7 @@ impl Parser {
                     let low = self.add_expression()?;
                     self.expect(&Tok::Kw(Keyword::And))?;
                     let high = self.add_expression()?;
+                    d = within(2 + d.max(depth(&low)).max(depth(&high)))?;
                     left = if not {
                         create_or(
                             create_ordering(CmpOp::Lt, left.clone(), low)?,
@@ -217,6 +289,7 @@ impl Parser {
                         values,
                         not,
                     };
+                    d = 1;
                 }
                 _ => return Ok(left),
             }
@@ -225,6 +298,7 @@ impl Parser {
 
     fn add_expression(&mut self) -> Result<Expr, String> {
         let mut left = self.mult_expr()?;
+        let mut d = depth(&left);
         loop {
             let op = match self.peek() {
                 Tok::Plus => ArithOp::Plus,
@@ -233,12 +307,14 @@ impl Parser {
             };
             self.bump();
             let right = self.mult_expr()?;
+            d = within(1 + d.max(depth(&right)))?;
             left = Expr::Arith(op, Box::new(left), Box::new(right));
         }
     }
 
     fn mult_expr(&mut self) -> Result<Expr, String> {
         let mut left = self.unary_expr()?;
+        let mut d = depth(&left);
         loop {
             let op = match self.peek() {
                 Tok::Star => ArithOp::Multiply,
@@ -248,6 +324,7 @@ impl Parser {
             };
             self.bump();
             let right = self.unary_expr()?;
+            d = within(1 + d.max(depth(&right)))?;
             left = Expr::Arith(op, Box::new(left), Box::new(right));
         }
     }

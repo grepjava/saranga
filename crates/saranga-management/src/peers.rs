@@ -253,8 +253,22 @@ impl Peers {
                     None => "",
                 };
                 drop(guard);
+                let e = match done {
+                    Ok(json) => {
+                        *link.used.lock().unwrap() = Instant::now();
+                        return Ok(json);
+                    }
+                    Err(e) => e,
+                };
+                // A link that has failed is made again next time, as for an
+                // operation or attribute; left cached, every later browse,
+                // export or import would reuse it (and keep it from going idle).
+                if link_broken(&e) {
+                    self.drop_link(node, who).await;
+                    return Err(unreachable(node, e));
+                }
                 *link.used.lock().unwrap() = Instant::now();
-                return done.map_err(|e| match e.kind() {
+                return Err(match e.kind() {
                     Some(ErrorType::SecurityException) => client_problem(node, &e, false),
                     Some(ErrorType::QueueDoesNotExist) => Problem::new(
                         StatusCode::NOT_FOUND,
@@ -263,8 +277,7 @@ impl Peers {
                     Some(ErrorType::AddressDoesNotExist) => {
                         Problem::new(StatusCode::NOT_FOUND, e.to_string())
                     }
-                    Some(_) => Problem::new(StatusCode::BAD_REQUEST, e.to_string()),
-                    None => unreachable(node, e),
+                    _ => Problem::new(StatusCode::BAD_REQUEST, e.to_string()),
                 });
             }
         };
@@ -518,6 +531,22 @@ fn refused(message: String) -> Problem {
     Problem::new(status, message)
 }
 
+/// Whether an error means the link itself is gone (its connection or session
+/// failed or closed), rather than that the node refused the request on a
+/// link still usable.
+fn link_broken(e: &saranga_client::Error) -> bool {
+    matches!(
+        e.kind(),
+        None | Some(
+            ErrorType::NotConnected
+                | ErrorType::ConnectionTimedOut
+                | ErrorType::Disconnected
+                | ErrorType::ObjectClosed
+                | ErrorType::RemoteDisconnect
+        )
+    )
+}
+
 /// A client error: a refusal is 403, and the rest that the node cannot be
 /// reached. Refused while the link was made, the node refuses the user.
 fn client_problem(node: &str, e: &saranga_client::Error, linking: bool) -> Problem {
@@ -562,6 +591,78 @@ mod tests {
             refused("AMQ229017: Queue x does not exist".into()).status,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// A browse on a link whose connection has failed evicts the link, as an
+    /// operation or attribute request does, so the next request makes a new
+    /// one instead of reusing the dead session forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_browse_evicts_the_link() {
+        use saranga_server::postoffice::SelectorFilters;
+        use saranga_server::{Acceptor, BrokerConfig};
+
+        let broker = Broker::start(BrokerConfig::new(Arc::new(SelectorFilters)))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let acceptor = tokio::spawn(broker.clone().serve_acceptor(listener, Acceptor::default()));
+
+        // A link to the "node", cached as `link` would cache it.
+        let conn = Connection::connect(&address, ConnectionOptions::default())
+            .await
+            .unwrap();
+        let session = conn
+            .create_session(SessionOptions::default())
+            .await
+            .unwrap();
+        let requestor = Requestor::correlated(session).await.unwrap();
+        let peers = Arc::new(Peers::default());
+        let who = Credentials {
+            user: "admin".into(),
+            password: None,
+        };
+        peers.links.lock().unwrap().insert(
+            who.key("n1"),
+            Arc::new(Link {
+                conn,
+                requestor: tokio::sync::Mutex::new(Some(requestor)),
+                used: Mutex::new(Instant::now()),
+            }),
+        );
+
+        // The node drops the connection.
+        acceptor.abort();
+        for c in broker.registry().connections() {
+            c.disconnect();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let browsed = peers
+            .request(
+                &broker,
+                "n1",
+                &who,
+                Request::Browse {
+                    queue: "q",
+                    filter: None,
+                    skip: 0,
+                    take: 10,
+                },
+            )
+            .await;
+        let problem = browsed.expect_err("the browse fails");
+        assert_eq!(
+            problem.status,
+            StatusCode::BAD_GATEWAY,
+            "{}",
+            problem.message
+        );
+        assert!(
+            peers.links.lock().unwrap().is_empty(),
+            "the failed link is evicted, not kept for the next request"
+        );
+        broker.stop().unwrap();
     }
 
     #[test]

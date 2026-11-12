@@ -189,7 +189,9 @@ async fn complete(broker: &Arc<Broker>, base64: &str, commit: bool) -> Outcome {
     if let Some(p) = written {
         p.wait().await.map_err(|e| e.to_string())?;
     }
-    outcome.apply();
+    // A `sync` mirror's acknowledgements of what the outcome sends and
+    // acknowledges come back as waits, as on a client's commit.
+    let mirrored = outcome.apply();
     let record = broker.post_office().ids().next();
     if let Some(s) = &storage {
         let p = s
@@ -198,6 +200,13 @@ async fn complete(broker: &Arc<Broker>, base64: &str, commit: bool) -> Outcome {
         p.wait().await.map_err(|e| e.to_string())?;
     }
     rm.put_heuristic(record, xid, commit);
+    // Artemis's `storageManager.waitOnOperations()` waits on the operation
+    // context, where a `sync` mirror registers its pending acknowledgement,
+    // before the call reports success. A peer that never answers keeps the
+    // call waiting, as Artemis does; one gone is no error (as for a client).
+    for w in mirrored {
+        let _ = w.wait().await;
+    }
     Ok(Json::from(true))
 }
 

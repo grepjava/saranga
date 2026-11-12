@@ -93,6 +93,54 @@ fn deep_nesting_is_rejected_rather_than_crashing() {
     assert!(Filter::parse(&ok).is_ok(), "ordinary nesting still parses");
 }
 
+/// The binary operators are parsed in loops, so a long chain of them builds a
+/// tree as deep as it is long without any recursion in the parser. Such a
+/// selector must be refused before it is built: evaluating it (and dropping
+/// it) recurses over the tree and would overflow the stack, aborting the
+/// broker. Run on a thread with an ordinary 2 MiB stack, as a broker's are.
+#[test]
+fn long_operator_chains_are_rejected_rather_than_crashing() {
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let m = create_message();
+            let chain = |op: &str, n: usize| vec!["x"; n].join(op);
+            for selector in [
+                format!("{} > 0", chain(" + ", 30_000)),
+                format!("{} > 0", chain(" * ", 30_000)),
+                format!("{} = 1", chain(" = ", 30_000)),
+                format!("x{}", " IS NULL".repeat(30_000)),
+                format!("x{}", " LIKE 'a'".repeat(30_000)),
+            ] {
+                match Filter::parse(&selector) {
+                    Err(_) => {}
+                    // Were it accepted, it must at least evaluate safely.
+                    Ok(f) => {
+                        f.matches(&m);
+                    }
+                }
+                assert!(
+                    Filter::parse(&selector).is_err(),
+                    "a chain thousands of operators long is refused"
+                );
+            }
+            // Selectors far longer than any real one still parse and match:
+            // a long arithmetic chain, and a long OR list (a flat list, which
+            // does not deepen the tree).
+            let sum = format!("{} > 0", chain(" + ", 100));
+            assert!(Filter::parse(&sum).is_ok(), "a 100-term sum still parses");
+            let ors = (0..10_000)
+                .map(|i| format!("x = {i}"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let f = Filter::parse(&ors).expect("a long OR list still parses");
+            f.matches(&m);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 mod selector_test {
     use super::*;
 
