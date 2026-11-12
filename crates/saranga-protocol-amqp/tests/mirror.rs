@@ -406,3 +406,57 @@ async fn committing_a_prepared_branch_waits_for_a_sync_mirror() {
     stop(a).await;
     stop(b).await;
 }
+
+/// A management move answers once a `sync` mirror's peer has the moved
+/// copies and the originals' acknowledgements, as a client's send and
+/// acknowledgement do, not while they are still on their way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_management_move_waits_for_a_sync_mirror() {
+    use saranga_server::management::Json;
+
+    const N: u32 = 200;
+    let d = dirs();
+    let lb = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let la = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let pb = lb.local_addr().unwrap().port();
+    let queues = r#"<addresses>
+        <address name="jobs"><anycast><queue name="jobs"/></anycast></address>
+        <address name="done"><anycast><queue name="done"/></anycast></address>
+      </addresses>"#;
+    let b = start(d.1.path(), lb, queues).await;
+    let a = start(
+        d.0.path(),
+        la,
+        &format!("{queues}{}", mirror_to(pb, "to-b", true)),
+    )
+    .await;
+    wait_until("connected", || connected(&a, "to-b")).await;
+    let (_ca, sa) = session(a.port).await;
+    send(&sa, "jobs", 0, N).await;
+    wait_until("the messages mirrored", || {
+        count(&b, "jobs") == Some(i64::from(N))
+    })
+    .await;
+
+    let moved = a
+        .broker
+        .management()
+        .invoke(
+            &a.broker,
+            "queue.jobs",
+            "moveMessages",
+            &[Json::Null, Json::from("done")],
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(moved.as_i64(), Some(i64::from(N)), "{moved:?}");
+    assert_eq!(
+        (count(&b, "done"), count(&b, "jobs")),
+        (Some(i64::from(N)), Some(0)),
+        "a move answered as done must have reached the sync mirror's peer"
+    );
+    drop(sa);
+    stop(a).await;
+    stop(b).await;
+}

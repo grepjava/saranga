@@ -90,8 +90,8 @@ fn property(v: &PropertyValue) -> (&'static str, Json) {
 
 /// A float or double's value: a number, or for one JSON has no number for
 /// (NaN, an infinity) Java's name for it as text, which the import reads
-/// back as it reads any number given as text.
-fn number(f: f64) -> Json {
+/// back as it reads any number given as text. Browsing writes them so too.
+pub(super) fn number(f: f64) -> Json {
     if f.is_finite() {
         Json::from(f)
     } else if f.is_nan() {

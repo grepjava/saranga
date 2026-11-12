@@ -538,6 +538,7 @@ impl Queue {
             write_failures: 0,
             commits: Vec::new(),
             collecting_commits: false,
+            mirror_waits: Vec::new(),
             last_commit: None,
             redistributor: false,
             redistribute_at: None,
@@ -1469,8 +1470,12 @@ struct Actor {
     write_failures: u64,
     /// The journal commits of moves and copies not yet answered, each
     /// with its error if it failed: management waits for them.
-    commits: Vec<tokio::sync::oneshot::Receiver<Option<String>>>,
+    /// with what `sync` mirrors' peers complete once they have the move.
+    commits: Vec<tokio::sync::oneshot::Receiver<(Option<String>, Vec<Pending>)>>,
     collecting_commits: bool,
+    /// What `sync` mirrors' peers complete once they have the moves made
+    /// at once (nothing to journal): management waits for these too.
+    mirror_waits: Vec<Pending>,
     /// Handed to the actor when the latest commit's outcome is: the next
     /// waits for it.
     last_commit: Option<tokio::sync::oneshot::Receiver<()>>,
@@ -1995,13 +2000,22 @@ impl Actor {
             .ids
             .storage()
             .map(|_| crate::transaction::Transaction::new_ref(self.shared.ids.next(), None));
-        let routed = match po.page_routed_mirrored(routed.clone(), move_tx.as_ref(), &mirroring) {
-            Ok(paged) => paged.routed,
-            Err(e) => {
-                tracing::warn!("moving message {} to {address}: {e}", r.message_id());
-                routed
-            }
-        };
+        // A destination that refuses the copy (full under `FAIL`) fails the
+        // move, and the original stays: Artemis's `page` throws out of the
+        // move's routing and its transaction rolls back.
+        let (routed, mut replicated) =
+            match po.page_routed_mirrored(routed, move_tx.as_ref(), &mirroring) {
+                Ok(paged) => (paged.routed, paged.replicated),
+                Err(e) => {
+                    if let Some(move_tx) = &move_tx {
+                        std::mem::take(&mut crate::transaction::lock(move_tx).paging)
+                            .after_rollback();
+                    }
+                    let what = format!("moving message {} to {address}: {e}", r.message_id());
+                    self.move_failed(r, what, settle);
+                    return;
+                }
+            };
         let queue = self.queue();
         let what = format!("moving message {} to {address}", r.message_id());
         let mut committed = None;
@@ -2061,39 +2075,47 @@ impl Actor {
         match committed {
             None => {
                 paging.after_commit();
-                self.moved(routed, &r, reason, settle)
+                replicated.extend(self.moved(routed, &r, reason, settle));
+                if self.collecting_commits {
+                    self.mirror_waits.extend(replicated);
+                }
             }
             Some(p) => self.after_commit(p, what, move |a, failed| match failed {
                 None => {
                     paging.after_commit();
-                    a.moved(routed, &r, reason, settle)
+                    replicated.extend(a.moved(routed, &r, reason, settle));
+                    replicated
                 }
                 Some(e) => {
                     paging.after_rollback();
-                    a.move_failed(r, e, settle)
+                    a.move_failed(r, e, settle);
+                    Vec::new()
                 }
             }),
         }
     }
 
     /// A move in the journal: the copy joins its queues, the original is
-    /// acknowledged, and the duplicate ID it reserved is taken.
+    /// acknowledged, and the duplicate ID it reserved is taken. Returns
+    /// what a `sync` mirror's peer completes once it has the
+    /// acknowledgement.
     fn moved(
         &mut self,
         routed: crate::postoffice::Routed,
         r: &MessageRef,
         reason: AckReason,
         settle: Option<Settle>,
-    ) {
+    ) -> Option<Pending> {
         for (m, targets) in routed {
             for q in targets {
                 q.add(m.clone());
             }
         }
-        self.queue().post_acknowledge_for(r, reason);
+        let mirrored = self.queue().post_acknowledge_for(r, reason);
         if let Some(settle) = settle {
             settle(true);
         }
+        mirrored
     }
 
     /// A move whose journal write failed: the message stays, the ID a
@@ -2113,7 +2135,7 @@ impl Actor {
         &mut self,
         p: crate::storage::Pending,
         what: String,
-        then: impl FnOnce(&mut Actor, Option<String>) + Send + 'static,
+        then: impl FnOnce(&mut Actor, Option<String>) -> Vec<Pending> + Send + 'static,
     ) {
         let queue = self.queue();
         let (reply, wait) = tokio::sync::oneshot::channel();
@@ -2133,8 +2155,8 @@ impl Actor {
             }
             queue.send(Cmd::Manage(Box::new(move |a| {
                 let report = failed.clone();
-                then(a, failed);
-                let _ = reply.send(report);
+                let mirrored = then(a, failed);
+                let _ = reply.send((report, mirrored));
             })));
             let _ = handed.send(());
         });

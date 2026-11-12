@@ -41,8 +41,8 @@ fn property_json(v: &PropertyValue, limit: i32) -> Json {
         PropertyValue::Short(s) => Json::from(i32::from(*s)),
         PropertyValue::Int(i) => Json::from(*i),
         PropertyValue::Long(l) => Json::from(*l),
-        PropertyValue::Float(f) => Json::from(f64::from(*f)),
-        PropertyValue::Double(d) => Json::from(*d),
+        PropertyValue::Float(f) => super::export::number(f64::from(*f)),
+        PropertyValue::Double(d) => super::export::number(*d),
         PropertyValue::Char(c) => Json::from(String::from_utf16_lossy(&[*c])),
         PropertyValue::String(s) => Json::from(truncate(s.to_string_lossy(), limit)),
         PropertyValue::Bytes(b) => {
@@ -267,6 +267,11 @@ pub fn composite(core: &CoreMessage, about: &Composed, limit: i32) -> Json {
         (
             "FloatProperties",
             typed(&|v| match v {
+                // NaN and the infinities as text: JSON has no number for
+                // them, and one bare token makes the whole page unreadable.
+                PropertyValue::Float(f) if !f.is_finite() => {
+                    Some(super::export::number(f64::from(*f)))
+                }
                 PropertyValue::Float(f) => {
                     Some(Json::from(java_float(*f).parse::<f64>().unwrap_or(0.0)))
                 }
@@ -276,7 +281,7 @@ pub fn composite(core: &CoreMessage, about: &Composed, limit: i32) -> Json {
         (
             "DoubleProperties",
             typed(&|v| match v {
-                PropertyValue::Double(d) => Some(Json::from(*d)),
+                PropertyValue::Double(d) => Some(super::export::number(*d)),
                 _ => None,
             }),
         ),
@@ -532,4 +537,45 @@ pub(super) fn base64_decode(text: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod nonfinite_tests {
+    use super::*;
+
+    /// A NaN or infinite property is text in a browsed or listed message,
+    /// so the JSON around it still parses.
+    #[test]
+    fn a_nan_or_infinite_property_leaves_valid_json() {
+        let mut core = CoreMessage::default();
+        for (k, v) in [
+            ("f", PropertyValue::Float(f32::NAN)),
+            ("d", PropertyValue::Double(f64::NAN)),
+            ("i", PropertyValue::Double(f64::INFINITY)),
+            ("n", PropertyValue::Double(f64::NEG_INFINITY)),
+            ("ok", PropertyValue::Double(1.5)),
+        ] {
+            core.properties.insert(SimpleString::from(k), v);
+        }
+        let about = Composed {
+            protocol: None,
+            redelivered: false,
+            large: false,
+            persistent_size: 0,
+        };
+        let text = composite(&core, &about, -1).to_string();
+        let j = Json::parse(&text).unwrap_or_else(|e| panic!("{e:?}: {text}"));
+        let doubles = j.get("DoubleProperties").unwrap();
+        assert_eq!(doubles.get("d").and_then(Json::as_str), Some("NaN"));
+        assert_eq!(doubles.get("i").and_then(Json::as_str), Some("Infinity"));
+        assert_eq!(doubles.get("n").and_then(Json::as_str), Some("-Infinity"));
+        assert_eq!(doubles.get("ok"), Some(&Json::from(1.5)));
+        let floats = j.get("FloatProperties").unwrap();
+        assert_eq!(floats.get("f").and_then(Json::as_str), Some("NaN"));
+
+        let r = MessageRef::new(ServerMessage::new(core));
+        let text = to_map(&r, -1).to_string();
+        let j = Json::parse(&text).unwrap_or_else(|e| panic!("{e:?}: {text}"));
+        assert_eq!(j.get("d").and_then(Json::as_str), Some("NaN"));
+    }
 }

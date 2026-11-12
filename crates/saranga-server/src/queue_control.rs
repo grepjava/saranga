@@ -401,21 +401,36 @@ impl Queue {
             .manage(move |a| {
                 a.write_failure = None;
                 a.commits.clear();
+                a.mirror_waits.clear();
                 a.collecting_commits = true;
                 let n = a.act(&sel, &action);
                 a.collecting_commits = false;
-                (n, a.write_failure.take(), std::mem::take(&mut a.commits))
+                (
+                    n,
+                    a.write_failure.take(),
+                    std::mem::take(&mut a.commits),
+                    std::mem::take(&mut a.mirror_waits),
+                )
             })
             .await;
         self.prompt_delivery();
-        let Some((n, mut failed, commits)) = done else {
+        let Some((n, mut failed, commits, mut mirrored)) = done else {
             return Ok(0);
         };
         // As Artemis's transaction commits before the operation returns.
         for c in commits {
-            if let Ok(Some(e)) = c.await {
-                failed.get_or_insert(e);
+            if let Ok((e, waits)) = c.await {
+                if let Some(e) = e {
+                    failed.get_or_insert(e);
+                }
+                mirrored.extend(waits);
             }
+        }
+        // And, with a `sync` mirror, once its peer has the copies and the
+        // acknowledgements (`OperationContext`'s replication wait). A peer
+        // that is gone is no error, as for a client's send.
+        for w in mirrored {
+            let _ = w.wait().await;
         }
         match failed {
             Some(e) => Err(e),
@@ -992,12 +1007,15 @@ impl Actor {
                 // The copy is seen once it is in the journal.
                 Ok(p) => {
                     let target = target.clone();
-                    self.after_commit(p, what, move |a, failed| match failed {
-                        None => target.add(copy),
-                        Some(e) => {
-                            tracing::warn!("{e}");
-                            a.write_failed(e);
+                    self.after_commit(p, what, move |a, failed| {
+                        match failed {
+                            None => target.add(copy),
+                            Some(e) => {
+                                tracing::warn!("{e}");
+                                a.write_failed(e);
+                            }
                         }
+                        Vec::new()
                     });
                 }
                 Err(e) => {

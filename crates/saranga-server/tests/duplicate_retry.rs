@@ -273,3 +273,69 @@ async fn an_id_is_a_duplicate_from_its_commit_on() {
     retry.close(false).await;
     broker.stop().unwrap();
 }
+
+/// A management move to an address full under `FAIL` is refused as a send
+/// there is, and the message stays where it was: Artemis's `page` throws out
+/// of the move's routing and its transaction rolls back.
+#[tokio::test]
+async fn a_move_to_a_full_fail_address_is_refused_and_keeps_the_message() {
+    for persistence in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = start(dir.path(), persistence).await;
+        create_full_queue(&broker).await;
+        op(
+            &broker,
+            "broker",
+            "createQueue",
+            vec![
+                Json::from("src"),
+                Json::from("ANYCAST"),
+                Json::from("src"),
+                Json::Null,
+                Json::Bool(true),
+                Json::Long(-1),
+                Json::Bool(false),
+                Json::Bool(true),
+            ],
+        )
+        .await;
+        let mut s = session(&broker);
+        let mut filled = 0;
+        while send(&mut s, None).await.is_ok() {
+            filled += 1;
+            assert!(filled < 10, "the address never filled");
+        }
+        let held = count(&broker).await;
+        let message = CoreMessage {
+            address: Some(SimpleString::from("src")),
+            durable: true,
+            body: vec![7u8; 4000].into(),
+            ..Default::default()
+        };
+        s.send(message, None).await.unwrap();
+        s.take_completion().wait().await.unwrap();
+
+        let moved = broker
+            .management()
+            .invoke(
+                &broker,
+                "queue.src",
+                "moveMessages",
+                &[Json::Null, Json::from("full")],
+                Default::default(),
+            )
+            .await;
+        assert!(
+            moved.is_err(),
+            "persistence {persistence}: the move must be refused: {moved:?}"
+        );
+        assert_eq!(
+            op(&broker, "queue.src", "countMessages", vec![]).await,
+            Json::Long(1),
+            "persistence {persistence}: the message stays on its queue"
+        );
+        assert_eq!(count(&broker).await, held, "persistence {persistence}");
+        s.close(false).await;
+        broker.stop().unwrap();
+    }
+}
