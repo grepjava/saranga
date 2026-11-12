@@ -658,6 +658,38 @@ mod tests {
     }
 
     #[test]
+    fn copying_a_large_message_with_no_body_fails_rather_than_sharing_it() {
+        use crate::message::ServerMessage;
+        use saranga_message::CoreMessage;
+        let d = dir("copy-missing");
+        let store = LargeMessageStore::new(d.clone(), false);
+        assert!(store.start().unwrap().is_empty());
+        // A durable large message with its body on disk.
+        let mut w = store.create(5, true).unwrap();
+        w.append(b"hello world").unwrap();
+        let body = w.finish().unwrap();
+        let message = ServerMessage::new_large(
+            CoreMessage {
+                message_id: 5,
+                durable: true,
+                ..Default::default()
+            },
+            body,
+        );
+        // Its body file goes missing (a lost or unreadable large file).
+        fs::remove_file(d.join("5.msg")).unwrap();
+        // Copying to a new ID cannot write the new body. The copy must fail
+        // rather than return a message that shares the original's absent body
+        // under an ID that has no body file of its own: that ID's journal
+        // record could never be recovered.
+        let mut copy = message.core().clone();
+        copy.message_id = 9;
+        assert!(message.copy(copy).is_none());
+        assert!(!d.join("9.msg").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn interrupted_upload_is_removed() {
         let d = dir("interrupted");
         let store = LargeMessageStore::new(d.clone(), false);

@@ -882,8 +882,15 @@ impl Actor {
                     let record = po.ids().next();
                     c.reserve(&id);
                     drop(c);
-                    // The ID is taken once the message is moved, given back
-                    // if it is not.
+                    // The ID is journaled inside the move's transaction (see
+                    // `commit_move`) so `persist-id-cache` keeps it across a
+                    // restart; the settle takes it into the in-memory cache once
+                    // the move is known to have happened, or gives it back.
+                    let pending = crate::duplicate::PendingId {
+                        cache: cache.clone(),
+                        id: id.clone(),
+                        record,
+                    };
                     let settle: super::Settle = Box::new(move |moved| {
                         let mut c = crate::duplicate::lock(&cache);
                         match moved {
@@ -891,7 +898,13 @@ impl Actor {
                             false => c.release(&id),
                         }
                     });
-                    self.move_to(address, r, AckReason::Normal, target.clone(), Some(settle));
+                    self.move_to(
+                        address,
+                        r,
+                        AckReason::Normal,
+                        target.clone(),
+                        Some(super::DuplicateMove { pending, settle }),
+                    );
                     return;
                 }
                 self.move_to(address, r, AckReason::Normal, target.clone(), None);
@@ -925,7 +938,16 @@ impl Actor {
             false,
             now,
         );
-        let copy = MessageRef::new(r.message.copy(copy));
+        let Some(copy) = r.message.copy(copy) else {
+            // A large body that cannot be copied leaves the original in place
+            // rather than add a copy with no recoverable body.
+            tracing::warn!(
+                "copying message {} to {address}: its large body could not be copied",
+                r.message_id()
+            );
+            return;
+        };
+        let copy = MessageRef::new(copy);
         if target.is_durable_ref(&copy)
             && let Some(s) = self.shared.ids.storage()
         {

@@ -1421,6 +1421,14 @@ impl Consumer {
 /// taken or given back.
 type Settle = Box<dyn FnOnce(bool) + Send>;
 
+/// What a reject-duplicates move settles once it is in the journal (or fails):
+/// the duplicate ID to journal in the move's own transaction, and the
+/// in-memory cache update to make when the move is known to have happened.
+struct DuplicateMove {
+    pending: crate::duplicate::PendingId,
+    settle: Settle,
+}
+
 struct Actor {
     shared: Arc<Shared>,
     messages: MessageList,
@@ -1899,12 +1907,12 @@ impl Actor {
         r: MessageRef,
         reason: AckReason,
         target: Option<Queue>,
-        settle: Option<Settle>,
+        dup: Option<DuplicateMove>,
     ) {
         let expiry = reason == AckReason::Expired;
         let Some(po) = self.shared.post_office.upgrade() else {
-            if let Some(settle) = settle {
-                settle(false);
+            if let Some(d) = dup {
+                (d.settle)(false);
             }
             self.kill_for(r, reason);
             return;
@@ -1919,13 +1927,24 @@ impl Actor {
             now,
         );
         message::apply_expiry_delay(&mut copy, &po.settings(address), now);
-        let mut copy = MessageRef::new(r.message.copy(copy));
+        let Some(copy) = r.message.copy(copy) else {
+            // The copy's body could not be written: leaving the reference
+            // where it is keeps the message rather than route a copy with no
+            // recoverable body.
+            self.move_failed(
+                r,
+                format!("moving message to {address}: its large body could not be copied"),
+                dup.map(|d| d.settle),
+            );
+            return;
+        };
+        let mut copy = MessageRef::new(copy);
         copy.scheduled_time = message::scheduled_delivery_time(copy.message.core());
         let routed = match target {
             Some(q) => vec![(copy.clone(), vec![q])],
             None => po.route_internal(&copy, address),
         };
-        self.commit_move(&po, r, routed, reason, address, settle);
+        self.commit_move(&po, r, routed, reason, address, dup);
     }
 
     /// The end of `move` and of a redistribution: the routed copy is
@@ -1938,8 +1957,15 @@ impl Actor {
         routed: crate::postoffice::Routed,
         reason: AckReason,
         address: &str,
-        settle: Option<Settle>,
+        dup: Option<DuplicateMove>,
     ) {
+        // The duplicate ID is journaled in the move's transaction below; the
+        // in-memory cache update waits until the move is known to have
+        // happened (`settle`).
+        let (dup, settle) = match dup {
+            Some(d) => (Some(d.pending), Some(d.settle)),
+            None => (None, None),
+        };
         // A paging address takes the copy in its pages. An expired
         // message's copy is not mirrored: the peer expires it too.
         let mirroring = match reason {
@@ -1988,6 +2014,17 @@ impl Actor {
                 }
                 if queue.store_ack_tx(tx, &mut r, &mut paging)? {
                     persistent = true;
+                }
+                // `addDuplicateID`: a reject-duplicates move journals the
+                // destination's duplicate ID in the same transaction, so
+                // `persist-id-cache` keeps it across a restart rather than
+                // only in memory.
+                if let Some(d) = &dup {
+                    let c = crate::duplicate::lock(&d.cache);
+                    if c.is_persistent() {
+                        c.store_tx(tx, &d.id, d.record)?;
+                        persistent = true;
+                    }
                 }
                 if !persistent {
                     return Ok(None);

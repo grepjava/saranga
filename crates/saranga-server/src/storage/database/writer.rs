@@ -261,6 +261,9 @@ pub struct Settings {
     pub max_retries: u32,
     pub retry_interval: Duration,
     pub max_pending_writes: usize,
+    /// Where large-message bodies are kept, so a deleted large message's file
+    /// goes with its row.
+    pub large_dir: std::path::PathBuf,
 }
 
 pub fn io_error(e: impl std::fmt::Display) -> JournalError {
@@ -299,7 +302,7 @@ pub async fn start(
 ) -> Result<Writes, JournalError> {
     let mut writers = Vec::with_capacity(settings.connections);
     for _ in 0..settings.connections.max(1) {
-        writers.push(Writer::connect(settings.config.clone()).await?);
+        writers.push(Writer::connect(settings.config.clone(), settings.large_dir.clone()).await?);
     }
     let (sender, receiver) = mpsc::unbounded_channel();
     let pending = Arc::new(Credits {
@@ -682,6 +685,9 @@ impl Changes {
 struct Writer {
     config: Target,
     connection: Option<Prepared>,
+    /// Where large-message bodies live: a committed message delete takes the
+    /// file with it.
+    large_dir: std::path::PathBuf,
 }
 
 struct Prepared {
@@ -728,10 +734,12 @@ fn records_sql(table: &str) -> String {
 /// Deletes references: acknowledgements.
 pub(super) const UNREFERENCE: &str = "DELETE FROM DB_REFERENCES r USING UNNEST($1::bigint[], $2::bigint[]) AS d(m, q) \
                  WHERE r.MESSAGE_ID >= $3 AND r.MESSAGE_ID <= $4 AND r.MESSAGE_ID = d.m AND r.QUEUE_ID = d.q";
-/// Deletes messages no reference is left on.
+/// Deletes messages no reference is left on, returning which of them were
+/// large so their body files can go with them.
 pub(super) const DELETE_MESSAGES: &str = "DELETE FROM DB_MESSAGES m \
                  WHERE m.MESSAGE_ID = ANY($1) AND NOT EXISTS \
-                 (SELECT 1 FROM DB_REFERENCES r WHERE r.MESSAGE_ID = m.MESSAGE_ID)";
+                 (SELECT 1 FROM DB_REFERENCES r WHERE r.MESSAGE_ID = m.MESSAGE_ID) \
+                 RETURNING m.MESSAGE_ID, m.IS_LARGE::text";
 
 /// No statement can reach past its batch, in whatever order the planner joins:
 /// statistics taken while a table was empty make it walk the whole table
@@ -887,10 +895,14 @@ impl Prepared {
 type Step<'a> = Pin<Box<dyn Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>>;
 
 impl Writer {
-    async fn connect(config: Target) -> Result<Self, JournalError> {
+    async fn connect(config: Target, large_dir: std::path::PathBuf) -> Result<Self, JournalError> {
         let client = connect(&config).await.map_err(io_error)?;
         let connection = Some(Prepared::new(client).await.map_err(io_error)?);
-        Ok(Self { config, connection })
+        Ok(Self {
+            config,
+            connection,
+            large_dir,
+        })
     }
 
     /// One database transaction, sent at once. The order is fixed: inserts,
@@ -908,6 +920,9 @@ impl Writer {
         }
         let p = self.connection.as_ref().expect("a connection");
         let db = &p.client;
+        // The IDs of large messages whose rows this batch deletes: their body
+        // files go once the batch commits.
+        let deleted_large: Arc<Mutex<Vec<i64>>> = Arc::default();
         let mut steps: Vec<Step<'_>> =
             vec![Box::pin(async move { db.execute(&p.begin, &[]).await })];
         if !c.message_ids.is_empty() {
@@ -1042,8 +1057,18 @@ impl Writer {
             }));
         }
         if !c.deleted_messages.is_empty() {
+            let large = deleted_large.clone();
             steps.push(Box::pin(async move {
-                db.execute(&p.delete_messages, &[&c.deleted_messages]).await
+                let rows = db.query(&p.delete_messages, &[&c.deleted_messages]).await?;
+                let mut large = large.lock().unwrap_or_else(|e| e.into_inner());
+                for row in &rows {
+                    let id: i64 = row.get(0);
+                    let is_large: String = row.get(1);
+                    if is_large == "Y" {
+                        large.push(id);
+                    }
+                }
+                Ok(rows.len() as u64)
             }));
         }
         for (records, statement) in [(&c.broker, &p.delete_broker), (&c.config, &p.delete_config)] {
@@ -1067,10 +1092,32 @@ impl Writer {
         }
         steps.push(Box::pin(async move { db.execute(&p.commit, &[]).await }));
         let result = futures_util::future::try_join_all(steps).await.map(|_| ());
-        if result.is_err() {
-            // The statements after the failed one may still be in flight;
-            // a new connection starts clean.
-            self.connection = None;
+        match &result {
+            // The large bodies of the messages the commit deleted are files of
+            // their own; they go now the rows are gone. A missing file (the
+            // body was kept in the row, or already deleted) is no error.
+            Ok(()) => {
+                for id in deleted_large
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                {
+                    let path = self.large_dir.join(format!("{id}.msg"));
+                    if let Err(e) = std::fs::remove_file(&path)
+                        && e.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::warn!(
+                            "AMQ222010: Critical IO Error, failed to delete large message file {}: {e}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            Err(_) => {
+                // The statements after the failed one may still be in flight;
+                // a new connection starts clean.
+                self.connection = None;
+            }
         }
         result
     }

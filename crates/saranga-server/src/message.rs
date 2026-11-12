@@ -464,34 +464,37 @@ impl ServerMessage {
     }
 
     /// A copy with its own message ID (`Message.copy(newID)`): a large
-    /// message's body is copied to a file of its own.
-    pub fn copy(&self, core: CoreMessage) -> Arc<Self> {
+    /// message's body is copied to a file of its own. `None` when that copy
+    /// fails (`LargeServerMessageImpl.copy` returns null): the new ID has no
+    /// body of its own, so the caller must not route a copy that cannot be
+    /// recovered rather than share the original's body under a new ID.
+    pub fn copy(&self, core: CoreMessage) -> Option<Arc<Self>> {
         if let Some(n) = &self.native {
             let n = n.updated(&self.core, &core);
             return match &self.large {
-                None => Self::new_native(n),
+                None => Some(Self::new_native(n)),
                 Some(body) => match body.copy(core.message_id, core.durable) {
-                    Ok(copy) => Self::new_native_large(n, copy),
+                    Ok(copy) => Some(Self::new_native_large(n, copy)),
                     Err(e) => {
                         tracing::warn!(
                             "AMQ222181: Unable to copy large message {}: {e}",
                             self.message_id()
                         );
-                        Self::new_native_large(n, body.clone())
+                        None
                     }
                 },
             };
         }
         match &self.large {
-            None => Self::new(core),
+            None => Some(Self::new(core)),
             Some(body) => match body.copy(core.message_id, core.durable) {
-                Ok(copy) => Self::new_large(core, copy),
+                Ok(copy) => Some(Self::new_large(core, copy)),
                 Err(e) => {
                     tracing::warn!(
                         "AMQ222181: Unable to copy large message {}: {e}",
                         self.message_id()
                     );
-                    Self::new_large(core, body.clone())
+                    None
                 }
             },
         }

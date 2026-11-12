@@ -248,6 +248,59 @@ fn messages_refs_acks_and_counts_recover() {
     );
 }
 
+/// A large message's body is a file of its own; it must outlive every
+/// reference but the last, so a multicast message read into two queues from
+/// pages does not lose its body when the first delivery is acknowledged.
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn a_large_message_file_goes_with_its_last_reference() {
+    use crate::large::LargeMessageStore;
+    let f = Fixture::new();
+    let (s, _) = f.start();
+    let large_dir = f.dir.path().join("largemessages");
+    let store = LargeMessageStore::new(large_dir.clone(), false);
+    let mut w = store.create(50, true).unwrap();
+    w.append(b"a large body").unwrap();
+    let body = w.finish().unwrap();
+    // A depaged body does not delete its file when dropped; the file goes with
+    // the message's row.
+    body.set_keep(true);
+    let message = ServerMessage::new_large(
+        CoreMessage {
+            message_id: 50,
+            durable: true,
+            ..Default::default()
+        },
+        body,
+    );
+    let path = large_dir.join("50.msg");
+    assert!(path.exists());
+    // Two queues reference it.
+    s.store_message(&message).unwrap();
+    s.store_reference(1, 50, false).unwrap();
+    wait(s.store_reference(2, 50, true).unwrap());
+
+    // The first queue acknowledges and asks to delete the message. A reference
+    // is still left, so neither the row nor the file may go.
+    wait(s.store_acknowledge(1, 50).unwrap());
+    s.delete_message(50).unwrap();
+    s.settle().unwrap();
+    assert!(
+        path.exists(),
+        "the file outlives the first queue's acknowledgement"
+    );
+
+    // The second queue acknowledges: no reference is left, so the row and the
+    // body file both go.
+    wait(s.store_acknowledge(2, 50).unwrap());
+    s.delete_message(50).unwrap();
+    s.settle().unwrap();
+    assert!(
+        !path.exists(),
+        "the file goes once the last reference is acknowledged"
+    );
+}
+
 /// Artemis's store leaves these out; a restart here keeps them.
 #[test]
 #[ignore = "needs PostgreSQL"]

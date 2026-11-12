@@ -961,7 +961,16 @@ impl PostOffice {
                     };
                     let store = self.paging_store(&snf.config().address);
                     let id = if paged || store.is_paging() {
-                        let copy = self.copy_for_mirror(&r);
+                        let Some(copy) = self.copy_for_mirror(&r) else {
+                            // A large body that cannot be copied is not mirrored
+                            // rather than page a copy with no recoverable body.
+                            tracing::warn!(
+                                "mirroring message {} to {}: its large body could not be copied",
+                                r.message_id(),
+                                snf.config().address
+                            );
+                            continue;
+                        };
                         let id = copy.message_id();
                         match store.page(&copy.message, tx, std::slice::from_ref(&snf))? {
                             crate::paging::Paged::No => copies.push((copy, vec![snf])),
@@ -1025,7 +1034,7 @@ impl PostOffice {
 
     /// `AMQPMirrorControllerSource.copyMessageForPaging`: a copy with an ID
     /// of its own, the original's kept as `x-opt-amq-mr-id`.
-    fn copy_for_mirror(&self, r: &MessageRef) -> MessageRef {
+    fn copy_for_mirror(&self, r: &MessageRef) -> Option<MessageRef> {
         let original = r.message.core();
         let mut core = original.clone();
         core.message_id = self.ids.next();
@@ -1033,9 +1042,9 @@ impl PostOffice {
             saranga_buffer::SimpleString::from(crate::mirror::INTERNAL_ID),
             saranga_buffer::PropertyValue::Long(original.message_id),
         );
-        let mut copy = MessageRef::new(r.message.copy(core));
+        let mut copy = MessageRef::new(r.message.copy(core)?);
         copy.scheduled_time = r.scheduled_time;
-        copy
+        Some(copy)
     }
 
     /// A new queue's cursor on its address's pages.
@@ -2298,7 +2307,17 @@ impl PostOffice {
                     let mut core = d.copy(message.message.core(), self.ids.next(), forward);
                     let s = self.settings(forward);
                     crate::message::apply_expiry_delay(&mut core, &s, now);
-                    let mut r = MessageRef::new(message.message.copy(core));
+                    let Some(copied) = message.message.copy(core) else {
+                        // A large body that cannot be copied is not diverted to
+                        // this target rather than route a copy with no
+                        // recoverable body.
+                        tracing::warn!(
+                            "diverting message {} to {forward}: its large body could not be copied",
+                            message.message_id()
+                        );
+                        continue;
+                    };
+                    let mut r = MessageRef::new(copied);
                     r.scheduled_time = crate::message::scheduled_delivery_time(r.message.core());
                     r
                 };
@@ -3171,7 +3190,17 @@ impl PostOffice {
         // The message needs a new ID; its internal properties go.
         let mut core = message.message.core().clone();
         core.message_id = self.ids.next();
-        let mut copy = MessageRef::new(message.message.copy(core));
+        let Some(copied) = message.message.copy(core) else {
+            // A large body that cannot be copied is not redistributed rather
+            // than route a copy with no recoverable body; the message stays
+            // where it is for a later redistribution.
+            tracing::warn!(
+                "redistributing message {}: its large body could not be copied",
+                message.message_id()
+            );
+            return None;
+        };
+        let mut copy = MessageRef::new(copied);
         copy.scheduled_time = message.scheduled_time;
         let copy = clear_internal_properties(&copy).unwrap_or(copy);
         positions.insert(key, position);

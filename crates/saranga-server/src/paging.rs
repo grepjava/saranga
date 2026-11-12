@@ -1359,13 +1359,23 @@ impl PagingStore {
         let mut out = Vec::with_capacity(rows.len());
         for (stored, large) in rows {
             let id = stored.message_id();
+            // Each queue reading a paged large message builds its own body. The
+            // file belongs to the message (one file, shared by its references),
+            // not to a reader, so a reader's body must not delete it when it is
+            // dropped: a multicast message read into two queues would lose its
+            // file as soon as the first delivery acknowledged. The file goes
+            // with the message's row instead, deleted once no reference is left
+            // on it (the database store's reference-guarded message delete).
+            let body = |id| {
+                let b = manager.large.existing(id);
+                b.set_keep(true);
+                b
+            };
             let message = match stored {
                 crate::storage::StoredMessage::Core(m) if !large => Ok(ServerMessage::new(m)),
-                crate::storage::StoredMessage::Core(m) => {
-                    Ok(ServerMessage::new_large(m, manager.large.existing(id)))
-                }
+                crate::storage::StoredMessage::Core(m) => Ok(ServerMessage::new_large(m, body(id))),
                 crate::storage::StoredMessage::Native(r) if large => {
-                    decoders.decode_large(&r, manager.large.existing(id))
+                    decoders.decode_large(&r, body(id))
                 }
                 crate::storage::StoredMessage::Native(r) => decoders.decode(&r),
             };

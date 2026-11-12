@@ -485,6 +485,7 @@ impl DatabaseStorage {
             max_retries: database.max_retries.max(0) as u32,
             retry_interval: Duration::from_millis(database.retry_interval_millis.max(0) as u64),
             max_pending_writes: database.max_pending_writes.max(1) as usize,
+            large_dir: cfg.large_messages.clone(),
         };
         let listener = critical.clone();
         let on_failure: Arc<dyn Fn(&JournalError) + Send + Sync> = Arc::new(move |e| {
