@@ -176,6 +176,7 @@ Saranga matches what Artemis actually puts on the wire, including the oddities b
   - **Unknown transactions:** a transfer that names an unknown transaction closes the connection in both brokers. Artemis still routes the message, outside any transaction; Saranga does not.
   - **Failed SASL outcomes:** Artemis leaves the socket open after a failed outcome, and PLAIN or SCRAM with no initial response is an internal error there. Saranga closes the socket after the outcome and answers PLAIN or SCRAM with no response with outcome `auth`.
   - **Outcomes inside transactional states:** Released, Rejected and Modified wrapped in a transactional state do nothing in Artemis, so the message stays delivered to the consumer. Saranga applies them as it would outside a transaction.
+  - **A session window lowered under transfers in flight:** Proton-J computes the client's remaining incoming window as an unsigned number, so a flow that counts fewer transfers than were sent wraps it round to some four billion and Artemis goes on sending. Saranga keeps it signed and sends nothing until the client opens the window again.
   - **Delivery tags** go back to the session's pool only when a delivery is settled. Artemis returns them on every disposition, so two unsettled deliveries can share a tag.
   - **Conversion to Core:**
     - An `amqp-value` body of a type other than null, string, binary, list or map becomes a BytesMessage holding the encoded section. Artemis copies the wrong bytes there (ARTEMIS-6316).

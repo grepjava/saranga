@@ -13,6 +13,9 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **An AMQP session window lowered under transfers in flight lets none through.** A client that lowered its incoming window below the transfers already on their way left the broker with a window of some four billion, so it went on sending past it. The window is now counted as a signed difference and nothing is sent while it is not positive (see COMPAT).
+- **A detached AMQP link's waiting transfers are not sent after its detach.** Transfers held back for the client's session window stayed queued when their link closed, and went out once the window opened, on a handle no longer attached (or one a new link had taken). They now go with the link; its messages were already returned to the queue.
+- **The console's links to its other nodes acknowledge their replies.** Each management reply, including one that arrived after its request timed out, stayed on the link's reply queue for as long as the link lived.
 - **AMQP credit withdrawn under a delivery in flight stays withdrawn.** A receiver lowering its link credit below what was already on the way left the broker with a credit of some four billion instead of a negative one, so it went on sending. Credit is now signed, as Proton keeps it.
 - **A large message whose body cannot be read is not delivered without it.** Its consumer got an empty body (AMQP, STOMP, MQTT, OpenWire) or zeros in place of the unreadable chunks (Core), and acknowledging that lost the message. The consumer is now failed and its client told to close it, as Artemis does, and the message goes back to the queue.
 - **The console asks its other nodes on the configured management address.** With a `<management-address>` other than `activemq.management`, every request the console made to another node of the cluster timed out.

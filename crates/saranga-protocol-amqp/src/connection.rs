@@ -778,14 +778,17 @@ struct Session {
     server: ServerSession,
     next_outgoing_id: u32,
     next_incoming_id: u32,
-    remote_incoming_window: u32,
+    /// The transfers the client's incoming window still has room for:
+    /// negative when it was lowered below what was already on its way.
+    remote_incoming_window: i64,
     next_delivery_id: u32,
     next_consumer: i64,
     links: HashMap<u32, Link>,
     out: BTreeMap<u32, OutDelivery>,
     tags: Tags,
-    /// Transfer frames waiting for the client's incoming window.
-    blocked: std::collections::VecDeque<Vec<u8>>,
+    /// Transfer frames waiting for the client's incoming window, with
+    /// the handle of the link they are on.
+    blocked: std::collections::VecDeque<(u32, Vec<u8>)>,
     /// The peer's handles, and this end's for them.
     handles: HashMap<u32, u32>,
     /// Links this end detached, waiting for the peer's detach.
@@ -1863,7 +1866,7 @@ impl Conn {
             server,
             next_outgoing_id: 1,
             next_incoming_id,
-            remote_incoming_window,
+            remote_incoming_window: i64::from(remote_incoming_window),
             next_delivery_id: 0,
             next_consumer: 0,
             links: HashMap::new(),
@@ -1893,7 +1896,7 @@ impl Conn {
                 ));
             };
             s.next_incoming_id = begin.next_outgoing_id;
-            s.remote_incoming_window = begin.incoming_window;
+            s.remote_incoming_window = i64::from(begin.incoming_window);
             self.channels.insert(remote, local);
             return Ok(());
         }
@@ -1943,7 +1946,7 @@ impl Conn {
         let handles: Vec<u32> = s.links.keys().copied().collect();
         for h in handles {
             if let Some(l) = s.links.remove(&h) {
-                self.close_link(&mut s, l, false).await;
+                self.close_link(&mut s, h, l, false).await;
             }
         }
         self.orphaned_transactions(&mut s);
@@ -1960,7 +1963,7 @@ impl Conn {
             let handles: Vec<u32> = s.links.keys().copied().collect();
             for h in handles {
                 if let Some(l) = s.links.remove(&h) {
-                    self.close_link(&mut s, l, false).await;
+                    self.close_link(&mut s, h, l, false).await;
                 }
             }
             self.orphaned_transactions(&mut s);
@@ -2014,7 +2017,7 @@ impl Conn {
                 let handles: Vec<u32> = s.links.keys().copied().collect();
                 for h in handles {
                     if let Some(l) = s.links.remove(&h) {
-                        self.close_link(&mut s, l, false).await;
+                        self.close_link(&mut s, h, l, false).await;
                     }
                 }
                 s.server.close(true).await;
@@ -3021,7 +3024,7 @@ impl Conn {
                 Link::Coordinator(_) => None,
             } == Some(TerminusExpiryPolicy::LinkDetach);
             closed |= link_detach_expiry;
-            self.close_link(&mut s, l, closed).await;
+            self.close_link(&mut s, handle, l, closed).await;
         }
         self.sessions.insert(channel, s);
         self.send(
@@ -3734,7 +3737,9 @@ impl Conn {
 
     /// `close(remoteClose)` of a link: its consumer closes; a closed
     /// subscription or temporary destination goes.
-    async fn close_link(&mut self, s: &mut Session, link: Link, remote_close: bool) {
+    async fn close_link(&mut self, s: &mut Session, handle: u32, link: Link, remote_close: bool) {
+        // Its transfers still waiting for the client's window go with it.
+        s.blocked.retain(|(h, _)| *h != handle);
         match link {
             Link::Sender(sl) => {
                 lock(&sl.credit).closed = true;
@@ -3839,15 +3844,16 @@ impl Conn {
         let Some(s) = self.sessions.get_mut(&channel) else {
             return Ok(());
         };
-        s.remote_incoming_window = match flow.next_incoming_id {
-            Some(next) => next
-                .wrapping_add(flow.incoming_window)
-                .wrapping_sub(s.next_outgoing_id),
-            None => flow.incoming_window,
+        // The client's window, less the transfers sent that it had not
+        // yet had when it counted (serial arithmetic on the IDs).
+        let in_flight = match flow.next_incoming_id {
+            Some(next) => i64::from(s.next_outgoing_id.wrapping_sub(next) as i32),
+            None => 0,
         };
+        s.remote_incoming_window = i64::from(flow.incoming_window) - in_flight;
         if !s.blocked.is_empty() {
             self.last_write = Instant::now();
-            send_transfers(s, Vec::new(), &self.out);
+            write_blocked(s, &self.out);
         }
         let mut stopped = None;
         let mut reply = None;
@@ -4461,7 +4467,7 @@ impl Conn {
                             _ => {}
                         }
                     }
-                    self.close_link(&mut s, l, false).await;
+                    self.close_link(&mut s, handle, l, false).await;
                     self.send(
                         channel,
                         Performative::Detach(Detach {
@@ -4651,7 +4657,7 @@ impl Conn {
                     {
                         c.remote_closed(Some(&error));
                     }
-                    self.close_link(&mut s, l, false).await;
+                    self.close_link(&mut s, handle, l, false).await;
                     s.detaching.insert(handle);
                     self.send(
                         channel,
@@ -4779,7 +4785,7 @@ impl Conn {
             LinkOp::Close => {
                 let mut s = self.sessions.remove(&channel).expect("found");
                 if let Some(l) = s.links.remove(&handle) {
-                    self.close_link(&mut s, l, false).await;
+                    self.close_link(&mut s, handle, l, false).await;
                     s.detaching.insert(handle);
                     self.send(
                         channel,
@@ -4909,7 +4915,7 @@ impl Conn {
         };
         let frames = transfer_frames(channel, first, &payload, max_frame);
         self.last_write = Instant::now();
-        send_transfers(s, frames, &self.out);
+        send_transfers(s, handle, frames, &self.out);
         let s = self.sessions.get_mut(&channel).expect("checked");
         if presettled {
             // Settled when written: acknowledged now.
@@ -5642,7 +5648,7 @@ fn transfer_frames(
 
 /// Writes transfer frames while the client's incoming window allows,
 /// keeping the rest for its next flow.
-fn send_transfers(s: &mut Session, mut frames: Vec<Vec<u8>>, out: &Outbound) {
+fn send_transfers(s: &mut Session, handle: u32, mut frames: Vec<Vec<u8>>, out: &Outbound) {
     if s.blocked.is_empty() && frames.len() == 1 && s.remote_incoming_window > 0 {
         if let Some(f) = frames.pop() {
             s.next_outgoing_id = s.next_outgoing_id.wrapping_add(1);
@@ -5651,10 +5657,16 @@ fn send_transfers(s: &mut Session, mut frames: Vec<Vec<u8>>, out: &Outbound) {
         }
         return;
     }
-    s.blocked.extend(frames);
+    s.blocked.extend(frames.into_iter().map(|f| (handle, f)));
+    write_blocked(s, out);
+}
+
+/// Writes the waiting transfer frames the client's incoming window has
+/// room for.
+fn write_blocked(s: &mut Session, out: &Outbound) {
     let mut bytes = Vec::new();
     while s.remote_incoming_window > 0 {
-        let Some(f) = s.blocked.pop_front() else {
+        let Some((_, f)) = s.blocked.pop_front() else {
             break;
         };
         bytes.extend(f);

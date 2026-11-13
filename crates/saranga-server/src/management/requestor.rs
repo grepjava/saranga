@@ -162,6 +162,14 @@ impl Requestor {
             let Some(d) = self.consumer.receive(left).await? else {
                 continue;
             };
+            // `ClientRequestor.request` leaves the reply unacknowledged; it
+            // goes with the reply queue. A correlated requestor is kept for
+            // request after request, so every reply it has, its own or one
+            // that came after its request gave up, is acknowledged.
+            if self.correlate {
+                self.consumer.acknowledge(&d).await?;
+                self.consumer.flush_acks().await?;
+            }
             let matches = match &correlation {
                 None => true,
                 Some(id) => d.message.string_property(CORRELATION_ID).as_ref() == Some(id),
@@ -170,8 +178,6 @@ impl Requestor {
                 break d;
             }
         };
-        // `ClientRequestor.request` leaves the reply unacknowledged; it
-        // goes with the reply queue.
         let message = &reply.message;
         let succeeded = matches!(
             message.property(HDR_OPERATION_SUCCEEDED),
@@ -190,6 +196,11 @@ impl Requestor {
             None => None,
         };
         Ok(Reply { succeeded, result })
+    }
+
+    /// The temporary queue replies come to.
+    pub fn reply_queue(&self) -> &str {
+        &self.reply_queue
     }
 
     /// The requestor's session, for what is not a management request.

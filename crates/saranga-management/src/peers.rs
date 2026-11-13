@@ -632,6 +632,50 @@ mod tests {
         broker.stop().unwrap();
     }
 
+    /// A node's link is kept for request after request, so the replies
+    /// it has had, and one that came after its request gave up, do not
+    /// stay on its reply queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_link_keeps_no_reply_it_has_had() {
+        use saranga_server::postoffice::SelectorFilters;
+        use saranga_server::{Acceptor, BrokerConfig};
+
+        let broker = Broker::start(BrokerConfig::new(Arc::new(SelectorFilters)))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let acceptor = tokio::spawn(broker.clone().serve_acceptor(listener, Acceptor::default()));
+        let conn = Connection::connect(&address, ConnectionOptions::default())
+            .await
+            .unwrap();
+        let session = conn
+            .create_session(SessionOptions::default())
+            .await
+            .unwrap();
+        let requestor = requestor(&broker, session).await.unwrap();
+        // A request that gives up before its reply comes.
+        let late = requestor
+            .attribute("broker", "Version", Duration::ZERO)
+            .await;
+        assert!(late.is_err());
+        for _ in 0..20 {
+            let reply = requestor
+                .attribute("broker", "Version", Duration::from_secs(5))
+                .await;
+            assert!(reply.is_ok(), "{:?}", reply.err());
+        }
+        let queue = broker.post_office().queue(requestor.reply_queue()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while queue.message_count() != 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(queue.message_count(), 0);
+        conn.close().await;
+        acceptor.abort();
+        broker.stop().unwrap();
+    }
+
     /// A browse on a link whose connection has failed evicts the link, as an
     /// operation or attribute request does, so the next request makes a new
     /// one instead of reusing the dead session forever.
