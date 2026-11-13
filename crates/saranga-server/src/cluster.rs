@@ -48,6 +48,10 @@ pub struct ClusterConfig {
     /// The rest of its `<cluster-connection>`: what its bridges are made
     /// with and how messages are balanced.
     pub settings: saranga_config::ClusterConnectionConfig,
+    /// `HAPolicy.getBackupGroupName`: the replication `group-name` this
+    /// broker announces itself with, and a backup replicates only a primary
+    /// announced with.
+    pub backup_group_name: Option<String>,
 }
 
 impl ClusterConfig {
@@ -142,6 +146,11 @@ impl ClusterConfig {
             cluster_user: config.cluster_user.clone(),
             cluster_password: config.cluster_password.clone(),
             settings: cc.clone(),
+            backup_group_name: match &config.ha_policy {
+                saranga_config::HaPolicy::ReplicationPrimary(r)
+                | saranga_config::HaPolicy::ReplicationBackup(r) => r.group_name.clone(),
+                _ => None,
+            },
         })
     }
 }
@@ -654,11 +663,11 @@ impl ClusterConnection {
         out
     }
 
-    /// `Topology.updateAsPrimary`.
+    /// `Topology.updateAsPrimary`, with the HA policy's group name.
     fn update_as_primary(&self) {
         let member = Member {
             node_id: self.node_id.clone(),
-            backup_group_name: None,
+            backup_group_name: self.config.backup_group_name.clone(),
             scale_down_group_name: None,
             primary: Some(self.config.connector.clone()),
             backup: None,
@@ -1040,7 +1049,7 @@ async fn announce_loop(
             }
             conn.node_announce(NodeAnnounceMessage {
                 node_id: node_id.as_str().into(),
-                backup_group_name: None,
+                backup_group_name: config.backup_group_name.as_deref().map(Into::into),
                 backup: true,
                 current_event_id: crate::message::now_millis(),
                 connector: Flagged(Some(config.connector.clone())),
@@ -1144,6 +1153,7 @@ mod tests {
             cluster_user: "u".into(),
             cluster_password: "p".into(),
             settings: saranga_config::ClusterConnectionConfig::new("my-cluster", "artemis"),
+            backup_group_name: None,
         }
     }
 

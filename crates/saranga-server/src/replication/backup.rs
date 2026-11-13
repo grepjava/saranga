@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use saranga_buffer::{Codec, Writer};
@@ -154,20 +155,56 @@ async fn try_locate(
 ) -> Option<(Connection, String)> {
     let cluster = &cfg.cluster;
     let here = crate::cluster::dial(target)?;
-    let conn = Connection::connect_connector(here.clone(), options(cluster))
-        .await
-        .ok()?;
-    // Saranga's client keeps no backup group names, so `group-name` does
-    // not choose among the primaries.
-    // When failing back, only the broker with this node's ID.
+    // The group each node was announced with, as the topology arrives.
+    let groups: Arc<Mutex<HashMap<String, Option<String>>>> = Arc::default();
+    let hook = {
+        let groups = groups.clone();
+        saranga_client::TopologyHook(Arc::new(move |event| {
+            let mut groups = groups.lock().unwrap_or_else(|e| e.into_inner());
+            match event {
+                saranga_client::TopologyEvent::Up {
+                    node_id,
+                    backup_group_name,
+                    ..
+                } => {
+                    groups.insert(node_id, backup_group_name);
+                }
+                saranga_client::TopologyEvent::Down { node_id, .. } => {
+                    groups.remove(&node_id);
+                }
+            }
+        }))
+    };
+    let conn = Connection::connect_connector(
+        here.clone(),
+        ConnectionOptions {
+            topology_listener: Some(hook),
+            ..options(cluster)
+        },
+    )
+    .await
+    .ok()?;
+    // With a `group-name`, only a primary of that group
+    // (`NamedNodeLocatorForReplication`); else any primary
+    // (`AnyNodeLocatorForReplication`). When failing back, only the broker
+    // with this node's ID.
     let expected = cfg
         .pluggable
         .as_ref()
         .and_then(|p| p.expected_node_id.as_deref());
-    let found = conn
-        .topology()
-        .into_iter()
-        .find(|(id, primary, _)| primary.is_some() && expected.is_none_or(|e| e == id));
+    let group = cfg.policy.group_name.as_deref();
+    let in_group = |id: &str| {
+        group.is_none_or(|g| {
+            groups
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(id)
+                .is_some_and(|n| n.as_deref() == Some(g))
+        })
+    };
+    let found = conn.topology().into_iter().find(|(id, primary, _)| {
+        primary.is_some() && expected.is_none_or(|e| e == id) && in_group(id)
+    });
     let Some((node_id, Some(primary), _)) = found else {
         conn.close().await;
         return None;
@@ -1343,6 +1380,7 @@ mod tests {
                 notification_attempts: 0,
                 cluster_user: "u".into(),
                 cluster_password: "p".into(),
+                backup_group_name: None,
                 settings: saranga_config::ClusterConnectionConfig::new("my-cluster", "artemis"),
             },
             messages: JournalConfig {

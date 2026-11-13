@@ -81,10 +81,11 @@ The primary's policy, as `create --replicated` writes it:
 
 When the primary's connection goes, a synchronized backup asks the cluster's other primaries whether they still see its primary. If the vote says the primary is gone, the backup becomes active on its copy with the primary's node ID and logs `AMQ221007`. A backup not yet synchronized starts again. A primary that loses its backup goes on alone, after a vote if `vote-on-replication-failure` is set, and stops if it loses the vote. `quorum-size`, `vote-retries`, `vote-retry-wait`, `quorum-vote-wait`, `initial-replication-sync-timeout` and `retry-replication-wait` work as in Artemis.
 
-Two cautions:
+With several primaries in the cluster, `group-name` pairs a backup with its primary, as in Artemis: each broker announces itself with its group, and a backup with a `group-name` replicates only a primary of that group. A backup without one replicates any primary it finds.
+
+One caution:
 
 - **A lone pair has no one to ask.** In a cluster with no other primaries the backup needs no votes, so any break in its replication connection makes it active beside a live primary. This is split brain, and it happens in Artemis too. Use a lock manager (below) for a single pair, or run at least three primaries. Artemis's [network isolation chapter](https://activemq.apache.org/components/artemis/documentation/latest/network-isolation.html) describes the problem, and Saranga's network check is described in [Operations](operations.md).
-- **`group-name` does not choose a primary.** A Saranga backup does not keep backup group names, so with several primaries in the cluster `group-name` does not decide which one it replicates.
 
 ### Failback with replication
 

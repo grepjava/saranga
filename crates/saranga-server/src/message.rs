@@ -58,7 +58,7 @@ fn property<'a>(message: &'a CoreMessage, name: &str) -> Option<&'a PropertyValu
 
 /// A numeric property as a long, as `getLongProperty` would read one
 /// written as any integer type.
-fn long_property(message: &CoreMessage, name: &str) -> Option<i64> {
+pub(crate) fn long_property(message: &CoreMessage, name: &str) -> Option<i64> {
     match property(message, name)? {
         PropertyValue::Byte(v) => Some(i64::from(*v)),
         PropertyValue::Short(v) => Some(i64::from(*v)),

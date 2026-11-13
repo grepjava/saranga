@@ -198,3 +198,91 @@ async fn replay_needs_retention() {
     );
     broker.stop().unwrap();
 }
+
+/// A large message whose body is only partly in the retained files (an
+/// earlier file with its first chunks was removed) is not replayed: the
+/// part left is not the message. Its whole body replays.
+#[tokio::test]
+async fn replay_refuses_a_large_message_missing_part_of_its_body() {
+    use saranga_buffer::{PropertyValue, SimpleString};
+    use saranga_message::CoreMessage;
+    use saranga_server::session::{ClientConnection, ServerSession, SessionOptions, Transport};
+
+    for remove_first in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = start(dir.path(), true).await;
+        queue(&broker, "orders").await;
+        queue(&broker, "replayed").await;
+
+        // A 200 KB body: twenty 10 KiB chunks across several 64 KiB files.
+        let mut body_bytes = b"prefix".to_vec();
+        body_bytes.extend(std::iter::repeat_n(b'.', 200_000));
+        body_bytes.extend_from_slice(b"suffix");
+        let id = broker.post_office().ids().next();
+        let mut w = broker.large_messages().create(id, true).unwrap();
+        for chunk in body_bytes.chunks(10_000) {
+            w.append(chunk).unwrap();
+        }
+        let body = w.finish().unwrap();
+        let mut message = CoreMessage {
+            message_id: id,
+            address: Some(SimpleString::from("orders")),
+            durable: true,
+            ..Default::default()
+        };
+        message.properties.insert(
+            SimpleString::from("_AMQ_LARGE_SIZE"),
+            PropertyValue::Long(body_bytes.len() as i64),
+        );
+        let conn = Arc::new(ClientConnection::new(
+            Transport::internal("test"),
+            Arc::new(Default::default()),
+            Vec::new(),
+        ));
+        let mut session = ServerSession::new(
+            broker.clone(),
+            conn,
+            SessionOptions {
+                name: "s".into(),
+                username: None,
+                password: None,
+                xa: false,
+                auto_commit_sends: true,
+                auto_commit_acks: true,
+                pre_acknowledge: false,
+                default_address: None,
+            },
+            Default::default(),
+        );
+        session.send(message, Some(body)).await.unwrap();
+        session.take_completion().wait().await.unwrap();
+        assert_eq!(count(&broker, "orders").await, Json::Long(1));
+
+        if remove_first {
+            // Retention removes the oldest copy, with the body's first chunks.
+            let mut copies: Vec<_> = std::fs::read_dir(dir.path().join("history"))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            copies.sort();
+            assert!(copies.len() > 2, "{copies:?}");
+            std::fs::remove_file(&copies[0]).unwrap();
+        }
+        op(
+            &broker,
+            "broker",
+            "replay",
+            vec![s("orders"), s("replayed"), Json::Null],
+        )
+        .await
+        .unwrap();
+        let expected = if remove_first { 0 } else { 1 };
+        assert_eq!(
+            count(&broker, "replayed").await,
+            Json::Long(expected),
+            "first copy removed: {remove_first}"
+        );
+        session.close(false).await;
+        broker.stop().unwrap();
+    }
+}

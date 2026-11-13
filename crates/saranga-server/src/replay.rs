@@ -226,7 +226,9 @@ impl Replay<'_> {
                 return;
             }
             let id = self.broker.post_office().ids().next();
-            let Some(body) = self.body(original, id, core.durable) else {
+            // `_AMQ_LARGE_SIZE`: the bytes the body was stored with.
+            let size = crate::message::long_property(&core, crate::message::HDR_LARGE_BODY_SIZE);
+            let Some(body) = self.body(original, id, core.durable, size) else {
                 return;
             };
             ServerMessage::new_large(core, body)
@@ -248,7 +250,7 @@ impl Replay<'_> {
         let decoders = self.broker.post_office().paging().decoders();
         let message = if record.is_large() {
             let id = self.broker.post_office().ids().next();
-            let Some(body) = self.body(original, id, true) else {
+            let Some(body) = self.body(original, id, true, None) else {
                 return;
             };
             decoders.decode_large(&record, body)
@@ -265,8 +267,18 @@ impl Replay<'_> {
     }
 
     /// `readLargeMessageBody`: the body events of `original`, written to a
-    /// file for the message's new ID.
-    fn body(&mut self, original: i64, id: i64, durable: bool) -> Option<Arc<LargeBody>> {
+    /// file for the message's new ID. `None`, with the message not
+    /// replayed, when the retained files no longer hold the whole body (an
+    /// earlier file with some of it was removed): fewer bytes than `size`,
+    /// the size it was stored with, when known, or none at all. Artemis
+    /// replays whatever part is left as if it were the message.
+    fn body(
+        &mut self,
+        original: i64,
+        id: i64,
+        durable: bool,
+        size: Option<i64>,
+    ) -> Option<Arc<LargeBody>> {
         let mut writer = match self.broker.large_messages().create(id, durable) {
             Ok(w) => w,
             Err(e) => {
@@ -274,6 +286,7 @@ impl Replay<'_> {
                 return None;
             }
         };
+        let mut read: i64 = 0;
         for file in self.bodies.remove(&original).unwrap_or_default().values() {
             for r in file.records() {
                 if let Record::Event {
@@ -282,12 +295,26 @@ impl Replay<'_> {
                     data,
                 } = r
                     && id == original
-                    && let Err(e) = writer.append(&data)
                 {
-                    tracing::warn!("replay: large message {original}: {e}");
-                    return None;
+                    if let Err(e) = writer.append(&data) {
+                        tracing::warn!("replay: large message {original}: {e}");
+                        return None;
+                    }
+                    read += data.len() as i64;
                 }
             }
+        }
+        let whole = match size {
+            Some(size) => read == size,
+            None => read > 0,
+        };
+        if !whole {
+            // Dropped unfinished, the writer removes its file.
+            tracing::warn!(
+                "replay: large message {original} is not replayed: the retained journal holds {read} of its {} body bytes",
+                size.map_or_else(|| "unknown".to_owned(), |s| s.to_string())
+            );
+            return None;
         }
         match writer.finish() {
             Ok(b) => Some(b),

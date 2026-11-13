@@ -601,3 +601,61 @@ async fn freeze_replication_cuts_the_backup_off() {
     assert_eq!(alone.freeze_replication(), Ok(false));
     alone.stop().unwrap();
 }
+
+/// A backup with a `group-name` replicates only a primary announced with
+/// that group (`NamedNodeLocatorForReplication`): not the other group's
+/// primary it reaches first, but its own group's once that one joins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backup_replicates_only_a_primary_of_its_group() {
+    let (adir, bdir, ddir) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let (pa, pb, pd) = (free_port().await, free_port().await, free_port().await);
+    let group = |g: &str, role: &str| format!("<{role}><group-name>{g}</group-name></{role}>");
+
+    // Group a's primary; the backup, of group b, reaches it first.
+    let a = Broker::start(config(
+        &xml("a", pa, pb, &group("a", "primary")),
+        adir.path(),
+    ))
+    .await
+    .unwrap();
+    let a_acceptor = serve(&a, pa).await;
+    let backup_file = xml("backup", pd, pa, &group("b", "backup"));
+    let policy = match &backup_file.ha_policy {
+        saranga_config::HaPolicy::ReplicationBackup(r) => r.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(policy.group_name.as_deref(), Some("b"));
+    let bc = config(&backup_file, ddir.path());
+    let backup = tokio::spawn(replicate(
+        BackupConfig {
+            policy,
+            ..backup_config(&bc, false)
+        },
+        "test",
+    ));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !a.is_replica_sync(),
+        "a backup of group b must not replicate group a's primary"
+    );
+
+    // Group b's primary joins the cluster through a; the backup finds it in
+    // the topology and replicates it.
+    let b = Broker::start(config(
+        &xml("b", pb, pa, &group("b", "primary")),
+        bdir.path(),
+    ))
+    .await
+    .unwrap();
+    let b_acceptor = serve(&b, pb).await;
+    wait_for_sync(&b).await;
+    assert!(!a.is_replica_sync());
+
+    backup.abort();
+    stop(&b, b_acceptor).await;
+    stop(&a, a_acceptor).await;
+}
