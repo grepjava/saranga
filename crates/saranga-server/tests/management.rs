@@ -659,3 +659,39 @@ async fn import_takes_a_body_bigger_than_a_journal_record() {
     assert_eq!(large.read_all().unwrap(), body);
     broker.stop().unwrap();
 }
+
+/// A queue filtered by `XPATH` takes the text messages whose body the
+/// expression selects, as `XPathExpression` evaluates it against
+/// `getBodyAs(String.class)`.
+#[tokio::test]
+async fn an_xpath_filter_reads_the_text_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(dir.path()).await;
+    let config = r#"{"name":"orders","address":"orders","routing-type":"ANYCAST","durable":true,"auto-create-address":true,"filter-string":"XPATH '//order'"}"#;
+    op(&broker, "broker", "createQueue", vec![s(config)]).await;
+    for body in [
+        "<root><order/></root>",
+        "<root><invoice/></root>",
+        "not xml",
+    ] {
+        op(
+            &broker,
+            "address.orders",
+            "sendMessage",
+            vec![
+                Json::object(),
+                Json::from(3i64),
+                s(body),
+                Json::from(true),
+                Json::Null,
+                Json::Null,
+            ],
+        )
+        .await;
+    }
+    assert_eq!(
+        op(&broker, "queue.orders", "countMessages", vec![]).await,
+        Json::Long(1)
+    );
+    broker.stop().unwrap();
+}

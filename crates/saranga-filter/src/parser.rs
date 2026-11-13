@@ -358,7 +358,11 @@ impl Parser {
             }
             Tok::Kw(Keyword::XPath) => {
                 self.bump();
-                Ok(Expr::XPath(self.string_literal()?))
+                // `XPathExpression`: the expression is compiled now, and one
+                // that does not compile makes the selector invalid.
+                let xpath = self.string_literal()?;
+                crate::xpath::compile(&xpath)?;
+                Ok(Expr::XPath(xpath))
             }
             Tok::Kw(Keyword::XQuery) => {
                 self.bump();

@@ -9,6 +9,9 @@ use crate::mbean::ObjectName;
 #[derive(Debug, Clone, Default)]
 struct Access {
     key: String,
+    /// `keyPattern`: the key as a regular expression, `*` standing for
+    /// `.*`, matched against a whole `name=value`.
+    pattern: Option<Box<fancy_regex::Regex>>,
     catch_all: Vec<String>,
     methods: HashMap<String, Vec<String>>,
     /// Method prefixes, in the order they were added.
@@ -16,15 +19,24 @@ struct Access {
 }
 
 impl Access {
-    fn new(key: &str) -> Self {
-        Self {
+    /// `Access(id, key)`: a key that is not a valid regular expression is
+    /// refused, as `Pattern.compile` refuses it.
+    fn new(key: &str) -> Result<Self, String> {
+        let regex = format!(r"\A(?:{})\z", key.replace('*', ".*"));
+        let pattern = fancy_regex::Regex::new(&regex)
+            .map_err(|e| format!("management.xml: key {key:?} is not a valid pattern: {e}"))?;
+        Ok(Self {
             key: key.to_owned(),
+            pattern: Some(Box::new(pattern)),
             ..Self::default()
-        }
+        })
     }
 
+    /// `getKeyPattern().matcher(key).matches()`.
     fn key_matches(&self, key: &str) -> bool {
-        crate::mbean::glob(&self.key, key)
+        self.pattern
+            .as_ref()
+            .is_some_and(|p| p.is_match(key).unwrap_or(false))
     }
 
     fn add(&mut self, method: &str, roles: &[String]) {
@@ -109,44 +121,57 @@ fn accesses<'a, 'i>(n: roxmltree::Node<'a, 'i>) -> Vec<roxmltree::Node<'a, 'i>> 
 impl AccessList {
     fn empty() -> Self {
         Self {
-            default_access: Access::new(""),
+            default_access: Access::default(),
             domain_access: HashMap::new(),
             allow_list: HashMap::new(),
         }
     }
 
-    fn add_allow(&mut self, domain: &str, key: Option<&str>) {
+    fn add_allow(&mut self, domain: &str, key: Option<&str>) -> Result<(), String> {
         let key = normalize(key.unwrap_or(""));
         let list = self.allow_list.entry(domain.to_owned()).or_default();
         if !list.iter().any(|a| a.key == key) {
-            list.push(Access::new(&key));
+            list.push(Access::new(&key)?);
             list.sort_by(|a, b| key_order(&a.key, &b.key));
         }
+        Ok(())
     }
 
-    fn add_role_access(&mut self, domain: &str, key: Option<&str>, method: &str, roles: &[String]) {
+    fn add_role_access(
+        &mut self,
+        domain: &str,
+        key: Option<&str>,
+        method: &str,
+        roles: &[String],
+    ) -> Result<(), String> {
         let key = normalize(key.unwrap_or(""));
         let list = self.domain_access.entry(domain.to_owned()).or_default();
         if !list.iter().any(|a| a.key == key) {
-            list.push(Access::new(&key));
+            list.push(Access::new(&key)?);
             list.sort_by(|a, b| key_order(&a.key, &b.key));
         }
         if let Some(a) = list.iter_mut().find(|a| a.key == key) {
             a.add(method, roles);
         }
+        Ok(())
     }
 
     /// `createDefaultList`: what applies without `management.xml`.
     pub fn default_list() -> Self {
         let mut l = Self::empty();
         let r = |roles: &[&str]| roles.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        l.add_allow("hawtio", Some("type=*"));
+        let fixed = "the default list's keys are valid patterns";
+        l.add_allow("hawtio", Some("type=*")).expect(fixed);
         let d = "org.apache.activemq.artemis";
-        l.add_role_access(d, None, "list*", &r(&["view", "update", "amq"]));
-        l.add_role_access(d, None, "get*", &r(&["view", "update", "amq"]));
-        l.add_role_access(d, None, "is*", &r(&["view", "update", "amq"]));
-        l.add_role_access(d, None, "set*", &r(&["update", "amq"]));
-        l.add_role_access(d, None, "*", &r(&["amq"]));
+        for (method, roles) in [
+            ("list*", &["view", "update", "amq"][..]),
+            ("get*", &["view", "update", "amq"]),
+            ("is*", &["view", "update", "amq"]),
+            ("set*", &["update", "amq"]),
+            ("*", &["amq"]),
+        ] {
+            l.add_role_access(d, None, method, &r(roles)).expect(fixed);
+        }
         l.default_access
             .add("list*", &r(&["view", "update", "amq"]));
         l.default_access.add("get*", &r(&["view", "update", "amq"]));
@@ -193,7 +218,7 @@ impl AccessList {
                         l.add_allow(
                             &attribute(e, "domain").unwrap_or_default(),
                             attribute(e, "key").as_deref(),
-                        );
+                        )?;
                     }
                 }
                 "default-access" => {
@@ -215,7 +240,7 @@ impl AccessList {
                                 key.as_deref(),
                                 &attribute(a, "method").unwrap_or_default(),
                                 &roles(a),
-                            );
+                            )?;
                         }
                     }
                 }
@@ -319,6 +344,42 @@ mod tests {
         assert!(l.can_invoke(&roles(&["update"]), &queue, "setX"));
         let hawtio = ObjectName::parse("hawtio:type=x").unwrap();
         assert!(l.can_invoke(&[], &hawtio, "anything"));
+    }
+
+    /// A key is a regular expression (`*` standing for `.*`), as
+    /// `JMXAccessControlList` compiles it: a restrictive rule written with a
+    /// character class applies, rather than letting the broader rule grant
+    /// the call.
+    #[test]
+    fn a_key_is_a_regular_expression() {
+        let xml = r#"<management-context xmlns="http://activemq.apache.org/schema">
+   <authorisation>
+      <role-access>
+         <match domain="org.apache.activemq.artemis">
+            <access method="*" roles="view,amq"/>
+         </match>
+         <match domain="org.apache.activemq.artemis" key="queue=secret[0-9]">
+            <access method="get*" roles="view,amq"/>
+            <access method="*" roles="amq"/>
+         </match>
+      </role-access>
+   </authorisation>
+</management-context>"#;
+        let l = AccessList::parse(xml).unwrap();
+        let view = ["view".to_owned()];
+        let queue = |name: &str| {
+            ObjectName::parse(&format!(
+                "org.apache.activemq.artemis:broker=\"b\",component=addresses,address=\"a\",subcomponent=queues,routing-type=\"anycast\",queue=\"{name}\""
+            ))
+            .unwrap()
+        };
+        assert!(l.can_invoke(&view, &queue("secret1"), "getMessageCount"));
+        assert!(!l.can_invoke(&view, &queue("secret1"), "removeAllMessages"));
+        // Not matched by the class: the broader rule applies.
+        assert!(l.can_invoke(&view, &queue("secretX"), "removeAllMessages"));
+        // A key that is not a valid pattern is refused, as Pattern.compile
+        // refuses it.
+        assert!(AccessList::parse(&xml.replace("secret[0-9]", "secret[0-9")).is_err());
     }
 }
 

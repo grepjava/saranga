@@ -11,9 +11,8 @@
 //! Artemis's lopsided handling of mixed types (for example `shortProp = 1`
 //! is TRUE for a short property of 1, while `1 = shortProp` is FALSE).
 //!
-//! Not supported: evaluating `XPATH` against the message body (`XPATH`
-//! parses but always evaluates to FALSE, and its expression is not
-//! validated as Artemis does at parse time).
+//! `XPATH` evaluates an XPath 1.0 expression against the message body read
+//! as text (see [`xpath`]); `XQUERY` is always FALSE, as in Artemis.
 
 mod expr;
 mod java;
@@ -27,6 +26,7 @@ mod like;
 mod message;
 mod parser;
 pub mod translate;
+pub mod xpath;
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -92,6 +92,12 @@ pub trait Filterable {
     /// can throw. The evaluator calls this; the default never fails.
     fn try_get(&self, identifier: &str) -> Result<Option<Value>, PropertyError> {
         Ok(self.get(identifier))
+    }
+
+    /// The body as text, for `XPATH` (`getBodyAs(String.class)`); `None`
+    /// when it is not text. The default has none.
+    fn string_body(&self) -> Option<String> {
+        None
     }
 }
 

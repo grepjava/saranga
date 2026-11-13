@@ -254,6 +254,12 @@ pub trait NativeMessage: Send + Sync + fmt::Debug {
     /// whole encoding already returns a copy of itself.
     fn reconstitute(&self, body: Vec<u8>) -> Arc<dyn NativeMessage>;
 
+    /// `getStringBody`, for an `XPATH` selector: the body as text, `None`
+    /// when the protocol's body is not text.
+    fn string_body(&self) -> Option<String> {
+        None
+    }
+
     /// Whether `body`, a large message's file put together again (by a
     /// replay, from the retained journal), is this message's whole
     /// encoding rather than what is left of it once its first part was
@@ -655,6 +661,18 @@ impl saranga_filter::Filterable for ServerMessage {
         match &self.native {
             Some(n) => Ok(n.filter_value(identifier)),
             None => self.core.try_get(identifier),
+        }
+    }
+
+    /// `FilterableServerMessage.getBodyAs(String.class)`: none for a large
+    /// message.
+    fn string_body(&self) -> Option<String> {
+        if self.is_large() {
+            return None;
+        }
+        match &self.native {
+            Some(n) => n.string_body(),
+            None => saranga_filter::Filterable::string_body(&self.core),
         }
     }
 }

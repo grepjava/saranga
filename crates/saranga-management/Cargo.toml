@@ -14,6 +14,7 @@ flate2 = "1"
 httpdate = "1"
 rand = "0.9"
 roxmltree = "0.21"
+fancy-regex = "0.16"
 saranga-buffer = { path = "../saranga-buffer" }
 saranga-client = { path = "../saranga-client" }
 saranga-message = { path = "../saranga-message" }

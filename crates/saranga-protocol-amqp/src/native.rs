@@ -432,6 +432,17 @@ impl NativeMessage for AmqpNative {
         AmqpNative::arc(m)
     }
 
+    /// `AMQPStandardMessage.getStringBody`: an `amqp-value` body holding a
+    /// string.
+    fn string_body(&self) -> Option<String> {
+        match self.message.body() {
+            Some((crate::messaging::section::AMQP_VALUE, crate::types::Value::String(s))) => {
+                Some(s)
+            }
+            _ => None,
+        }
+    }
+
     fn holds_large_body(&self, body: &saranga_server::large::LargeBody) -> bool {
         let size = body.size();
         let wanted = self.message.large_file_prefix(size);
@@ -461,5 +472,33 @@ impl NativeMessage for AmqpNative {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `AMQPStandardMessage.getStringBody`: only an `amqp-value` string is
+    /// text, for an `XPATH` selector.
+    #[test]
+    fn the_string_body_is_an_amqp_value_string() {
+        let section = |code: u8, value: &[u8]| {
+            let mut s = vec![0x00, 0x53, code];
+            s.extend_from_slice(value);
+            s
+        };
+        let text = b"<root><order/></root>";
+        let mut string = vec![0xa1, text.len() as u8];
+        string.extend_from_slice(text);
+        let value = AmqpNative::arc(AmqpMessage::new(0, section(0x77, &string), 0).unwrap());
+        assert_eq!(
+            value.string_body().as_deref(),
+            Some("<root><order/></root>")
+        );
+        let mut binary = vec![0xa0, text.len() as u8];
+        binary.extend_from_slice(text);
+        let data = AmqpNative::arc(AmqpMessage::new(0, section(0x75, &binary), 0).unwrap());
+        assert_eq!(data.string_body(), None);
     }
 }

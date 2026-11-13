@@ -342,9 +342,12 @@ impl Expr {
                 Some(Val::Bool(b)) => Some(Val::Bool(b)),
                 Some(_) => Some(Val::Bool(false)),
             }),
-            // XPath evaluation against the message body is not implemented;
-            // XQuery is always false in Artemis too.
-            Expr::XPath(_) | Expr::XQuery(_) => Ok(Some(Val::Bool(false))),
+            Expr::XPath(x) => Ok(Some(Val::Bool(crate::xpath::matches(
+                x,
+                ctx.target.string_body().as_deref(),
+            )))),
+            // `XQueryExpression` is always false in Artemis.
+            Expr::XQuery(_) => Ok(Some(Val::Bool(false))),
         }
     }
 }

@@ -21,6 +21,19 @@ impl Filterable for CoreMessage {
         self.try_get(identifier).ok().flatten()
     }
 
+    /// `CoreMessage.getStringBody`: a TEXT message's body, a nullable
+    /// `SimpleString`.
+    fn string_body(&self) -> Option<String> {
+        if self.message_type != saranga_message::message_type::TEXT {
+            return None;
+        }
+        saranga_buffer::Reader::new(&self.body)
+            .nullable_simple_string()
+            .ok()
+            .flatten()
+            .map(|s| s.to_string_lossy())
+    }
+
     /// Header identifiers (`AMQUserID`, `AMQPriority`, `AMQTimestamp`,
     /// `AMQDurable`, `AMQExpiration`, `AMQSize`, `AMQAddress`, `AMQGroupID`)
     /// read the message headers. Anything else, including a header that is
