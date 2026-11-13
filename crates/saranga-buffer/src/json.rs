@@ -444,9 +444,17 @@ impl Parser<'_> {
                         b't' => '\t',
                         b'u' => {
                             let mut code = self.hex4()?;
+                            // A high surrogate joins a low one that follows;
+                            // anything else after it is read on its own, and
+                            // the lone surrogate becomes U+FFFD.
+                            let at = self.i;
                             if (0xd800..0xdc00).contains(&code) && self.eat("\\u") {
                                 let low = self.hex4()?;
-                                code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+                                if (0xdc00..0xe000).contains(&low) {
+                                    code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+                                } else {
+                                    self.i = at;
+                                }
                             }
                             char::from_u32(code).unwrap_or('\u{fffd}')
                         }
@@ -491,6 +499,24 @@ mod tests {
         // Siblings do not add up.
         let wide = format!("[{}]", vec![nested(MAX_DEPTH - 1); 100].join(","));
         assert!(Json::parse(&wide).is_ok());
+    }
+
+    /// A high surrogate joins only a low surrogate: followed by any other
+    /// escape it is U+FFFD and the escape is read on its own.
+    #[test]
+    fn a_lone_high_surrogate_is_replaced() {
+        let s = |text: &str| match Json::parse(text).unwrap() {
+            Json::Array(v) => match &v[0] {
+                Json::String(s) => s.clone(),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(s(r#"["\uD83D\uDE00"]"#), "\u{1F600}");
+        assert_eq!(s(r#"["\uD800\u0000"]"#), "\u{fffd}\u{0}");
+        assert_eq!(s(r#"["\uD800\u0041b"]"#), "\u{fffd}Ab");
+        assert_eq!(s(r#"["\uD800\uD83D\uDE00"]"#), "\u{fffd}\u{1F600}");
+        assert_eq!(s(r#"["\uD800x"]"#), "\u{fffd}x");
     }
 
     #[test]
