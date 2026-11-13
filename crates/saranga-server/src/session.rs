@@ -1533,16 +1533,19 @@ impl ServerSession {
             } else {
                 po.duplicate_cache(name)
             };
+            // The transaction is locked before the cache, as its commit and
+            // prepare take them, holding its IDs.
+            let mut t = tx.as_ref().map(transaction::lock);
             let mut c = crate::duplicate::lock(&cache);
             // An ID this transaction already sent counts too, though it
             // joins the cache only when the transaction commits.
-            let in_tx = tx.as_ref().is_some_and(|tx| {
-                transaction::lock(tx)
-                    .duplicates
+            let in_tx = t.as_ref().is_some_and(|t| {
+                t.duplicates
                     .iter()
                     .any(|d| Arc::ptr_eq(&d.cache, &cache) && d.id == id)
             });
             if in_tx || c.contains(&id) {
+                drop(c);
                 if bridge {
                     tracing::trace!("Message {} hit a bridge duplicate", r.message.message_id());
                 } else {
@@ -1551,8 +1554,8 @@ impl ServerSession {
                         r.message.message_id()
                     );
                 }
-                if !bridge && let Some(tx) = &tx {
-                    transaction::lock(tx).mark_rollback_only(&BrokerError::new(
+                if !bridge && let Some(t) = t.as_mut() {
+                    t.mark_rollback_only(&BrokerError::new(
                         ErrorType::DuplicateIdRejected,
                         format!(
                             "Duplicate message detected - message will not be routed. Message information:{}",
@@ -1561,7 +1564,6 @@ impl ServerSession {
                     ));
                 }
                 if let Some(plugins) = &plugins {
-                    let t = tx.as_ref().map(transaction::lock);
                     plugins.each(|p| {
                         p.after_send(
                             &entry,
@@ -1574,7 +1576,7 @@ impl ServerSession {
                 return Ok(());
             }
             let record = po.ids().next();
-            match &tx {
+            match t {
                 None => {
                     let jtx = po.ids().next();
                     c.store_tx(jtx, &id, record).map_err(io_error)?;
@@ -1582,8 +1584,7 @@ impl ServerSession {
                     c.reserve(&id);
                     reserved = Some((cache.clone(), id, record));
                 }
-                Some(tx) => {
-                    let mut t = transaction::lock(tx);
+                Some(mut t) => {
                     c.store_tx(t.id, &id, record).map_err(io_error)?;
                     t.persistent |= c.is_persistent();
                     t.duplicates.push(crate::duplicate::PendingId {
@@ -1598,11 +1599,41 @@ impl ServerSession {
             .broker
             .post_office()
             .route(&r, &address, routing_type, self.creator());
-        let routed = match routed.and_then(|routed| self.page_routed(routed, tx.as_ref())) {
+        // A send with a journal transaction of its own (for its duplicate
+        // ID) pages in it too, as Artemis pages in the transaction it
+        // starts for the ID: if the send fails, no page record of it
+        // survives to be recovered, and sent again, as a second copy.
+        let own_paging = own_tx.map(|(jtx, _)| Transaction::new_ref(jtx, None));
+        let routed =
+            routed.and_then(|routed| self.page_routed(routed, tx.as_ref().or(own_paging.as_ref())));
+        let mut paged_in_own = None;
+        let routed = match routed.and_then(|routed| {
+            if let Some(p) = &own_paging {
+                let mut p = transaction::lock(p);
+                lock_replicated(&self.replicated).extend(std::mem::take(&mut p.replicated));
+                let mut paging = std::mem::take(&mut p.paging);
+                if !paging.page_txs.is_empty() {
+                    if let (Some(s), Some((jtx, persistent))) = (&storage, &mut own_tx) {
+                        // The page transaction is journaled in the send's
+                        // transaction, which now has something to commit.
+                        let written = paging.before_commit(s, *jtx).map_err(io_error);
+                        *persistent = true;
+                        paged_in_own = Some(paging);
+                        written?;
+                    } else {
+                        paging.after_commit();
+                    }
+                }
+            }
+            Ok(routed)
+        }) {
             Ok(routed) => routed,
             Err(e) => {
                 if let Some(tx) = &tx {
                     transaction::lock(tx).mark_rollback_only(&e);
+                }
+                if let Some(paging) = paged_in_own {
+                    paging.after_rollback();
                 }
                 undo_reserved(own_tx, reserved, storage.as_deref());
                 if let Some(plugins) = &plugins {
@@ -1619,9 +1650,18 @@ impl ServerSession {
             // The message may be in the send's journal transaction, though
             // the ID was not.
             let own_tx = own_tx.map(|(jtx, _)| (jtx, true));
+            if let Some(paging) = paged_in_own {
+                paging.after_rollback();
+            }
             undo_reserved(own_tx, reserved, storage.as_deref());
-        } else if let Some((cache, id, record)) = reserved {
-            crate::duplicate::lock(&cache).confirm(id, record);
+        } else {
+            if let Some((cache, id, record)) = reserved {
+                crate::duplicate::lock(&cache).confirm(id, record);
+            }
+            // The paged message is there once the commit is written.
+            if let Some(paging) = paged_in_own {
+                self.actions.push(Box::new(move || paging.after_commit()));
+            }
         }
         let (Some(plugins), Some(status)) = (plugins, status) else {
             return sent;

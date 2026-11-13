@@ -245,6 +245,16 @@ impl PendingId {
         lock(&self.cache).add_in_memory(self.id, self.record);
     }
 
+    /// Holds the ID, already checked, as a duplicate: a prepared branch's
+    /// after recovery, as it held it once prepared.
+    pub fn reserve(&self) -> Reservation {
+        lock(&self.cache).reserve(&self.id);
+        Reservation {
+            cache: self.cache.clone(),
+            id: self.id.clone(),
+        }
+    }
+
     /// Takes a committing transaction's IDs, each as a duplicate from now
     /// on, unless one is already held (by a send, or by another
     /// transaction that committed or is committing it): that ID is

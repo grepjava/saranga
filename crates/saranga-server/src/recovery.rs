@@ -427,12 +427,16 @@ pub async fn load_messages(
                 None => tracing::warn!("AMQ222036: Unable to remove reference {message_id}"),
             }
         }
+        // Its duplicate IDs are held until it ends, as they were from its
+        // prepare: another send of one is a duplicate meanwhile.
         for d in p.duplicates {
-            tx.duplicates.push(crate::duplicate::PendingId {
+            let pending = crate::duplicate::PendingId {
                 cache: post_office.duplicate_cache(&d.address),
                 id: d.id,
                 record: d.record,
-            });
+            };
+            tx.held.push(pending.reserve());
+            tx.duplicates.push(pending);
         }
         // Paged messages the transaction sent wait for it; those it
         // acknowledged are not delivered meanwhile.

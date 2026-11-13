@@ -277,6 +277,155 @@ async fn overlapping_transactions_deliver_an_id_once() {
     }
 }
 
+/// A send with a duplicate ID in a transaction another thread is
+/// committing waits for the commit, without holding the cache the commit
+/// needs: the two take the transaction, then the cache.
+#[tokio::test]
+async fn a_send_and_a_commit_of_one_transaction_do_not_deadlock() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(dir.path(), false).await;
+    create_full_queue(&broker).await;
+    let mut s = session(&broker);
+    let tx = s.new_transaction();
+    let message = |id: &str| {
+        let mut m = CoreMessage {
+            address: Some(SimpleString::from("full")),
+            ..Default::default()
+        };
+        m.properties.insert(
+            SimpleString::from("_AMQ_DUPL_ID"),
+            PropertyValue::String(SimpleString::from(id)),
+        );
+        m
+    };
+    s.send_in(message("first"), None, Some(tx.clone()))
+        .await
+        .unwrap();
+    let cache = broker.post_office().duplicate_cache("full");
+    let (locked, is_locked) = mpsc::channel();
+    let (go, gate) = mpsc::channel();
+    let (done, finished) = mpsc::channel();
+    let committing = tx.clone();
+    std::thread::spawn(move || {
+        let mut t = saranga_server::transaction::lock(&committing);
+        locked.send(()).unwrap();
+        gate.recv().unwrap();
+        let _ = t.commit(true);
+        let _ = done.send(());
+    });
+    is_locked.recv_timeout(Duration::from_secs(5)).unwrap();
+    let sender_broker = broker.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let mut s = session(&sender_broker);
+            let _ = s.send_in(message("second"), None, Some(tx)).await;
+        });
+    });
+    // Give the send time to reach its locks: with the order reversed it
+    // takes the cache, then waits for the transaction.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline && cache.try_lock().is_ok() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    go.send(()).unwrap();
+    assert!(
+        finished.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "the commit waits for the cache the send holds while it waits for the transaction"
+    );
+}
+
+/// A paged send with a duplicate ID whose journal write fails leaves no
+/// page record behind: after a restart nothing of it is recovered, and
+/// sending it again delivers it once.
+#[tokio::test]
+async fn a_failed_paged_send_with_a_duplicate_id_leaves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = cfg::BrokerConfig::parse(
+        r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+             <persistence-enabled>true</persistence-enabled>
+             <address-settings><address-setting match="full">
+               <max-size-bytes>1</max-size-bytes>
+               <page-size-bytes>10240</page-size-bytes>
+               <address-full-policy>PAGE</address-full-policy>
+             </address-setting></address-settings>
+           </core></configuration>"#,
+    )
+    .unwrap();
+    let start_paging = || {
+        let config =
+            BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path()).unwrap();
+        Broker::start(config)
+    };
+    let broker = start_paging().await.unwrap();
+    create_full_queue(&broker).await;
+    let mut s = session(&broker);
+    send(&mut s, None).await.unwrap();
+    assert!(broker.post_office().paging_store("full").is_paging());
+    let fault =
+        saranga_fault::Fault::new(saranga_fault::Op::Write, dir.path().join("data/journal")).arm();
+    assert!(send(&mut s, Some("p1")).await.is_err());
+    drop(fault);
+    s.close(false).await;
+    let _ = broker.stop();
+    drop(s);
+    drop(broker);
+    let broker = start_paging().await.unwrap();
+    assert_eq!(
+        count(&broker).await,
+        Json::Long(1),
+        "the failed send was recovered"
+    );
+    let mut retry = session(&broker);
+    send(&mut retry, Some("p1")).await.unwrap();
+    assert_eq!(count(&broker).await, Json::Long(2));
+    retry.close(false).await;
+    broker.stop().unwrap();
+}
+
+/// A prepared branch recovered after a restart still holds its duplicate
+/// IDs: another send of one is a duplicate, and committing the branch
+/// delivers the message once.
+#[tokio::test]
+async fn a_recovered_prepared_branch_holds_its_duplicate_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(dir.path(), true).await;
+    create_full_queue(&broker).await;
+    let xid = saranga_server::transaction::Xid {
+        format_id: 7,
+        branch_qualifier: b"b".to_vec(),
+        global_transaction_id: b"g".to_vec(),
+    };
+    let mut s = session_with(&broker, false);
+    s.xa_start(xid.clone()).unwrap();
+    send(&mut s, Some("x1")).await.unwrap();
+    s.xa_end(xid.clone()).unwrap();
+    s.xa_prepare(xid.clone()).unwrap();
+    s.take_completion().wait().await.unwrap();
+    s.close(false).await;
+    broker.stop().unwrap();
+    drop(s);
+    drop(broker);
+    let broker = start(dir.path(), true).await;
+    let mut retry = session(&broker);
+    send(&mut retry, Some("x1")).await.unwrap();
+    assert_eq!(
+        count(&broker).await,
+        Json::Long(0),
+        "the retry was delivered"
+    );
+    retry.xa_commit(xid, false).unwrap();
+    retry.take_completion().wait().await.unwrap();
+    assert_eq!(count(&broker).await, Json::Long(1));
+    retry.close(false).await;
+    broker.stop().unwrap();
+}
+
 /// A send of an ID a commit took, before that commit's record is written,
 /// is already a duplicate.
 #[tokio::test]
