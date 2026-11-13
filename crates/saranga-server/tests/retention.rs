@@ -286,3 +286,83 @@ async fn replay_refuses_a_large_message_missing_part_of_its_body() {
         broker.stop().unwrap();
     }
 }
+
+/// A copy of a large message (here `copyMessage`; diverts, dead-lettering
+/// and expiry copy the same way) is recorded under its own ID, body and all,
+/// so replaying the copy's address replays it whole.
+#[tokio::test]
+async fn a_copied_large_message_can_be_replayed() {
+    use saranga_buffer::{PropertyValue, SimpleString};
+    use saranga_message::CoreMessage;
+    use saranga_server::session::{ClientConnection, ServerSession, SessionOptions, Transport};
+
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(dir.path(), true).await;
+    queue(&broker, "orders").await;
+    queue(&broker, "copies").await;
+    queue(&broker, "replayed").await;
+    let body_bytes = vec![b'x'; 50_000];
+    let id = broker.post_office().ids().next();
+    let mut w = broker.large_messages().create(id, true).unwrap();
+    w.append(&body_bytes).unwrap();
+    let body = w.finish().unwrap();
+    let mut message = CoreMessage {
+        message_id: id,
+        address: Some(SimpleString::from("orders")),
+        durable: true,
+        ..Default::default()
+    };
+    message.properties.insert(
+        SimpleString::from("_AMQ_LARGE_SIZE"),
+        PropertyValue::Long(body_bytes.len() as i64),
+    );
+    let conn = Arc::new(ClientConnection::new(
+        Transport::internal("test"),
+        Arc::new(Default::default()),
+        Vec::new(),
+    ));
+    let mut session = ServerSession::new(
+        broker.clone(),
+        conn,
+        SessionOptions {
+            name: "s".into(),
+            username: None,
+            password: None,
+            xa: false,
+            auto_commit_sends: true,
+            auto_commit_acks: true,
+            pre_acknowledge: false,
+            default_address: None,
+        },
+        Default::default(),
+    );
+    session.send(message, Some(body)).await.unwrap();
+    session.take_completion().wait().await.unwrap();
+
+    let copied = op(
+        &broker,
+        "queue.orders",
+        "copyMessage",
+        vec![Json::Long(id), s("copies")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(copied, Json::Bool(true));
+    assert_eq!(count(&broker, "copies").await, Json::Long(1));
+
+    op(
+        &broker,
+        "broker",
+        "replay",
+        vec![s("copies"), s("replayed"), Json::Null],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        count(&broker, "replayed").await,
+        Json::Long(1),
+        "the copy's body must be in the retained journal under its own ID"
+    );
+    session.close(false).await;
+    broker.stop().unwrap();
+}

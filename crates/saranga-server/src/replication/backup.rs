@@ -692,8 +692,7 @@ impl Endpoint {
                 if m.is_delete {
                     self.pages.delete(&store, m.page_number)
                 } else {
-                    self.pages.close(&store, m.page_number);
-                    Ok(())
+                    self.pages.close(&store, m.page_number)
                 }
             }
             Packet::ReplicationLargeMessageBeginMessage(m) => self.large.begin(m.message_id),
@@ -704,8 +703,7 @@ impl Endpoint {
                 if m.is_delete == Some(true) {
                     self.large.delete(m.message_id)
                 } else {
-                    self.large.close(m.message_id);
-                    Ok(())
+                    self.large.close(m.message_id)
                 }
             }
             Packet::ReplicationPrimaryIsStoppingMessage(_) => Ok(()),
@@ -865,18 +863,12 @@ impl Endpoint {
                 let store = store.to_string_lossy();
                 match data {
                     Some(d) => self.pages.write_raw(&store, m.file_id, d),
-                    None => {
-                        self.pages.close(&store, m.file_id);
-                        Ok(())
-                    }
+                    None => self.pages.close(&store, m.file_id),
                 }
             }
             SyncFileType::LargeMessage => match data {
                 Some(d) => self.large.write_synced(m.file_id, d),
-                None => {
-                    self.large.close(m.file_id);
-                    Ok(())
-                }
+                None => self.large.close(m.file_id),
             },
         }
     }
@@ -1097,10 +1089,18 @@ impl Pages {
         self.file(address, page)?.write_all(data)
     }
 
-    fn close(&mut self, address: &str, page: i64) {
-        if let Some(f) = self.open.remove(&(address.to_owned(), page)) {
-            let _ = f.sync_all();
-        }
+    /// A page file done with, synced: an error fails the replication, as
+    /// the primary must not count on a page the backup did not keep.
+    fn close(&mut self, address: &str, page: i64) -> io::Result<()> {
+        let Some(f) = self.open.remove(&(address.to_owned(), page)) else {
+            return Ok(());
+        };
+        let path = self
+            .folders
+            .get(address)
+            .map(|d| d.join(saranga_paging::page_file_name(page)))
+            .unwrap_or_default();
+        saranga_fault::check(saranga_fault::Op::Sync, &path).and_then(|()| f.sync_all())
     }
 
     fn delete(&mut self, address: &str, page: i64) -> io::Result<()> {
@@ -1192,13 +1192,17 @@ impl Large {
         self.file(id)?.write_all(data)
     }
 
-    fn close(&mut self, id: i64) {
+    /// A body done with, synced: an error fails the replication
+    /// (`ReplicationEndpoint` answers the primary with the exception), so
+    /// the primary does not count on a body the backup did not keep.
+    fn close(&mut self, id: i64) -> io::Result<()> {
         if self.syncing.contains(&id) {
-            return;
+            return Ok(());
         }
-        if let Some(f) = self.open.remove(&id) {
-            let _ = f.sync_all();
-        }
+        let Some(f) = self.open.remove(&id) else {
+            return Ok(());
+        };
+        saranga_fault::check(saranga_fault::Op::Sync, &self.path(id)).and_then(|()| f.sync_all())
     }
 
     fn delete(&mut self, id: i64) -> io::Result<()> {
@@ -1446,6 +1450,41 @@ mod tests {
         assert!(!e.up_to_date, "a copy missing records must not activate");
         assert!(e.failed.is_some(), "replication ends");
         assert!(e.close(&cfg).is_err());
+    }
+
+    /// A large body the backup cannot sync when it ends is answered with
+    /// an exception, not a success the primary would count on.
+    #[test]
+    fn a_body_the_backup_cannot_sync_is_not_acknowledged() {
+        use saranga_core_protocol::packets::replication::{
+            ReplicationLargeMessageBeginMessage, ReplicationLargeMessageEndMessage,
+            ReplicationLargeMessageWriteMessage,
+        };
+        let d = tempfile::tempdir().unwrap();
+        let cfg = backup_config(d.path());
+        let mut e = synced(&cfg);
+        e.handle(ReplicationLargeMessageBeginMessage { message_id: 77 }.into());
+        e.handle(
+            ReplicationLargeMessageWriteMessage {
+                message_id: 77,
+                body: vec![1; 1000],
+            }
+            .into(),
+        );
+        let fault = saranga_fault::Fault::new(saranga_fault::Op::Sync, &cfg.large_messages).arm();
+        let ended = e.handle(
+            ReplicationLargeMessageEndMessage {
+                message_id: 77,
+                pending_record_id: Some(1),
+                is_delete: Some(false),
+            }
+            .into(),
+        );
+        assert!(fault.hits() >= 1, "the body's sync was not reached");
+        assert!(
+            is_exception(ended),
+            "a body not synced must not be acknowledged"
+        );
     }
 
     #[test]

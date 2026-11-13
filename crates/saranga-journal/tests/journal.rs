@@ -434,3 +434,73 @@ fn retention_storage_limit_removes_the_oldest_copies() {
     j.stop().unwrap();
     assert_eq!(std::fs::read_dir(&history).unwrap().count(), 2);
 }
+
+/// The copies a file ID: the number after the last dash.
+fn copy_ids(history: &std::path::Path) -> Vec<i64> {
+    let mut ids: Vec<i64> = std::fs::read_dir(history)
+        .unwrap()
+        .map(|e| {
+            let n = e.unwrap().file_name().into_string().unwrap();
+            let stem = n.split_once('.').unwrap().0.to_owned();
+            stem.rsplit_once('-').unwrap().1.parse().unwrap()
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// The storage limit keeps the newest copies, by file ID: copies made in the
+/// same second keep their order though their IDs differ in length.
+#[test]
+fn retention_storage_limit_keeps_the_newest_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let history = dir.path().join("history");
+    let cfg = JournalConfig {
+        retention: Some(saranga_journal::Retention {
+            directory: history.clone(),
+            max_bytes: 2 * 64 * 1024,
+            period_millis: -1,
+            local_offset: |_| 0,
+        }),
+        ..config(&dir.path().join("journal"))
+    };
+    let j = open(&cfg);
+    // About twenty files: IDs past 9, copied within a second or two.
+    for id in 1..=120 {
+        j.append_add(id, 45, vec![7u8; 10 * 1024], false, None)
+            .unwrap();
+        j.append_delete(id, false, None).unwrap();
+    }
+    j.stop().unwrap();
+    let ids = copy_ids(&history);
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(
+        ids[0] >= 10,
+        "the oldest copies must go first: kept {ids:?}"
+    );
+}
+
+/// A storage limit smaller than one journal file keeps no copy, rather than
+/// counting as no limit.
+#[test]
+fn retention_storage_limit_below_one_file_keeps_no_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let history = dir.path().join("history");
+    let cfg = JournalConfig {
+        retention: Some(saranga_journal::Retention {
+            directory: history.clone(),
+            max_bytes: 32 * 1024,
+            period_millis: -1,
+            local_offset: |_| 0,
+        }),
+        ..config(&dir.path().join("journal"))
+    };
+    let j = open(&cfg);
+    for id in 1..=60 {
+        j.append_add(id, 45, vec![7u8; 10 * 1024], false, None)
+            .unwrap();
+        j.append_delete(id, false, None).unwrap();
+    }
+    j.stop().unwrap();
+    assert_eq!(copy_ids(&history), Vec::<i64>::new());
+}

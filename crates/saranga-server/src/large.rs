@@ -506,8 +506,11 @@ impl LargeBody {
         }
     }
 
-    /// `LargeBody.copyInto`: the body of a copy with its own ID.
+    /// `LargeBody.copyInto`: the body of a copy with its own ID. As
+    /// Artemis writes the copy through `addBytes`, its bytes are recorded
+    /// under the new ID for journal retention, so the copy can be replayed.
     pub fn copy(&self, new_id: i64, durable: bool) -> io::Result<Arc<LargeBody>> {
+        let history = self.store.history.get();
         let backing = match (&self.backing, self.store.path(new_id, durable)) {
             (Backing::File(from), Some(to)) => {
                 let replication = self.store.replication();
@@ -516,11 +519,18 @@ impl LargeBody {
                     // Syncing needs write access on Windows.
                     OpenOptions::new().write(true).open(&to)?.sync_all()?;
                 }
-                if durable && let Some(r) = replication.replicator() {
-                    r.send(
-                        ReplicationLargeMessageBeginMessage { message_id: new_id },
-                        None,
-                    );
+                let replicator = if durable {
+                    replication.replicator()
+                } else {
+                    None
+                };
+                if history.is_some() || replicator.is_some() {
+                    if let Some(r) = &replicator {
+                        r.send(
+                            ReplicationLargeMessageBeginMessage { message_id: new_id },
+                            None,
+                        );
+                    }
                     let mut f = File::open(&to)?;
                     let mut chunk = vec![0; CHUNK_SIZE];
                     loop {
@@ -528,20 +538,38 @@ impl LargeBody {
                         if n == 0 {
                             break;
                         }
-                        r.send(
-                            ReplicationLargeMessageWriteMessage {
-                                message_id: new_id,
-                                body: chunk[..n].to_vec(),
-                            },
-                            None,
-                        );
+                        if let Some(History(storage)) = history {
+                            storage.large_body_history(new_id, &chunk[..n]);
+                        }
+                        if let Some(r) = &replicator {
+                            r.send(
+                                ReplicationLargeMessageWriteMessage {
+                                    message_id: new_id,
+                                    body: chunk[..n].to_vec(),
+                                },
+                                None,
+                            );
+                        }
                     }
-                    r.send(end(new_id, false), None);
+                    if let Some(r) = &replicator {
+                        r.send(end(new_id, false), None);
+                    }
                 }
                 Backing::File(to)
             }
-            (Backing::Memory(m), _) => Backing::Memory(m.clone()),
-            (Backing::File(from), None) => Backing::Memory(Arc::from(fs::read(from)?)),
+            (Backing::Memory(m), _) => {
+                if let Some(History(storage)) = history {
+                    storage.large_body_history(new_id, m);
+                }
+                Backing::Memory(m.clone())
+            }
+            (Backing::File(from), None) => {
+                let bytes = fs::read(from)?;
+                if let Some(History(storage)) = history {
+                    storage.large_body_history(new_id, &bytes);
+                }
+                Backing::Memory(Arc::from(bytes))
+            }
         };
         Ok(Arc::new(LargeBody {
             store: self.store.clone(),

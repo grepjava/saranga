@@ -106,19 +106,22 @@ impl Inner {
 
     /// `processBackupCleanup`: copies older than the period go, then the
     /// oldest beyond the storage limit's count of files.
+    ///
+    /// A storage limit is a limit however small: below one journal file it
+    /// keeps no copy. Artemis divides it into a whole number of files and
+    /// takes zero as no limit, so a limit smaller than a file lets the
+    /// copies grow without bound.
     fn history_cleanup(&mut self) {
         let Some(retention) = self.cfg.retention.clone() else {
             return;
         };
-        let max_files = if retention.max_bytes > 0 {
-            retention.max_bytes / self.cfg.file_size as i64
-        } else {
-            0
-        };
-        if max_files <= 0 && retention.period_millis <= 0 {
+        let max_files = (retention.max_bytes > 0)
+            .then(|| (retention.max_bytes / (self.cfg.file_size as i64).max(1)) as usize);
+        if max_files.is_none() && retention.period_millis <= 0 {
             return;
         }
         let suffix = format!(".{}", self.cfg.file_extension);
+        let prefix = self.cfg.file_prefix.clone();
         let list = || -> Vec<String> {
             let mut names: Vec<String> = std::fs::read_dir(&retention.directory)
                 .map(|d| {
@@ -127,7 +130,11 @@ impl Inner {
                         .collect()
                 })
                 .unwrap_or_default();
-            names.sort();
+            // Oldest first: by the copy's date, then its file ID as a
+            // number, so that file 10 copied in the same second as file 9
+            // comes after it. Artemis sorts the names as text, putting 10
+            // before 8 and 9.
+            names.sort_by_cached_key(|n| history_order(&prefix, n));
             names
         };
         if retention.period_millis > 0 {
@@ -142,9 +149,9 @@ impl Inner {
                 }
             }
         }
-        if max_files > 0 {
+        if let Some(max_files) = max_files {
             let names = list();
-            let excess = names.len().saturating_sub(max_files as usize);
+            let excess = names.len().saturating_sub(max_files);
             for name in names.iter().take(excess) {
                 tracing::debug!("Removing {name}");
                 let _ = std::fs::remove_file(retention.directory.join(name));
@@ -159,6 +166,13 @@ impl Inner {
         let Some(retention) = self.cfg.retention.clone() else {
             return Ok(());
         };
+        if retention.max_bytes > 0 && retention.max_bytes < self.cfg.file_size as i64 {
+            tracing::warn!(
+                "The journal retention storage-limit ({} bytes) is less than one journal file ({} bytes): no retention copy is kept",
+                retention.max_bytes,
+                self.cfg.file_size
+            );
+        }
         std::fs::create_dir_all(&retention.directory).map_err(JournalError::io)?;
         let pending = self.list_files(&format!("{}{BKP}", self.cfg.file_extension))?;
         for name in pending {
@@ -190,6 +204,22 @@ impl Inner {
         }
         self.history_cleanup();
         Ok(())
+    }
+}
+
+/// Where a retention copy (`<prefix>-<yyyyMMddHHmmss>-<id>.<ext>`) comes
+/// in time: its date, then its file ID as a number. A name that is not a
+/// copy's sorts by itself, after the copies.
+fn history_order(prefix: &str, name: &str) -> (u8, String, i64, String) {
+    let parsed = name
+        .strip_prefix(prefix)
+        .and_then(|r| r.strip_prefix('-'))
+        .and_then(|r| r.split_once('.').map(|(stem, _)| stem))
+        .and_then(|stem| stem.split_once('-'))
+        .and_then(|(date, id)| Some((date.to_owned(), id.parse::<i64>().ok()?)));
+    match parsed {
+        Some((date, id)) => (0, date, id, String::new()),
+        None => (1, String::new(), 0, name.to_owned()),
     }
 }
 
@@ -282,7 +312,31 @@ impl Civil {
 
 #[cfg(test)]
 mod tests {
-    use super::{Civil, is_history_of};
+    use super::{Civil, history_order, is_history_of};
+
+    /// Copies sort oldest first: by date, then by file ID as a number, so
+    /// file 10 copied in the same second as 8 and 9 comes after them.
+    #[test]
+    fn history_copies_sort_by_date_then_numeric_id() {
+        let mut names: Vec<String> = [
+            "activemq-data-20260101000001-1.amq",
+            "activemq-data-20260101000000-10.amq",
+            "activemq-data-20260101000000-9.amq",
+            "activemq-data-20260101000000-8.amq",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        names.sort_by_cached_key(|n| history_order("activemq-data", n));
+        assert_eq!(
+            names,
+            [
+                "activemq-data-20260101000000-8.amq",
+                "activemq-data-20260101000000-9.amq",
+                "activemq-data-20260101000000-10.amq",
+                "activemq-data-20260101000001-1.amq",
+            ]
+        );
+    }
 
     /// Recovering a partially copied backup of file `id` must delete only
     /// that file's history copy, not the copy of a file whose ID merely ends
