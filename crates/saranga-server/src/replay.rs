@@ -253,7 +253,18 @@ impl Replay<'_> {
             let Some(body) = self.body(original, id, true, None) else {
                 return;
             };
-            decoders.decode_large(&record, body)
+            // Its record keeps no size, but it says how the file begins: a
+            // file whose first part was removed with an older journal file
+            // does not begin so.
+            match decoders.decode_large(&record, body.clone()) {
+                Ok(m) if m.native().is_some_and(|n| !n.holds_large_body(&body)) => {
+                    tracing::warn!(
+                        "replay: large message {original} is not replayed: the retained journal no longer holds the start of its body"
+                    );
+                    return;
+                }
+                decoded => decoded,
+            }
         } else {
             decoders.decode(&record)
         };

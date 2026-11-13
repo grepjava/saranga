@@ -258,6 +258,65 @@ impl AmqpMessage {
         self.large
     }
 
+    /// How much of a large message's file (of `size` bytes)
+    /// [`Self::file_starts_as_recorded`] reads: its sections up to the
+    /// body, and enough of the body's first section to know it.
+    pub fn large_file_prefix(&self, size: u64) -> usize {
+        let wanted = match self.remaining_body_position.get() {
+            Some(body) => body as u64 + 64,
+            None => size,
+        };
+        wanted.min(size) as usize
+    }
+
+    /// Whether a large message's file, `prefix` being its first
+    /// [`Self::large_file_prefix`] bytes, begins as the message's record
+    /// says it does: the sections before the body at the positions the
+    /// record holds, and a body section where the body begins. A file whose
+    /// first part is missing (a replay whose oldest retained journal file
+    /// was removed) begins in the middle of the body instead.
+    pub fn file_starts_as_recorded(&self, prefix: &[u8], size: u64) -> bool {
+        let body = self.remaining_body_position.get();
+        let end = body.unwrap_or(prefix.len());
+        if size == 0 || prefix.len() < end {
+            return false;
+        }
+        let mut expected: Vec<usize> = [
+            self.header_position,
+            self.delivery_annotations_position,
+            self.message_annotations_position,
+            self.properties_position,
+            self.application_properties_position,
+        ]
+        .iter()
+        .filter_map(|p| p.get())
+        .collect();
+        expected.sort_unstable();
+        let mut d = Decoder::new(&prefix[..end]);
+        let mut found = Vec::with_capacity(expected.len());
+        while d.has_remaining() {
+            found.push(d.position());
+            if !matches!(d.read_described_head(), Ok(Some(_))) || d.skip().is_err() {
+                return false;
+            }
+        }
+        if found != expected {
+            return false;
+        }
+        let Some(body) = body else {
+            return true;
+        };
+        let mut d = Decoder::new(&prefix[body..]);
+        matches!(
+            d.read_described_head()
+                .ok()
+                .flatten()
+                .as_ref()
+                .and_then(section_code),
+            Some(section::DATA | section::AMQP_SEQUENCE | section::AMQP_VALUE | section::FOOTER)
+        )
+    }
+
     /// `AMQPLargeMessage.toCore`'s first step: a standard message of the
     /// file's encoding with this message's annotations, ID, expiration and
     /// priority (which `setPriority` puts in its header).

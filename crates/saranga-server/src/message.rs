@@ -254,6 +254,16 @@ pub trait NativeMessage: Send + Sync + fmt::Debug {
     /// whole encoding already returns a copy of itself.
     fn reconstitute(&self, body: Vec<u8>) -> Arc<dyn NativeMessage>;
 
+    /// Whether `body`, a large message's file put together again (by a
+    /// replay, from the retained journal), is this message's whole
+    /// encoding rather than what is left of it once its first part was
+    /// removed. A protocol whose record keeps nothing to check it by says
+    /// yes.
+    fn holds_large_body(&self, body: &crate::large::LargeBody) -> bool {
+        let _ = body;
+        true
+    }
+
     fn as_any(&self) -> &dyn Any;
 }
 

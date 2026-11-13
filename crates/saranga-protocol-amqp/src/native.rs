@@ -432,6 +432,16 @@ impl NativeMessage for AmqpNative {
         AmqpNative::arc(m)
     }
 
+    fn holds_large_body(&self, body: &saranga_server::large::LargeBody) -> bool {
+        let size = body.size();
+        let wanted = self.message.large_file_prefix(size);
+        let prefix = body
+            .reader()
+            .and_then(|mut r| r.read_chunk(wanted))
+            .unwrap_or_default();
+        prefix.len() == wanted && self.message.file_starts_as_recorded(&prefix, size)
+    }
+
     fn reconstitute(&self, body: Vec<u8>) -> Arc<dyn NativeMessage> {
         // `AMQPLargeMessage.toMessage`: the headers kept in memory and the
         // body read from the file, rebuilt into the whole encoding the
