@@ -1263,13 +1263,17 @@ struct Consumer {
     large: Option<LargeTransfer>,
     /// Forced-delivery markers waiting for the large message.
     forced: Vec<CoreMessage>,
+    /// `errorProcessing`: a large message's body could not be read for it,
+    /// so it takes nothing more and its client is told to close it, which
+    /// returns what it holds to the queue.
+    failed: bool,
 }
 
 /// A large message part-way to a consumer (`CoreLargeMessageDeliverer`).
 /// It holds the body, so the file stays until the transfer ends.
 struct LargeTransfer {
     body: Arc<LargeBody>,
-    reader: Option<LargeReader>,
+    reader: LargeReader,
     position: u64,
 }
 
@@ -1282,12 +1286,30 @@ impl Consumer {
             browsed: HashSet::new(),
             large: None,
             forced: Vec::new(),
+            failed: false,
             reg,
         }
     }
 
     fn has_credits(&self) -> bool {
-        self.credits.is_none_or(|c| c > 0)
+        !self.failed && self.credits.is_none_or(|c| c > 0)
+    }
+
+    /// `QueueImpl.errorProcessing` and `ServerConsumerImpl.failed`: the
+    /// message stays with this consumer, undelivered, until the client
+    /// closes it (`callback.disconnect`) and it goes back to the queue.
+    fn fail(&mut self, message_id: i64, e: &dyn std::fmt::Display) {
+        tracing::warn!("AMQ222110: Error on resetting large message deliver - {message_id}: {e}");
+        tracing::warn!(
+            "AMQ222061: removing consumer {} which did not handle a message {message_id}: {e}",
+            self.reg.client_id
+        );
+        self.failed = true;
+        self.large = None;
+        self.forced.clear();
+        self.reg
+            .sink
+            .disconnect(self.reg.client_id, &format!("message {message_id}: {e}"));
     }
 
     fn take_credits(&mut self, size: i64) {
@@ -1296,17 +1318,22 @@ impl Consumer {
         }
     }
 
-    /// Hands a message to the sink; a large one starts a transfer.
-    fn send(&mut self, message: &Arc<ServerMessage>, delivery_count: i32) {
+    /// Hands a message to the sink; a large one starts a transfer. False
+    /// when a large body could not be read: nothing was sent and the
+    /// consumer has [failed](Self::fail).
+    fn send(&mut self, message: &Arc<ServerMessage>, delivery_count: i32) -> bool {
         let id = self.reg.client_id;
-        let read_body = |body: &Arc<crate::large::LargeBody>| -> Vec<u8> {
-            body.read_all().unwrap_or_else(|e| {
-                tracing::warn!(
-                    "AMQ222110: Error on resetting large message deliver - {}: {e}",
-                    message.message_id()
-                );
-                Vec::new()
-            })
+        let body = match message.large() {
+            Some(body) if message.native().is_some() || !self.reg.sink.supports_large() => {
+                match body.read_all() {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        self.fail(message.message_id(), &e);
+                        return false;
+                    }
+                }
+            }
+            _ => None,
         };
         let size = match message.large() {
             // Not a large message: it goes as it is.
@@ -1314,35 +1341,34 @@ impl Consumer {
             // A large native (AMQP) message keeps only its headers in memory;
             // its body is read from the file and the whole message rebuilt,
             // which a native delivery takes whole.
-            Some(body) if message.native().is_some() => {
+            Some(_) if message.native().is_some() => {
                 let whole = ServerMessage::new_native(
                     message
                         .native()
                         .expect("native")
-                        .reconstitute(read_body(body)),
+                        .reconstitute(body.unwrap_or_default()),
                 );
                 self.reg.sink.deliver(id, &whole, delivery_count)
             }
             // A large Core message read whole for a sink that cannot take it
             // in chunks.
-            Some(body) if !self.reg.sink.supports_large() => {
+            Some(_) if !self.reg.sink.supports_large() => {
                 let mut core = message.core().clone();
-                core.body = read_body(body).into();
+                core.body = body.unwrap_or_default().into();
                 self.reg
                     .sink
                     .deliver(id, &ServerMessage::new(core), delivery_count)
             }
             Some(body) => {
                 let size = body.size() as i64;
-                let reader = body
-                    .reader()
-                    .inspect_err(|e| {
-                        tracing::warn!(
-                            "AMQ222110: Error on resetting large message deliver - {}: {e}",
-                            message.message_id()
-                        );
-                    })
-                    .ok();
+                // `context.open()`, before anything is sent.
+                let reader = match body.reader() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.fail(message.message_id(), &e);
+                        return false;
+                    }
+                };
                 self.large = Some(LargeTransfer {
                     body: body.clone(),
                     reader,
@@ -1355,6 +1381,7 @@ impl Consumer {
         };
         self.reg.metrics.add_message(message.encode_size() as i64);
         self.take_credits(size);
+        true
     }
 
     /// Sends the next chunks of the large message while the consumer has
@@ -1371,17 +1398,15 @@ impl Consumer {
             }
             let size = t.body.size();
             let len = (size - t.position).min(self.reg.sink.chunk_size().max(1) as u64) as usize;
-            let chunk = match t.reader.as_mut().map(|r| r.read_chunk(len)) {
-                Some(Ok(chunk)) => chunk,
-                Some(Err(e)) => {
-                    tracing::warn!(
-                        "AMQ222110: Error on resetting large message deliver - {}: {e}",
-                        t.body.id()
-                    );
-                    t.reader = None;
-                    vec![0; len]
+            let chunk = match t.reader.read_chunk(len) {
+                Ok(chunk) => chunk,
+                // The rest of the body cannot be sent, and what was is
+                // incomplete: the message must not be taken as delivered.
+                Err(e) => {
+                    let id = t.body.id();
+                    self.fail(id, &e);
+                    return false;
                 }
-                None => vec![0; len],
             };
             t.position += len as u64;
             let continues = t.position < size;
@@ -2734,7 +2759,12 @@ impl Actor {
         };
         let c = &mut self.consumers[index];
         r.delivery_count += 1;
-        c.send(flagged.as_ref().unwrap_or(&r.message), r.delivery_count);
+        if !c.send(flagged.as_ref().unwrap_or(&r.message), r.delivery_count) {
+            // Held by the failed consumer until it is closed, then put back
+            // (`cancel`), never acknowledged unread.
+            c.delivering.push_back(r);
+            return true;
+        }
         if c.large.is_some() && c.continue_large() {
             self.shared.tx.send(Cmd::ResumeLarge).ok();
         }

@@ -138,3 +138,107 @@ async fn a_slim_large_message_is_delivered_whole() {
     );
     broker.stop().unwrap();
 }
+
+/// A sink that keeps what it is handed and whether it was told to close.
+struct Watch {
+    delivered: Arc<Mutex<Vec<Arc<ServerMessage>>>>,
+    closed: Arc<Mutex<Option<String>>>,
+    /// Takes large messages in chunks, as Core does.
+    chunks: bool,
+}
+impl DeliverySink for Watch {
+    fn deliver(&self, _: i64, message: &Arc<ServerMessage>, _: i32) -> i64 {
+        self.delivered.lock().unwrap().push(message.clone());
+        1
+    }
+    fn deliver_large(&self, _: i64, message: &ServerMessage, _: i64, _: i32) -> i64 {
+        self.delivered
+            .lock()
+            .unwrap()
+            .push(ServerMessage::new(message.core().clone()));
+        0
+    }
+    fn deliver_continuation(&self, _: i64, _: Vec<u8>, _: bool) -> i64 {
+        0
+    }
+    fn chunk_size(&self) -> usize {
+        1024
+    }
+    fn supports_large(&self) -> bool {
+        self.chunks
+    }
+    fn disconnect(&self, _: i64, reason: &str) {
+        *self.closed.lock().unwrap() = Some(reason.to_owned());
+    }
+}
+
+/// `errorProcessing`: a large message whose body cannot be read is not
+/// delivered without it. The consumer is failed and told to close, and the
+/// message goes back to the queue when it does.
+#[tokio::test]
+async fn an_unreadable_large_body_is_not_delivered_empty() {
+    unreadable_large_body(false).await;
+    unreadable_large_body(true).await;
+}
+
+async fn unreadable_large_body(chunks: bool) {
+    let broker = Broker::start(BrokerConfig::new(Arc::new(SelectorFilters)))
+        .await
+        .unwrap();
+    let mut spec = QueueSpec::new("q", "a");
+    spec.auto_create_address = Some(true);
+    spec.durable = false;
+    let q = broker.post_office().create_queue(spec, false).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let body = vec![0xCDu8; 200_000];
+    let mut full = AmqpMessage::new(0, data_message(&body), NOW).unwrap();
+    full.set_message_id(1);
+    full.set_address(SimpleString::from("a"));
+    full.make_large();
+    let store = LargeMessageStore::new(dir.path().to_owned(), false);
+    let mut w = store.create(full.message_id(), true).unwrap();
+    w.append(full.data()).unwrap();
+    let large_body = w.finish().unwrap();
+    std::fs::remove_file(large_body.path().expect("a file")).unwrap();
+    let slim = AmqpMessage::from_large_record(&full.large_record(), Vec::new(), NOW).unwrap();
+    let msg = ServerMessage::new_native_large(AmqpNative::arc(slim), large_body);
+
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let closed = Arc::new(Mutex::new(None));
+    let mut session = session(&broker);
+    let (d, c) = (delivered.clone(), closed.clone());
+    session
+        .create_consumer(1, "q", None, 0, false, move |_| {
+            Arc::new(Watch {
+                delivered: d.clone(),
+                closed: c.clone(),
+                chunks,
+            })
+        })
+        .await
+        .unwrap();
+    session.consumer_credits(1, -1);
+    session.set_started(true).await;
+    q.add(MessageRef::new(msg));
+    session.prompt_delivery(1);
+
+    for _ in 0..200 {
+        if closed.lock().unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        closed.lock().unwrap().is_some(),
+        "the consumer is told to close"
+    );
+    assert!(
+        delivered.lock().unwrap().is_empty(),
+        "nothing delivered in place of the body"
+    );
+    // The client closes it, as it is told to: the message is back.
+    session.close_consumer(1, true).await;
+    assert_eq!(q.message_count(), 1);
+    broker.stop().unwrap();
+}

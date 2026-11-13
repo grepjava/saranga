@@ -53,6 +53,8 @@ pub struct Requestor {
     session: Session,
     consumer: Consumer,
     reply_queue: String,
+    /// The management address requests go to.
+    address: String,
     /// Each request carries a correlation ID, and a reply that does not
     /// carry it (one that came after its request gave up) is dropped.
     correlate: bool,
@@ -60,20 +62,26 @@ pub struct Requestor {
 
 impl Requestor {
     /// `ClientRequestor` on a session of its own: its temporary reply
-    /// queue, on the management address.
+    /// queue, on the default management address, as Artemis's CLI and
+    /// `ActiveMQManagementProxy` have it.
     pub async fn on(session: Session) -> saranga_client::Result<Self> {
-        Self::open(session, false).await
+        Self::open(session, false, MANAGEMENT_ADDRESS).await
     }
 
-    /// A requestor whose requests carry correlation IDs.
-    pub async fn correlated(session: Session) -> saranga_client::Result<Self> {
-        Self::open(session, true).await
+    /// A requestor whose requests carry correlation IDs, to the
+    /// management address `address`.
+    pub async fn correlated(session: Session, address: &str) -> saranga_client::Result<Self> {
+        Self::open(session, true, address).await
     }
 
-    async fn open(session: Session, correlate: bool) -> saranga_client::Result<Self> {
+    async fn open(
+        session: Session,
+        correlate: bool,
+        address: &str,
+    ) -> saranga_client::Result<Self> {
         session.start().await?;
         let reply_queue = format!(
-            "{MANAGEMENT_ADDRESS}.{}",
+            "{address}.{}",
             saranga_client::uuid::to_string(&saranga_client::uuid::time_based())
         );
         session
@@ -88,6 +96,7 @@ impl Requestor {
             session,
             consumer,
             reply_queue,
+            address: address.to_owned(),
             correlate,
         })
     }
@@ -141,10 +150,7 @@ impl Requestor {
         if let Some(id) = &correlation {
             m.put_string_property(CORRELATION_ID, id);
         }
-        let producer = self
-            .session
-            .create_producer(Some(MANAGEMENT_ADDRESS))
-            .await?;
+        let producer = self.session.create_producer(Some(&self.address)).await?;
         producer.send(m).await?;
         producer.close();
         let deadline = tokio::time::Instant::now() + timeout;

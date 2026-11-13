@@ -76,6 +76,15 @@ pub(crate) struct Member {
 
 /// The brokers this one knows of, itself first, from every cluster
 /// connection's topology.
+/// A requestor to a node of the topology. The console's nodes share this
+/// broker's configuration, so they answer on its management address.
+async fn requestor(
+    broker: &Broker,
+    session: saranga_client::Session,
+) -> saranga_client::Result<Requestor> {
+    Requestor::correlated(session, broker.management().address()).await
+}
+
 pub(crate) fn members(broker: &Broker) -> Vec<Member> {
     let local = broker.node_id().to_owned();
     let mut out: Vec<Member> = vec![Member {
@@ -347,7 +356,7 @@ impl Peers {
                 return Err(client_problem(node, &e, true));
             }
         };
-        let requestor = match Requestor::correlated(session).await {
+        let requestor = match requestor(broker, session).await {
             Ok(r) => r,
             Err(e) => {
                 conn.close().await;
@@ -593,6 +602,36 @@ mod tests {
         );
     }
 
+    /// A node's requests go to the management address the broker is
+    /// configured with, not the default one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_is_asked_on_the_configured_management_address() {
+        use saranga_server::postoffice::SelectorFilters;
+        use saranga_server::{Acceptor, BrokerConfig};
+
+        let mut cfg = BrokerConfig::new(Arc::new(SelectorFilters));
+        cfg.management.address = "custom.management".into();
+        let broker = Broker::start(cfg).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let acceptor = tokio::spawn(broker.clone().serve_acceptor(listener, Acceptor::default()));
+        let conn = Connection::connect(&address, ConnectionOptions::default())
+            .await
+            .unwrap();
+        let session = conn
+            .create_session(SessionOptions::default())
+            .await
+            .unwrap();
+        let requestor = requestor(&broker, session).await.unwrap();
+        let reply = requestor
+            .attribute("broker", "Version", Duration::from_secs(5))
+            .await;
+        assert!(reply.is_ok(), "{:?}", reply.err());
+        conn.close().await;
+        acceptor.abort();
+        broker.stop().unwrap();
+    }
+
     /// A browse on a link whose connection has failed evicts the link, as an
     /// operation or attribute request does, so the next request makes a new
     /// one instead of reusing the dead session forever.
@@ -616,7 +655,7 @@ mod tests {
             .create_session(SessionOptions::default())
             .await
             .unwrap();
-        let requestor = Requestor::correlated(session).await.unwrap();
+        let requestor = requestor(&broker, session).await.unwrap();
         let peers = Arc::new(Peers::default());
         let who = Credentials {
             user: "admin".into(),

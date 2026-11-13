@@ -743,7 +743,9 @@ struct SenderLink {
     source: Option<Source>,
     credit: Arc<Mutex<Credit>>,
     /// The link's credit and delivery count, as the sender keeps them.
-    link_credit: u32,
+    /// Proton's credit is signed: a receiver that lowers it below what is
+    /// already on the way leaves it negative until those deliveries count.
+    link_credit: i32,
     delivery_count: u32,
     presettled: bool,
     draining: bool,
@@ -3868,9 +3870,12 @@ impl Conn {
                     // The credit the client gives from where it counted.
                     let remote_count = flow.delivery_count.unwrap_or(0);
                     let credit = flow.link_credit.unwrap_or(0);
+                    // Serial-number arithmetic: less than the deliveries
+                    // already sent is a negative credit, not a huge one.
                     sl.link_credit = remote_count
                         .wrapping_add(credit)
-                        .wrapping_sub(sl.delivery_count);
+                        .wrapping_sub(sl.delivery_count)
+                        as i32;
                     {
                         let mut c = lock(&sl.credit);
                         c.available = i64::from(sl.link_credit) - c.pending;
@@ -3884,7 +3889,7 @@ impl Conn {
                         reply = Some(Flow {
                             handle: Some(handle),
                             delivery_count: Some(sl.delivery_count),
-                            link_credit: Some(sl.link_credit),
+                            link_credit: Some(sl.link_credit.max(0) as u32),
                             ..base
                         });
                     }
@@ -4423,7 +4428,7 @@ impl Conn {
                 }
                 sl.draining = false;
                 // drained(): the rest of the credit is used up.
-                sl.delivery_count = sl.delivery_count.wrapping_add(sl.link_credit);
+                sl.delivery_count = sl.delivery_count.wrapping_add(sl.link_credit.max(0) as u32);
                 sl.link_credit = 0;
                 lock(&sl.credit).available = 0;
                 let (count, _) = (sl.delivery_count, 0);
