@@ -27,6 +27,7 @@ mod api_schema;
 mod catalog;
 pub mod console;
 mod exceptions;
+mod java_regex;
 mod jolokia;
 mod live;
 mod mbean;
@@ -632,24 +633,27 @@ fn rand_u32() -> u32 {
 /// names `ArtemisRbacMBeanServerBuilder`, else the default list. Artemis
 /// sets the property to its own builder for an `<authorisation>`, over the
 /// one given. `filter` gives the values of the file's attributes.
+///
+/// A `management.xml` that cannot be read as one is an error, as
+/// `Run.getManagementDTO` fails the broker's start: falling back to the
+/// default list would drop the restrictions the file was written to make.
 pub fn guard(
     etc: &Path,
     builder: Option<&str>,
     rbac: Rbac,
     filter: &dyn Fn(&str) -> String,
-) -> Guard {
+) -> Result<Guard, String> {
     let xml = std::fs::read_to_string(etc.join("management.xml")).ok();
     let authorisation = xml.as_deref().is_some_and(access::has_authorisation);
     if !authorisation && builder == Some(RBAC_BUILDER) {
-        return Guard::Rbac(rbac);
+        return Ok(Guard::Rbac(rbac));
     }
-    Guard::Acl(match xml {
-        Some(xml) => AccessList::parse_with(&xml, filter).unwrap_or_else(|e| {
-            tracing::warn!("management.xml: {e}; using the default access list");
-            AccessList::default_list()
-        }),
+    Ok(Guard::Acl(match xml {
+        Some(xml) => {
+            AccessList::parse_with(&xml, filter).map_err(|e| format!("management.xml: {e}"))?
+        }
         None => AccessList::default_list(),
-    })
+    }))
 }
 
 /// `jolokia-access.xml` from an instance's etc.
@@ -662,6 +666,46 @@ pub fn cors(etc: &Path) -> Cors {
 #[cfg(test)]
 mod tests {
     use super::{base64_decode, percent_decode};
+
+    /// A `management.xml` whose rules cannot be read fails the start, as
+    /// in Artemis, instead of giving way to the default list.
+    #[test]
+    fn an_unreadable_access_list_is_an_error() {
+        let etc = std::env::temp_dir().join(format!("saranga-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&etc).unwrap();
+        let xml = |key: &str| {
+            format!(
+                r#"<management-context xmlns="http://activemq.apache.org/schema">
+   <authorisation>
+      <role-access>
+         <match domain="org.apache.activemq.artemis" key="{key}">
+            <access method="*" roles="amq"/>
+         </match>
+      </role-access>
+   </authorisation>
+</management-context>"#
+            )
+        };
+        let guard = |key: &str| {
+            std::fs::write(etc.join("management.xml"), xml(key)).unwrap();
+            super::guard(
+                &etc,
+                None,
+                super::Rbac {
+                    prefix: "mops".to_owned(),
+                    delimiter: '.',
+                    domain: "org.apache.activemq.artemis".to_owned(),
+                },
+                &|v| v.to_owned(),
+            )
+        };
+        assert!(guard(r"queue=\Qsecret\E").is_ok());
+        let refused = guard(r"queue=\p{InGreek}");
+        let unparsed = guard("queue=secret[");
+        std::fs::remove_dir_all(&etc).unwrap();
+        assert!(refused.is_err());
+        assert!(unparsed.is_err());
+    }
 
     #[test]
     fn decoding() {

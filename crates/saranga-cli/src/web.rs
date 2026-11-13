@@ -193,7 +193,8 @@ pub async fn start(
                 domain: file.jmx_domain.clone(),
             },
             &|v| saranga_config::dto_filter(v, &|n| instance.lookup(n)),
-        ),
+        )
+        .map_err(anyhow::Error::msg)?,
         console_roles: console_roles(instance),
         cors: saranga_management::cors(&instance.etc),
         root_redirect: web.root_redirect_location.clone(),

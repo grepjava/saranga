@@ -20,11 +20,13 @@ struct Access {
 
 impl Access {
     /// `Access(id, key)`: a key that is not a valid regular expression is
-    /// refused, as `Pattern.compile` refuses it.
+    /// refused, as `Pattern.compile` refuses it. The key is in Java's
+    /// syntax (see [`crate::java_regex`]).
     fn new(key: &str) -> Result<Self, String> {
-        let regex = format!(r"\A(?:{})\z", key.replace('*', ".*"));
-        let pattern = fancy_regex::Regex::new(&regex)
-            .map_err(|e| format!("management.xml: key {key:?} is not a valid pattern: {e}"))?;
+        let invalid = |e: String| format!("key {key:?} is not a valid pattern: {e}");
+        let java = crate::java_regex::translate(&key.replace('*', ".*")).map_err(invalid)?;
+        let pattern = fancy_regex::Regex::new(&format!(r"\A(?:{java})\z"))
+            .map_err(|e| invalid(e.to_string()))?;
         Ok(Self {
             key: key.to_owned(),
             pattern: Some(Box::new(pattern)),
@@ -380,6 +382,45 @@ mod tests {
         // A key that is not a valid pattern is refused, as Pattern.compile
         // refuses it.
         assert!(AccessList::parse(&xml.replace("secret[0-9]", "secret[0-9")).is_err());
+    }
+
+    /// A key in Java's own syntax restricts what it names, and one this
+    /// broker cannot give Java's meaning is refused rather than skipped.
+    #[test]
+    fn a_key_is_read_as_java_reads_it() {
+        let xml = |key: &str| {
+            format!(
+                r#"<management-context xmlns="http://activemq.apache.org/schema">
+   <authorisation>
+      <role-access>
+         <match domain="org.apache.activemq.artemis">
+            <access method="*" roles="view,amq"/>
+         </match>
+         <match domain="org.apache.activemq.artemis" key="{key}">
+            <access method="get*" roles="view,amq"/>
+            <access method="*" roles="amq"/>
+         </match>
+      </role-access>
+   </authorisation>
+</management-context>"#
+            )
+        };
+        let queue = |name: &str| {
+            ObjectName::parse(&format!(
+                "org.apache.activemq.artemis:broker=\"b\",component=addresses,address=\"a\",subcomponent=queues,routing-type=\"anycast\",queue=\"{name}\""
+            ))
+            .unwrap()
+        };
+        let view = ["view".to_owned()];
+        let l = AccessList::parse(&xml(r"queue=\Qsecret.1\E")).unwrap();
+        assert!(l.can_invoke(&view, &queue("secret.1"), "getMessageCount"));
+        assert!(!l.can_invoke(&view, &queue("secret.1"), "removeAllMessages"));
+        assert!(l.can_invoke(&view, &queue("secretX1"), "removeAllMessages"));
+        // Java's `\h` is horizontal whitespace, not a hexadecimal digit.
+        let l = AccessList::parse(&xml(r"queue=secret\h1")).unwrap();
+        assert!(!l.can_invoke(&view, &queue("secret 1"), "removeAllMessages"));
+        assert!(l.can_invoke(&view, &queue("secreta1"), "removeAllMessages"));
+        assert!(AccessList::parse(&xml(r"queue=\p{InBasicLatin}")).is_err());
     }
 }
 

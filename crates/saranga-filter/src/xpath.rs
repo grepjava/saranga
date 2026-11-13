@@ -11,7 +11,15 @@
 //! either, and is not parsed: the parser's work grows with the square of the
 //! depth, evaluating an expression walks the document recursively, and the
 //! body comes from whoever sent the message.
+//!
+//! The expression is compiled as the JDK's `XPathFactory` compiles it: no
+//! more than [`MAX_GROUPS`] groups and [`MAX_OPERATORS`] operators, and only
+//! the functions it knows, with the arguments they take (see [`functions`]).
 
+mod functions;
+mod lexer;
+
+pub use lexer::{MAX_GROUPS, MAX_OPERATORS};
 use sxd_document::dom::{ChildOfElement, ChildOfRoot, Element};
 
 /// The deepest element nesting a body is evaluated at.
@@ -20,10 +28,13 @@ pub const MAX_DEPTH: usize = 1024;
 /// `JAXPXPathEvaluator`'s `xpath.compile`: an expression that does not
 /// compile makes the selector invalid.
 pub(crate) fn compile(expression: &str) -> Result<sxd_xpath::XPath, String> {
+    let invalid = |e: String| format!("invalid XPath expression {expression:?}: {e}");
+    lexer::within_jdk_limits(expression).map_err(invalid)?;
+    lexer::check_calls(expression).map_err(invalid)?;
     match sxd_xpath::Factory::new().build(expression) {
         Ok(Some(xpath)) => Ok(xpath),
         Ok(None) => Err("an empty XPath expression".to_owned()),
-        Err(e) => Err(format!("invalid XPath expression {expression:?}: {e}")),
+        Err(e) => Err(invalid(e.to_string())),
     }
 }
 
@@ -56,22 +67,37 @@ pub(crate) fn matches(expression: &str, body: Option<&str>) -> bool {
         return false;
     };
     xpath
-        .evaluate(&sxd_xpath::Context::new(), root)
+        .evaluate(&functions::context(), root)
         .is_ok_and(|v| v.boolean())
 }
 
 /// Removes the comments under `elements` (`IGNORE_COMMENTS`), walking the
 /// tree without recursion; false if it is nested deeper than [`MAX_DEPTH`].
+///
+/// Text left next to text, where a comment was or around a CDATA section,
+/// is joined into one node, as XPath's data model has it and Java's
+/// evaluator gives it.
 fn drop_comments_within_depth(mut elements: Vec<(Element<'_>, usize)>) -> bool {
     while let Some((element, depth)) = elements.pop() {
         if depth > MAX_DEPTH {
             return false;
         }
+        let mut text: Option<sxd_document::dom::Text<'_>> = None;
         for child in element.children() {
             match child {
                 ChildOfElement::Comment(c) => c.remove_from_parent(),
-                ChildOfElement::Element(e) => elements.push((e, depth + 1)),
-                _ => {}
+                ChildOfElement::Text(t) => match text {
+                    Some(first) => {
+                        first.set_text(&(first.text().to_owned() + t.text()));
+                        t.remove_from_parent();
+                    }
+                    None => text = Some(t),
+                },
+                ChildOfElement::Element(e) => {
+                    text = None;
+                    elements.push((e, depth + 1));
+                }
+                ChildOfElement::ProcessingInstruction(_) => text = None,
             }
         }
     }
@@ -206,7 +232,121 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_text_is_one_node() {
+        // Each with what Artemis's `JAXPXPathEvaluator` made of it.
+        let cases = [
+            ("<root>a<!-- c -->b</root>", "count(/root/text()) = 1", true),
+            ("<root>a<!-- c -->b</root>", "/root/text() = 'ab'", true),
+            (
+                "<root>a<![CDATA[b]]>c</root>",
+                "count(/root/text()) = 1",
+                true,
+            ),
+            ("<root>a<![CDATA[b]]>c</root>", "/root/text() = 'abc'", true),
+            ("<root>a<?pi x?>b</root>", "count(/root/text()) = 2", true),
+            (
+                "<root>a<!-- c --><![CDATA[b]]><!-- d -->c<x/>d</root>",
+                "count(/root/text()) = 2",
+                true,
+            ),
+            (
+                "<root>&amp;<![CDATA[x]]></root>",
+                "count(/root/text()) = 1",
+                true,
+            ),
+            ("<root><x/></root>", "count(//text()) = 0", true),
+            ("<root><![CDATA[]]></root>", "count(/root/text()) = 1", true),
+            (
+                "<root>&amp;<![CDATA[]]></root>",
+                "count(/root/text()) = 1",
+                true,
+            ),
+        ];
+        for (body, expression, expected) in cases {
+            assert_eq!(
+                matches(expression, Some(body)),
+                expected,
+                "{expression} over {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_jdk_functions_sxd_lacks_are_evaluated() {
+        let lang = "<root xml:lang='en-GB'><x/><y xml:lang='EN'/><z xml:lang='english'/></root>";
+        let plain = Some("<root><x/><y/></root>");
+        // Each with what the JDK's evaluator made of it.
+        for (expression, body, expected) in [
+            ("boolean(//x[lang('en')])", lang, true),
+            ("boolean(//y[lang('en')])", lang, true),
+            ("boolean(//z[lang('en')])", lang, false),
+            ("boolean(//x[lang('EN-gb')])", lang, true),
+            ("boolean(//x[lang('en-')])", lang, false),
+            ("boolean(//x[lang('')])", lang, false),
+            ("boolean(/root/@*[lang('en')])", lang, true),
+            ("count(//*[lang('en')]) = 3", lang, true),
+            ("lang('en')", lang, false),
+        ] {
+            assert_eq!(matches(expression, Some(body)), expected, "{expression}");
+        }
+        for (expression, expected) in [
+            ("count(id('x')) = 0", true),
+            ("count(current()) = 1", true),
+            ("count(//x[current()]) = 1", true),
+            ("boolean(//x[name(current())='x'])", false),
+            ("generate-id(//x) = generate-id(//x)", true),
+            ("generate-id(//x) = generate-id(//y)", false),
+            ("generate-id(//none) = ''", true),
+            ("boolean(generate-id())", true),
+            ("function-available('count')", true),
+            ("function-available('key')", true),
+            ("function-available('foo')", false),
+            ("function-available('x:y')", false),
+            ("element-available('if')", false),
+            ("system-property('nope') = ''", true),
+            ("unparsed-entity-uri('x') = ''", true),
+            ("document-location() = ''", true),
+            ("boolean(here())", false),
+            ("not(boolean(here()))", false),
+        ] {
+            assert_eq!(matches(expression, plain), expected, "{expression}");
+        }
+    }
+
+    #[test]
+    fn an_expression_is_bounded_before_it_is_compiled() {
+        // Recursing on each of these overflowed a 2 MiB stack.
+        let deep = "(".repeat(1000) + "1" + &")".repeat(1000);
+        assert!(compile(&deep).is_err());
+        assert!(compile(&("-".repeat(100_000) + "1")).is_err());
+        assert!(compile(&("1".to_owned() + &"+1".repeat(100_000))).is_err());
+        // The deepest the limits allow compiles, evaluates and is dropped
+        // within a worker's stack.
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                let body = Some("<a><b/></a>");
+                for expression in [
+                    "not(".repeat(99) + "1" + &")".repeat(99),
+                    "1".to_owned() + &"+1".repeat(99) + " = 100",
+                    "/a".to_owned() + &"[b".repeat(98) + &"]".repeat(98),
+                    "-".repeat(99) + "1 < 0",
+                    "(".repeat(10) + "1" + &")".repeat(10),
+                ] {
+                    assert!(compile(&expression).is_ok(), "{expression}");
+                    matches(&expression, body);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn an_expression_that_does_not_compile_is_refused() {
+        assert!(compile("unknown()").is_err());
+        assert!(compile("contains('a')").is_err());
+        assert!(compile("foo:bar()").is_ok());
         assert!(compile("//order").is_ok());
         assert!(compile("//order[").is_err());
         assert!(compile("").is_err());
