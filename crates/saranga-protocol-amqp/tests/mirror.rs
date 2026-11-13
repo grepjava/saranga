@@ -460,3 +460,55 @@ async fn a_management_move_waits_for_a_sync_mirror() {
     stop(a).await;
     stop(b).await;
 }
+
+/// A management copy reaches a mirror's peer, as a copy routed through the
+/// post office does in Artemis, and with a `sync` mirror the operation
+/// answers once the peer has it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_management_copy_is_mirrored() {
+    use saranga_server::management::Json;
+
+    let d = dirs();
+    let lb = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let la = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let pb = lb.local_addr().unwrap().port();
+    let queues = r#"<addresses>
+        <address name="jobs"><anycast><queue name="jobs"/></anycast></address>
+        <address name="done"><anycast><queue name="done"/></anycast></address>
+      </addresses>"#;
+    let b = start(d.1.path(), lb, queues).await;
+    let a = start(
+        d.0.path(),
+        la,
+        &format!("{queues}{}", mirror_to(pb, "to-b", true)),
+    )
+    .await;
+    wait_until("connected", || connected(&a, "to-b")).await;
+    let (_ca, sa) = session(a.port).await;
+    send(&sa, "jobs", 0, 1).await;
+    wait_until("the message mirrored", || count(&b, "jobs") == Some(1)).await;
+    let id = a.broker.post_office().queue("jobs").unwrap().browse().await[0].message_id();
+
+    let copied = a
+        .broker
+        .management()
+        .invoke(
+            &a.broker,
+            "queue.jobs",
+            "copyMessage",
+            &[Json::Long(id), Json::from("done")],
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(copied, Json::from(true));
+    assert_eq!(count(&a, "done"), Some(1));
+    assert_eq!(
+        (count(&b, "done"), count(&b, "jobs")),
+        (Some(1), Some(1)),
+        "the copy must reach the sync mirror's peer by the time the call returns"
+    );
+    drop(sa);
+    stop(a).await;
+    stop(b).await;
+}

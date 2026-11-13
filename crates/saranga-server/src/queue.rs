@@ -1950,7 +1950,7 @@ impl Actor {
             // where it is keeps the message rather than route a copy with no
             // recoverable body.
             self.move_failed(
-                r,
+                Some(r),
                 format!("moving message to {address}: its large body could not be copied"),
                 dup.map(|d| d.settle),
             );
@@ -1962,21 +1962,26 @@ impl Actor {
             Some(q) => vec![(copy.clone(), vec![q])],
             None => po.route_internal(&copy, address),
         };
-        self.commit_move(&po, r, routed, reason, address, dup);
+        let id = r.message_id();
+        self.commit_move(&po, Some(r), id, routed, reason, address, dup);
     }
 
-    /// The end of `move` and of a redistribution: the routed copy is
-    /// journaled with the reference's acknowledgement in one transaction,
-    /// then joins its queues.
+    /// The end of `move`, of a redistribution and of a copy: the routed
+    /// copy is journaled, with the reference's acknowledgement for a move
+    /// (`r`; `None` for a copy, whose original stays where it is), in one
+    /// transaction, then joins its queues. `id` is the original's ID.
+    #[allow(clippy::too_many_arguments)]
     fn commit_move(
         &mut self,
         po: &PostOffice,
-        mut r: MessageRef,
+        mut r: Option<MessageRef>,
+        id: i64,
         routed: crate::postoffice::Routed,
         reason: AckReason,
         address: &str,
         dup: Option<DuplicateMove>,
     ) {
+        let verb = if r.is_some() { "moving" } else { "copying" };
         // The duplicate ID is journaled in the move's transaction below; the
         // in-memory cache update waits until the move is known to have
         // happened (`settle`).
@@ -2011,13 +2016,13 @@ impl Actor {
                         std::mem::take(&mut crate::transaction::lock(move_tx).paging)
                             .after_rollback();
                     }
-                    let what = format!("moving message {} to {address}: {e}", r.message_id());
+                    let what = format!("{verb} message {id} to {address}: {e}");
                     self.move_failed(r, what, settle);
                     return;
                 }
             };
         let queue = self.queue();
-        let what = format!("moving message {} to {address}", r.message_id());
+        let what = format!("{verb} message {id} to {address}");
         let mut committed = None;
         let mut paging = TxPaging::default();
         if let (Some(s), Some(move_tx)) = (self.shared.ids.storage(), &move_tx) {
@@ -2039,7 +2044,9 @@ impl Actor {
                         persistent = true;
                     }
                 }
-                if queue.store_ack_tx(tx, &mut r, &mut paging)? {
+                if let Some(r) = r.as_mut()
+                    && queue.store_ack_tx(tx, r, &mut paging)?
+                {
                     persistent = true;
                 }
                 // `addDuplicateID`: a reject-duplicates move journals the
@@ -2075,7 +2082,7 @@ impl Actor {
         match committed {
             None => {
                 paging.after_commit();
-                replicated.extend(self.moved(routed, &r, reason, settle));
+                replicated.extend(self.moved(routed, r.as_ref(), reason, settle));
                 if self.collecting_commits {
                     self.mirror_waits.extend(replicated);
                 }
@@ -2083,7 +2090,7 @@ impl Actor {
             Some(p) => self.after_commit(p, what, move |a, failed| match failed {
                 None => {
                     paging.after_commit();
-                    replicated.extend(a.moved(routed, &r, reason, settle));
+                    replicated.extend(a.moved(routed, r.as_ref(), reason, settle));
                     replicated
                 }
                 Some(e) => {
@@ -2095,14 +2102,14 @@ impl Actor {
         }
     }
 
-    /// A move in the journal: the copy joins its queues, the original is
-    /// acknowledged, and the duplicate ID it reserved is taken. Returns
-    /// what a `sync` mirror's peer completes once it has the
-    /// acknowledgement.
+    /// A move (or copy) in the journal: the copy joins its queues, the
+    /// original of a move is acknowledged, and the duplicate ID it reserved
+    /// is taken. Returns what a `sync` mirror's peer completes once it has
+    /// the acknowledgement.
     fn moved(
         &mut self,
         routed: crate::postoffice::Routed,
-        r: &MessageRef,
+        r: Option<&MessageRef>,
         reason: AckReason,
         settle: Option<Settle>,
     ) -> Option<Pending> {
@@ -2111,22 +2118,25 @@ impl Actor {
                 q.add(m.clone());
             }
         }
-        let mirrored = self.queue().post_acknowledge_for(r, reason);
+        let mirrored = r.and_then(|r| self.queue().post_acknowledge_for(r, reason));
         if let Some(settle) = settle {
             settle(true);
         }
         mirrored
     }
 
-    /// A move whose journal write failed: the message stays, the ID a
-    /// duplicate check took for it is given back, and the failure is kept.
-    fn move_failed(&mut self, r: MessageRef, e: String, settle: Option<Settle>) {
+    /// A move (or copy) whose journal write failed: the message stays (a
+    /// move's goes back; a copy's never left), the ID a duplicate check took
+    /// for it is given back, and the failure is kept.
+    fn move_failed(&mut self, r: Option<MessageRef>, e: String, settle: Option<Settle>) {
         tracing::warn!("{e}");
         if let Some(settle) = settle {
             settle(false);
         }
         self.write_failed(e);
-        self.add_sorted(r);
+        if let Some(r) = r {
+            self.add_sorted(r);
+        }
     }
 
     /// Runs `then` on this actor once the journal has `p`, with the error
@@ -2565,7 +2575,8 @@ impl Actor {
                 .as_ref()
                 .map(|a| a.to_string_lossy())
                 .unwrap_or_default();
-            self.commit_move(&po, r, routed, AckReason::Normal, &address, None);
+            let id = r.message_id();
+            self.commit_move(&po, Some(r), id, routed, AckReason::Normal, &address, None);
             if self.write_failures != failures {
                 break;
             }

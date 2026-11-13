@@ -972,8 +972,14 @@ impl Actor {
         }
     }
 
-    /// `copyReference`: a copy of the message goes to `target`.
+    /// `copyReference`: a copy of the message goes to `target`, routed as
+    /// Artemis's `copy` routes it (`postOffice.route` in a transaction):
+    /// paged when the destination pages, refused when it is full under
+    /// `FAIL`, and mirrored. The original stays where it is.
     fn copy_to(&mut self, address: &str, r: &MessageRef, target: &Queue) {
+        let Some(po) = self.shared.post_office.upgrade() else {
+            return;
+        };
         let now = now_millis();
         let copy = message::make_copy(
             r.message.core(),
@@ -985,48 +991,26 @@ impl Actor {
         );
         let Some(copy) = r.message.copy(copy) else {
             // A large body that cannot be copied leaves the original in place
-            // rather than add a copy with no recoverable body.
-            tracing::warn!(
+            // rather than add a copy with no recoverable body, and the
+            // operation reports it.
+            let e = format!(
                 "copying message {} to {address}: its large body could not be copied",
                 r.message_id()
             );
+            tracing::warn!("{e}");
+            self.write_failed(e);
             return;
         };
-        let copy = MessageRef::new(copy);
-        if target.is_durable_ref(&copy)
-            && let Some(s) = self.shared.ids.storage()
-        {
-            copy.message.durable_up();
-            let tx = self.shared.ids.next();
-            let what = format!("copying message {} to {address}", r.message_id());
-            let written = s
-                .store_message_tx(tx, &copy.message)
-                .and_then(|()| s.store_reference_tx(tx, target.id(), copy.message_id()))
-                .and_then(|()| s.commit(tx));
-            match written {
-                // The copy is seen once it is in the journal.
-                Ok(p) => {
-                    let target = target.clone();
-                    self.after_commit(p, what, move |a, failed| {
-                        match failed {
-                            None => target.add(copy),
-                            Some(e) => {
-                                tracing::warn!("{e}");
-                                a.write_failed(e);
-                            }
-                        }
-                        Vec::new()
-                    });
-                }
-                Err(e) => {
-                    let _ = s.rollback(tx);
-                    tracing::warn!("{what}: {e}");
-                    self.write_failed(format!("{what}: {e}"));
-                }
-            }
-            return;
-        }
-        target.add(copy);
+        let routed = vec![(MessageRef::new(copy), vec![target.clone()])];
+        self.commit_move(
+            &po,
+            None,
+            r.message_id(),
+            routed,
+            AckReason::Normal,
+            address,
+            None,
+        );
     }
 }
 

@@ -1193,12 +1193,9 @@ pub(crate) async fn list_on(
 /// paged. A node that cannot answer is named in `errors`.
 pub(crate) async fn list_all(state: &ApiState, u: &User, operation: &str, q: &ListQuery) -> Json {
     let broker = state.broker.get();
-    let reach = q.page.saturating_mul(q.size).min(MAX_PAGE_SIZE);
-    let first = ListQuery {
-        page: 1,
-        size: reach,
-        ..q.clone()
-    };
+    // Each node's first `reach` rows (in the order asked for) hold every
+    // row of the page asked for, however the nodes' rows interleave.
+    let reach = q.page.saturating_mul(q.size);
     let targets: Vec<(String, Target)> = peers::members(&broker)
         .into_iter()
         .filter(|m| m.local || m.primary.is_some())
@@ -1215,17 +1212,22 @@ pub(crate) async fn list_all(state: &ApiState, u: &User, operation: &str, q: &Li
     let mut count = 0;
     let mut errors = Vec::new();
     for (node, t) in &targets {
-        match list_on(state, u, t, operation, &first).await {
-            Ok(page) => {
-                count += page.get("count").and_then(Json::as_i64).unwrap_or(0);
-                if let Some(Json::Array(data)) = page.get("data") {
-                    rows.extend(data.iter().cloned().map(|mut r| {
-                        r.put("node", node.as_str());
-                        r
-                    }));
-                }
-            }
-            Err(p) => errors.push(p.json().with("node", node.as_str())),
+        let (node_count, node_rows, error) = prefix(reach, MAX_PAGE_SIZE, |page, size| {
+            let query = ListQuery {
+                page,
+                size,
+                ..q.clone()
+            };
+            async move { list_on(state, u, t, operation, &query).await }
+        })
+        .await;
+        count += node_count;
+        rows.extend(node_rows.into_iter().map(|mut r| {
+            r.put("node", node.as_str());
+            r
+        }));
+        if let Some(p) = error {
+            errors.push(p.json().with("node", node.as_str()));
         }
     }
     if let Some((field, descending)) = &q.sort {
@@ -1242,6 +1244,39 @@ pub(crate) async fn list_all(state: &ApiState, u: &User, operation: &str, q: &Li
         .with("page", q.page)
         .with("size", q.size)
         .with("errors", Json::Array(errors))
+}
+
+/// A node's first `reach` rows, fetched `chunk` at a time (a node answers
+/// at most [`MAX_PAGE_SIZE`] rows a page), with the node's count of rows
+/// and the error that stopped the fetch, if one did.
+async fn prefix<F, Fut>(reach: i64, chunk: i64, mut fetch: F) -> (i64, Vec<Json>, Option<Problem>)
+where
+    F: FnMut(i64, i64) -> Fut,
+    Fut: std::future::Future<Output = Result<Json, Problem>>,
+{
+    let chunk = reach.clamp(1, chunk);
+    let (mut count, mut rows) = (0, Vec::new());
+    for page in 1.. {
+        let answer = match fetch(page, chunk).await {
+            Ok(answer) => answer,
+            Err(p) => return (count, rows, Some(p)),
+        };
+        if page == 1 {
+            count = answer.get("count").and_then(Json::as_i64).unwrap_or(0);
+        }
+        let got = match answer.get("data") {
+            Some(Json::Array(data)) => {
+                rows.extend(data.iter().cloned());
+                data.len() as i64
+            }
+            _ => 0,
+        };
+        if got < chunk || rows.len() as i64 >= reach.min(count) {
+            break;
+        }
+    }
+    rows.truncate(usize::try_from(reach).unwrap_or(usize::MAX));
+    (count, rows, None)
 }
 
 /// Two rows' values of a field, as the views compare them: numbers as
@@ -1773,6 +1808,42 @@ async fn openapi() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node of `n` rows numbered from 0, answering a page as `list_on`
+    /// does.
+    fn node(n: i64, page: i64, size: i64) -> Result<Json, Problem> {
+        let from = (page - 1) * size;
+        let data = (from..(from + size).min(n)).map(Json::from).collect();
+        Ok(Json::object()
+            .with("data", Json::Array(data))
+            .with("count", n))
+    }
+
+    /// A page beyond the first chunk of a node's rows is still filled: the
+    /// rows are fetched a chunk at a time until the page is reached.
+    #[tokio::test]
+    async fn a_node_prefix_reaches_past_one_chunk() {
+        // 10,001 rows in chunks of 100: the 101st page of 100 is row 10,000.
+        let (count, rows, error) = prefix(101 * 100, 100, |page, size| async move {
+            node(10_001, page, size)
+        })
+        .await;
+        assert!(error.is_none());
+        assert_eq!(count, 10_001);
+        assert_eq!(rows.len(), 10_001);
+        assert_eq!(rows.last(), Some(&Json::from(10_000)));
+        // Only as far as asked, and no further than the node has.
+        let (_, rows, _) = prefix(
+            250,
+            100,
+            |page, size| async move { node(10_001, page, size) },
+        )
+        .await;
+        assert_eq!(rows.len(), 250);
+        let (_, rows, _) =
+            prefix(500, 100, |page, size| async move { node(120, page, size) }).await;
+        assert_eq!(rows.len(), 120);
+    }
 
     #[test]
     fn list_queries() {
