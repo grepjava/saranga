@@ -2588,8 +2588,16 @@ impl Conn {
         let clean_start = connect.clean_start;
         // Attaching marks the state attached under the states-map lock, so the
         // session scan cannot expire this session between the lookup and the
-        // attach.
-        let (state, session_present, previous) = self.manager.attach_session(&client_id);
+        // attach; and waits for a cleanup of the client's expired session
+        // still under way, which would otherwise delete what this one makes.
+        let (state, session_present, previous) = loop {
+            match self.manager.attach_session(&client_id) {
+                Ok(attached) => break attached,
+                Err(mut cleaning) => {
+                    let _ = cleaning.changed().await;
+                }
+            }
+        };
         drop(previous);
         let mut session = ServerSession::new(
             self.broker.clone(),

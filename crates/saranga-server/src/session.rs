@@ -429,12 +429,57 @@ pub struct SessionOptions {
     pub default_address: Option<String>,
 }
 
+/// An acknowledged delivery that stays with its consumer, as delivered,
+/// when its transaction rolls back (`ProtonTransactionRefsOperation`): the
+/// consumer may be on another session than the transaction's.
+#[derive(Clone)]
+pub struct Kept {
+    consumer: ConsumerId,
+    queue: i64,
+    message_id: i64,
+}
+
 struct ServerConsumer {
     id: ConsumerId,
     queue: Queue,
     browse_only: bool,
     metrics: Arc<ConsumerMetrics>,
     filter: Option<String>,
+}
+
+/// Takes the acknowledgements `keep` names out of `tx`, so that its
+/// rollback leaves them with their consumers.
+fn take_kept(tx: &TxRef, keep: &[Kept]) -> Vec<(ConsumerId, Queue, MessageRef)> {
+    if keep.is_empty() {
+        return Vec::new();
+    }
+    let mut t = transaction::lock(tx);
+    let mut kept = Vec::new();
+    let mut i = 0;
+    while i < t.acks.len() {
+        let (q, r) = &t.acks[i];
+        let owner = keep
+            .iter()
+            .find(|k| k.message_id == r.message_id() && k.queue == q.id())
+            .map(|k| k.consumer);
+        match owner {
+            Some(id) => {
+                let (q, r) = t.acks.remove(i);
+                kept.push((id, q, r));
+            }
+            None => i += 1,
+        }
+    }
+    kept
+}
+
+/// Gives kept acknowledgements back to their consumers as delivered,
+/// counted once more.
+fn back_to_delivering(kept: Vec<(ConsumerId, Queue, MessageRef)>) {
+    for (id, q, mut r) in kept {
+        r.delivery_count += 1;
+        q.back_to_delivering(id, r);
+    }
 }
 
 /// `b` after `a`, taking `b` whole when `a` is empty (no allocation).
@@ -3110,36 +3155,60 @@ impl ServerSession {
         }
     }
 
+    /// The acknowledged message `message_id` of this session's consumer
+    /// `consumer`, to keep with it if a transaction rolls back.
+    pub fn kept(&self, consumer: i64, message_id: i64) -> Option<Kept> {
+        let c = self.consumers.get(&consumer)?;
+        Some(Kept {
+            consumer: c.id,
+            queue: c.queue.id(),
+            message_id,
+        })
+    }
+
     /// Rolls back a transaction of the caller's own, except that the
     /// acknowledged messages `keep` names (consumer ID, message ID) stay
     /// with their consumers as delivered, counted once more
     /// (`ProtonTransactionRefsOperation`).
     pub fn rollback_tx_keeping(&mut self, tx: &TxRef, keep: &[(i64, i64)]) -> Result<()> {
-        let kept: Vec<(ConsumerId, Queue, MessageRef)> = {
-            let mut t = transaction::lock(tx);
-            let mut kept = Vec::new();
-            let mut i = 0;
-            while i < t.acks.len() {
-                let (q, r) = &t.acks[i];
-                let owner = keep.iter().find_map(|(consumer, message)| {
-                    let c = self.consumers.get(consumer)?;
-                    (*message == r.message_id() && c.queue.id() == q.id()).then_some(c.id)
-                });
-                match owner {
-                    Some(id) => {
-                        let (q, mut r) = t.acks.remove(i);
-                        r.delivery_count += 1;
-                        kept.push((id, q, r));
-                    }
-                    None => i += 1,
-                }
-            }
-            kept
-        };
-        for (id, q, r) in kept {
-            q.back_to_delivering(id, r);
-        }
+        let keep: Vec<Kept> = keep
+            .iter()
+            .filter_map(|(consumer, message)| self.kept(*consumer, *message))
+            .collect();
+        self.rollback_tx_kept(tx, &keep)
+    }
+
+    /// [`rollback_tx_keeping`](Self::rollback_tx_keeping), with deliveries
+    /// of any session's consumers.
+    pub fn rollback_tx_kept(&mut self, tx: &TxRef, keep: &[Kept]) -> Result<()> {
+        let kept = take_kept(tx, keep);
+        back_to_delivering(kept);
         self.rollback_tx(tx)
+    }
+
+    /// Commits a transaction of the caller's own; if the commit rolls it
+    /// back instead (it was rollback-only, or a duplicate ID refused it),
+    /// the acknowledged messages `keep` names stay with their consumers as
+    /// delivered, as they would on a rollback the client asked for.
+    pub fn commit_tx_kept(&mut self, tx: &TxRef, keep: &[Kept]) -> Result<()> {
+        let kept = take_kept(tx, keep);
+        let ending = crate::audit::ending(&transaction::lock(tx));
+        let result = transaction::lock(tx).commit(true);
+        self.audit_ended(ending, tx, result.is_ok());
+        match result {
+            Ok(mut outcome) => {
+                outcome
+                    .acked
+                    .extend(kept.into_iter().map(|(_, q, r)| (q, r)));
+                self.finish(outcome, true)
+            }
+            Err(failed) => {
+                let (e, outcome) = *failed;
+                back_to_delivering(kept);
+                self.finish(outcome, false)?;
+                Err(e)
+            }
+        }
     }
 
     /// Rolls back a transaction of the caller's own.

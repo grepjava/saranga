@@ -1683,6 +1683,61 @@ async fn a_core_topic_over_the_wire_length_is_discarded() {
     broker.stop().unwrap();
 }
 
+/// A client connecting while the scan is still cleaning up its expired
+/// session waits for the cleanup to finish, and then gets a new session: the
+/// cleanup deletes queues and the stored record by client ID, and would
+/// otherwise delete what the new session made in the meantime.
+#[tokio::test]
+async fn a_connect_waits_for_its_expired_sessions_cleanup() {
+    use saranga_protocol_mqtt::state::{StateManager, lock};
+    let (broker, _address, _task) = start(None).await;
+    let mgr = std::sync::Arc::new(StateManager::new(&broker, false, String::new()));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let old = mgr.session_state("c");
+    {
+        let mut s = lock(&old);
+        s.client_session_expiry_interval = 1;
+        s.disconnected_time = now - 10_000;
+        s.attached = false;
+    }
+    assert!(mgr.claim_expired("c", now).is_some(), "the scan takes it");
+
+    // The client connects while the cleanup is under way.
+    let connecting = tokio::spawn({
+        let mgr = mgr.clone();
+        async move {
+            loop {
+                match mgr.attach_session("c") {
+                    Ok((_, present, _)) => return present,
+                    Err(mut cleaning) => {
+                        let _ = cleaning.changed().await;
+                    }
+                }
+            }
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !connecting.is_finished(),
+        "the connect waits for the cleanup"
+    );
+    assert!(
+        !mgr.has_session_state("c"),
+        "no new session before it is done"
+    );
+
+    mgr.expired("c");
+    let present = tokio::time::timeout(std::time::Duration::from_secs(5), connecting)
+        .await
+        .expect("the connect goes on once the cleanup is done")
+        .unwrap();
+    assert!(!present, "a new session, not the expired one");
+    broker.stop().unwrap();
+}
+
 /// A session the scan chose to expire, but to which a client has since
 /// reconnected (marking its state attached), is not removed: the re-check and
 /// removal are one atomic step, so an active client keeps its session and
@@ -1706,7 +1761,9 @@ async fn a_reattached_session_is_not_expired() {
         s.attached = false;
     }
     // A client reconnects to it.
-    let (_state, present, _prev) = mgr.attach_session("attached");
+    let (_state, present, _prev) = mgr
+        .attach_session("attached")
+        .expect("no cleanup under way");
     assert!(present, "the session already existed");
     // The scan must not claim it now that it is attached.
     assert!(

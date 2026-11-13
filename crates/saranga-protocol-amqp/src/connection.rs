@@ -4334,23 +4334,28 @@ impl Conn {
         } else {
             coordinator_channel
         };
+        // Acknowledged but unsettled deliveries, on whichever session,
+        // stay with their consumers as delivered if the transaction rolls
+        // back, whether the client asked for that or the commit failed
+        // (`ProtonTransactionRefsOperation`, the transaction discharged).
+        let keep: Vec<saranga_server::session::Kept> = acked
+            .iter()
+            .filter_map(|(ch, id)| {
+                let s = self.sessions.get(ch)?;
+                let o = s.out.get(id).filter(|o| !o.remote_settled)?;
+                s.server.kept(o.consumer, o.message_id)
+            })
+            .collect();
         let result = {
             let s = self.sessions.get_mut(&channel).expect("checked");
             if fail {
-                // Acknowledged but unsettled deliveries stay with their
-                // consumers as delivered (`ProtonTransactionRefsOperation`).
-                let keep: Vec<(i64, i64)> = acked
-                    .iter()
-                    .filter(|(ch, _)| *ch == channel)
-                    .filter_map(|(_, id)| s.out.get(id))
-                    .filter(|o| !o.remote_settled)
-                    .map(|o| (o.consumer, o.message_id))
-                    .collect();
-                s.server.rollback_tx_keeping(&txn.tx, &keep)
+                s.server.rollback_tx_kept(&txn.tx, &keep)
             } else {
-                s.server.commit_tx(&txn.tx)
+                s.server.commit_tx_kept(&txn.tx, &keep)
             }
         };
+        // Settled as accepted only once committed (`afterCommit`).
+        let committed = !fail && result.is_ok();
         // Lined up on the declaring session, they would wait for that
         // session's next answer: the coordinator's waits for them instead.
         let elsewhere = (channel != coordinator_channel).then(|| {
@@ -4370,7 +4375,7 @@ impl Conn {
                 if let Some(o) = s.out.remove(id) {
                     s.tags.give_back(o.tag);
                 }
-            } else if fail {
+            } else if !committed {
                 if let Some(o) = s.out.get_mut(id) {
                     o.txn = None;
                 }

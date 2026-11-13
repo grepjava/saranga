@@ -697,6 +697,10 @@ pub struct ConnectedClient {
 pub struct StateManager {
     broker: Weak<Broker>,
     states: Mutex<HashMap<String, StateRef>>,
+    /// Clients whose expired session is being cleaned up: a connect waits
+    /// for the sender to go before it attaches, so the cleanup cannot
+    /// delete what the new session makes. Locked after `states`.
+    expiring: Mutex<HashMap<String, tokio::sync::watch::Sender<()>>>,
     connected: Mutex<HashMap<String, ConnectedClient>>,
     store: Mutex<Option<Queue>>,
     persistence_enabled: bool,
@@ -710,6 +714,7 @@ impl StateManager {
         Self {
             broker: Arc::downgrade(broker),
             states: Mutex::default(),
+            expiring: Mutex::default(),
             connected: Mutex::default(),
             store: Mutex::default(),
             persistence_enabled,
@@ -791,12 +796,20 @@ impl StateManager {
     /// the state attached under the states-map lock so the session scan cannot
     /// expire it between the lookup and the attach. Returns the state, whether
     /// a session already existed (for Session Present), and the previous
-    /// connection's kept session to drop.
+    /// connection's kept session to drop; or, while the client's expired
+    /// session is still being cleaned up, what to wait on before trying again.
+    #[allow(clippy::type_complexity)]
     pub fn attach_session(
         &self,
         client_id: &str,
-    ) -> (StateRef, bool, Option<Box<crate::connection::Core>>) {
+    ) -> Result<
+        (StateRef, bool, Option<Box<crate::connection::Core>>),
+        tokio::sync::watch::Receiver<()>,
+    > {
         let mut states = lock(&self.states);
+        if let Some(cleaning) = lock(&self.expiring).get(client_id) {
+            return Err(cleaning.subscribe());
+        }
         let present = states.contains_key(client_id);
         let state = states
             .entry(client_id.to_owned())
@@ -812,7 +825,7 @@ impl StateManager {
             s.failed = false;
             s.session.take()
         };
-        (state, present, previous)
+        Ok((state, present, previous))
     }
 
     /// Removes an expired session only if it is still detached and expired,
@@ -831,10 +844,19 @@ impl StateManager {
         if expired {
             tracing::debug!("Removing MQTT session state for: {client_id}");
             states.remove(client_id);
+            let (cleaning, _) = tokio::sync::watch::channel(());
+            lock(&self.expiring).insert(client_id.to_owned(), cleaning);
             Some(state)
         } else {
             None
         }
+    }
+
+    /// The cleanup of a session [`claim_expired`](Self::claim_expired) took
+    /// is done: the client can connect again.
+    pub fn expired(&self, client_id: &str) {
+        let _states = lock(&self.states);
+        lock(&self.expiring).remove(client_id);
     }
 
     pub fn session_states(&self) -> Vec<(String, StateRef)> {
@@ -941,6 +963,7 @@ impl StateManager {
                 continue;
             };
             crate::connection::expire_detached(self, &state).await;
+            self.expired(&client_id);
         }
     }
 }

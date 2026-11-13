@@ -285,6 +285,53 @@ impl Client {
     }
 }
 
+impl Client {
+    /// An unsettled Accepted disposition of `id` in transaction `txn_id`,
+    /// or outside any with `txn_id` `None`.
+    async fn accept(&mut self, channel: u16, id: u32, txn_id: Option<&[u8]>, settled: bool) {
+        let state = match txn_id {
+            Some(txn_id) => DeliveryState::Transactional(TransactionalState {
+                txn_id: txn_id.to_vec(),
+                outcome: Some(Box::new(DeliveryState::Accepted)),
+            }),
+            None => DeliveryState::Accepted,
+        };
+        self.send(
+            channel,
+            Performative::Disposition(Disposition {
+                role: Role::Receiver,
+                first: id,
+                last: None,
+                settled,
+                state: Some(state),
+                batchable: false,
+            }),
+            &[],
+        )
+        .await;
+    }
+
+    /// Whether the broker settles delivery `id` on `channel` within `wait`.
+    async fn settles(&mut self, channel: u16, id: u32, wait: Duration) -> bool {
+        tokio::time::timeout(
+            wait,
+            self.until(|ch, p| {
+                ch == channel
+                    && matches!(p, Performative::Disposition(d)
+                        if d.role == Role::Sender && d.first == id && d.settled)
+            }),
+        )
+        .await
+        .is_ok()
+    }
+}
+
+/// A message `m` with the duplicate ID `x`.
+const DUPLICATE: &[u8] = &[
+    0x00, 0x53, 0x74, 0xc1, 18, 2, 0xa1, 12, b'_', b'A', b'M', b'Q', b'_', b'D', b'U', b'P', b'L',
+    b'_', b'I', b'D', 0xa1, 1, b'x', 0x00, 0x53, 0x77, 0xa1, 1, b'm',
+];
+
 /// A persistent broker, so that a commit's queue updates wait for its
 /// journal write, with a durable queue `q`.
 async fn broker(dir: &tempfile::TempDir) -> (Arc<Broker>, Queue) {
@@ -488,6 +535,96 @@ async fn a_transactional_modified_can_be_undeliverable_here() {
         "not given again to the consumer that found it undeliverable"
     );
     assert_eq!(q.message_count(), 1);
+    task.abort();
+    broker.stop().unwrap();
+}
+
+/// A commit that rolls the transaction back instead (it was made
+/// rollback-only by a refused send) leaves the deliveries acknowledged in
+/// it unsettled, with their consumer, as a rollback does: they are settled
+/// as accepted only once committed.
+#[tokio::test]
+async fn a_failed_commit_does_not_settle_its_acknowledgements() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, q) = broker(&dir).await;
+    let (mut c, task) = Client::connect(&broker).await;
+    c.begin(0).await;
+    c.attach(0, 0, None).await;
+    c.attach(0, 1, Some("q")).await;
+    let outcome = c.transfer(0, 1, None, DUPLICATE).await;
+    assert!(matches!(outcome, DeliveryState::Accepted), "{outcome:?}");
+    c.receiver(0, 2, "q", 2).await;
+    let id = c
+        .delivery(0, Duration::from_secs(5))
+        .await
+        .expect("delivered");
+    let txn = c.declare(0, 0).await;
+    c.accept(0, id, Some(&txn), false).await;
+    // The same duplicate ID again, in the transaction: refused, and the
+    // transaction can only roll back.
+    let state = DeliveryState::Transactional(TransactionalState {
+        txn_id: txn.clone(),
+        ..Default::default()
+    });
+    c.transfer(0, 1, Some(state), DUPLICATE).await;
+    let outcome = c.coordinate(0, 0, &discharge(txn, false)).await;
+    assert!(matches!(outcome, DeliveryState::Rejected(_)), "{outcome:?}");
+    assert!(
+        !c.settles(0, id, Duration::from_millis(500)).await,
+        "not settled as accepted by a commit that failed"
+    );
+    assert_eq!(
+        c.delivery(0, Duration::from_millis(300)).await,
+        None,
+        "kept with its consumer, not given again"
+    );
+    // Still the client's to settle.
+    c.accept(0, id, None, true).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while q.message_count() != 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(q.message_count(), 0, "acknowledged by its settlement");
+    task.abort();
+    broker.stop().unwrap();
+}
+
+/// A rollback keeps a delivery acknowledged in the transaction but not
+/// settled with its consumer even when it was acknowledged on another
+/// session than the one that declared the transaction.
+#[tokio::test]
+async fn a_rollback_keeps_another_sessions_unsettled_acknowledgement() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, q) = broker(&dir).await;
+    let (mut c, task) = Client::connect(&broker).await;
+    c.begin(0).await;
+    c.attach(0, 0, None).await;
+    c.attach(0, 1, Some("q")).await;
+    let outcome = c
+        .transfer(0, 1, None, &[0x00, 0x53, 0x77, 0xa1, 1, b'm'])
+        .await;
+    assert!(matches!(outcome, DeliveryState::Accepted), "{outcome:?}");
+    c.begin(1).await;
+    c.receiver(1, 0, "q", 2).await;
+    let id = c
+        .delivery(1, Duration::from_secs(5))
+        .await
+        .expect("delivered");
+    let txn = c.declare(0, 0).await;
+    c.accept(1, id, Some(&txn), false).await;
+    let outcome = c.coordinate(0, 0, &discharge(txn, true)).await;
+    assert!(matches!(outcome, DeliveryState::Accepted), "{outcome:?}");
+    assert_eq!(
+        c.delivery(1, Duration::from_millis(500)).await,
+        None,
+        "kept with its consumer, not given again under another delivery ID"
+    );
+    c.accept(1, id, None, true).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while q.message_count() != 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(q.message_count(), 0, "acknowledged by its settlement");
     task.abort();
     broker.stop().unwrap();
 }
