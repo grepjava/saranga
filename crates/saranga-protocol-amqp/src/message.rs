@@ -1026,6 +1026,11 @@ impl AmqpMessage {
         }
     }
 
+    /// The properties section's `user-id`.
+    pub fn set_user_id(&mut self, user: Vec<u8>) {
+        self.properties_mut().user_id = Some(user);
+    }
+
     /// `removeProperty`.
     pub fn remove_property(&mut self, key: &str) -> Option<Value> {
         let props = self.application_properties_mut();

@@ -19,6 +19,7 @@ const HDR_GROUP_ID: &str = "_AMQ_GROUP_ID";
 const HDR_GROUP_SEQUENCE: &str = "_AMQ_GROUP_SEQUENCE";
 const HDR_SCHEDULED_DELIVERY_TIME: &str = "_AMQ_SCHED_DELIVERY";
 const HDR_VALIDATED_USER: &str = "_AMQ_VALIDATED_USER";
+const JMSX_USER_ID: &str = "JMSXUserID";
 const HDR_INGRESS_TIMESTAMP: &str = "_AMQ_INGRESS_TIMESTAMP";
 const HDR_ROUTE_TO_IDS: &str = "_AMQ_ROUTE_TO";
 const ORIG_PREFIX: &str = "_AMQ_ORIG_";
@@ -374,7 +375,20 @@ impl NativeMessage for AmqpNative {
                 continue;
             }
             match key.as_str() {
-                HDR_ROUTING_TYPE | HDR_GROUP_ID | HDR_GROUP_SEQUENCE | HDR_VALIDATED_USER => {}
+                HDR_ROUTING_TYPE | HDR_GROUP_ID | HDR_GROUP_SEQUENCE => {}
+                // `populate-validated-user`: the user the session
+                // authenticated is the message's `user-id`, which is what a
+                // Core or JMS consumer reads as `_AMQ_VALIDATED_USER` and
+                // `JMSXUserID`, in place of any the properties gave.
+                HDR_VALIDATED_USER => {
+                    if let PropertyValue::String(user) = v {
+                        m.set_user_id(user.to_string_lossy().into_bytes());
+                        m.remove_property(JMSX_USER_ID);
+                        m.remove_property(HDR_VALIDATED_USER);
+                        m.set_extra_property(HDR_VALIDATED_USER, v.clone());
+                        reencode = true;
+                    }
+                }
                 HDR_SCHEDULED_DELIVERY_TIME => {
                     if let PropertyValue::Long(t) = v {
                         m.set_scheduled_delivery_time(*t);

@@ -5040,28 +5040,13 @@ impl Conn {
                         );
                     }
                 }
-                Some(DeliveryState::Released) => {
+                Some(
+                    state @ (DeliveryState::Released
+                    | DeliveryState::Rejected(_)
+                    | DeliveryState::Modified(_)),
+                ) => {
                     if !browse {
-                        s.server.cancel_one(consumer, message_id, false);
-                    }
-                }
-                Some(DeliveryState::Rejected(_)) => {
-                    if !browse {
-                        if treat_reject {
-                            s.server.cancel_one(consumer, message_id, true);
-                        } else {
-                            s.server.reject(consumer, message_id);
-                        }
-                    }
-                }
-                Some(DeliveryState::Modified(m)) => {
-                    if !browse {
-                        let failed = m.delivery_failed.unwrap_or(false);
-                        if m.undeliverable_here.unwrap_or(false) {
-                            s.server.cancel_undeliverable(consumer, message_id, failed);
-                        } else {
-                            s.server.cancel_one(consumer, message_id, failed);
-                        }
+                        return_outcome(&s.server, consumer, message_id, state, treat_reject);
                     }
                 }
                 Some(DeliveryState::Transactional(_)) => {
@@ -5106,16 +5091,23 @@ impl Conn {
                                 );
                             }
                         }
-                        // Other outcomes in a transaction: as without one.
-                        Some(DeliveryState::Released) => {
-                            s.server.cancel_one(consumer, message_id, false)
+                        // Other outcomes in a transaction: as without one
+                        // (COMPAT: Artemis does nothing with them).
+                        Some(
+                            state @ (DeliveryState::Released
+                            | DeliveryState::Rejected(_)
+                            | DeliveryState::Modified(_)),
+                        ) => {
+                            if !browse {
+                                return_outcome(
+                                    &s.server,
+                                    consumer,
+                                    message_id,
+                                    state,
+                                    treat_reject,
+                                );
+                            }
                         }
-                        Some(DeliveryState::Rejected(_)) => s.server.reject(consumer, message_id),
-                        Some(DeliveryState::Modified(m)) => s.server.cancel_one(
-                            consumer,
-                            message_id,
-                            m.delivery_failed.unwrap_or(false),
-                        ),
                         _ => settle = false,
                     }
                 }
@@ -5321,6 +5313,33 @@ struct Anonymous<'a> {
 
 /// `validateAddressOnAnonymousLink`: an anonymous relay sending to an
 /// address of another full policy than the last's is warned about once.
+/// `ProtonServerSenderContext.onMessage`'s Released, Rejected and Modified:
+/// the message goes back to the queue (failed for a Rejected under
+/// `amqpTreatRejectAsUnmodifiedDeliveryFailed`, and kept from this consumer
+/// for an undeliverable-here Modified), or a Rejected one is rejected.
+fn return_outcome(
+    server: &ServerSession,
+    consumer: i64,
+    message_id: i64,
+    outcome: &DeliveryState,
+    treat_reject: bool,
+) {
+    match outcome {
+        DeliveryState::Released => server.cancel_one(consumer, message_id, false),
+        DeliveryState::Rejected(_) if treat_reject => server.cancel_one(consumer, message_id, true),
+        DeliveryState::Rejected(_) => server.reject(consumer, message_id),
+        DeliveryState::Modified(m) => {
+            let failed = m.delivery_failed.unwrap_or(false);
+            if m.undeliverable_here.unwrap_or(false) {
+                server.cancel_undeliverable(consumer, message_id, failed);
+            } else {
+                server.cancel_one(consumer, message_id, failed);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn validate_anonymous_address(server: &ServerSession, address: &str, a: &mut Anonymous<'_>) {
     if a.address.as_ref().is_some_and(|l| l.eq_str(address)) {
         return;

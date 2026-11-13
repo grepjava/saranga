@@ -22,12 +22,20 @@ struct Client {
 
 impl Client {
     async fn connect(broker: &Arc<Broker>) -> (Self, tokio::task::JoinHandle<()>) {
+        Self::connect_to(broker, Acceptor::default()).await
+    }
+
+    /// Connects through an acceptor with `acceptor`'s parameters.
+    async fn connect_to(
+        broker: &Arc<Broker>,
+        acceptor: Acceptor,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         let task = tokio::spawn({
             let broker = broker.clone();
             async move {
-                let _ = broker.serve_acceptor(l, Acceptor::default()).await;
+                let _ = broker.serve_acceptor(l, acceptor).await;
             }
         });
         let mut s = TcpStream::connect(addr).await.unwrap();
@@ -205,6 +213,76 @@ impl Client {
             "{outcome:?}"
         );
     }
+
+    /// Attaches a receiving link, `handle`, to `address` with `credit`.
+    async fn receiver(&mut self, channel: u16, handle: u32, address: &str, credit: u32) {
+        self.send(
+            channel,
+            Performative::Attach(Attach {
+                name: format!("{channel}-{handle}"),
+                handle,
+                role: Role::Receiver,
+                source: Some(Source {
+                    address: Some(address.into()),
+                    capabilities: Some(vec!["queue".into()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            &[],
+        )
+        .await;
+        self.until(|ch, p| ch == channel && matches!(p, Performative::Attach(_)))
+            .await;
+        self.send(
+            channel,
+            Performative::Flow(Flow {
+                incoming_window: 100,
+                next_outgoing_id: 0,
+                outgoing_window: 100,
+                handle: Some(handle),
+                delivery_count: Some(0),
+                link_credit: Some(credit),
+                ..Default::default()
+            }),
+            &[],
+        )
+        .await;
+    }
+
+    /// The next delivery on `channel`, within `wait`.
+    async fn delivery(&mut self, channel: u16, wait: Duration) -> Option<u32> {
+        tokio::time::timeout(
+            wait,
+            self.until(|ch, p| ch == channel && matches!(p, Performative::Transfer(_))),
+        )
+        .await
+        .ok()
+        .map(|p| match p {
+            Performative::Transfer(t) => t.delivery_id.expect("a delivery ID"),
+            _ => unreachable!(),
+        })
+    }
+
+    /// The receiver's settled disposition of `id`, in transaction `txn_id`.
+    async fn dispose_in(&mut self, channel: u16, id: u32, txn_id: &[u8], outcome: DeliveryState) {
+        self.send(
+            channel,
+            Performative::Disposition(Disposition {
+                role: Role::Receiver,
+                first: id,
+                last: None,
+                settled: true,
+                state: Some(DeliveryState::Transactional(TransactionalState {
+                    txn_id: txn_id.to_vec(),
+                    outcome: Some(Box::new(outcome)),
+                })),
+                batchable: false,
+            }),
+            &[],
+        )
+        .await;
+    }
 }
 
 /// A persistent broker, so that a commit's queue updates wait for its
@@ -337,6 +415,78 @@ async fn an_ended_sessions_transaction_commits_through_another() {
     c.end(0).await;
     let outcome = c.coordinate(1, 0, &discharge(txn, false)).await;
     assert!(matches!(outcome, DeliveryState::Accepted), "{outcome:?}");
+    assert_eq!(q.message_count(), 1);
+    task.abort();
+    broker.stop().unwrap();
+}
+
+/// A Rejected outcome in a transaction is applied as one outside it (see
+/// COMPAT), so under `amqpTreatRejectAsUnmodifiedDeliveryFailed` it returns
+/// the message to the queue, failed, instead of rejecting it.
+#[tokio::test]
+async fn a_transactional_reject_can_be_treated_as_a_failed_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, q) = broker(&dir).await;
+    let mut acceptor = Acceptor::default();
+    acceptor.params.insert(
+        "amqpTreatRejectAsUnmodifiedDeliveryFailed".to_owned(),
+        "true".to_owned(),
+    );
+    let (mut c, task) = Client::connect_to(&broker, acceptor).await;
+    c.begin(0).await;
+    c.attach(0, 0, None).await;
+    c.attach(0, 1, Some("q")).await;
+    let outcome = c
+        .transfer(0, 1, None, &[0x00, 0x53, 0x77, 0xa1, 1, b'm'])
+        .await;
+    assert!(matches!(outcome, DeliveryState::Accepted), "{outcome:?}");
+    c.receiver(0, 2, "q", 1).await;
+    let id = c
+        .delivery(0, Duration::from_secs(5))
+        .await
+        .expect("delivered");
+    let txn = c.declare(0, 0).await;
+    c.dispose_in(0, id, &txn, DeliveryState::Rejected(Rejected::default()))
+        .await;
+    let outcome = c.coordinate(0, 0, &discharge(txn, false)).await;
+    assert!(matches!(outcome, DeliveryState::Accepted), "{outcome:?}");
+    assert_eq!(q.message_count(), 1, "returned to the queue, not rejected");
+    task.abort();
+    broker.stop().unwrap();
+}
+
+/// A Modified outcome in a transaction keeps an undeliverable-here message
+/// from the consumer that gave it, as one outside a transaction does.
+#[tokio::test]
+async fn a_transactional_modified_can_be_undeliverable_here() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, q) = broker(&dir).await;
+    let (mut c, task) = Client::connect(&broker).await;
+    c.begin(0).await;
+    c.attach(0, 0, None).await;
+    c.attach(0, 1, Some("q")).await;
+    let outcome = c
+        .transfer(0, 1, None, &[0x00, 0x53, 0x77, 0xa1, 1, b'm'])
+        .await;
+    assert!(matches!(outcome, DeliveryState::Accepted), "{outcome:?}");
+    c.receiver(0, 2, "q", 2).await;
+    let id = c
+        .delivery(0, Duration::from_secs(5))
+        .await
+        .expect("delivered");
+    let txn = c.declare(0, 0).await;
+    let modified = Modified {
+        delivery_failed: Some(true),
+        undeliverable_here: Some(true),
+        ..Default::default()
+    };
+    c.dispose_in(0, id, &txn, DeliveryState::Modified(modified))
+        .await;
+    assert_eq!(
+        c.delivery(0, Duration::from_millis(500)).await,
+        None,
+        "not given again to the consumer that found it undeliverable"
+    );
     assert_eq!(q.message_count(), 1);
     task.abort();
     broker.stop().unwrap();
