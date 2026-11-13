@@ -236,6 +236,47 @@ async fn one_transaction_cannot_send_an_id_twice() {
     }
 }
 
+/// Two transactions sending one ID before either commits: the second to
+/// commit is a duplicate and rolls back, so the message is delivered once.
+/// One that rolls back leaves the ID to the other.
+#[tokio::test]
+async fn overlapping_transactions_deliver_an_id_once() {
+    for persistence in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = start(dir.path(), persistence).await;
+        create_full_queue(&broker).await;
+        let mut first = session_with(&broker, false);
+        let mut second = session_with(&broker, false);
+        send(&mut first, Some("o1")).await.unwrap();
+        send(&mut second, Some("o1")).await.unwrap();
+        first.commit().unwrap();
+        first.take_completion().wait().await.unwrap();
+        let e = second.commit().expect_err("both transactions committed o1");
+        second.take_completion().wait().await.unwrap();
+        assert!(e.message.contains("Duplicate"), "{}", e.message);
+        assert_eq!(
+            count(&broker).await,
+            Json::Long(1),
+            "persistence {persistence}"
+        );
+        // A transaction that rolls back takes no ID from another.
+        send(&mut first, Some("o2")).await.unwrap();
+        send(&mut second, Some("o2")).await.unwrap();
+        first.rollback(false, false).await;
+        first.take_completion().wait().await.unwrap();
+        second.commit().unwrap();
+        second.take_completion().wait().await.unwrap();
+        assert_eq!(
+            count(&broker).await,
+            Json::Long(2),
+            "persistence {persistence}"
+        );
+        first.close(false).await;
+        second.close(false).await;
+        broker.stop().unwrap();
+    }
+}
+
 /// A send of an ID a commit took, before that commit's record is written,
 /// is already a duplicate.
 #[tokio::test]

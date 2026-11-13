@@ -108,6 +108,9 @@ pub struct Transaction {
     pub exception: Option<BrokerError>,
     /// Duplicate IDs that join their caches on commit.
     pub duplicates: Vec<crate::duplicate::PendingId>,
+    /// Those IDs, held as duplicates from the commit (or prepare) until
+    /// they join their caches.
+    pub held: Vec<crate::duplicate::Reservation>,
     /// `createTime`, in epoch milliseconds.
     pub created: i64,
     /// The XA timeout the client set; -1 for the resource manager's.
@@ -141,6 +144,8 @@ pub struct Outcome {
     pub cancel: Vec<(Queue, MessageRef)>,
     /// Commit: duplicate IDs for their caches.
     pub duplicates: Vec<crate::duplicate::PendingId>,
+    /// Commit: the same IDs, held as duplicates until they are added.
+    pub held: Vec<crate::duplicate::Reservation>,
     /// The transaction's paging, committed or rolled back with it.
     pub paging: crate::paging::TxPaging,
     pub committed: bool,
@@ -177,6 +182,7 @@ impl Outcome {
         for d in self.duplicates {
             d.apply();
         }
+        drop(self.held);
         for (q, r) in self.add {
             q.add_counted(r);
         }
@@ -240,6 +246,7 @@ impl Transaction {
             acks: Vec::new(),
             exception: None,
             duplicates: Vec::new(),
+            held: Vec::new(),
             created: crate::message::now_millis(),
             timeout_seconds: -1,
             paging: crate::paging::TxPaging::default(),
@@ -278,6 +285,7 @@ impl Transaction {
             q.ref_down(&r);
         }
         self.duplicates.clear();
+        self.held.clear();
         self.replicated.clear();
         Outcome {
             record: journaled.then_some(TxRecord::Rollback(self.id)),
@@ -312,6 +320,11 @@ impl Transaction {
         if !valid {
             return Err(Box::new((invalid_state(self.state), Outcome::default())));
         }
+        if self.state == TxState::Active
+            && let Err(e) = self.hold_duplicates()
+        {
+            return Err(Box::new((e, self.internal_rollback())));
+        }
         // doCommit: a commit record for persistent work (paged messages'
         // page transaction among it), or to end a prepared branch.
         let journaled = self.persistent
@@ -324,10 +337,43 @@ impl Transaction {
             acked: std::mem::take(&mut self.acks),
             cancel: Vec::new(),
             duplicates: std::mem::take(&mut self.duplicates),
+            held: std::mem::take(&mut self.held),
             paging: std::mem::take(&mut self.paging),
             committed: true,
             replicated: std::mem::take(&mut self.replicated),
         })
+    }
+
+    /// Holds the transaction's duplicate IDs from its commit (or prepare)
+    /// on, so that of two transactions sending one ID, the second to commit
+    /// fails as a duplicate, as a send of an ID already committed does.
+    /// Artemis checks the ID only when it is sent and adds it to the cache
+    /// at commit, so both commit and the message is delivered twice.
+    fn hold_duplicates(&mut self) -> Result<(), BrokerError> {
+        if self.duplicates.is_empty() {
+            return Ok(());
+        }
+        match crate::duplicate::PendingId::hold(&self.duplicates) {
+            Ok(held) => {
+                self.held = held;
+                Ok(())
+            }
+            Err(id) => {
+                let id = String::from_utf8_lossy(&id);
+                tracing::warn!(
+                    "AMQ222059: Duplicate message detected - transaction {} will not be committed. Duplicate ID: {id}",
+                    self.id
+                );
+                let e = BrokerError::new(
+                    saranga_core_protocol::ErrorType::DuplicateIdRejected,
+                    format!(
+                        "Duplicate message detected - message will not be routed. Duplicate ID: {id}"
+                    ),
+                );
+                self.exception = Some(e.clone());
+                Err(e)
+            }
+        }
     }
 
     /// `TransactionImpl.rollback`.
@@ -379,6 +425,9 @@ impl Transaction {
                 BrokerError::illegal_state("Cannot prepare non XA transaction"),
                 Outcome::default(),
             )));
+        }
+        if let Err(e) = self.hold_duplicates() {
+            return Err(Box::new((e, self.internal_rollback())));
         }
         self.state = TxState::Prepared;
         Ok(())

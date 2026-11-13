@@ -448,7 +448,7 @@ async fn send_as(
     session.close(false).await;
     // The routed message reaches its queues once journaled.
     let written = session.take_completion().wait().await;
-    sent.map_err(|e| e.message)?;
+    let id = sent.map_err(|e| e.message)?;
     written.map_err(|e| e.to_string())?;
     Ok(id.to_string())
 }

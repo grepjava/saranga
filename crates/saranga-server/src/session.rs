@@ -1118,13 +1118,12 @@ impl ServerSession {
         }
         if defer && self.broker.storage().is_some() {
             // A send of one of the commit's duplicate IDs before its record
-            // is written is a duplicate already; if the write fails, the
-            // IDs are given back with the dropped update.
-            let reserved: Vec<_> = outcome.duplicates.iter().map(|d| d.reserve()).collect();
+            // is written is a duplicate already (the commit holds them); if
+            // the write fails, the IDs are given back with the dropped
+            // update.
             let replicated = self.replicated.clone();
             self.actions.push(Box::new(move || {
                 let waits = outcome.apply();
-                drop(reserved);
                 if !waits.is_empty() {
                     lock_replicated(&replicated).extend(waits);
                 }
@@ -1234,14 +1233,20 @@ impl ServerSession {
     }
 
     /// As [`ServerSession::send`], keeping the message's ID (a message the
-    /// broker made, as management's `sendMessage` does).
-    pub async fn send_with_id(&mut self, message: CoreMessage) -> Result<()> {
+    /// broker made, as management's `sendMessage` does) unless it is too
+    /// big for a journal record and becomes a large message with an ID of
+    /// its own. Returns the ID it was sent with.
+    pub async fn send_with_id(&mut self, mut message: CoreMessage) -> Result<i64> {
         let tx = if self.auto_commit_sends {
             None
         } else {
             self.tx.clone()
         };
-        self.send_message(message, Outgoing::Core(None), tx).await
+        let large = self.check_large_message(&mut message)?;
+        let id = message.message_id;
+        self.send_message(message, Outgoing::Core(large), tx)
+            .await
+            .map(|()| id)
     }
 
     /// Sends a message kept in its own protocol's encoding, which has no ID

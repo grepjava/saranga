@@ -2226,7 +2226,7 @@ impl PostOffice {
             creator,
             mirror,
         } = hop;
-        let (real, _) = split_fqqn(address);
+        let (real, fqqn_queue) = split_fqqn(address);
         // Fast check under a single read lock when the address already exists
         // and has at least one local binding.
         let (has_addr, has_local) = if auto_create {
@@ -2248,11 +2248,13 @@ impl PostOffice {
         // routeFromCluster: a message naming the queues it goes to
         // (`_AMQ_ROUTE_TO`, as `artemis data imp` and cluster bridges send
         // it) goes to those of the address's queues, unless an exclusive
-        // divert takes it. The header goes.
+        // divert takes it. The header goes. A message sent to one queue
+        // (`address::queue`) reaches no other: the send was authorized for
+        // that queue only.
         if let Some((ids, stripped)) = route_to(message)
             && !self.has_exclusive_divert(&stripped, real)
         {
-            let queues = self.queues_by_id(real, &ids, &stripped);
+            let queues = self.queues_by_id(real, fqqn_queue, &ids, &stripped);
             self.count_route(real, !queues.is_empty());
             if !queues.is_empty() {
                 out.push((stripped, queues));
@@ -2353,7 +2355,13 @@ impl PostOffice {
 
     /// The queues of `address` with these IDs, in their order; an ID bound
     /// to nothing there is logged (`bindingNotFound`).
-    fn queues_by_id(&self, address: &str, ids: &[i64], message: &MessageRef) -> Vec<Queue> {
+    fn queues_by_id(
+        &self,
+        address: &str,
+        only: Option<&str>,
+        ids: &[i64],
+        message: &MessageRef,
+    ) -> Vec<Queue> {
         let state = self.read();
         let bound: &[Queue] = state
             .addresses
@@ -2362,6 +2370,12 @@ impl PostOffice {
         let mut out = Vec::new();
         for &id in ids {
             match bound.iter().find(|q| q.id() == id) {
+                Some(q) if only.is_some_and(|n| &**q.name() != n) => tracing::warn!(
+                    "Message {} sent to {address}::{} names queue {} in _AMQ_ROUTE_TO; not routed there",
+                    message.message_id(),
+                    only.unwrap_or_default(),
+                    q.name()
+                ),
                 Some(q) => out.push(q.clone()),
                 None => tracing::warn!(
                     "AMQ222196: Could not find binding with id={id} on routeFromCluster for message={} binding = {address}",

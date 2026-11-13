@@ -241,26 +241,44 @@ impl std::fmt::Debug for PendingId {
 }
 
 impl PendingId {
-    /// Holds the ID as a duplicate while its committed transaction waits
-    /// for its record to be written, until the guard is dropped: after
-    /// [`Self::apply`] has given it its slot, or when the write failed.
-    pub fn reserve(&self) -> Reservation {
-        lock(&self.cache).reserve(&self.id);
-        Reservation {
-            cache: self.cache.clone(),
-            id: self.id.clone(),
-        }
-    }
-
     pub fn apply(self) {
         lock(&self.cache).add_in_memory(self.id, self.record);
     }
+
+    /// Takes a committing transaction's IDs, each as a duplicate from now
+    /// on, unless one is already held (by a send, or by another
+    /// transaction that committed or is committing it): that ID is
+    /// returned, and none is taken. The guards are dropped once
+    /// [`Self::apply`] has given the IDs their slots, or when the commit's
+    /// record could not be written.
+    pub fn hold(ids: &[PendingId]) -> Result<Vec<Reservation>, Vec<u8>> {
+        let mut held = Vec::with_capacity(ids.len());
+        for d in ids {
+            let mut c = lock(&d.cache);
+            if c.contains(&d.id) {
+                return Err(d.id.clone());
+            }
+            c.reserve(&d.id);
+            drop(c);
+            held.push(Reservation {
+                cache: d.cache.clone(),
+                id: d.id.clone(),
+            });
+        }
+        Ok(held)
+    }
 }
 
-/// An ID [`PendingId::reserve`] holds, given back when this is dropped.
+/// An ID [`PendingId::hold`] holds, given back when this is dropped.
 pub struct Reservation {
     cache: CacheRef,
     id: Vec<u8>,
+}
+
+impl std::fmt::Debug for Reservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Reservation({})", String::from_utf8_lossy(&self.id))
+    }
 }
 
 impl Drop for Reservation {

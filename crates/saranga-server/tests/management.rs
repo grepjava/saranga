@@ -634,3 +634,28 @@ async fn an_ambiguous_base64_transaction_is_not_completed() {
     );
     broker.stop().unwrap();
 }
+
+/// Import sends a message too big for a journal record as a large message,
+/// as a client's send is, so a large message exported imports again.
+#[tokio::test]
+async fn import_takes_a_body_bigger_than_a_journal_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(dir.path()).await;
+    let config = r#"{"name":"big","address":"big","routing-type":"ANYCAST","durable":true,"auto-create-address":true}"#;
+    op(&broker, "broker", "createQueue", vec![s(config)]).await;
+    let body: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    let message = saranga_message::CoreMessage {
+        durable: true,
+        body: body.clone().into(),
+        ..Default::default()
+    };
+    let (sent, error) =
+        saranga_server::management::import_messages(&broker, "big", vec![message]).await;
+    assert_eq!((sent, error), (1, None));
+    let q = broker.post_office().queue("big").unwrap();
+    let browsed = q.browse_matching(None, 10).await;
+    assert_eq!(browsed.len(), 1);
+    let large = browsed[0].message.large().expect("a large message");
+    assert_eq!(large.read_all().unwrap(), body);
+    broker.stop().unwrap();
+}
