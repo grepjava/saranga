@@ -747,7 +747,9 @@ impl StateManager {
                 return;
             }
         };
-        for r in queue.browse().await {
+        // Every record, those in pages too, as Artemis's `browserIterator`
+        // reads them.
+        for r in queue.browse_matching(None, usize::MAX).await {
             let message = r.message.core();
             let client_id = message
                 .properties

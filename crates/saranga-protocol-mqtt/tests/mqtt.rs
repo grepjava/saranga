@@ -32,15 +32,30 @@ async fn start_scanning(
     std::net::SocketAddr,
     tokio::task::JoinHandle<()>,
 ) {
+    start_configured(instance, scan_ms, "").await
+}
+
+/// [`start_scanning`] with `extra` added to a persistent instance's
+/// `<core>` configuration.
+async fn start_configured(
+    instance: Option<&Path>,
+    scan_ms: i64,
+    extra: &str,
+) -> (
+    Arc<Broker>,
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<()>,
+) {
     let mut config = match instance {
         Some(dir) => {
-            let file = cfg::BrokerConfig::parse(
+            let file = cfg::BrokerConfig::parse(&format!(
                 r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
                      <persistence-enabled>true</persistence-enabled>
                      <journal-pool-files>2</journal-pool-files>
                      <journal-file-size>65536</journal-file-size>
-                   </core></configuration>"#,
-            )
+                     {extra}
+                   </core></configuration>"#
+            ))
             .unwrap();
             BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir).unwrap()
         }
@@ -1950,4 +1965,99 @@ async fn shared_subscribers_racing_to_make_the_queue_all_subscribe() {
     for t in tasks {
         t.await.expect("every member gets its SUBACK");
     }
+}
+
+/// Session records the session store has paged out are loaded at start
+/// with the rest: every client finds its session.
+#[tokio::test]
+async fn paged_session_records_are_loaded_at_start() {
+    const PAGING: &str = r#"<address-settings>
+           <address-setting match="$sys.mqtt.sessions">
+             <max-size-bytes>1</max-size-bytes>
+             <page-size-bytes>10240</page-size-bytes>
+             <address-full-policy>PAGE</address-full-policy>
+           </address-setting>
+         </address-settings>"#;
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, address, task) = start_configured(Some(dir.path()), 5000, PAGING).await;
+    for i in 0..8 {
+        let (mut c, _) =
+            Client::open_with(address, &connect5(&format!("paged{i}"), true, 600, None)).await;
+        let mut body = vec![0, 1, 0];
+        body.extend(string(&format!("paged/{i}")));
+        body.push(1);
+        c.send(&packet(0x82, &body)).await;
+        assert_eq!(c.packet().await.unwrap()[0], 0x90, "a SUBACK");
+        c.send(&[0xE0, 0]).await;
+        assert_eq!(c.packet().await, None);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        broker
+            .post_office()
+            .paging_store("$sys.mqtt.sessions")
+            .is_paging(),
+        "the session store pages"
+    );
+    broker.stop().unwrap();
+    task.abort();
+    drop(broker);
+
+    let (_broker, address, _task) = start_configured(Some(dir.path()), 5000, PAGING).await;
+    for i in 0..8 {
+        let (_c, connack) =
+            Client::open_with(address, &connect5(&format!("paged{i}"), false, 600, None)).await;
+        assert_eq!(connack[2], 1, "paged{i}: session present");
+    }
+}
+
+/// A restored session expiring while another member is on its configured
+/// shared subscription queue leaves the backlog to that member.
+#[tokio::test]
+async fn an_expiring_restored_member_keeps_a_configured_shared_backlog() {
+    const QUEUE: &str = r#"<addresses>
+           <address name="orders"><multicast><queue name="g.orders"/></multicast></address>
+         </addresses>"#;
+    let dir = tempfile::tempdir().unwrap();
+    let mut subscribe = vec![0, 1, 0];
+    subscribe.extend(string("$share/g/orders"));
+    subscribe.push(1);
+    let (broker, address, task) = start_configured(Some(dir.path()), 100, QUEUE).await;
+    let (mut a, _) = Client::open_with(address, &connect5("member-a", true, 1, None)).await;
+    a.send(&packet(0x82, &subscribe)).await;
+    assert_eq!(a.packet().await.expect("a SUBACK")[0], 0x90);
+    a.send(&[0xE0, 0]).await;
+    assert_eq!(a.packet().await, None);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    broker.stop().unwrap();
+    task.abort();
+    drop(broker);
+
+    // A's session is restored and expires; B is on the queue meanwhile and
+    // takes one message at a time.
+    let (broker, address, _task) = start_configured(Some(dir.path()), 100, QUEUE).await;
+    let queue = broker.post_office().queue("g.orders").unwrap();
+    assert!(queue.config().configuration_managed);
+    let (mut b, _) = Client::open_with(address, &connect5_one_at_a_time("member-b")).await;
+    b.send(&packet(0x82, &subscribe)).await;
+    assert_eq!(b.packet().await.expect("a SUBACK")[0], 0x90);
+    for id in 1..=4 {
+        let mut message = saranga_message::CoreMessage {
+            message_id: id,
+            durable: true,
+            address: Some("orders".into()),
+            body: vec![0, 0, 0, 0].into(),
+            ..Default::default()
+        };
+        message.properties.insert(
+            "mqtt.qos.level".into(),
+            saranga_buffer::PropertyValue::Int(1),
+        );
+        queue.add(saranga_server::message::MessageRef::new(
+            saranga_server::message::ServerMessage::new(message),
+        ));
+    }
+    assert_eq!(b.packet().await.expect("a message")[0] & 0xF0, 0x30);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(queue.message_count(), 4, "B's backlog is kept");
 }

@@ -2864,7 +2864,11 @@ async fn clean_restored(manager: &StateManager, state: &StateRef, client_id: &st
             continue;
         };
         if queue.config().configuration_managed {
-            queue.delete_matching(None).await;
+            // Emptied in place of a delete, and only when it would be
+            // deleted: no other member or consumer is on it.
+            if queue.consumer_count() == 0 {
+                queue.delete_matching(None).await;
+            }
         } else if !util::is_shared(topic) || queue.consumer_count() == 0 {
             let address = queue.config().address.clone();
             match po.delete_queue_reporting(&name, true).await {

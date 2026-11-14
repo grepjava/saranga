@@ -13,6 +13,8 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **MQTT sessions the session store has paged out are restored at start.** Only the records held in memory were read, so with the store paging, clients lost their subscriptions and found no session present after a restart.
+- **A restored MQTT session expiring leaves a configured shared subscription's backlog to the members still on it**, as unsubscribing already did; its cleanup emptied the queue under them (see COMPAT).
 - **A revoked permission no longer comes back through the authorization cache.** A permission check in flight while a security setting changed cached the grant it had read after the change had cleared the cache, so the revoked permission held until the entry expired (see COMPAT).
 - **Removing a security or address setting with a fully qualified wildcard match or a literal match removes it.** `orders::tenant.*` and `(orders.#)` were looked for where they are not stored, so the removal did nothing and the setting stayed in force (see COMPAT).
 - **MQTT clients joining a new shared subscription at once all subscribe.** Those that lost the race to make its queue on a multicast address were disconnected without a SUBACK (see COMPAT).
