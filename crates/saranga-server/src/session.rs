@@ -2157,7 +2157,11 @@ impl ServerSession {
                         }
                     }
                 }
-                // QueueImpl.acknowledge
+                // QueueImpl.acknowledge: on a non-destructive queue a
+                // normal acknowledgement leaves the message where it is.
+                if queue.config().non_destructive {
+                    return Ok(ids);
+                }
                 match tx {
                     Some(tx) => {
                         let mut t = transaction::lock(&tx);

@@ -715,6 +715,10 @@ pub struct MessageRef {
     /// Consumers the message is not given to again
     /// (`Message.rejectConsumer`).
     pub rejected_consumers: Vec<crate::queue::ConsumerId>,
+    /// Its place in its queue's order, given as it joins the queue's list
+    /// (`MessageReference.getSequence`): a reference coming back goes back
+    /// in this order, not in message ID order.
+    pub sequence: u64,
 }
 
 impl MessageRef {
@@ -727,6 +731,7 @@ impl MessageRef {
             paged: None,
             stored: false,
             rejected_consumers: Vec::new(),
+            sequence: 0,
         }
     }
 

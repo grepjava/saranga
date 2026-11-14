@@ -399,3 +399,52 @@ async fn an_ended_transaction_leaves_no_session() {
         "each commit's message is there by its receipt"
     );
 }
+
+/// Every message a cumulative ACK acknowledges gives its window credit
+/// back, on a non-destructive queue too, where the messages stay.
+#[tokio::test]
+async fn a_cumulative_ack_on_a_non_destructive_queue_credits_every_message() {
+    let mut config = BrokerConfig::new(Arc::new(SelectorFilters));
+    config.protocols = vec![Arc::new(StompProtocol)];
+    let broker = Broker::start(config).await.unwrap();
+    let mut spec = saranga_server::postoffice::QueueSpec::new("nd", "nd");
+    spec.auto_create_address = Some(true);
+    spec.non_destructive = Some(true);
+    spec.routing_type = Some(saranga_server::RoutingType::Anycast);
+    broker.post_office().create_queue(spec, false).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(broker.clone().serve_acceptor(listener, Acceptor::default()));
+
+    let mut c = Client::connect(address, "1.2").await;
+    for i in 0..12 {
+        c.send(&format!(
+            "SEND\ndestination:nd\ndestination-type:ANYCAST\n\nmessage {i:02} {}",
+            "x".repeat(60)
+        ))
+        .await;
+    }
+    c.send("SUBSCRIBE\ndestination:nd\ndestination-type:ANYCAST\nsubscription-type:ANYCAST\nid:s\nack:client\nconsumer-window-size:500\n\n")
+        .await;
+    // What the window lets through.
+    async fn batch(c: &mut Client) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            let more = tokio::time::timeout(Duration::from_millis(500), c.frame()).await;
+            match more {
+                Ok(m) => out.push(header(&m, "ack").unwrap().to_owned()),
+                Err(_) => return out,
+            }
+        }
+    }
+    let first = batch(&mut c).await;
+    assert!(first.len() > 1, "a window of several messages: {first:?}");
+    c.send(&format!("ACK\nid:{}\n\n", first.last().unwrap()))
+        .await;
+    let second = batch(&mut c).await;
+    assert_eq!(
+        second.len(),
+        first.len(),
+        "the whole window back: {first:?} then {second:?}"
+    );
+}

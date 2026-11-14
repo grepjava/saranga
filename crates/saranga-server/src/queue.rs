@@ -1178,10 +1178,15 @@ impl Queue {
 #[derive(Default)]
 struct MessageList {
     levels: [VecDeque<MessageRef>; 10],
+    /// The last sequence given (`queueSequence`).
+    sequence: u64,
 }
 
 impl MessageList {
-    fn push_back(&mut self, r: MessageRef) {
+    /// `internalAddTail`: the reference takes the next sequence.
+    fn push_back(&mut self, mut r: MessageRef) {
+        self.sequence += 1;
+        r.sequence = self.sequence;
         self.levels[r.message.priority_level()].push_back(r);
     }
 
@@ -1215,12 +1220,13 @@ impl MessageList {
         out
     }
 
-    /// `addSorted`: inserts in message ID order within its priority.
+    /// `addSorted`: inserts in queue order (the sequence each reference
+    /// took as it joined the list) within its priority.
     fn insert_sorted(&mut self, r: MessageRef) {
         let level = &mut self.levels[r.message.priority_level()];
         let pos = level
             .iter()
-            .position(|m| m.message_id() > r.message_id())
+            .position(|m| m.sequence > r.sequence)
             .unwrap_or(level.len());
         level.insert(pos, r);
     }
@@ -1653,7 +1659,7 @@ impl Actor {
         }
     }
 
-    /// `addSorted`: a returned reference goes back in message ID order, or
+    /// `addSorted`: a returned reference goes back in queue order, or
     /// waits out its redelivery delay. A last-value queue keeps a newer
     /// value over it; a full ring queue drops it.
     fn add_sorted(&mut self, r: MessageRef) {
@@ -2383,6 +2389,20 @@ impl Actor {
                         .position(|r| r.message_id() == message_id)?;
                     c.delivering.remove(i)
                 });
+                // On a non-destructive queue the delivery is a copy of a
+                // reference still queued: that one leaves the queue with it,
+                // and the message is killed once. A copy whose reference has
+                // gone (another consumer's rejection took it) owns nothing.
+                let r = r.filter(|_| {
+                    !self.shared.config().non_destructive
+                        || match self.messages.find(|q| q.message_id() == message_id) {
+                            Some(at) => {
+                                self.messages.remove(at);
+                                true
+                            }
+                            None => false,
+                        }
+                });
                 if let Some(mut r) = r {
                     if !properties.is_empty() {
                         let mut core = r.message.core().clone();
@@ -2505,10 +2525,10 @@ impl Actor {
                 .metrics
                 .add_acknowledge(r.message.encode_size() as i64, transactional);
         }
-        // Acknowledging on a non-destructive queue leaves the message there.
-        if self.shared.config().non_destructive {
-            return Ok(Vec::new());
-        }
+        // On a non-destructive queue these are copies of references it still
+        // holds: the caller counts them as acknowledged (a protocol credits
+        // their window back) but acknowledges nothing in the store, and the
+        // message stays.
         Ok(refs)
     }
 

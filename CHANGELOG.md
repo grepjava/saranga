@@ -13,6 +13,9 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **Rejecting a message on a non-destructive queue no longer takes it from another queue.** The rejected delivery was acknowledged while the queue kept the message, so deleting the queue acknowledged it again and a durable message held by another queue lost its record, gone after a restart. The message now leaves the non-destructive queue as it is dead-lettered (see COMPAT).
+- **A rollback returns messages in the order the queue had them**, not in message ID order: IDs are given at send, and transactions can commit in another order.
+- **A STOMP cumulative ACK on a non-destructive queue gives back the window credit of every message it acknowledges**; only the last one's came back, so the subscription stalled.
 - **MQTT sessions the session store has paged out are restored at start.** Only the records held in memory were read, so with the store paging, clients lost their subscriptions and found no session present after a restart.
 - **A restored MQTT session expiring leaves a configured shared subscription's backlog to the members still on it**, as unsubscribing already did; its cleanup emptied the queue under them (see COMPAT).
 - **A revoked permission no longer comes back through the authorization cache.** A permission check in flight while a security setting changed cached the grant it had read after the change had cleared the cache, so the revoked permission held until the entry expired (see COMPAT).
