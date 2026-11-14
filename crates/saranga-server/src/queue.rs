@@ -694,9 +694,14 @@ impl Queue {
                 .each(|p| p.message_acknowledged(r, self, reason));
             if reason != AckReason::Replaced {
                 let origin = crate::mirror::origin();
+                // Every sync mirror's peer has the acknowledgement before it
+                // completes, not only the last one's.
                 for m in po.mirrors().all() {
                     if let Some(p) = m.acknowledged(self, r, reason, origin.as_ref()) {
-                        mirrored = Some(p);
+                        mirrored = Some(match mirrored {
+                            Some(before) => Pending::and(before, p),
+                            None => p,
+                        });
                     }
                 }
             }

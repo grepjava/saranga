@@ -529,3 +529,32 @@ async fn a_move_to_a_full_fail_address_is_refused_and_keeps_the_message() {
         broker.stop().unwrap();
     }
 }
+
+/// With `id-cache-size` 0 duplicate detection is off, as Artemis's
+/// `NoOpDuplicateIDCache` has it: an ID is never a duplicate, and nothing is
+/// journaled for it. A record journaled for it would never be deleted, and
+/// a later start with a cache would load the IDs back.
+#[tokio::test]
+async fn a_cache_of_size_zero_journals_no_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start_with(dir.path(), true, "<id-cache-size>0</id-cache-size>").await;
+    create_full_queue(&broker).await;
+    let mut s = session(&broker);
+    for id in ["d1", "d2", "d3", "d1"] {
+        send(&mut s, Some(id)).await.unwrap();
+        assert_eq!(count(&broker).await, Json::Long(1), "{id} delivered");
+        op(&broker, "queue.full", "removeAllMessages", vec![]).await;
+    }
+    s.close(false).await;
+    broker.stop().unwrap();
+    drop(s);
+    drop(broker);
+
+    // A cache now: had the IDs been journaled, d1 would load as a duplicate.
+    let broker = start_with(dir.path(), true, "<id-cache-size>10</id-cache-size>").await;
+    let mut s = session(&broker);
+    send(&mut s, Some("d1")).await.unwrap();
+    assert_eq!(count(&broker).await, Json::Long(1), "no ID was journaled");
+    s.close(false).await;
+    broker.stop().unwrap();
+}

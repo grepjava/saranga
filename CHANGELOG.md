@@ -13,6 +13,8 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **An acknowledgement mirrored to several `sync` mirrors waits for every peer**, as Artemis's mirror aggregation does; it waited for the last mirror's only, so the client could be told it was done while an earlier peer still lacked it.
+- **`id-cache-size` 0 turns duplicate detection off without journaling the IDs**, as Artemis's no-op cache does. Each ID was journaled and never deleted, so the journal grew until a restart, and an ID taken by a send under way still counted as a duplicate.
 - **`send-to-dla-on-no-route` takes a message the address's queues all turn away**, through their filters, routing types or being disabled, as Artemis does, not only one sent to an address with no queue: such a message was dropped without a word. As in Artemis, a divert's copies do not count, so a message only a divert took goes to the dead-letter address as well.
 - **Non-exclusive diverts sharing a `routing-name` take turns**, one of them diverting each message as Artemis's routing-name groups choose, where each of them diverted a copy.
 - **Rejecting a message on a non-destructive queue no longer takes it from another queue.** The rejected delivery was acknowledged while the queue kept the message, so deleting the queue acknowledged it again and a durable message held by another queue lost its record, gone after a restart. The message now leaves the non-destructive queue as it is dead-lettered (see COMPAT).

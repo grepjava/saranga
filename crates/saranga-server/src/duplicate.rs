@@ -64,14 +64,18 @@ impl DuplicateIdCache {
         self.storage.is_some()
     }
 
-    /// Whether the ID is held, or taken by a send not yet done.
+    /// Whether the ID is held, or taken by a send not yet done. A cache of
+    /// size 0 holds nothing (`NoOpDuplicateIDCache`).
     pub fn contains(&self, id: &[u8]) -> bool {
-        self.index.contains_key(id) || self.reserved.contains_key(id)
+        self.size > 0 && (self.index.contains_key(id) || self.reserved.contains_key(id))
     }
 
     /// Takes an ID for a send under way: another send of it is a duplicate
     /// from now on, but nothing leaves the cache until [`Self::confirm`].
     pub fn reserve(&mut self, id: &[u8]) {
+        if self.size == 0 {
+            return;
+        }
         *self.reserved.entry(id.to_vec()).or_default() += 1;
     }
 
@@ -206,10 +210,15 @@ impl DuplicateIdCache {
     }
 
     /// Journals a new ID inside transaction `tx` (`storeDuplicateIDTransactional`).
+    /// A cache of size 0 journals nothing (`NoOpDuplicateIDCache`): it would
+    /// never hold the ID, so nothing would delete its record.
     pub fn store_tx(&self, tx: i64, id: &[u8], record: i64) -> StoreResult<()> {
         let Some(s) = &self.storage else {
             return Ok(());
         };
+        if self.size == 0 {
+            return Ok(());
+        }
         let body = DuplicateIdEncoding {
             address: SimpleString::from(self.address.as_str()),
             duplicate_id: id.to_vec(),

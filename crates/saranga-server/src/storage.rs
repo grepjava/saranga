@@ -36,7 +36,7 @@ pub type StoreResult<T> = std::result::Result<T, JournalError>;
 /// A journal write the caller may wait for before answering the client
 /// (an `OperationContext` line-up).
 #[derive(Debug)]
-pub struct Pending(oneshot::Receiver<Result<(), JournalError>>);
+pub struct Pending(Vec<oneshot::Receiver<Result<(), JournalError>>>);
 
 impl Pending {
     /// A journal completion and the handle that waits for it.
@@ -46,14 +46,28 @@ impl Pending {
             Box::new(move |r| {
                 let _ = tx.send(r);
             }),
-            Pending(rx),
+            Pending(vec![rx]),
         )
     }
 
+    /// One handle for both: it completes once each has, with the first
+    /// failure.
+    pub fn and(mut self, other: Pending) -> Pending {
+        self.0.extend(other.0);
+        self
+    }
+
     pub async fn wait(self) -> Result<(), JournalError> {
-        self.0
-            .await
-            .unwrap_or_else(|_| Err(JournalError::IllegalState("journal stopped".into())))
+        let mut result = Ok(());
+        for rx in self.0 {
+            let r = rx
+                .await
+                .unwrap_or_else(|_| Err(JournalError::IllegalState("journal stopped".into())));
+            if result.is_ok() {
+                result = r;
+            }
+        }
+        result
     }
 }
 
