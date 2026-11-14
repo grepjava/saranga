@@ -1603,7 +1603,10 @@ impl Actor {
     }
 
     /// `ScheduledDeliveryRunnable`: references whose time has come go to the
-    /// head of the queue, in delivery-time order.
+    /// head of the queue, in delivery-time order (`addHead(refs, true)`). A
+    /// full ring queue drops a due reference (`enforceRing`), and on a
+    /// last-value queue one replaces the queued reference with its key
+    /// (`LastValueQueue.addHead` tracks it as the last value).
     fn deliver_scheduled(&mut self) {
         if self.scheduled.is_empty() {
             return;
@@ -1618,7 +1621,13 @@ impl Actor {
             r.scheduled_time = 0;
             due.push(r);
         }
+        let ring = self.shared.config().ring_size;
         for r in due.into_iter().rev() {
+            if ring != -1 && self.messages.len() as i64 + 1 > ring {
+                self.kill_for(r, AckReason::Replaced);
+                continue;
+            }
+            self.track_last_value(&r, true);
             self.messages.push_front(r);
         }
     }

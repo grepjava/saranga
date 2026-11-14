@@ -498,6 +498,9 @@ pub struct WebSocketStream<S> {
     /// Frames (and control replies) not yet written.
     out: Vec<u8>,
     out_at: usize,
+    /// The frames of a fragmented message taken so far: 0 outside one
+    /// (`fragmentedFramesCount`).
+    fragments: u32,
     /// A close frame came: no more data.
     closed: bool,
     eof: bool,
@@ -517,6 +520,7 @@ impl<S> WebSocketStream<S> {
             data_at: 0,
             out: Vec::new(),
             out_at: 0,
+            fragments: 0,
             closed: false,
             eof: false,
         }
@@ -611,6 +615,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
             let fin_opcode = b[0];
             let opcode = fin_opcode & 0x0F;
             let masked = b[1] & 0x80 != 0;
+            let len7 = b[1] & 0x7F;
+            let fin = fin_opcode & 0x80 != 0;
             let mut at = 2;
             let len = match b[1] & 0x7F {
                 126 => {
@@ -643,6 +649,41 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
             if !masked {
                 return violation(self, "unmasked client to server frame");
             }
+            // WebSocket08FrameDecoder's checks of the opcode against the
+            // frame and the message it may be part of.
+            if opcode > 7 {
+                if !fin {
+                    return violation(self, "fragmented control frame");
+                }
+                if len7 > 125 {
+                    return violation(self, "control frame with payload length > 125 octets");
+                }
+                if !matches!(opcode, 0x8..=0xA) {
+                    return violation(
+                        self,
+                        &format!("control frame using reserved opcode {opcode}"),
+                    );
+                }
+                if opcode == 0x8 && len7 == 1 {
+                    return violation(self, "received close control frame with payload len 1");
+                }
+            } else {
+                if opcode > 2 {
+                    return violation(self, &format!("data frame using reserved opcode {opcode}"));
+                }
+                if self.fragments == 0 && opcode == 0 {
+                    return violation(
+                        self,
+                        "received continuation data frame outside fragmented message",
+                    );
+                }
+                if self.fragments != 0 && opcode != 0 {
+                    return violation(
+                        self,
+                        "received non-continuation data frame while inside fragmented message",
+                    );
+                }
+            }
             if len > self.max_payload as u64 {
                 let reason = format!(
                     "Max frame length of {} has been exceeded.",
@@ -665,6 +706,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
             self.raw.drain(..at + len);
             match opcode {
                 0x0..=0x2 => {
+                    if fin {
+                        self.fragments = 0;
+                    } else {
+                        self.fragments += 1;
+                    }
                     let payload = match self.inflated(fin_opcode, payload) {
                         Ok(p) => p,
                         Err(e) => {
@@ -985,6 +1031,58 @@ mod tests {
         let mut got = vec![1u8; zeros.len()];
         ws.read_exact(&mut got).await.unwrap();
         assert_eq!(got, zeros);
+    }
+
+    /// Frames out of place in the message they would be part of, or
+    /// control frames Netty refuses, close the connection with a protocol
+    /// error (1002), and nothing after them reaches the protocol.
+    #[tokio::test]
+    async fn frames_out_of_sequence_close_with_a_protocol_error() {
+        let cases: Vec<(&str, Vec<u8>, &[u8])> = vec![
+            ("an orphan continuation", masked(0x0, true, b"orphan"), b""),
+            (
+                "a new message inside a fragmented one",
+                [masked(0x1, false, b"a"), masked(0x1, true, b"b")].concat(),
+                b"a",
+            ),
+            ("a fragmented control frame", masked(0x9, false, b"x"), b""),
+            (
+                "a control frame over 125 bytes",
+                masked(0x9, true, &[0; 126]),
+                b"",
+            ),
+            ("a reserved data opcode", masked(0x3, true, b"x"), b""),
+            ("a reserved control opcode", masked(0xB, true, b"x"), b""),
+            ("a close of one byte", masked(0x8, true, &[1]), b""),
+        ];
+        for (case, input, delivered) in cases {
+            let (mut client, server) = tokio::io::duplex(1 << 16);
+            let mut ws = WebSocketStream::new(server, input, 1024, EncoderType::Binary);
+            let mut got = Vec::new();
+            let read = ws.read_to_end(&mut got);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), read).await;
+            assert_eq!(got, delivered, "{case}");
+            assert!(ws.closed, "{case}");
+            drop(ws);
+            let mut sent = Vec::new();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.read_to_end(&mut sent),
+            )
+            .await;
+            assert!(
+                sent.windows(4)
+                    .any(|w| w[0] == 0x88 && w[2..4] == [0x03, 0xEA]),
+                "{case}: a 1002 close, {sent:?}"
+            );
+        }
+        // A continuation that belongs is taken.
+        let (_client, server) = tokio::io::duplex(1 << 16);
+        let input = [masked(0x1, false, b"one "), masked(0x0, true, b"two")].concat();
+        let mut ws = WebSocketStream::new(server, input, 1024, EncoderType::Binary);
+        let mut got = [0u8; 7];
+        ws.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"one two");
     }
 
     #[tokio::test]
