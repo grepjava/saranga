@@ -1925,3 +1925,29 @@ async fn a_wildcard_subscription_does_not_replay_a_dollar_retained_topic() {
     let m = secret.packet().await.expect("a retained PUBLISH");
     assert_eq!(publish_topic(&m), "$secret/status");
 }
+
+/// Members of a shared subscription subscribing at once race to make its
+/// queue: those that lose use the queue the winner made, and every one
+/// gets its SUBACK.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_subscribers_racing_to_make_the_queue_all_subscribe() {
+    let (_broker, address, _task) = start(None).await;
+    let mut clients = Vec::new();
+    for i in 0..16 {
+        clients.push(Client::open(address, &format!("race{i}"), true).await.0);
+    }
+    let barrier = Arc::new(tokio::sync::Barrier::new(clients.len()));
+    let tasks: Vec<_> = clients
+        .into_iter()
+        .map(|mut c| {
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                c.subscribe("$share/g/race/t", 1).await;
+            })
+        })
+        .collect();
+    for t in tasks {
+        t.await.expect("every member gets its SUBACK");
+    }
+}

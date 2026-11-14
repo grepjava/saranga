@@ -142,6 +142,11 @@ pub struct SecurityStore {
     authentication_cache: Option<TtlCache<String, Option<Arc<Subject>>>>,
     /// `user.CHECK` -> addresses (or FQQNs) granted.
     authorization_cache: Option<TtlCache<String, HashSet<String>>>,
+    /// Bumped, under `authorization_lock`, each time the granted
+    /// permissions are forgotten: a check caches its grant only if the
+    /// settings it read have not changed since.
+    authorization_generation: AtomicU64,
+    authorization_lock: Mutex<()>,
     pub counters: SecurityCounters,
 }
 
@@ -157,6 +162,8 @@ impl SecurityStore {
                 .then(|| TtlCache::new(config.authentication_cache_size, ttl)),
             authorization_cache: (enabled && config.authorization_cache_size > 0)
                 .then(|| TtlCache::new(config.authorization_cache_size, ttl)),
+            authorization_generation: AtomicU64::new(0),
+            authorization_lock: Mutex::new(()),
             config,
             repository: RwLock::new(repository),
             manager,
@@ -279,6 +286,11 @@ impl SecurityStore {
 
     pub fn invalidate_authorization_cache(&self) {
         if let Some(c) = &self.authorization_cache {
+            let _guard = self
+                .authorization_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.authorization_generation.fetch_add(1, Ordering::AcqRel);
             c.clear();
         }
     }
@@ -518,6 +530,9 @@ impl SecurityStore {
             return true;
         }
 
+        // Read before the roles: a change after it keeps this check's grant
+        // out of the cache.
+        let generation = self.authorization_generation.load(Ordering::Acquire);
         let roles = {
             let repo = self.repository.read().unwrap_or_else(|e| e.into_inner());
             let setting = match &fqqn {
@@ -531,10 +546,16 @@ impl SecurityStore {
         };
         let validated = self.manager.authorize(&subject, &roles, check, target);
         if validated && let (Some(_), Some(cache)) = (user, &self.authorization_cache) {
-            cache.update(authorization_cache_key(check, auth), |set| {
-                set.get_or_insert_with(HashSet::new)
-                    .insert(target.to_owned());
-            });
+            let _guard = self
+                .authorization_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if self.authorization_generation.load(Ordering::Acquire) == generation {
+                cache.update(authorization_cache_key(check, auth), |set| {
+                    set.get_or_insert_with(HashSet::new)
+                        .insert(target.to_owned());
+                });
+            }
         }
         validated
     }

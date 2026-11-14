@@ -453,3 +453,21 @@ fn entries_and_named_matches_name_each_match_as_added() {
     let literal: Vec<String> = r.named_matches("a.#").into_iter().map(|(m, _)| m).collect();
     assert_eq!(literal, ["(a.#)", "a.*", "#"]);
 }
+
+/// A match is removed from where it was added: a fully qualified match
+/// with a wildcard (stored as an exact match) and a literal match given in
+/// its markers. (Artemis removes neither.)
+#[test]
+fn remove_a_fully_qualified_or_literal_match() {
+    let mut r: HierarchicalRepository<Plain> = repo().with_literal_markers('(', ')');
+    r.add_match("#", Plain("root")).unwrap();
+    r.add_match("orders::tenant.*", Plain("fqqn")).unwrap();
+    r.add_match("(orders.#)", Plain("literal")).unwrap();
+    assert_eq!(get(&r, "orders::tenant.*"), "fqqn");
+    assert_eq!(get(&r, "orders.#"), "literal");
+    r.remove_match("orders::tenant.*");
+    r.remove_match("(orders.#)");
+    assert_eq!(get(&r, "orders::tenant.*"), "root");
+    assert_eq!(get(&r, "orders.#"), "root");
+    assert_eq!(r.entries().len(), 1, "{:?}", r.entries());
+}

@@ -513,3 +513,72 @@ fn a_cached_grant_holds_only_for_its_credentials() {
         "still cached"
     );
 }
+
+/// [`Fixed`], taking every permission away the first time it authorizes:
+/// the settings change while that check is in flight.
+struct Revoking {
+    inner: Fixed,
+    store: std::sync::OnceLock<std::sync::Weak<SecurityStore>>,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl SecurityManager for Revoking {
+    fn authenticate(
+        &self,
+        user: Option<&str>,
+        password: Option<&str>,
+        conn: &ConnectionInfo,
+    ) -> Result<Option<Subject>, NoCache> {
+        self.inner.authenticate(user, password, conn)
+    }
+
+    fn authorize(&self, subject: &Subject, roles: &[Role], check: CheckType, _: &str) -> bool {
+        let granted = authorize_roles(subject, roles, check);
+        if !self.fired.swap(true, Ordering::SeqCst)
+            && let Some(store) = self.store.get().and_then(std::sync::Weak::upgrade)
+        {
+            store.set_repository({
+                let mut repo = HierarchicalRepository::new(Default::default());
+                repo.set_default(Some(SecuritySetting::default()));
+                repo
+            });
+        }
+        granted
+    }
+}
+
+/// A grant read from settings that changed before it is cached is not
+/// cached: the change's revocation holds at once.
+#[test]
+fn a_grant_from_settings_changed_meanwhile_is_not_cached() {
+    let mut config = SecurityStoreConfig::from_broker(&BrokerConfig::default());
+    config.enabled = true;
+    let mut repo = HierarchicalRepository::new(Default::default());
+    repo.set_default(Some(SecuritySetting::default()));
+    repo.add_match(
+        "#",
+        SecuritySetting {
+            roles: vec![Role::new("a", [CheckType::Send])],
+        },
+    )
+    .unwrap();
+    let manager = Arc::new(Revoking {
+        inner: Fixed {
+            logins: AtomicUsize::new(0),
+        },
+        store: Default::default(),
+        fired: Default::default(),
+    });
+    let store = Arc::new(SecurityStore::new(config, repo, manager.clone()));
+    manager.store.set(Arc::downgrade(&store)).unwrap();
+    // Granted by the settings it read; they change before it is cached.
+    store
+        .check("orders", None, CheckType::Send, &auth("u1"))
+        .unwrap();
+    assert!(
+        store
+            .check("orders", None, CheckType::Send, &auth("u1"))
+            .is_err(),
+        "the revoked permission is not served from the cache"
+    );
+}

@@ -1256,7 +1256,22 @@ impl Core {
             spec.routing_type = Some(RoutingType::Multicast);
             spec.filter_string = Some(filter);
             spec.durable = durable;
-            return self.session.create_queue(spec).map(|q| (q, true));
+            // Another connection (a shared subscription's other member)
+            // may make the queue first: its queue is this subscription's.
+            // (Artemis catches this for the anycast queue only.)
+            return match self.session.create_queue(spec) {
+                Err(e) if e.kind == ErrorType::QueueExists => {
+                    let q = po
+                        .queue(&core_queue)
+                        .ok_or_else(|| BrokerError::no_such_queue(&core_queue))?;
+                    let have = q.config();
+                    if &*have.address != address {
+                        return Err(queue_address_collision(&core_queue, &have.address, address));
+                    }
+                    Ok((q, false))
+                }
+                other => other.map(|q| (q, true)),
+            };
         }
         if info.routing_types.anycast {
             if !bq.queue_names.is_empty() {

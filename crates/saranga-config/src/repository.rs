@@ -113,17 +113,23 @@ impl<T> HierarchicalRepository<T> {
         self.wildcards.is_wild(m) && !is_fully_qualified(m)
     }
 
-    /// `addMatch`. Replaces any value already stored for the same match.
-    pub fn add_match(&mut self, match_str: &str, value: T) -> Result<()> {
-        let mut text = match_str;
-        let mut literal = false;
+    /// A match without its literal markers, and whether it had them.
+    fn unmark<'a>(&self, match_str: &'a str) -> (&'a str, bool) {
         if let Some((start, end)) = self.literal_markers {
-            let mut chars = text.chars();
-            literal = chars.next() == Some(start) && chars.next_back() == Some(end);
-            if literal {
-                text = &text[start.len_utf8()..text.len() - end.len_utf8()];
+            let mut chars = match_str.chars();
+            if chars.next() == Some(start) && chars.next_back() == Some(end) {
+                return (
+                    &match_str[start.len_utf8()..match_str.len() - end.len_utf8()],
+                    true,
+                );
             }
         }
+        (match_str, false)
+    }
+
+    /// `addMatch`. Replaces any value already stored for the same match.
+    pub fn add_match(&mut self, match_str: &str, value: T) -> Result<()> {
+        let (text, literal) = self.unmark(match_str);
         let text = self.modify(text);
         Match::verify(&text, &self.wildcards)?;
         let m = Match::with_literal(&text, &self.wildcards, literal);
@@ -144,10 +150,16 @@ impl<T> HierarchicalRepository<T> {
         Ok(())
     }
 
-    /// `removeMatch`.
+    /// `removeMatch`: removes the match from where [`Self::add_match`]
+    /// stored it. (Artemis looks for any match with a wildcard among the
+    /// wildcard matches, where a fully qualified one is not, and keeps a
+    /// literal match's markers, so neither is removed.)
     pub fn remove_match(&mut self, match_str: &str) {
-        let text = self.modify(match_str);
-        if self.wildcards.is_wild(&text) {
+        let (text, literal) = self.unmark(match_str);
+        let text = self.modify(text);
+        if literal {
+            self.literal_matches.remove(&text);
+        } else if self.is_wildcard_entry(&text) {
             self.wildcard_matches.retain(|(m, _)| m.as_str() != text);
         } else {
             self.exact_matches.remove(&text);

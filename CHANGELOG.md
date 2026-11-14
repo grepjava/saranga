@@ -13,6 +13,9 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **A revoked permission no longer comes back through the authorization cache.** A permission check in flight while a security setting changed cached the grant it had read after the change had cleared the cache, so the revoked permission held until the entry expired (see COMPAT).
+- **Removing a security or address setting with a fully qualified wildcard match or a literal match removes it.** `orders::tenant.*` and `(orders.#)` were looked for where they are not stored, so the removal did nothing and the setting stayed in force (see COMPAT).
+- **MQTT clients joining a new shared subscription at once all subscribe.** Those that lost the race to make its queue on a multicast address were disconnected without a SUBACK (see COMPAT).
 - **A transaction that pages across several page files has them all on disk when it commits.** A page was not synced when the broker moved on to the next one, and the commit synced only the last, so a power loss could lose committed messages. Leaving a page now syncs it, as Artemis does.
 - **A divert that cannot copy a large message fails the send.** The copy was skipped with a warning, so a message taken by an exclusive divert was acknowledged to the producer and stored nowhere.
 - **The store takes no more writes after a critical I/O error in a page or large message file**, as COMPAT says it does after a journal's own error; a send could still succeed while the broker stopped.
