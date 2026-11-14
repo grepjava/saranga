@@ -1645,9 +1645,10 @@ impl Actor {
         self.messages.push_back(r);
         let ring = self.shared.config().ring_size;
         if ring != -1 && self.messages.len() as i64 > ring {
+            // enforceRing acknowledges it as replaced.
             let oldest = self.messages.take_first();
             if let Some(old) = oldest {
-                self.kill(old);
+                self.kill_for(old, AckReason::Replaced);
             }
         }
     }
@@ -1666,7 +1667,7 @@ impl Actor {
         }
         let ring = self.shared.config().ring_size;
         if ring != -1 && self.messages.len() as i64 + 1 > ring {
-            self.kill(r);
+            self.kill_for(r, AckReason::Replaced);
             return;
         }
         self.messages.insert_sorted(r);

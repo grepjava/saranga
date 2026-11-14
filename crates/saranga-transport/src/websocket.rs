@@ -644,10 +644,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
                 ))
             };
             if fin_opcode & 0x70 != 0 && !self.allow_extensions {
-                return violation(self, "RSV != 0 and no extension negotiated");
+                let rsv = (fin_opcode & 0x70) >> 4;
+                return violation(
+                    self,
+                    &format!("RSV != 0 and no extension negotiated, RSV:{rsv}"),
+                );
             }
             if !masked {
-                return violation(self, "unmasked client to server frame");
+                return violation(self, "received a frame that is not masked as expected");
             }
             // WebSocket08FrameDecoder's checks of the opcode against the
             // frame and the message it may be part of.
@@ -1076,6 +1080,37 @@ mod tests {
                 "{case}: a 1002 close, {sent:?}"
             );
         }
+        // The reasons Netty gives for an unmasked frame and for RSV bits
+        // with no extension.
+        let mut unmasked = Vec::new();
+        frame_header(&mut unmasked, true, 0x2, 1);
+        unmasked.push(b'x');
+        for (input, reason) in [
+            (unmasked, "received a frame that is not masked as expected"),
+            (
+                masked_rsv(0x2, true, 0x40, b"x"),
+                "RSV != 0 and no extension negotiated, RSV:4",
+            ),
+        ] {
+            let (mut client, server) = tokio::io::duplex(1 << 16);
+            let mut ws = WebSocketStream::new(server, input, 1024, EncoderType::Binary);
+            let mut got = Vec::new();
+            let read = ws.read_to_end(&mut got);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), read).await;
+            drop(ws);
+            let mut sent = Vec::new();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.read_to_end(&mut sent),
+            )
+            .await;
+            assert!(
+                sent.windows(reason.len()).any(|w| w == reason.as_bytes()),
+                "{reason}: {}",
+                String::from_utf8_lossy(&sent)
+            );
+        }
+
         // A continuation that belongs is taken.
         let (_client, server) = tokio::io::duplex(1 << 16);
         let input = [masked(0x1, false, b"one "), masked(0x0, true, b"two")].concat();

@@ -13,6 +13,8 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **A ring queue counts what it drops as replaced.** The message a full ring queue let go was counted in `MessagesKilled` and its acknowledgement sent to mirrors. It is now counted in `MessagesReplaced` and not mirrored, as Artemis's `enforceRing` does: the target's ring drops its own copy.
+- **WebSocket protocol errors give Netty's reasons.** An unmasked frame is refused with "received a frame that is not masked as expected", and RSV bits without an extension with "RSV != 0 and no extension negotiated, RSV:" and their value.
 - **A scheduled message that falls due is subject to its queue's policies.** On a last-value queue it was added beside the queued message with the same key instead of replacing it, and a full ring queue took it over its size. It now replaces the last value, and a full ring drops it, as Artemis does.
 - **WebSocket frames out of place in a message close the connection.** A continuation frame with no message to continue, or a new message started inside a fragmented one, was passed to the protocol as if it belonged. These, fragmented or oversized control frames, a one-byte close and reserved opcodes are now refused with a protocol error (1002), as Netty refuses them.
 - **An MQTT 5 topic alias reaches the client before it is used.** With overlapping subscriptions delivering the same topic, the publication that defined a new alias could be overtaken by one on another subscription that referred to it with an empty topic, which the client cannot resolve, so it disconnected. The publication that takes an alias is now on its way before any other uses it (see COMPAT).

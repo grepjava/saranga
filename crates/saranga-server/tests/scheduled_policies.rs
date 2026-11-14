@@ -70,5 +70,20 @@ async fn a_due_message_is_dropped_by_a_full_ring() {
     q.add(message(1, 0));
     q.add(message(2, now_millis() + 200));
     assert_eq!(settled_count(&q).await, 1, "the ring holds one");
+    assert_eq!(q.messages_replaced(), 1, "acknowledged as replaced");
+    broker.stop().unwrap();
+}
+
+/// A ring queue over its size acknowledges its oldest message as replaced
+/// (`enforceRing`), not as killed.
+#[tokio::test]
+async fn a_ring_counts_what_it_drops_as_replaced() {
+    let (broker, q) = queue(|s| s.ring_size = Some(1)).await;
+    q.add(message(1, 0));
+    q.add(message(2, 0));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(q.message_count(), 1);
+    assert_eq!(q.messages_replaced(), 1);
+    assert_eq!(q.messages_killed(), 0);
     broker.stop().unwrap();
 }
