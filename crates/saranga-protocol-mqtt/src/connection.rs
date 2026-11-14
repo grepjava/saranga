@@ -2415,13 +2415,6 @@ impl Conn {
         if !self.link_stealing(&client_id).await {
             return;
         }
-        self.manager.add_connected_client(
-            &client_id,
-            ConnectedClient {
-                connection: self.id,
-                control: self.control.clone(),
-            },
-        );
         // Routed after the login, which a role key needs.
         if let Some(router) = self.client.router().map(str::to_owned) {
             let user = authenticated
@@ -2540,11 +2533,23 @@ impl Conn {
 
     /// `handleLinkStealing` ([MQTT-3.1.4-2]): false when this connection is
     /// refused.
+    ///
+    /// The ID is claimed (checked and registered) in one step, so of two
+    /// connects racing for it one takes the other over in turn, rather than
+    /// both taking over the same connection and both staying.
     async fn link_stealing(&mut self, client_id: &str) -> bool {
-        let Some(existing) = self.manager.connected_client(client_id) else {
+        let claimed = self.manager.claim_connected_client(
+            client_id,
+            ConnectedClient {
+                connection: self.id,
+                control: self.control.clone(),
+            },
+            self.settings.allow_link_stealing,
+        );
+        if let state::Claim::Free = claimed {
             return true;
-        };
-        if self.settings.allow_link_stealing {
+        }
+        if let state::Claim::Replaced(existing) = claimed {
             let (done, wait) = oneshot::channel();
             if existing.control.send(Control::TakeOver { done }).is_ok() {
                 let _ = tokio::time::timeout(Duration::from_secs(30), wait).await;
@@ -2553,7 +2558,9 @@ impl Conn {
                 "Existing MQTT session closed due to incoming session from {} with the same client ID: {client_id}",
                 self.remote
             );
-            true
+            // Another connect took the ID meanwhile: its takeover, queued
+            // for this connection, closes it next.
+            self.manager.is_client_connected(client_id, self.id)
         } else {
             if self.v5() {
                 self.send_disconnect(reason::UNSPECIFIED_ERROR);

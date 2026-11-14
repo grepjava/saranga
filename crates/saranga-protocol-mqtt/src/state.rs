@@ -692,6 +692,16 @@ pub struct ConnectedClient {
     pub control: mpsc::UnboundedSender<Control>,
 }
 
+/// What [`StateManager::claim_connected_client`] found.
+pub enum Claim {
+    /// No client held the ID; this one does now.
+    Free,
+    /// This one holds the ID now, in place of the client given, to take over.
+    Replaced(ConnectedClient),
+    /// Another client holds the ID and link stealing is off.
+    Denied,
+}
+
 /// `MQTTStateManager`: the broker's MQTT session states and connected
 /// clients.
 pub struct StateManager {
@@ -915,8 +925,31 @@ impl StateManager {
         lock(&self.connected).get(client_id).cloned()
     }
 
-    pub fn add_connected_client(&self, client_id: &str, client: ConnectedClient) {
-        lock(&self.connected).insert(client_id.to_owned(), client);
+    /// `handleLinkStealing` and `addConnectedClient` as one step, so two
+    /// connects with one client ID cannot both find (and both take over)
+    /// the same connection, or both find none.
+    pub fn claim_connected_client(
+        &self,
+        client_id: &str,
+        client: ConnectedClient,
+        steal: bool,
+    ) -> Claim {
+        let mut connected = lock(&self.connected);
+        if !steal && connected.contains_key(client_id) {
+            return Claim::Denied;
+        }
+        match connected.insert(client_id.to_owned(), client) {
+            Some(previous) => Claim::Replaced(previous),
+            None => Claim::Free,
+        }
+    }
+
+    /// Whether `connection` still holds the client ID:
+    /// `isClientConnected(clientId, connection)`.
+    pub fn is_client_connected(&self, client_id: &str, connection: u64) -> bool {
+        lock(&self.connected)
+            .get(client_id)
+            .is_some_and(|c| c.connection == connection)
     }
 
     /// Removes the client if `connection` is still the one connected with

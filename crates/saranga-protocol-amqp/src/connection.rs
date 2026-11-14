@@ -5006,24 +5006,30 @@ impl Conn {
         }
         let treat_reject = self.settings.treat_reject_as_unmodified_delivery_failed;
         let last = d.last.unwrap_or(d.first);
-        // `first` and `last` are peer-controlled; `first > last` would panic
-        // `BTreeMap::range`, unwinding the connection task past its consumer
-        // cleanup. Reject it as a protocol error, which closes the connection
-        // through the normal path.
-        if d.first > last {
+        // Delivery IDs are serial numbers (2.8.8 of the transport spec): a
+        // range may cross the wrap (`first = 0xFFFFFFFE, last = 1`). Proton-J's
+        // `handleDisposition` takes `last - first` modulo 2^32 and closes the
+        // connection only for a range of more than 2^31 - 1.
+        if last.wrapping_sub(d.first) > i32::MAX as u32 {
             return Err(Fatal::new(
-                condition::DECODE_ERROR,
-                format!(
-                    "AMQ119000: invalid disposition range: first {} is greater than last {last}",
-                    d.first
-                ),
+                condition::NOT_ALLOWED,
+                format!("Invalid disposition sequence range: {} to {last}", d.first),
             ));
         }
         let ids: Vec<u32> = {
             let Some(s) = self.sessions.get(&channel) else {
                 return Ok(());
             };
-            s.out.range(d.first..=last).map(|(k, _)| *k).collect()
+            if d.first <= last {
+                s.out.range(d.first..=last).map(|(k, _)| *k).collect()
+            } else {
+                // Across the wrap: to the top, then from zero.
+                s.out
+                    .range(d.first..)
+                    .chain(s.out.range(..=last))
+                    .map(|(k, _)| *k)
+                    .collect()
+            }
         };
         for id in ids {
             let txn = match &d.state {

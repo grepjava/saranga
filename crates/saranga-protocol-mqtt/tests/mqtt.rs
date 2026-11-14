@@ -1024,6 +1024,44 @@ async fn a_takeover_publishes_the_immediate_will() {
     broker.stop().unwrap();
 }
 
+/// Whether `c` still answers a PINGREQ.
+async fn answers_ping(c: &mut Client) -> bool {
+    if c.0.write_all(&[0xC0, 0]).await.is_err() {
+        return false;
+    }
+    tokio::time::timeout(Duration::from_millis(500), c.packet())
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|p| p[0] == 0xD0)
+}
+
+/// Two connects racing to take one client over: one takes the other over
+/// in turn, so one stays, where both took over the old connection and
+/// both stayed.
+#[tokio::test]
+async fn racing_takeovers_leave_one_connection() {
+    let (broker, address, _task) = start(None).await;
+    for i in 0..20 {
+        let id = format!("race{i}");
+        let (mut old, _) = Client::open(address, &id, true).await;
+        let mut a = Client(TcpStream::connect(address).await.unwrap());
+        let mut b = Client(TcpStream::connect(address).await.unwrap());
+        let c = connect(&id, true);
+        tokio::join!(a.send(&c), b.send(&c));
+        // Each gets its CONNACK, or is closed.
+        let _ = tokio::join!(a.packet(), b.packet());
+        let (pa, pb) = tokio::join!(answers_ping(&mut a), answers_ping(&mut b));
+        assert!(!(pa && pb), "iteration {i}: both replacements stayed");
+        assert!(pa || pb, "iteration {i}: neither replacement stayed");
+        assert!(
+            !answers_ping(&mut old).await,
+            "iteration {i}: the old one stayed"
+        );
+    }
+    broker.stop().unwrap();
+}
+
 /// The outgoing Maximum Packet Size check counts every property length prefix,
 /// so a packet whose true encoded size exceeds the client's limit is discarded
 /// even when Artemis's undercounting estimate would have let it through.

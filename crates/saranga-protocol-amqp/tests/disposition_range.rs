@@ -1,7 +1,8 @@
-//! A peer-controlled AMQP disposition with `first > last` must not panic the
-//! connection task (which would unwind past the consumer cleanup and strand the
-//! queue's consumer). The broker rejects it as a protocol error and closes the
-//! connection through the normal path, leaving no consumer behind.
+//! Disposition ranges. Delivery IDs are serial numbers, so a range may cross
+//! the wrap (`first = 0xFFFFFFFE, last = 0`), which Proton-J applies; one of
+//! more than 2^31 - 1 (as `first = 2, last = 1`) closes the connection, and
+//! must not panic the connection task (which would unwind past the consumer
+//! cleanup and strand the queue's consumer).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,8 +36,14 @@ async fn recv(s: &mut TcpStream) -> Performative {
     }
 }
 
-#[tokio::test]
-async fn a_reversed_disposition_range_does_not_strand_the_consumer() {
+/// A broker with one message on `q`, and a client connected to it whose
+/// receiver on `q` got its transfer (delivery ID 0).
+async fn delivered() -> (
+    Arc<Broker>,
+    saranga_server::queue::Queue,
+    TcpStream,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+) {
     let mut cfg = BrokerConfig::new(Arc::new(SelectorFilters));
     cfg.protocols
         .push(Arc::new(AmqpProtocol::new(AmqpConfig::default())));
@@ -116,7 +123,12 @@ async fn a_reversed_disposition_range_does_not_strand_the_consumer() {
         }
     }
     assert_eq!(q.consumer_count(), 1);
+    (broker, q, s, task)
+}
 
+#[tokio::test]
+async fn a_reversed_disposition_range_does_not_strand_the_consumer() {
+    let (broker, q, mut s, task) = delivered().await;
     // A disposition with first (2) > last (1): must not panic the task.
     send(
         &mut s,
@@ -139,6 +151,35 @@ async fn a_reversed_disposition_range_does_not_strand_the_consumer() {
         "the consumer must be removed after the malformed frame closes its connection"
     );
 
+    task.abort();
+    broker.stop().unwrap();
+}
+
+/// A range across the wrap of the delivery IDs, ending at the delivery
+/// (ID 0), settles it, where it closed the connection as a reversed range.
+#[tokio::test]
+async fn a_disposition_range_across_the_wrap_settles_its_deliveries() {
+    let (broker, q, mut s, task) = delivered().await;
+    send(
+        &mut s,
+        Performative::Disposition(Disposition {
+            role: Role::Receiver,
+            first: 0xFFFF_FFFE,
+            last: Some(0),
+            settled: true,
+            state: Some(DeliveryState::Accepted),
+            ..Default::default()
+        }),
+    )
+    .await;
+    let acked = tokio::time::timeout(Duration::from_secs(3), async {
+        while q.message_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(acked.is_ok(), "the delivery was not settled");
+    assert_eq!(q.consumer_count(), 1, "the connection was closed");
     task.abort();
     broker.stop().unwrap();
 }

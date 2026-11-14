@@ -1373,8 +1373,41 @@ impl ServerSession {
     }
 
     /// The rest of `send`: `message` is the message, or the view of a
-    /// native one, with its ID.
+    /// native one, with its ID. A send in a transaction the resource
+    /// manager rolled back (its XA timeout) goes in a new one rolled back
+    /// at once: the message is dropped and nothing stays counted, as
+    /// Artemis's `addOperation` on a rolled-back transaction runs the
+    /// operation's `afterRollback` at once.
     async fn send_message(
+        &mut self,
+        message: CoreMessage,
+        outgoing: Outgoing,
+        tx: Option<TxRef>,
+    ) -> Result<()> {
+        let dead = self.dead_tx(tx.as_ref());
+        let tx = dead.clone().or(tx);
+        let sent = self.send_message_in(message, outgoing, tx).await;
+        match dead {
+            Some(dead) => self.roll_back_dead(&dead).and(sent),
+            None => sent,
+        }
+    }
+
+    /// A new transaction for work given `tx` once the resource manager
+    /// rolled it back (an XA timeout): the session keeps the transaction
+    /// until the client ends it, but nothing may join it any more.
+    fn dead_tx(&self, tx: Option<&TxRef>) -> Option<TxRef> {
+        tx.filter(|tx| transaction::lock(tx).state == TxState::RolledBack)
+            .map(|_| self.new_tx(None))
+    }
+
+    /// Rolls back a [`dead_tx`](Self::dead_tx)'s replacement.
+    fn roll_back_dead(&mut self, tx: &TxRef) -> Result<()> {
+        let outcome = transaction::lock(tx).rollback()?;
+        self.finish(outcome, false)
+    }
+
+    async fn send_message_in(
         &mut self,
         mut message: CoreMessage,
         outgoing: Outgoing,
@@ -2103,7 +2136,27 @@ impl ServerSession {
         self.acknowledged_in(pending, Some(tx.clone()), result)
     }
 
+    /// `ServerSessionImpl.acknowledge`: an acknowledgement in a
+    /// transaction the resource manager rolled back (its XA timeout) goes
+    /// in a new one rolled back at once, so the message goes back to its
+    /// queue rather than staying acknowledged in a transaction that never
+    /// ends.
     fn acknowledged_in(
+        &mut self,
+        pending: AckPending,
+        tx: Option<TxRef>,
+        result: AckResult,
+    ) -> Result<Vec<i64>> {
+        let dead = self.dead_tx(tx.as_ref());
+        let tx = dead.clone().or(tx);
+        let acked = self.acknowledged_in_tx(pending, tx, result);
+        match dead {
+            Some(dead) => self.roll_back_dead(&dead).and(acked),
+            None => acked,
+        }
+    }
+
+    fn acknowledged_in_tx(
         &mut self,
         pending: AckPending,
         tx: Option<TxRef>,
