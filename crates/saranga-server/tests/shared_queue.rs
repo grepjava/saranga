@@ -152,3 +152,26 @@ async fn a_shared_queue_with_another_address_or_filter_is_refused() {
     assert_eq!(e.kind, ErrorType::InvalidTransientQueueUse);
     assert!(e.message.starts_with("AMQ229083"), "{}", e.message);
 }
+
+/// A queue deleted between a consumer's lookup of it and its admission
+/// (here by the sink's factory, which runs in between, as the last consumer
+/// of a transient queue leaving would) refuses the consumer rather than
+/// taking it on a queue that is gone.
+#[tokio::test]
+async fn a_consumer_on_a_queue_deleted_meanwhile_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(dir.path()).await;
+    let mut s = session(&broker);
+    s.create_shared_queue(shared("gone", "topic", None, false))
+        .unwrap();
+    let po = broker.post_office().clone();
+    let created = s
+        .create_consumer(1, "gone", None, 0, false, move |_| {
+            po.delete_queue("gone", true, false).unwrap();
+            Arc::new(Nothing)
+        })
+        .await;
+    let e = created.expect_err("a consumer on a deleted queue");
+    assert_eq!(e.kind, ErrorType::QueueDoesNotExist, "{}", e.message);
+    assert!(broker.post_office().queue("gone").is_none());
+}

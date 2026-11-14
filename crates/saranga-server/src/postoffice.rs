@@ -1683,6 +1683,11 @@ impl PostOffice {
             ));
         }
         self.plugins.check(|p| p.before_destroy_queue(name))?;
+        // Checked again with the queue closed to new consumers: one that
+        // came since the check above keeps it.
+        if let Err(n) = queue.close_for_delete(check_consumers) {
+            return Err(BrokerError::cannot_delete_queue_with_consumers(name, n));
+        }
         for m in self.mirrors.all() {
             m.delete_queue(&queue);
         }

@@ -2898,7 +2898,7 @@ impl ServerSession {
         // checked and the slot reserved atomically here, so two sessions
         // racing to the last slot cannot both be admitted.
         let effective_max = if browse_only { -1 } else { c.max_consumers };
-        if !queue.add_consumer(
+        match queue.add_consumer(
             ConsumerRegistration {
                 id,
                 client_id: consumer_id,
@@ -2912,7 +2912,14 @@ impl ServerSession {
             },
             effective_max,
         ) {
-            return Err(BrokerError::max_consumer_limit_reached(&c.address, &c.name));
+            crate::queue::Admission::Added => {}
+            crate::queue::Admission::Full => {
+                return Err(BrokerError::max_consumer_limit_reached(&c.address, &c.name));
+            }
+            // Deleted since it was looked up.
+            crate::queue::Admission::Deleted => {
+                return Err(BrokerError::no_such_queue(&c.name));
+            }
         }
         self.entry.add_consumer(consumer.clone());
         self.broker.registry().consumer_created();
@@ -3083,18 +3090,7 @@ impl ServerSession {
         // The user must be allowed to create the queue, and the address too
         // if the queue's creation would create or extend it.
         self.security_check(&spec.address, Some(&spec.name), create_check(spec.durable))?;
-        let post_office = self.broker.post_office();
-        let settings = post_office.settings(&spec.address);
-        let routing_type = spec
-            .routing_type
-            .unwrap_or(settings.default_queue_routing_type);
-        if settings.auto_create_addresses
-            && post_office
-                .address_info(&spec.address)
-                .is_none_or(|i| !i.routing_types.contains(routing_type))
-        {
-            self.security_check(&spec.address, Some(&spec.name), CheckType::CreateAddress)?;
-        }
+        self.check_address_creation(&spec)?;
         spec.user = self.validated_user.clone();
         let temporary = spec.temporary;
         let queue = self.broker.post_office().create_queue(spec, false)?;
@@ -3102,6 +3098,30 @@ impl ServerSession {
             self.conn.add_temp_queue(queue.name().clone());
         }
         Ok(queue)
+    }
+
+    /// The address permission a queue's creation needs when it would
+    /// create its address or add the queue's routing type to it: whenever
+    /// the post office would (the address settings, the queue's own
+    /// `auto_create_address`, or a temporary queue), not only with
+    /// `auto-create-addresses`.
+    fn check_address_creation(&self, spec: &QueueSpec) -> Result<()> {
+        let post_office = self.broker.post_office();
+        let settings = post_office.settings(&spec.address);
+        let routing_type = spec
+            .routing_type
+            .unwrap_or(settings.default_queue_routing_type);
+        let creates = settings.auto_create_addresses
+            || spec.auto_create_address == Some(true)
+            || spec.temporary;
+        if creates
+            && post_office
+                .address_info(&spec.address)
+                .is_none_or(|i| !i.routing_types.contains(routing_type))
+        {
+            self.security_check(&spec.address, Some(&spec.name), CheckType::CreateAddress)?;
+        }
+        Ok(())
     }
 
     /// `createSharedQueue`: creates the queue, or takes the one there
@@ -3119,6 +3139,7 @@ impl ServerSession {
         spec.transient = !spec.durable;
         spec.auto_created = false;
         spec.auto_create_address = Some(true);
+        self.check_address_creation(&spec)?;
         let po = self.broker.post_office();
         let (name, address, filter) = (
             spec.name.clone(),

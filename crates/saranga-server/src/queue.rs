@@ -114,6 +114,16 @@ const MAX_DEPAGE_NUM: i64 = 1000;
 /// a queue holds are checked as it fills.
 const DEPAGE_CHUNK: i64 = 200;
 
+/// What [`Queue::add_consumer`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    Added,
+    /// At `max-consumers` already.
+    Full,
+    /// Being deleted.
+    Deleted,
+}
+
 /// A queue's settings (`QueueConfiguration` with every default applied).
 /// Name, address, durability and the kind of queue (last-value,
 /// temporary) are fixed when it is created; `updateQueue` may change the
@@ -416,6 +426,11 @@ struct Shared {
     consumer_count: AtomicI32,
     /// Each consumer's filter, for routing (`hasMatchingConsumer`).
     consumer_filters: RwLock<Vec<(ConsumerId, Option<FilterRef>)>>,
+    /// Closed to new consumers once its deletion is under way: taken by a
+    /// consumer's admission and by the deletion's consumer check, so a
+    /// consumer is either admitted before the check (which then sees it)
+    /// or refused after it.
+    closed: std::sync::Mutex<bool>,
     deleted: AtomicBool,
     /// When the queue was created, in epoch milliseconds.
     created_at: i64,
@@ -509,6 +524,7 @@ impl Queue {
             paging,
             consumer_count: AtomicI32::new(0),
             consumer_filters: RwLock::default(),
+            closed: std::sync::Mutex::new(false),
             deleted: AtomicBool::new(false),
             created_at: crate::message::now_millis(),
             consumer_removed_at: AtomicI64::new(-1),
@@ -891,17 +907,21 @@ impl Queue {
 
     /// Registers a consumer, reserving its slot atomically against
     /// `max_consumers` (`-1` for no limit) so two sessions cannot both pass the
-    /// check and exceed the limit. Returns `false` without registering when the
-    /// queue is already full.
+    /// check and exceed the limit. Registers nothing when the queue is full,
+    /// or is being deleted.
     #[must_use]
-    pub fn add_consumer(&self, reg: ConsumerRegistration, max_consumers: i32) -> bool {
+    pub fn add_consumer(&self, reg: ConsumerRegistration, max_consumers: i32) -> Admission {
+        let closed = self.0.closed.lock().unwrap_or_else(|e| e.into_inner());
+        if *closed {
+            return Admission::Deleted;
+        }
         if max_consumers < 0 {
             self.0.consumer_count.fetch_add(1, Ordering::SeqCst);
         } else {
             let mut cur = self.0.consumer_count.load(Ordering::SeqCst);
             loop {
                 if cur >= max_consumers {
-                    return false;
+                    return Admission::Full;
                 }
                 match self.0.consumer_count.compare_exchange_weak(
                     cur,
@@ -920,7 +940,22 @@ impl Queue {
             .unwrap_or_else(|e| e.into_inner())
             .push((reg.id, reg.filter.clone()));
         self.send(Cmd::AddConsumer(Box::new(reg)));
-        true
+        drop(closed);
+        Admission::Added
+    }
+
+    /// Closes the queue to new consumers for its deletion. With
+    /// `check_consumers`, refused (with the count) while it has any; the
+    /// check and the closing are one step against
+    /// [`add_consumer`](Self::add_consumer).
+    pub fn close_for_delete(&self, check_consumers: bool) -> std::result::Result<(), i32> {
+        let mut closed = self.0.closed.lock().unwrap_or_else(|e| e.into_inner());
+        let count = self.0.consumer_count.load(Ordering::SeqCst);
+        if check_consumers && count > 0 {
+            return Err(count);
+        }
+        *closed = true;
+        Ok(())
     }
 
     /// `hasMatchingConsumer`: a consumer without a filter, or whose filter
