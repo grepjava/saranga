@@ -2647,7 +2647,13 @@ impl PagingStore {
             if let Err(e) = fs::remove_file(&path)
                 && e.kind() != io::ErrorKind::NotFound
             {
+                // The page stays, so its acknowledgements must too: deleted,
+                // the page's acknowledged messages would come back at the
+                // next start. A critical I/O error stops the broker first.
+                // (Artemis only logs it, and drops the acknowledgements.)
                 tracing::warn!("AMQ222003: Error deleting page {}: {e}", path.display());
+                manager.critical_io(&e, &path);
+                continue;
             }
             if let Some(r) = manager.replicator()
                 && lock(&self.state).replicated

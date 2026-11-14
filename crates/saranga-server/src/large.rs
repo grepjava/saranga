@@ -281,12 +281,7 @@ impl LargeMessageStore {
         let deferred =
             std::mem::take(&mut *self.deferred.lock().unwrap_or_else(|e| e.into_inner()));
         for (id, path) in deferred {
-            self.remove(id, &path, |e| {
-                tracing::warn!(
-                    "AMQ222010: Critical IO Error, failed to delete large message file {}: {e}",
-                    path.display()
-                )
-            });
+            self.remove(id, &path, |e| deletion_failed(&path, &e));
         }
     }
 
@@ -514,10 +509,23 @@ impl LargeBody {
         let backing = match (&self.backing, self.store.path(new_id, durable)) {
             (Backing::File(from), Some(to)) => {
                 let replication = self.store.replication();
-                fs::copy(from, &to)?;
+                // Writing the copy is a critical I/O error when it fails
+                // (`copyInto` writes through `addBytes`); a source that is
+                // gone just fails the copy.
+                let critical = |e: io::Error| {
+                    self.store.critical_io(&e, &to);
+                    e
+                };
+                if let Err(e) = fs::copy(from, &to) {
+                    return Err(if from.exists() { critical(e) } else { e });
+                }
                 if self.store.sync {
                     // Syncing needs write access on Windows.
-                    OpenOptions::new().write(true).open(&to)?.sync_all()?;
+                    OpenOptions::new()
+                        .write(true)
+                        .open(&to)
+                        .and_then(|f| f.sync_all())
+                        .map_err(critical)?;
                 }
                 let replicator = if durable {
                     replication.replicator()
@@ -531,10 +539,10 @@ impl LargeBody {
                             None,
                         );
                     }
-                    let mut f = File::open(&to)?;
+                    let mut f = File::open(&to).map_err(critical)?;
                     let mut chunk = vec![0; CHUNK_SIZE];
                     loop {
-                        let n = f.read(&mut chunk)?;
+                        let n = f.read(&mut chunk).map_err(critical)?;
                         if n == 0 {
                             break;
                         }
@@ -581,18 +589,20 @@ impl LargeBody {
     }
 }
 
+/// A body file that could not be deleted: logged as Artemis's
+/// `SequentialFile.delete` logs it, and left for the next start's cleanup.
+pub(crate) fn deletion_failed(path: &Path, e: &io::Error) {
+    tracing::error!("AMQ144000: Failed to delete file {}", path.display());
+    tracing::debug!("Fine error while deleting file: {e}");
+}
+
 impl Drop for LargeBody {
     fn drop(&mut self) {
         if let Backing::File(p) = &self.backing
             && self.store.is_live()
             && !self.keep.load(Ordering::SeqCst)
         {
-            self.store.remove(self.id, p, |e| {
-                tracing::warn!(
-                    "AMQ222010: Critical IO Error, failed to delete large message file {}: {e}",
-                    p.display()
-                )
-            });
+            self.store.remove(self.id, p, |e| deletion_failed(p, &e));
         }
     }
 }

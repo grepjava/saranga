@@ -1106,10 +1106,7 @@ impl Writer {
                     if let Err(e) = std::fs::remove_file(&path)
                         && e.kind() != std::io::ErrorKind::NotFound
                     {
-                        tracing::warn!(
-                            "AMQ222010: Critical IO Error, failed to delete large message file {}: {e}",
-                            path.display()
-                        );
+                        crate::large::deletion_failed(&path, &e);
                     }
                 }
             }
