@@ -13,6 +13,9 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **A transaction that pages across several page files has them all on disk when it commits.** A page was not synced when the broker moved on to the next one, and the commit synced only the last, so a power loss could lose committed messages. Leaving a page now syncs it, as Artemis does.
+- **A divert that cannot copy a large message fails the send.** The copy was skipped with a warning, so a message taken by an exclusive divert was acknowledged to the producer and stored nowhere.
+- **The store takes no more writes after a critical I/O error in a page or large message file**, as COMPAT says it does after a journal's own error; a send could still succeed while the broker stopped.
 - **A page file that cannot be deleted no longer brings its acknowledged messages back.** Once every message on a page was acknowledged, its acknowledgement records were deleted even when the page file itself could not be, so the messages were delivered again after a restart. The page's acknowledgements are now kept, and the failure is a critical I/O error that stops the broker (see COMPAT).
 - **A large message copy that cannot be written is a critical I/O error**, as it is in Artemis, where a divert, dead-letter or expiry copy failed without one. A body file that cannot be deleted is now logged as Artemis logs it (AMQ144000) rather than as a critical error, and is left for the next start's cleanup.
 - **Deleting a non-destructive queue no longer loses another queue's durable message.** The deliveries its consumers held were acknowledged along with the queued references they copy, taking a message that another queue also held down twice: its journal record went, and the other queue lost it at the next start.

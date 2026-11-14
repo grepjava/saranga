@@ -144,6 +144,12 @@ impl Store for JournalStorage {
     }
 
     fn critical_io(&self, e: &std::io::Error, file: Option<&Path>) {
+        // Neither journal takes another write once the broker is stopping
+        // on the error: the stop runs on its own, and a write in the
+        // meantime would succeed.
+        let failure = JournalError::Io(Arc::new(std::io::Error::new(e.kind(), e.to_string())));
+        self.messages.stop_writes(failure.clone());
+        self.bindings.stop_writes(failure);
         match file {
             Some(f) => tracing::warn!(
                 "AMQ144011: Critical IO Exception happened: {e} on {}",

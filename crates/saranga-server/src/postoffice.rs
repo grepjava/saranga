@@ -2310,14 +2310,17 @@ impl PostOffice {
                     let s = self.settings(forward);
                     crate::message::apply_expiry_delay(&mut core, &s, now);
                     let Some(copied) = message.message.copy(core) else {
-                        // A large body that cannot be copied is not diverted to
-                        // this target rather than route a copy with no
-                        // recoverable body.
-                        tracing::warn!(
-                            "diverting message {} to {forward}: its large body could not be copied",
-                            message.message_id()
-                        );
-                        continue;
+                        // A large body that cannot be copied fails the
+                        // send, as Artemis's `DivertImpl.route` fails on the
+                        // copy `copy` gives as null: going on would lose
+                        // the message an exclusive divert takes.
+                        return Err(BrokerError::new(
+                            saranga_core_protocol::ErrorType::IoError,
+                            format!(
+                                "diverting message {} to {forward}: its large body could not be copied",
+                                message.message_id()
+                            ),
+                        ));
                     };
                     let mut r = MessageRef::new(copied);
                     r.scheduled_time = crate::message::scheduled_delivery_time(r.message.core());

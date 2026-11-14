@@ -396,7 +396,7 @@ async fn concurrent_replacements_leave_one_retained_message() {
 #[tokio::test]
 async fn a_failed_replacement_keeps_the_retained_message() {
     let dir = tempfile::tempdir().unwrap();
-    let (broker, address, _task) = start(Some(dir.path())).await;
+    let (broker, address, task) = start(Some(dir.path())).await;
     let (mut publisher, _) = Client::open(address, "r-pub", true).await;
     publisher.retain("r/t", b"v1", 1).await;
     // The replacement is large: the message's file opens, its retained
@@ -410,6 +410,13 @@ async fn a_failed_replacement_keeps_the_retained_message() {
     assert_eq!(publisher.packet().await, None, "closed without a PUBACK");
     assert_eq!(fault.hits(), 1, "the retained copy's file failed");
     drop(fault);
+    // The failure is a critical I/O error: the broker takes no more writes
+    // and stops. After a restart the old message is still retained.
+    assert!(broker.is_critical_io_failed());
+    let _ = broker.stop();
+    task.abort();
+    drop(broker);
+    let (broker, address, _task) = start(Some(dir.path())).await;
     let (mut sub, _) = Client::open(address, "r-sub", true).await;
     sub.subscribe("r/t", 1).await;
     let (flags, _, payload) = parse_publish(&sub.packet().await.expect("the old message"));

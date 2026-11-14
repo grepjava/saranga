@@ -309,6 +309,14 @@ impl Writer {
         self.lock().failed.clone()
     }
 
+    /// Latches `e` as the journal's failure, for a critical I/O error
+    /// outside it: no more writes are taken. The critical listener is not
+    /// told; whoever latches it tells it.
+    pub fn stop_writes(&self, e: JournalError) {
+        self.lock().failed.get_or_insert(e);
+        self.shared.done.notify_all();
+    }
+
     pub fn set_critical_listener(&self, listener: Option<CriticalListener>) {
         *self
             .shared

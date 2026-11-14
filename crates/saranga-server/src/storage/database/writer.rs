@@ -199,6 +199,14 @@ impl Credits {
 }
 
 impl Writes {
+    /// A critical I/O error outside the store (a page or large message
+    /// file): no more writes are taken, as after one of the store's own.
+    pub fn stop(&self) {
+        self.failed.store(true, Ordering::Release);
+        let _guard = self.pending.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.pending.freed.notify_all();
+    }
+
     /// Queues a unit, waiting while too much is unwritten.
     pub fn send(&self, unit: Unit) -> Result<(), JournalError> {
         if self.failed.load(Ordering::Acquire) {

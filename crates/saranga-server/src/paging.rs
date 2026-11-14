@@ -1120,6 +1120,16 @@ impl PagingStore {
 
     /// `openNewPage`.
     fn open_new_page(&self, st: &mut StoreState) -> io::Result<()> {
+        // `oldPage.close(true)`: closing the page syncs it, so a commit,
+        // which syncs only the current page, has every earlier page it
+        // wrote to on disk.
+        if let Some(old) = &st.current {
+            sync_page(&old.file, &old.path).inspect_err(|e| {
+                if let Some(m) = self.manager.upgrade() {
+                    m.critical_io(e, &old.path);
+                }
+            })?;
+        }
         let folder = self.folder(st)?;
         let id = st.current_page_id + 1;
         let path = folder.join(saranga_paging::page_file_name(id));

@@ -1250,6 +1250,8 @@ impl Store for DatabaseStorage {
     }
 
     fn critical_io(&self, e: &std::io::Error, file: Option<&Path>) {
+        // No more writes once the broker is stopping on the error.
+        self.writes.stop();
         match file {
             Some(f) => tracing::warn!(
                 "AMQ144011: Critical IO Exception happened: {e} on {}",

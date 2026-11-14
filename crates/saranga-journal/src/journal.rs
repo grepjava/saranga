@@ -1113,6 +1113,12 @@ impl Journal {
     pub fn failure(&self) -> Option<JournalError> {
         self.writer.failure()
     }
+
+    /// A critical I/O error outside the journal (a page or large message
+    /// file): the journal takes no more writes, as after one of its own.
+    pub fn stop_writes(&self, e: JournalError) {
+        self.writer.stop_writes(e);
+    }
 }
 
 impl Drop for Journal {
