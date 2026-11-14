@@ -441,6 +441,10 @@ struct Shared {
     address_paused: AtomicBool,
     /// The `QUEUE_STATUS_RECORD` of a persisted pause; -1 for none.
     pause_record: AtomicI64,
+    /// A mirror's store-and-forward queue (`isMirrorController`): its
+    /// messages never expire, the peer taking each one being what a `sync`
+    /// mirror waits for.
+    mirror_controller: AtomicBool,
     /// The actor at work, for the critical analyzer.
     critical: crate::critical::Measure,
 }
@@ -516,6 +520,7 @@ impl Queue {
             paused: AtomicBool::new(false),
             address_paused: AtomicBool::new(false),
             pause_record: AtomicI64::new(-1),
+            mirror_controller: AtomicBool::new(false),
             critical: Default::default(),
         }));
         let actor = Actor {
@@ -1116,6 +1121,17 @@ impl Queue {
     /// gone.
     pub fn back_to_delivering(&self, id: ConsumerId, r: MessageRef) {
         self.send(Cmd::BackToDelivering { id, r });
+    }
+
+    /// `setMirrorController`: the queue is a mirror's store-and-forward
+    /// queue, whose messages do not expire.
+    pub fn set_mirror_controller(&self, mirror: bool) {
+        self.0.mirror_controller.store(mirror, Ordering::SeqCst);
+    }
+
+    /// `isMirrorController`.
+    pub fn is_mirror_controller(&self) -> bool {
+        self.0.mirror_controller.load(Ordering::SeqCst)
     }
 
     /// `ServerSessionImpl.expire`: a delivered message the client found
@@ -2387,28 +2403,7 @@ impl Actor {
                 message_id,
                 properties,
             } => {
-                let r = self.consumer_mut(id).and_then(|c| {
-                    let i = c
-                        .delivering
-                        .iter()
-                        .position(|r| r.message_id() == message_id)?;
-                    c.delivering.remove(i)
-                });
-                // On a non-destructive queue the delivery is a copy of a
-                // reference still queued: that one leaves the queue with it,
-                // and the message is killed once. A copy whose reference has
-                // gone (another consumer's rejection took it) owns nothing.
-                let r = r.filter(|_| {
-                    !self.shared.config().non_destructive
-                        || match self.messages.find(|q| q.message_id() == message_id) {
-                            Some(at) => {
-                                self.messages.remove(at);
-                                true
-                            }
-                            None => false,
-                        }
-                });
-                if let Some(mut r) = r {
+                if let Some(mut r) = self.take_delivered_for_good(id, message_id) {
                     if !properties.is_empty() {
                         let mut core = r.message.core().clone();
                         for (k, v) in properties {
@@ -2445,15 +2440,11 @@ impl Actor {
                 }
                 let _ = reply.send(r);
             }
+            // Mirror store-and-forward queues are not supposed to expire
+            // messages (`isExpiryDisabled`, `checkExpired`).
+            Cmd::Expire { .. } | Cmd::ExpireScan if self.queue().is_mirror_controller() => {}
             Cmd::Expire { id, message_id } => {
-                let r = self.consumer_mut(id).and_then(|c| {
-                    let i = c
-                        .delivering
-                        .iter()
-                        .position(|r| r.message_id() == message_id)?;
-                    c.delivering.remove(i)
-                });
-                if let Some(r) = r {
+                if let Some(r) = self.take_delivered_for_good(id, message_id) {
                     self.expire(r);
                 }
             }
@@ -2473,6 +2464,27 @@ impl Actor {
             Cmd::Stop => return false,
         }
         true
+    }
+
+    /// Takes a delivery off its consumer for a rejection or an expiry,
+    /// which take the message off the queue for good. On a non-destructive
+    /// queue the delivery is a copy of a reference still queued: that one
+    /// leaves the queue with it, so the message is acknowledged once. A
+    /// copy whose reference has gone (another consumer's rejection or
+    /// expiry took it) owns nothing, and is only dropped.
+    fn take_delivered_for_good(&mut self, id: ConsumerId, message_id: i64) -> Option<MessageRef> {
+        let r = self.consumer_mut(id).and_then(|c| {
+            let i = c
+                .delivering
+                .iter()
+                .position(|r| r.message_id() == message_id)?;
+            c.delivering.remove(i)
+        })?;
+        if self.shared.config().non_destructive {
+            let at = self.messages.find(|q| q.message_id() == message_id)?;
+            self.messages.remove(at);
+        }
+        Some(r)
     }
 
     fn consumer_mut(&mut self, id: ConsumerId) -> Option<&mut Consumer> {
@@ -2741,7 +2753,7 @@ impl Actor {
         // An expired message is never delivered (`checkExpired`). Drop it before
         // the credit check below, which reserves a flow-control slot for what it
         // admits; a reserved slot must always be spent on a delivery.
-        {
+        if !self.queue().is_mirror_controller() {
             let m = &self.messages.get(at).message;
             if m.core().expiration != 0 && m.is_expired(now_millis()) {
                 let r = self.messages.remove(at);

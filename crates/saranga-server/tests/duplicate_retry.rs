@@ -558,3 +558,20 @@ async fn a_cache_of_size_zero_journals_no_ids() {
     s.close(false).await;
     broker.stop().unwrap();
 }
+
+/// With duplicate detection off (`id-cache-size` 0), one transaction can
+/// send an ID twice: both are delivered and the commit succeeds.
+#[tokio::test]
+async fn a_transaction_sends_an_id_twice_with_detection_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start_with(dir.path(), false, "<id-cache-size>0</id-cache-size>").await;
+    create_full_queue(&broker).await;
+    let mut s = session_with(&broker, false);
+    send(&mut s, Some("d1")).await.unwrap();
+    send(&mut s, Some("d1")).await.unwrap();
+    s.commit().expect("the commit succeeds");
+    s.take_completion().wait().await.unwrap();
+    assert_eq!(count(&broker).await, Json::Long(2), "both delivered");
+    s.close(false).await;
+    broker.stop().unwrap();
+}

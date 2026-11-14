@@ -59,6 +59,12 @@ impl DuplicateIdCache {
         &self.address
     }
 
+    /// Whether duplicate detection is on: a cache of size 0 is Artemis's
+    /// `NoOpDuplicateIDCache`, for which no ID is ever a duplicate.
+    pub fn is_enabled(&self) -> bool {
+        self.size > 0
+    }
+
     /// Whether IDs are journaled.
     pub fn is_persistent(&self) -> bool {
         self.storage.is_some()

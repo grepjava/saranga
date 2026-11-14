@@ -512,3 +512,81 @@ async fn a_management_copy_is_mirrored() {
     stop(a).await;
     stop(b).await;
 }
+
+/// A mirror's store-and-forward queue never expires a message (Artemis's
+/// `isExpiryDisabled` and `checkExpired` for a mirror controller queue):
+/// expiring it would acknowledge it there, which a `sync` mirror takes as
+/// its peer having it, and complete the send with no peer at all.
+#[tokio::test]
+async fn a_sync_mirror_queue_does_not_expire_a_message_its_peer_lacks() {
+    use saranga_protocol_amqp::mirror::source::MirrorSource;
+    use saranga_server::session::{ClientConnection, ServerSession, SessionOptions, Transport};
+    let b = Broker::start(BrokerConfig::new(Arc::new(SelectorFilters)))
+        .await
+        .unwrap();
+    let mut spec = saranga_server::postoffice::QueueSpec::new("q", "q");
+    spec.auto_create_address = Some(true);
+    b.post_office().create_queue(spec, false).unwrap();
+    let mirror = MirrorSource::install(
+        &b,
+        "offline",
+        &saranga_config::AmqpMirrorElement {
+            sync: true,
+            queue_creation: false,
+            queue_removal: false,
+            message_acknowledgements: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let conn = Arc::new(ClientConnection::new(
+        Transport::internal("test"),
+        Arc::default(),
+        vec![],
+    ));
+    let mut s = ServerSession::new(
+        b.clone(),
+        conn,
+        SessionOptions {
+            name: "s".into(),
+            username: None,
+            password: None,
+            xa: false,
+            auto_commit_sends: true,
+            auto_commit_acks: true,
+            pre_acknowledge: false,
+            default_address: None,
+        },
+        Default::default(),
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    s.send(
+        saranga_message::CoreMessage {
+            address: Some("q".into()),
+            expiration: now + 100,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let completion = s.take_completion();
+    assert_eq!(mirror.snf().browse().await.len(), 1);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    mirror.snf().expire_scan();
+    assert_eq!(
+        mirror.snf().browse().await.len(),
+        1,
+        "the store-and-forward queue keeps it"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), completion.wait())
+            .await
+            .is_err(),
+        "the send completed with no peer to take it"
+    );
+    b.stop().unwrap();
+}

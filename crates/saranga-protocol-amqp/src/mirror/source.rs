@@ -132,6 +132,8 @@ impl MirrorSource {
             );
             return Err(BrokerError::internal("Cannot start replica"));
         }
+        // `snfQueue.setMirrorController(true)`: its messages do not expire.
+        snf.set_mirror_controller(true);
         po.paging_store(&snf_address)
             .enforce_policy(match element.sync {
                 true => AddressFullPolicy::Block,

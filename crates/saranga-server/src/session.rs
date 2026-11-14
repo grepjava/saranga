@@ -1583,12 +1583,14 @@ impl ServerSession {
             let mut t = tx.as_ref().map(transaction::lock);
             let mut c = crate::duplicate::lock(&cache);
             // An ID this transaction already sent counts too, though it
-            // joins the cache only when the transaction commits.
-            let in_tx = t.as_ref().is_some_and(|t| {
-                t.duplicates
-                    .iter()
-                    .any(|d| Arc::ptr_eq(&d.cache, &cache) && d.id == id)
-            });
+            // joins the cache only when the transaction commits; unless
+            // duplicate detection is off for the address.
+            let in_tx = c.is_enabled()
+                && t.as_ref().is_some_and(|t| {
+                    t.duplicates
+                        .iter()
+                        .any(|d| Arc::ptr_eq(&d.cache, &cache) && d.id == id)
+                });
             if in_tx || c.contains(&id) {
                 drop(c);
                 if bridge {

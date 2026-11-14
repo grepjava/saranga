@@ -196,3 +196,80 @@ async fn rejecting_on_a_non_destructive_queue_keeps_another_queues_message() {
     );
     broker.stop().unwrap();
 }
+
+/// A delivery the client finds expired on a non-destructive queue takes the
+/// message off that queue, acknowledged there once, as a rejection does:
+/// deleting the queue afterwards leaves another queue's copy in place.
+#[tokio::test]
+async fn expiring_on_a_non_destructive_queue_keeps_another_queues_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = saranga_config::BrokerConfig::parse(
+        r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+             <persistence-enabled>true</persistence-enabled>
+             <journal-file-size>65536</journal-file-size>
+           </core></configuration>"#,
+    )
+    .unwrap();
+    let config =
+        || BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path()).unwrap();
+    let broker = Broker::start(config()).await.unwrap();
+    for name in ["a", "b"] {
+        let mut spec = QueueSpec::new(name, "addr");
+        spec.auto_create_address = Some(true);
+        spec.durable = true;
+        spec.non_destructive = Some(name == "a");
+        broker.post_office().create_queue(spec, false).unwrap();
+    }
+    let mut s = session(&broker);
+    s.create_consumer(1, "a", None, 0, false, |_| Arc::new(Sink))
+        .await
+        .unwrap();
+    s.consumer_credits(1, -1);
+    s.set_started(true).await;
+    s.send(
+        saranga_message::CoreMessage {
+            address: Some("addr".into()),
+            durable: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    s.take_completion().wait().await.unwrap();
+    let a = broker.post_office().queue("a").unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while a.stats().await.delivering_count != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let id = broker.post_office().queue("b").unwrap().browse().await[0].message_id();
+    s.expire(1, id).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while a.message_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the expired message leaves the non-destructive queue");
+    broker
+        .post_office()
+        .delete_queue_awaited("a", false, false)
+        .await
+        .unwrap();
+    assert_eq!(broker.post_office().queue("b").unwrap().message_count(), 1);
+    s.close(true).await;
+    broker.stop().unwrap();
+    drop(s);
+    drop(broker);
+
+    let broker = Broker::start(config()).await.unwrap();
+    assert_eq!(
+        broker.post_office().queue("b").unwrap().message_count(),
+        1,
+        "b's message is still there after a restart"
+    );
+    broker.stop().unwrap();
+}

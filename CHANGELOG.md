@@ -13,6 +13,9 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **A mirror's store-and-forward queue no longer expires messages**, as Artemis's does not. Expiring one acknowledged it there, which a `sync` mirror takes as its peer having it: a send completed with no peer connected.
+- **A delivery a client finds expired on a non-destructive queue leaves that queue**, as a rejected one already did, so deleting the queue afterwards no longer takes a durable message from another queue (see COMPAT).
+- **With `id-cache-size` 0, one transaction can send an ID twice**: the transaction's own duplicate check still ran and marked it rollback-only, though duplicate detection is off.
 - **An acknowledgement mirrored to several `sync` mirrors waits for every peer**, as Artemis's mirror aggregation does; it waited for the last mirror's only, so the client could be told it was done while an earlier peer still lacked it.
 - **`id-cache-size` 0 turns duplicate detection off without journaling the IDs**, as Artemis's no-op cache does. Each ID was journaled and never deleted, so the journal grew until a restart, and an ID taken by a send under way still counted as a duplicate.
 - **`send-to-dla-on-no-route` takes a message the address's queues all turn away**, through their filters, routing types or being disabled, as Artemis does, not only one sent to an address with no queue: such a message was dropped without a word. As in Artemis, a divert's copies do not count, so a message only a divert took goes to the dead-letter address as well.
