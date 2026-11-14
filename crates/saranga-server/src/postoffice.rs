@@ -2255,11 +2255,13 @@ impl PostOffice {
             && !self.has_exclusive_divert(&stripped, real)
         {
             let queues = self.queues_by_id(real, fqqn_queue, &ids, &stripped);
-            self.count_route(real, !queues.is_empty());
-            if !queues.is_empty() {
+            let routed = !queues.is_empty();
+            self.count_route(real, routed);
+            if routed {
                 out.push((stripped, queues));
+                return Ok(());
             }
-            return Ok(());
+            return self.unrouted(routed, &stripped, real, to_dla, out);
         }
         // simpleRoute: without a local binding, the address and its queue
         // may be created first.
@@ -2283,13 +2285,18 @@ impl PostOffice {
         else {
             return self.maybe_send_to_dla(message, real, to_dla, out);
         };
-        if !queues.is_empty() {
+        // `simpleRoute` gives no bindings when the message reached no queue,
+        // whatever bindings the address has (filters, routing types and
+        // disabled queues can turn it away): `maybeSendToDLA` then. A
+        // divert's copies route on their own and do not count.
+        let routed = !queues.is_empty();
+        if routed {
             out.push((with_route_context(message, &remote), queues));
         }
         // `disableDivert`: a mirror target's message is not diverted (the
         // peer sends the diverted copies on their own).
         if mirror {
-            return Ok(());
+            return self.unrouted(routed, message, real, to_dla, out);
         }
         if depth >= MAX_DIVERT_DEPTH {
             if !diverts.is_empty() {
@@ -2297,7 +2304,7 @@ impl PostOffice {
                     "diverts from {real} nest deeper than {MAX_DIVERT_DEPTH}; not followed"
                 );
             }
-            return Ok(());
+            return self.unrouted(routed, message, real, to_dla, out);
         }
         // DivertImpl.route
         for d in diverts {
@@ -2340,7 +2347,22 @@ impl PostOffice {
                 )?;
             }
         }
-        Ok(())
+        self.unrouted(routed, message, real, to_dla, out)
+    }
+
+    /// `maybeSendToDLA` for a message that reached no queue.
+    fn unrouted(
+        &self,
+        routed: bool,
+        message: &MessageRef,
+        address: &str,
+        to_dla: bool,
+        out: &mut Routed,
+    ) -> Result<()> {
+        if routed {
+            return Ok(());
+        }
+        self.maybe_send_to_dla(message, address, to_dla, out)
     }
 
     /// Whether an exclusive divert of `address` takes the message.
@@ -2640,6 +2662,7 @@ impl PostOffice {
         new.routing_type = d.routing_type;
         let mut replacement = self.build_divert(&new, transformers)?;
         replacement.routing_name = old.routing_name.clone();
+        replacement.id = old.id;
         {
             let mut state = self.write();
             for entry in state.addresses.values_mut() {
@@ -2742,6 +2765,7 @@ impl PostOffice {
             },
         };
         Ok(Divert {
+            id: self.ids.next(),
             name: d.name.as_str().into(),
             routing_name: d
                 .routing_name
@@ -2918,17 +2942,21 @@ impl PostOffice {
                 Bound::Remote(Arc::clone(b)),
             );
         }
-        // Non-exclusive diverts route a copy as well.
-        let diverts = if fqqn_queue.is_none() {
-            entries
+        // A non-exclusive divert is a binding of its routing name: of the
+        // diverts (and queues) sharing one, one takes each message.
+        if fqqn_queue.is_none() {
+            for d in entries
                 .iter()
                 .flat_map(|e| e.diverts.iter())
-                .filter(|d| !d.exclusive && divert_matches(d))
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
+                .filter(|d| !d.exclusive)
+            {
+                add_to_group(
+                    &mut groups,
+                    d.routing_name.clone(),
+                    Bound::Divert(Arc::clone(d)),
+                );
+            }
+        }
         // A proposal may wait for another node: nothing stays locked.
         drop(entries);
         drop(state);
@@ -2958,6 +2986,7 @@ impl PostOffice {
                         crate::remote_binding::strip_trailing_uuid(r.unique_name()) == n
                     }) && r.filter().is_none_or(|f| f.matches(target))
                 }
+                Bound::Divert(d) => divert_matches(d),
             }
         };
         // routeUsingStrictOrdering: with a grouping handler, a message of a
@@ -2969,10 +2998,7 @@ impl PostOffice {
                 crate::message::HDR_GROUP_ID,
             ))
             .zip(self.node_id());
-        let mut routes = Routes {
-            diverts,
-            ..Routes::default()
-        };
+        let mut routes = Routes::default();
         for (name, mut group) in groups {
             group.sort_by_key(Bound::id);
             let key = (Name::from(real), name);
@@ -3001,6 +3027,7 @@ impl PostOffice {
                     }
                     routes.remote.push(Arc::clone(r));
                 }
+                Bound::Divert(d) => routes.diverts.push(Arc::clone(d)),
             }
         }
         Some(routes)
@@ -3079,6 +3106,8 @@ impl PostOffice {
         let cluster_name = |b: &Bound| match b {
             Bound::Local(q) => format!("{}{node_id}", q.name()),
             Bound::Remote(r) => r.unique_name().to_string(),
+            // DivertBinding.getClusterName: the divert's name.
+            Bound::Divert(d) => d.name.to_string(),
         };
         let locate = |name: &str| group.iter().position(|b| cluster_name(b) == name);
         for tries in 0..=crate::grouping::MAX_GROUP_RETRY {
@@ -3190,6 +3219,7 @@ impl PostOffice {
             let (filter, own) = match b {
                 Bound::Local(q) => (q.filter(), q == originating),
                 Bound::Remote(r) => (r.filter(), false),
+                Bound::Divert(_) => continue,
             };
             if b.is_high_accept_priority(target) && !own && filter.is_none_or(|f| f.matches(target))
             {
@@ -3221,13 +3251,14 @@ impl PostOffice {
         copy.scheduled_time = message.scheduled_time;
         let copy = clear_internal_properties(&copy).unwrap_or(copy);
         positions.insert(key, position);
-        Some(match chosen {
-            Bound::Local(q) => vec![(copy, vec![q.clone()])],
-            Bound::Remote(r) => vec![(
+        match chosen {
+            Bound::Local(q) => Some(vec![(copy, vec![q.clone()])]),
+            Bound::Remote(r) => Some(vec![(
                 with_route_context(&copy, std::slice::from_ref(r)),
                 vec![r.sf_queue().clone()],
-            )],
-        })
+            )]),
+            Bound::Divert(_) => None,
+        }
     }
 }
 
@@ -3252,6 +3283,9 @@ fn add_to_group(groups: &mut Vec<(Name, Vec<Bound>)>, name: Name, b: Bound) {
 enum Bound {
     Local(Queue),
     Remote(Arc<RemoteBinding>),
+    /// A non-exclusive divert (`DivertBinding`), one of its routing name's
+    /// bindings like any other.
+    Divert(Arc<Divert>),
 }
 
 impl Bound {
@@ -3259,12 +3293,13 @@ impl Bound {
         match self {
             Self::Local(q) => q.id(),
             Self::Remote(r) => r.id(),
+            Self::Divert(d) => d.id,
         }
     }
 
     fn is_connected(&self) -> bool {
         match self {
-            Self::Local(_) => true,
+            Self::Local(_) | Self::Divert(_) => true,
             Self::Remote(r) => r.is_connected(),
         }
     }
@@ -3275,6 +3310,8 @@ impl Bound {
         match self {
             Self::Local(q) => q.has_matching_consumer(message),
             Self::Remote(r) => r.is_high_accept_priority(message),
+            // DivertBinding.isHighAcceptPriority
+            Self::Divert(_) => true,
         }
     }
 }
@@ -3347,6 +3384,9 @@ pub fn routing_name(q: &Queue) -> Name {
 /// A divert (`DivertImpl`): a binding on `address` that sends a copy of
 /// each matching message on to the forwarding addresses.
 pub struct Divert {
+    /// Its binding's ID (`DivertBinding.getID`): where it stands among its
+    /// routing name's bindings.
+    pub id: i64,
     pub name: Name,
     pub routing_name: Name,
     pub address: Name,

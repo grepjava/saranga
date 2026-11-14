@@ -202,3 +202,118 @@ async fn a_queue_that_takes_nothing_gives_up_its_turn() {
         b.stop().unwrap();
     }
 }
+
+/// A broker whose addresses send what reaches no queue to `DLQ`, with
+/// anycast queues `names` (a filter for any given one).
+async fn dla_broker(queues: &[(&str, Option<&str>)]) -> Arc<Broker> {
+    use saranga_server::settings::{AddressSettings, UniformSettings};
+    let mut config = BrokerConfig::new(Arc::new(SelectorFilters));
+    config.settings = Arc::new(UniformSettings(Arc::new(AddressSettings {
+        send_to_dla_on_no_route: true,
+        dead_letter_address: Some("DLQ".into()),
+        ..Default::default()
+    })));
+    let b = Broker::start(config).await.unwrap();
+    for (name, filter) in queues.iter().chain([&("DLQ", None)]) {
+        let mut spec = QueueSpec::new(*name, *name);
+        spec.auto_create_address = Some(true);
+        spec.routing_type = Some(RoutingType::Anycast);
+        spec.filter_string = filter.map(str::to_owned);
+        b.post_office().create_queue(spec, false).unwrap();
+    }
+    b
+}
+
+/// `send-to-dla-on-no-route` takes a message the address's queues all turn
+/// away (`simpleRoute` gives no bindings when no queue took it), not only
+/// one sent to an address with no queue.
+#[tokio::test]
+async fn a_message_every_filter_rejects_goes_to_the_dead_letter_address() {
+    let b = dla_broker(&[("orders", Some("color = 'red'"))]).await;
+    let to_orders = |id, color| {
+        let mut core = message(id, color).message.core().clone();
+        core.address = Some(SimpleString::from("orders"));
+        MessageRef::new(ServerMessage::new(core))
+    };
+    let routed = b
+        .post_office()
+        .route(&to_orders(1, "blue"), "orders", None, Default::default())
+        .unwrap();
+    assert_eq!(queues(&routed), ["DLQ"]);
+    // One the filter takes goes to its queue only.
+    let routed = b
+        .post_office()
+        .route(&to_orders(2, "red"), "orders", None, Default::default())
+        .unwrap();
+    assert_eq!(queues(&routed), ["orders"]);
+}
+
+/// As in Artemis, a divert's copy routes on its own: a message only an
+/// exclusive divert took reached no queue of its address, and goes to the
+/// dead-letter address as well.
+#[tokio::test]
+async fn a_message_only_a_divert_took_also_goes_to_the_dead_letter_address() {
+    let b = dla_broker(&[("src", None), ("dst", None)]).await;
+    b.post_office()
+        .deploy_divert(
+            &DivertDeployment {
+                filter: None,
+                transformer: None,
+                ..divert(true)
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    let routed = b
+        .post_office()
+        .route(&message(1, "red"), "src", None, Default::default())
+        .unwrap();
+    let mut names = queues(&routed);
+    names.sort();
+    assert_eq!(names, ["DLQ", "dst"]);
+}
+
+/// Non-exclusive diverts sharing a routing name are one binding group: each
+/// message goes through one of them, in turn (`BindingsImpl` routing-name
+/// groups), not through all.
+#[tokio::test]
+async fn diverts_sharing_a_routing_name_take_turns() {
+    let b = Broker::start(BrokerConfig::new(Arc::new(SelectorFilters)))
+        .await
+        .unwrap();
+    for name in ["src", "dst1", "dst2"] {
+        let mut spec = QueueSpec::new(name, name);
+        spec.auto_create_address = Some(true);
+        spec.routing_type = Some(RoutingType::Anycast);
+        b.post_office().create_queue(spec, false).unwrap();
+    }
+    for name in ["dst1", "dst2"] {
+        b.post_office()
+            .deploy_divert(
+                &DivertDeployment {
+                    name: name.to_owned(),
+                    routing_name: Some("shared".to_owned()),
+                    address: "src".to_owned(),
+                    forwarding_address: name.to_owned(),
+                    exclusive: false,
+                    filter: None,
+                    routing_type: DivertRoutingType::Strip,
+                    transformer: None,
+                },
+                &Default::default(),
+            )
+            .unwrap();
+    }
+    let mut seen = Vec::new();
+    for id in 1..=4 {
+        let routed = b
+            .post_office()
+            .route(&message(id, "red"), "src", None, Default::default())
+            .unwrap();
+        let names = queues(&routed);
+        assert_eq!(names.len(), 2, "the source and one copy: {names:?}");
+        assert_eq!(names[0], "src");
+        seen.push(names[1].clone());
+    }
+    assert_eq!(seen, ["dst1", "dst2", "dst1", "dst2"]);
+}
