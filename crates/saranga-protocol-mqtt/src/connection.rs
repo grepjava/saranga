@@ -563,6 +563,10 @@ fn publish_after(
     let has = |k: &str| message.properties.get_str(k).is_some();
     let mut is_retain = has(util::MQTT_MESSAGE_RETAIN_INITIAL_DISTRIBUTION_KEY);
     let mut properties = Properties::default();
+    // With a topic alias, the state stays locked until the PUBLISH is queued
+    // to be written: a delivery on another subscription that finds the alias
+    // must not queue its reference before the packet that defines it.
+    let mut aliased = None;
     if shared.version == Version::V5 {
         // The lock is held across the alias decision and the size check, so a
         // discarded message's alias is never left in the state.
@@ -623,6 +627,7 @@ fn publish_after(
                 return Ok(false);
             }
         }
+        aliased = Some((s, added_alias));
     }
     let dup = qos != 0 && redelivery;
     match codec::publish(
@@ -635,8 +640,16 @@ fn publish_after(
         &properties,
         &payload,
     ) {
-        Some(bytes) => shared.out.send(wait, Some(bytes)),
-        None => return discard_unrepresentable(shared, wait, packet_id, qos),
+        Some(bytes) => {
+            shared.out.send(wait, Some(bytes));
+            drop(aliased);
+        }
+        None => {
+            if let Some((mut s, Some(t))) = aliased {
+                s.remove_server_topic_alias(&t);
+            }
+            return discard_unrepresentable(shared, wait, packet_id, qos);
+        }
     }
     Ok(true)
 }

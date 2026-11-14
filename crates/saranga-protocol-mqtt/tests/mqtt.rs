@@ -882,6 +882,62 @@ async fn a_discarded_publication_leaves_no_topic_alias() {
     broker.stop().unwrap();
 }
 
+/// A publication that defines a topic alias is on its way to the client
+/// before one on another subscription refers to the alias: the second
+/// waits while the first is held up between taking the alias and being
+/// written (here by an outgoing interceptor), rather than going first with
+/// an empty topic the client cannot resolve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_topic_alias_is_defined_before_it_is_used() {
+    use saranga_protocol_mqtt::codec::Packet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (broker, address, _task) = start(None).await;
+    let held = Arc::new(AtomicBool::new(false));
+    broker.interceptors().add_outgoing(
+        saranga_server::interceptor::Interceptor::new("HoldAliasDefinition").on::<Packet>({
+            let held = held.clone();
+            move |p: &mut Packet, _: &saranga_server::session::ClientConnection| {
+                if let Packet::Publish(p) = p
+                    && !p.topic.is_empty()
+                    && p.properties.int(0x23).is_some()
+                    && !held.swap(true, Ordering::SeqCst)
+                {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                Ok(true)
+            }
+        }),
+    );
+    // Topic Alias Maximum 10; two subscriptions that both take "t".
+    let (mut sub, _) = Client::open_with(address, &connect5_props("s", &[0x22, 0, 10], None)).await;
+    sub.send(&subscribe_option("t", 0)).await;
+    assert_eq!(sub.packet().await.unwrap()[0], 0x90);
+    sub.send(&subscribe_option("#", 0)).await;
+    assert_eq!(sub.packet().await.unwrap()[0], 0x90);
+    let (mut publisher, _) = Client::open(address, "p", true).await;
+    publisher
+        .send(&packet(0x30, &{
+            let mut b = string("t");
+            b.extend_from_slice(b"m");
+            b
+        }))
+        .await;
+    let first = sub.packet().await.expect("the first copy");
+    assert_eq!(
+        &first[2..4],
+        &[0, 1],
+        "the first copy carries the topic that defines the alias: {first:?}"
+    );
+    let second = sub.packet().await.expect("the second copy");
+    assert_eq!(
+        &second[2..4],
+        &[0, 0],
+        "the second uses the alias: {second:?}"
+    );
+    assert!(held.load(Ordering::SeqCst), "the definition was held up");
+    broker.stop().unwrap();
+}
+
 /// Acknowledging on one subscription frees the connection's send slot and
 /// wakes a message waiting on another subscription.
 #[tokio::test]

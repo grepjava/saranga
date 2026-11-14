@@ -880,6 +880,8 @@ struct Conn {
     registered: bool,
     opened: bool,
     remote_max_frame: u32,
+    /// The highest channel the peer's Open allows this end to use.
+    remote_channel_max: u16,
     /// The client's idle-time-out: an empty frame goes out in half of it.
     remote_idle: Option<Duration>,
     /// `connection-ttl`: the connection closes when nothing comes for it.
@@ -1025,6 +1027,7 @@ where
         registered: false,
         opened: false,
         remote_max_frame: u32::MAX,
+        remote_channel_max: CHANNEL_MAX,
         remote_idle: None,
         ttl: (ttl > 0).then(|| Duration::from_millis(ttl as u64)),
         last_read: Instant::now(),
@@ -1404,7 +1407,8 @@ impl Conn {
 
     /// Begins a session from this end, on the lowest free channel.
     async fn begin_local(&mut self) -> u16 {
-        let channel = self.free_channel();
+        // Sent before the peer's Open: channel 0, which any channel-max allows.
+        let channel = self.free_channel().unwrap_or(0);
         let mut session = self.new_session(0, WINDOW);
         session.server.set_started(true).await;
         self.sessions.insert(channel, session);
@@ -1699,6 +1703,7 @@ impl Conn {
         self.remote_container = Some(open.container_id.clone());
         self.remote_container_id = Some(open.container_id.as_str().into());
         self.remote_max_frame = open.max_frame_size.max(frame::MIN_MAX_FRAME_SIZE);
+        self.remote_channel_max = open.channel_max;
         self.remote_idle = open
             .idle_time_out
             .filter(|&t| t > 0)
@@ -1900,7 +1905,15 @@ impl Conn {
             self.channels.insert(remote, local);
             return Ok(());
         }
-        let channel = self.free_channel();
+        let Some(channel) = self.free_channel() else {
+            return Err(Fatal::new(
+                condition::RESOURCE_LIMIT_EXCEEDED,
+                format!(
+                    "no channel free within the channel-max of {}",
+                    self.remote_channel_max
+                ),
+            ));
+        };
         let mut session = self.new_session(begin.next_outgoing_id, begin.incoming_window);
         // AMQPSessionCallback.init starts the session.
         session.server.set_started(true).await;
@@ -1920,11 +1933,12 @@ impl Conn {
         Ok(())
     }
 
-    /// The lowest channel with no session, nor one ending.
-    fn free_channel(&self) -> u16 {
-        (0..=CHANNEL_MAX)
+    /// The lowest channel with no session, nor one ending, within the
+    /// peer's channel-max (this end's is the highest there is); none if
+    /// every one the peer allows is in use.
+    fn free_channel(&self) -> Option<u16> {
+        (0..=self.remote_channel_max)
             .find(|c| !self.sessions.contains_key(c) && !self.ending.contains(c))
-            .unwrap_or(CHANNEL_MAX)
     }
 
     /// `AMQPSessionCallback.close` for management (`closeSessionWithID`,
