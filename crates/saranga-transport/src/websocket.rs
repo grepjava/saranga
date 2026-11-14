@@ -604,6 +604,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
         }
     }
 
+    /// `protocolViolation`: a close frame with `code` and `reason` goes out,
+    /// and the connection closes.
+    fn violation(&mut self, code: u16, reason: &str) -> io::Result<()> {
+        close_frame(&mut self.out, code, reason);
+        self.closed = true;
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            reason.to_owned(),
+        ))
+    }
+
     /// Decodes the frames in `raw`. An error means the connection must
     /// close (after the close frame queued for it).
     fn decode(&mut self) -> io::Result<()> {
@@ -635,14 +646,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
                 }
                 n => u64::from(n),
             };
-            let violation = |s: &mut Self, reason: &str| {
-                close_frame(&mut s.out, 1002, reason);
-                s.closed = true;
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    reason.to_owned(),
-                ))
-            };
+            let violation = |s: &mut Self, reason: &str| s.violation(1002, reason);
             if fin_opcode & 0x70 != 0 && !self.allow_extensions {
                 let rsv = (fin_opcode & 0x70) >> 4;
                 return violation(
@@ -685,6 +689,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
                     return violation(
                         self,
                         "received non-continuation data frame while inside fragmented message",
+                    );
+                }
+            }
+            // The extended length in the fewest bytes it fits, and not
+            // negative as a Java long.
+            if len7 == 126 && len < 126 {
+                return violation(
+                    self,
+                    "invalid data frame length (not using minimal length encoding)",
+                );
+            }
+            if len7 == 127 {
+                if len > i64::MAX as u64 {
+                    return violation(self, "invalid data frame length (negative length)");
+                }
+                if len < 65536 {
+                    return violation(
+                        self,
+                        "invalid data frame length (not using minimal length encoding)",
                     );
                 }
             }
@@ -733,6 +756,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
                     self.data.extend_from_slice(&payload);
                 }
                 0x8 => {
+                    // checkCloseFrameBody: a status code that may be sent,
+                    // and a reason in UTF-8.
+                    if payload.len() >= 2 {
+                        let code = i32::from(i16::from_be_bytes([payload[0], payload[1]]));
+                        if !valid_close_code(code) {
+                            return self.violation(
+                                1002,
+                                &format!("Invalid close frame getStatus code: {code}"),
+                            );
+                        }
+                        if std::str::from_utf8(&payload[2..]).is_err() {
+                            return self.violation(1007, "bytes are not UTF-8");
+                        }
+                    }
                     // handshaker.close: the close frame goes back.
                     frame_header(&mut self.out, true, 0x8, payload.len());
                     self.out.extend_from_slice(&payload);
@@ -855,6 +892,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
             other => other,
         }
     }
+}
+
+/// `WebSocketCloseStatus.isValidStatusCode`, of the code read as a signed
+/// short.
+fn valid_close_code(code: i32) -> bool {
+    code < 0 || (1000..=1003).contains(&code) || (1007..=1014).contains(&code) || code >= 3000
 }
 
 #[cfg(test)]
@@ -1085,11 +1128,44 @@ mod tests {
         let mut unmasked = Vec::new();
         frame_header(&mut unmasked, true, 0x2, 1);
         unmasked.push(b'x');
-        for (input, reason) in [
-            (unmasked, "received a frame that is not masked as expected"),
+        for (input, code, reason) in [
+            (
+                unmasked,
+                1002u16,
+                "received a frame that is not masked as expected",
+            ),
             (
                 masked_rsv(0x2, true, 0x40, b"x"),
+                1002,
                 "RSV != 0 and no extension negotiated, RSV:4",
+            ),
+            // One byte in the two-byte length, then in the eight-byte one.
+            (
+                vec![0x82, 0xFE, 0, 1, 0, 0, 0, 0, b'x'],
+                1002,
+                "invalid data frame length (not using minimal length encoding)",
+            ),
+            (
+                vec![0x82, 0xFF, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, b'x'],
+                1002,
+                "invalid data frame length (not using minimal length encoding)",
+            ),
+            (
+                vec![0x82, 0xFF, 0x80, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+                1002,
+                "invalid data frame length (negative length)",
+            ),
+            // A close with a status code that may not be sent (1006), and
+            // one whose reason is not UTF-8.
+            (
+                masked(0x8, true, &[0x03, 0xEE]),
+                1002,
+                "Invalid close frame getStatus code: 1006",
+            ),
+            (
+                masked(0x8, true, &[0x03, 0xE8, 0xFF]),
+                1007,
+                "bytes are not UTF-8",
             ),
         ] {
             let (mut client, server) = tokio::io::duplex(1 << 16);
@@ -1104,12 +1180,35 @@ mod tests {
                 client.read_to_end(&mut sent),
             )
             .await;
+            let mut close = code.to_be_bytes().to_vec();
+            close.extend_from_slice(reason.as_bytes());
             assert!(
-                sent.windows(reason.len()).any(|w| w == reason.as_bytes()),
-                "{reason}: {}",
+                sent.windows(close.len()).any(|w| w == close),
+                "{code} {reason}: {}",
                 String::from_utf8_lossy(&sent)
             );
+            assert!(got.is_empty(), "{reason}: nothing reaches the protocol");
         }
+
+        // A valid close is answered with itself.
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let mut ws = WebSocketStream::new(
+            server,
+            masked(0x8, true, b"\x03\xe8bye"),
+            1024,
+            EncoderType::Binary,
+        );
+        let mut got = Vec::new();
+        let read = ws.read_to_end(&mut got);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), read).await;
+        drop(ws);
+        let mut sent = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut sent),
+        )
+        .await;
+        assert_eq!(sent, [0x88, 5, 0x03, 0xE8, b'b', b'y', b'e']);
 
         // A continuation that belongs is taken.
         let (_client, server) = tokio::io::duplex(1 << 16);

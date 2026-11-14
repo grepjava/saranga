@@ -58,9 +58,16 @@ fn session_flow(next_incoming_id: u32, window: u32) -> Performative {
 }
 
 /// A broker with two messages on queue `q`, and a client whose session
-/// takes one transfer at a time, its receiver on `q` given credit for
-/// both. The first transfer has come.
-async fn receiving() -> (Arc<Broker>, JoinHandle<std::io::Result<()>>, TcpStream) {
+/// takes one transfer at a time, its receiver on `q`, in sender settle
+/// mode `settle`, given credit for both. The first transfer has come.
+async fn receiving(
+    settle: SenderSettleMode,
+) -> (
+    Arc<Broker>,
+    JoinHandle<std::io::Result<()>>,
+    TcpStream,
+    saranga_server::queue::Queue,
+) {
     let mut cfg = BrokerConfig::new(Arc::new(SelectorFilters));
     cfg.protocols
         .push(Arc::new(AmqpProtocol::new(AmqpConfig::default())));
@@ -110,6 +117,7 @@ async fn receiving() -> (Arc<Broker>, JoinHandle<std::io::Result<()>>, TcpStream
             name: "r".into(),
             handle: 0,
             role: Role::Receiver,
+            snd_settle_mode: settle,
             source: Some(Source {
                 address: Some("q".into()),
                 capabilities: Some(vec!["queue".into()]),
@@ -137,12 +145,12 @@ async fn receiving() -> (Arc<Broker>, JoinHandle<std::io::Result<()>>, TcpStream
         transfer(&mut s, Duration::from_secs(5)).await.is_some(),
         "one transfer for the window of one"
     );
-    (broker, task, s)
+    (broker, task, s, q)
 }
 
 #[tokio::test]
 async fn a_window_lowered_under_a_transfer_in_flight_lets_none_through() {
-    let (broker, task, mut s) = receiving().await;
+    let (broker, task, mut s, _) = receiving(SenderSettleMode::Mixed).await;
 
     // Sent before the client had transfer 1: no room from where it
     // counted, so the window is 1 + 0 - 2.
@@ -165,7 +173,7 @@ async fn a_window_lowered_under_a_transfer_in_flight_lets_none_through() {
 
 #[tokio::test]
 async fn a_detached_links_waiting_transfers_are_not_sent() {
-    let (broker, task, mut s) = receiving().await;
+    let (broker, task, mut s, _) = receiving(SenderSettleMode::Mixed).await;
 
     // The second transfer waits for the window; the link goes first.
     send(
@@ -195,6 +203,61 @@ async fn a_detached_links_waiting_transfers_are_not_sent() {
         "no transfer for the detached link"
     );
 
+    task.abort();
+    broker.stop().unwrap();
+}
+
+/// The queue's message count, once it has settled at `want` (or after a
+/// while).
+async fn count(q: &saranga_server::queue::Queue, want: i64) -> i64 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while q.message_count() != want && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    q.message_count()
+}
+
+/// A presettled delivery still waiting for the window when its link goes
+/// was never sent, so it is not consumed: its message stays on the queue.
+#[tokio::test]
+async fn a_presettled_delivery_not_yet_sent_is_not_consumed() {
+    let (broker, task, mut s, q) = receiving(SenderSettleMode::Settled).await;
+    send(
+        &mut s,
+        Performative::Detach(Detach {
+            handle: 0,
+            closed: true,
+            error: None,
+        }),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(recv(&mut s).await, Performative::Detach(_)) {}
+    })
+    .await
+    .expect("the broker's detach");
+    assert_eq!(count(&q, 1).await, 1, "the unsent message is still there");
+    task.abort();
+    broker.stop().unwrap();
+}
+
+/// A presettled delivery waiting for the window is consumed once it is
+/// sent.
+#[tokio::test]
+async fn a_presettled_delivery_is_consumed_once_sent() {
+    let (broker, task, mut s, q) = receiving(SenderSettleMode::Settled).await;
+    assert_eq!(
+        count(&q, 1).await,
+        1,
+        "the first is consumed, not the second"
+    );
+    send(&mut s, session_flow(2, 1)).await;
+    assert!(
+        transfer(&mut s, Duration::from_secs(5)).await.is_some(),
+        "the second transfer"
+    );
+    assert_eq!(count(&q, 0).await, 0, "both consumed once sent");
     task.abort();
     broker.stop().unwrap();
 }

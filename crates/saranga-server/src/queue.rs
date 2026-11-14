@@ -2913,8 +2913,16 @@ impl Actor {
         for level in &mut self.messages.levels {
             refs.extend(level.drain(..));
         }
+        // A non-destructive queue's deliveries are copies of references it
+        // still holds, owning nothing of their own: acknowledged with those,
+        // they would take the message's records and counts down twice.
+        let non_destructive = self.shared.config().non_destructive;
         for c in self.consumers.iter_mut() {
-            refs.extend(c.delivering.drain(..));
+            if non_destructive {
+                c.delivering.clear();
+            } else {
+                refs.extend(c.delivering.drain(..));
+            }
         }
         let _ = storage;
         if crate::audit::message_enabled() {

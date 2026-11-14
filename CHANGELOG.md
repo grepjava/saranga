@@ -13,6 +13,10 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **Deleting a non-destructive queue no longer loses another queue's durable message.** The deliveries its consumers held were acknowledged along with the queued references they copy, taking a message that another queue also held down twice: its journal record went, and the other queue lost it at the next start.
+- **A presettled AMQP delivery is consumed only once it is sent.** One waiting for the client's session window was acknowledged as it was queued, so if its link closed first the message was gone without having been sent. It is now acknowledged when its last frame is written, and otherwise stays on the queue.
+- **A WebSocket frame length in more bytes than it needs is refused**, as Netty refuses it, with a protocol error (1002), as is an eight-byte length that is negative read as a Java long.
+- **A WebSocket close is checked before it is answered.** A close carrying a status code that may not be sent (such as 1006) is answered with a protocol error (1002), and one whose reason is not UTF-8 with 1007, as Netty answers them, rather than echoed.
 - **A ring queue counts what it drops as replaced.** The message a full ring queue let go was counted in `MessagesKilled` and its acknowledgement sent to mirrors. It is now counted in `MessagesReplaced` and not mirrored, as Artemis's `enforceRing` does: the target's ring drops its own copy.
 - **WebSocket protocol errors give Netty's reasons.** An unmasked frame is refused with "received a frame that is not masked as expected", and RSV bits without an extension with "RSV != 0 and no extension negotiated, RSV:" and their value.
 - **A scheduled message that falls due is subject to its queue's policies.** On a last-value queue it was added beside the queued message with the same key instead of replacing it, and a full ring queue took it over its size. It now replaces the last value, and a full ring drops it, as Artemis does.

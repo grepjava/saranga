@@ -771,6 +771,15 @@ enum Link {
     Coordinator(CoordinatorLink),
 }
 
+/// A transfer frame waiting for the client's incoming window: the handle
+/// of the link it is on, and on the last frame of a presettled delivery
+/// the (consumer, message) to acknowledge once it is written.
+struct Blocked {
+    handle: u32,
+    frame: Vec<u8>,
+    ack: Option<(i64, i64)>,
+}
+
 /// A session, on this end's channel. Its links are kept by this end's
 /// handles: the peer's are mapped to them as its frames come
 /// (`TransportSession`).
@@ -786,9 +795,8 @@ struct Session {
     links: HashMap<u32, Link>,
     out: BTreeMap<u32, OutDelivery>,
     tags: Tags,
-    /// Transfer frames waiting for the client's incoming window, with
-    /// the handle of the link they are on.
-    blocked: std::collections::VecDeque<(u32, Vec<u8>)>,
+    /// Transfer frames waiting for the client's incoming window.
+    blocked: std::collections::VecDeque<Blocked>,
     /// The peer's handles, and this end's for them.
     handles: HashMap<u32, u32>,
     /// Links this end detached, waiting for the peer's detach.
@@ -3753,7 +3761,9 @@ impl Conn {
     /// subscription or temporary destination goes.
     async fn close_link(&mut self, s: &mut Session, handle: u32, link: Link, remote_close: bool) {
         // Its transfers still waiting for the client's window go with it.
-        s.blocked.retain(|(h, _)| *h != handle);
+        // A presettled delivery among them was never written, so it is not
+        // acknowledged, and closing the consumer returns its message.
+        s.blocked.retain(|b| b.handle != handle);
         match link {
             Link::Sender(sl) => {
                 lock(&sl.credit).closed = true;
@@ -3867,7 +3877,9 @@ impl Conn {
         s.remote_incoming_window = i64::from(flow.incoming_window) - in_flight;
         if !s.blocked.is_empty() {
             self.last_write = Instant::now();
-            write_blocked(s, &self.out);
+            for (consumer, message_id) in write_blocked(s, &self.out) {
+                let _ = ack_settled(&mut s.server, &self.events, channel, consumer, message_id);
+            }
         }
         let mut stopped = None;
         let mut reply = None;
@@ -4934,14 +4946,23 @@ impl Conn {
         };
         let frames = transfer_frames(channel, first, &payload, max_frame);
         self.last_write = Instant::now();
-        send_transfers(s, handle, frames, &self.out);
+        let ack = presettled.then(|| (consumer, message.message_id()));
+        let written = send_transfers(s, handle, frames, &self.out, ack);
         let s = self.sessions.get_mut(&channel).expect("checked");
+        for (c, m) in written {
+            if Some((c, m)) != ack {
+                let _ = ack_settled(&mut s.server, &self.events, channel, c, m);
+            }
+        }
         if presettled {
-            // Settled when written: acknowledged now.
-            let _ = s
-                .server
-                .acknowledge_in(consumer, message.message_id(), true, None)
-                .await;
+            // Settled when written: acknowledged now if it was, or once the
+            // client's window lets its last frame go (`on_flow`).
+            if s.blocked.iter().all(|b| b.ack != ack) {
+                let _ = s
+                    .server
+                    .acknowledge_in(consumer, message.message_id(), true, None)
+                    .await;
+            }
         } else {
             s.out.insert(
                 id,
@@ -5034,27 +5055,7 @@ impl Conn {
                         // Settled by the client, so nothing goes back: the
                         // queue's answer comes as an event, and the next
                         // disposition need not wait for it.
-                        let events = self.events.clone();
-                        s.server.acknowledge_then(
-                            consumer,
-                            message_id,
-                            true,
-                            move |pending, result| {
-                                let acked = Event::Acked {
-                                    channel,
-                                    pending,
-                                    result,
-                                };
-                                if let Err(mpsc::error::SendError(Event::Acked {
-                                    pending,
-                                    result,
-                                    ..
-                                })) = events.send(acked)
-                                {
-                                    pending.finish_alone(result);
-                                }
-                            },
-                        )
+                        ack_settled(&mut s.server, &self.events, channel, consumer, message_id)
                     } else {
                         // The broker settles it once the acknowledgement is
                         // stored, so it waits for the queue.
@@ -5667,34 +5668,80 @@ fn transfer_frames(
 
 /// Writes transfer frames while the client's incoming window allows,
 /// keeping the rest for its next flow.
-fn send_transfers(s: &mut Session, handle: u32, mut frames: Vec<Vec<u8>>, out: &Outbound) {
+///
+/// `ack` is the (consumer, message) of a presettled delivery, kept with its
+/// last frame: the presettled deliveries written whole come back, to be
+/// acknowledged, and one still waiting comes back from [`write_blocked`]
+/// once its last frame is written.
+fn send_transfers(
+    s: &mut Session,
+    handle: u32,
+    mut frames: Vec<Vec<u8>>,
+    out: &Outbound,
+    ack: Option<(i64, i64)>,
+) -> Vec<(i64, i64)> {
     if s.blocked.is_empty() && frames.len() == 1 && s.remote_incoming_window > 0 {
         if let Some(f) = frames.pop() {
             s.next_outgoing_id = s.next_outgoing_id.wrapping_add(1);
             s.remote_incoming_window -= 1;
             out.now(f);
         }
-        return;
+        return ack.into_iter().collect();
     }
-    s.blocked.extend(frames.into_iter().map(|f| (handle, f)));
-    write_blocked(s, out);
+    let last = frames.len().saturating_sub(1);
+    s.blocked
+        .extend(frames.into_iter().enumerate().map(|(i, frame)| Blocked {
+            handle,
+            frame,
+            ack: if i == last { ack } else { None },
+        }));
+    write_blocked(s, out)
 }
 
 /// Writes the waiting transfer frames the client's incoming window has
-/// room for.
-fn write_blocked(s: &mut Session, out: &Outbound) {
+/// room for, returning the presettled deliveries now written whole.
+fn write_blocked(s: &mut Session, out: &Outbound) -> Vec<(i64, i64)> {
     let mut bytes = Vec::new();
+    let mut acks = Vec::new();
     while s.remote_incoming_window > 0 {
-        let Some((_, f)) = s.blocked.pop_front() else {
+        let Some(b) = s.blocked.pop_front() else {
             break;
         };
-        bytes.extend(f);
+        bytes.extend(b.frame);
+        acks.extend(b.ack);
         s.next_outgoing_id = s.next_outgoing_id.wrapping_add(1);
         s.remote_incoming_window -= 1;
     }
     if !bytes.is_empty() {
         out.now(bytes);
     }
+    acks
+}
+
+/// Acknowledges a delivery that is settled, the client's or a presettled
+/// one written: the queue's answer comes as an event, so nothing waits
+/// for it.
+fn ack_settled(
+    server: &mut ServerSession,
+    events: &mpsc::UnboundedSender<Event>,
+    channel: u16,
+    consumer: i64,
+    message_id: i64,
+) -> saranga_server::Result<()> {
+    let events = events.clone();
+    server.acknowledge_then(consumer, message_id, true, move |pending, result| {
+        let acked = Event::Acked {
+            channel,
+            pending,
+            result,
+        };
+        if let Err(mpsc::error::SendError(Event::Acked {
+            pending, result, ..
+        })) = events.send(acked)
+        {
+            pending.finish_alone(result);
+        }
+    })
 }
 
 /// `RoutingType.getType`: 0 multicast, 1 anycast.
