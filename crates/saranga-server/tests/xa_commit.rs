@@ -12,13 +12,19 @@ use saranga_server::transaction::Xid;
 use saranga_server::{Broker, BrokerConfig};
 
 async fn start(dir: &Path) -> Arc<Broker> {
-    let file = cfg::BrokerConfig::parse(
+    start_with(dir, "").await
+}
+
+/// [`start`] with `extra` in `<core>`.
+async fn start_with(dir: &Path, extra: &str) -> Arc<Broker> {
+    let file = cfg::BrokerConfig::parse(&format!(
         r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
              <persistence-enabled>true</persistence-enabled>
              <journal-pool-files>2</journal-pool-files>
              <journal-file-size>65536</journal-file-size>
-           </core></configuration>"#,
-    )
+             {extra}
+           </core></configuration>"#
+    ))
     .unwrap();
     let config = BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir).unwrap();
     Broker::start(config).await.unwrap()
@@ -150,5 +156,94 @@ async fn xa_start_does_not_deadlock_with_the_reaper() {
     // Only safe once the worker finished: otherwise the reaper is blocked on a
     // transaction the worker holds and this would hang too.
     reaper.join().unwrap();
+    broker.stop().unwrap();
+}
+
+/// [`start`] with the transaction reaper an hour apart. [`race`] holds a
+/// branch's lock while it starts the Xid on another session, which takes the
+/// resource manager's: the reaper takes them the other way round, so a pass
+/// meanwhile would deadlock the test (the broker never holds them so).
+async fn start_without_reaper(dir: &Path) -> Arc<Broker> {
+    start_with(
+        dir,
+        "<transaction-timeout-scan-period>3600000</transaction-timeout-scan-period>",
+    )
+    .await
+}
+
+/// Runs `complete` on another thread while the branch's lock is held, starts
+/// the same Xid on another session meanwhile, and returns whether that start
+/// was accepted, what `complete` answered, and whether the manager still
+/// holds the original branch. A branch is checked while it is registered,
+/// so the start is refused; it was accepted once the branch had been taken
+/// out to be checked, and the refused completion could not put it back.
+fn race(
+    broker: &Arc<Broker>,
+    x: &Xid,
+    complete: impl FnOnce(&mut ServerSession) -> bool + Send + 'static,
+) -> (bool, bool, bool) {
+    let original = broker.resource_manager().get(x).unwrap();
+    let guard = saranga_server::transaction::lock(&original);
+    let other = broker.clone();
+    let done = std::thread::spawn(move || complete(&mut xa_session(&other)));
+    // With the branch taken out to be checked, it goes at once.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while broker.resource_manager().get(x).is_some() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let started = xa_session(broker).xa_start(x.clone()).is_ok();
+    drop(guard);
+    let completed = done.join().unwrap();
+    let kept = broker
+        .resource_manager()
+        .get(x)
+        .is_some_and(|t| Arc::ptr_eq(&t, &original));
+    (started, completed, kept)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_commit_keeps_its_branch_from_another_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start_without_reaper(dir.path()).await;
+    let x = xid("raced-commit");
+    let mut s = xa_session(&broker);
+    s.xa_start(x.clone()).unwrap();
+    s.xa_end(x.clone()).unwrap();
+    s.xa_prepare(x.clone()).unwrap();
+    s.take_completion().wait().await.unwrap();
+    // One phase, for a prepared branch: refused.
+    let (started, committed, kept) = race(&broker, &x, {
+        let x = x.clone();
+        move |s| s.xa_commit(x, true).is_ok()
+    });
+    assert!(!committed, "a one-phase commit of a prepared branch");
+    assert!(!started, "another session started the branch's Xid");
+    assert!(kept, "the branch was lost");
+    broker.stop().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_rollback_keeps_its_branch_from_another_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start_without_reaper(dir.path()).await;
+    let x = xid("raced-rollback");
+    let mut s = xa_session(&broker);
+    s.xa_start(x.clone()).unwrap();
+    s.xa_suspend().unwrap();
+    // A suspended branch cannot be rolled back.
+    let (started, rolled_back, kept) = race(&broker, &x, {
+        let x = x.clone();
+        move |s| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(s.xa_rollback(x))
+                .is_ok()
+        }
+    });
+    assert!(!rolled_back, "a suspended branch rolled back");
+    assert!(!started, "another session started the branch's Xid");
+    assert!(kept, "the branch was lost");
     broker.stop().unwrap();
 }

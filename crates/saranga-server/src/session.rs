@@ -2548,7 +2548,7 @@ impl ServerSession {
             .into());
         }
         let rm = self.broker.resource_manager();
-        let Some(tx) = rm.remove(&xid) else {
+        let Some(tx) = rm.get(&xid) else {
             return Err(match rm.heuristic(&xid) {
                 Some(true) => XaError::new(
                     xa_code::XA_HEURCOM,
@@ -2569,29 +2569,38 @@ impl ServerSession {
                 None => Self::not_found(&xid),
             });
         };
-        let mut t = transaction::lock(&tx);
-        if t.state == TxState::Suspended {
-            drop(t);
-            rm.put(xid.clone(), tx);
-            return Err(XaError::new(
-                xa_code::XAER_PROTO,
-                format!(
-                    "Cannot commit transaction, it is suspended {}",
-                    transaction::xid_string(&xid)
-                ),
-            )
-            .into());
+        // Checked while the branch is still registered, so another session
+        // cannot take its Xid meanwhile. Refused as suspended, or as the
+        // wrong kind of commit (one phase for a prepared branch, two for one
+        // not prepared), the branch is as it was, to be committed or rolled
+        // back properly, and recovered. Artemis leaves it out until a
+        // restart.
+        let refused = {
+            let t = transaction::lock(&tx);
+            if t.state == TxState::Suspended {
+                Some(
+                    XaError::new(
+                        xa_code::XAER_PROTO,
+                        format!(
+                            "Cannot commit transaction, it is suspended {}",
+                            transaction::xid_string(&xid)
+                        ),
+                    )
+                    .into(),
+                )
+            } else {
+                t.commit_refused(one_phase).map(TxError::from)
+            }
+        };
+        if let Some(e) = refused {
+            return Err(e);
         }
-        let result = t.commit(one_phase);
-        // Refused as the wrong kind of commit (one phase for a prepared
-        // branch, two for one not prepared), the branch is as it was: it
-        // goes back, to be committed or rolled back properly, and recovered.
-        // Artemis leaves it out until a restart.
-        let untouched = result.is_err() && matches!(t.state, TxState::Active | TxState::Prepared);
-        drop(t);
-        if untouched {
-            rm.put(xid, tx);
+        // Taken out (after the transaction's lock, as the reaper takes
+        // them); another completing it first leaves nothing to commit.
+        if !rm.remove_own(&xid, &tx) {
+            return Err(Self::not_found(&xid));
         }
+        let result = transaction::lock(&tx).commit(one_phase);
         match result {
             Ok(outcome) => {
                 self.finish(outcome, true)?;
@@ -2627,7 +2636,7 @@ impl ServerSession {
             .into());
         }
         let rm = self.broker.resource_manager();
-        let Some(tx) = rm.remove(&xid) else {
+        let Some(tx) = rm.get(&xid) else {
             // Artemis spells it "ben" here.
             return Err(match rm.heuristic(&xid) {
                 Some(true) => XaError::new(
@@ -2649,8 +2658,8 @@ impl ServerSession {
                 None => Self::not_found(&xid),
             });
         };
+        // A suspended branch is refused while it is still registered.
         if transaction::lock(&tx).state == TxState::Suspended {
-            rm.put(xid.clone(), tx);
             return Err(XaError::new(
                 xa_code::XAER_PROTO,
                 format!(
@@ -2659,6 +2668,9 @@ impl ServerSession {
                 ),
             )
             .into());
+        }
+        if !rm.remove_own(&xid, &tx) {
+            return Err(Self::not_found(&xid));
         }
         self.do_rollback(false, false, &tx).await?;
         Ok(())

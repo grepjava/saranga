@@ -172,9 +172,17 @@ async fn complete(broker: &Arc<Broker>, base64: &str, commit: bool) -> Outcome {
         );
         return Ok(Json::from(false));
     }
-    let Some(tx) = rm.remove(&xid) else {
+    let Some(tx) = rm.get(&xid) else {
         return Ok(Json::from(false));
     };
+    // Still prepared, checked while it is registered: a branch completed
+    // meanwhile is not taken out, and one taken out is completed.
+    // The transaction's lock is let go before the map's is taken, the
+    // reaper taking them the other way round.
+    let prepared = transaction::lock(&tx).state == transaction::TxState::Prepared;
+    if !prepared || !rm.remove_own(&xid, &tx) {
+        return Ok(Json::from(false));
+    }
     let result = {
         let mut t = transaction::lock(&tx);
         if commit {

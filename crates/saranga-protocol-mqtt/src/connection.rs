@@ -1507,13 +1507,13 @@ impl Core {
 
     /// `sendWillMessage`.
     async fn send_will_message(&mut self) {
-        let will = {
+        let (will, generation) = {
             let mut s = lock(&self.state);
             if s.will_status != WillStatus::NotSent {
                 return;
             }
             s.will_status = WillStatus::Sending;
-            s.will.clone()
+            (s.will.clone(), s.will_generation)
         };
         let mut properties = Properties::default();
         if let Some(v) = will.payload_format_indicator {
@@ -1547,27 +1547,34 @@ impl Core {
             payload: will.message.unwrap_or_default(),
         };
         tracing::debug!("{} sending will message", self.client_id);
-        match self.send_to_queue(publish, true).await {
-            Ok(()) => {
-                let mut s = lock(&self.state);
-                s.will_status = WillStatus::Sent;
-                s.will.message = None;
-            }
-            Err(e) => {
-                lock(&self.state).will_status = WillStatus::NotSent;
-                match e {
-                    PublishError::Other(e) if is_security(&e) => tracing::error!(
-                        "AMQ834007: Authorization failure sending will message: {}",
-                        e.message
-                    ),
-                    PublishError::Other(e) => {
-                        tracing::error!("AMQ834003: Error sending will message. {}", e.message)
-                    }
-                    PublishError::Disconnect(_) => {
-                        tracing::error!("AMQ834003: Error sending will message.")
-                    }
+        let sent = self.send_to_queue(publish, true).await;
+        {
+            // Only while the will is still the one published: a CONNECT
+            // meanwhile set its own, which this must leave alone.
+            let mut s = lock(&self.state);
+            if s.will_generation == generation {
+                if sent.is_ok() {
+                    s.will_status = WillStatus::Sent;
+                    s.will.message = None;
+                } else {
+                    s.will_status = WillStatus::NotSent;
                 }
             }
+        }
+        match sent {
+            Ok(()) => {}
+            Err(e) => match e {
+                PublishError::Other(e) if is_security(&e) => tracing::error!(
+                    "AMQ834007: Authorization failure sending will message: {}",
+                    e.message
+                ),
+                PublishError::Other(e) => {
+                    tracing::error!("AMQ834003: Error sending will message. {}", e.message)
+                }
+                PublishError::Disconnect(_) => {
+                    tracing::error!("AMQ834003: Error sending will message.")
+                }
+            },
         }
     }
 
@@ -2706,6 +2713,7 @@ impl Conn {
             s.is_will = false;
             s.will = crate::state::Will::default();
             s.will_status = WillStatus::NotSent;
+            s.will_generation += 1;
         }
         if let Some(will) = &connect.will {
             let mut s = lock(&state);

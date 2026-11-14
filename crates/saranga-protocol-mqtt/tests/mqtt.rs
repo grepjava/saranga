@@ -2125,3 +2125,95 @@ async fn an_expiring_restored_member_keeps_a_configured_shared_backlog() {
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert_eq!(queue.message_count(), 4, "B's backlog is kept");
 }
+
+/// Holds the send of the message `body` until released, telling when it got
+/// there.
+struct HoldSend {
+    body: &'static [u8],
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl saranga_server::plugin::BrokerPlugin for HoldSend {
+    fn before_send(
+        &self,
+        _: &saranga_server::registry::SessionEntry,
+        m: &saranga_message::CoreMessage,
+        _: bool,
+    ) -> Result<(), saranga_server::BrokerError> {
+        if m.body.as_ref() == self.body {
+            let _ = self.entered.send(());
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10));
+        }
+        Ok(())
+    }
+}
+
+/// A client reconnecting while its last connection's delayed will is being
+/// published keeps the will its CONNECT set: the old will's publication
+/// finishing marked the new one sent, so it was never published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delayed_will_finishing_late_leaves_the_new_connections_will() {
+    let (broker, address, task) = start_scanning(None, 20).await;
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    broker.register_plugin(Arc::new(HoldSend {
+        body: b"old-will",
+        entered: entered_tx,
+        release: std::sync::Mutex::new(release_rx),
+    }));
+    let (mut watcher, _) = Client::open(address, "will-watch", true).await;
+    watcher.subscribe("late/will", 0).await;
+    // Session expiry 60 s; a will delayed 1 s.
+    let mut body = vec![
+        0, 4, b'M', b'Q', b'T', b'T', 5, 0x06, 0, 60, 5, 0x11, 0, 0, 0, 60,
+    ];
+    body.extend(string("late-willer"));
+    body.extend([5, 0x18, 0, 0, 0, 1]);
+    body.extend(string("late/will"));
+    body.extend(string("old-will"));
+    let (old, _) = Client::open_with(address, &packet(0x10, &body)).await;
+    drop(old);
+    // The old will's publication is under way, and held.
+    tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(5)).unwrap())
+        .await
+        .unwrap();
+    // Reconnected meanwhile, with a will of its own, through an acceptor on
+    // a runtime the held send does not hold up.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let b = broker.clone();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(l.local_addr().unwrap()).unwrap();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    b.serve_acceptor(l, Acceptor::default()),
+                )
+                .await;
+            });
+    });
+    let second = rx.recv().unwrap();
+    let (new, _) = Client::open_with(
+        second,
+        &connect5("late-willer", false, 60, Some(("late/will", b"new-will"))),
+    )
+    .await;
+    release.send(()).unwrap();
+    let first = watcher.packet().await.expect("the old will");
+    assert!(first.ends_with(b"old-will"), "{first:?}");
+    // The new connection fails: its will goes.
+    drop(new);
+    let new_will = watcher.packet().await.expect("the new connection's will");
+    assert!(new_will.ends_with(b"new-will"), "{new_will:?}");
+    broker.stop().unwrap();
+    task.abort();
+}

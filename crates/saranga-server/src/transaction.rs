@@ -295,6 +295,26 @@ impl Transaction {
         }
     }
 
+    /// Why [`commit`](Self::commit) would refuse the transaction, leaving it
+    /// as it is: the wrong state for the kind of commit (one phase for a
+    /// prepared branch, two for one not prepared). `None` when it would
+    /// commit, or roll back a rollback-only one.
+    pub fn commit_refused(&self, one_phase: bool) -> Option<BrokerError> {
+        if matches!(self.state, TxState::Committed | TxState::RollbackOnly) {
+            return None;
+        }
+        let valid = if self.xid.is_some() {
+            if one_phase {
+                self.state == TxState::Active
+            } else {
+                self.state == TxState::Prepared
+            }
+        } else {
+            self.state == TxState::Active
+        };
+        (!valid).then(|| invalid_state(self.state))
+    }
+
     /// `TransactionImpl.commit(onePhase)`. A rollback-only transaction rolls
     /// back and fails with the reason it was marked.
     pub fn commit(&mut self, one_phase: bool) -> Result<Outcome, Failed> {
@@ -308,17 +328,8 @@ impl Transaction {
                 None => Ok(outcome),
             };
         }
-        let valid = if self.xid.is_some() {
-            if one_phase {
-                self.state == TxState::Active
-            } else {
-                self.state == TxState::Prepared
-            }
-        } else {
-            self.state == TxState::Active
-        };
-        if !valid {
-            return Err(Box::new((invalid_state(self.state), Outcome::default())));
+        if let Some(e) = self.commit_refused(one_phase) {
+            return Err(Box::new((e, Outcome::default())));
         }
         if self.state == TxState::Active
             && let Err(e) = self.hold_duplicates()
@@ -677,11 +688,16 @@ impl ResourceManager {
         self.map().remove(xid)
     }
 
-    /// Removes `xid` only while it is `tx`, not another session's.
-    pub fn remove_own(&self, xid: &Xid, tx: &TxRef) {
+    /// Removes `xid` only while it is `tx`, not another session's. Returns
+    /// whether it did: of two completing one branch, the one that took it
+    /// out goes on.
+    pub fn remove_own(&self, xid: &Xid, tx: &TxRef) -> bool {
         let mut map = self.map();
         if map.get(xid).is_some_and(|t| Arc::ptr_eq(t, tx)) {
             map.remove(xid);
+            true
+        } else {
+            false
         }
     }
 

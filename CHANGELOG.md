@@ -13,6 +13,8 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **A refused XA commit or rollback keeps its branch from another session.** The branch was taken out of the resource manager while it was checked, so another session could start its Xid meanwhile, and the refused commit (one phase for a prepared branch, or of a suspended one) could not put the original back: it was lost until a restart. It now stays registered until the commit or rollback goes ahead, and management's completion of a prepared branch does the same.
+- **An MQTT client reconnecting while its delayed will is being published keeps its new will.** The old will's publication finishing marked the new connection's will sent, so it was never published if that connection failed (see COMPAT).
 - **On the database store, a message a prepared XA branch paged is deleted from the tables once acknowledged.** Recovered after a restart and committed, its reference was not taken for the store's, so a non-durable message's acknowledgement left its row and the message came back at the next restart.
 - **A consumer created while its queue is being deleted is refused**, where it was created on the deleted queue and received nothing; one admitted first keeps a deletion that checks for consumers from going ahead. A non-durable shared subscription joined just as its last member left was the likeliest way in (see COMPAT).
 - **A large retained MQTT message replayed to a new subscription survives a restart.** The copy took a new message ID but shared the retained message's body file, named after the old ID, so after a restart it had no body and was never delivered. Its body is now copied under the new ID, as Artemis's `copy` does.

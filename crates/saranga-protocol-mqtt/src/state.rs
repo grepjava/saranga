@@ -211,6 +211,10 @@ pub struct SessionState {
     pub is_will: bool,
     pub will: Will,
     pub will_status: WillStatus,
+    /// Which will `will` and `will_status` are: set afresh by each CONNECT
+    /// (and a clean), so a will still being published for an earlier
+    /// connection does not mark the new one sent when it finishes.
+    pub will_generation: u64,
     pub failed: bool,
     pub client_max_packet_size: u32,
     client_topic_aliases: HashMap<i32, String>,
@@ -246,6 +250,7 @@ impl SessionState {
             is_will: false,
             will: Will::default(),
             will_status: WillStatus::NotSent,
+            will_generation: 0,
             failed: false,
             client_max_packet_size: 0,
             client_topic_aliases: HashMap::new(),
@@ -324,6 +329,7 @@ impl SessionState {
         self.disconnected_time = 0;
         self.will.message = None;
         self.will_status = WillStatus::NotSent;
+        self.will_generation += 1;
         self.failed = false;
         self.will.delay_interval = 0;
         self.will.retain = false;
