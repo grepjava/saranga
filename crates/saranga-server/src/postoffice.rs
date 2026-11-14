@@ -2128,8 +2128,10 @@ impl PostOffice {
 
     /// `PostOfficeImpl.route` for a message the broker itself sends (a
     /// dead-letter or expiry copy): no auto-creation, and no bindings means
-    /// no queues.
-    pub fn route_internal(&self, message: &MessageRef, address: &str) -> Routed {
+    /// no queues. A routing error (a plugin refusing the message, a divert
+    /// that cannot copy it) is the caller's: a move fails on it and keeps
+    /// its original, as Artemis's `move` throws out of its routing.
+    pub fn route_internal(&self, message: &MessageRef, address: &str) -> Result<Routed> {
         let mut out = Vec::new();
         let routing_type = routing_type(message.message.core());
         let cleared = clear_internal_properties(message);
@@ -2144,14 +2146,29 @@ impl PostOffice {
             Ok(()) => {
                 let status = crate::plugin::RoutingStatus::of(&out);
                 plugins.each(|p| p.after_message_route(&message.message, status));
+                Ok(out)
             }
             Err(e) => {
                 tracing::debug!("routing to {address}: {e}");
                 plugins.each(|p| p.on_message_route_exception(&message.message, &e));
-                out.clear();
+                Err(e)
             }
         }
-        out
+    }
+
+    /// `route` with a `bindingMove`: a moved or copied message goes to
+    /// `queue` only, and the plugins are asked as for any route; one
+    /// refusing it fails the move or copy, which keeps its original.
+    pub fn route_moved(&self, message: &MessageRef, queue: Queue) -> Result<Routed> {
+        let plugins = &self.plugins;
+        if let Err(e) = plugins.check(|p| p.before_message_route(&message.message)) {
+            plugins.each(|p| p.on_message_route_exception(&message.message, &e));
+            return Err(e);
+        }
+        let out = vec![(message.clone(), vec![queue])];
+        let status = crate::plugin::RoutingStatus::of(&out);
+        plugins.each(|p| p.after_message_route(&message.message, status));
+        Ok(out)
     }
 
     /// `route` as a mirror target routes its peer's message

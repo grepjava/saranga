@@ -13,6 +13,8 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **A move whose copy cannot be routed keeps the message.** A routing error (a plugin refusing the copy) on a dead-letter, expiry or management move was taken as no route at all: the original was acknowledged and the message lost. The move now fails and the original stays, as Artemis's does. Management moves and copies to a given queue now ask the plugins too, as Artemis's routing with a target binding does, where they bypassed them.
+- **Internal queues (mirror and cluster store-and-forward queues) are exempt from what Artemis exempts them from**: no dead-letter or redelivery-delay check (a returned message was dropped after 10 attempts), no priorities (they deliver in the order messages came) and no message groups.
 - **A mirror's store-and-forward queue no longer expires messages**, as Artemis's does not. Expiring one acknowledged it there, which a `sync` mirror takes as its peer having it: a send completed with no peer connected.
 - **A delivery a client finds expired on a non-destructive queue leaves that queue**, as a rejected one already did, so deleting the queue afterwards no longer takes a durable message from another queue (see COMPAT).
 - **With `id-cache-size` 0, one transaction can send an ID twice**: the transaction's own duplicate check still ran and marked it rollback-only, though duplicate detection is off.

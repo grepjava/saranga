@@ -583,7 +583,10 @@ impl PostOffice {
     /// its durable references and adds it to its queues once written.
     pub async fn deliver_internal(&self, message: Arc<ServerMessage>, address: &str) {
         let r = MessageRef::new(message);
-        let routed = self.route_internal(&r, address);
+        // A notification that cannot be routed is not sent.
+        let Ok(routed) = self.route_internal(&r, address) else {
+            return;
+        };
         let routed = match self.page_routed(routed.clone(), None) {
             Ok((routed, _)) => routed,
             Err(e) => {

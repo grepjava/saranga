@@ -525,7 +525,7 @@ impl Queue {
         }));
         let actor = Actor {
             shared: queue.0.clone(),
-            messages: MessageList::default(),
+            messages: MessageList::for_queue(queue.0.config().internal),
             consumers: Vec::new(),
             browsers: Vec::new(),
             round_robin: HashMap::new(),
@@ -1201,14 +1201,34 @@ struct MessageList {
     levels: [VecDeque<MessageRef>; 10],
     /// The last sequence given (`queueSequence`).
     sequence: u64,
+    /// An internal queue's: every reference at the default priority, so
+    /// its events go in the order they came (`getPriority`: a mirror's
+    /// acknowledgement must not overtake the send it follows).
+    flat: bool,
 }
 
 impl MessageList {
+    fn for_queue(internal: bool) -> Self {
+        Self {
+            flat: internal,
+            ..Self::default()
+        }
+    }
+
+    fn level(&self, r: &MessageRef) -> usize {
+        if self.flat {
+            4
+        } else {
+            r.message.priority_level()
+        }
+    }
+
     /// `internalAddTail`: the reference takes the next sequence.
     fn push_back(&mut self, mut r: MessageRef) {
         self.sequence += 1;
         r.sequence = self.sequence;
-        self.levels[r.message.priority_level()].push_back(r);
+        let level = self.level(&r);
+        self.levels[level].push_back(r);
     }
 
     fn get(&self, (level, index): (usize, usize)) -> &MessageRef {
@@ -1221,7 +1241,8 @@ impl MessageList {
     }
 
     fn push_front(&mut self, r: MessageRef) {
-        self.levels[r.message.priority_level()].push_front(r);
+        let level = self.level(&r);
+        self.levels[level].push_front(r);
     }
 
     /// Takes out every reference `pred` selects, in list order.
@@ -1244,7 +1265,8 @@ impl MessageList {
     /// `addSorted`: inserts in queue order (the sequence each reference
     /// took as it joined the list) within its priority.
     fn insert_sorted(&mut self, r: MessageRef) {
-        let level = &mut self.levels[r.message.priority_level()];
+        let level = self.level(&r);
+        let level = &mut self.levels[level];
         let pos = level
             .iter()
             .position(|m| m.sequence > r.sequence)
@@ -1804,6 +1826,13 @@ impl Actor {
     /// reference to the dead-letter address once it has used its delivery
     /// attempts, or delays its redelivery. `None` when it has left the queue.
     fn check_redelivery(&mut self, mut r: MessageRef, time_base: i64) -> Option<MessageRef> {
+        // No dead-letter or redelivery-delay check on an internal queue (a
+        // mirror's or a cluster's store-and-forward queue): what it holds
+        // must reach its peer however often it comes back. Its delivery
+        // count is not journaled either.
+        if self.shared.config().internal {
+            return Some(r);
+        }
         let queue = self.queue();
         crate::transaction::persist_delivery_count(&queue, &mut r);
         let s = queue.settings();
@@ -2021,8 +2050,20 @@ impl Actor {
         let mut copy = MessageRef::new(copy);
         copy.scheduled_time = message::scheduled_delivery_time(copy.message.core());
         let routed = match target {
-            Some(q) => vec![(copy.clone(), vec![q])],
+            Some(q) => po.route_moved(&copy, q),
             None => po.route_internal(&copy, address),
+        };
+        let routed = match routed {
+            Ok(routed) => routed,
+            Err(e) => {
+                // The copy could not be routed: the original stays.
+                self.move_failed(
+                    Some(r),
+                    format!("moving message to {address}: {}", e.message),
+                    dup.map(|d| d.settle),
+                );
+                return;
+            }
         };
         let id = r.message_id();
         self.commit_move(&po, Some(r), id, routed, reason, address, dup);
@@ -2716,7 +2757,9 @@ impl Actor {
     /// when `group-buckets` is set.
     fn group_of(&self, r: &MessageRef) -> Option<GroupKey> {
         let c = self.shared.config();
-        if c.exclusive || c.group_buckets == 0 {
+        // `extractGroupID`: an internal queue has no groups (its group map
+        // would only grow).
+        if c.internal || c.exclusive || c.group_buckets == 0 {
             return None;
         }
         let id = message::group_id(r.message.core())?;
@@ -2733,7 +2776,7 @@ impl Actor {
         let id = c.reg.id;
         let groups = &self.groups;
         let group_ok = |r: &MessageRef| {
-            if cfg.exclusive || cfg.group_buckets == 0 {
+            if cfg.internal || cfg.exclusive || cfg.group_buckets == 0 {
                 return true;
             }
             let Some(g) = message::group_id(r.message.core()) else {

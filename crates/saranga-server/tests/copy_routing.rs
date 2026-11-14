@@ -199,3 +199,116 @@ async fn a_large_copy_that_cannot_be_made_is_reported() {
     assert_eq!(count(&broker, "src").await, Json::Long(1));
     broker.stop().unwrap();
 }
+
+/// Refuses to route messages to one address, as a plugin can.
+struct RefuseTo(&'static str);
+
+impl saranga_server::plugin::BrokerPlugin for RefuseTo {
+    fn before_message_route(
+        &self,
+        m: &ServerMessage,
+    ) -> Result<(), saranga_server::error::BrokerError> {
+        if m.core().address.as_ref().is_some_and(|a| a.eq_str(self.0)) {
+            return Err(saranga_server::error::BrokerError::internal("refused"));
+        }
+        Ok(())
+    }
+}
+
+/// A move whose copy cannot be routed (a plugin refuses it) fails and
+/// keeps the original, as Artemis's `move` throws out of its routing: it
+/// does not acknowledge the source with the copy gone nowhere.
+#[tokio::test]
+async fn a_move_whose_copy_is_refused_keeps_the_message() {
+    for persistence in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = start(dir.path(), persistence).await;
+        create_queue(&broker, "src").await;
+        create_queue(&broker, "dst").await;
+        let id = broker.post_office().ids().next();
+        broker
+            .post_office()
+            .queue("src")
+            .unwrap()
+            .add(MessageRef::new(ServerMessage::new(CoreMessage {
+                message_id: id,
+                durable: true,
+                address: Some(SimpleString::from("src")),
+                ..Default::default()
+            })));
+        broker.register_plugin(Arc::new(RefuseTo("dst")));
+        let _ = op(
+            &broker,
+            "queue.src",
+            "moveMessages",
+            vec![Json::Null, Json::from("dst")],
+        )
+        .await;
+        assert_eq!(
+            count(&broker, "src").await,
+            Json::Long(1),
+            "persistence {persistence}: the original stays"
+        );
+        assert_eq!(count(&broker, "dst").await, Json::Long(0));
+        broker.stop().unwrap();
+    }
+}
+
+/// A copy a plugin refuses is not made, and the operation says so.
+#[tokio::test]
+async fn a_copy_a_plugin_refuses_is_not_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(dir.path(), true).await;
+    create_queue(&broker, "src").await;
+    create_queue(&broker, "dst").await;
+    let id = broker.post_office().ids().next();
+    broker
+        .post_office()
+        .queue("src")
+        .unwrap()
+        .add(MessageRef::new(ServerMessage::new(CoreMessage {
+            message_id: id,
+            durable: true,
+            address: Some(SimpleString::from("src")),
+            ..Default::default()
+        })));
+    broker.register_plugin(Arc::new(RefuseTo("dst")));
+    let copied = op(
+        &broker,
+        "queue.src",
+        "copyMessage",
+        vec![Json::Long(id), Json::from("dst")],
+    )
+    .await;
+    assert!(copied.is_err(), "the refused copy is reported: {copied:?}");
+    assert_eq!(count(&broker, "src").await, Json::Long(1));
+    assert_eq!(count(&broker, "dst").await, Json::Long(0));
+    broker.stop().unwrap();
+}
+
+/// An expiry whose copy a plugin refuses keeps the message where it is
+/// (`move` routed by address, as dead-letter and expiry moves are).
+#[tokio::test]
+async fn an_expiry_whose_copy_is_refused_keeps_the_message() {
+    use saranga_server::settings::{AddressSettings, UniformSettings};
+    let mut config = BrokerConfig::new(Arc::new(SelectorFilters));
+    config.settings = Arc::new(UniformSettings(Arc::new(AddressSettings {
+        expiry_address: Some("exp".into()),
+        ..Default::default()
+    })));
+    let broker = Broker::start(config).await.unwrap();
+    create_queue(&broker, "src").await;
+    create_queue(&broker, "exp").await;
+    let q = broker.post_office().queue("src").unwrap();
+    q.add(MessageRef::new(ServerMessage::new(CoreMessage {
+        message_id: broker.post_office().ids().next(),
+        address: Some(SimpleString::from("src")),
+        expiration: 1,
+        ..Default::default()
+    })));
+    broker.register_plugin(Arc::new(RefuseTo("exp")));
+    q.expire_scan();
+    assert_eq!(q.browse().await.len(), 1, "the original stays");
+    assert_eq!(count(&broker, "exp").await, Json::Long(0));
+    broker.stop().unwrap();
+}

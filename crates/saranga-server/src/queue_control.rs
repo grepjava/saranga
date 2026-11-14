@@ -1001,7 +1001,19 @@ impl Actor {
             self.write_failed(e);
             return;
         };
-        let routed = vec![(MessageRef::new(copy), vec![target.clone()])];
+        let routed = match po.route_moved(&MessageRef::new(copy), target.clone()) {
+            Ok(routed) => routed,
+            Err(e) => {
+                let e = format!(
+                    "copying message {} to {address}: {}",
+                    r.message_id(),
+                    e.message
+                );
+                tracing::warn!("{e}");
+                self.write_failed(e);
+                return;
+            }
+        };
         self.commit_move(
             &po,
             None,
