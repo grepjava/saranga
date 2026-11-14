@@ -83,6 +83,7 @@ pub fn queue_config(b: &PersistentQueueBindingEncoding) -> QueueConfig {
             .filter(|f| !f.trim().is_empty()),
         durable: true,
         temporary: false,
+        transient: false,
         auto_created: b.auto_created,
         max_consumers,
         purge_on_no_consumers,

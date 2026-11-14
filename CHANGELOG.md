@@ -13,6 +13,9 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **A large retained MQTT message replayed to a new subscription survives a restart.** The copy took a new message ID but shared the retained message's body file, named after the old ID, so after a restart it had no body and was never delivered. Its body is now copied under the new ID, as Artemis's `copy` does.
+- **A non-durable shared subscription's queue goes with its last consumer**, as Artemis's transient queues do. It stayed, gathering messages for a subscription nobody held, for Core and JMS shared non-durable subscriptions and AMQP shared volatile ones alike.
+- **A shared subscription's address is created whatever `auto-create-addresses` says**, as Artemis creates it; the subscription was refused (AMQ229203). A shared queue already there with another address or filter is refused with Artemis's AMQ229082 or AMQ229083, and one another subscriber made at the same moment is taken.
 - **MQTT clients connecting at once with one client ID no longer both stay connected.** Each looked the ID up, took over the connection it found and then registered, so two taking over the same client both stayed on its one session; the ID is now claimed in one step, and the second takes the first over in turn (see COMPAT).
 - **A send or acknowledgement after an XA transaction timed out no longer leaks.** The send's message stayed counted against its address after the session closed, so repeated sends could fill the address and block its producers; an acknowledged message was never delivered again. As in Artemis, the work goes in a new transaction rolled back at once: the send is dropped and the message returns to its queue.
 - **An AMQP disposition range crossing the wrap of the delivery IDs settles its deliveries**, as Proton-J's does, where it closed the connection as a reversed range. Only a range of more than 2^31 - 1 closes it, with `amqp:not-allowed`.

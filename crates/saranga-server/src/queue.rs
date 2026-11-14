@@ -126,6 +126,9 @@ pub struct QueueConfig {
     pub filter_string: Option<String>,
     pub durable: bool,
     pub temporary: bool,
+    /// `isTransient`: deleted once its last consumer goes
+    /// (`TransientQueueManagerImpl`).
+    pub transient: bool,
     pub auto_created: bool,
     pub max_consumers: i32,
     pub purge_on_no_consumers: bool,
@@ -942,10 +945,23 @@ impl Queue {
         let (done, wait) = oneshot::channel();
         self.send(Cmd::RemoveConsumer { id, failed, done });
         let _ = wait.await;
-        self.0.consumer_count.fetch_sub(1, Ordering::SeqCst);
+        let before = self.0.consumer_count.fetch_sub(1, Ordering::SeqCst);
         self.0
             .consumer_removed_at
             .store(crate::message::now_millis(), Ordering::SeqCst);
+        // `TransientQueueManagerImpl`: a transient queue goes with its last
+        // consumer (`destroyQueue`, the address left to its reaper). A
+        // consumer that came meanwhile keeps it, and its own leaving
+        // deletes it.
+        if before == 1
+            && self.config().transient
+            && let Some(po) = self.0.post_office.upgrade()
+        {
+            let name = self.name().clone();
+            if let Err(e) = po.delete_queue(&name, true, false) {
+                tracing::debug!("deleting transient queue {name}: {}", e.message);
+            }
+        }
     }
 
     pub fn credits(&self, id: ConsumerId, credits: i32) {

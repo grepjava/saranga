@@ -1079,12 +1079,21 @@ impl Core {
                     util::MQTT_MESSAGE_RETAIN_INITIAL_DISTRIBUTION_KEY.into(),
                     PropertyValue::Null,
                 );
-                self.session.send_to_queue(
-                    copy,
-                    last.message.large().cloned(),
-                    queue,
-                    Some(tx.clone()),
-                )?;
+                // `Message.copy(newID)`: a large body is copied to a file
+                // named after the new ID, which is the one a restart looks
+                // for; shared, the copy had no body after a restart.
+                let large = match last.message.large() {
+                    Some(body) => Some(body.copy(copy.message_id, copy.durable).map_err(|e| {
+                        tracing::warn!(
+                            "AMQ222181: Unable to copy large message {}: {e}",
+                            last.message.message_id()
+                        );
+                        BrokerError::new(ErrorType::IoError, e.to_string())
+                    })?),
+                    None => None,
+                };
+                self.session
+                    .send_to_queue(copy, large, queue, Some(tx.clone()))?;
             }
             Ok(())
         }

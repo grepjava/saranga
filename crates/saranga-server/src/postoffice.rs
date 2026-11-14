@@ -152,6 +152,9 @@ pub struct QueueSpec {
     pub filter_string: Option<String>,
     pub durable: bool,
     pub temporary: bool,
+    /// `setTransient`: deleted once its last consumer goes (a shared
+    /// non-durable subscription's queue).
+    pub transient: bool,
     pub auto_created: bool,
     pub configuration_managed: bool,
     pub auto_create_address: Option<bool>,
@@ -189,6 +192,7 @@ impl QueueSpec {
             filter_string: None,
             durable: true,
             temporary: false,
+            transient: false,
             auto_created: false,
             configuration_managed: false,
             auto_create_address: None,
@@ -288,6 +292,7 @@ impl QueueSpec {
             filter_string: self.filter_string,
             durable: self.durable,
             temporary: self.temporary,
+            transient: self.transient,
             auto_created: self.auto_created,
             max_consumers: self.max_consumers.unwrap_or(-1),
             purge_on_no_consumers: self.purge_on_no_consumers.unwrap_or(false),

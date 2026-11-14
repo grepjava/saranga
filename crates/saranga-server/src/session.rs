@@ -3104,24 +3104,49 @@ impl ServerSession {
         Ok(queue)
     }
 
-    /// `createSharedQueue`: creates the queue unless one with the same
-    /// address and filter exists. Only the address loses its prefix.
+    /// `createSharedQueue`: creates the queue, or takes the one there
+    /// (`ignoreIfExists`) if it has the same address and filter. Only the
+    /// address loses its prefix. As in `ActiveMQServerImpl`, a non-durable
+    /// shared queue is temporary and transient (it goes with its last
+    /// consumer), and the address is created whatever
+    /// `auto-create-addresses` says.
     pub fn create_shared_queue(&mut self, mut spec: QueueSpec) -> Result<()> {
         self.audit().queue(&spec, true);
         spec.address = self.remove_prefix(&spec.address).into();
         self.security_check(&spec.address, Some(&spec.name), create_check(spec.durable))?;
         spec.user = self.validated_user.clone();
-        let existing = self.broker.post_office().queue_query(&spec.name);
-        if existing.exists
-            && existing.address == spec.address
-            && existing.filter_string == spec.filter_string
-        {
-            return Ok(());
+        spec.temporary = !spec.durable;
+        spec.transient = !spec.durable;
+        spec.auto_created = false;
+        spec.auto_create_address = Some(true);
+        let po = self.broker.post_office();
+        let (name, address, filter) = (
+            spec.name.clone(),
+            spec.address.clone(),
+            spec.filter_string.clone(),
+        );
+        if !po.queue_query(&name).exists {
+            match po.create_queue(spec, false) {
+                Ok(_) => return Ok(()),
+                // Made meanwhile by another subscriber: checked below.
+                Err(e) if e.kind == ErrorType::QueueExists => {}
+                Err(e) => return Err(e),
+            }
         }
-        self.broker
-            .post_office()
-            .create_queue(spec, false)
-            .map(|_| ())
+        let existing = po.queue_query(&name);
+        if existing.address != address {
+            return Err(BrokerError::new(
+                ErrorType::InvalidTransientQueueUse,
+                format!("AMQ229082: Queue {name} already exists on another subscription"),
+            ));
+        }
+        if existing.filter_string != filter {
+            return Err(BrokerError::new(
+                ErrorType::InvalidTransientQueueUse,
+                format!("AMQ229083: Queue {name} has a different filter than requested"),
+            ));
+        }
+        Ok(())
     }
 
     /// `ServerSessionImpl.deleteQueue`.

@@ -365,6 +365,32 @@ async fn a_retained_message_larger_than_a_journal_record_is_kept() {
     broker.stop().unwrap();
 }
 
+/// A large retained message replayed to a new subscription has a body file
+/// of its own, under the copy's ID, so it is delivered after a restart; it
+/// shared the retained message's file, and a restart found none for it.
+#[tokio::test]
+async fn a_large_retained_message_replayed_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, address, task) = start(Some(dir.path())).await;
+    let big: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    let (mut publisher, _) = Client::open(address, "big-pub", true).await;
+    publisher.retain("big/r", &big, 1).await;
+    // A persistent session subscribes and goes before reading it.
+    let (mut sub, _) = Client::open(address, "big-keep", false).await;
+    sub.subscribe("big/r", 1).await;
+    drop(sub);
+    drop(publisher);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    broker.stop().unwrap();
+    task.abort();
+    drop(broker);
+    let (broker, address, _task) = start(Some(dir.path())).await;
+    let (mut sub, _) = Client::open(address, "big-keep", false).await;
+    let (_, _, payload) = parse_publish(&sub.packet().await.expect("the replayed message"));
+    assert_eq!(payload, big);
+    broker.stop().unwrap();
+}
+
 /// Clients replacing one topic's retained message at once leave it one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_replacements_leave_one_retained_message() {
