@@ -248,3 +248,59 @@ async fn an_attach_above_the_brokers_handle_max_is_refused() {
     task.abort();
     broker.stop().unwrap();
 }
+
+fn limited_receiver(name: &str, handle: u32, max_message_size: Option<u64>) -> Performative {
+    let Performative::Attach(mut a) = receiver(name, handle) else {
+        unreachable!()
+    };
+    a.max_message_size = max_message_size;
+    Performative::Attach(a)
+}
+
+fn flow(handle: u32, link_credit: u32) -> Performative {
+    Performative::Flow(Flow {
+        incoming_window: 100,
+        next_outgoing_id: 0,
+        outgoing_window: 100,
+        handle: Some(handle),
+        delivery_count: Some(0),
+        link_credit: Some(link_credit),
+        ..Default::default()
+    })
+}
+
+/// A message larger than a receiver's max-message-size is not sent to it:
+/// it stays on the queue, and goes to a consumer that accepts it.
+#[tokio::test]
+async fn a_message_above_the_receivers_max_message_size_is_not_sent_to_it() {
+    let (broker, task, mut s) = connect(&[], u32::MAX).await;
+    let q = broker.post_office().queue("q").unwrap();
+    q.add(saranga_server::message::MessageRef::new(
+        saranga_server::message::ServerMessage::new(saranga_message::CoreMessage {
+            message_id: 100,
+            address: Some("q".into()),
+            ..Default::default()
+        }),
+    ));
+    send(&mut s, limited_receiver("small", 0, Some(10))).await;
+    send(&mut s, flow(0, 10)).await;
+    let sent = next(&mut s, Duration::from_secs(1), |p| match p {
+        Performative::Transfer(t) => Some(t.handle),
+        _ => None,
+    })
+    .await;
+    assert_eq!(sent, None, "nothing goes to the limited receiver");
+    assert_eq!(q.message_count(), 1, "the message stays on the queue");
+
+    send(&mut s, limited_receiver("any", 1, None)).await;
+    send(&mut s, flow(1, 10)).await;
+    let sent = next(&mut s, Duration::from_secs(5), |p| match p {
+        Performative::Transfer(t) => Some(t.handle),
+        _ => None,
+    })
+    .await;
+    assert_eq!(sent, Some(1), "the receiver without a limit gets it");
+
+    task.abort();
+    broker.stop().unwrap();
+}

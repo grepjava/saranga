@@ -755,6 +755,9 @@ struct SenderLink {
     /// A mirror's link: its store-and-forward address, whose other
     /// messages carry delivery annotations (`setProtocolData`).
     mirror: Option<String>,
+    /// The largest message the receiver's attach accepts; none for no
+    /// limit.
+    max_message_size: Option<u64>,
 }
 
 /// The transaction coordinator link (`ProtonTransactionHandler`).
@@ -2087,10 +2090,13 @@ impl Conn {
             .iter()
             .find(|(_, p)| p.attach.name == attach.name && p.attach.role != attach.role)
             .map(|(h, _)| *h);
+        let max_message_size = attach.max_message_size;
         if let Some(local) = answering {
             let link = s.pending.remove(&local).expect("found");
             s.handles.insert(attach.handle, local);
-            return self.local_link_attached(channel, local, link, attach).await;
+            let attached = self.local_link_attached(channel, local, link, attach).await;
+            self.limit_sender(channel, local, max_message_size);
+            return attached;
         }
         let Some(local) = s.allocate_handle() else {
             return Err(no_handle(s.remote_handle_max));
@@ -2127,7 +2133,7 @@ impl Conn {
             },
             Role::Receiver => {
                 let desired = attach.desired_capabilities.as_ref();
-                if link::has(desired, fed::FEDERATION_ADDRESS_RECEIVER) {
+                let attached = if link::has(desired, fed::FEDERATION_ADDRESS_RECEIVER) {
                     self.attach_federation_sender(channel, attach, FedSenderRole::Address)
                         .await
                 } else if link::has(desired, fed::FEDERATION_QUEUE_RECEIVER) {
@@ -2138,8 +2144,22 @@ impl Conn {
                         .await
                 } else {
                     self.attach_sender(channel, attach).await
-                }
+                };
+                self.limit_sender(channel, local, max_message_size);
+                attached
             }
+        }
+    }
+
+    /// Keeps the receiver's max-message-size on the sending link made for
+    /// it; 0, as no value, sets no limit.
+    fn limit_sender(&mut self, channel: u16, handle: u32, max: Option<u64>) {
+        if let Some(Some(Link::Sender(sl))) = self
+            .sessions
+            .get_mut(&channel)
+            .map(|s| s.links.get_mut(&handle))
+        {
+            sl.max_message_size = max.filter(|m| *m > 0);
         }
     }
 
@@ -2986,6 +3006,7 @@ impl Conn {
                 fed: None,
                 bridge: None,
                 mirror: None,
+                max_message_size: None,
             })),
         );
         let mut reply = reply;
@@ -3354,6 +3375,7 @@ impl Conn {
                 fed,
                 bridge: None,
                 mirror: None,
+                max_message_size: None,
             })),
         );
         Ok(())
@@ -4274,6 +4296,8 @@ impl Conn {
         // A discharge's queue updates lined up on the session that declared
         // the transaction, when that is not this one.
         let mut moved = None;
+        // A committed discharge's settlements, written once it completes.
+        let mut settles = Vec::new();
         let body = AmqpMessage::new(i64::from(incoming.format), incoming.payload, now)
             .ok()
             .and_then(|m| m.body())
@@ -4291,8 +4315,9 @@ impl Conn {
             Some(v @ Value::Described(..)) if matches!(&v, Value::Described(d, _) if Discharge::is(d)) => {
                 match <Discharge as Composite>::from_value(v) {
                     Ok(d) => {
-                        let (state, elsewhere) = self.discharge(channel, d).await;
+                        let (state, elsewhere, settled) = self.discharge(channel, d).await;
                         moved = elsewhere;
+                        settles = settled;
                         state
                     }
                     Err(e) => DeliveryState::Rejected(Rejected {
@@ -4315,6 +4340,10 @@ impl Conn {
             wait.merge(elsewhere);
         }
         self.coordinator_topup(channel, handle);
+        // The answer waits for the commit; the deliveries it settles follow
+        // it (`afterCommit`), held behind it by the writer, which keeps the
+        // frames' order.
+        let mut wait = Some(wait);
         if let Some(id) = incoming.delivery_id {
             self.last_write = Instant::now();
             self.out.frame(
@@ -4328,7 +4357,16 @@ impl Conn {
                     batchable: false,
                 }),
                 &[],
-                wait,
+                wait.take().unwrap_or_default(),
+            );
+        }
+        for (ch, settle) in settles {
+            self.last_write = Instant::now();
+            self.out.frame(
+                ch,
+                Performative::Disposition(settle),
+                &[],
+                wait.take().unwrap_or_default(),
             );
         }
         Ok(())
@@ -4336,12 +4374,14 @@ impl Conn {
 
     /// Commits or rolls back (`ProtonTransactionHandler`, `discharge`);
     /// with the outcome, the queue updates the commit or rollback lined up
-    /// on another session than the coordinator's, for the answer to wait for.
+    /// on another session than the coordinator's, for the answer to wait for,
+    /// and the settlements of the deliveries a commit acknowledged, to be
+    /// written once it completes.
     async fn discharge(
         &mut self,
         coordinator_channel: u16,
         d: Discharge,
-    ) -> (DeliveryState, Option<Completion>) {
+    ) -> (DeliveryState, Option<Completion>, Vec<(u16, Disposition)>) {
         let Some(txn) = self.txns.remove(&d.txn_id) else {
             let refused = DeliveryState::Rejected(Rejected {
                 error: Some(Error::new(
@@ -4352,7 +4392,7 @@ impl Conn {
                     )),
                 )),
             });
-            return (refused, None);
+            return (refused, None, Vec::new());
         };
         let fail = d.fail.unwrap_or(false);
         // The deliveries the client acknowledged in the transaction.
@@ -4400,6 +4440,7 @@ impl Conn {
                 .server
                 .take_completion()
         });
+        let mut settles = Vec::new();
         for (ch, id) in &acked {
             let Some(s) = self.sessions.get_mut(ch) else {
                 continue;
@@ -4416,10 +4457,9 @@ impl Conn {
                 }
             } else if let Some(o) = s.out.remove(id) {
                 s.tags.give_back(o.tag);
-                self.last_write = Instant::now();
-                self.out.frame(
+                settles.push((
                     *ch,
-                    Performative::Disposition(Disposition {
+                    Disposition {
                         role: Role::Sender,
                         first: *id,
                         last: None,
@@ -4429,10 +4469,8 @@ impl Conn {
                             outcome: Some(Box::new(DeliveryState::Accepted)),
                         })),
                         batchable: false,
-                    }),
-                    &[],
-                    Completion::default(),
-                );
+                    },
+                ));
             }
         }
         let state = match result {
@@ -4441,7 +4479,7 @@ impl Conn {
                 error: Some(Error::new(broker_condition(&e), Some(e.message))),
             }),
         };
-        (state, elsewhere)
+        (state, elsewhere, settles)
     }
 
     // -------------------------------------------------------- outgoing
@@ -4973,6 +5011,19 @@ impl Conn {
                 ),
             }
         };
+        // Larger than the receiver accepts: not sent, and left on the queue
+        // for other consumers, as if it had come back undeliverable here.
+        if sl
+            .max_message_size
+            .is_some_and(|max| payload.len() as u64 > max)
+        {
+            lock(&sl.credit).pending -= 1;
+            if !sl.resolved.browse {
+                s.server
+                    .cancel_undeliverable(sl.consumer, message.message_id(), false);
+            }
+            return Ok(());
+        }
         sl.link_credit = sl.link_credit.saturating_sub(1);
         sl.delivery_count = sl.delivery_count.wrapping_add(1);
         lock(&sl.credit).pending -= 1;

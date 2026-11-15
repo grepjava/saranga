@@ -628,3 +628,96 @@ async fn a_rollback_keeps_another_sessions_unsettled_acknowledgement() {
     task.abort();
     broker.stop().unwrap();
 }
+
+/// A `sync` mirror whose acknowledgements stay pending until released.
+#[derive(Default)]
+struct HeldMirror(std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>>);
+
+impl saranga_server::mirror::MirrorController for HeldMirror {
+    fn add_address(&self, _: &saranga_server::postoffice::AddressInfo) {}
+    fn delete_address(&self, _: &saranga_server::postoffice::AddressInfo) {}
+    fn create_queue(&self, _: &Queue) {}
+    fn delete_queue(&self, _: &Queue) {}
+    fn send_message(
+        &self,
+        _: &saranga_server::message::MessageRef,
+        _: Option<&saranga_server::mirror::Origin>,
+    ) -> Option<Queue> {
+        None
+    }
+    fn sync_wait(&self, _: i64) -> Option<saranga_server::storage::Pending> {
+        None
+    }
+    fn acknowledged(
+        &self,
+        _: &Queue,
+        _: &saranga_server::message::MessageRef,
+        _: saranga_server::queue::AckReason,
+        _: Option<&saranga_server::mirror::Origin>,
+    ) -> Option<saranga_server::storage::Pending> {
+        let (done, pending) = saranga_server::storage::Pending::new();
+        self.0.lock().unwrap().push(Box::new(move || done(Ok(()))));
+        Some(pending)
+    }
+    fn remote_mirror_id(&self) -> Option<String> {
+        None
+    }
+}
+
+/// A delivery acknowledged in a transaction is settled only once the
+/// commit has completed, its `sync` mirror's acknowledgement included
+/// (`afterCommit`), and not as soon as the discharge is handled.
+#[tokio::test]
+async fn a_committed_delivery_is_settled_after_the_commit_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, _) = broker(&dir).await;
+    let mirror = Arc::new(HeldMirror::default());
+    broker.post_office().mirrors().install(mirror.clone());
+    let (mut c, task) = Client::connect(&broker).await;
+    c.begin(0).await;
+    c.attach(0, 0, None).await;
+    c.attach(0, 1, Some("q")).await;
+    c.transfer(0, 1, None, &[0x00, 0x53, 0x77, 0xa1, 1, b'm'])
+        .await;
+    c.receiver(0, 2, "q", 1).await;
+    let id = c.delivery(0, Duration::from_secs(2)).await.unwrap();
+    let txn = c.declare(0, 0).await;
+    c.accept(0, id, Some(&txn), false).await;
+    c.until(|_, p| {
+        matches!(p, Performative::Disposition(d)
+            if d.role == Role::Sender && d.first == id && !d.settled)
+    })
+    .await;
+    let mut payload = vec![0x00, 0x53, 0x77];
+    codec::encode(&discharge(txn, false).to_value(), &mut payload);
+    let discharge_id = c.next[0];
+    c.next[0] += 1;
+    c.send(
+        0,
+        Performative::Transfer(Transfer {
+            handle: 0,
+            delivery_id: Some(discharge_id),
+            delivery_tag: Some(vec![99]),
+            message_format: Some(0),
+            settled: Some(false),
+            ..Default::default()
+        }),
+        &payload,
+    )
+    .await;
+    assert!(
+        !c.settles(0, id, Duration::from_millis(500)).await,
+        "settled before the mirror acknowledged the commit"
+    );
+    let held: Vec<_> = mirror.0.lock().unwrap().drain(..).collect();
+    assert!(!held.is_empty(), "the commit waits for the mirror");
+    for done in held {
+        done();
+    }
+    assert!(
+        c.settles(0, id, Duration::from_secs(5)).await,
+        "settled once the commit completed"
+    );
+    task.abort();
+    broker.stop().unwrap();
+}
