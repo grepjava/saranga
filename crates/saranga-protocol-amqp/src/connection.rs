@@ -803,18 +803,19 @@ struct Session {
     detaching: std::collections::HashSet<u32>,
     /// Links this end attached, waiting for the peer's attach.
     pending: HashMap<u32, LocalLink>,
+    /// The highest handle the peer's Begin allows this end to use.
+    remote_handle_max: u32,
 }
 
 impl Session {
-    /// `allocateLocalHandle`: the lowest handle not in use.
-    fn allocate_handle(&self) -> u32 {
-        (0..=HANDLE_MAX)
-            .find(|h| {
-                !self.links.contains_key(h)
-                    && !self.detaching.contains(h)
-                    && !self.pending.contains_key(h)
-            })
-            .unwrap_or(HANDLE_MAX)
+    /// `allocateLocalHandle`: the lowest handle not in use, within the
+    /// peer's handle-max as well as this end's; none if all are in use.
+    fn allocate_handle(&self) -> Option<u32> {
+        (0..=HANDLE_MAX.min(self.remote_handle_max)).find(|h| {
+            !self.links.contains_key(h)
+                && !self.detaching.contains(h)
+                && !self.pending.contains_key(h)
+        })
     }
 
     /// This end's handle for the peer's.
@@ -1889,6 +1890,7 @@ impl Conn {
             handles: HashMap::new(),
             detaching: std::collections::HashSet::new(),
             pending: HashMap::new(),
+            remote_handle_max: u32::MAX,
         }
     }
 
@@ -1910,6 +1912,7 @@ impl Conn {
             };
             s.next_incoming_id = begin.next_outgoing_id;
             s.remote_incoming_window = i64::from(begin.incoming_window);
+            s.remote_handle_max = begin.handle_max;
             self.channels.insert(remote, local);
             return Ok(());
         }
@@ -1923,6 +1926,7 @@ impl Conn {
             ));
         };
         let mut session = self.new_session(begin.next_outgoing_id, begin.incoming_window);
+        session.remote_handle_max = begin.handle_max;
         // AMQPSessionCallback.init starts the session.
         session.server.set_started(true).await;
         self.sessions.insert(channel, session);
@@ -2065,6 +2069,11 @@ impl Conn {
                 "attach on an unknown channel",
             ));
         };
+        // TransportImpl.handleAttach: above the handle-max this end's Begin
+        // gave.
+        if attach.handle > HANDLE_MAX {
+            return Err(Fatal::new(condition::FRAMING_ERROR, "handle-max exceeded"));
+        }
         if s.handles.contains_key(&attach.handle) {
             return Err(Fatal::new(
                 condition::HANDLE_IN_USE,
@@ -2083,7 +2092,9 @@ impl Conn {
             s.handles.insert(attach.handle, local);
             return self.local_link_attached(channel, local, link, attach).await;
         }
-        let local = s.allocate_handle();
+        let Some(local) = s.allocate_handle() else {
+            return Err(no_handle(s.remote_handle_max));
+        };
         s.handles.insert(attach.handle, local);
         attach.handle = local;
         match attach.role {
@@ -3075,18 +3086,21 @@ impl Conn {
 
     /// Attaches a broker connection's link on its session, with the lowest
     /// free handle.
-    fn open_local(&mut self, mut link: LocalLink) {
+    fn open_local(&mut self, mut link: LocalLink) -> Handled {
         let Some(channel) = self.main_channel else {
-            return;
+            return Ok(());
         };
         let Some(s) = self.sessions.get_mut(&channel) else {
-            return;
+            return Ok(());
         };
-        let handle = s.allocate_handle();
+        let Some(handle) = s.allocate_handle() else {
+            return Err(no_handle(s.remote_handle_max));
+        };
         link.attach.handle = handle;
         let attach = link.attach.clone();
         s.pending.insert(handle, link);
         self.send(channel, Performative::Attach(attach));
+        Ok(())
     }
 
     /// The peer's attach answering a link this end attached (the
@@ -4016,6 +4030,9 @@ impl Conn {
             }
         };
         let Some(incoming) = complete else {
+            if t.aborted {
+                self.aborted(channel, t.handle);
+            }
             return Ok(());
         };
         let is_coordinator = matches!(
@@ -4297,15 +4314,7 @@ impl Conn {
             // after the commit's I/O on the coordinator's context.
             wait.merge(elsewhere);
         }
-        if let Some(Link::Coordinator(cl)) = s.links.get_mut(&handle)
-            && cl.credit < self.settings.low_credits.max(0) as u32
-        {
-            cl.credit += self.settings.credits.max(0) as u32;
-            let (count, credit) = (cl.delivery_count, cl.credit);
-            let s = &self.sessions[&channel];
-            let flow = self.link_flow(s, handle, count, credit, false);
-            self.send(channel, Performative::Flow(flow));
-        }
+        self.coordinator_topup(channel, handle);
         if let Some(id) = incoming.delivery_id {
             self.last_write = Instant::now();
             self.out.frame(
@@ -4512,10 +4521,7 @@ impl Conn {
                 self.sessions.insert(channel, s);
                 Ok(())
             }
-            Event::Open(link) => {
-                self.open_local(*link);
-                Ok(())
-            }
+            Event::Open(link) => self.open_local(*link),
             Event::CloseSession { name } => {
                 self.close_session(&name).await;
                 Ok(())
@@ -4829,6 +4835,50 @@ impl Conn {
                 }
                 self.sessions.insert(channel, s);
             }
+        }
+    }
+
+    /// The coordinator's credit, topped up below its low mark
+    /// (`ProtonTransactionHandler.onMessage`).
+    fn coordinator_topup(&mut self, channel: u16, handle: u32) {
+        let (credits, low) = (
+            self.settings.credits.max(0) as u32,
+            self.settings.low_credits.max(0) as u32,
+        );
+        let Some(s) = self.sessions.get_mut(&channel) else {
+            return;
+        };
+        let Some(Link::Coordinator(cl)) = s.links.get_mut(&handle) else {
+            return;
+        };
+        if cl.credit >= low {
+            return;
+        }
+        cl.credit += credits;
+        let (count, credit) = (cl.delivery_count, cl.credit);
+        let s = &self.sessions[&channel];
+        let flow = self.link_flow(s, handle, count, credit, false);
+        self.send(channel, Performative::Flow(flow));
+    }
+
+    /// `handleAbortedDelivery`: the credit an aborted delivery used is
+    /// given back while the receiver is started and not draining;
+    /// otherwise a pending stop or drain may now be complete.
+    fn aborted(&mut self, channel: u16, handle: u32) {
+        let Some(s) = self.sessions.get_mut(&channel) else {
+            return;
+        };
+        match s.links.get_mut(&handle) {
+            Some(Link::Receiver(rl)) if rl.state == ReceiverState::Started => {
+                rl.credit = rl.credit.saturating_add(1);
+                let (count, credit) = (rl.delivery_count, rl.credit);
+                let s = &self.sessions[&channel];
+                let flow = self.link_flow(s, handle, count, credit, false);
+                self.send(channel, Performative::Flow(flow));
+            }
+            Some(Link::Receiver(_)) => self.check_stopped(channel, handle),
+            Some(Link::Coordinator(_)) => self.coordinator_topup(channel, handle),
+            _ => {}
         }
     }
 
@@ -5586,6 +5636,15 @@ fn try_spill(inc: &mut Incoming, sp: &Spilling<'_>) -> std::io::Result<()> {
     inc.payload.truncate(body_start);
     inc.spill = Some(Spill { writer, id });
     Ok(())
+}
+
+/// No handle free within the peer's handle-max: the connection ends, as
+/// it does when no channel is free within its channel-max.
+fn no_handle(remote_handle_max: u32) -> Fatal {
+    Fatal::new(
+        condition::RESOURCE_LIMIT_EXCEEDED,
+        format!("no handle free within the handle-max of {remote_handle_max}"),
+    )
 }
 
 /// `topUpCreditIfNeeded`: back to `credits` once at or below `low`.
