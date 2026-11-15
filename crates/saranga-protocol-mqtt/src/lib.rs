@@ -122,6 +122,11 @@ impl MqttProtocol {
             state: OnceLock::new(),
         }
     }
+
+    /// The sessions' state, once the protocol has started.
+    pub fn state_manager(&self) -> Option<Arc<StateManager>> {
+        self.state.get().cloned()
+    }
 }
 
 impl Default for MqttProtocol {

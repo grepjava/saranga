@@ -13,6 +13,9 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **An MQTT client's new delayed will is not published early.** The session scan took each will it had found due only after publishing the ones before it; a client that meanwhile connected again with a new delayed will and went had that will published at once. The scan now takes a will only if it is still the one it found and still due.
+- **The OIDC login's `httpTimeout` bounds the whole exchange with the provider.** Each wait on the socket was given the full timeout and a response completed after it was accepted, so a slow provider could take far longer; each wait now gets what is left, and a late response is refused.
+- **A malformed chunked response from an OIDC provider or the Kubernetes API fails the login instead of its task.** A chunk size too large to add to panicked, and a chunk without its closing CRLF was misread; both are now errors.
 - **A message whose ID or correlation ID reads `ID:AMQP_BINARY:` followed by other than hex digits no longer stops an AMQP consumer's connection.** Converting it for AMQP split a character of more than one byte and panicked; it is now sent as the string it is, as Artemis sends an ID it cannot decode. A `%` before such a character in an OpenWire destination's options, or in an XInclude `href` of the configuration, panicked the same way and is now kept as it is.
 - **The console's pages are not sent gzipped to a client that refuses gzip.** An `Accept-Encoding` refusing gzip but accepting any coding (`gzip;q=0, *`) was read as accepting it; gzip's own entry now decides, and `*` stands only for codings not named.
 - **A journal holding a damaged prepare record loads.** A prepare record whose extra-data length was damaged to a negative value could pass the record checks and stop the broker at start with a panic; it is now skipped as damage, as other damaged records are (see COMPAT).

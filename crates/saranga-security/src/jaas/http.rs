@@ -91,7 +91,7 @@ impl HttpClient {
             .collect();
         addrs.sort_by_key(|a| a.is_ipv6());
         for addr in addrs {
-            let attempt = match self.timeout {
+            let attempt = match remaining(deadline)? {
                 Some(t) => TcpStream::connect_timeout(&addr, t),
                 None => TcpStream::connect(addr),
             };
@@ -104,8 +104,6 @@ impl HttpClient {
             }
         }
         let tcp = connected.ok_or(last)?;
-        tcp.set_read_timeout(self.timeout).ok();
-        tcp.set_write_timeout(self.timeout).ok();
         let mut request =
             format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: saranga\r\n");
         for (name, value) in headers {
@@ -150,19 +148,51 @@ fn split_authority(authority: &str, default_port: u16) -> Result<(String, u16), 
     }
 }
 
+/// What is left of the exchange's time: `None` for no limit, an error once
+/// it is up.
+fn remaining(deadline: Option<Instant>) -> Result<Option<Duration>, String> {
+    let Some(d) = deadline else {
+        return Ok(None);
+    };
+    match d.checked_duration_since(Instant::now()) {
+        Some(left) if !left.is_zero() => Ok(Some(left)),
+        _ => Err("request timed out".into()),
+    }
+}
+
+/// A stream whose socket waits at most so long for each read or write.
+trait Timed {
+    fn wait_at_most(&self, t: Option<Duration>);
+}
+
+impl Timed for TcpStream {
+    fn wait_at_most(&self, t: Option<Duration>) {
+        self.set_read_timeout(t).ok();
+        self.set_write_timeout(t).ok();
+    }
+}
+
+impl Timed for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    fn wait_at_most(&self, t: Option<Duration>) {
+        self.sock.wait_at_most(t);
+    }
+}
+
+/// Sends the request and reads the response, the whole of it within the
+/// deadline: each wait on the socket gets only what is left, and a
+/// response completed after it is refused.
 fn exchange(
-    stream: &mut (impl Read + Write),
+    stream: &mut (impl Read + Write + Timed),
     request: &[u8],
     deadline: Option<Instant>,
 ) -> Result<Response, String> {
+    stream.wait_at_most(remaining(deadline)?);
     stream.write_all(request).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
     let mut data = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
-        if deadline.is_some_and(|d| Instant::now() > d) {
-            return Err("request timed out".into());
-        }
+        stream.wait_at_most(remaining(deadline)?);
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => data.extend_from_slice(&buf[..n]),
@@ -177,10 +207,13 @@ fn exchange(
             Err(e) => return Err(e.to_string()),
         }
         if let Some(r) = complete(&data, false)? {
+            remaining(deadline)?;
             return Ok(r);
         }
     }
-    complete(&data, true)?.ok_or_else(|| "the connection closed before the response ended".into())
+    let r = complete(&data, true)?;
+    remaining(deadline)?;
+    r.ok_or_else(|| "the connection closed before the response ended".into())
 }
 
 /// The response, once `data` holds all of it.
@@ -212,7 +245,7 @@ fn complete(data: &[u8], eof: bool) -> Result<Option<Response>, String> {
     }
     let body = &data[end + 4..];
     if chunked {
-        return Ok(dechunk(body).map(|body| Response { status, body }));
+        return Ok(dechunk(body)?.map(|body| Response { status, body }));
     }
     match length {
         Some(n) if body.len() >= n => Ok(Some(Response {
@@ -228,18 +261,30 @@ fn complete(data: &[u8], eof: bool) -> Result<Option<Response>, String> {
     }
 }
 
-fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
+/// A chunked body: `None` until all of it is there, an error for one that
+/// cannot be read.
+fn dechunk(mut body: &[u8]) -> Result<Option<Vec<u8>>, String> {
     let mut out = Vec::new();
     loop {
-        let line_end = body.windows(2).position(|w| w == b"\r\n")?;
-        let size_text = String::from_utf8_lossy(&body[..line_end]);
-        let size = usize::from_str_radix(size_text.split(';').next()?.trim(), 16).ok()?;
+        let Some(line_end) = body.windows(2).position(|w| w == b"\r\n") else {
+            return Ok(None);
+        };
+        let size_line = String::from_utf8_lossy(&body[..line_end]);
+        let size_text = size_line.split(';').next().unwrap_or_default().trim();
+        // The chunk and the CRLF after it must fit in an address.
+        let size = usize::from_str_radix(size_text, 16)
+            .ok()
+            .filter(|s| s.checked_add(2).is_some())
+            .ok_or_else(|| format!("invalid chunk size {size_text}"))?;
         body = &body[line_end + 2..];
         if size == 0 {
-            return Some(out);
+            return Ok(Some(out));
         }
         if body.len() < size + 2 {
-            return None;
+            return Ok(None);
+        }
+        if &body[size..size + 2] != b"\r\n" {
+            return Err("invalid chunk: no CRLF after its data".into());
         }
         out.extend_from_slice(&body[..size]);
         body = &body[size + 2..];
@@ -316,5 +361,67 @@ mod tests {
         assert_eq!((r.status, r.body.as_slice()), (404, &b"hi!"[..]));
         assert_eq!(split_authority("h:8080", 80).unwrap(), ("h".into(), 8080));
         assert_eq!(split_authority("[::1]", 443).unwrap(), ("::1".into(), 443));
+    }
+
+    /// A chunk size no body could have, or a chunk not followed by its
+    /// CRLF, is an error, not a panic or a wait for more.
+    #[test]
+    fn a_chunk_that_cannot_be_read_is_an_error() {
+        for body in [
+            &b"ffffffffffffffff\r\nhi\r\n0\r\n\r\n"[..],
+            b"fffffffffffffffe\r\nhi\r\n0\r\n\r\n",
+            b"zz\r\nhi\r\n0\r\n\r\n",
+            b"2\r\nhiXX1\r\n!\r\n0\r\n\r\n",
+        ] {
+            let mut data = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+            data.extend_from_slice(body);
+            assert!(
+                complete(&data, false).is_err(),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// The timeout bounds the whole exchange: a response whose pieces each
+    /// come within it, but whose last comes after it, is refused.
+    #[test]
+    fn a_response_completed_after_the_timeout_is_refused() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut buf).unwrap();
+                seen.extend_from_slice(&buf[..n]);
+            }
+            let start = Instant::now();
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = s.write_all(b"a");
+            std::thread::sleep(Duration::from_millis(130));
+            let _ = s.write_all(b"b");
+            std::thread::sleep(Duration::from_millis(200));
+            start.elapsed()
+        });
+        let started = Instant::now();
+        let result = HttpClient::new(200, None, None).get(&format!("http://127.0.0.1:{port}/"));
+        let took = started.elapsed();
+        assert!(
+            server.join().unwrap() >= Duration::from_millis(280),
+            "the server sent its last byte after the timeout"
+        );
+        assert_eq!(
+            result.err().as_deref(),
+            Some("request timed out"),
+            "after {took:?}"
+        );
+        assert!(
+            took < Duration::from_millis(270),
+            "gave up at the timeout, not later: {took:?}"
+        );
     }
 }

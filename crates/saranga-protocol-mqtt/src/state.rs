@@ -316,6 +316,16 @@ impl SessionState {
         &self.client_id
     }
 
+    /// Whether a disconnected client's delayed will is due (`scanSessions`):
+    /// it failed, and its will delay is over.
+    pub fn will_due(&self, now: i64) -> bool {
+        self.is_will
+            && !self.attached
+            && self.failed
+            && self.will.delay_interval > 0
+            && self.disconnected_time + self.will.delay_interval * 1000 < now
+    }
+
     /// `clear`.
     pub fn clear(&mut self, broker: &Broker) {
         self.subscriptions.clear();
@@ -984,17 +994,12 @@ impl StateManager {
             if !s.attached && raw != -1 && expiry > 0 && s.disconnected_time + expiry * 1000 < now {
                 to_remove.push(client_id.clone());
             }
-            if s.is_will
-                && !s.attached
-                && s.failed
-                && s.will.delay_interval > 0
-                && s.disconnected_time + s.will.delay_interval * 1000 < now
-            {
-                wills.push(state.clone());
+            if s.will_due(now) {
+                wills.push((state.clone(), s.will_generation));
             }
         }
-        for state in wills {
-            crate::connection::send_detached_will(&state).await;
+        for (state, generation) in wills {
+            crate::connection::send_detached_will(&state, generation).await;
         }
         for client_id in to_remove {
             // Re-validate and remove atomically: a client that reconnected

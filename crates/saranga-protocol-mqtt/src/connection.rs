@@ -2831,9 +2831,18 @@ impl Conn {
     }
 }
 
-/// The scan found a disconnected client's will delay over.
-pub async fn send_detached_will(state: &StateRef) {
-    let core = lock(state).session.take();
+/// The scan found a disconnected client's will delay over. The session is
+/// taken only if that will (`generation`) is still due: while the scan
+/// published others, the client may have connected again, set a new will
+/// and gone, and that one waits for its own delay.
+pub async fn send_detached_will(state: &StateRef, generation: u64) {
+    let core = {
+        let mut s = lock(state);
+        if s.will_generation != generation || !s.will_due(now_millis()) {
+            return;
+        }
+        s.session.take()
+    };
     let Some(mut core) = core else {
         return;
     };

@@ -2217,3 +2217,69 @@ async fn a_delayed_will_finishing_late_leaves_the_new_connections_will() {
     broker.stop().unwrap();
     task.abort();
 }
+
+/// The scan's claim of a delayed will it found due holds only for that
+/// will: a client that connected again with a new delayed will, and went,
+/// keeps that will until its own delay is over.
+#[tokio::test]
+async fn a_will_found_due_does_not_send_the_next_connections_will() {
+    let protocol = Arc::new(MqttProtocol::default());
+    let mut config = BrokerConfig::new(Arc::new(SelectorFilters));
+    config.protocols = vec![protocol.clone()];
+    let broker = Broker::start(config).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(broker.clone().serve_acceptor(listener, Acceptor::default()));
+    let manager = protocol.state_manager().expect("started");
+    let (mut watcher, _) = Client::open(address, "due-watch", true).await;
+    watcher.subscribe("due/will", 0).await;
+    // Session expiry 60 s; a will delayed 60 s.
+    let connect = |message: &[u8]| {
+        let mut body = vec![
+            0, 4, b'M', b'Q', b'T', b'T', 5, 0x06, 0, 60, 5, 0x11, 0, 0, 0, 60,
+        ];
+        body.extend(string("due-willer"));
+        body.extend([5, 0x18, 0, 0, 0, 60]);
+        body.extend(string("due/will"));
+        body.extend(string(std::str::from_utf8(message).unwrap()));
+        packet(0x10, &body)
+    };
+    let state = || {
+        manager
+            .session_states()
+            .into_iter()
+            .find(|(id, _)| id == "due-willer")
+            .map(|(_, s)| s)
+            .expect("the session")
+    };
+    let gone = |state: &saranga_protocol_mqtt::state::StateRef| {
+        let s = state.lock().unwrap();
+        !s.attached && s.failed
+    };
+    let (first, _) = Client::open_with(address, &connect(b"first")).await;
+    drop(first);
+    let st = state();
+    while !gone(&st) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The scan found this will due, and before it took the session...
+    let found = st.lock().unwrap().will_generation;
+    // ...the client connected again with a new will, and went.
+    let (second, _) = Client::open_with(address, &connect(b"second")).await;
+    drop(second);
+    while st.lock().unwrap().will_generation == found || !gone(&st) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    saranga_protocol_mqtt::connection::send_detached_will(&st, found).await;
+    assert!(
+        watcher.silent_for(500).await,
+        "the new will waits for its own delay"
+    );
+    // Nor does a claim for the current will go before its delay is over.
+    let current = st.lock().unwrap().will_generation;
+    saranga_protocol_mqtt::connection::send_detached_will(&st, current).await;
+    assert!(watcher.silent_for(300).await, "not due yet");
+    assert!(st.lock().unwrap().session.is_some(), "the session stays");
+    broker.stop().unwrap();
+    task.abort();
+}
