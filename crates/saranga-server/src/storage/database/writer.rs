@@ -134,12 +134,16 @@ impl Op {
     }
 
     /// A paged reference also holds its queue's place: the queue reads them
-    /// in message order, so they cannot commit out of it.
+    /// in message order, so they cannot commit out of it. Deleting a
+    /// binding deletes its queue's paged references, so it holds that place
+    /// too: a paged reference sent before it commits before it, and is not
+    /// left behind for a queue that has gone.
     fn queue_key(&self) -> Option<i64> {
         match self {
             Op::Reference {
                 queue, paged: true, ..
             } => Some(!*queue),
+            Op::DeleteBinding { id } => Some(!*id),
             _ => None,
         }
     }
@@ -359,7 +363,12 @@ async fn dispatch(mut receiver: mpsc::UnboundedReceiver<Unit>, writers: Vec<Writ
     let mut in_flight: HashSet<i64> = HashSet::new();
     let mut open = true;
     loop {
-        while !idle.is_empty() {
+        // After a write failed for good, or a critical I/O error elsewhere,
+        // nothing more is written: what waits fails, barriers too.
+        if run.failed.load(Ordering::Acquire) {
+            fail_all(&mut queue, &run);
+        }
+        while !idle.is_empty() && !run.failed.load(Ordering::Acquire) {
             let queued: usize = queue.iter().map(|u| u.ops.len().max(1)).sum();
             let share = queued.div_ceil(idle.len()).max(1);
             let batch = form(&mut queue, &in_flight, idle.len() == total, share, &run);
@@ -395,6 +404,18 @@ async fn dispatch(mut receiver: mpsc::UnboundedReceiver<Unit>, writers: Vec<Writ
                 }
                 idle.push(finished.writer);
             }
+        }
+    }
+}
+
+/// Fails every unit waiting, once the store has failed.
+fn fail_all(queue: &mut VecDeque<Unit>, run: &Run) {
+    for unit in queue.drain(..) {
+        run.pending.release(unit.ops.len().max(1));
+        if let Some(done) = unit.done {
+            done(Err(JournalError::IllegalState(
+                "the database store has failed".into(),
+            )));
         }
     }
 }
@@ -1125,5 +1146,107 @@ impl Writer {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(pending: usize) -> Run {
+        Run {
+            settings: Settings {
+                config: Target {
+                    config: Config::new(),
+                    tls: None,
+                },
+                connections: 1,
+                max_retries: 0,
+                retry_interval: Duration::ZERO,
+                max_pending_writes: 100,
+                large_dir: std::path::PathBuf::new(),
+            },
+            pending: Arc::new(Credits {
+                count: AtomicUsize::new(pending),
+                max: 100,
+                lock: Mutex::new(()),
+                freed: Condvar::new(),
+            }),
+            failed: Arc::new(AtomicBool::new(false)),
+            critical: Arc::new(|_| {}),
+        }
+    }
+
+    fn unit(ops: Vec<Op>) -> Unit {
+        Unit {
+            ops,
+            done: None,
+            barrier: false,
+        }
+    }
+
+    /// Deleting a binding deletes its queue's paged references: it waits
+    /// for one sent before it, as another paged reference would.
+    #[test]
+    fn a_binding_deletion_waits_for_its_queues_paged_reference() {
+        let paged = unit(vec![Op::Reference {
+            message: 7,
+            queue: 5,
+            tx: None,
+            paged: true,
+        }]);
+        let in_flight: HashSet<i64> = paged.keys().collect();
+        let mut queue = VecDeque::from([
+            unit(vec![Op::DeleteBinding { id: 5 }]),
+            unit(vec![Op::DeleteMessage { id: 99 }]),
+        ]);
+        let batch = form(&mut queue, &in_flight, false, 10, &run(0));
+        let keys: Vec<i64> = batch
+            .iter()
+            .flat_map(|u| u.ops.iter().map(Op::key))
+            .collect();
+        assert_eq!(keys, vec![99], "only the unrelated unit goes");
+        assert!(matches!(queue[0].ops[..], [Op::DeleteBinding { id: 5 }]));
+    }
+
+    /// Once the store has failed nothing more is written: what waits, a
+    /// barrier too, is answered with the failure.
+    #[tokio::test]
+    async fn after_a_failure_what_waits_fails() {
+        let run = run(2);
+        run.failed.store(true, Ordering::Release);
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let (seen_tx, seen) = std::sync::mpsc::channel();
+        for barrier in [false, true] {
+            let seen = seen_tx.clone();
+            sender
+                .send(Unit {
+                    ops: if barrier {
+                        Vec::new()
+                    } else {
+                        vec![Op::DeleteMessage { id: 1 }]
+                    },
+                    done: Some(Box::new(move |r| {
+                        let _ = seen.send((barrier, r.is_ok()));
+                    })),
+                    barrier,
+                })
+                .unwrap();
+        }
+        drop(sender);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            dispatch(receiver, Vec::new(), run.clone()),
+        )
+        .await
+        .expect("every unit is answered and the dispatcher ends");
+        let mut answers: Vec<(bool, bool)> = seen.try_iter().collect();
+        answers.sort();
+        assert_eq!(answers, vec![(false, false), (true, false)]);
+        assert_eq!(
+            run.pending.count.load(Ordering::Acquire),
+            0,
+            "credits given back"
+        );
     }
 }

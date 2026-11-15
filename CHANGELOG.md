@@ -13,6 +13,8 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **The database store writes nothing more after a critical failure.** A write that failed for good, or a critical I/O error elsewhere, refused new work but let what was already queued go on to the database, and answered a queued barrier as written; what waits now fails, barriers too, as the journal stops.
+- **Deleting a queue in the database store waits for its paged messages sent before it.** With more than one write connection, the deletion could commit before an earlier paged reference to the queue, leaving that reference behind; it now holds the queue's place as paged references do.
 - **An MQTT client's new delayed will is not published early.** The session scan took each will it had found due only after publishing the ones before it; a client that meanwhile connected again with a new delayed will and went had that will published at once. The scan now takes a will only if it is still the one it found and still due.
 - **The OIDC login's `httpTimeout` bounds the whole exchange with the provider.** Each wait on the socket was given the full timeout and a response completed after it was accepted, so a slow provider could take far longer; each wait now gets what is left, and a late response is refused.
 - **A malformed chunked response from an OIDC provider or the Kubernetes API fails the login instead of its task.** A chunk size too large to add to panicked, and a chunk without its closing CRLF was misread; both are now errors.
