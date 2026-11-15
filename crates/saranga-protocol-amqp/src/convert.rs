@@ -187,7 +187,9 @@ fn to_id_object(s: &str) -> Option<Value> {
     } else if let Some(v) = rest.strip_prefix(STRING) {
         Some(Value::String(v.to_owned()))
     } else if let Some(v) = rest.strip_prefix(BINARY) {
-        if v.len() % 2 != 0 {
+        // `convertHexStringToBinary`: hex digits only, in pairs. Checking
+        // the digits first also keeps the pairs on character boundaries.
+        if v.len() % 2 != 0 || !v.bytes().all(|c| c.is_ascii_hexdigit()) {
             return None;
         }
         (0..v.len())
@@ -1259,6 +1261,39 @@ mod tests {
         ] {
             let s = to_message_id_string(&id).unwrap();
             assert_eq!(to_id_object(&s), Some(id), "{s}");
+        }
+    }
+
+    /// A binary ID is hex digits in pairs (`convertHexStringToBinary`):
+    /// anything else is not one, and is sent as the string it is. A
+    /// character of more than one byte made the pairs split it.
+    #[test]
+    fn a_binary_id_is_hex_digits_only() {
+        assert_eq!(
+            to_id_object("ID:AMQP_BINARY:0aFF"),
+            Some(Value::Binary(vec![0x0a, 0xff]))
+        );
+        for bad in [
+            "ID:AMQP_BINARY:a€",
+            "ID:AMQP_BINARY:+1",
+            "ID:AMQP_BINARY:0g",
+            "ID:AMQP_BINARY:é",
+        ] {
+            assert_eq!(to_id_object(bad), None, "{bad}");
+        }
+        for key in [JMS_CORRELATION_ID, NATIVE_MESSAGE_ID] {
+            let mut core = CoreMessage::default();
+            core.properties.insert(
+                key.into(),
+                PropertyValue::String("ID:AMQP_BINARY:a€".into()),
+            );
+            let m = from_core(&core, 0);
+            let id = if key == NATIVE_MESSAGE_ID {
+                m.properties().and_then(|p| p.message_id.clone())
+            } else {
+                m.properties().and_then(|p| p.correlation_id.clone())
+            };
+            assert_eq!(id, Some(Value::String("ID:AMQP_BINARY:a€".into())), "{key}");
         }
     }
 

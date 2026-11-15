@@ -166,12 +166,17 @@ fn url_decode(s: &str) -> String {
     while i < b.len() {
         match b[i] {
             b'+' => out.push(b' '),
-            b'%' if i + 2 < b.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                Ok(v) => {
+            // The two digits are read as bytes: a character after `%` may
+            // be more than one.
+            b'%' if i + 2 < b.len() => match std::str::from_utf8(&b[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                Some(v) => {
                     out.push(v);
                     i += 2;
                 }
-                Err(_) => out.push(b'%'),
+                None => out.push(b'%'),
             },
             c => out.push(c),
         }
@@ -183,6 +188,15 @@ fn url_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client's destination option with `%` before a character of more
+    /// than one byte is read, not a panic.
+    #[test]
+    fn an_escape_before_a_wide_character_is_kept() {
+        let d = Destination::queue("orders?x=%€&y=%41%€1");
+        assert_eq!(d.option("x").as_deref(), Some("%€"));
+        assert_eq!(d.option("y").as_deref(), Some("A%€1"));
+    }
 
     #[test]
     fn names() {
