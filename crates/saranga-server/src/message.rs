@@ -719,6 +719,11 @@ pub struct MessageRef {
     /// (`MessageReference.getSequence`): a reference coming back goes back
     /// in this order, not in message ID order.
     pub sequence: u64,
+    /// Set on what a non-destructive queue delivers: a copy of a reference
+    /// the queue still holds, sent to this consumer. It owns nothing;
+    /// coming back, it gives the queue its delivery count and lets that
+    /// consumer have the message again.
+    pub copy_for: Option<crate::queue::ConsumerId>,
 }
 
 impl MessageRef {
@@ -732,6 +737,7 @@ impl MessageRef {
             stored: false,
             rejected_consumers: Vec::new(),
             sequence: 0,
+            copy_for: None,
         }
     }
 

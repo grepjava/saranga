@@ -2213,8 +2213,14 @@ impl ServerSession {
                     }
                 }
                 // QueueImpl.acknowledge: on a non-destructive queue a
-                // normal acknowledgement leaves the message where it is.
+                // normal acknowledgement leaves the message where it is. In
+                // a transaction, a rollback gives it back to its consumer.
                 if queue.config().non_destructive {
+                    if let Some(tx) = tx {
+                        transaction::lock(&tx)
+                            .browsed
+                            .extend(refs.into_iter().map(|r| (queue.clone(), r)));
+                    }
                     return Ok(ids);
                 }
                 match tx {

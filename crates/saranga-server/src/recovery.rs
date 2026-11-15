@@ -392,6 +392,7 @@ pub async fn load_messages(
                 stored: storage.pages_in_store(),
                 rejected_consumers: Vec::new(),
                 sequence: 0,
+                copy_for: None,
             });
         }
     }

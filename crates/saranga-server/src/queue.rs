@@ -556,6 +556,7 @@ impl Queue {
             last_values: HashMap::new(),
             dispatching: false,
             dispatch_start: None,
+            delivered_at: 0,
             page_iter: PageIterator::default(),
             removing: None,
             write_failure: None,
@@ -1286,6 +1287,10 @@ impl MessageList {
         &self.levels[level][index]
     }
 
+    fn get_mut(&mut self, (level, index): (usize, usize)) -> &mut MessageRef {
+        &mut self.levels[level][index]
+    }
+
     /// `poll`: the head, from the highest priority.
     fn take_first(&mut self) -> Option<MessageRef> {
         self.levels.iter_mut().rev().find_map(VecDeque::pop_front)
@@ -1350,6 +1355,25 @@ impl MessageList {
     }
 }
 
+/// How many IDs of messages gone from the queue a browser or
+/// non-destructive consumer may remember beyond twice what the queue holds
+/// before they are dropped ([`Consumer::mark_browsed`]).
+const BROWSED_SLACK: usize = 1024;
+
+fn remember_browsed(browsed: &mut HashSet<i64>, id: i64, messages: &MessageList) {
+    browsed.insert(id);
+    if browsed.len() > 2 * messages.len() + BROWSED_SLACK {
+        let held: HashSet<i64> = messages.iter().map(MessageRef::message_id).collect();
+        browsed.retain(|id| held.contains(id));
+    }
+}
+
+/// When the end of a delay-before-dispatch wakes the queue: once, unless
+/// delivery has run since it ended.
+fn dispatch_wake(start: Option<i64>, dispatching: bool, delivered_at: i64) -> Option<i64> {
+    start.filter(|t| !dispatching && *t >= delivered_at)
+}
+
 struct Consumer {
     reg: ConsumerRegistration,
     /// `availableCredits`; `None` when flow control is off.
@@ -1393,6 +1417,15 @@ impl Consumer {
 
     fn has_credits(&self) -> bool {
         !self.failed && self.credits.is_none_or(|c| c > 0)
+    }
+
+    /// Remembers a message sent to this browser or non-destructive
+    /// consumer. Once the IDs it remembers outnumber what the queue holds,
+    /// those of messages gone from it (acknowledged, expired, deleted,
+    /// replaced) are dropped, so the set follows the queue's size, not
+    /// everything that went through it.
+    fn mark_browsed(&mut self, id: i64, messages: &MessageList) {
+        remember_browsed(&mut self.browsed, id, messages);
     }
 
     /// `QueueImpl.errorProcessing` and `ServerConsumerImpl.failed`: the
@@ -1584,6 +1617,11 @@ struct Actor {
     dispatching: bool,
     /// `dispatchStartTime`: when a delay-before-dispatch ends.
     dispatch_start: Option<i64>,
+    /// When delivery last ran. The end of a delay-before-dispatch wakes
+    /// the actor once (Artemis schedules one `deliverAsync` for it): a
+    /// queue that cannot dispatch then (paused, or deliveries still out)
+    /// waits for what changes that, which prompts delivery itself.
+    delivered_at: i64,
     /// While management removes messages with the message audit log on:
     /// those removed, logged when the removal ends.
     removing: Option<Vec<Arc<ServerMessage>>>,
@@ -1641,7 +1679,11 @@ impl Actor {
                 .next()
                 .map(|k| k.0)
                 .into_iter()
-                .chain(self.dispatch_start.filter(|_| !self.dispatching))
+                .chain(dispatch_wake(
+                    self.dispatch_start,
+                    self.dispatching,
+                    self.delivered_at,
+                ))
                 .chain(self.redistribute_at)
                 .min();
             let cmd = match wake {
@@ -1857,8 +1899,13 @@ impl Actor {
     /// (`RefsOperation.afterRollback`): each is checked for redelivery
     /// (`checkRedelivery`), then the survivors return (`postRollback`).
     fn return_refs(&mut self, refs: Vec<MessageRef>) {
-        // A non-destructive queue never took them off its list.
-        if self.shared.config().non_destructive {
+        // A non-destructive queue's deliveries never took their references
+        // off its list; anything else it took off (a delivery taken for
+        // good, management's) goes back like any queue's.
+        let (copies, refs): (Vec<MessageRef>, Vec<MessageRef>) =
+            refs.into_iter().partition(|r| r.copy_for.is_some());
+        copies.into_iter().for_each(|r| self.return_copy(r));
+        if refs.is_empty() {
             return;
         }
         let now = now_millis();
@@ -1870,6 +1917,43 @@ impl Actor {
             back.into_iter().for_each(|r| self.kill(r));
         } else {
             back.into_iter().for_each(|r| self.add_sorted(r));
+        }
+    }
+
+    /// A non-destructive delivery coming back, rolled back or cancelled:
+    /// the consumer it went to may have the message again, unless it
+    /// refused it as undeliverable, and the reference it copies takes its
+    /// delivery count. One that has used its delivery attempts goes to the
+    /// dead-letter address (`checkRedelivery`); a redelivery delay holds
+    /// nothing back, the reference never having left the list. A reference
+    /// gone meanwhile (expired, deleted, replaced) stays gone.
+    fn return_copy(&mut self, r: MessageRef) {
+        let Some(consumer) = r.copy_for else {
+            return;
+        };
+        let id = r.message_id();
+        if !r.rejected_consumers.contains(&consumer)
+            && let Some(c) = self.consumer_mut(consumer)
+        {
+            c.browsed.remove(&id);
+        }
+        let Some(at) = self.messages.find(|q| q.message_id() == id) else {
+            return;
+        };
+        let queue = self.queue();
+        let held = self.messages.get_mut(at);
+        if r.delivery_count <= held.delivery_count {
+            return;
+        }
+        held.delivery_count = r.delivery_count;
+        if self.shared.config().internal {
+            return;
+        }
+        crate::transaction::persist_delivery_count(&queue, held);
+        let s = queue.settings();
+        if s.max_delivery_attempts > 0 && held.delivery_count >= s.max_delivery_attempts {
+            let r = self.messages.remove(at);
+            self.send_to_dead_letter_address(r, &s);
         }
     }
 
@@ -2575,6 +2659,11 @@ impl Actor {
         if self.shared.config().non_destructive {
             let at = self.messages.find(|q| q.message_id() == message_id)?;
             self.messages.remove(at);
+            // Off the list, it is the reference now: should it come back,
+            // it goes back on.
+            let mut r = r;
+            r.copy_for = None;
+            return Some(r);
         }
         Some(r)
     }
@@ -2751,6 +2840,7 @@ impl Actor {
     /// another. Each message goes to the next consumer, round robin, in the
     /// highest priority group that has one able to take it.
     fn deliver(&mut self) {
+        self.delivered_at = now_millis();
         if self.is_paused() {
             self.deliver_to_browsers();
             return;
@@ -2867,7 +2957,9 @@ impl Actor {
             return false;
         }
         let mut r = if non_destructive {
-            self.messages.get(at).clone()
+            let mut copy = self.messages.get(at).clone();
+            copy.copy_for = Some(id);
+            copy
         } else {
             self.messages.remove(at)
         };
@@ -2911,7 +3003,7 @@ impl Actor {
         }
         let c = &mut self.consumers[index];
         if non_destructive {
-            c.browsed.insert(r.message_id());
+            c.mark_browsed(r.message_id(), &self.messages);
             if !c.reg.pre_acknowledge {
                 c.delivering.push_back(r);
             }
@@ -3084,8 +3176,8 @@ impl Actor {
                 else {
                     break;
                 };
-                b.browsed.insert(r.message_id());
-                let (message, count) = (r.message.clone(), r.delivery_count);
+                let (id, message, count) = (r.message_id(), r.message.clone(), r.delivery_count);
+                b.mark_browsed(id, &self.messages);
                 b.send(&message, count);
                 if b.large.is_some() && b.continue_large() {
                     self.shared.tx.send(Cmd::ResumeLarge).ok();
@@ -3174,4 +3266,52 @@ fn cancel(
             r
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list(ids: impl IntoIterator<Item = i64>) -> MessageList {
+        let mut l = MessageList::for_queue(false);
+        for id in ids {
+            l.push_back(MessageRef::new(ServerMessage::new(
+                saranga_message::CoreMessage {
+                    message_id: id,
+                    ..Default::default()
+                },
+            )));
+        }
+        l
+    }
+
+    /// A consumer of a bounded queue remembers what the queue holds, not
+    /// everything that went through it.
+    #[test]
+    fn browsed_ids_follow_the_queue() {
+        let mut browsed = HashSet::new();
+        // A one-message queue (a last-value or ring queue) whose message
+        // is replaced 100,000 times, each delivered.
+        for id in 0..100_000 {
+            remember_browsed(&mut browsed, id, &list([id]));
+        }
+        assert!(browsed.len() <= 2 + BROWSED_SLACK, "{} IDs", browsed.len());
+        assert!(browsed.contains(&99_999), "the held message stays browsed");
+    }
+
+    /// The end of a delay-before-dispatch wakes the queue once: a paused
+    /// queue, or one still waiting for deliveries, is not woken again and
+    /// again.
+    #[test]
+    fn the_end_of_a_dispatch_delay_wakes_once() {
+        assert_eq!(dispatch_wake(Some(100), false, 50), Some(100));
+        assert_eq!(dispatch_wake(Some(100), false, 100), Some(100));
+        assert_eq!(
+            dispatch_wake(Some(100), false, 101),
+            None,
+            "delivery ran after it"
+        );
+        assert_eq!(dispatch_wake(Some(100), true, 50), None);
+        assert_eq!(dispatch_wake(None, false, 50), None);
+    }
 }

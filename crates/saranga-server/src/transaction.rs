@@ -104,6 +104,9 @@ pub struct Transaction {
     pub sends: Vec<(Queue, MessageRef)>,
     /// Acknowledged references, removed on commit, returned on rollback.
     pub acks: Vec<(Queue, MessageRef)>,
+    /// Non-destructive deliveries acknowledged in it: the message stays
+    /// whatever happens, but a rollback gives each back to its consumer.
+    pub browsed: Vec<(Queue, MessageRef)>,
     /// Why the transaction can only roll back.
     pub exception: Option<BrokerError>,
     /// Duplicate IDs that join their caches on commit.
@@ -244,6 +247,7 @@ impl Transaction {
             state: TxState::Active,
             sends: Vec::new(),
             acks: Vec::new(),
+            browsed: Vec::new(),
             exception: None,
             duplicates: Vec::new(),
             held: Vec::new(),
@@ -287,9 +291,11 @@ impl Transaction {
         self.duplicates.clear();
         self.held.clear();
         self.replicated.clear();
+        let mut cancel = std::mem::take(&mut self.acks);
+        cancel.append(&mut self.browsed);
         Outcome {
             record: journaled.then_some(TxRecord::Rollback(self.id)),
-            cancel: std::mem::take(&mut self.acks),
+            cancel,
             paging: std::mem::take(&mut self.paging),
             ..Outcome::default()
         }
@@ -342,6 +348,7 @@ impl Transaction {
             || !self.paging.page_txs.is_empty()
             || (self.xid.is_some() && self.state == TxState::Prepared);
         self.state = TxState::Committed;
+        self.browsed.clear();
         Ok(Outcome {
             record: journaled.then_some(TxRecord::Commit(self.id)),
             add: std::mem::take(&mut self.sends),
