@@ -78,8 +78,10 @@ fn resource(kind: &str, name: &str) -> Option<String> {
     Some(format!("{prefix}.{name}"))
 }
 
-/// The session a request runs as: `None` without broker security.
-fn login(
+/// The session a request runs as: `None` without broker security. The
+/// login runs off the runtime's workers, as the console's and the
+/// protocols' do: a login module may block (LDAP, a token endpoint).
+async fn login(
     broker: &Broker,
     headers: &HeaderMap,
     peer: SocketAddr,
@@ -114,9 +116,15 @@ fn login(
         sasl_principals: None,
         sni_host: None,
     });
-    let authenticated = store
-        .authenticate(Some(&user), Some(&password), &connection)
-        .map_err(|_| Box::new(unauthorized()))?;
+    let authenticated = {
+        let (store, connection) = (store.clone(), connection.clone());
+        let (u, p) = (user.clone(), password.clone());
+        tokio::task::spawn_blocking(move || store.authenticate(Some(&u), Some(&p), &connection))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .ok_or_else(|| Box::new(unauthorized()))?
+    };
     let auth = SecurityAuth {
         username: Some(user),
         password: Some(password),
@@ -291,7 +299,7 @@ async fn get3(
     headers: HeaderMap,
 ) -> Response {
     let broker = current.get();
-    let auth = match login(&broker, &headers, peer) {
+    let auth = match login(&broker, &headers, peer).await {
         Ok(a) => a,
         Err(r) => return *r,
     };
@@ -313,7 +321,7 @@ async fn post3(
     body: Bytes,
 ) -> Response {
     let broker = current.get();
-    let auth = match login(&broker, &headers, peer) {
+    let auth = match login(&broker, &headers, peer).await {
         Ok(a) => a,
         Err(r) => return *r,
     };
@@ -331,7 +339,7 @@ async fn get4(
     headers: HeaderMap,
 ) -> Response {
     let broker = current.get();
-    let auth = match login(&broker, &headers, peer) {
+    let auth = match login(&broker, &headers, peer).await {
         Ok(a) => a,
         Err(r) => return *r,
     };
@@ -350,7 +358,7 @@ async fn post4(
     body: Bytes,
 ) -> Response {
     let broker = current.get();
-    let auth = match login(&broker, &headers, peer) {
+    let auth = match login(&broker, &headers, peer).await {
         Ok(a) => a,
         Err(r) => return *r,
     };
@@ -358,5 +366,44 @@ async fn post4(
     match (resource(&kind, &name), part.as_str()) {
         (Some(r), "operations") => call(&broker, &auth, &remote, &r, &member, &body).await,
         _ => not_found("no such API"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A slow login leaves the runtime free: on a single-threaded runtime,
+    /// a timer set as a REST request's login starts fires long before the
+    /// login ends.
+    #[tokio::test]
+    async fn a_slow_login_does_not_hold_the_runtime() {
+        let file = saranga_config::BrokerConfig::default();
+        let mut config = saranga_server::BrokerConfig::new(Arc::new(
+            saranga_server::postoffice::SelectorFilters,
+        ));
+        config.security = Some(Arc::new(saranga_security::SecurityStore::new(
+            saranga_security::SecurityStoreConfig::from_broker(&file),
+            saranga_config::HierarchicalRepository::new(Default::default()),
+            Arc::new(crate::console::tests::SlowLogin),
+        )));
+        let broker = Broker::start(config).await.unwrap();
+        let mut headers = HeaderMap::new();
+        // admin:pw
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Basic YWRtaW46cHc="),
+        );
+        let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let started = std::time::Instant::now();
+        let (auth, ticked) = tokio::join!(login(&broker, &headers, peer), async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            started.elapsed()
+        });
+        assert!(matches!(auth, Ok(Some(_))), "logged in");
+        assert!(
+            ticked < std::time::Duration::from_millis(300),
+            "the runtime was held for {ticked:?} by the login"
+        );
     }
 }

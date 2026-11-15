@@ -596,6 +596,9 @@ struct Connection {
     id: String,
     /// The frame handler in use (`frameHandler`).
     handler: Version,
+    /// How far into the frame still arriving its body's NUL is known not to
+    /// be ([`decoder::decode_from`]).
+    scanned: usize,
     /// The version agreed at CONNECT (`version`).
     negotiated: Option<Version>,
     /// A login succeeded (`valid`).
@@ -662,6 +665,7 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
         settings,
         id: uuid::Uuid::new_v4().simple().to_string()[..8].to_owned(),
         handler: Version::V10,
+        scanned: 0,
         negotiated: None,
         valid: false,
         login: None,
@@ -761,7 +765,12 @@ impl Connection {
                 return true;
             }
             let rest = &buf[*at..];
-            match decoder::decode(self.handler.rules(), rest) {
+            let decoded = decoder::decode_from(self.handler.rules(), rest, &mut self.scanned);
+            if !matches!(decoded, Ok(None)) {
+                // A frame decoded, or an error: what follows is a new frame.
+                self.scanned = 0;
+            }
+            match decoded {
                 Ok(Some((decoded, used))) => {
                     *at += used;
                     let mut frame =

@@ -37,11 +37,29 @@ pub(crate) fn deflate(body: &[u8], level: i32) -> Result<Vec<u8>> {
     Ok(encoder.finish()?)
 }
 
-/// `InflaterWriter`: a zlib-compressed body inflated. `size_hint` is the
-/// body size from `_AMQ_LARGE_SIZE`, when known.
-pub(crate) fn inflate(body: &[u8], size_hint: usize) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(size_hint);
-    ZlibDecoder::new(body).read_to_end(&mut out)?;
+/// The most room reserved for an inflated body before it is inflated.
+const INFLATE_RESERVE: usize = 1024 * 1024;
+
+/// `InflaterWriter`: a zlib-compressed body inflated. `declared` is the
+/// body size from `_AMQ_LARGE_SIZE`, when known (else 0): the body may not
+/// inflate to more than it, nor ever to more than a Core body holds. Room
+/// is reserved for at most [`INFLATE_RESERVE`] of it up front; the rest
+/// grows as the body inflates.
+pub(crate) fn inflate(body: &[u8], declared: usize) -> Result<Vec<u8>> {
+    let limit = if declared > 0 {
+        declared.min(i32::MAX as usize)
+    } else {
+        i32::MAX as usize
+    };
+    let mut out = Vec::with_capacity(declared.min(INFLATE_RESERVE));
+    ZlibDecoder::new(body)
+        .take(limit as u64 + 1)
+        .read_to_end(&mut out)?;
+    if out.len() > limit {
+        return Err(Error::InvalidArgument(format!(
+            "the compressed body inflates to more than its {limit} bytes"
+        )));
+    }
     Ok(out)
 }
 

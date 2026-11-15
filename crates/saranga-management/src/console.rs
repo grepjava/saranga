@@ -1024,7 +1024,7 @@ pub fn find_war(dirs: &[PathBuf], war: &str) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1071,7 +1071,7 @@ mod tests {
     }
 
     /// A login module that takes its time, as LDAP over a slow network.
-    struct SlowLogin;
+    pub(crate) struct SlowLogin;
 
     impl saranga_security::SecurityManager for SlowLogin {
         fn authenticate(

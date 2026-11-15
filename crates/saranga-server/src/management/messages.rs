@@ -415,9 +415,16 @@ async fn send_as(
         (Some(s), Some(subject)) if user.is_none() && password.is_none() => {
             s.authenticate_as(subject, &info)
         }
-        (Some(s), _) => s
-            .authenticate(user.as_deref(), password.as_deref(), &info)
-            .map_err(|e| e.0)?,
+        // A login module may block (LDAP, a token endpoint): off the
+        // runtime's workers, as the protocols log in.
+        (Some(s), _) => {
+            let (s, info) = (s.clone(), info.clone());
+            let (u, p) = (user.clone(), password.clone());
+            tokio::task::spawn_blocking(move || s.authenticate(u.as_deref(), p.as_deref(), &info))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.0)?
+        }
         (None, _) => Default::default(),
     };
     let conn = Arc::new(crate::session::ClientConnection::new(

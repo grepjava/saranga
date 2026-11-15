@@ -695,3 +695,84 @@ async fn an_xpath_filter_reads_the_text_body() {
     );
     broker.stop().unwrap();
 }
+
+/// A login module that takes its time, as LDAP over a slow network.
+struct SlowLogin;
+
+impl saranga_security::SecurityManager for SlowLogin {
+    fn authenticate(
+        &self,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: &saranga_security::ConnectionInfo,
+    ) -> Result<Option<saranga_security::jaas::Subject>, saranga_security::manager::NoCache> {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let mut s = saranga_security::jaas::Subject::default();
+        s.add(saranga_security::jaas::Principal::User("admin".into()));
+        s.add(saranga_security::jaas::Principal::Role("amq".into()));
+        Ok(Some(s))
+    }
+
+    fn authorize(
+        &self,
+        _: &saranga_security::jaas::Subject,
+        _: &[cfg::Role],
+        _: cfg::CheckType,
+        _: &str,
+    ) -> bool {
+        true
+    }
+}
+
+/// `sendMessage` as a given user logs in off the runtime's workers: on a
+/// single-threaded runtime, a timer set as the slow login starts fires
+/// long before the login ends.
+#[tokio::test]
+async fn a_send_as_a_user_does_not_hold_the_runtime_while_logging_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = cfg::BrokerConfig::parse(
+        r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+             <persistence-enabled>false</persistence-enabled>
+           </core></configuration>"#,
+    )
+    .unwrap();
+    let mut config =
+        BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path()).unwrap();
+    config.security = Some(Arc::new(saranga_security::SecurityStore::new(
+        saranga_security::SecurityStoreConfig::from_broker(&file),
+        file.security_repository().unwrap(),
+        Arc::new(SlowLogin),
+    )));
+    let broker = Broker::start(config).await.unwrap();
+    let queue = r#"{"name":"q","address":"q","routing-type":"ANYCAST","durable":false,"auto-create-address":true}"#;
+    op(&broker, "broker", "createQueue", vec![s(queue)]).await;
+    let started = std::time::Instant::now();
+    let (_, ticked) = tokio::join!(
+        op(
+            &broker,
+            "address.q",
+            "sendMessage",
+            vec![
+                Json::object(),
+                Json::from(3i64),
+                s("m"),
+                Json::from(false),
+                s("admin"),
+                s("pw"),
+            ],
+        ),
+        async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            started.elapsed()
+        }
+    );
+    assert!(
+        ticked < std::time::Duration::from_millis(300),
+        "the runtime was held for {ticked:?} by the login"
+    );
+    assert_eq!(
+        op(&broker, "queue.q", "countMessages", vec![]).await,
+        Json::Long(1)
+    );
+    broker.stop().unwrap();
+}

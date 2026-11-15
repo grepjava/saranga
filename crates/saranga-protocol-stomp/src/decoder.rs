@@ -53,14 +53,27 @@ pub enum DecodeError {
 /// (heart-beats) before a frame are skipped; `Ok(None)` with only those
 /// in `buf` means nothing is pending.
 pub fn decode(rules: Rules, buf: &[u8]) -> Result<Option<(Decoded, usize)>, DecodeError> {
-    decode_lines(rules, buf, true)
+    decode_lines(rules, buf, true, &mut 0)
 }
 
-/// [`decode`], taking plain header lines whole (`fast`) or not.
+/// [`decode`] of a frame still arriving: `scanned` is how far into `buf`
+/// the body's NUL is known not to be, kept by the caller between reads of
+/// the same frame (0 for a new one), so that each read searches only the
+/// bytes that came since, as `StompDecoder` keeps its `pos` between reads.
+pub fn decode_from(
+    rules: Rules,
+    buf: &[u8],
+    scanned: &mut usize,
+) -> Result<Option<(Decoded, usize)>, DecodeError> {
+    decode_lines(rules, buf, true, scanned)
+}
+
+/// [`decode_from`], taking plain header lines whole (`fast`) or not.
 fn decode_lines(
     rules: Rules,
     buf: &[u8],
     fast: bool,
+    scanned: &mut usize,
 ) -> Result<Option<(Decoded, usize)>, DecodeError> {
     let Some((command, mut pos)) = parse_command(rules, buf)? else {
         return Ok(None);
@@ -68,7 +81,7 @@ fn decode_lines(
     let Some((headers, content_length)) = parse_headers(rules, buf, &mut pos, fast)? else {
         return Ok(None);
     };
-    let Some(body) = parse_body(rules, buf, &mut pos, content_length) else {
+    let Some(body) = parse_body(rules, buf, &mut pos, content_length, scanned) else {
         return Ok(None);
     };
     // A newline after the NUL belongs to the frame.
@@ -405,9 +418,28 @@ fn parse_headers_v11(
     Ok(Some((headers, length)))
 }
 
+/// The first NUL in `buf` from `from`, searching only past `scanned`; when
+/// there is none, `scanned` becomes the end of `buf`.
+fn find_nul(buf: &[u8], from: usize, scanned: &mut usize) -> Option<usize> {
+    let start = from.max(*scanned).min(buf.len());
+    match buf[start..].iter().position(|&b| b == 0) {
+        Some(i) => Some(start + i),
+        None => {
+            *scanned = buf.len();
+            None
+        }
+    }
+}
+
 /// `parseBody`: `content-length` bytes, or up to the NUL. Under 1.1 and
 /// 1.2, the bytes after a length's worth up to the NUL are dropped.
-fn parse_body(rules: Rules, buf: &[u8], pos: &mut usize, length: Option<usize>) -> Option<Vec<u8>> {
+fn parse_body(
+    rules: Rules,
+    buf: &[u8],
+    pos: &mut usize,
+    length: Option<usize>,
+    scanned: &mut usize,
+) -> Option<Vec<u8>> {
     match length {
         Some(len) => {
             let end = pos.checked_add(len)?;
@@ -422,16 +454,16 @@ fn parse_body(rules: Rules, buf: &[u8], pos: &mut usize, length: Option<usize>) 
                 // as the next one, so what it does depends on how the bytes
                 // arrive.
                 Rules::V11 | Rules::V12 => {
-                    let nul = buf[end..].iter().position(|&b| b == 0)?;
-                    *pos = end + nul + 1;
+                    let nul = find_nul(buf, end, scanned)?;
+                    *pos = nul + 1;
                 }
             }
             Some(content)
         }
         None => {
-            let nul = buf[*pos..].iter().position(|&b| b == 0)?;
-            let content = buf[*pos..*pos + nul].to_vec();
-            *pos += nul + 1;
+            let nul = find_nul(buf, *pos, scanned)?;
+            let content = buf[*pos..nul].to_vec();
+            *pos = nul + 1;
             Some(content)
         }
     }
@@ -605,12 +637,39 @@ mod tests {
             }
             for rules in [Rules::V11, Rules::V12] {
                 assert_eq!(
-                    decode_lines(rules, &frame, true),
-                    decode_lines(rules, &frame, false),
+                    decode_lines(rules, &frame, true, &mut 0),
+                    decode_lines(rules, &frame, false, &mut 0),
                     "{:?} {rules:?}",
                     String::from_utf8_lossy(&frame)
                 );
             }
+        }
+    }
+
+    /// A body arriving in pieces is searched for its NUL once: each read
+    /// takes up where the last left off, rather than from the body's start.
+    #[test]
+    fn a_body_arriving_in_pieces_is_searched_once() {
+        for (rules, length) in [
+            (Rules::V12, None),
+            (Rules::V12, Some(16usize)),
+            (Rules::V10, None),
+        ] {
+            let mut buf = match length {
+                Some(n) => format!("SEND\ndestination:q\ncontent-length:{n}\n\n").into_bytes(),
+                None => b"SEND\ndestination:q\n\n".to_vec(),
+            };
+            let body = vec![b'x'; 64 * 1024];
+            let mut scanned = 0;
+            for chunk in body.chunks(4096) {
+                buf.extend_from_slice(chunk);
+                assert!(decode_from(rules, &buf, &mut scanned).unwrap().is_none());
+                assert_eq!(scanned, buf.len(), "searched up to what has arrived");
+            }
+            buf.push(0);
+            let (d, used) = decode_from(rules, &buf, &mut scanned).unwrap().unwrap();
+            assert_eq!(used, buf.len());
+            assert_eq!(d.body, &body[..length.unwrap_or(body.len())]);
         }
     }
 }
