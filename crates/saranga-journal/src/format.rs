@@ -440,6 +440,12 @@ pub fn scan(
                 }
                 prepare_extra = be_i32(buf, p) as i64;
                 p += SIZE_INT;
+                // The extra data follows here. A damaged, negative length
+                // could otherwise bring the record's total down until its
+                // check size is read from before the record.
+                if invalid_size(file_size, p, prepare_extra) {
+                    skip!(mark);
+                }
             }
             variable_size = 0;
         }
@@ -522,6 +528,39 @@ fn record_size(record_type: u8, journal_version: i32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A prepare record whose extra-data length is damaged to a negative
+    /// value bringing its total to zero, after zero padding that would
+    /// pass as that total's check size: the record is skipped as damaged,
+    /// and the record after it is still read.
+    #[test]
+    fn a_negative_prepare_length_is_damage() {
+        let at = SIZE_HEADER + 16;
+        let mut b = FileHeader::new(0, 1).encode().to_vec();
+        b.resize(at, 0);
+        Record::Prepare {
+            tx: 7,
+            num_records: 1,
+            data: vec![],
+        }
+        .encode(record_id_of(1), 0, &mut b);
+        let total = (record_size(PREPARE_RECORD, FORMAT_VERSION)) as i32;
+        // type, file ID, compact count, transaction, record count: the
+        // extra-data length comes next.
+        let extra = at + 1 + SIZE_INT + 1 + SIZE_LONG + SIZE_INT;
+        b[extra..extra + 4].copy_from_slice(&(-total).to_be_bytes());
+        let next = Record::Add {
+            id: 5,
+            user_type: 21,
+            data: vec![1, 2, 3],
+        };
+        next.encode(record_id_of(1), 0, &mut b);
+        b.resize(b.len() + 64, 0);
+        let out = scan(&b, record_id_of(1), FORMAT_VERSION, false).expect("a header");
+        assert!(out.damaged);
+        let records: Vec<&Record> = out.records.iter().map(|r| &r.record).collect();
+        assert_eq!(records, vec![&next], "only the record after it");
+    }
 
     fn file_with(records: &[(Record, i16)], file_id: i64, size: usize) -> Vec<u8> {
         let mut b = FileHeader::new(0, file_id).encode().to_vec();

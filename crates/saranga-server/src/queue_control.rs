@@ -668,6 +668,16 @@ impl Actor {
         }
     }
 
+    /// `isExpiryDisabled`, for management's expiry and the expiry scan: a
+    /// queue on its own expiry address keeps its messages (expiring one
+    /// would only send it back to itself), and a mirror's store-and-forward
+    /// queue holds what its peer has yet to receive.
+    pub(super) fn expiry_disabled(&self) -> bool {
+        let queue = self.queue();
+        queue.settings().expiry_address.as_deref() == Some(&*self.shared.config().address)
+            || queue.is_mirror_controller()
+    }
+
     pub(super) fn is_paused(&self) -> bool {
         self.queue().is_paused()
     }
@@ -721,13 +731,8 @@ impl Actor {
     }
 
     fn act_unaudited(&mut self, sel: &Selection, action: &SelectionAction) -> usize {
-        // `isExpiryDisabled`: a queue on its own expiry address keeps its
-        // messages.
-        if matches!(action, SelectionAction::Expire) {
-            let s = self.queue().settings();
-            if s.expiry_address.as_deref() == Some(&*self.shared.config().address) {
-                return 0;
-            }
+        if matches!(action, SelectionAction::Expire) && self.expiry_disabled() {
+            return 0;
         }
         // `changeReferencesPriority`: the message changes in place and keeps
         // its position.

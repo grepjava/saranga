@@ -2617,8 +2617,10 @@ impl Actor {
                 let _ = reply.send(r);
             }
             // Mirror store-and-forward queues are not supposed to expire
-            // messages (`isExpiryDisabled`, `checkExpired`).
-            Cmd::Expire { .. } | Cmd::ExpireScan if self.queue().is_mirror_controller() => {}
+            // messages (`checkExpired`); the scan also leaves a queue on its
+            // own expiry address alone (`isExpiryDisabled`).
+            Cmd::Expire { .. } if self.queue().is_mirror_controller() => {}
+            Cmd::ExpireScan if self.expiry_disabled() => {}
             Cmd::Expire { id, message_id } => {
                 if let Some(r) = self.take_delivered_for_good(id, message_id) {
                     self.expire(r);

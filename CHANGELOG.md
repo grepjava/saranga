@@ -13,6 +13,9 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **A journal holding a damaged prepare record loads.** A prepare record whose extra-data length was damaged to a negative value could pass the record checks and stop the broker at start with a panic; it is now skipped as damage, as other damaged records are (see COMPAT).
+- **Management no longer expires the messages of a mirror's store-and-forward queue.** `expireMessage` and `expireMessages` removed what the peer had yet to receive; like the expiry scan, they now leave such a queue alone, as Artemis does.
+- **The expiry scan leaves a queue whose expiry address is its own address alone.** It expired the queue's messages back onto the queue as new messages, with new IDs and expiry details; it now keeps them, as management's expiry already did and as Artemis does.
 - **A message rolled back on a non-destructive queue comes back to its consumer.** The consumer that rolled it back was never given it again; it now is, counted as redelivered, and a message that has used its delivery attempts goes to the dead-letter address (see COMPAT). A message taken off such a queue and then returned, as when the management call that took it could not finish, was dropped; it now goes back on the queue.
 - **A browser or non-destructive consumer no longer remembers every message it was sent.** The IDs it kept to avoid sending a message twice were never forgotten, so on a last-value or ring queue a long-lived consumer's memory grew with all the traffic; it now keeps only those of messages the queue still holds.
 - **A paused queue whose delay-before-dispatch has ended no longer wakes itself without pause.** Until delivery could start, the queue's task woke at once again and again, scanning for nothing; the end of the delay now wakes it once, and resuming the queue or the deliveries it waits for finishing start delivery.
