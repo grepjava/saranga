@@ -13,6 +13,7 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **The console's pages are not sent gzipped to a client that refuses gzip.** An `Accept-Encoding` refusing gzip but accepting any coding (`gzip;q=0, *`) was read as accepting it; gzip's own entry now decides, and `*` stands only for codings not named.
 - **A journal holding a damaged prepare record loads.** A prepare record whose extra-data length was damaged to a negative value could pass the record checks and stop the broker at start with a panic; it is now skipped as damage, as other damaged records are (see COMPAT).
 - **Management no longer expires the messages of a mirror's store-and-forward queue.** `expireMessage` and `expireMessages` removed what the peer had yet to receive; like the expiry scan, they now leave such a queue alone, as Artemis does.
 - **The expiry scan leaves a queue whose expiry address is its own address alone.** It expired the queue's messages back onto the queue as new messages, with new IDs and expiry details; it now keeps them, as management's expiry already did and as Artemis does.

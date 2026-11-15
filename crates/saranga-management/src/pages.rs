@@ -124,22 +124,36 @@ fn serve(state: &PagesState, path: &str, headers: &HeaderMap) -> Response {
     crate::secure(r)
 }
 
+/// Whether `Accept-Encoding` allows gzip (RFC 9110 12.5.3): its own entry
+/// (`gzip`, or the `x-gzip` alias) decides, and `*` stands only for codings
+/// not named, so `gzip;q=0, *` refuses it. A weight of 0 refuses.
 fn accepts_gzip(headers: &HeaderMap) -> bool {
-    headers
+    let (mut named, mut any): (Option<f32>, Option<f32>) = (None, None);
+    let entries = headers
         .get_all(header::ACCEPT_ENCODING)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .any(|e| {
-            let mut parts = e.split(';');
-            let coding = parts.next().unwrap_or_default().trim();
-            let refused = parts.any(|p| {
-                p.trim()
-                    .strip_prefix("q=")
-                    .is_some_and(|q| q.trim().parse::<f32>().is_ok_and(|q| q == 0.0))
-            });
-            (coding.eq_ignore_ascii_case("gzip") || coding == "*") && !refused
-        })
+        .flat_map(|v| v.split(','));
+    for e in entries {
+        let mut parts = e.split(';');
+        let coding = parts.next().unwrap_or_default().trim();
+        let weight = parts
+            .filter_map(|p| {
+                let (name, value) = p.split_once('=')?;
+                name.trim().eq_ignore_ascii_case("q").then(|| value.trim())
+            })
+            .next()
+            .map_or(1.0, |q| q.parse::<f32>().unwrap_or(1.0));
+        let slot = if coding.eq_ignore_ascii_case("gzip") || coding.eq_ignore_ascii_case("x-gzip") {
+            &mut named
+        } else if coding == "*" {
+            &mut any
+        } else {
+            continue;
+        };
+        *slot = Some(slot.map_or(weight, |w: f32| w.max(weight)));
+    }
+    named.or(any).is_some_and(|q| q > 0.0)
 }
 
 fn gunzip(bytes: &[u8]) -> Vec<u8> {
@@ -174,5 +188,13 @@ mod tests {
         assert!(!accepts_gzip(&h("gzip;q=0")));
         assert!(!accepts_gzip(&h("br")));
         assert!(!accepts_gzip(&HeaderMap::new()));
+        // An explicit refusal outranks the wildcard, in either order.
+        assert!(!accepts_gzip(&h("gzip;q=0, *;q=1")));
+        assert!(!accepts_gzip(&h("*, gzip;q=0")));
+        assert!(!accepts_gzip(&h("GZIP; Q=0.000, *")));
+        assert!(!accepts_gzip(&h("x-gzip;q=0, *")));
+        assert!(!accepts_gzip(&h("*;q=0")));
+        assert!(accepts_gzip(&h("br;q=0, *")));
+        assert!(accepts_gzip(&h("x-gzip")));
     }
 }
