@@ -304,3 +304,77 @@ async fn a_message_above_the_receivers_max_message_size_is_not_sent_to_it() {
     task.abort();
     broker.stop().unwrap();
 }
+
+/// A message for queue `q`; `padding` bytes of property make it large.
+fn queued(id: i64, padding: usize) -> saranga_server::message::MessageRef {
+    let mut m = saranga_message::CoreMessage {
+        message_id: id,
+        address: Some("q".into()),
+        ..Default::default()
+    };
+    if padding > 0 {
+        m.properties.insert(
+            "padding".into(),
+            saranga_buffer::PropertyValue::String("x".repeat(padding).as_str().into()),
+        );
+    }
+    saranga_server::message::MessageRef::new(saranga_server::message::ServerMessage::new(m))
+}
+
+/// The handle of the next transfer within `wait`.
+async fn sent(s: &mut TcpStream, wait: Duration) -> Option<u32> {
+    next(s, wait, |p| match p {
+        Performative::Transfer(t) => Some(t.handle),
+        _ => None,
+    })
+    .await
+}
+
+/// A message too large for the receiver leaves it the credit it would have
+/// used: with one credit, the next message comes without another flow.
+#[tokio::test]
+async fn a_message_too_large_for_the_receiver_leaves_its_credit() {
+    let (broker, task, mut s) = connect(&[], u32::MAX).await;
+    let q = broker.post_office().queue("q").unwrap();
+    q.add(queued(100, 2000));
+    q.add(queued(101, 0));
+    send(&mut s, limited_receiver("small", 0, Some(400))).await;
+    send(&mut s, flow(0, 1)).await;
+    assert_eq!(
+        sent(&mut s, Duration::from_secs(3)).await,
+        Some(0),
+        "the small message comes on the one credit"
+    );
+    task.abort();
+    broker.stop().unwrap();
+}
+
+/// A message an outgoing interceptor refuses leaves the credit it would
+/// have used, as one too large does.
+#[tokio::test]
+async fn a_message_an_interceptor_refuses_leaves_its_credit() {
+    let (broker, task, mut s) = connect(&[], u32::MAX).await;
+    let refused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let first = refused.clone();
+    broker.interceptors().add_outgoing(
+        saranga_server::interceptor::Interceptor::new("refuse-first").on(
+            move |_: &mut saranga_protocol_amqp::message::AmqpMessage,
+                  _: &saranga_server::session::ClientConnection| {
+                Ok(first.swap(true, std::sync::atomic::Ordering::SeqCst))
+            },
+        ),
+    );
+    let q = broker.post_office().queue("q").unwrap();
+    q.add(queued(100, 0));
+    q.add(queued(101, 0));
+    send(&mut s, limited_receiver("r", 0, None)).await;
+    send(&mut s, flow(0, 1)).await;
+    assert_eq!(
+        sent(&mut s, Duration::from_secs(3)).await,
+        Some(0),
+        "the second message comes on the one credit"
+    );
+    assert!(refused.load(std::sync::atomic::Ordering::SeqCst));
+    task.abort();
+    broker.stop().unwrap();
+}

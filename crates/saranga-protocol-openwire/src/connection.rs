@@ -3125,6 +3125,20 @@ impl Connection {
         })))
     }
 
+    /// An XA branch whose commit or rollback was refused, still the
+    /// resource manager's, keeps its acknowledgements and the credits its
+    /// consumers get back, for the completion that follows.
+    fn keep_if_registered(&mut self, x: &XaTransactionId, entry: TxEntry) {
+        let registered = self
+            .broker
+            .resource_manager()
+            .get(&to_xid(x))
+            .is_some_and(|tx| Arc::ptr_eq(&tx, &entry.tx));
+        if registered {
+            self.xa_txs.insert(x.clone(), entry);
+        }
+    }
+
     /// `processCommit`: the consumers get their credits back once it is
     /// written.
     async fn commit(
@@ -3162,14 +3176,15 @@ impl Connection {
             }
         };
         if let Err(e) = result {
-            if let TransactionId::Xa(x) = id
-                && transaction::lock(&entry.tx).state == TxState::Suspended
-            {
-                self.xa_txs.insert(x.clone(), entry);
-                return Err(OwError::new(
-                    "javax.transaction.xa.XAException",
-                    e.message.unwrap_or_default(),
-                ));
+            if let TransactionId::Xa(x) = id {
+                let suspended = transaction::lock(&entry.tx).state == TxState::Suspended;
+                self.keep_if_registered(x, entry);
+                if suspended {
+                    return Err(OwError::new(
+                        "javax.transaction.xa.XAException",
+                        e.message.unwrap_or_default(),
+                    ));
+                }
             }
             return Err(e);
         }
@@ -3202,6 +3217,8 @@ impl Connection {
         if let TransactionId::Xa(x) = id {
             let xid = to_xid(x);
             if transaction::lock(&entry.tx).state == TxState::Suspended {
+                // Refused: the branch stays, and so does what it holds.
+                self.keep_if_registered(x, entry);
                 return Err(OwError::new(
                     "javax.transaction.xa.XAException",
                     format!(

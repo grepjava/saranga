@@ -464,6 +464,14 @@ struct Credit {
     closed: bool,
 }
 
+/// A delivery handed to the task and not written: the credit it took is
+/// the link's again, for the next message.
+fn unsent(credit: &Mutex<Credit>) {
+    let mut c = lock(credit);
+    c.pending -= 1;
+    c.available += 1;
+}
+
 /// `ProtonServerSenderContext` as the queue's consumer sink.
 struct Sink {
     events: mpsc::UnboundedSender<Event>,
@@ -4989,7 +4997,8 @@ impl Conn {
                 .invoke_outgoing(&mut m, &self.client, Log::Server)
                 .is_some()
             {
-                lock(&sl.credit).pending -= 1;
+                unsent(&sl.credit);
+                s.server.prompt_delivery(sl.consumer);
                 return Ok(());
             }
             (
@@ -5017,11 +5026,12 @@ impl Conn {
             .max_message_size
             .is_some_and(|max| payload.len() as u64 > max)
         {
-            lock(&sl.credit).pending -= 1;
+            unsent(&sl.credit);
             if !sl.resolved.browse {
                 s.server
                     .cancel_undeliverable(sl.consumer, message.message_id(), false);
             }
+            s.server.prompt_delivery(sl.consumer);
             return Ok(());
         }
         sl.link_credit = sl.link_credit.saturating_sub(1);

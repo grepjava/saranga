@@ -13,6 +13,8 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **An AMQP message not sent to a receiver gives back the link credit it took.** A message too large for the receiver's `max-message-size`, or refused by an outgoing interceptor, kept its credit counted as used, so with one credit the next message waited until the client granted credit again; it now goes at once (see COMPAT for the interceptor case).
+- **A refused OpenWire XA commit or rollback keeps what the branch acknowledged.** A commit of the wrong kind, or a rollback of a suspended branch, left the branch registered but dropped its acknowledgements and the prefetch credit its consumers get back, so the completion that followed left those consumers stalled.
 - **A slow login no longer holds the runtime's workers for REST requests or a management `sendMessage` as a user.** Both logged in on the worker that handled them, so an LDAP, OIDC or Kubernetes login module that took its time delayed other messaging and management work; they now log in off the workers, as the console and the protocols do.
 - **A STOMP frame arriving in many pieces is decoded in linear time.** Each read searched the whole body received so far for its NUL again, so a large frame sent in small pieces took time growing with the square of its size; the search now carries on from where the last read left it, as Artemis's decoder keeps its position.
 - **No AMQP message larger than a receiver's `max-message-size` is sent to it.** The limit in a receiver's attach was ignored, so a client enforcing it detached on each such message, or was sent it presettled. The message now stays on the queue for other consumers, as if this one had returned it undeliverable here (see COMPAT).
