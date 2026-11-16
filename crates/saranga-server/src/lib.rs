@@ -273,6 +273,9 @@ pub struct BrokerConfig {
     pub global_max_size: i64,
     /// `global-max-messages`; -1 for no limit.
     pub global_max_messages: i64,
+    /// `purge-page-folders`: an address that stops paging removes its page
+    /// folder.
+    pub purge_page_folders: bool,
     /// Authentication and authorization; `None` lets everyone do anything.
     pub security: Option<Arc<saranga_security::SecurityStore>>,
     /// The JAAS configuration of the JVM in Artemis (`login.config`, and
@@ -358,6 +361,7 @@ impl BrokerConfig {
             persist_id_cache: true,
             global_max_size: -1,
             global_max_messages: -1,
+            purge_page_folders: false,
             security: None,
             login_config: None,
             populate_validated_user: false,
@@ -740,6 +744,7 @@ impl Broker {
             config.global_max_size,
             config.global_max_messages,
         );
+        paging.set_purge_page_folders(config.purge_page_folders);
         let decoders = message::MessageDecoders::new(
             config
                 .protocols
@@ -820,6 +825,7 @@ impl Broker {
             // leftovers of a crash (`rebuildCounters`).
             paging.after_load(&mut stored_large);
             large_messages.delete_files(stored_large);
+            paging.remove_extra_stores(|a| post_office.has_address(a));
         } else {
             paging.set_loaded();
         }

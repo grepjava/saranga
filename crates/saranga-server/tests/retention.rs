@@ -366,3 +366,86 @@ async fn a_copied_large_message_can_be_replayed() {
     session.close(false).await;
     broker.stop().unwrap();
 }
+
+async fn attribute(broker: &Arc<Broker>, resource: &str, name: &str) -> Json {
+    broker
+        .management()
+        .attribute(broker, resource, name, Default::default())
+        .await
+        .unwrap()
+}
+
+/// A replayed message is routed as Artemis's `route` routes it: one
+/// scheduled for later waits for its time, and its duplicate ID is held by
+/// the target's cache.
+#[tokio::test]
+async fn a_replayed_message_keeps_its_schedule_and_duplicate_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(dir.path(), true).await;
+    queue(&broker, "orders").await;
+    queue(&broker, "replayed").await;
+    use saranga_buffer::{PropertyValue, SimpleString, TypedProperties};
+    use saranga_server::session::{ClientConnection, ServerSession, SessionOptions, Transport};
+    let mut session = ServerSession::new(
+        broker.clone(),
+        Arc::new(ClientConnection::new(
+            Transport::internal("test"),
+            Arc::new(Default::default()),
+            vec![],
+        )),
+        SessionOptions {
+            name: "s".into(),
+            username: None,
+            password: None,
+            xa: false,
+            auto_commit_sends: true,
+            auto_commit_acks: true,
+            pre_acknowledge: false,
+            default_address: None,
+        },
+        Default::default(),
+    );
+    let mut send = async |address: &str| {
+        let mut properties = TypedProperties::default();
+        // 2100-01-01.
+        properties.insert(
+            SimpleString::from("_AMQ_SCHED_DELIVERY"),
+            PropertyValue::Long(4_102_444_800_000),
+        );
+        properties.insert(
+            SimpleString::from("_AMQ_DUPL_ID"),
+            PropertyValue::String(SimpleString::from("x1")),
+        );
+        let message = saranga_message::CoreMessage {
+            address: Some(address.into()),
+            durable: true,
+            properties,
+            ..Default::default()
+        };
+        session.send(message, None).await.unwrap();
+        session.take_completion().wait().await.unwrap();
+    };
+    send("orders").await;
+    assert_eq!(
+        attribute(&broker, "queue.orders", "scheduledCount").await,
+        Json::Long(1),
+        "scheduled when sent"
+    );
+    op(
+        &broker,
+        "broker",
+        "replay",
+        vec![s("orders"), s("replayed"), Json::Null],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        attribute(&broker, "queue.replayed", "scheduledCount").await,
+        Json::Long(1),
+        "scheduled when replayed"
+    );
+    // The same ID sent to the target now is a duplicate.
+    send("replayed").await;
+    assert_eq!(count(&broker, "replayed").await, Json::Long(1));
+    broker.stop().unwrap();
+}

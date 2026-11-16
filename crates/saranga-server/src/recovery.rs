@@ -295,6 +295,7 @@ pub async fn load_messages(
         large,
         queues,
         prepared,
+        mut failed_prepared,
         duplicates,
         cursor_acks,
         page_completes,
@@ -403,6 +404,17 @@ pub async fn load_messages(
         }
     }
     for p in prepared {
+        // A send whose message is gone: the transaction cannot commit
+        // whole, and is rolled back (`Cannot find message with id`).
+        if let Some((_, m)) = p
+            .sends
+            .iter()
+            .chain(&p.paged_sends)
+            .find(|(_, m)| !messages.contains_key(m))
+        {
+            failed_prepared.push((p.id, format!("Cannot find message with id {m}")));
+            continue;
+        }
         let mut tx = Transaction::new(p.id, Some(p.xid.clone()));
         tx.persistent = true;
         for (queue_id, message_id) in p.sends {
@@ -492,6 +504,15 @@ pub async fn load_messages(
     }
     for (record, xid, commit) in heuristics {
         resource_manager.put_heuristic(record, xid, commit);
+    }
+    // `failedToPrepareException`.
+    for (id, why) in failed_prepared {
+        tracing::warn!(
+            "AMQ222306: Failed to load prepared TX and it will be rolled back: {id}: {why}"
+        );
+        if let Err(e) = storage.rollback(id) {
+            tracing::warn!("rolling back prepared transaction {id}: {e}");
+        }
     }
     Ok(extra)
 }

@@ -108,6 +108,8 @@ pub struct PagingManager {
     syncer: Mutex<Option<mpsc::Sender<SyncRequest>>>,
     /// Queues read their pages only once the cursors are recovered.
     loaded: AtomicBool,
+    /// `purge-page-folders`: a store that stops paging removes its folder.
+    purge_page_folders: AtomicBool,
     /// The disk is past `max-disk-usage` or `min-disk-free` (`diskFull`).
     disk_full: AtomicBool,
     /// The usable and total bytes the disk monitor last read
@@ -152,6 +154,7 @@ impl PagingManager {
             memory_callbacks: Mutex::default(),
             syncer: Mutex::new(None),
             loaded: AtomicBool::new(false),
+            purge_page_folders: AtomicBool::new(false),
             replication: crate::replication::Slot::default(),
             cleanup_paused: AtomicBool::new(false),
             me: me.clone(),
@@ -225,6 +228,40 @@ impl PagingManager {
                 .insert(address, store);
         }
         Ok(())
+    }
+
+    /// `purge-page-folders`.
+    pub fn set_purge_page_folders(&self, purge: bool) {
+        self.purge_page_folders.store(purge, Ordering::SeqCst);
+    }
+
+    /// `deletePageStore`: the store of an address removed goes, with its
+    /// folder and its pages.
+    pub fn delete_store(&self, address: &str) {
+        let store = self
+            .stores
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(address);
+        if let Some(store) = store {
+            store.destroy();
+        }
+    }
+
+    /// `removeExtraAddressStores`: at the start, the stores of addresses
+    /// that no longer exist.
+    pub fn remove_extra_stores(&self, exists: impl Fn(&str) -> bool) {
+        let extra: Vec<Name> = self
+            .stores
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .filter(|a| !exists(a))
+            .cloned()
+            .collect();
+        for address in extra {
+            self.delete_store(&address);
+        }
     }
 
     /// `getPageStore`: the address's store, created on first use.
@@ -1457,6 +1494,75 @@ impl PagingStore {
 
     /// `stopPaging`, with `onPageModeCleared`: the subscriptions' counters
     /// go back to zero.
+    /// `destroy`: the store's folder goes, and it pages no more.
+    fn destroy(&self) {
+        let mut st = lock(&self.state);
+        st.paging = false;
+        self.paging.store(false, Ordering::Release);
+        st.current = None;
+        st.cache.clear();
+        st.number_of_pages = 0;
+        if let Some(folder) = st.folder.take()
+            && let Err(e) = fs::remove_dir_all(&folder)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!("removing page folder {}: {e}", folder.display());
+        }
+    }
+
+    /// `purgeFolder`: with `purge-page-folders`, a store no longer paging
+    /// removes its pages and folder, and its queues' records of them; the
+    /// next page opens a new folder.
+    fn purge_folder(&self, st: &mut StoreState) {
+        let Some(manager) = self.manager.upgrade() else {
+            return;
+        };
+        if st.paging || !manager.purge_page_folders.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(folder) = st.folder.clone() else {
+            return;
+        };
+        tracing::info!(
+            "AMQ224146: Purging Page Folder {} on address {}",
+            folder.display(),
+            self.address
+        );
+        st.current = None;
+        st.cache.clear();
+        st.number_of_pages = 0;
+        st.first_page = i64::MAX;
+        let removed = match fs::read_dir(&folder) {
+            Ok(entries) => {
+                for path in entries.flatten().map(|e| e.path()) {
+                    if let Err(e) = fs::remove_file(&path) {
+                        manager.critical_io(&e, &path);
+                    }
+                }
+                fs::remove_dir(&folder)
+            }
+            Err(e) => Err(e),
+        };
+        match removed {
+            Ok(()) => {
+                st.folder = None;
+                // deleteCursorInfo: once the folder is gone.
+                if let Some(storage) = &manager.storage {
+                    for sub in st.subscriptions.values() {
+                        let pages: Vec<i64> = lock(&sub.state).consumed.keys().copied().collect();
+                        for page in pages {
+                            sub.on_delete_page(page, storage);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("removing page folder {}: {e}", folder.display());
+                tracing::warn!("AMQ224147: Failed purging folder {}", folder.display());
+            }
+        }
+    }
+
     fn stop_paging(&self, st: &mut StoreState) {
         if !st.paging {
             return;
@@ -2792,6 +2898,11 @@ impl PagingStore {
             for sub in &subs {
                 sub.on_delete_page(page, &storage);
             }
+        }
+        // stopPaging's `purgeFolder`, once the pages it deleted are gone.
+        let mut st = lock(&self.state);
+        if !st.paging {
+            self.purge_folder(&mut st);
         }
     }
 

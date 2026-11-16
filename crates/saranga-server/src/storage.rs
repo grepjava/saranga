@@ -276,6 +276,10 @@ pub struct RecoveredMessages {
     /// Per queue, in journal order.
     pub queues: HashMap<i64, Vec<RecoveredRef>>,
     pub prepared: Vec<RecoveredTx>,
+    /// Prepared transactions that could not be read (a damaged record or
+    /// Xid), with why: rolled back, as Artemis's `failedToPrepareException`
+    /// rolls them back, rather than failing the start.
+    pub failed_prepared: Vec<(i64, String)>,
     /// Committed duplicate IDs, in journal order.
     pub duplicates: Vec<RecoveredDuplicate>,
     /// `ACKNOWLEDGE_CURSOR` records.

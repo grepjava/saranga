@@ -453,6 +453,7 @@ impl BrokerConfig {
                 )
             }),
             global_max_messages: config.global_max_messages,
+            purge_page_folders: config.journal.purge_page_folders.unwrap_or(false),
             // The security manager comes from outside broker.xml
             // (`login.config`, `bootstrap.xml`): whoever starts the broker
             // sets it.

@@ -168,22 +168,69 @@ async fn full_disk_fails_or_drops_by_policy() {
     broker.stop().unwrap();
 }
 
-/// Management's sends have no flow control: a full disk refuses them
-/// whatever the address's policy.
+/// Management's sends have no flow control: a full disk fails them where
+/// the address would block, and where it fails or drops it does that. A
+/// request to the management address itself goes on. (Artemis fails them
+/// all.)
 #[tokio::test]
 async fn full_disk_refuses_management_sends() {
     let dir = tempfile::tempdir().unwrap();
     let broker = start(dir.path(), "1000000000000000000").await;
-    for q in ["failing", "dropping"] {
+    for q in ["failing", "dropping", "blocking"] {
         queue(&broker, q).await;
     }
     wait_disk_full(&broker, true).await;
 
-    for q in ["failing", "dropping"] {
-        let e = send(&broker, q).await.unwrap_err();
-        assert!(e.starts_with("AMQ229119: Free storage space is at "), "{e}");
-        assert!(e.ends_with("System will start blocking producers."), "{e}");
+    let e = send(&broker, "blocking").await.unwrap_err();
+    assert!(e.starts_with("AMQ229119: Free storage space is at "), "{e}");
+    assert!(e.ends_with("System will start blocking producers."), "{e}");
+    let e = send(&broker, "failing").await.unwrap_err();
+    assert!(e.contains("AMQ229102"), "{e}");
+    send(&broker, "dropping").await.unwrap();
+    assert_eq!(count(&broker, "dropping").await, Json::Long(0));
+
+    // A management request from a connection without flow control.
+    let conn = Arc::new(ClientConnection::new(
+        Transport::management(),
+        Arc::new(Default::default()),
+        Vec::new(),
+    ));
+    let mut session = ServerSession::new(
+        broker.clone(),
+        conn,
+        SessionOptions {
+            name: "m".into(),
+            username: None,
+            password: None,
+            xa: false,
+            auto_commit_sends: true,
+            auto_commit_acks: true,
+            pre_acknowledge: false,
+            default_address: None,
+        },
+        Default::default(),
+    );
+    let mut properties = saranga_buffer::TypedProperties::default();
+    for (k, v) in [
+        ("_AMQ_ResourceName", "queue.blocking"),
+        ("_AMQ_OperationName", "removeAllMessages"),
+    ] {
+        properties.insert(
+            SimpleString::from(k),
+            saranga_buffer::PropertyValue::String(SimpleString::from(v)),
+        );
     }
+    let request = CoreMessage {
+        address: Some(SimpleString::from("activemq.management")),
+        properties,
+        body: b"[]".to_vec().into(),
+        ..Default::default()
+    };
+    session
+        .send(request, None)
+        .await
+        .expect("a management request goes on");
+    session.close(false).await;
     broker.stop().unwrap();
 }
 

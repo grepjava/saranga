@@ -1475,10 +1475,21 @@ impl ServerSession {
             return Err(e);
         }
         // A client that credits cannot hold back is failed while the disk
-        // is full: there is nothing else to do with it.
+        // is full and its address would block: there is nothing else to do
+        // with it. A request to the management address (which may be what
+        // frees the disk) goes on, and an address that drops or refuses
+        // messages on a full disk does that (`page`). (Artemis fails the
+        // client whatever the address.)
         if !self.conn.supports_flow_control() {
-            let paging = self.broker.post_office().paging();
-            if paging.is_disk_full() {
+            let po = self.broker.post_office();
+            let paging = po.paging();
+            if paging.is_disk_full()
+                && (self.unchecked || *address != *self.broker.management().address())
+                && po
+                    .settings(crate::postoffice::split_fqqn(&address).0)
+                    .disk_full_policy
+                    == crate::settings::DiskFullPolicy::Block
+            {
                 let (usable, total) = paging.disk_space();
                 let e = BrokerError::new(
                     ErrorType::IoError,

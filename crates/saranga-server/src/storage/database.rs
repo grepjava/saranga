@@ -1511,12 +1511,27 @@ impl Store for DatabaseStorage {
             .collect();
 
         let mut prepared: HashMap<i64, RecoveredTx> = HashMap::new();
+        // Prepared transactions that cannot be read: their rows are theirs
+        // still, not the queues', until they are rolled back.
+        let mut failed: HashMap<i64, String> = HashMap::new();
         for (tx, xid) in rows.prepared {
+            // Ended as a prepared one, whether it is read or not.
+            self.prepared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(tx);
+            let xid = match decode_xid(&xid) {
+                Ok(x) => x,
+                Err(e) => {
+                    failed.insert(tx, e.to_string());
+                    continue;
+                }
+            };
             prepared.insert(
                 tx,
                 RecoveredTx {
                     id: tx,
-                    xid: decode_xid(&xid)?,
+                    xid,
                     sends: Vec::new(),
                     paged_sends: Vec::new(),
                     acks: Vec::new(),
@@ -1526,17 +1541,22 @@ impl Store for DatabaseStorage {
                     page_tx_updates: Vec::new(),
                 },
             );
-            self.prepared
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(tx);
         }
 
         // Per queue, in message order, with its side records to come.
         let mut queues: HashMap<i64, Vec<RecoveredRef>> = HashMap::new();
         let mut at: HashMap<(i64, i64), usize> = HashMap::new();
         for (message, queue, paged, tx, ack_tx) in rows.references {
+            if tx.is_some_and(|t| failed.contains_key(&t)) {
+                continue;
+            }
             if !out.messages.contains_key(&message) {
+                // A prepared send without its message cannot commit whole.
+                if let Some(t) = tx.filter(|t| prepared.contains_key(t)) {
+                    prepared.remove(&t);
+                    failed.insert(t, format!("Cannot find message with id {message}"));
+                    continue;
+                }
                 tracing::warn!("AMQ222031: Cannot find message {message}");
                 continue;
             }
@@ -1567,9 +1587,18 @@ impl Store for DatabaseStorage {
         let mut stale = Vec::new();
         let mut sides = self.sides.lock().unwrap_or_else(|e| e.into_inner());
         for (id, record_type, tx, data) in rows.records {
+            if tx.is_some_and(|t| failed.contains_key(&t)) {
+                continue;
+            }
             let data = data.unwrap_or_default();
             let holder = tx.and_then(|t| prepared.get_mut(&t));
             match record_type as u8 {
+                // A prepared send's: its message has the time already, and
+                // the row goes with its transaction (Artemis ignores it in a
+                // prepared one). Its reference is not among the queues', so
+                // it is not stale.
+                ids::UPDATE_DELIVERY_COUNT | ids::SET_SCHEDULED_DELIVERY_TIME
+                    if holder.is_some() => {}
                 t @ (ids::UPDATE_DELIVERY_COUNT | ids::SET_SCHEDULED_DELIVERY_TIME) => {
                     let Some((message, body)) = data.split_first_chunk::<8>() else {
                         return Err(JournalError::Corrupt(format!("side record {id}")));
@@ -1647,6 +1676,17 @@ impl Store for DatabaseStorage {
                         .map_err(|e| JournalError::Corrupt(format!("heuristic completion: {e}")))?;
                     out.heuristics.push((id, xid, commit));
                 }
+                // What a prepared transaction deletes at its commit: the
+                // writer's, found again by its transaction.
+                PREPARED_DELETE => {}
+                // A prepared transaction's own record of another type is
+                // not committed: no protocol is told of it
+                // (`journalInvalidRecordTypeOnPreparedTX`).
+                other if holder.is_some() => {
+                    tracing::warn!(
+                        "AMQ222050: Can not locate recordType={other} on loadPreparedTransaction//deleteRecords"
+                    );
+                }
                 other => out.extra.push(ExtraRecord {
                     id,
                     record_type: other,
@@ -1685,6 +1725,8 @@ impl Store for DatabaseStorage {
         out.queues = queues;
         out.prepared = prepared.into_values().collect();
         out.prepared.sort_by_key(|t| t.id);
+        out.failed_prepared = failed.into_iter().collect();
+        out.failed_prepared.sort();
 
         let mut referenced: HashSet<i64> = out
             .queues
@@ -2234,6 +2276,13 @@ impl Store for DatabaseStorage {
     ) -> StoreResult<()> {
         let mut ops = vec![Op::DeleteBinding { id: old_id }];
         ops.extend(self.binding_ops(new_id, user_type, body)?);
+        // An address's queues name it by its ID (`data exp` joins them).
+        if user_type == ids::ADDRESS_BINDING_RECORD && old_id != new_id {
+            ops.push(Op::MoveQueues {
+                from: old_id,
+                to: new_id,
+            });
+        }
         write(&self.writes, ops)
     }
 

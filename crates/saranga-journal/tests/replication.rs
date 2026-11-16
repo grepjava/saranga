@@ -235,3 +235,27 @@ fn a_failed_file_switch_at_replication_start_is_critical() {
     assert!(j.failure().is_some(), "a critical I/O error");
     assert!(j.append_add(2, 30, vec![2; 10], true, None).is_err());
 }
+
+/// A record too large for a file after its header is refused before it is
+/// replicated: the backup never has a record the primary could not store.
+#[test]
+fn a_record_that_cannot_be_stored_is_not_replicated() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = config(dir.path());
+    c.buffer_size = 0;
+    let j = Journal::open(c).unwrap();
+    j.load_all().unwrap();
+    let collect = Arc::new(Collect::default());
+    j.start_replication(collect.clone(), |_| {}).unwrap();
+    let before = collect.0.lock().unwrap().len();
+    // Fits the file size, not the file after its header.
+    let record = Record::Add {
+        id: 1,
+        user_type: 30,
+        data: Vec::new(),
+    };
+    let overhead = record.encode_size();
+    let size = 64 * 1024 - 8 - overhead;
+    assert!(j.append_add(1, 30, vec![0; size], true, None).is_err());
+    assert_eq!(collect.0.lock().unwrap().len(), before, "not replicated");
+}

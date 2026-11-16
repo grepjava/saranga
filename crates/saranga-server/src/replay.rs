@@ -249,8 +249,22 @@ impl Replay<'_> {
     ) {
         let decoders = self.broker.post_office().paging().decoders();
         let message = if record.is_large() {
+            // `messageMatch` before the body is copied: a message replayed
+            // elsewhere, or filtered out, leaves no file behind.
+            match decoders.decode_large_headers(&record) {
+                Ok(m) if self.matches(&m) => {}
+                Ok(_) => {
+                    self.bodies.remove(&original);
+                    return;
+                }
+                Err(e) => {
+                    self.bodies.remove(&original);
+                    tracing::warn!("replay: message {original}: {e}");
+                    return;
+                }
+            }
             let id = self.broker.post_office().ids().next();
-            let Some(body) = self.body(original, id, true, None) else {
+            let Some(body) = self.body(original, id, record.is_durable(), None) else {
                 return;
             };
             // Its record keeps no size, but it says how the file begins: a
@@ -347,8 +361,57 @@ impl Replay<'_> {
         };
         core.address = Some(SimpleString::from(self.target.as_str()));
         crate::message::apply_expiry_delay(&mut core, &po.settings(&self.target), now_millis());
+        // checkDuplicateID, not rejecting duplicates (`route(..., false,
+        // false, null)`): a bridge's ID comes off the message and a
+        // duplicate of it is not routed; the message's own ID is routed
+        // either way, and a new one is held by the target's cache.
+        let bridge = match core
+            .properties
+            .remove(&SimpleString::from(crate::message::HDR_BRIDGE_DUPLICATE_ID))
+        {
+            Some(saranga_buffer::PropertyValue::Bytes(b)) => Some(b),
+            _ => None,
+        };
+        let duplicate = match bridge {
+            Some(b) => Some((b, true)),
+            None => crate::duplicate::duplicate_id_bytes(&core).map(|d| (d, false)),
+        };
+        let mut hold = None;
+        if let Some((id, bridge)) = duplicate {
+            let cache = if bridge {
+                po.duplicate_cache(&format!("BRIDGE.{}", self.target))
+            } else {
+                po.duplicate_cache(&self.target)
+            };
+            let held = crate::duplicate::lock(&cache).contains(&id);
+            if held && bridge {
+                tracing::trace!("replay: message {} hit a bridge duplicate", core.message_id);
+                return;
+            }
+            if !held {
+                hold = Some((cache, id));
+            }
+        }
         let message = message.with_core(core);
         po.deliver_internal(message, &self.target).await;
+        // After the message: a crash in between leaves at worst a message
+        // whose ID a resend may duplicate, never an ID without its message.
+        if let Some((cache, id)) = hold {
+            let record = po.ids().next();
+            let stored = match self.broker.storage() {
+                Some(s) if crate::duplicate::lock(&cache).is_persistent() => {
+                    let tx = po.ids().next();
+                    crate::duplicate::lock(&cache)
+                        .store_tx(tx, &id, record)
+                        .and_then(|()| s.commit(tx).map(|_| ()))
+                }
+                _ => Ok(()),
+            };
+            match stored {
+                Ok(()) => crate::duplicate::lock(&cache).add_in_memory(id, record),
+                Err(e) => tracing::warn!("replay: duplicate ID of a replayed message: {e}"),
+            }
+        }
     }
 }
 

@@ -581,8 +581,12 @@ impl PostOffice {
 
     /// Routes a message the broker sends on its own to `address`, journals
     /// its durable references and adds it to its queues once written.
+    /// A message scheduled for later (`_AMQ_SCHED_DELIVERY`) waits for its
+    /// time, as `PostOfficeImpl.route` schedules any message.
     pub async fn deliver_internal(&self, message: Arc<ServerMessage>, address: &str) {
-        let r = MessageRef::new(message);
+        let scheduled_time = crate::message::scheduled_delivery_time(message.core());
+        let mut r = MessageRef::new(message);
+        r.scheduled_time = scheduled_time;
         // A notification that cannot be routed is not sent.
         let Ok(routed) = self.route_internal(&r, address) else {
             return;
@@ -604,10 +608,24 @@ impl PostOffice {
                         if m.message.durable_up() == 1 {
                             s.store_message(&m.message)?;
                         }
-                        s.store_reference(q.id(), m.message_id(), i == last)
+                        let p = s.store_reference(q.id(), m.message_id(), i == last)?;
+                        let scheduled = if m.scheduled_time > 0 {
+                            s.update_scheduled_delivery_time(
+                                q.id(),
+                                m.message_id(),
+                                m.scheduled_time,
+                                0,
+                            )?
+                        } else {
+                            None
+                        };
+                        crate::storage::StoreResult::Ok((p, scheduled))
                     })();
                     match stored {
-                        Ok(p) => waits.push(p),
+                        Ok((p, scheduled)) => {
+                            waits.push(p);
+                            waits.extend(scheduled);
+                        }
                         Err(e) => tracing::warn!("notification to {address}: {e}"),
                     }
                 }

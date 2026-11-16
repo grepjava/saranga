@@ -357,8 +357,18 @@ impl Store for JournalStorage {
             out.queues.insert(queue, list);
         }
         for p in loaded.prepared {
-            out.prepared
-                .push(self.recover_prepared(p, &mut out.messages, &mut out.large)?);
+            // Each on its own (`loadSinglePreparedTransaction`): its
+            // messages join the others only once it is read whole.
+            let id = p.id;
+            let (mut messages, mut large) = (HashMap::new(), HashSet::new());
+            match self.recover_prepared(p, &mut messages, &mut large) {
+                Ok(tx) => {
+                    out.messages.extend(messages);
+                    out.large.extend(large);
+                    out.prepared.push(tx);
+                }
+                Err(e) => out.failed_prepared.push((id, e.to_string())),
+            }
         }
         // Messages with no reference left, and none held by a prepared
         // transaction, are deleted.

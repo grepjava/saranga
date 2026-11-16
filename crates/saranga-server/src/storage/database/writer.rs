@@ -105,6 +105,11 @@ pub enum Op {
     DeleteBinding {
         id: i64,
     },
+    /// The queues of an address rewritten under a new ID move to it.
+    MoveQueues {
+        from: i64,
+        to: i64,
+    },
     Prepare {
         tx: i64,
         xid: Vec<u8>,
@@ -126,6 +131,7 @@ impl Op {
             | Op::Address { id, .. }
             | Op::Queue { id, .. }
             | Op::DeleteBinding { id } => *id,
+            Op::MoveQueues { to, .. } => *to,
             Op::Reference { message, .. }
             | Op::Unreference { message, .. }
             | Op::PreparedAck { message, .. } => *message,
@@ -541,6 +547,8 @@ struct Changes {
     queue_filters: Vec<Option<Vec<u8>>>,
     queue_configs: Vec<Vec<u8>>,
     deleted_bindings: Vec<i64>,
+    moved_from: Vec<i64>,
+    moved_to: Vec<i64>,
     prepared_txs: Vec<i64>,
     prepared_xids: Vec<Vec<u8>>,
     committed: Vec<i64>,
@@ -688,6 +696,10 @@ impl Changes {
                     }
                 },
                 Op::DeleteBinding { id } => c.deleted_bindings.push(id),
+                Op::MoveQueues { from, to } => {
+                    c.moved_from.push(from);
+                    c.moved_to.push(to);
+                }
                 Op::Prepare { tx, xid } => {
                     c.prepared_txs.push(tx);
                     c.prepared_xids.push(xid);
@@ -736,6 +748,7 @@ struct Prepared {
     delete_addresses: Statement,
     delete_queues: Statement,
     delete_paged: Statement,
+    move_queues: Statement,
     prepare: Statement,
     commit_messages: Statement,
     commit_references: Statement,
@@ -839,8 +852,24 @@ impl Prepared {
         let delete_queues = c
             .prepare("DELETE FROM DB_QUEUE WHERE QUEUE_ID = ANY($1)")
             .await?;
+        // A deleted queue's paged references go, and with them the messages
+        // nothing else references (the large bodies' files once the rows
+        // are gone). The references this deletes are still seen by the
+        // statement, so they are left out by hand.
         let delete_paged = c
-            .prepare("DELETE FROM DB_REFERENCES WHERE QUEUE_ID = ANY($1) AND PAGED = 'Y'")
+            .prepare(
+                "WITH gone AS (DELETE FROM DB_REFERENCES WHERE QUEUE_ID = ANY($1) AND PAGED = 'Y' \
+                 RETURNING MESSAGE_ID) \
+                 DELETE FROM DB_MESSAGES m WHERE m.MESSAGE_ID IN (SELECT MESSAGE_ID FROM gone) \
+                 AND NOT EXISTS (SELECT 1 FROM DB_REFERENCES r WHERE r.MESSAGE_ID = m.MESSAGE_ID \
+                 AND NOT (r.QUEUE_ID = ANY($1) AND r.PAGED = 'Y')) \
+                 RETURNING m.MESSAGE_ID, m.IS_LARGE::text",
+            )
+            .await?;
+        let move_queues = c
+            .prepare(
+                "UPDATE DB_QUEUE SET ADDRESS_ID = M.TO_ID FROM UNNEST($1::BIGINT[], $2::BIGINT[]) AS M(FROM_ID, TO_ID) WHERE DB_QUEUE.ADDRESS_ID = M.FROM_ID",
+            )
             .await?;
         let prepare = c
             .prepare(
@@ -903,6 +932,7 @@ impl Prepared {
             delete_addresses,
             delete_queues,
             delete_paged,
+            move_queues,
             prepare,
             commit_messages,
             commit_references,
@@ -1109,17 +1139,30 @@ impl Writer {
                 }));
             }
         }
+        if !c.moved_from.is_empty() {
+            steps.push(Box::pin(async move {
+                db.execute(&p.move_queues, &[&c.moved_from, &c.moved_to])
+                    .await
+            }));
+        }
         if !c.deleted_bindings.is_empty() {
-            for statement in [
-                &p.delete_addresses,
-                &p.delete_queues,
-                &p.delete_paged,
-                &p.delete_config,
-            ] {
+            for statement in [&p.delete_addresses, &p.delete_queues, &p.delete_config] {
                 steps.push(Box::pin(async move {
                     db.execute(statement, &[&c.deleted_bindings]).await
                 }));
             }
+            let large = deleted_large.clone();
+            steps.push(Box::pin(async move {
+                let rows = db.query(&p.delete_paged, &[&c.deleted_bindings]).await?;
+                let mut large = large.lock().unwrap_or_else(|e| e.into_inner());
+                for row in &rows {
+                    let is_large: String = row.get(1);
+                    if is_large == "Y" {
+                        large.push(row.get(0));
+                    }
+                }
+                Ok(rows.len() as u64)
+            }));
         }
         steps.push(Box::pin(async move { db.execute(&p.commit, &[]).await }));
         let result = futures_util::future::try_join_all(steps).await.map(|_| ());

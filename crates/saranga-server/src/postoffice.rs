@@ -1374,6 +1374,8 @@ impl PostOffice {
                 }
                 let info = state.addresses.remove(name).map(|e| e.info);
                 drop(state);
+                // deletePageStore.
+                self.paging().delete_store(name);
                 self.plugins
                     .each(|p| p.after_remove_address(name, info.as_ref()));
                 if let Some(info) = &info {

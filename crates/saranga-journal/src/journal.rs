@@ -1225,6 +1225,14 @@ impl Inner {
                 return Err(JournalError::RecordTooLarge { size, max });
             }
         }
+        // What `switchFileIfNecessary` refuses, refused before the record
+        // is replicated: Artemis appends locally first, so a record that
+        // cannot be stored never reaches the backup.
+        if size > self.cfg.file_size - SIZE_HEADER {
+            return Err(JournalError::IllegalState(format!(
+                "Record is too large to store {size} bytes"
+            )));
+        }
         Ok(())
     }
 

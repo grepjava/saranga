@@ -303,6 +303,16 @@ impl MessageDecoders {
         self.native(record, None).map(ServerMessage::new_native)
     }
 
+    /// A large message of another protocol without its file: its headers
+    /// and properties, for a filter to look at before the body is read.
+    pub fn decode_large_headers(
+        &self,
+        record: &PersistedMessage,
+    ) -> Result<Arc<ServerMessage>, String> {
+        self.native(record, Some(Vec::new()))
+            .map(ServerMessage::new_native)
+    }
+
     /// A large message of another protocol, with its file. The body stays in
     /// the file: the message keeps only its headers in memory and is read
     /// back whole when it is delivered.
