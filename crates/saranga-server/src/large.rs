@@ -29,6 +29,38 @@ use crate::replication::Replicator;
 /// regular message is turned into a large one.
 pub const CHUNK_SIZE: usize = 100 * 1024;
 
+/// `LargeServerMessageImpl.checkLargeMessage`: a message too large for one
+/// journal record of `max_record_size` has its body moved to a file of
+/// `store`, under a new ID from `next_id`, which becomes the message's.
+/// `None` when it fits.
+pub fn check_large_message(
+    store: &Arc<LargeMessageStore>,
+    max_record_size: usize,
+    next_id: impl FnOnce() -> i64,
+    message: &mut saranga_message::CoreMessage,
+) -> io::Result<Option<Arc<LargeBody>>> {
+    // The encoded size, without copying the body: its length, the body,
+    // then the headers and properties.
+    if message.encode_size() + 512 <= max_record_size {
+        return Ok(None);
+    }
+    let id = next_id();
+    let mut writer = store.create(id, message.durable)?;
+    for chunk in message.body.chunks(CHUNK_SIZE) {
+        writer.append(chunk)?;
+    }
+    let size = message.body.len() as i64;
+    message.body = Vec::new().into();
+    message.message_id = id;
+    let key = saranga_buffer::SimpleString::from(crate::message::HDR_LARGE_BODY_SIZE);
+    if message.properties.get(&key).is_none() {
+        message
+            .properties
+            .insert(key, saranga_buffer::PropertyValue::Long(size));
+    }
+    Ok(Some(writer.finish()?))
+}
+
 /// `LargeMessageExtension`.
 const DURABLE: &str = "msg";
 const TEMPORARY: &str = "tmp";

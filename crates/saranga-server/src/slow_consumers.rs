@@ -24,8 +24,7 @@ use crate::registry::ConsumerEntry;
 /// How often the task looks at the queues.
 const TICK: Duration = Duration::from_millis(200);
 
-/// A queue's reaper (`SlowConsumerReaperRunnable`) and the queue's rate
-/// snapshot (`queueRateCheckTime`, `messagesAddedSnapshot`).
+/// A queue's reaper (`SlowConsumerReaperRunnable`).
 struct Reaper {
     /// Check period, threshold, its unit and the policy.
     settings: (
@@ -35,7 +34,6 @@ struct Reaper {
         SlowConsumerPolicy,
     ),
     next: Instant,
-    rate: Rate,
 }
 
 impl Reaper {
@@ -111,13 +109,14 @@ pub(crate) fn spawn(broker: &Arc<Broker>) {
     let weak: Weak<Broker> = Arc::downgrade(broker);
     tokio::spawn(async move {
         let mut reapers: HashMap<i64, Reaper> = HashMap::new();
+        let mut queues: HashMap<i64, Rate> = HashMap::new();
         let mut consumers: HashMap<(String, i64), Rate> = HashMap::new();
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
             let Some(broker) = weak.upgrade() else { break };
-            check(&broker, &mut reapers, &mut consumers);
+            check(&broker, &mut reapers, &mut queues, &mut consumers);
         }
     });
 }
@@ -125,13 +124,23 @@ pub(crate) fn spawn(broker: &Arc<Broker>) {
 fn check(
     broker: &Arc<Broker>,
     reapers: &mut HashMap<i64, Reaper>,
+    queue_rates: &mut HashMap<i64, Rate>,
     consumers: &mut HashMap<(String, i64), Rate>,
 ) {
     let now = Instant::now();
     let queues = broker.post_office().queues();
+    // The queue's rate snapshot (`queueRateCheckTime`,
+    // `messagesAddedSnapshot`) is the queue's, from its creation: a reaper
+    // started or restarted later measures from the last check, not over
+    // everything the queue has had.
+    let existing: HashSet<i64> = queues.iter().map(|q| q.id()).collect();
+    queue_rates.retain(|id, _| existing.contains(id));
     let mut live = HashSet::new();
     let mut due = Vec::new();
     for q in queues {
+        queue_rates
+            .entry(q.id())
+            .or_insert_with(|| Rate::new(q.created_at()));
         let s = q.settings();
         if s.slow_consumer_threshold
             == saranga_config::AddressSettings::DEFAULT_SLOW_CONSUMER_THRESHOLD
@@ -149,7 +158,6 @@ fn check(
         let reaper = reapers.entry(q.id()).or_insert_with(|| Reaper {
             settings: key,
             next: now + period,
-            rate: Rate::new(now_millis()),
         });
         // configureSlowConsumerReaper: changed settings reschedule it.
         if reaper.settings != key {
@@ -173,10 +181,11 @@ fn check(
         .filter(|c| !c.browse_only)
         .collect();
     for q in due {
-        let Some(reaper) = reapers.get_mut(&q.id()) else {
+        let (Some(reaper), Some(rate)) = (reapers.get(&q.id()), queue_rates.get_mut(&q.id()))
+        else {
             continue;
         };
-        reap(broker, &q, reaper, &entries, consumers);
+        reap(broker, &q, reaper, rate, &entries, consumers);
     }
     let seen: HashSet<(String, i64)> = entries.iter().map(|c| (c.session.clone(), c.id)).collect();
     consumers.retain(|k, _| seen.contains(k));
@@ -186,11 +195,12 @@ fn check(
 fn reap(
     broker: &Arc<Broker>,
     q: &Queue,
-    reaper: &mut Reaper,
+    reaper: &Reaper,
+    rate: &mut Rate,
     entries: &[Arc<ConsumerEntry>],
     rates: &mut HashMap<(String, i64), Rate>,
 ) {
-    let queue_rate = reaper.rate.take(q.messages_added());
+    let queue_rate = rate.take(q.messages_added());
     let queue_messages = q.message_count();
     let consumer_count = q.consumer_count();
     tracing::debug!(

@@ -768,6 +768,9 @@ impl Broker {
             ),
             paging.clone(),
         );
+        if let Some(s) = &storage {
+            post_office.set_large_messages(large_messages.clone(), s.max_record_size());
+        }
         // registerBrokerPlugins: before anything is loaded, so the plugins
         // see the addresses and queues recovered and deployed.
         for p in &config.plugins {

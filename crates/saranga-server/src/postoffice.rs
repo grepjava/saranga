@@ -449,6 +449,11 @@ pub struct AddressStatus {
 #[derive(Default)]
 struct State {
     addresses: HashMap<Name, AddressEntry>,
+    /// Diverts bound to an address that does not exist (a `DivertBinding`
+    /// needs no `AddressInfo`): routed through as an address's are, once
+    /// a send reaches the address, or one its wildcard matches. The entry's
+    /// address information is a placeholder.
+    free_diverts: HashMap<Name, AddressEntry>,
     queues: HashMap<Name, Queue>,
     /// Remote queue bindings by address, in the order they came; an
     /// address need not exist here for the other broker's queues to.
@@ -497,6 +502,9 @@ pub struct PostOffice {
     has_wild: AtomicBool,
     /// The broker's grouping handler, when it has one.
     grouping: std::sync::OnceLock<Arc<crate::grouping::GroupingHandler>>,
+    /// The large-message store and the journal's record size, for a
+    /// divert's transformed copy (`checkLargeMessage`).
+    large: std::sync::OnceLock<(Arc<crate::large::LargeMessageStore>, usize)>,
     /// The mirror sources installed.
     mirrors: crate::mirror::Mirrors,
     /// What the last deployment of the configured addresses wrote into
@@ -537,6 +545,7 @@ impl PostOffice {
             wild_checked: AtomicBool::new(true),
             has_wild: AtomicBool::new(false),
             grouping: std::sync::OnceLock::new(),
+            large: std::sync::OnceLock::new(),
             mirrors: crate::mirror::Mirrors::default(),
             deployed: Mutex::default(),
         })
@@ -554,6 +563,12 @@ impl PostOffice {
 
     pub(crate) fn set_deployed_queues(&self, deployed: Vec<crate::reload::DeployedQueue>) {
         *self.deployed.lock().unwrap_or_else(|e| e.into_inner()) = deployed;
+    }
+
+    /// The store a divert's transformed copy too large for one journal
+    /// record goes to, and that record size.
+    pub fn set_large_messages(&self, store: Arc<crate::large::LargeMessageStore>, max: usize) {
+        let _ = self.large.set((store, max));
     }
 
     /// `setGroupingHandler`.
@@ -1364,8 +1379,9 @@ impl PostOffice {
     /// Removes an address that has no queues (`removeAddressInfo`).
     pub fn remove_address(&self, name: &str) -> bool {
         let mut state = self.write();
+        let free = state.free_diverts.contains_key(name);
         match state.addresses.get(name) {
-            Some(entry) if entry.queues.is_empty() && entry.diverts.is_empty() => {
+            Some(entry) if entry.queues.is_empty() && entry.diverts.is_empty() && !free => {
                 if !entry.info.temporary
                     && let Some(s) = self.ids.storage()
                     && let Err(e) = s.delete_binding(entry.info.id)
@@ -1815,6 +1831,7 @@ impl PostOffice {
                 .is_some_and(|s| s.address_size() > 0);
             let remove = {
                 let mut state = self.write();
+                let free = state.free_diverts.contains_key(&name);
                 let Some(entry) = state.addresses.get_mut(&name) else {
                     continue;
                 };
@@ -1829,6 +1846,7 @@ impl PostOffice {
                     && entry.info.auto_created
                     && entry.queues.is_empty()
                     && entry.diverts.is_empty()
+                    && !free
                     && !held
                     && (initial || used)
                     && (initial || delay_passed);
@@ -2260,8 +2278,9 @@ impl PostOffice {
         // and has at least one local binding.
         let (has_addr, has_local) = if auto_create {
             let state = self.read();
+            let free = state.free_diverts.contains_key(real);
             match state.addresses.get(real) {
-                Some(e) => (true, !e.queues.is_empty() || !e.diverts.is_empty()),
+                Some(e) => (true, free || !e.queues.is_empty() || !e.diverts.is_empty()),
                 None => (false, false),
             }
         } else {
@@ -2273,6 +2292,13 @@ impl PostOffice {
             && self.check_auto_create(address, routing_type, creator)? == AutoCreate::NotFound
         {
             return Err(BrokerError::address_does_not_exist(real));
+        }
+        // `WildcardAddressManager.getBindingsForRoutingAddress`: with
+        // wildcard routing, a wildcard address is for consumers only. Its
+        // queues would otherwise take what is sent to every address it
+        // matches.
+        if self.wildcard.routing_enabled && self.wildcard.is_wild(address) {
+            return Err(BrokerError::wildcard_on_producer(address));
         }
         // routeFromCluster: a message naming the queues it goes to
         // (`_AMQ_ROUTE_TO`, as `artemis data imp` and cluster bridges send
@@ -2338,14 +2364,28 @@ impl PostOffice {
         // DivertImpl.route
         for d in diverts {
             for forward in &d.forwarding {
-                let copy = if forward == real {
-                    message.clone()
-                } else {
+                // The message is being routed to that address already.
+                if forward == real {
+                    continue;
+                }
+                let (copy, target) = {
                     let now = crate::message::now_millis();
                     let mut core = d.copy(message.message.core(), self.ids.next(), forward);
-                    let s = self.settings(forward);
+                    // `postOffice.route(copy)` goes to the copy's address,
+                    // which a transformer may have changed.
+                    let target = core
+                        .address
+                        .as_ref()
+                        .map(|a| a.to_string())
+                        .filter(|a| !a.is_empty())
+                        .unwrap_or_else(|| forward.to_string());
+                    let s = self.settings(&target);
                     crate::message::apply_expiry_delay(&mut core, &s, now);
-                    let Some(copied) = message.message.copy(core) else {
+                    let copied = match d.transformer.is_some() {
+                        true => self.check_large_copy(message, core)?,
+                        false => message.message.copy(core),
+                    };
+                    let Some(copied) = copied else {
                         // A large body that cannot be copied fails the
                         // send, as Artemis's `DivertImpl.route` fails on the
                         // copy `copy` gives as null: going on would lose
@@ -2360,12 +2400,12 @@ impl PostOffice {
                     };
                     let mut r = MessageRef::new(copied);
                     r.scheduled_time = crate::message::scheduled_delivery_time(r.message.core());
-                    r
+                    (r, target)
                 };
                 let rt = routing_type_of(copy.message.core());
                 self.route_into(
                     &copy,
-                    forward,
+                    &target,
                     rt,
                     Hop {
                         depth: depth + 1,
@@ -2377,6 +2417,32 @@ impl PostOffice {
             }
         }
         self.unrouted(routed, message, real, to_dla, out)
+    }
+
+    /// The copy of `message` a divert's transformer made: its body goes to
+    /// a large-message file if it outgrew a journal record
+    /// (`LargeServerMessageImpl.checkLargeMessage`, after `transform`). A
+    /// large message is copied as it is. `None` when its large body could
+    /// not be copied.
+    fn check_large_copy(
+        &self,
+        message: &MessageRef,
+        mut core: saranga_message::CoreMessage,
+    ) -> Result<Option<Arc<crate::message::ServerMessage>>> {
+        if message.message.is_large() {
+            return Ok(message.message.copy(core));
+        }
+        let Some((store, max)) = self.large.get() else {
+            return Ok(message.message.copy(core));
+        };
+        match crate::large::check_large_message(store, *max, || self.ids.next(), &mut core)
+            .map_err(|e| {
+                BrokerError::new(saranga_core_protocol::ErrorType::IoError, e.to_string())
+            })? {
+            // As a Core message (`toCore`).
+            Some(body) => Ok(Some(crate::message::ServerMessage::new_large(core, body))),
+            None => Ok(message.message.copy(core)),
+        }
     }
 
     /// `maybeSendToDLA` for a message that reached no queue.
@@ -2397,13 +2463,19 @@ impl PostOffice {
     /// Whether an exclusive divert of `address` takes the message.
     fn has_exclusive_divert(&self, message: &MessageRef, address: &str) -> bool {
         let state = self.read();
-        state.addresses.get(address).is_some_and(|e| {
-            e.diverts.iter().any(|d| {
-                d.exclusive
-                    && d.filter
-                        .as_ref()
-                        .is_none_or(|f| f.matches(&*message.message))
-            })
+        [
+            state.addresses.get(address),
+            state.free_diverts.get(address),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|e| e.diverts.iter())
+        .any(|d| {
+            d.exclusive
+                && !d.forwards_only_to(address)
+                && d.filter
+                    .as_ref()
+                    .is_none_or(|f| f.matches(&*message.message))
         })
     }
 
@@ -2510,16 +2582,25 @@ impl PostOffice {
 
     /// An address's statistics and state.
     pub fn address_status(&self, name: &str) -> Option<AddressStatus> {
-        self.read().addresses.get(name).map(|e| AddressStatus {
-            info: e.info.clone(),
-            created_at: e.created_at,
-            routed: e.routed.load(Ordering::Relaxed),
-            unrouted: e.unrouted.load(Ordering::Relaxed),
-            paused: e.paused,
-            persisted_pause: e.pause_record >= 0,
-            queues: e.queues.clone(),
-            diverts: e.diverts.clone(),
-        })
+        self.read()
+            .addresses
+            .get(name)
+            .map(|e| AddressStatus {
+                info: e.info.clone(),
+                created_at: e.created_at,
+                routed: e.routed.load(Ordering::Relaxed),
+                unrouted: e.unrouted.load(Ordering::Relaxed),
+                paused: e.paused,
+                persisted_pause: e.pause_record >= 0,
+                queues: e.queues.clone(),
+                diverts: e.diverts.clone(),
+            })
+            .map(|mut s| {
+                if let Some(free) = self.read().free_diverts.get(name) {
+                    s.diverts.extend(free.diverts.iter().cloned());
+                }
+                s
+            })
     }
 
     /// `AddressControl.pause(persist)`: none of the address's queues
@@ -2577,17 +2658,21 @@ impl PostOffice {
     /// Whether anything is bound to `address`
     /// (`lookupBindingsForAddress` not empty).
     pub fn has_bindings(&self, address: &str) -> bool {
-        self.read()
-            .addresses
-            .get(address)
-            .is_some_and(|e| !e.queues.is_empty() || !e.diverts.is_empty())
+        let state = self.read();
+        state.free_diverts.contains_key(address)
+            || state
+                .addresses
+                .get(address)
+                .is_some_and(|e| !e.queues.is_empty() || !e.diverts.is_empty())
     }
 
-    /// The diverts bound to addresses.
+    /// The diverts bound to addresses, existing or not.
     pub fn diverts(&self) -> Vec<Arc<Divert>> {
-        self.read()
+        let state = self.read();
+        state
             .addresses
             .values()
+            .chain(state.free_diverts.values())
             .flat_map(|e| e.diverts.iter().cloned())
             .collect()
     }
@@ -2606,7 +2691,12 @@ impl PostOffice {
         let found = {
             let mut state = self.write();
             let mut found = false;
-            for entry in state.addresses.values_mut() {
+            let state = &mut *state;
+            for entry in state
+                .addresses
+                .values_mut()
+                .chain(state.free_diverts.values_mut())
+            {
                 if let Some(i) = entry.diverts.iter().position(|d| *d.name == *name) {
                     entry.diverts.remove(i);
                     entry.binding_removed_at = crate::message::now_millis();
@@ -2614,6 +2704,7 @@ impl PostOffice {
                     break;
                 }
             }
+            state.free_diverts.retain(|_, e| !e.diverts.is_empty());
             found
         };
         // deleteDivertConfiguration.
@@ -2694,7 +2785,12 @@ impl PostOffice {
         replacement.id = old.id;
         {
             let mut state = self.write();
-            for entry in state.addresses.values_mut() {
+            let state = &mut *state;
+            for entry in state
+                .addresses
+                .values_mut()
+                .chain(state.free_diverts.values_mut())
+            {
                 if let Some(slot) = entry.diverts.iter_mut().find(|x| x.name == old.name) {
                     *slot = Arc::new(replacement);
                     break;
@@ -2732,13 +2828,29 @@ impl PostOffice {
         if state
             .addresses
             .values()
+            .chain(state.free_diverts.values())
             .any(|e| e.diverts.iter().any(|d| d.name == divert.name))
         {
             tracing::warn!("AMQ222017: Divert {} already exists", divert.name);
             return Ok(false);
         }
-        let Some(entry) = state.addresses.get_mut(&*divert.address) else {
-            return Err(BrokerError::address_does_not_exist(&divert.address));
+        // `postOffice.addBinding`: the address need not exist.
+        let st = &mut *state;
+        let entry = match st.addresses.get_mut(&*divert.address) {
+            Some(entry) => entry,
+            None => st
+                .free_diverts
+                .entry(divert.address.clone())
+                .or_insert_with(|| {
+                    AddressEntry::new(AddressInfo {
+                        id: -1,
+                        name: divert.address.clone(),
+                        routing_types: RoutingTypes::default(),
+                        auto_created: false,
+                        temporary: false,
+                        internal: false,
+                    })
+                }),
         };
         let (name, routing_name, address) = (
             divert.name.to_string(),
@@ -2824,6 +2936,7 @@ impl PostOffice {
         let has = state
             .addresses
             .values()
+            .chain(state.free_diverts.values())
             .any(|e| *e.wild.get_or_init(|| self.wildcard.is_wild(&e.info.name)));
         self.has_wild.store(has, Ordering::Relaxed);
         self.wild_checked.store(true, Ordering::Release);
@@ -2833,15 +2946,26 @@ impl PostOffice {
     /// The local bindings of `address` and of every wildcard address
     /// matching it.
     fn routing_entries<'s>(&self, state: &'s State, real: &str) -> Vec<&'s AddressEntry> {
-        let mut entries: Vec<&AddressEntry> = state.addresses.get(real).into_iter().collect();
+        let mut entries: Vec<&AddressEntry> = state
+            .addresses
+            .get(real)
+            .into_iter()
+            .chain(state.free_diverts.get(real))
+            .collect();
         if self.wildcard.routing_enabled
             && self.has_wildcard_addresses(state)
             && !self.wildcard.is_wild(real)
         {
-            entries.extend(state.addresses.values().filter(|e| {
-                *e.wild.get_or_init(|| self.wildcard.is_wild(&e.info.name))
-                    && self.wildcard.matches(real, &e.info.name)
-            }));
+            entries.extend(
+                state
+                    .addresses
+                    .values()
+                    .chain(state.free_diverts.values())
+                    .filter(|e| {
+                        *e.wild.get_or_init(|| self.wildcard.is_wild(&e.info.name))
+                            && self.wildcard.matches(real, &e.info.name)
+                    }),
+            );
         }
         entries
     }
@@ -2888,6 +3012,7 @@ impl PostOffice {
             c.enabled && !(c.purge_on_no_consumers && q.consumer_count() == 0)
         };
         if (!self.wildcard.routing_enabled || !self.has_wildcard_addresses(&state))
+            && !state.free_diverts.contains_key(real)
             && let Some(e) = state.addresses.get(real)
             && let [q] = e.queues.as_slice()
             && e.diverts.is_empty()
@@ -2933,21 +3058,26 @@ impl PostOffice {
             }
             return Some(routes);
         }
-        let divert_matches = |d: &Divert| d.filter.as_ref().is_none_or(|f| f.matches(target));
-        // Exclusive diverts take the message from everything else.
-        if fqqn_queue.is_none() {
-            let exclusive: Vec<Arc<Divert>> = entries
-                .iter()
-                .flat_map(|e| e.diverts.iter())
-                .filter(|d| d.exclusive && divert_matches(d))
-                .cloned()
-                .collect();
-            if !exclusive.is_empty() {
-                return Some(Routes {
-                    diverts: exclusive,
-                    ..Routes::default()
-                });
-            }
+        // A divert that would only send the message back to the address it
+        // is being routed to takes nothing: the message is going there
+        // already (Artemis routes it again, without end).
+        let divert_matches = |d: &Divert| {
+            !d.forwards_only_to(real) && d.filter.as_ref().is_none_or(|f| f.matches(target))
+        };
+        // Exclusive diverts take the message from everything else, one sent
+        // to a queue (`address::queue`) included: `matchBinding` narrows
+        // only the queue bindings to it.
+        let exclusive: Vec<Arc<Divert>> = entries
+            .iter()
+            .flat_map(|e| e.diverts.iter())
+            .filter(|d| d.exclusive && divert_matches(d))
+            .cloned()
+            .collect();
+        if !exclusive.is_empty() {
+            return Some(Routes {
+                diverts: exclusive,
+                ..Routes::default()
+            });
         }
         let lb = state
             .load_balancing
@@ -2973,18 +3103,16 @@ impl PostOffice {
         }
         // A non-exclusive divert is a binding of its routing name: of the
         // diverts (and queues) sharing one, one takes each message.
-        if fqqn_queue.is_none() {
-            for d in entries
-                .iter()
-                .flat_map(|e| e.diverts.iter())
-                .filter(|d| !d.exclusive)
-            {
-                add_to_group(
-                    &mut groups,
-                    d.routing_name.clone(),
-                    Bound::Divert(Arc::clone(d)),
-                );
-            }
+        for d in entries
+            .iter()
+            .flat_map(|e| e.diverts.iter())
+            .filter(|d| !d.exclusive && !d.forwards_only_to(real))
+        {
+            add_to_group(
+                &mut groups,
+                d.routing_name.clone(),
+                Bound::Divert(Arc::clone(d)),
+            );
         }
         // A proposal may wait for another node: nothing stays locked.
         drop(entries);
@@ -3540,6 +3668,12 @@ impl DivertDeployment {
 }
 
 impl Divert {
+    /// Whether every forwarding address is `address`, so diverting a
+    /// message routed there would only send it round again.
+    fn forwards_only_to(&self, address: &str) -> bool {
+        self.forwarding.iter().all(|f| f == address)
+    }
+
     /// The copy `DivertImpl.route` sends on: a new ID, the original's
     /// address, queue (the divert) and ID recorded, its expiration kept, and
     /// its routing type set by the divert.
@@ -3574,6 +3708,10 @@ impl Divert {
         }
         copy.address = Some(SimpleString::from(forward));
         copy.expiration = original.expiration;
+        // A cluster's routing header would send the copy to the queues it
+        // names on the original's address (`removeExtraBytesProperty`).
+        copy.properties
+            .remove(&SimpleString::from(HDR_ROUTE_TO_IDS));
         let key = SimpleString::from(m::HDR_ROUTING_TYPE);
         match self.routing_type {
             DivertRoutingType::Anycast => {

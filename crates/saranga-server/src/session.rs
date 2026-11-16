@@ -1223,31 +1223,13 @@ impl ServerSession {
         let Some(max) = self.broker.max_record_size() else {
             return Ok(None);
         };
-        // The encoded size, without copying the body: its length, the body,
-        // then the headers and properties.
-        if message.encode_size() + 512 <= max {
-            return Ok(None);
-        }
-        let id = self.broker.post_office().ids().next();
-        let io = |e: std::io::Error| BrokerError::new(ErrorType::IoError, e.to_string());
-        let mut writer = self
-            .broker
-            .large_messages()
-            .create(id, message.durable)
-            .map_err(io)?;
-        for chunk in message.body.chunks(crate::large::CHUNK_SIZE) {
-            writer.append(chunk).map_err(io)?;
-        }
-        let size = message.body.len() as i64;
-        message.body = Vec::new().into();
-        message.message_id = id;
-        let key = SimpleString::from(crate::message::HDR_LARGE_BODY_SIZE);
-        if message.properties.get(&key).is_none() {
-            message
-                .properties
-                .insert(key, saranga_buffer::PropertyValue::Long(size));
-        }
-        Ok(Some(writer.finish().map_err(io)?))
+        crate::large::check_large_message(
+            self.broker.large_messages(),
+            max,
+            || self.broker.post_office().ids().next(),
+            message,
+        )
+        .map_err(|e| BrokerError::new(ErrorType::IoError, e.to_string()))
     }
 
     /// `ServerSessionImpl.send`: assigns the ID, routes, and either adds to

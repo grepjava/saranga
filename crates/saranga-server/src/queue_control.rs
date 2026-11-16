@@ -732,7 +732,7 @@ impl Actor {
         s
     }
 
-    fn act(&mut self, sel: &Selection, action: &SelectionAction) -> usize {
+    pub(crate) fn act(&mut self, sel: &Selection, action: &SelectionAction) -> usize {
         if !matches!(action, SelectionAction::Remove(_)) || !crate::audit::message_enabled() {
             return self.act_unaudited(sel, action);
         }
@@ -899,6 +899,69 @@ impl Actor {
             }
         }
         hits
+    }
+
+    /// Takes out every message `sel` selects, for a caller that acknowledges
+    /// them in its own transaction: the queued ones, the scheduled ones and
+    /// those still in pages (read in, as an operation's are). The
+    /// transaction's rollback returns them with [`Queue::reinsert`].
+    pub(crate) fn take_all_selected(&mut self, sel: &Selection) -> Vec<MessageRef> {
+        let mut hits = 0;
+        let mut out = self.messages.take_selected(sel, &mut hits, |_| true);
+        let keys: Vec<_> = self
+            .scheduled
+            .iter()
+            .filter(|(_, r)| sel.matches(r))
+            .map(|(k, _)| *k)
+            .collect();
+        for k in keys {
+            if sel.reached(hits) {
+                break;
+            }
+            if let Some(mut r) = self.scheduled.remove(&k) {
+                hits += 1;
+                r.scheduled_time = 0;
+                out.push(r);
+            }
+        }
+        if let Some(sub) = self.shared.paging.clone()
+            && let Some(store) = sub.store()
+            && !sel.reached(hits)
+        {
+            // Those taken above are still unacknowledged in their pages.
+            let in_memory: HashSet<(i64, i32)> = self
+                .messages
+                .iter()
+                .chain(self.scheduled.values())
+                .chain(self.consumers.iter().flat_map(|c| c.delivering.iter()))
+                .chain(out.iter())
+                .filter_map(|r| r.paged.as_ref().map(|p| (p.page, p.message_nr)))
+                .collect();
+            let mut it = PageIterator::default();
+            let mut found = Vec::new();
+            while !sel.reached(hits) {
+                let Some(p) = store.scan(&sub, &mut it) else {
+                    break;
+                };
+                if in_memory.contains(&(p.position.page, p.position.message_nr)) {
+                    continue;
+                }
+                let r = scanned(p);
+                if sel.matches(&r) {
+                    hits += 1;
+                    found.push(r);
+                }
+            }
+            let settle = found.iter().any(|r| r.stored);
+            for r in found {
+                self.claim(&sub, &store, &r);
+                out.push(r);
+            }
+            if settle {
+                self.settle();
+            }
+        }
+        out
     }
 
     fn reprioritised(&self, mut r: MessageRef, action: &SelectionAction) -> MessageRef {

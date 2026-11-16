@@ -317,3 +317,204 @@ async fn diverts_sharing_a_routing_name_take_turns() {
     }
     assert_eq!(seen, ["dst1", "dst2", "dst1", "dst2"]);
 }
+
+fn plain_divert(name: &str, address: &str, forwarding: &str, exclusive: bool) -> DivertDeployment {
+    DivertDeployment {
+        name: name.to_owned(),
+        routing_name: None,
+        address: address.to_owned(),
+        forwarding_address: forwarding.to_owned(),
+        exclusive,
+        filter: None,
+        routing_type: DivertRoutingType::Strip,
+        transformer: None,
+    }
+}
+
+fn to(address: &str, id: i64) -> MessageRef {
+    MessageRef::new(ServerMessage::new(CoreMessage {
+        message_id: id,
+        address: Some(SimpleString::from(address)),
+        ..Default::default()
+    }))
+}
+
+/// A divert binds to an address that does not exist (a `DivertBinding`
+/// needs no `AddressInfo`): a send creating the address goes through it,
+/// and no queue is created there, the divert being its binding.
+#[tokio::test]
+async fn a_divert_needs_no_address() {
+    let mut config = BrokerConfig::new(Arc::new(SelectorFilters));
+    config.addresses = vec![anycast("dst")];
+    config.diverts = vec![plain_divert("d", "src", "dst", true)];
+    let b = Broker::start(config).await.unwrap();
+    assert!(b.post_office().divert("d").is_some(), "deployed");
+    let routed = b
+        .post_office()
+        .route(&to("src", 1), "src", None, Default::default())
+        .unwrap();
+    assert_eq!(queues(&routed), ["dst"]);
+    assert!(b.post_office().queue("src").is_none());
+    // Destroyed, it leaves nothing behind.
+    assert!(b.post_office().destroy_divert("d"));
+    assert!(b.post_office().divert("d").is_none());
+}
+
+/// A wildcard divert whose forwarding address it matches: a message sent
+/// there is not diverted back to it (one copy per diverting, not one per
+/// round until a depth limit, all with the original's ID).
+#[tokio::test]
+async fn a_divert_does_not_send_a_message_back_to_its_own_address() {
+    for exclusive in [false, true] {
+        let mut config = BrokerConfig::new(Arc::new(SelectorFilters));
+        config.addresses = vec![anycast("events.audit")];
+        config.diverts = vec![plain_divert("tap", "events.#", "events.audit", exclusive)];
+        let b = Broker::start(config).await.unwrap();
+        let routed = b
+            .post_office()
+            .route(
+                &to("events.audit", 1),
+                "events.audit",
+                None,
+                Default::default(),
+            )
+            .unwrap();
+        assert_eq!(queues(&routed), ["events.audit"], "exclusive {exclusive}");
+        let routed = b
+            .post_office()
+            .route(&to("events.x", 2), "events.x", None, Default::default())
+            .unwrap();
+        assert_eq!(queues(&routed), ["events.audit"], "exclusive {exclusive}");
+    }
+}
+
+/// A send to one queue of an address (`address::queue`) still goes through
+/// the address's diverts: `matchBinding` narrows the queue bindings only.
+#[tokio::test]
+async fn a_send_to_a_queue_is_diverted() {
+    for exclusive in [true, false] {
+        let mut config = BrokerConfig::new(Arc::new(SelectorFilters));
+        config.addresses = vec![anycast("src"), anycast("dst")];
+        config.diverts = vec![plain_divert("d", "src", "dst", exclusive)];
+        let b = Broker::start(config).await.unwrap();
+        let routed = b
+            .post_office()
+            .route(&to("src::src", 1), "src::src", None, Default::default())
+            .unwrap();
+        let expected: &[&str] = if exclusive { &["dst"] } else { &["src", "dst"] };
+        assert_eq!(queues(&routed), expected);
+    }
+}
+
+/// A cluster's `_AMQ_ROUTE_TO` names queues of the original's address: an
+/// exclusive divert's copy goes without it, to its forwarding address's
+/// queues.
+#[tokio::test]
+async fn a_diverted_copy_loses_the_route_to_header() {
+    let mut config = BrokerConfig::new(Arc::new(SelectorFilters));
+    config.addresses = vec![anycast("src"), anycast("dst")];
+    config.diverts = vec![plain_divert("d", "src", "dst", true)];
+    let b = Broker::start(config).await.unwrap();
+    let src = b.post_office().queue("src").unwrap();
+    let mut core = CoreMessage {
+        message_id: 1,
+        address: Some(SimpleString::from("src")),
+        ..Default::default()
+    };
+    core.properties.insert(
+        "_AMQ_ROUTE_TO".into(),
+        PropertyValue::Bytes(src.id().to_be_bytes().to_vec()),
+    );
+    let routed = b
+        .post_office()
+        .route(
+            &MessageRef::new(ServerMessage::new(core)),
+            "src",
+            None,
+            Default::default(),
+        )
+        .unwrap();
+    assert_eq!(queues(&routed), ["dst"]);
+}
+
+/// Sends its copy to the address in its configuration, with a body of the
+/// size given.
+struct Redirect(String, usize);
+
+impl Transformer for Redirect {
+    fn transform(&self, mut message: CoreMessage) -> CoreMessage {
+        message.address = Some(SimpleString::from(self.0.as_str()));
+        if self.1 > 0 {
+            message.body = vec![7u8; self.1].into();
+        }
+        message
+    }
+}
+
+fn redirecting(config: &mut BrokerConfig) {
+    config.transformers.insert(
+        "redirect".to_owned(),
+        Arc::new(|p: &HashMap<String, String>| {
+            Arc::new(Redirect(
+                p["to"].clone(),
+                p.get("grow").map_or(0, |g| g.parse().unwrap()),
+            )) as Arc<dyn Transformer>
+        }),
+    );
+}
+
+/// The copy goes where the transformer addressed it (`postOffice.route`
+/// routes it to its own address).
+#[tokio::test]
+async fn a_transformer_can_send_the_copy_elsewhere() {
+    let mut config = BrokerConfig::new(Arc::new(SelectorFilters));
+    config.addresses = vec![anycast("src"), anycast("dst"), anycast("other")];
+    let mut d = plain_divert("d", "src", "dst", true);
+    d.transformer = Some((
+        "redirect".to_owned(),
+        HashMap::from([("to".to_owned(), "other".to_owned())]),
+    ));
+    config.diverts = vec![d];
+    redirecting(&mut config);
+    let b = Broker::start(config).await.unwrap();
+    let routed = b
+        .post_office()
+        .route(&to("src", 1), "src", None, Default::default())
+        .unwrap();
+    assert_eq!(queues(&routed), ["other"]);
+}
+
+/// A transformed copy too large for a journal record becomes a large
+/// message (`checkLargeMessage` after `transform`).
+#[tokio::test]
+async fn a_transformed_copy_too_large_for_a_record_becomes_large() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = saranga_config::BrokerConfig::parse(
+        r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+             <persistence-enabled>true</persistence-enabled>
+             <journal-file-size>102400</journal-file-size>
+           </core></configuration>"#,
+    )
+    .unwrap();
+    let mut config =
+        BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path()).unwrap();
+    config.addresses = vec![anycast("src"), anycast("dst")];
+    let mut d = plain_divert("d", "src", "dst", true);
+    d.transformer = Some((
+        "redirect".to_owned(),
+        HashMap::from([
+            ("to".to_owned(), "dst".to_owned()),
+            ("grow".to_owned(), "300000".to_owned()),
+        ]),
+    ));
+    config.diverts = vec![d];
+    redirecting(&mut config);
+    let b = Broker::start(config).await.unwrap();
+    let routed = b
+        .post_office()
+        .route(&to("src", 1), "src", None, Default::default())
+        .unwrap();
+    assert_eq!(queues(&routed), ["dst"]);
+    assert!(routed[0].0.message.is_large(), "spilled to a large file");
+    b.stop().unwrap();
+}

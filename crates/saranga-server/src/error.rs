@@ -141,6 +141,17 @@ impl BrokerError {
         )
     }
 
+    /// `wildcardOnProducerNotSupported`.
+    pub fn wildcard_on_producer(address: &str) -> Self {
+        Self::bundle(
+            ErrorType::GenericException,
+            229260,
+            format!(
+                "Wildcard addresses are not supported on producers. Only on consumers. Please send to a real address. {address}"
+            ),
+        )
+    }
+
     pub fn address_does_not_exist(address: &str) -> Self {
         Self::bundle(
             ErrorType::AddressDoesNotExist,

@@ -13,6 +13,16 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **A pre-acknowledged delivery counts as acknowledged,** so the slow-consumer check no longer takes a pre-acknowledging consumer (Core `preAcknowledge`, MQTT QoS 0) for one that acknowledges nothing and kills its connection under `KILL`. A browser's deliveries are no longer counted as the consumer's, and a cancelled, rejected or closed consumer's deliveries leave its in-transit size, as in Artemis. The check turned on for a queue measures the queue's rate since the last check, or its creation, instead of taking all it ever had for one period's traffic.
+- **A consumer closed with unacknowledged deliveries returns them at once,** not after the address's `redelivery-delay`, as Artemis does (`cancel` with the redelivery check ignored).
+- **`purge-on-no-consumers`, and MQTT's cleanup of a session's queue and of a replaced retained message,** take the queue's scheduled and paged messages too, not only those in memory.
+- **A send to a wildcard address fails** with `AMQ229260` while wildcard routing is on, as in Artemis, instead of auto-creating a queue there that takes what is sent to every address the wildcard matches.
+- **Diverts:**
+  - A divert deploys without an address of its own, as Artemis's binding does, and goes to work once a send creates the address.
+  - A divert that would send a message back to the address it is routed to (a wildcard tap onto a matching address) leaves it alone instead of delivering it again up to sixteen times under the same ID.
+  - A send to one queue (`address::queue`) is diverted as a send to the address is.
+  - A copy loses the cluster's `_AMQ_ROUTE_TO`, which named queues of the original's address and lost the copy.
+  - A transformer's copy goes to the address the transformer gave it, and becomes a large message when it outgrows a journal record.
 - **A synchronous journal write waits for the backup while a backup is replicating.** A binding created, updated or deleted, or a prepare, commit or rollback, with no completion of its own waited only for the local write: the primary could fail with the record acknowledged and not yet on the backup. It now waits for both, as Artemis lines up every replicated operation.
 - **Records appended after a journal file of format version 1 load again.** Appended to that file under its version-1 header, they were read as version 1 at the next start and lost; the old file is now kept as it is and appends go to a new one.
 - **A paged AMQP large message is read back from its page.** Its saved encoding was read to the end of the record, taking the queue IDs after it, so the page was found damaged and its messages from there on were not read.

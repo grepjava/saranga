@@ -1533,7 +1533,9 @@ impl Consumer {
                     .deliver_large(id, message, size, delivery_count)
             }
         };
-        self.reg.metrics.add_message(message.encode_size() as i64);
+        if !self.reg.browse_only {
+            self.reg.metrics.add_message(message.encode_size() as i64);
+        }
         self.take_credits(size);
         true
     }
@@ -1921,6 +1923,14 @@ impl Actor {
     /// (`RefsOperation.afterRollback`): each is checked for redelivery
     /// (`checkRedelivery`), then the survivors return (`postRollback`).
     fn return_refs(&mut self, refs: Vec<MessageRef>) {
+        self.return_refs_with(refs, false);
+    }
+
+    /// [`Actor::return_refs`]; `ignore_redelivery_delay` for a closed
+    /// consumer's references (`cancel(tx, ref, true)` from
+    /// `ServerConsumerImpl.close`), which go back at once: most never
+    /// reached the application.
+    fn return_refs_with(&mut self, refs: Vec<MessageRef>, ignore_redelivery_delay: bool) {
         // A non-destructive queue's deliveries never took their references
         // off its list; anything else it took off (a delivery taken for
         // good, management's) goes back like any queue's.
@@ -1933,7 +1943,7 @@ impl Actor {
         let now = now_millis();
         let back: Vec<MessageRef> = refs
             .into_iter()
-            .filter_map(|r| self.check_redelivery(r, now))
+            .filter_map(|r| self.check_redelivery(r, now, ignore_redelivery_delay))
             .collect();
         if self.shared.config().purge_on_no_consumers && self.consumers.is_empty() {
             back.into_iter().for_each(|r| self.kill(r));
@@ -1982,7 +1992,12 @@ impl Actor {
     /// `checkRedelivery`: journals the delivery count, then sends the
     /// reference to the dead-letter address once it has used its delivery
     /// attempts, or delays its redelivery. `None` when it has left the queue.
-    fn check_redelivery(&mut self, mut r: MessageRef, time_base: i64) -> Option<MessageRef> {
+    fn check_redelivery(
+        &mut self,
+        mut r: MessageRef,
+        time_base: i64,
+        ignore_redelivery_delay: bool,
+    ) -> Option<MessageRef> {
         // No dead-letter or redelivery-delay check on an internal queue (a
         // mirror's or a cluster's store-and-forward queue): what it holds
         // must reach its peer however often it comes back. Its delivery
@@ -1997,7 +2012,7 @@ impl Actor {
             self.send_to_dead_letter_address(r, &s);
             return None;
         }
-        if s.redelivery_delay > 0 {
+        if !ignore_redelivery_delay && s.redelivery_delay > 0 {
             r.scheduled_time = time_base + redelivery_delay(&s, r.delivery_count);
             if queue.is_durable_ref(&r)
                 && let Some(st) = self.shared.ids.storage()
@@ -2490,7 +2505,10 @@ impl Actor {
             Cmd::RemoveConsumer { id, failed, done } => {
                 if let Some(c) = self.take_consumer(id) {
                     let browser = c.reg.browse_only;
-                    self.return_refs(cancel(c.delivering, false, failed));
+                    self.return_refs_with(
+                        cancel(c.delivering, &c.reg.metrics, false, failed),
+                        true,
+                    );
                     if !browser {
                         if self.consumers.is_empty() {
                             self.stop_dispatch();
@@ -2501,9 +2519,13 @@ impl Actor {
                         self.groups.retain(|_, c| *c != id);
                     }
                 }
+                // `deleteMatchingReferences`: scheduled and paged messages
+                // too.
                 if self.shared.config().purge_on_no_consumers && self.consumers.is_empty() {
-                    let refs = self.messages.take_where(|_| true);
-                    refs.into_iter().for_each(|r| self.kill(r));
+                    self.act(
+                        &Selection::filter(None),
+                        &SelectionAction::Remove(AckReason::Killed),
+                    );
                 }
                 let _ = done.send(());
             }
@@ -2546,7 +2568,12 @@ impl Actor {
                     Some(c) if !c.reg.browse_only => {
                         c.started = false;
                         c.large = None;
-                        cancel(std::mem::take(&mut c.delivering), last_as_delivered, failed)
+                        cancel(
+                            std::mem::take(&mut c.delivering),
+                            &c.reg.metrics,
+                            last_as_delivered,
+                            failed,
+                        )
                     }
                     _ => Vec::new(),
                 };
@@ -2560,17 +2587,14 @@ impl Actor {
             Cmd::AddRedistributor { delay } => self.add_redistributor(delay),
             Cmd::CancelRedistributor => self.cancel_redistributor(),
             Cmd::DeleteMatching { filter, reply } => {
-                let refs = self
-                    .messages
-                    .take_where(|r| filter.as_ref().is_none_or(|f| f.matches(&*r.message)));
-                let n = refs.len();
-                refs.into_iter().for_each(|r| self.kill(r));
+                let n = self.act(
+                    &Selection::filter(filter),
+                    &SelectionAction::Remove(AckReason::Killed),
+                );
                 let _ = reply.send(n);
             }
             Cmd::TakeMatching { filter, reply } => {
-                let refs = self
-                    .messages
-                    .take_where(|r| filter.as_ref().is_none_or(|f| f.matches(&*r.message)));
+                let refs = self.take_all_selected(&Selection::filter(filter));
                 if let Err(refs) = reply.send(refs) {
                     // The caller went: the messages stay.
                     self.return_refs(refs);
@@ -2596,7 +2620,11 @@ impl Actor {
                         .delivering
                         .iter()
                         .position(|r| r.message_id() == message_id)?;
-                    c.delivering.remove(i)
+                    let r = c.delivering.remove(i)?;
+                    c.reg
+                        .metrics
+                        .add_acknowledge(r.message.encode_size() as i64, false);
+                    Some(r)
                 });
                 if let Some(mut r) = r {
                     if !failed {
@@ -2611,7 +2639,10 @@ impl Actor {
             // `deliveringRefs.addFirst`: ahead of what was delivered since, so a
             // cumulative acknowledgement reaches it first.
             Cmd::BackToDelivering { id, r } => match self.consumer_mut(id) {
-                Some(c) => c.delivering.push_front(r),
+                Some(c) => {
+                    c.reg.metrics.add_message(r.message.encode_size() as i64);
+                    c.delivering.push_front(r);
+                }
                 None => self.return_refs(vec![r]),
             },
             Cmd::Reject {
@@ -2619,7 +2650,7 @@ impl Actor {
                 message_id,
                 properties,
             } => {
-                if let Some(mut r) = self.take_delivered_for_good(id, message_id) {
+                if let Some(mut r) = self.take_delivered_for_good(id, message_id, true) {
                     if !properties.is_empty() {
                         let mut core = r.message.core().clone();
                         for (k, v) in properties {
@@ -2662,7 +2693,8 @@ impl Actor {
             Cmd::Expire { .. } if self.queue().is_mirror_controller() => {}
             Cmd::ExpireScan if self.expiry_disabled() => {}
             Cmd::Expire { id, message_id } => {
-                if let Some(r) = self.take_delivered_for_good(id, message_id) {
+                // Artemis's expiry leaves the consumer's metrics alone.
+                if let Some(r) = self.take_delivered_for_good(id, message_id, false) {
                     self.expire(r);
                 }
             }
@@ -2690,13 +2722,26 @@ impl Actor {
     /// leaves the queue with it, so the message is acknowledged once. A
     /// copy whose reference has gone (another consumer's rejection or
     /// expiry took it) owns nothing, and is only dropped.
-    fn take_delivered_for_good(&mut self, id: ConsumerId, message_id: i64) -> Option<MessageRef> {
+    /// A rejection counts as the consumer's acknowledgement
+    /// (`ServerConsumerImpl.reject`); an expiry does not.
+    fn take_delivered_for_good(
+        &mut self,
+        id: ConsumerId,
+        message_id: i64,
+        acknowledged: bool,
+    ) -> Option<MessageRef> {
         let r = self.consumer_mut(id).and_then(|c| {
             let i = c
                 .delivering
                 .iter()
                 .position(|r| r.message_id() == message_id)?;
-            c.delivering.remove(i)
+            let r = c.delivering.remove(i)?;
+            if acknowledged {
+                c.reg
+                    .metrics
+                    .add_acknowledge(r.message.encode_size() as i64, false);
+            }
+            Some(r)
         })?;
         if self.shared.config().non_destructive {
             let at = self.messages.find(|q| q.message_id() == message_id)?;
@@ -2751,6 +2796,13 @@ impl Actor {
         } else {
             loop {
                 let Some(r) = c.delivering.pop_front() else {
+                    // Those acknowledged before the missing one count, as
+                    // Artemis counts each as it goes.
+                    for r in &refs {
+                        c.reg
+                            .metrics
+                            .add_acknowledge(r.message.encode_size() as i64, transactional);
+                    }
                     return Err(AckError { refs });
                 };
                 let done = r.message_id() == message_id;
@@ -3044,6 +3096,12 @@ impl Actor {
             self.shared.tx.send(Cmd::ResumeLarge).ok();
         }
         let c = &mut self.consumers[index];
+        if c.reg.pre_acknowledge {
+            // With pre-ack, the message is acknowledged as it is sent.
+            c.reg
+                .metrics
+                .add_acknowledge(r.message.encode_size() as i64, false);
+        }
         if non_destructive {
             c.mark_browsed(r.message_id(), &self.messages);
             if !c.reg.pre_acknowledge {
@@ -3293,6 +3351,7 @@ fn rand_unit() -> f64 {
 /// client failed.
 fn cancel(
     delivering: VecDeque<MessageRef>,
+    metrics: &ConsumerMetrics,
     last_as_delivered: bool,
     failed: bool,
 ) -> Vec<MessageRef> {
@@ -3300,6 +3359,7 @@ fn cancel(
     delivering
         .into_iter()
         .map(|mut r| {
+            metrics.add_acknowledge(r.message.encode_size() as i64, false);
             if keep_first {
                 keep_first = false;
             } else if !failed {
