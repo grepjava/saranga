@@ -39,8 +39,10 @@ pub(crate) enum Val<'a> {
     Double(f64),
     Char(u16),
     Str(Cow<'a, str>),
-    /// `byte[]`: its contents never matter to the selector.
-    Bytes,
+    /// `byte[]`: its contents never matter to the selector, only which
+    /// array it is: the property it was read from, whose lookup gives the
+    /// same array each time.
+    Bytes(Option<String>),
     /// `BigDecimal`, only ever produced by integer literals beyond `long`.
     Big(BigInt),
 }
@@ -57,7 +59,7 @@ impl From<Value> for Val<'_> {
             Value::Double(d) => Val::Double(d),
             Value::Char(c) => Val::Char(c),
             Value::String(s) => Val::Str(Cow::Owned(s)),
-            Value::Bytes(_) => Val::Bytes,
+            Value::Bytes(_) => Val::Bytes(None),
         }
     }
 }
@@ -76,7 +78,7 @@ impl Val<'_> {
             Val::Char(c) => String::from_utf16_lossy(&[*c]).into(),
             Val::Str(s) => Cow::Borrowed(s),
             // Java prints `[B@` and an identity hash code.
-            Val::Bytes => Cow::Borrowed("[B@0"),
+            Val::Bytes(_) => Cow::Borrowed("[B@0"),
             Val::Big(b) => b.to_string().into(),
         }
     }
@@ -247,7 +249,10 @@ impl Expr {
                 Constant::Big(v) => Val::Big(v.clone()),
             })),
             Expr::BoolConst(b) => Ok(b.map(Val::Bool)),
-            Expr::Property(name) => Ok(ctx.target.try_get(name)?.map(Val::from)),
+            Expr::Property(name) => Ok(ctx.target.try_get(name)?.map(|v| match Val::from(v) {
+                Val::Bytes(_) => Val::Bytes(Some(name.clone())),
+                v => v,
+            })),
             Expr::Arith(op, left, right) => {
                 let Some(l) = left.evaluate(ctx)? else {
                     return Ok(None);
@@ -283,20 +288,22 @@ impl Expr {
                     (None, None) => true,
                     (None, Some(_)) => return Ok(None),
                     (Some(_), None) => false,
-                    // `byte[]` is not Comparable, and its `equals` is identity.
-                    (Some(Val::Bytes), Some(_)) | (Some(_), Some(Val::Bytes)) => false,
+                    // `byte[]` is not Comparable, and its `equals` is identity
+                    // (`lv == rv`): a property is equal to itself.
+                    (Some(Val::Bytes(Some(l))), Some(Val::Bytes(Some(r)))) if l == r => true,
+                    (Some(Val::Bytes(_)), Some(_)) | (Some(_), Some(Val::Bytes(_))) => false,
                     (Some(l), Some(r)) => compare(CmpOp::Eq, l, r, ctx.convert_strings),
                 })))
             }
             Expr::Compare(op, left, right) => {
                 let l = match left.evaluate(ctx)? {
                     None => return Ok(None),
-                    Some(Val::Bytes) => return Err(not_comparable()),
+                    Some(Val::Bytes(_)) => return Err(not_comparable()),
                     Some(v) => v,
                 };
                 let r = match right.evaluate(ctx)? {
                     None => return Ok(None),
-                    Some(Val::Bytes) => return Err(not_comparable()),
+                    Some(Val::Bytes(_)) => return Err(not_comparable()),
                     Some(v) => v,
                 };
                 Ok(Some(Val::Bool(compare(*op, l, r, ctx.convert_strings))))

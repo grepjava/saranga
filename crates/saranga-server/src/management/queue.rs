@@ -27,7 +27,10 @@ pub(super) async fn attribute(
         "User" => Json::from(c.user.clone()),
         "RoutingType" => Json::from(c.routing_type.name()),
         "Temporary" => Json::from(c.temporary),
-        "RetroactiveResource" => Json::from(c.name.starts_with(&*internal_prefix(broker))),
+        "RetroactiveResource" => Json::from(crate::retroactive::is_retroactive_resource(
+            &internal_prefix(broker),
+            &c.name,
+        )),
         "MessageCount" => Json::from(q.message_count()),
         "PersistentSize" => {
             let s = q.stats().await;

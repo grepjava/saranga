@@ -94,11 +94,10 @@ pub(super) async fn attribute(
         "Temporary" => Json::from(st.info.temporary),
         "AutoCreated" => Json::from(st.info.auto_created),
         "Internal" => Json::from(st.info.internal),
-        "RetroactiveResource" => Json::from(
-            st.info
-                .name
-                .starts_with(&*super::queue::internal_prefix(broker)),
-        ),
+        "RetroactiveResource" => Json::from(crate::retroactive::is_retroactive_resource(
+            &super::queue::internal_prefix(broker),
+            &st.info.name,
+        )),
         "CurrentDuplicateIdCacheSize" => Json::from(if po.duplicate_cache_exists(name) {
             crate::duplicate::lock(&po.duplicate_cache(name)).len() as i64
         } else {

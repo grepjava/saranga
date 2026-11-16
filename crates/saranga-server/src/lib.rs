@@ -42,6 +42,7 @@ pub mod reload;
 pub mod remote_binding;
 pub mod replay;
 pub mod replication;
+pub mod retroactive;
 pub mod routing;
 pub mod session;
 pub mod settings;
@@ -389,13 +390,53 @@ impl BrokerConfig {
 
 /// `PostOfficeImpl.ExpiryReaper`: every period, each queue expires the
 /// messages whose time has passed. It stops with the post office.
+/// What a start that fails part-way has set running is stopped, as
+/// Artemis's failed `start` stops the server: the queues' actors, the
+/// stores and the primary lock, or the whole broker once there is one.
+struct StartGuard {
+    storage: Option<Arc<storage::Storage>>,
+    node_manager: Option<Arc<node::NodeManager>>,
+    post_office: Option<Arc<PostOffice>>,
+    broker: Option<Arc<Broker>>,
+    done: bool,
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        if let Some(b) = &self.broker {
+            if let Err(e) = b.stop() {
+                tracing::warn!("stopping a broker that failed to start: {e}");
+            }
+            return;
+        }
+        if let Some(po) = &self.post_office {
+            po.mark_stopped();
+            for q in po.queues() {
+                q.stop();
+            }
+            po.paging().stop();
+        }
+        if let Some(s) = &self.storage {
+            let _ = s.stop();
+        }
+        if let Some(n) = &self.node_manager
+            && n.holds_primary_lock()
+        {
+            let _ = n.pause_primary();
+        }
+    }
+}
+
 fn spawn_expiry_reaper(post_office: &Arc<PostOffice>, period_ms: i64) {
     let post_office = Arc::downgrade(post_office);
     let period = std::time::Duration::from_millis(period_ms as u64);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(period).await;
-            let Some(po) = post_office.upgrade() else {
+            let Some(po) = post_office.upgrade().filter(|p| !p.is_stopped()) else {
                 break;
             };
             for q in po.queues() {
@@ -414,7 +455,7 @@ fn spawn_address_queue_reaper(post_office: &Arc<PostOffice>, period_ms: i64) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(period).await;
-            let Some(po) = post_office.upgrade() else {
+            let Some(po) = post_office.upgrade().filter(|p| !p.is_stopped()) else {
                 break;
             };
             po.reap(false);
@@ -485,7 +526,9 @@ fn spawn_transaction_reaper(broker: &Arc<Broker>, period_ms: i64) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(period).await;
-            let Some(b) = broker.upgrade() else { break };
+            let Some(b) = broker.upgrade().filter(|b| !b.is_stopped()) else {
+                break;
+            };
             for tx in b.resource_manager.take_timed_out(message::now_millis()) {
                 let outcome = transaction::lock(&tx).rollback();
                 match outcome {
@@ -723,6 +766,13 @@ impl Broker {
             }
             None => (Arc::new(IdGenerator::new(1)), None, None),
         };
+        let mut guard = StartGuard {
+            storage: storage.clone(),
+            node_manager: node_manager.clone(),
+            post_office: None,
+            broker: None,
+            done: false,
+        };
         let large_messages = match &config.storage {
             Some(sc) => {
                 large::LargeMessageStore::new(sc.large_messages.clone(), sc.large_message_sync)
@@ -770,6 +820,10 @@ impl Broker {
         );
         if let Some(s) = &storage {
             post_office.set_large_messages(large_messages.clone(), s.max_record_size());
+        }
+        guard.post_office = Some(post_office.clone());
+        if let Some(f) = &config.management.file {
+            post_office.set_internal_prefix(f.internal_naming_prefix.clone());
         }
         // registerBrokerPlugins: before anything is loaded, so the plugins
         // see the addresses and queues recovered and deployed.
@@ -1016,6 +1070,7 @@ impl Broker {
                 broker.node_id.clone(),
                 broker.management.address().to_owned(),
             ));
+        guard.broker = Some(broker.clone());
         if let Some(store) = &broker.security {
             let po = Arc::downgrade(&broker.post_office);
             store.set_violation_listener(Arc::new(move |v| {
@@ -1091,6 +1146,7 @@ impl Broker {
         for p in broker.protocols.clone() {
             p.start_services(&broker);
         }
+        guard.done = true;
         Ok(broker)
     }
 
@@ -1291,19 +1347,31 @@ impl Broker {
             }
         }
         self.stop_services();
+        // No new connections, and those there closed (what whoever runs the
+        // broker does first, with waits, is done here at once if not): the
+        // acceptors' tasks hold the broker, and their ports stay bound
+        // while they run.
+        self.abort_acceptors();
+        self.close_unestablished();
+        for c in self.registry().connections() {
+            if !self.is_backup_connection(&c) {
+                c.disconnect();
+            }
+        }
+        self.post_office.mark_stopped();
         self.stop_replicating();
         self.large_messages.stop();
         self.post_office.paging().stop();
         // After a critical I/O error the stores fail whatever they are
-        // asked to write: the stop goes on regardless.
+        // asked to write: the stop goes on regardless. Otherwise the error
+        // is returned once the queues are stopped and the lock let go.
         let critical = self.is_critical_io_failed();
-        if let Some(s) = &self.storage {
-            match s.stop() {
-                Err(e) if !critical => {
-                    return Err(BrokerError::internal(format!("stopping the journals: {e}")));
-                }
-                _ => {}
-            }
+        let mut failed = None;
+        if let Some(s) = &self.storage
+            && let Err(e) = s.stop()
+            && !critical
+        {
+            failed = Some(BrokerError::internal(format!("stopping the journals: {e}")));
         }
         // Each queue's actor holds its queue, its pages and the storage:
         // they end with the broker. What they drop is in the journals, and
@@ -1327,10 +1395,13 @@ impl Broker {
             } else if let Err(e) = n.pause_primary()
                 && !critical
             {
-                return Err(BrokerError::internal(format!("server.lock: {e}")));
+                failed.get_or_insert(BrokerError::internal(format!("server.lock: {e}")));
             }
         }
-        Ok(())
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     pub fn node_id(&self) -> &str {

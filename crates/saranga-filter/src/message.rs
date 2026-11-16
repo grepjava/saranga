@@ -1,7 +1,7 @@
 //! Filtering Core messages. Ported from `FilterImpl.FilterableServerMessage`
 //! and `FilterImpl.getHeaderFieldValue`.
 
-use saranga_buffer::{PropertyValue, Writer};
+use saranga_buffer::PropertyValue;
 use saranga_message::CoreMessage;
 
 use crate::{Filterable, PropertyError, Value};
@@ -91,11 +91,9 @@ fn header(msg: &CoreMessage, id: &str) -> Result<Option<Value>, PropertyError> {
 /// `CoreMessage.getEncodeSize()`: the length of the full message buffer as
 /// `CoreMessage::encode` writes it (end-of-body position, body, headers and
 /// properties), which is what the Java broker holds for a message it
-/// received.
+/// received. Counted, not encoded: a filter asks for it for every message.
 pub(crate) fn encode_size(msg: &CoreMessage) -> i32 {
-    let mut w = Writer::new();
-    msg.encode(&mut w);
-    w.len() as i32
+    msg.encode_size() as i32
 }
 
 /// `ByteUtil.bytesToInt(message.getExtraBytesProperty(HDR_HOPS))`.

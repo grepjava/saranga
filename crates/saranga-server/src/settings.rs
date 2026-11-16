@@ -45,6 +45,12 @@ pub struct AddressSettings {
     pub default_group_buckets: i32,
     pub default_group_first_key: Option<String>,
     pub default_ring_size: i64,
+    /// `retroactive-message-count`: messages kept for queues made on the
+    /// address later.
+    pub retroactive_message_count: i64,
+    /// `enable-ingress-timestamp`: a message sent to the address is
+    /// stamped with the time the broker took it.
+    pub enable_ingress_timestamp: bool,
     pub default_address_routing_type: RoutingType,
     pub default_queue_routing_type: RoutingType,
     pub max_delivery_attempts: i32,
@@ -53,7 +59,9 @@ pub struct AddressSettings {
     pub redelivery_delay: i64,
     pub redelivery_multiplier: f64,
     pub redelivery_collision_avoidance_factor: f64,
-    pub max_redelivery_delay: i64,
+    /// `max-redelivery-delay`; unset, ten times the redelivery delay
+    /// ([`Self::max_redelivery_delay`]).
+    pub max_redelivery_delay: Option<i64>,
     pub expiry_delay: i64,
     pub min_expiry_delay: i64,
     pub max_expiry_delay: i64,
@@ -151,6 +159,12 @@ pub enum AddressFullPolicy {
 impl AddressSettings {
     /// `DEFAULT_MIN_EXPIRY_DELAY` / `DEFAULT_MAX_EXPIRY_DELAY`: unset.
     pub const NO_EXPIRY_DELAY: i64 = -1;
+
+    /// `getMaxRedeliveryDelay`: as set, or ten times the redelivery delay.
+    pub fn max_redelivery_delay(&self) -> i64 {
+        self.max_redelivery_delay
+            .unwrap_or_else(|| self.redelivery_delay.wrapping_mul(10))
+    }
 }
 
 impl Default for AddressSettings {
@@ -185,6 +199,8 @@ impl Default for AddressSettings {
             default_group_buckets: -1,
             default_group_first_key: None,
             default_ring_size: -1,
+            retroactive_message_count: 0,
+            enable_ingress_timestamp: false,
             default_address_routing_type: RoutingType::Multicast,
             default_queue_routing_type: RoutingType::Multicast,
             max_delivery_attempts: 10,
@@ -193,7 +209,7 @@ impl Default for AddressSettings {
             redelivery_delay: 0,
             redelivery_multiplier: 1.0,
             redelivery_collision_avoidance_factor: 0.0,
-            max_redelivery_delay: 0,
+            max_redelivery_delay: None,
             expiry_delay: -1,
             min_expiry_delay: -1,
             max_expiry_delay: -1,

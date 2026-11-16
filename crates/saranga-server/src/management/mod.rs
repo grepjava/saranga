@@ -333,7 +333,7 @@ impl Management {
             Resource::Broker => server::attribute(self, broker, &upper).await,
             Resource::Address(a) => address::attribute(broker, a, &upper).await,
             Resource::Queue(q) => queue::attribute(broker, q, &upper).await,
-            Resource::Divert(d) => Ok(divert_attribute(d, &upper)),
+            Resource::Divert(d) => Ok(divert_attribute(broker, d, &upper)),
             Resource::Acceptor(a) => Ok(acceptor_attribute(broker, a, &upper)),
             Resource::BroadcastGroup(g) => Ok(broadcast_group_attribute(g, &upper)),
             Resource::Bridge(b) => bridge_attribute(b, &upper),
@@ -464,7 +464,7 @@ impl Management {
                         Resource::Broker => server::attribute(self, broker, attr).await,
                         Resource::Address(a) => address::attribute(broker, a, attr).await,
                         Resource::Queue(q) => queue::attribute(broker, q, attr).await,
-                        Resource::Divert(d) => Ok(divert_attribute(d, attr)),
+                        Resource::Divert(d) => Ok(divert_attribute(broker, d, attr)),
                         Resource::Acceptor(a) => Ok(acceptor_attribute(broker, a, attr)),
                         Resource::BroadcastGroup(g) => Ok(broadcast_group_attribute(g, attr)),
                         Resource::Bridge(b) => bridge_attribute(b, attr),
@@ -858,10 +858,15 @@ fn invoke_broker_connection(
     Some(Ok(Json::Null))
 }
 
-fn divert_attribute(d: &crate::postoffice::Divert, name: &str) -> Option<Json> {
+fn divert_attribute(broker: &Broker, d: &crate::postoffice::Divert, name: &str) -> Option<Json> {
     use crate::postoffice::DivertRoutingType as T;
     Some(match name {
         "UniqueName" | "Name" => Json::from(&*d.name),
+        // `isRetroactiveResource` of the divert's unique name.
+        "RetroactiveResource" => Json::from(crate::retroactive::is_retroactive_resource(
+            &queue::internal_prefix(broker),
+            &d.name,
+        )),
         "Address" => Json::from(&*d.address),
         "ForwardingAddress" => Json::from(d.forwarding.join(",")),
         "RoutingName" => Json::from(&*d.routing_name),

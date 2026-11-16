@@ -82,6 +82,14 @@ impl BrokerError {
         )
     }
 
+    pub fn cannot_delete_queue_with_messages(name: &str, messages: i64) -> Self {
+        Self::bundle(
+            ErrorType::IllegalState,
+            229215,
+            format!("Cannot delete queue {name} on binding {name} - it has {messages} messages"),
+        )
+    }
+
     pub fn consumer_no_reference(consumer: i64, message: i64, queue: &str) -> Self {
         Self::bundle(
             ErrorType::IllegalState,

@@ -16,6 +16,8 @@ use crate::settings::AddressSettings;
 
 /// `Message.HDR_VALIDATED_USER`.
 pub const HDR_VALIDATED_USER: &str = "_AMQ_VALIDATED_USER";
+/// `Message.HDR_INGRESS_TIMESTAMP`: when the broker took the message.
+pub const HDR_INGRESS_TIMESTAMP: &str = "_AMQ_INGRESS_TIMESTAMP";
 
 /// `Message.HDR_ROUTING_TYPE`.
 pub const HDR_ROUTING_TYPE: &str = "_AMQ_ROUTING_TYPE";
@@ -111,8 +113,11 @@ pub fn scheduled_delivery_time(message: &CoreMessage) -> i64 {
 }
 
 /// `Message.isExpired`.
+///
+/// As in Java the subtraction wraps: an expiration so far in the past that
+/// it overflows (`i64::MIN`) never expires, as in Artemis.
 pub fn is_expired(message: &CoreMessage, now: i64) -> bool {
-    message.expiration != 0 && now - message.expiration >= 0
+    message.expiration != 0 && now.wrapping_sub(message.expiration) >= 0
 }
 
 /// `PostOfficeImpl.applyExpiryDelay`, reading the clock only when `s`
@@ -132,25 +137,27 @@ pub fn apply_expiry_delay_now(message: &mut CoreMessage, s: &AddressSettings) {
 /// `PostOfficeImpl.applyExpiryDelay`: the address's expiry settings applied
 /// to a message being routed.
 pub fn apply_expiry_delay(message: &mut CoreMessage, s: &AddressSettings, now: i64) {
+    // Java's `long` additions, which wrap.
+    let at = |delay: i64| now.wrapping_add(delay);
     if s.no_expiry {
         message.expiration = 0;
     } else if s.expiry_delay >= 0 {
         if message.expiration == 0 {
-            message.expiration = now + s.expiry_delay;
+            message.expiration = at(s.expiry_delay);
         }
     } else {
         let (min, max) = (s.min_expiry_delay, s.max_expiry_delay);
         let unset = AddressSettings::NO_EXPIRY_DELAY;
         if message.expiration == 0 {
             if max != unset {
-                message.expiration = now + max;
+                message.expiration = at(max);
             } else if min != unset {
-                message.expiration = now + min;
+                message.expiration = at(min);
             }
-        } else if max != unset && message.expiration > now + max {
-            message.expiration = now + max;
-        } else if min != unset && message.expiration < now + min {
-            message.expiration = now + min;
+        } else if max != unset && message.expiration > at(max) {
+            message.expiration = at(max);
+        } else if min != unset && message.expiration < at(min) {
+            message.expiration = at(min);
         }
     }
 }
@@ -559,8 +566,21 @@ impl ServerMessage {
         }))
     }
 
+    /// The whole message as a Core message (`toCore`): a large native
+    /// message is rebuilt from its body's file first, as a delivery
+    /// rebuilds it, since only its headers are kept in memory. A Core
+    /// message is itself, its large body (if any) still in its file.
+    pub fn whole_core(&self) -> std::io::Result<CoreMessage> {
+        match (&self.native, &self.large) {
+            (Some(n), Some(body)) => Ok(n.reconstitute(body.read_all()?).to_core()),
+            (Some(n), None) => Ok(n.to_core()),
+            (None, _) => Ok(self.core.clone()),
+        }
+    }
+
     /// The message as a Core message, for delivery to a client of another
-    /// protocol (`Message.toCore`).
+    /// protocol (`Message.toCore`). A large native message must be rebuilt
+    /// first (see [`Self::whole_core`]).
     pub fn delivery_core(&self) -> &CoreMessage {
         self.converted().map_or(&self.core, |c| &c.0)
     }
@@ -763,5 +783,29 @@ impl MessageRef {
 
     pub fn message_id(&self) -> i64 {
         self.message.message_id()
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    /// Java's wrapping `long` arithmetic, without a debug-build panic: an
+    /// expiration of `i64::MIN` never expires, as in Artemis.
+    #[test]
+    fn extreme_expirations_wrap_as_java_does() {
+        let now = 1_750_000_000_000;
+        let m = CoreMessage {
+            expiration: i64::MIN,
+            ..Default::default()
+        };
+        assert!(!is_expired(&m, now));
+        let s = AddressSettings {
+            max_expiry_delay: i64::MAX,
+            ..AddressSettings::default()
+        };
+        let mut m = CoreMessage::default();
+        apply_expiry_delay(&mut m, &s, now);
+        assert_eq!(m.expiration, now.wrapping_add(i64::MAX));
     }
 }

@@ -465,12 +465,18 @@ async fn serve<S>(
     // limited from the start.
     let connection_security = broker.security().is_some() && acceptor.core_connection_security;
     let frame_limit = connection_security.then_some(acceptor.core_initial_max_frame_size);
+    // `createConnectionEntry`: the override from the start, or the default
+    // until the client's first ping says otherwise.
+    let ttl = match broker.connection_ttl_override() {
+        -1 => DEFAULT_CONNECTION_TTL,
+        ttl => ttl,
+    };
     let mut conn = Connection {
         broker,
         shared,
         sessions: HashMap::new(),
         session_tasks: Vec::new(),
-        ttl: DEFAULT_CONNECTION_TTL,
+        ttl,
         topology_subscribed: false,
         acceptor,
         connection_security,

@@ -644,7 +644,7 @@ pub fn to_core(m: &AmqpMessage, now: i64) -> CoreMessage {
                     put(
                         &mut core,
                         HDR_SCHEDULED_DELIVERY_TIME,
-                        PropertyValue::Long(now + d),
+                        PropertyValue::Long(now.wrapping_add(d)),
                     );
                 }
             } else if key == annotation::INGRESS_TIME
@@ -1104,7 +1104,7 @@ pub fn from_core(core: &CoreMessage, now: i64) -> AmqpMessage {
         Some(other) => Some(property_value(other)),
     };
     if core.expiration != 0 {
-        let ttl = (core.expiration - now).max(1);
+        let ttl = core.expiration.wrapping_sub(now).max(1);
         header.get_or_insert_with(Header::default).ttl = Some(ttl as u32);
         properties.absolute_expiry_time = Some(Timestamp(core.expiration));
     }

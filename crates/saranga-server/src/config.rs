@@ -164,6 +164,8 @@ fn resolve(s: &cfg::AddressSettings) -> AddressSettings {
         default_group_buckets: s.default_group_buckets(),
         default_group_first_key: s.default_group_first_key.clone(),
         default_ring_size: s.default_ring_size(),
+        retroactive_message_count: s.retroactive_message_count(),
+        enable_ingress_timestamp: s.enable_ingress_timestamp(),
         default_address_routing_type: routing_type(s.default_address_routing_type()),
         default_queue_routing_type: routing_type(s.default_queue_routing_type()),
         max_delivery_attempts: s.max_delivery_attempts(),
@@ -172,7 +174,7 @@ fn resolve(s: &cfg::AddressSettings) -> AddressSettings {
         redelivery_delay: s.redelivery_delay(),
         redelivery_multiplier: s.redelivery_multiplier(),
         redelivery_collision_avoidance_factor: s.redelivery_collision_avoidance_factor(),
-        max_redelivery_delay: s.max_redelivery_delay(),
+        max_redelivery_delay: s.max_redelivery_delay,
         expiry_delay: s.expiry_delay(),
         min_expiry_delay: s.min_expiry_delay(),
         max_expiry_delay: s.max_expiry_delay(),
@@ -419,7 +421,7 @@ impl BrokerConfig {
                 // `\`, as Artemis's fixed `WildcardConfiguration.ESCAPE`.
                 uses_escape: true,
             },
-            connection_ttl_override: -1,
+            connection_ttl_override: config.connection_ttl_override,
             // FileBroker deploys the legacy <jms> configuration after the
             // core's addresses.
             addresses: config

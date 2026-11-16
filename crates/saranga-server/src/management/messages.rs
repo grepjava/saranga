@@ -15,7 +15,11 @@ use crate::message::{MessageRef, ServerMessage};
 /// message's whole content, not the view the broker routes by.
 fn full_core(m: &ServerMessage) -> Cow<'_, CoreMessage> {
     match m.native() {
-        Some(n) => Cow::Owned(n.to_core()),
+        // A large one's body is read from its file.
+        Some(n) => Cow::Owned(m.whole_core().unwrap_or_else(|e| {
+            tracing::warn!("reading message {}: {e}", m.message_id());
+            n.to_core()
+        })),
         None => Cow::Borrowed(m.core()),
     }
 }

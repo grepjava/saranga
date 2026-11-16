@@ -30,8 +30,8 @@ pub const MAX_DEPTH: usize = 1024;
 pub(crate) fn compile(expression: &str) -> Result<sxd_xpath::XPath, String> {
     let invalid = |e: String| format!("invalid XPath expression {expression:?}: {e}");
     lexer::within_jdk_limits(expression).map_err(invalid)?;
-    lexer::check_calls(expression).map_err(invalid)?;
-    match sxd_xpath::Factory::new().build(expression) {
+    let expression = lexer::check_calls(expression).map_err(invalid)?;
+    match sxd_xpath::Factory::new().build(&expression) {
         Ok(Some(xpath)) => Ok(xpath),
         Ok(None) => Err("an empty XPath expression".to_owned()),
         Err(e) => Err(invalid(e.to_string())),
@@ -201,6 +201,32 @@ mod tests {
         assert!(!matches("//invoice", body));
         assert!(!matches("//order", None));
         assert!(!matches("//order", Some("not xml")));
+    }
+
+    /// Whitespace XPath allows before a call's `(` and within an empty
+    /// `( )`, which the JDK reads, compiles here too.
+    #[test]
+    fn whitespace_around_a_call_is_allowed() {
+        let body = Some("<root><a>hi</a></root>");
+        for expression in [
+            "count (//a) > 0",
+            "//a/text () = 'hi'",
+            "//a/node( )",
+            "count( //a ) = 1",
+            "string-length (string (/)) = 2",
+            "//a [ position () = 1 ]",
+            "child :: root",
+            "/ root / a",
+            "//root/a [@ x = 1] | //a",
+            "child::root/ child ::a",
+        ] {
+            assert!(compile(expression).is_ok(), "{expression}");
+            assert!(matches(expression, body), "{expression}");
+        }
+        // An operator name before a group stays an operator.
+        assert!(matches("1 = 1 and (2 = 2)", body));
+        assert!(!matches("1 = 1 and (2 = 3)", body));
+        assert!(matches("'a (b)' = concat ('a (', 'b)')", body));
     }
 
     #[test]

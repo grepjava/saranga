@@ -191,8 +191,13 @@ fn name_char(c: char) -> bool {
 /// (`node()`, `text()`...) given arguments it does not take, and a call
 /// where only a node test can be (after `@` or an axis, or `*`). A
 /// prefixed name is left for evaluation to fail, as Java leaves it.
-pub(super) fn check_calls(expression: &str) -> Result<(), String> {
+///
+/// Returns the expression as `sxd_xpath` reads what the JDK reads: without
+/// the whitespace XPath allows between a call's name and its `(`
+/// (`count (//a)`) or within an empty `( )` (`node( )`), which it refuses.
+pub(super) fn check_calls(expression: &str) -> Result<String, String> {
     let chars: Vec<char> = expression.chars().collect();
+    let mut dropped = vec![false; chars.len()];
     let skip_space = |mut i: usize| {
         while chars.get(i).is_some_and(|c| c.is_whitespace()) {
             i += 1;
@@ -202,6 +207,8 @@ pub(super) fn check_calls(expression: &str) -> Result<(), String> {
     let mut previous = Previous::Opening;
     let mut after_axis = false;
     let mut call: Option<String> = None;
+    // A name was followed by `(`: the next `(` opens its arguments.
+    let mut calling = false;
     let mut frames: Vec<Frame> = Vec::new();
     let mut i = 0;
     while i < chars.len() {
@@ -218,6 +225,12 @@ pub(super) fn check_calls(expression: &str) -> Result<(), String> {
         let was_after_axis = std::mem::take(&mut after_axis);
         match c {
             '(' | '[' => {
+                if c == '(' && std::mem::take(&mut calling) {
+                    let close = skip_space(i + 1);
+                    if chars.get(close) == Some(&')') {
+                        dropped[i + 1..close].fill(true);
+                    }
+                }
                 frames.push(Frame {
                     function: if c == '(' { call.take() } else { None },
                     commas: 0,
@@ -260,6 +273,14 @@ pub(super) fn check_calls(expression: &str) -> Result<(), String> {
                 i += 1;
             }
             ':' if chars.get(i + 1) == Some(&':') => {
+                // `child :: a`: whitespace around the axis separator.
+                let mut before = i;
+                while before > 0 && chars[before - 1].is_whitespace() {
+                    before -= 1;
+                }
+                dropped[before..i].fill(true);
+                let next = skip_space(i + 2);
+                dropped[i + 2..next].fill(true);
                 after_axis = true;
                 previous = Previous::Opening;
                 i += 2;
@@ -323,6 +344,8 @@ pub(super) fn check_calls(expression: &str) -> Result<(), String> {
                 previous = Previous::Operand;
                 let after = skip_space(i);
                 if chars.get(after) == Some(&'(') {
+                    dropped[i..after].fill(true);
+                    calling = true;
                     let node_test = !prefixed
                         && matches!(
                             name.as_str(),
@@ -347,7 +370,12 @@ pub(super) fn check_calls(expression: &str) -> Result<(), String> {
             }
         }
     }
-    Ok(())
+    Ok(chars
+        .iter()
+        .zip(dropped)
+        .filter(|(_, d)| !d)
+        .map(|(c, _)| c)
+        .collect())
 }
 
 /// Whether the function `name` (a node test as `name()`) takes `given`

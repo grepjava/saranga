@@ -4,12 +4,18 @@
 
 /// The local time zone's offset from UTC at an instant, in seconds.
 pub fn offset(secs: i64) -> i64 {
-    // The offset changes at most a few times a year: keep the last hour's.
+    // The offset changes at most a few times a year, always on a quarter
+    // hour of UTC (zones such as Adelaide, St John's or Chatham change at
+    // :30 or :45 past a UTC hour): keep the last quarter hour's.
+    const QUARTER: i64 = 900;
     static CACHE: std::sync::Mutex<(i64, i64)> = std::sync::Mutex::new((i64::MIN, 0));
-    let hour = secs.div_euclid(3600);
+    let quarter = secs.div_euclid(QUARTER);
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if cache.0 != hour {
-        *cache = (hour, os_local_offset(hour * 3600));
+    if cache.0 != quarter {
+        *cache = (
+            quarter,
+            os_local_offset(quarter.checked_mul(QUARTER).unwrap_or(secs)),
+        );
     }
     cache.1
 }
@@ -33,7 +39,13 @@ fn os_local_offset(secs: i64) -> i64 {
     use windows_sys::Win32::System::Time::{
         FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime,
     };
-    let ticks = (secs + 11_644_473_600) * 10_000_000;
+    // An instant the FILETIME cannot hold has no local offset to give.
+    let Some(ticks) = secs
+        .checked_add(11_644_473_600)
+        .and_then(|s| s.checked_mul(10_000_000))
+    else {
+        return 0;
+    };
     let utc = FILETIME {
         dwLowDateTime: ticks as u32,
         dwHighDateTime: (ticks >> 32) as u32,
@@ -67,4 +79,16 @@ pub fn offset_millis(millis: i64) -> i64 {
 /// `new java.util.Date(millis).toString()` in the local time zone.
 pub fn java_date(millis: i64) -> String {
     saranga_storage::java::date_at_offset(millis, offset_millis(millis))
+}
+
+#[cfg(test)]
+mod tests {
+    /// An instant outside what the OS can convert has no offset, rather
+    /// than overflowing.
+    #[test]
+    fn extreme_instants_do_not_overflow() {
+        assert_eq!(super::offset(i64::MAX), super::offset(i64::MAX));
+        let _ = super::offset(i64::MIN);
+        let _ = super::offset_millis(i64::MAX);
+    }
 }

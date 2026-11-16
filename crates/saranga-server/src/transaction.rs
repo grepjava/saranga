@@ -203,6 +203,22 @@ impl Outcome {
     }
 }
 
+impl Outcome {
+    /// A commit whose record could not be written: nothing of it is
+    /// applied. Its sends do not join their queues and are no longer
+    /// counted, what it acknowledged goes back to its queues, its paging is
+    /// rolled back and its duplicate IDs are given back.
+    pub fn fail(self) {
+        for (q, r) in &self.add {
+            q.ref_down(r);
+        }
+        self.paging.after_rollback();
+        let mut back = self.acked;
+        back.extend(self.cancel);
+        return_refs(back);
+    }
+}
+
 /// `StorageManager.updateDeliveryCount` for a reference going back to its
 /// queue after a rollback.
 pub fn persist_delivery_count(q: &Queue, r: &mut MessageRef) {
@@ -304,6 +320,29 @@ impl Transaction {
             paging: std::mem::take(&mut self.paging),
             ..Outcome::default()
         }
+    }
+
+    /// What was added to a transaction the timeout reaper had rolled back
+    /// already (`addOperation` on a `ROLLEDBACK` transaction runs the
+    /// operation's `afterRollback` at once): the sends go, what was
+    /// acknowledged or browsed goes back to its queues, its paging is rolled
+    /// back. The rollback's record was written already. `None` if the
+    /// transaction is not rolled back, or nothing came since.
+    pub fn sweep_rolled_back(&mut self) -> Option<Outcome> {
+        let p = &self.paging;
+        let paged = !p.page_txs.is_empty()
+            || !p.stores.is_empty()
+            || !p.updates.is_empty()
+            || !p.stored.is_empty()
+            || !p.waiting.is_empty();
+        if self.state != TxState::RolledBack
+            || (self.sends.is_empty() && self.acks.is_empty() && self.browsed.is_empty() && !paged)
+        {
+            return None;
+        }
+        let mut outcome = self.internal_rollback();
+        outcome.record = None;
+        Some(outcome)
     }
 
     /// Why [`commit`](Self::commit) would refuse the transaction, leaving it
@@ -455,6 +494,16 @@ impl Transaction {
         }
         self.state = TxState::Prepared;
         Ok(())
+    }
+
+    /// A prepare whose record could not be written: the transaction is
+    /// active again, as Artemis's is, which marks it prepared only once
+    /// `storageManager.prepare` returned. Its duplicate IDs are given back.
+    pub fn unprepare(&mut self) {
+        if self.state == TxState::Prepared {
+            self.state = TxState::Active;
+            self.held.clear();
+        }
     }
 }
 

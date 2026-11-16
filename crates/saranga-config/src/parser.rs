@@ -862,6 +862,9 @@ fn parse_scalars(
     if let Some(v) = s.i64("transaction-timeout", Check::GtZero)? {
         config.transaction_timeout = v;
     }
+    if let Some(v) = s.i64("connection-ttl-override", Check::MinusOneOrGtZero)? {
+        config.connection_ttl_override = v;
+    }
     if let Some(v) = s.i64("transaction-timeout-scan-period", Check::GtZero)? {
         config.transaction_timeout_scan_period = v;
     }

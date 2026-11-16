@@ -37,6 +37,7 @@ fn props() -> Props {
         ("strB", Value::String("b".into())),
         ("charA", Value::Char(u16::from(b'a'))),
         ("bytes", Value::Bytes(vec![1, 2, 3])),
+        ("sameBytes", Value::Bytes(vec![1, 2, 3])),
         ("trueProp", Value::Bool(true)),
         ("falseProp", Value::Bool(false)),
         ("name", Value::String("James".into())),
@@ -192,7 +193,12 @@ fn booleans_and_bytes() {
     check(&[
         ("trueProp > falseProp", true),
         ("trueProp = 1", false),
-        ("bytes = bytes", false),
+        // `lv == rv`: a property's `byte[]` is the same array each time it is
+        // read, so it equals itself, and no other.
+        ("bytes = bytes", true),
+        ("bytes <> bytes", false),
+        ("bytes = sameBytes", false),
+        ("bytes <> sameBytes", true),
         ("bytes IS NULL", false),
         ("bytes > 1", false),
         ("NOT (bytes > 1)", false),

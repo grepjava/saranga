@@ -1529,6 +1529,9 @@ async fn delete_address(broker: &Arc<Broker>, name: &str, force: bool) -> Outcom
     for b in remote {
         po.remove_remote_binding(b.unique_name());
     }
+    if force {
+        po.unbind_diverts(name);
+    }
     if !po.remove_address(name) {
         return Err(format!("AMQ229205: Address {name} has bindings"));
     }

@@ -242,3 +242,30 @@ async fn unreadable_large_body(chunks: bool) {
     assert_eq!(q.message_count(), 1);
     broker.stop().unwrap();
 }
+
+/// Converted outside a delivery (an MQTT retained replay, management's
+/// view of the message), a large message with only its headers in memory
+/// is rebuilt from its file first: its Core form has the body.
+#[test]
+fn a_slim_large_message_converts_whole() {
+    let body = vec![0xCDu8; 200_000];
+    let mut full = AmqpMessage::new(0, data_message(&body), NOW).unwrap();
+    full.set_message_id(1);
+    full.set_address(SimpleString::from("a"));
+    full.make_large();
+    let store = LargeMessageStore::in_memory();
+    let mut w = store.create(full.message_id(), true).unwrap();
+    w.append(full.data()).unwrap();
+    let large_body = w.finish().unwrap();
+    let slim = AmqpMessage::from_large_record(&full.large_record(), Vec::new(), NOW).unwrap();
+    let msg = ServerMessage::new_native_large(AmqpNative::arc(slim), large_body);
+    // The view the broker routes by lacks the body: what the replay and
+    // management used to take.
+    assert!(!has_run(&msg.delivery_core().body, 0xCD, body.len()));
+    let core = msg.whole_core().unwrap();
+    assert!(
+        has_run(&core.body, 0xCD, body.len()),
+        "the Core form carries the body ({} bytes)",
+        core.body.len()
+    );
+}

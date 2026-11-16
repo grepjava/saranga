@@ -477,7 +477,12 @@ pub(super) async fn list_addresses(
             ("autoCreated", Bool(info.auto_created)),
             ("paused", Bool(st.paused)),
             ("currentDuplicateIdCacheSize", Long(dup)),
-            ("retroactiveResource", Bool(info.name.starts_with(&*prefix))),
+            (
+                "retroactiveResource",
+                Bool(crate::retroactive::is_retroactive_resource(
+                    &prefix, &info.name,
+                )),
+            ),
             ("unroutedMessageCount", Long(st.unrouted)),
             ("routedMessageCount", Long(st.routed)),
             (

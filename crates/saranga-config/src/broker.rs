@@ -879,6 +879,9 @@ pub struct BrokerConfig {
     pub message_expiry_scan_period: i64,
     /// `transaction-timeout` in milliseconds.
     pub transaction_timeout: i64,
+    /// `connection-ttl-override` in milliseconds; -1 lets each client
+    /// choose its connection TTL.
+    pub connection_ttl_override: i64,
     /// `transaction-timeout-scan-period` in milliseconds.
     pub transaction_timeout_scan_period: i64,
     /// `address-queue-scan-period` in milliseconds; -1 turns the reaper off.
@@ -1169,6 +1172,7 @@ impl Default for BrokerConfig {
             broker_connections: Vec::new(),
             message_expiry_scan_period: Self::DEFAULT_MESSAGE_EXPIRY_SCAN_PERIOD,
             transaction_timeout: Self::DEFAULT_TRANSACTION_TIMEOUT,
+            connection_ttl_override: -1,
             transaction_timeout_scan_period: Self::DEFAULT_TRANSACTION_TIMEOUT_SCAN_PERIOD,
             address_queue_scan_period: Self::DEFAULT_ADDRESS_QUEUE_SCAN_PERIOD,
             id_cache_size: Self::DEFAULT_ID_CACHE_SIZE,

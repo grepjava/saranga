@@ -18,7 +18,8 @@ use crate::cluster::{ClusterConnection, Member, TopologyListener};
 pub(crate) struct Monitor {
     target: Arc<Target>,
     ready: AtomicBool,
-    check_period: Duration,
+    /// In milliseconds, as configured.
+    check_period: i32,
     probes: Arc<Mutex<Vec<Arc<Policy>>>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     runtime: tokio::runtime::Handle,
@@ -32,11 +33,18 @@ impl Listener for Monitor {
 }
 
 impl Monitor {
-    fn start(self: &Arc<Self>) {
+    /// `ActiveMQScheduledComponent.start`: a negative period schedules
+    /// nothing, and the target is never checked; a period of 0 is refused
+    /// as `scheduleWithFixedDelay` refuses it.
+    fn start(self: &Arc<Self>) -> Result<(), String> {
         let weak: Weak<dyn Listener> = Arc::downgrade(self) as Weak<dyn Listener>;
         self.target.set_listener(Some(weak));
+        let period = match self.check_period {
+            p if p < 0 => return Ok(()),
+            0 => return Err("java.lang.IllegalArgumentException".to_owned()),
+            p => Duration::from_millis(p as u64),
+        };
         let me = Arc::downgrade(self);
-        let period = self.check_period;
         let task = self.runtime.spawn(async move {
             loop {
                 let Some(m) = me.upgrade() else {
@@ -48,6 +56,7 @@ impl Monitor {
             }
         });
         *self.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+        Ok(())
     }
 
     fn stop(&self) {
@@ -117,7 +126,8 @@ pub struct Pool {
     source: Source,
     username: Option<String>,
     password: Option<String>,
-    check_period: Duration,
+    /// In milliseconds, as configured.
+    check_period: i32,
     quorum_size: usize,
     quorum_timeout: Duration,
     probes: Arc<Mutex<Vec<Arc<Policy>>>>,
@@ -145,7 +155,7 @@ impl Pool {
             source,
             username: config.username.clone(),
             password: config.password.clone(),
-            check_period: millis(config.check_period),
+            check_period: config.check_period,
             quorum_size: config.quorum_size.max(0) as usize,
             quorum_timeout: millis(config.quorum_timeout),
             probes: Arc::default(),
@@ -255,8 +265,10 @@ impl Pool {
             monitors.push(monitor.clone());
             monitor
         };
-        if self.started.load(Ordering::Acquire) {
-            monitor.start();
+        if self.started.load(Ordering::Acquire)
+            && let Err(e) = monitor.start()
+        {
+            tracing::warn!("monitoring {}: {e}", monitor.target);
         }
         true
     }
@@ -289,10 +301,15 @@ impl Pool {
         self.started.store(true, Ordering::Release);
         *self.local_node_id.lock().unwrap_or_else(|e| e.into_inner()) = local_node_id.clone();
         for m in self.monitors() {
-            m.start();
+            m.start()?;
         }
         match &self.source {
             Source::Static(connectors) => {
+                // `addTarget` starts each one's monitor, whose failure
+                // fails the start.
+                if self.check_period == 0 && !connectors.is_empty() {
+                    return Err("java.lang.IllegalArgumentException".to_owned());
+                }
                 for c in connectors {
                     self.add_connector(c.clone(), None);
                 }

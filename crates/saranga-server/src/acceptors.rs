@@ -419,6 +419,17 @@ impl Broker {
     /// or protocol detection) are closed, as stopping the acceptors closes
     /// every channel (`RemotingServiceImpl.stop`). The others are failed
     /// through the registry.
+    /// The acceptors stop listening at once, without waiting for their
+    /// tasks: what [`Broker::stop`] does, being synchronous. Their tasks
+    /// hold the broker, which outlives a stop while they run.
+    pub(crate) fn abort_acceptors(&self) {
+        for r in self.acceptors.all() {
+            if let Some(task) = r.listening().take() {
+                task.abort();
+            }
+        }
+    }
+
     pub fn close_unestablished(&self) {
         for r in self.acceptors.all() {
             r.closing.notify_waiters();

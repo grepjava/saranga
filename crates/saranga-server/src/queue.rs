@@ -327,8 +327,11 @@ enum Cmd {
     Depage,
     /// `updateQueue` replaced the configuration; a new `group-buckets`
     /// starts the groups afresh (`setGroupBuckets`).
+    /// Made non-exclusive, it forgets its exclusive consumer
+    /// (`setExclusive(false)`), even if made exclusive again since.
     Reconfigure {
         reset_groups: bool,
+        forget_exclusive: bool,
     },
     /// `promptDelivery`: try delivering again.
     Prompt,
@@ -613,11 +616,15 @@ impl Queue {
     /// given, the filter (text and compiled). Its name and address stay.
     pub fn update(&self, config: QueueConfig, filter: Option<(Option<String>, Option<FilterRef>)>) {
         let reset_groups = self.config().group_buckets != config.group_buckets;
+        let forget_exclusive = !config.exclusive;
         *self.0.config.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(config);
         if let Some(filter) = filter {
             *self.0.filter.write().unwrap_or_else(|e| e.into_inner()) = filter;
         }
-        let _ = self.0.tx.send(Cmd::Reconfigure { reset_groups });
+        let _ = self.0.tx.send(Cmd::Reconfigure {
+            reset_groups,
+            forget_exclusive,
+        });
     }
 
     /// The filter routing applies (`getFilter`).
@@ -899,9 +906,41 @@ impl Queue {
     }
 
     fn send(&self, cmd: Cmd) {
-        // A send only fails once the actor has stopped, when the queue
-        // is deleted; its messages go with it.
-        let _ = self.0.tx.send(cmd);
+        // A send only fails once the actor has stopped.
+        if let Err(mpsc::error::SendError(cmd)) = self.0.tx.send(cmd) {
+            self.orphaned(cmd);
+        }
+    }
+
+    /// A command the actor will never handle, its queue deleted: the
+    /// references it carries (a transaction's sends or acknowledgements
+    /// given back at its end) go as the queue's own went
+    /// (`removeMessagesWhileDelivering`): acknowledged, so that they no
+    /// longer count against their address nor keep their journal records.
+    /// A queue stopped with the broker keeps everything for the next start.
+    fn orphaned(&self, cmd: Cmd) {
+        if !self.is_deleted() {
+            return;
+        }
+        let refs = match cmd {
+            Cmd::Add(r) => {
+                self.0.adds_pending.fetch_sub(1, Ordering::SeqCst);
+                vec![r]
+            }
+            Cmd::Reinsert(refs) => refs,
+            Cmd::BackToDelivering { r, .. } => vec![r],
+            _ => return,
+        };
+        for mut r in refs {
+            if r.copy_for.is_some() {
+                // A non-destructive delivery's copy owns nothing.
+                continue;
+            }
+            if r.paged.is_none() {
+                let _ = self.store_ack(&mut r);
+            }
+            self.post_acknowledge_for(&r, AckReason::Killed);
+        }
     }
 
     /// Adds a routed message to the tail (`addTail`), counting it.
@@ -1752,6 +1791,13 @@ impl Actor {
             self.deliver_scheduled();
             self.deliver();
         }
+        // What was sent before the actor stopped but after the command that
+        // stopped it.
+        rx.close();
+        let queue = self.queue();
+        while let Ok(cmd) = rx.try_recv() {
+            queue.orphaned(cmd);
+        }
     }
 
     fn queue(&self) -> Queue {
@@ -2578,7 +2624,16 @@ impl Actor {
                 let refs = match self.consumer_mut(id) {
                     Some(c) if !c.reg.browse_only => {
                         c.started = false;
-                        c.large = None;
+                        // The large message being sent is given up: what
+                        // forced deliveries waited for it go now, after
+                        // it, as they would have.
+                        if c.large.take().is_some() {
+                            for marker in std::mem::take(&mut c.forced) {
+                                c.reg
+                                    .sink
+                                    .deliver(c.reg.client_id, &ServerMessage::new(marker), 0);
+                            }
+                        }
                         cancel(
                             std::mem::take(&mut c.delivering),
                             &c.reg.metrics,
@@ -2677,9 +2732,15 @@ impl Actor {
                     self.send_to_dead_letter_address(r, &s);
                 }
             }
-            Cmd::Reconfigure { reset_groups } => {
+            Cmd::Reconfigure {
+                reset_groups,
+                forget_exclusive,
+            } => {
                 if reset_groups {
                     self.groups.clear();
+                }
+                if forget_exclusive {
+                    self.exclusive_consumer = None;
                 }
             }
             Cmd::Remove { message_id, reply } => {
@@ -2710,9 +2771,25 @@ impl Actor {
                 }
             }
             Cmd::ExpireScan => {
+                let had = !self.messages.is_empty();
                 let now = now_millis();
                 let expired = self.messages.take_where(|r| r.message.is_expired(now));
+                let any = !expired.is_empty();
                 expired.into_iter().for_each(|r| self.expire(r));
+                // `ExpiryScanner`: an empty queue, or one that expired
+                // something, reads in more of its pages, paused or not, and
+                // scans what came in (`depage(scheduleExpiry)`), so paged
+                // messages expire without waiting for a consumer.
+                if !had || any {
+                    let before = self.messages.len() + self.scheduled.len();
+                    self.depage();
+                    if self.messages.len() + self.scheduled.len() > before {
+                        self.queue().send(Cmd::ExpireScan);
+                        if !self.is_paused() {
+                            self.deliver();
+                        }
+                    }
+                }
             }
             Cmd::Manage(op) => op(self),
             Cmd::Shutdown(then) => {
@@ -2754,7 +2831,7 @@ impl Actor {
             }
             Some(r)
         })?;
-        if self.shared.config().non_destructive {
+        if r.copy_for.is_some() {
             let at = self.messages.find(|q| q.message_id() == message_id)?;
             self.messages.remove(at);
             // Off the list, it is the reference now: should it come back,
@@ -3250,13 +3327,8 @@ impl Actor {
         // A non-destructive queue's deliveries are copies of references it
         // still holds, owning nothing of their own: acknowledged with those,
         // they would take the message's records and counts down twice.
-        let non_destructive = self.shared.config().non_destructive;
         for c in self.consumers.iter_mut() {
-            if non_destructive {
-                c.delivering.clear();
-            } else {
-                refs.extend(c.delivering.drain(..));
-            }
+            refs.extend(c.delivering.drain(..).filter(|r| r.copy_for.is_none()));
         }
         let _ = storage;
         if crate::audit::message_enabled() {
@@ -3344,7 +3416,7 @@ fn redelivery_delay(s: &AddressSettings, delivery_count: i32) -> i64 {
         let variance = sign * s.redelivery_collision_avoidance_factor * random;
         delay += (delay as f64 * variance) as i64;
     }
-    delay.min(s.max_redelivery_delay)
+    delay.min(s.max_redelivery_delay())
 }
 
 /// A number in [0, 1) for the collision-avoidance factor; the quality of
@@ -3396,6 +3468,28 @@ mod tests {
             )));
         }
         l
+    }
+
+    /// Settings built in code with only a redelivery delay keep it: an
+    /// unset maximum is ten times the delay (`getMaxRedeliveryDelay`), not
+    /// 0, which cut every delay to nothing.
+    #[test]
+    fn an_unset_max_redelivery_delay_is_ten_times_the_delay() {
+        let s = AddressSettings {
+            redelivery_delay: 5_000,
+            redelivery_multiplier: 3.0,
+            ..Default::default()
+        };
+        assert_eq!(s.max_redelivery_delay(), 50_000);
+        assert_eq!(redelivery_delay(&s, 1), 5_000);
+        assert_eq!(redelivery_delay(&s, 2), 15_000);
+        assert_eq!(redelivery_delay(&s, 3), 45_000);
+        assert_eq!(redelivery_delay(&s, 4), 50_000);
+        let set = AddressSettings {
+            max_redelivery_delay: Some(7_000),
+            ..s
+        };
+        assert_eq!(redelivery_delay(&set, 2), 7_000);
     }
 
     /// A consumer of a bounded queue remembers what the queue holds, not

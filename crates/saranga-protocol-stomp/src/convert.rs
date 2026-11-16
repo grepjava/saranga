@@ -104,7 +104,7 @@ pub fn frame_to_message(
         if delay > 0 {
             message.properties.insert(
                 m::HDR_SCHEDULED_DELIVERY_TIME.into(),
-                PropertyValue::Long(now + delay),
+                PropertyValue::Long(now.wrapping_add(delay)),
             );
         }
     }

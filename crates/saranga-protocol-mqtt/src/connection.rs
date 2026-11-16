@@ -791,7 +791,8 @@ fn publish_properties(
         // The interval is unsigned; keep its bits by wrapping into the codec's
         // i32 (Java's `(int)` truncates), not by saturating as `f64 as i32`
         // would, so a value over i32::MAX is forwarded whole and not shortened.
-        let left = (((message.expiration - now_millis()) as f64 / 1000.0).round() as i64) as i32;
+        let left =
+            ((message.expiration.wrapping_sub(now_millis()) as f64 / 1000.0).round() as i64) as i32;
         props.add_int(prop::MESSAGE_EXPIRY_INTERVAL, left);
     }
     Ok(props)
@@ -1094,7 +1095,16 @@ impl Core {
                 let Some(last) = retained.browse().await.pop() else {
                     continue;
                 };
-                let mut copy = last.message.delivery_core().clone();
+                // A large AMQP message is rebuilt from its file: as a Core
+                // copy its body is the message's, not its AMQP sections.
+                let native_large = last.message.native().is_some() && last.message.is_large();
+                let mut copy = match native_large {
+                    true => last
+                        .message
+                        .whole_core()
+                        .map_err(|e| BrokerError::new(ErrorType::IoError, e.to_string()))?,
+                    false => last.message.delivery_core().clone(),
+                };
                 copy.message_id = po.ids().next();
                 copy.properties.insert(
                     util::MQTT_MESSAGE_RETAIN_INITIAL_DISTRIBUTION_KEY.into(),
@@ -1104,6 +1114,7 @@ impl Core {
                 // named after the new ID, which is the one a restart looks
                 // for; shared, the copy had no body after a restart.
                 let large = match last.message.large() {
+                    Some(_) if native_large => self.session.check_large_message(&mut copy)?,
                     Some(body) => Some(body.copy(copy.message_id, copy.durable).map_err(|e| {
                         tracing::warn!(
                             "AMQ222181: Unable to copy large message {}: {e}",

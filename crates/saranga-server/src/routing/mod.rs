@@ -509,6 +509,15 @@ fn deploy_router(
     let key = KeyType::parse(&config.key_type)
         .ok_or_else(|| format!("Invalid RedirectKey:{}", config.key_type))?;
     let local = Target::local(broker);
+    // Caffeine's `expireAfterAccess` refuses a negative timeout.
+    if let Some(c) = &config.cache_configuration
+        && c.timeout < 0
+    {
+        return Err(format!(
+            "java.lang.IllegalArgumentException: duration cannot be negative: {} MILLISECONDS",
+            c.timeout
+        ));
+    }
     let cache = config.cache_configuration.as_ref().map(|c| {
         Cache::new(
             format!("{CACHE_ID_PREFIX}{}", config.name),

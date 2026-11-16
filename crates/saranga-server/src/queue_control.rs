@@ -101,6 +101,10 @@ pub enum SelectionAction {
     },
     /// `copyReference`: a copy goes to `target`; the message stays.
     Copy { address: String, target: Queue },
+    /// `rerouteMessages`: the message itself, its address now `target`'s,
+    /// goes to `target` too, and stays (a retroactive address's ring queue
+    /// giving a new queue what it holds).
+    Reroute { target: Queue },
     /// `retryMessages`: a message from a dead-letter or expiry queue goes
     /// back to its original address and queue.
     Retry,
@@ -151,6 +155,21 @@ impl Queue {
             let _ = reply.send(op(actor));
         })));
         wait.await.ok()
+    }
+
+    /// [`act`](Self::act), without waiting for it.
+    pub(crate) fn act_later(&self, sel: Selection, action: SelectionAction) {
+        self.send(Cmd::Manage(Box::new(move |a| {
+            a.act(&sel, &action);
+        })));
+    }
+
+    /// `setRingSize`: the queue keeps `size` messages from now on, its
+    /// journaled configuration unchanged.
+    pub(crate) fn set_ring_size(&self, size: i64) {
+        let mut config = (*self.config()).clone();
+        config.ring_size = size;
+        self.update(config, None);
     }
 
     pub fn messages_added(&self) -> i64 {
@@ -223,6 +242,18 @@ impl Queue {
             }
         }
         self.0.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// The queue is deleted: its persisted pause goes with it, not at the
+    /// next start.
+    pub(crate) fn forget_persisted_pause(&self) {
+        let old = self.0.pause_record.swap(-1, Ordering::SeqCst);
+        if old >= 0
+            && let Some(s) = self.0.ids.storage()
+            && let Err(e) = s.delete_binding_record(old)
+        {
+            tracing::warn!("deleting the pause of queue {}: {e}", self.name());
+        }
     }
 
     /// A pause recovered from its `QUEUE_STATUS_RECORD`.
@@ -802,10 +833,12 @@ impl Actor {
         let retryable = |r: &MessageRef| retry_target(po.as_deref(), r).is_some();
         let taken = match action {
             SelectionAction::DeliverScheduled => Vec::new(),
-            SelectionAction::Copy { .. } => self.messages.take_selected(sel, &mut hits, |r| {
-                copies.push(r.clone());
-                false
-            }),
+            SelectionAction::Copy { .. } | SelectionAction::Reroute { .. } => {
+                self.messages.take_selected(sel, &mut hits, |r| {
+                    copies.push(r.clone());
+                    false
+                })
+            }
             SelectionAction::Retry => self.messages.take_selected(sel, &mut hits, retryable),
             _ => self.messages.take_selected(sel, &mut hits, |_| true),
         };
@@ -837,7 +870,10 @@ impl Actor {
                 if matches!(action, SelectionAction::Retry) && !can_retry {
                     continue;
                 }
-                if matches!(action, SelectionAction::Copy { .. }) {
+                if matches!(
+                    action,
+                    SelectionAction::Copy { .. } | SelectionAction::Reroute { .. }
+                ) {
                     if let Some(r) = self.scheduled.get(&k).cloned() {
                         self.act_on(r, action);
                     }
@@ -887,7 +923,7 @@ impl Actor {
                 hits += 1;
                 match action {
                     SelectionAction::Retry if !retryable(&r) => continue,
-                    SelectionAction::Copy { .. } => {
+                    SelectionAction::Copy { .. } | SelectionAction::Reroute { .. } => {
                         self.act_on(r, action);
                         continue;
                     }
@@ -1047,6 +1083,7 @@ impl Actor {
                 self.move_to(address, r, AckReason::Normal, target.clone(), None);
             }
             SelectionAction::Copy { address, target } => self.copy_to(address, &r, target),
+            SelectionAction::Reroute { target } => self.reroute_to(&r, target),
             SelectionAction::Retry => {
                 let po = self.shared.post_office.upgrade();
                 match retry_target(po.as_deref(), &r) {
@@ -1062,6 +1099,27 @@ impl Actor {
             }
             SelectionAction::DeliverScheduled => self.messages.push_front(r),
         }
+    }
+
+    /// `rerouteMessages`: the message goes to `target` under `target`'s
+    /// address (Artemis sets the address on the message itself), routed to
+    /// that queue alone (`binding.route` and `processRoute`). It shares the
+    /// message's accounting, so a durable one is journaled only as a new
+    /// reference.
+    fn reroute_to(&mut self, r: &MessageRef, target: &Queue) {
+        let Some(po) = self.shared.post_office.upgrade() else {
+            return;
+        };
+        let mut core = r.message.core().clone();
+        core.address = Some(saranga_buffer::SimpleString::from(
+            &*target.config().address,
+        ));
+        let mut m = MessageRef::new(r.message.with_core_keeping_refs(core));
+        let t = message::scheduled_delivery_time(m.message.core());
+        if t > now_millis() {
+            m.scheduled_time = t;
+        }
+        po.route_to_queue(m, target);
     }
 
     /// `copyReference`: a copy of the message goes to `target`, routed as

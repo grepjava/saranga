@@ -234,3 +234,91 @@ async fn a_stop_after_a_pause_closes_the_connections() {
     op(&broker, "stop").await.unwrap();
     assert!(closed(s).await, "the connection stayed open");
 }
+
+/// `Broker::stop` on its own (an application embedding the broker) stops
+/// its acceptors and closes their connections: the port is free again,
+/// and the broker is not kept alive by its acceptors' tasks.
+#[tokio::test]
+async fn a_broker_stop_frees_its_ports_and_closes_its_connections() {
+    let broker = Broker::start(BrokerConfig::new(Arc::new(SelectorFilters)))
+        .await
+        .unwrap();
+    let address = format!("127.0.0.1:{}", free_port());
+    broker
+        .add_acceptor("artemis", &address, Acceptor::default())
+        .await
+        .unwrap();
+    let mut client = TcpStream::connect(&address).await.unwrap();
+    ping(&mut client).await;
+    let weak = Arc::downgrade(&broker);
+    broker.stop().unwrap();
+    drop(broker);
+    // Told the node is going (a DISCONNECT), then closed.
+    assert!(closes(&mut client).await, "closed");
+    drop(client);
+    for _ in 0..300 {
+        if std::net::TcpListener::bind(&address).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        std::net::TcpListener::bind(&address).is_ok(),
+        "the port is free"
+    );
+    for _ in 0..300 {
+        if weak.upgrade().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(weak.upgrade().is_none(), "nothing holds the broker");
+}
+
+/// `<connection-ttl-override>` is read, and a Core connection has it from
+/// the start (`createConnectionEntry`), not only after a ping.
+#[tokio::test]
+async fn the_connection_ttl_override_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = saranga_config::BrokerConfig::parse(
+        r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+             <persistence-enabled>false</persistence-enabled>
+             <connection-ttl-override>300</connection-ttl-override>
+           </core></configuration>"#,
+    )
+    .unwrap();
+    assert_eq!(file.connection_ttl_override, 300);
+    let broker = Broker::start(
+        BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path()).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(broker.connection_ttl_override(), 300);
+    let address = format!("127.0.0.1:{}", free_port());
+    broker
+        .add_acceptor("artemis", &address, Acceptor::default())
+        .await
+        .unwrap();
+    // A Core connection that goes silent after a ping asking for 60
+    // seconds is dropped within the override.
+    let mut silent = TcpStream::connect(&address).await.unwrap();
+    ping(&mut silent).await;
+    assert!(closes(&mut silent).await, "dropped");
+    broker.stop().unwrap();
+}
+
+/// Reads until the broker closes the connection, within 5 seconds.
+async fn closes(s: &mut TcpStream) -> bool {
+    let mut b = [0u8; 256];
+    let read = async {
+        loop {
+            match tokio::io::AsyncReadExt::read(s, &mut b).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), read)
+        .await
+        .is_ok()
+}

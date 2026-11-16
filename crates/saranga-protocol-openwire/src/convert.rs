@@ -435,7 +435,7 @@ pub fn inbound(msg: &Message, wf: &mut WireFormat, now: i64) -> R<CoreMessage> {
         put(
             &mut core,
             HDR_SCHEDULED_DELIVERY_TIME,
-            PropertyValue::Long(now + delay),
+            PropertyValue::Long(now.wrapping_add(*delay)),
         );
         let key = SimpleString::from(AMQ_SCHEDULED_DELAY);
         if core.properties.remove(&key).is_some() {

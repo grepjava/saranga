@@ -517,6 +517,10 @@ pub struct PostOffice {
     /// The large-message store and the journal's record size, for a
     /// divert's transformed copy (`checkLargeMessage`).
     large: std::sync::OnceLock<(Arc<crate::large::LargeMessageStore>, usize)>,
+    /// Set when the broker stops: its reapers end.
+    stopped: AtomicBool,
+    /// `getInternalNamingPrefix`.
+    internal_prefix: std::sync::OnceLock<String>,
     /// The mirror sources installed.
     mirrors: crate::mirror::Mirrors,
     /// What the last deployment of the configured addresses wrote into
@@ -558,6 +562,8 @@ impl PostOffice {
             has_wild: AtomicBool::new(false),
             grouping: std::sync::OnceLock::new(),
             large: std::sync::OnceLock::new(),
+            stopped: AtomicBool::new(false),
+            internal_prefix: std::sync::OnceLock::new(),
             mirrors: crate::mirror::Mirrors::default(),
             deployed: Mutex::default(),
         })
@@ -575,6 +581,27 @@ impl PostOffice {
 
     pub(crate) fn set_deployed_queues(&self, deployed: Vec<crate::reload::DeployedQueue>) {
         *self.deployed.lock().unwrap_or_else(|e| e.into_inner()) = deployed;
+    }
+
+    /// `internal-naming-prefix`, set once at start.
+    pub fn set_internal_prefix(&self, prefix: String) {
+        let _ = self.internal_prefix.set(prefix);
+    }
+
+    /// `getInternalNamingPrefix`.
+    pub fn internal_prefix(&self) -> &str {
+        self.internal_prefix
+            .get()
+            .map_or("$.artemis.internal.", String::as_str)
+    }
+
+    /// The broker stopped: the reapers end.
+    pub fn mark_stopped(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
     }
 
     /// The store a divert's transformed copy too large for one journal
@@ -816,6 +843,7 @@ impl PostOffice {
         for store in self.paging.stores() {
             store.apply_settings(self.settings(store.address()));
         }
+        self.retroactive_settings_changed();
     }
 
     /// `addAddressSettings(address, json)`: the settings apply to the match
@@ -1156,6 +1184,7 @@ impl PostOffice {
         if added {
             crate::audit::registered("AddressControlImpl", info.name.as_ref());
             self.plugins.each(|p| p.after_add_address(&info, true));
+            self.retroactive_address_added(&info, true);
         }
     }
 
@@ -1280,6 +1309,17 @@ impl PostOffice {
                         crate::recovery::address_binding(&updated),
                     )
                     .map_err(Self::io)?;
+                    // A persisted pause names the address by its ID: it
+                    // follows the address to the new one, or recovery
+                    // drops it as naming no address and the address
+                    // comes back unpaused.
+                    if entry.pause_record >= 0 {
+                        let record = s.store_address_status(updated.id).map_err(Self::io)?;
+                        if let Err(e) = s.delete_binding_record(entry.pause_record) {
+                            tracing::warn!("updating address {name}: {e}");
+                        }
+                        entry.pause_record = record;
+                    }
                 }
                 entry.info = updated;
             }
@@ -1314,6 +1354,7 @@ impl PostOffice {
         crate::audit::registered("AddressControlImpl", info.name.as_ref());
         self.plugins.each(|p| p.after_add_address(&info, false));
         self.mirror_add_address(&info);
+        self.retroactive_address_added(&info, false);
         Ok(info)
     }
 
@@ -1361,6 +1402,7 @@ impl PostOffice {
         crate::audit::registered("AddressControlImpl", info.name.as_ref());
         self.plugins.each(|p| p.after_add_address(&info, false));
         self.mirror_add_address(&info);
+        self.retroactive_address_added(&info, false);
         Ok((info, true))
     }
 
@@ -1403,10 +1445,18 @@ impl PostOffice {
                 {
                     tracing::warn!("removing address {name}: {e}");
                 }
+                // Its persisted pause goes with it, not at the next start.
+                if entry.pause_record >= 0
+                    && let Some(s) = self.ids.storage()
+                    && let Err(e) = s.delete_binding_record(entry.pause_record)
+                {
+                    tracing::warn!("removing address {name}: {e}");
+                }
                 let info = state.addresses.remove(name).map(|e| e.info);
                 drop(state);
                 // deletePageStore.
                 self.paging().delete_store(name);
+                self.remove_retroactive_resources(name);
                 self.delete_duplicate_cache(name);
                 self.plugins
                     .each(|p| p.after_remove_address(name, info.as_ref()));
@@ -1522,8 +1572,9 @@ impl PostOffice {
         self.plugins.each(|p| {
             let c = queue.config();
             p.after_add_binding(&c.name, &c.address);
-            p.after_create_queue(&queue);
         });
+        self.copy_retroactive_messages(&queue);
+        self.plugins.each(|p| p.after_create_queue(&queue));
         for m in self.mirrors.all() {
             m.create_queue(&queue);
         }
@@ -1651,7 +1702,20 @@ impl PostOffice {
                 }
             }) as AfterDelete
         });
-        self.remove_queue(name, check_consumers, force_auto_delete_address, then)
+        self.remove_queue(
+            name,
+            check_consumers,
+            force_auto_delete_address,
+            then,
+            false,
+        )
+    }
+
+    /// `performAutoDeleteQueue`: `destroyQueue` with `checkMessageCount`,
+    /// so a queue that took more messages than its auto-delete count since
+    /// the reaper looked at it stays.
+    pub fn auto_delete_queue(&self, name: &str) -> Result<()> {
+        self.remove_queue(name, true, false, None, true)
     }
 
     /// [`PostOffice::delete_queue`], returning once the queue's messages are
@@ -1676,6 +1740,7 @@ impl PostOffice {
                     let _ = done.send(());
                 },
             )),
+            false,
         )?;
         let _ = wait.await;
         Ok(())
@@ -1694,6 +1759,7 @@ impl PostOffice {
             Some(Box::new(move |_: &PostOffice, _: &str, durable: bool| {
                 let _ = done.send(durable);
             })),
+            false,
         )?;
         Ok(wait.await.unwrap_or(false))
     }
@@ -1706,6 +1772,7 @@ impl PostOffice {
         check_consumers: bool,
         force_auto_delete_address: bool,
         then: Option<AfterDelete>,
+        check_messages: bool,
     ) -> Result<()> {
         let queue = self
             .queue(name)
@@ -1714,6 +1781,13 @@ impl PostOffice {
             return Err(BrokerError::cannot_delete_queue_with_consumers(
                 name,
                 queue.consumer_count(),
+            ));
+        }
+        let most = queue.config().auto_delete_message_count;
+        if check_messages && most != -1 && queue.message_count() > most {
+            return Err(BrokerError::cannot_delete_queue_with_messages(
+                name,
+                queue.message_count(),
             ));
         }
         self.plugins.check(|p| p.before_destroy_queue(name))?;
@@ -1742,6 +1816,7 @@ impl PostOffice {
         {
             tracing::warn!("deleting queue {name}: {e}");
         }
+        queue.forget_persisted_pause();
         // `removeBinding` with `deleteData`: once nothing routes from the
         // address, its duplicate IDs go, so a queue made there again
         // takes what the old one had seen.
@@ -1833,7 +1908,7 @@ impl PostOffice {
                     q.id(),
                     c.address
                 );
-                if let Err(e) = self.delete_queue(q.name(), true, false) {
+                if let Err(e) = self.auto_delete_queue(q.name()) {
                     tracing::warn!(
                         "AMQ222241: Unable to remove auto-created queue {}: {e}",
                         q.name()
@@ -2187,11 +2262,10 @@ impl PostOffice {
         let cleared = clear_internal_properties(message);
         let message = cleared.as_ref().unwrap_or(message);
         let plugins = &self.plugins;
-        let routed = plugins
-            .check(|p| p.before_message_route(&message.message))
-            .and_then(|()| {
-                self.route_into(message, address, routing_type, Hop::internal(), &mut out)
-            });
+        // A refusal by `beforeMessageRoute` is not a routing exception: it
+        // comes before `route`'s `try`.
+        plugins.check(|p| p.before_message_route(&message.message))?;
+        let routed = self.route_into(message, address, routing_type, Hop::internal(), &mut out);
         match routed {
             Ok(()) => {
                 let status = crate::plugin::RoutingStatus::of(&out);
@@ -2211,10 +2285,8 @@ impl PostOffice {
     /// refusing it fails the move or copy, which keeps its original.
     pub fn route_moved(&self, message: &MessageRef, queue: Queue) -> Result<Routed> {
         let plugins = &self.plugins;
-        if let Err(e) = plugins.check(|p| p.before_message_route(&message.message)) {
-            plugins.each(|p| p.on_message_route_exception(&message.message, &e));
-            return Err(e);
-        }
+        // Before `route`'s `try`: no routing exception.
+        plugins.check(|p| p.before_message_route(&message.message))?;
         let out = vec![(message.clone(), vec![queue])];
         let status = crate::plugin::RoutingStatus::of(&out);
         plugins.each(|p| p.after_message_route(&message.message, status));
@@ -2711,6 +2783,29 @@ impl PostOffice {
 
     pub fn divert(&self, name: &str) -> Option<Arc<Divert>> {
         self.diverts().into_iter().find(|d| *d.name == *name)
+    }
+
+    /// A forced `removeAddressInfo` drops every binding of the address
+    /// (`mappings.remove`), its diverts' with the rest; their journaled
+    /// configurations stay, as they do in Artemis.
+    pub fn unbind_diverts(&self, address: &str) {
+        let removed: Vec<Arc<Divert>> = {
+            let mut state = self.write();
+            let mut removed = state
+                .free_diverts
+                .remove(address)
+                .map(|e| e.diverts)
+                .unwrap_or_default();
+            if let Some(e) = state.addresses.get_mut(address) {
+                removed.append(&mut e.diverts);
+                e.binding_removed_at = crate::message::now_millis();
+            }
+            removed
+        };
+        for d in removed {
+            self.plugins
+                .each(|p| p.after_remove_binding(&d.name, address));
+        }
     }
 
     /// `destroyDivert`: unbinds a divert. False if there is none.

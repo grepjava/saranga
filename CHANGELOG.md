@@ -11,8 +11,34 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 - **Shared-store HA** on the store: the backup opens the tables when it takes over. Replication is refused with a reason, as there are no journals to copy.
 - **`data print` and `data exp`** read the tables, and `data exp` writes what Artemis's exporter writes.
 
+### Addresses
+
+- **Retroactive addresses** (`retroactive-message-count`), as Artemis makes them: the address keeps its last messages in an internal ring queue per routing type, fed by a divert, and a queue made on it later is given those its filter accepts. The ring queues follow the address's settings, outlive a restart, and go with the address; the address, its queues and its divert report `RetroactiveResource`.
+
 ### Fixes
 
+- **A queue made non-destructive, or destructive again, acknowledges each delivery as it was sent**: an acknowledgement, rejection or expiry of a delivery made before the change no longer takes the wrong message's records, and a queue made non-exclusive forgets its exclusive consumer.
+- **A large message a consumer was given early (forced delivery) and then cancelled** no longer leaves the forced-delivery marker behind.
+- **A large message kept in another protocol's encoding is converted whole** for an MQTT retained-message replay and for management's message views, not from its first chunk.
+- **`Broker::stop` frees its ports and closes its connections**, so an embedded broker can be started again on the same ports, and a start that fails part-way stops what it had started (queues, stores, the primary lock). A connection router with a negative cache timeout, or a pool check period of 0, is refused as Artemis refuses it; a negative check period never checks.
+- **`<connection-ttl-override>` is read**, and a Core connection has it from the start.
+- **An expiration or expiry delay at the edge of the 64-bit range no longer panics the broker**, the arithmetic wrapping as Artemis's does.
+- **Local times in zones whose offsets change on the half or quarter hour** (Adelaide, St John's, Chatham) are right; they were cached by the hour.
+- **Address settings built in code without a maximum redelivery delay** use ten times the redelivery delay, as `getMaxRedeliveryDelay` does, rather than 0, which cut every delay to nothing.
+- **An address paused with `persist` stays paused after a restart when its routing types change** (Artemis unpauses it), and a deleted address's or queue's pause record goes with it.
+- **The expiry scan expires paged messages**, of a paused queue too, reading the pages in as Artemis's scanner does.
+- **`XPATH` selectors may have whitespace before a function's parenthesis, inside empty parentheses and around `::`**, as the JDK's XPath accepts. `AMQSize` is counted instead of encoding the message for every check, and a `byte[]` property is equal to itself, as in Artemis.
+- **The plugins' exception hooks hear what Artemis's hear**: a refusal by `before_send` or `before_message_route` is no longer reported to `on_send_exception` or `on_message_route_exception`, and a send that fails after `before_send` (no address, a refused permission, an empty validated user, a failed write) always is. `before_send` sees the message as the client sent it.
+- **The auto-delete reaper checks a queue's message count again as it deletes it**, as Artemis's `destroyQueue` does, so a queue that took messages since the reaper looked stays.
+- **A send or commit whose journal write fails gives back what it took**: the duplicate ID, so the client's retry is not refused as a duplicate, its page transaction, and the memory its messages counted against their addresses; a failed commit gives its acknowledged messages back. An XA prepare whose record fails is left active, not prepared.
+- **AMQP waits for a settled acknowledgement's journal writes**, and answers a session's End once its last writes are done, as the other protocols do.
+- **What reaches a transaction after the XA timeout reaper rolled it back is rolled back too**, instead of staying in a transaction that would never end.
+- **A failed session stops delivering before it rolls back**, as Artemis's does.
+- **Messages sent or given back to a queue as it is deleted are acknowledged**, as Artemis's destroyed queue acknowledges them, instead of counting against their address for good.
+- **A temporary queue's address goes with it when its connection closes**, whatever `auto-delete-addresses` says, as Artemis forces it.
+- **An ended XA branch whose commit or rollback the session refused is still rolled back if the session fails.**
+- **`<enable-ingress-timestamp>` stamps messages** sent to a matching address with `_AMQ_INGRESS_TIMESTAMP`.
+- **`deleteAddress` with `force` removes an address that has diverts**, unbinding them with it (Artemis leaves them registered but no longer routing).
 - **A dead-letter or expiry address given as `address::queue`, reached through a wildcard queue, or bound by another broker's queue takes the message** instead of it being dropped as if the address had no bindings. An address another broker's queue is bound to is no longer removed as unused, and a forced address deletion through management removes those bindings with it.
 - **A deleted address takes its duplicate-ID cache with it** (and its bridges' `BRIDGE.<address>` cache), as does the last queue of an address, as in Artemis: a queue made there again no longer refuses a message whose ID the old one had seen.
 - **Two transactions committing the same duplicate IDs in different orders** no longer both fail: the IDs are checked with every cache involved held at once.

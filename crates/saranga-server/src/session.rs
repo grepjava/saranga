@@ -404,15 +404,21 @@ impl ClientConnection {
         let temp = std::mem::take(&mut *self.temp_queues.lock().unwrap_or_else(|e| e.into_inner()));
         let post_office = broker.post_office();
         for name in temp {
-            let auto_delete_address = post_office
-                .queue(&name)
-                .map(|q| {
-                    post_office
-                        .settings(&q.config().address)
-                        .auto_delete_addresses
-                })
-                .unwrap_or(false);
-            let _ = post_office.delete_queue(&name, false, auto_delete_address);
+            // `TempQueueCleanerUpper`: the queue's address goes with it
+            // (`forceAutoDeleteAddress`) when it is temporary or gone,
+            // whatever `auto-delete-addresses` says; then an address of
+            // the resource's name, if temporary.
+            if let Some(q) = post_office.queue(&name)
+                && q.config().temporary
+            {
+                let force = post_office
+                    .address_info(&q.config().address)
+                    .is_none_or(|a| a.temporary);
+                let _ = post_office.delete_queue(&name, false, force);
+            }
+            if post_office.address_info(&name).is_some_and(|a| a.temporary) {
+                post_office.remove_address(&name);
+            }
         }
     }
 }
@@ -511,6 +517,9 @@ pub struct Completion {
     /// Queue updates that must follow the journal writes
     /// (`afterCompleteOperations`): routed references, committed outcomes.
     actions: Vec<Box<dyn FnOnce() + Send>>,
+    /// What undoes the work those updates would finish, should a write
+    /// fail: the updates are dropped, and these run instead.
+    on_failure: Vec<Box<dyn FnOnce() + Send>>,
     /// What `sync` mirrors' peers complete once they have what the queue
     /// updates sent them (`replicationLineUp`), waited for after those.
     replicated: Vec<Replicated>,
@@ -551,6 +560,7 @@ impl Completion {
             for action in std::mem::take(&mut self.actions) {
                 action();
             }
+            self.on_failure.clear();
             self.pending.clear();
         }
     }
@@ -559,6 +569,7 @@ impl Completion {
     pub fn merge(&mut self, other: Completion) {
         append(&mut self.waits, other.waits);
         append(&mut self.actions, other.actions);
+        append(&mut self.on_failure, other.on_failure);
         append(&mut self.replicated, other.replicated);
         append(&mut self.pending, other.pending);
     }
@@ -573,7 +584,12 @@ impl Completion {
             }
         }
         match failure {
-            Some(e) => Err(e),
+            Some(e) => {
+                for undo in self.on_failure {
+                    undo();
+                }
+                Err(e)
+            }
             None => {
                 for action in self.actions {
                     action();
@@ -664,6 +680,8 @@ pub struct ServerSession {
     ops: Vec<Pending>,
     /// Queue updates to make once those writes are done.
     actions: Vec<Box<dyn FnOnce() + Send>>,
+    /// What undoes them if a write fails (`OperationContext.onError`).
+    failed: Vec<Box<dyn FnOnce() + Send>>,
     /// Completions from this session whose journal writes or deferred
     /// queue updates have not yet finished.
     pending_writes: Arc<std::sync::atomic::AtomicUsize>,
@@ -787,6 +805,7 @@ impl ServerSession {
             timeout_seconds: -1,
             ops: Vec::new(),
             actions: Vec::new(),
+            failed: Vec::new(),
             pending_writes: Arc::default(),
             unchecked: false,
             direct: false,
@@ -846,6 +865,7 @@ impl ServerSession {
             timeout_seconds: -1,
             ops: Vec::new(),
             actions: Vec::new(),
+            failed: Vec::new(),
             pending_writes: Arc::default(),
             unchecked: false,
             direct: false,
@@ -1043,6 +1063,7 @@ impl ServerSession {
     pub fn take_completion(&mut self) -> Completion {
         let waits = std::mem::take(&mut self.ops);
         let actions = std::mem::take(&mut self.actions);
+        let on_failure = std::mem::take(&mut self.failed);
         let replicated = if actions.is_empty() && lock_replicated(&self.replicated).is_empty() {
             Vec::new()
         } else {
@@ -1064,6 +1085,7 @@ impl ServerSession {
         Completion {
             waits,
             actions,
+            on_failure,
             replicated,
             pending,
         }
@@ -1172,7 +1194,10 @@ impl ServerSession {
                 }
                 return Err(e);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                outcome.fail();
+                return Err(e);
+            }
         }
         if defer && self.broker.storage().is_some() {
             // A send of one of the commit's duplicate IDs before its record
@@ -1180,10 +1205,19 @@ impl ServerSession {
             // the write fails, the IDs are given back with the dropped
             // update.
             let replicated = self.replicated.clone();
+            let outcome = Arc::new(Mutex::new(Some(outcome)));
+            let undo = outcome.clone();
             self.actions.push(Box::new(move || {
-                let waits = outcome.apply();
-                if !waits.is_empty() {
-                    lock_replicated(&replicated).extend(waits);
+                if let Some(o) = outcome.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let waits = o.apply();
+                    if !waits.is_empty() {
+                        lock_replicated(&replicated).extend(waits);
+                    }
+                }
+            }));
+            self.failed.push(Box::new(move || {
+                if let Some(o) = undo.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    o.fail();
                 }
             }));
         } else {
@@ -1193,6 +1227,15 @@ impl ServerSession {
             }
         }
         Ok(())
+    }
+
+    /// Gives back what came to a transaction after it was rolled back
+    /// ([`Transaction::sweep_rolled_back`]).
+    fn apply_swept(&mut self, outcome: Outcome) {
+        let waits = outcome.apply();
+        if !waits.is_empty() {
+            lock_replicated(&self.replicated).extend(waits);
+        }
     }
 
     /// `PostOfficeImpl.processRoute` with `PagingStore.page`: the queues of
@@ -1402,14 +1445,43 @@ impl ServerSession {
         self.finish(outcome, false)
     }
 
+    /// `ServerSessionImpl.send`: `beforeSend` sees the message as it came,
+    /// and its refusal is the send's; whatever fails after it is reported
+    /// to `onSendException` (the `try` around the rest).
     async fn send_message_in(
         &mut self,
-        mut message: CoreMessage,
+        message: CoreMessage,
         outgoing: Outgoing,
         tx: Option<TxRef>,
     ) -> Result<()> {
         let entry = self.entry.clone();
         let _critical = entry.critical.enter();
+        // A session's own sends, not the replies the broker sends for it.
+        let plugins = (!self.unchecked)
+            .then(|| self.broker.post_office().plugins().clone())
+            .filter(|p| !p.is_empty());
+        let Some(plugins) = plugins else {
+            return self.send_checked(message, outgoing, tx, None).await;
+        };
+        plugins.check(|p| p.before_send(&entry, &message, tx.is_some()))?;
+        let seen = message.clone();
+        let sent = self
+            .send_checked(message, outgoing, tx, Some(plugins.clone()))
+            .await;
+        if let Err(e) = &sent {
+            plugins.each(|p| p.on_send_exception(&entry, &seen, e));
+        }
+        sent
+    }
+
+    async fn send_checked(
+        &mut self,
+        mut message: CoreMessage,
+        outgoing: Outgoing,
+        tx: Option<TxRef>,
+        plugins: Option<Arc<crate::plugin::Plugins>>,
+    ) -> Result<()> {
+        let entry = self.entry.clone();
         let address: Name = match &message.address {
             Some(a) => {
                 let a: Name = match &self.last_address {
@@ -1445,17 +1517,6 @@ impl ServerSession {
             }
             (_, None) => (address, None),
         };
-        // beforeSend: a session's own sends, not the replies the broker
-        // sends for it.
-        let plugins = (!self.unchecked)
-            .then(|| self.broker.post_office().plugins().clone())
-            .filter(|p| !p.is_empty());
-        if let Some(plugins) = &plugins
-            && let Err(e) = plugins.check(|p| p.before_send(&entry, &message, tx.is_some()))
-        {
-            plugins.each(|p| p.on_send_exception(&entry, &message, &e));
-            return Err(e);
-        }
         // A client that credits cannot hold back is failed while the disk
         // is full and its address would block: there is nothing else to do
         // with it. A request to the management address (which may be what
@@ -1483,9 +1544,6 @@ impl ServerSession {
                     ),
                 );
                 self.conn.fail_with(e.clone());
-                if let Some(plugins) = &plugins {
-                    plugins.each(|p| p.on_send_exception(&entry, &message, &e));
-                }
                 return Err(e);
             }
         }
@@ -1501,19 +1559,16 @@ impl ServerSession {
             };
             let sent = ServerMessage::new(request.clone());
             let handled = Box::pin(self.handle_management_message(request, tx.clone())).await;
-            match &handled {
-                Ok(()) => {
-                    let t = tx.as_ref().map(transaction::lock);
-                    plugins.each(|p| {
-                        p.after_send(
-                            &entry,
-                            &sent,
-                            crate::plugin::RoutingStatus::Ok,
-                            t.as_deref(),
-                        )
-                    });
-                }
-                Err(e) => plugins.each(|p| p.on_send_exception(&entry, sent.core(), e)),
+            if handled.is_ok() {
+                let t = tx.as_ref().map(transaction::lock);
+                plugins.each(|p| {
+                    p.after_send(
+                        &entry,
+                        &sent,
+                        crate::plugin::RoutingStatus::Ok,
+                        t.as_deref(),
+                    )
+                });
             }
             return handled;
         }
@@ -1555,6 +1610,14 @@ impl ServerSession {
             .post_office()
             .settings(crate::postoffice::split_fqqn(&address).0);
         crate::message::apply_expiry_delay_now(&mut message, &settings);
+        // `setIngressTimestamp` (`doSend`): a management reply and the
+        // broker's advisories too, which Artemis sends through a session.
+        if settings.enable_ingress_timestamp {
+            message.properties.insert(
+                crate::message::HDR_INGRESS_TIMESTAMP.into(),
+                saranga_buffer::PropertyValue::Long(crate::message::now_millis()),
+            );
+        }
         let scheduled_time = crate::message::scheduled_delivery_time(&message);
         // checkDuplicateID: a bridge's duplicate ID comes off the message and
         // is checked, in place of the message's own, in the bridge cache of
@@ -1747,9 +1810,6 @@ impl ServerSession {
                     paging.after_rollback();
                 }
                 undo_reserved(own_tx, reserved, storage.as_deref());
-                if let Some(plugins) = &plugins {
-                    plugins.each(|p| p.on_send_exception(&entry, r.message.core(), &e));
-                }
                 return Err(e);
             }
         };
@@ -1766,23 +1826,41 @@ impl ServerSession {
             }
             undo_reserved(own_tx, reserved, storage.as_deref());
         } else {
+            // The ID joins the cache once the send's journal transaction is
+            // written (`afterCommit`); if the write fails, it is given back,
+            // so the client's retry is not a duplicate.
             if let Some((cache, id, record)) = reserved {
-                crate::duplicate::lock(&cache).confirm(id, record);
+                let (undo_cache, undo_id) = (cache.clone(), id.clone());
+                self.actions.push(Box::new(move || {
+                    crate::duplicate::lock(&cache).confirm(id, record);
+                }));
+                self.failed.push(Box::new(move || {
+                    crate::duplicate::lock(&undo_cache).release(&undo_id);
+                }));
             }
-            // The paged message is there once the commit is written.
+            // The paged message is there once the commit is written, and
+            // its page transaction goes if the commit is not.
             if let Some(paging) = paged_in_own {
-                self.actions.push(Box::new(move || paging.after_commit()));
+                let paging = Arc::new(Mutex::new(Some(paging)));
+                let undo = paging.clone();
+                self.actions.push(Box::new(move || {
+                    if let Some(p) = paging.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        p.after_commit();
+                    }
+                }));
+                self.failed.push(Box::new(move || {
+                    if let Some(p) = undo.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        p.after_rollback();
+                    }
+                }));
             }
         }
         let (Some(plugins), Some(status)) = (plugins, status) else {
             return sent;
         };
-        match &sent {
-            Ok(()) => {
-                let t = tx.as_ref().map(transaction::lock);
-                plugins.each(|p| p.after_send(&entry, &r.message, status, t.as_deref()));
-            }
-            Err(e) => plugins.each(|p| p.on_send_exception(&entry, r.message.core(), e)),
+        if sent.is_ok() {
+            let t = tx.as_ref().map(transaction::lock);
+            plugins.each(|p| p.after_send(&entry, &r.message, status, t.as_deref()));
         }
         sent
     }
@@ -1984,13 +2062,26 @@ impl ServerSession {
                             q.ref_up(r);
                         }
                     }
+                    // If the journal write fails, they are not added, and
+                    // no longer counted.
+                    let routed = Arc::new(Mutex::new(Some(routed)));
+                    let undo = routed.clone();
                     self.actions.push(Box::new(move || {
-                        for (r, mut queues) in routed {
+                        let routed = routed.lock().unwrap_or_else(|e| e.into_inner()).take();
+                        for (r, mut queues) in routed.into_iter().flatten() {
                             if let Some(last) = queues.pop() {
                                 for q in queues {
                                     q.add_counted(r.clone());
                                 }
                                 last.add_counted(r);
+                            }
+                        }
+                    }));
+                    self.failed.push(Box::new(move || {
+                        let routed = undo.lock().unwrap_or_else(|e| e.into_inner()).take();
+                        for (r, queues) in routed.into_iter().flatten() {
+                            for q in queues {
+                                q.ref_down(&r);
                             }
                         }
                     }));
@@ -2032,6 +2123,13 @@ impl ServerSession {
                         q.ref_up(&r);
                     }
                     t.sends.extend(queues.into_iter().map(|q| (q, r.clone())));
+                }
+                // The reaper may have rolled the transaction back since the
+                // send looked at it: what it added goes as the rollback's.
+                let swept = t.sweep_rolled_back();
+                drop(t);
+                if let Some(o) = swept {
+                    self.apply_swept(o);
                 }
             }
         }
@@ -2246,12 +2344,20 @@ impl ServerSession {
                 // QueueImpl.acknowledge: on a non-destructive queue a
                 // normal acknowledgement leaves the message where it is. In
                 // a transaction, a rollback gives it back to its consumer.
-                if queue.config().non_destructive {
-                    if let Some(tx) = tx {
-                        transaction::lock(&tx)
-                            .browsed
-                            .extend(refs.into_iter().map(|r| (queue.clone(), r)));
-                    }
+                // What a delivery is was settled when it was sent (a copy of
+                // a reference the queue keeps, or the reference): the queue
+                // may have been made destructive or not since.
+                let (copies, rest): (Vec<MessageRef>, Vec<MessageRef>) =
+                    refs.into_iter().partition(|r| r.copy_for.is_some());
+                refs = rest;
+                if !copies.is_empty()
+                    && let Some(tx) = &tx
+                {
+                    transaction::lock(tx)
+                        .browsed
+                        .extend(copies.into_iter().map(|r| (queue.clone(), r)));
+                }
+                if refs.is_empty() {
                     return Ok(ids);
                 }
                 match tx {
@@ -2264,6 +2370,11 @@ impl ServerSession {
                             }
                         }
                         t.acks.extend(refs.into_iter().map(|r| (queue.clone(), r)));
+                        let swept = t.sweep_rolled_back();
+                        drop(t);
+                        if let Some(o) = swept {
+                            self.apply_swept(o);
+                        }
                     }
                     None => {
                         for r in &mut refs {
@@ -2548,9 +2659,24 @@ impl ServerSession {
                 Ok(()) => {
                     let (id, xid) = (t.id, t.xid.clone().expect("XA transaction"));
                     if let Some(s) = self.storage() {
-                        t.paging.before_commit(&s, id).map_err(io_error)?;
+                        if let Err(e) = t.paging.before_commit(&s, id) {
+                            t.unprepare();
+                            return Err(io_error(e).into());
+                        }
                         drop(t);
-                        self.ops.push(s.prepare(id, &xid).map_err(io_error)?);
+                        match s.prepare(id, &xid) {
+                            Ok(p) => {
+                                self.ops.push(p);
+                                let undo = tx.clone();
+                                self.failed.push(Box::new(move || {
+                                    transaction::lock(&undo).unprepare();
+                                }));
+                            }
+                            Err(e) => {
+                                transaction::lock(&tx).unprepare();
+                                return Err(io_error(e).into());
+                            }
+                        }
                     }
                     Ok(())
                 }
@@ -2566,7 +2692,32 @@ impl ServerSession {
 
     /// `xaCommit`.
     pub fn xa_commit(&mut self, xid: Xid, one_phase: bool) -> Result<(), TxError> {
-        self.pending_tx = None;
+        let pending = self.pending_tx.take();
+        let done = self.xa_commit_in(xid.clone(), one_phase);
+        self.keep_refused_pending(pending, &xid);
+        done
+    }
+
+    /// `xaCommit` and `xaRollback` forget the session's ended branch. One
+    /// they refused (see COMPAT.md: it stays registered, to be ended
+    /// properly) is kept, so the session's failure still rolls it back.
+    fn keep_refused_pending(&mut self, pending: Option<TxRef>, xid: &Xid) {
+        let Some(p) = pending else { return };
+        let keep = {
+            let t = transaction::lock(&p);
+            t.xid.as_ref() == Some(xid)
+                && !matches!(t.state, TxState::Committed | TxState::RolledBack)
+        } && self
+            .broker
+            .resource_manager()
+            .get(xid)
+            .is_some_and(|r| Arc::ptr_eq(&r, &p));
+        if keep {
+            self.pending_tx = Some(p);
+        }
+    }
+
+    fn xa_commit_in(&mut self, xid: Xid, one_phase: bool) -> Result<(), TxError> {
         if self.current_xid_is(&xid) {
             let current = self
                 .tx
@@ -2654,7 +2805,13 @@ impl ServerSession {
     /// `xaRollback`: rolls back the branch, and like Artemis also takes
     /// back what this session's consumers are delivering.
     pub async fn xa_rollback(&mut self, xid: Xid) -> Result<(), TxError> {
-        self.pending_tx = None;
+        let pending = self.pending_tx.take();
+        let done = self.xa_rollback_in(xid.clone()).await;
+        self.keep_refused_pending(pending, &xid);
+        done
+    }
+
+    async fn xa_rollback_in(&mut self, xid: Xid) -> Result<(), TxError> {
         if self.current_xid_is(&xid) {
             let current = self
                 .tx
@@ -3512,6 +3669,9 @@ impl ServerSession {
         self.blocked.cancel();
         let plugins = self.broker.post_office().plugins().clone();
         plugins.each(|p| p.before_close_session(&self.entry, failed));
+        // `setStarted(false)` first: what the rollbacks give back is not
+        // delivered again to the consumers about to close.
+        self.set_started(false).await;
         if failed {
             for tx in [self.tx.take(), self.pending_tx.take()]
                 .into_iter()
@@ -3769,6 +3929,202 @@ mod tests {
         assert_eq!(received, expected);
 
         session.close(false).await;
+        broker.stop().unwrap();
+    }
+
+    /// A completion whose journal write fails makes none of its queue
+    /// updates and runs what undoes them (`OperationContext.onError`).
+    #[tokio::test]
+    async fn a_failed_write_undoes_what_its_updates_would_finish() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for fails in [true, false] {
+            let applied = Arc::new(AtomicBool::new(false));
+            let undone = Arc::new(AtomicBool::new(false));
+            let (done, pending) = Pending::new();
+            let mut c = Completion::default();
+            c.push(pending);
+            let a = applied.clone();
+            c.actions
+                .push(Box::new(move || a.store(true, Ordering::SeqCst)));
+            let u = undone.clone();
+            c.on_failure
+                .push(Box::new(move || u.store(true, Ordering::SeqCst)));
+            done(match fails {
+                true => Err(saranga_journal::JournalError::IllegalState("x".into())),
+                false => Ok(()),
+            });
+            assert_eq!(c.wait().await.is_err(), fails);
+            assert_eq!(applied.load(Ordering::SeqCst), !fails);
+            assert_eq!(undone.load(Ordering::SeqCst), fails);
+        }
+    }
+
+    /// A send whose journal transaction fails gives its duplicate ID back:
+    /// the client's retry is sent, not refused as a duplicate.
+    #[tokio::test]
+    async fn a_send_that_fails_to_be_written_keeps_no_duplicate_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = saranga_config::BrokerConfig::parse(
+            r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+                 <persistence-enabled>true</persistence-enabled>
+                 <journal-file-size>65536</journal-file-size>
+               </core></configuration>"#,
+        )
+        .unwrap();
+        let config =
+            BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path()).unwrap();
+        let broker = Broker::start(config).await.unwrap();
+        let mut spec = QueueSpec::new("q", "q");
+        spec.routing_type = Some(RoutingType::Anycast);
+        let queue = broker.post_office().create_queue(spec, false).unwrap();
+        let conn = Arc::new(ClientConnection::new(
+            Transport::internal("test"),
+            Arc::default(),
+            Vec::new(),
+        ));
+        let mut session = ServerSession::new(
+            broker.clone(),
+            conn,
+            SessionOptions {
+                name: "s".to_owned(),
+                username: None,
+                password: None,
+                xa: false,
+                auto_commit_sends: true,
+                auto_commit_acks: true,
+                pre_acknowledge: false,
+                default_address: None,
+            },
+            Authenticated::default(),
+        );
+        let message = || {
+            let mut m = CoreMessage {
+                address: Some(SimpleString::from("q")),
+                durable: true,
+                ..Default::default()
+            };
+            m.properties.insert(
+                "_AMQ_DUPL_ID".into(),
+                saranga_buffer::PropertyValue::String("k".into()),
+            );
+            m
+        };
+        session.send(message(), None).await.unwrap();
+        // The write fails: what the completion would have done is undone.
+        let c = session.take_completion();
+        assert!(!c.on_failure.is_empty());
+        for undo in c.on_failure {
+            undo();
+        }
+        assert_eq!(queue.message_count(), 0);
+        session.send(message(), None).await.unwrap();
+        session.take_completion().wait().await.unwrap();
+        assert_eq!(queue.message_count(), 1, "the retry is sent");
+        session.send(message(), None).await.unwrap();
+        session.take_completion().wait().await.unwrap();
+        assert_eq!(queue.message_count(), 1, "and is a duplicate now");
+        session.close(false).await;
+        broker.stop().unwrap();
+    }
+
+    /// A prepare whose record is not written leaves its branch active, as
+    /// Artemis marks a branch prepared only once its record is: it is not
+    /// among the prepared branches, and can be prepared again.
+    #[tokio::test]
+    async fn a_prepare_that_fails_to_be_written_is_not_prepared() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = saranga_config::BrokerConfig::parse(
+            r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+                 <persistence-enabled>true</persistence-enabled>
+                 <journal-file-size>65536</journal-file-size>
+               </core></configuration>"#,
+        )
+        .unwrap();
+        let config =
+            BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path()).unwrap();
+        let broker = Broker::start(config).await.unwrap();
+        let mut spec = QueueSpec::new("q", "q");
+        spec.routing_type = Some(RoutingType::Anycast);
+        broker.post_office().create_queue(spec, false).unwrap();
+        let conn = Arc::new(ClientConnection::new(
+            Transport::internal("test"),
+            Arc::default(),
+            Vec::new(),
+        ));
+        let mut session = ServerSession::new(
+            broker.clone(),
+            conn,
+            SessionOptions {
+                name: "x".to_owned(),
+                username: None,
+                password: None,
+                xa: true,
+                auto_commit_sends: false,
+                auto_commit_acks: false,
+                pre_acknowledge: false,
+                default_address: None,
+            },
+            Authenticated::default(),
+        );
+        let xid = Xid {
+            format_id: 1,
+            branch_qualifier: b"b".to_vec(),
+            global_transaction_id: b"g".to_vec(),
+        };
+        session.xa_start(xid.clone()).unwrap();
+        let m = CoreMessage {
+            address: Some(SimpleString::from("q")),
+            durable: true,
+            ..Default::default()
+        };
+        session.send(m, None).await.unwrap();
+        session.xa_end(xid.clone()).unwrap();
+        session.take_completion().wait().await.unwrap();
+        session.xa_prepare(xid.clone()).unwrap();
+        let c = session.take_completion();
+        for undo in c.on_failure {
+            undo();
+        }
+        let rm = broker.resource_manager();
+        assert!(rm.prepared().is_empty(), "not prepared");
+        let tx = rm.get(&xid).unwrap();
+        assert_eq!(transaction::lock(&tx).state, TxState::Active);
+        session.xa_prepare(xid.clone()).unwrap();
+        session.take_completion().wait().await.unwrap();
+        assert_eq!(rm.prepared().len(), 1);
+        session.xa_rollback(xid).await.unwrap();
+        session.close(false).await;
+        broker.stop().unwrap();
+    }
+
+    /// What reaches a transaction after the timeout reaper rolled it back
+    /// is rolled back with it, as `addOperation` runs `afterRollback` on a
+    /// rolled-back transaction: an acknowledgement's message is given back
+    /// as a rollback gives it, a send never joins its queue, and no second
+    /// record is written.
+    #[tokio::test]
+    async fn what_comes_after_a_rollback_is_rolled_back() {
+        let broker = Broker::start(BrokerConfig::new(Arc::new(SelectorFilters)))
+            .await
+            .unwrap();
+        let mut spec = QueueSpec::new("q", "q");
+        spec.routing_type = Some(RoutingType::Anycast);
+        let q = broker.post_office().create_queue(spec, false).unwrap();
+        let tx = Transaction::new_ref(1, None);
+        let mut t = transaction::lock(&tx);
+        assert!(t.sweep_rolled_back().is_none(), "active");
+        t.state = TxState::RolledBack;
+        assert!(t.sweep_rolled_back().is_none(), "nothing came");
+        let r = MessageRef::new(ServerMessage::new(CoreMessage::default()));
+        t.acks.push((q.clone(), r.clone()));
+        q.ref_up(&r);
+        t.sends.push((q.clone(), r));
+        let o = t.sweep_rolled_back().unwrap();
+        assert!(o.record.is_none() && o.add.is_empty());
+        assert_eq!(o.cancel.len(), 1);
+        assert!(t.sends.is_empty() && t.acks.is_empty());
+        assert!(t.sweep_rolled_back().is_none(), "swept once");
+        drop(t);
         broker.stop().unwrap();
     }
 }

@@ -1253,10 +1253,9 @@ async fn acknowledge(inner: &Inner, consumer: u64, message_id: i64) {
     }
     match inner.queue.ack(consumer, message_id, true, false).await {
         Ok(mut refs) => {
-            // A non-destructive queue keeps the message.
-            if inner.queue.config().non_destructive {
-                refs.clear();
-            }
+            // A non-destructive queue keeps the message: its deliveries
+            // are copies of references it still holds.
+            refs.retain(|r| r.copy_for.is_none());
             for r in &mut refs {
                 match inner.queue.store_ack(r) {
                     Ok(Some(p)) => {

@@ -1988,14 +1988,23 @@ impl Conn {
         }
         self.orphaned_transactions(&mut s);
         s.server.close(true).await;
+        let wait = s.server.take_completion();
         if self.closed {
+            if !wait.is_empty() {
+                self.out.send(wait, Vec::new());
+            }
             return;
         }
         self.ending.insert(channel);
-        self.send(channel, Performative::End(End::default()));
+        // End once the session's last writes (its acknowledgements, a
+        // rollback) are done, as every other answer waits for them.
+        self.last_write = Instant::now();
+        self.out
+            .frame(channel, Performative::End(End::default()), &[], wait);
     }
 
     async fn on_end(&mut self, channel: u16, _end: End) -> Handled {
+        let mut wait = Completion::default();
         if let Some(mut s) = self.sessions.remove(&channel) {
             let handles: Vec<u32> = s.links.keys().copied().collect();
             for h in handles {
@@ -2005,8 +2014,12 @@ impl Conn {
             }
             self.orphaned_transactions(&mut s);
             s.server.close(false).await;
+            wait = s.server.take_completion();
         }
-        self.send(channel, Performative::End(End::default()));
+        // End once the session's last writes are done.
+        self.last_write = Instant::now();
+        self.out
+            .frame(channel, Performative::End(End::default()), &[], wait);
         Ok(())
     }
 
@@ -5102,6 +5115,12 @@ impl Conn {
             Some(s) => {
                 if let Err(e) = s.server.acknowledged(pending, result) {
                     tracing::debug!("AMQ119007: error acknowledging message, {}", e.message);
+                }
+                // The acknowledgement's writes, and the queue updates that
+                // follow them, go now, not with the session's next answer.
+                let wait = s.server.take_completion();
+                if !wait.is_empty() {
+                    self.out.send(wait, Vec::new());
                 }
             }
             None => pending.finish_alone(result),
