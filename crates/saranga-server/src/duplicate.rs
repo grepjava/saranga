@@ -65,8 +65,16 @@ impl DuplicateIdCache {
         self.size > 0
     }
 
-    /// Whether IDs are journaled.
+    /// Whether IDs are journaled: a cache of size 0 journals nothing
+    /// ([`Self::store_tx`]), so a transaction holding only its ID has no
+    /// record to commit.
     pub fn is_persistent(&self) -> bool {
+        self.storage.is_some() && self.size > 0
+    }
+
+    /// Whether the cache has a journal: [`Self::load`] deletes there the
+    /// records it does not keep, all of them for a cache of size 0.
+    pub fn has_storage(&self) -> bool {
         self.storage.is_some()
     }
 

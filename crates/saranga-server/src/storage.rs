@@ -201,6 +201,10 @@ pub struct RecoveredTx {
     pub xid: Xid,
     /// (queue ID, message ID) routed by the transaction.
     pub sends: Vec<(i64, i64)>,
+    /// (queue ID, message ID) the transaction paged in the store: once it
+    /// commits they are read from there, in their turn, like any paged
+    /// message.
+    pub paged_sends: Vec<(i64, i64)>,
     /// (queue ID, message ID) acknowledged by the transaction.
     pub acks: Vec<(i64, i64)>,
     pub duplicates: Vec<RecoveredDuplicate>,

@@ -698,8 +698,10 @@ impl Journal {
         let size = record.encode_size();
         inner.check_record_size(size)?;
         let wait = sync && completion.is_none();
-        let completion = inner.replicate(&record, completion);
+        // The waiter is the caller's completion: it runs once the backup
+        // has the record too, not only the local write.
         let (completion, rx) = completion_or_wait(completion, wait);
+        let completion = inner.replicate(&record, completion);
         let file = inner.append(&self.writer, record, None, sync, completion)?;
         account(&mut inner.books, file, size as i64);
         drop(inner);
@@ -811,8 +813,10 @@ impl Journal {
         let size = record.encode_size();
         inner.check_record_size(size)?;
         let wait = sync && completion.is_none();
-        let completion = inner.replicate(&record, completion);
+        // The waiter is the caller's completion: it runs once the backup
+        // has the record too, not only the local write.
         let (completion, rx) = completion_or_wait(completion, wait);
+        let completion = inner.replicate(&record, completion);
         let file = inner.append(&self.writer, record, None, sync, completion)?;
         account(&mut inner.books, file, size as i64);
         drop(inner);
@@ -890,8 +894,10 @@ impl Journal {
             num_records: 0,
             data,
         };
-        let completion = inner.replicate(&record, completion);
+        // The waiter is the caller's completion: it runs once the backup
+        // has the record too, not only the local write.
         let (completion, rx) = completion_or_wait(completion, wait);
+        let completion = inner.replicate(&record, completion);
         let file = inner.append(&self.writer, record, Some(tx), sync, completion)?;
         inner.books.tx_prepare(tx, file);
         drop(inner);
@@ -936,8 +942,10 @@ impl Journal {
         } else {
             Record::Rollback { tx }
         };
-        let completion = inner.replicate(&record, completion);
+        // The waiter is the caller's completion: it runs once the backup
+        // has the record too, not only the local write.
         let (completion, rx) = completion_or_wait(completion, wait);
+        let completion = inner.replicate(&record, completion);
         let file = inner.append(&self.writer, record, Some(tx), sync, completion)?;
         let t = inner.books.transactions.remove(&tx).unwrap_or_default();
         if commit {
@@ -1545,10 +1553,21 @@ impl Inner {
     /// `setUpCurrentFile`.
     fn set_up_current_file(&mut self, last_data_pos: u64) -> Result<()> {
         self.ensure_min_files()?;
-        if let Some(k) = self.data_files.pop_back() {
+        // Records are written in the current format: a last file of an
+        // older one (whose header says how its records are read) is kept as
+        // it is, and appends go to a new file.
+        let current_format = self
+            .data_files
+            .back()
+            .is_some_and(|k| self.books.files[k].version >= format::FORMAT_VERSION);
+        if current_format && let Some(k) = self.data_files.pop_back() {
             self.open_handle(k)?;
             self.current = Some(k);
             self.position = last_data_pos;
+        } else if self.free_files.is_empty() {
+            let k = self.create_file(true, None)?;
+            self.current = Some(k);
+            self.position = SIZE_HEADER as u64;
         } else {
             let k = self.free_files.pop_front().expect("ensureMinFiles");
             self.open_handle(k)?;

@@ -133,6 +133,59 @@ impl CoreMessage {
     }
 }
 
+/// `AMQPLargeMessage.saveEncoding` (`readSavedEncoding`): positions and
+/// sizes (i32s) interleaved with the header, message annotations,
+/// properties and application properties sections as AMQP values. It is not
+/// length-prefixed; its end is found by walking the AMQP encodings. Returns
+/// its bytes.
+pub fn read_amqp_saved_encoding<'a>(r: &mut Reader<'a>) -> Result<&'a [u8]> {
+    let start = r.rest();
+    let before = r.remaining();
+    for ints in [2, 3, 1, 2] {
+        r.bytes(4 * ints)?;
+        skip_amqp_value(r)?;
+    }
+    Ok(&start[..before - r.remaining()])
+}
+
+/// Skips one AMQP 1.0 encoded value (its format code determines its size):
+/// its descriptors, then the value they describe, as the AMQP codec skips
+/// one.
+fn skip_amqp_value(r: &mut Reader<'_>) -> Result<()> {
+    let mut code = r.u8()?;
+    while code == 0x00 {
+        let descriptor = r.u8()?;
+        if descriptor == 0x00 {
+            return Err(DecodeError::Invalid(
+                "described descriptor in an AMQP value".to_owned(),
+            ));
+        }
+        skip_amqp_primitive(r, descriptor)?;
+        code = r.u8()?;
+    }
+    skip_amqp_primitive(r, code)
+}
+
+fn skip_amqp_primitive(r: &mut Reader<'_>, code: u8) -> Result<()> {
+    let n = match code >> 4 {
+        0x4 => 0,
+        0x5 => 1,
+        0x6 => 2,
+        0x7 => 4,
+        0x8 => 8,
+        0x9 => 16,
+        0xA | 0xC | 0xE => r.u8()? as usize,
+        0xB | 0xD | 0xF => r.len("AMQP value")?,
+        _ => {
+            return Err(DecodeError::Invalid(format!(
+                "invalid AMQP format code 0x{code:02x}"
+            )));
+        }
+    };
+    r.bytes(n)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

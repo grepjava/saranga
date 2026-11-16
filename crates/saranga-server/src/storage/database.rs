@@ -1518,6 +1518,7 @@ impl Store for DatabaseStorage {
                     id: tx,
                     xid: decode_xid(&xid)?,
                     sends: Vec::new(),
+                    paged_sends: Vec::new(),
                     acks: Vec::new(),
                     duplicates: Vec::new(),
                     page_txs: Vec::new(),
@@ -1534,13 +1535,19 @@ impl Store for DatabaseStorage {
         // Per queue, in message order, with its side records to come.
         let mut queues: HashMap<i64, Vec<RecoveredRef>> = HashMap::new();
         let mut at: HashMap<(i64, i64), usize> = HashMap::new();
-        for (message, queue, _paged, tx, ack_tx) in rows.references {
+        for (message, queue, paged, tx, ack_tx) in rows.references {
             if !out.messages.contains_key(&message) {
                 tracing::warn!("AMQ222031: Cannot find message {message}");
                 continue;
             }
             if let Some(t) = tx.and_then(|t| prepared.get_mut(&t)) {
-                t.sends.push((queue, message));
+                // A paged one stays paged: the commit hands it to the
+                // queue's reading of the store, the rollback deletes it.
+                if paged {
+                    t.paged_sends.push((queue, message));
+                } else {
+                    t.sends.push((queue, message));
+                }
                 continue;
             }
             if let Some(t) = ack_tx.and_then(|t| prepared.get_mut(&t)) {

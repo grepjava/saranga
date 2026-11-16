@@ -474,9 +474,11 @@ fn take_kept(tx: &TxRef, keep: &[Kept]) -> Vec<(ConsumerId, Queue, MessageRef)> 
 }
 
 /// Gives kept acknowledgements back to their consumers as delivered,
-/// counted once more.
+/// counted once more. Each goes to the front of its consumer's deliveries,
+/// so they are given back last first, as OpenWire's `returnReferences`
+/// gives them, to keep the order they were delivered in.
 fn back_to_delivering(kept: Vec<(ConsumerId, Queue, MessageRef)>) {
-    for (id, q, mut r) in kept {
+    for (id, q, mut r) in kept.into_iter().rev() {
         r.delivery_count += 1;
         q.back_to_delivering(id, r);
     }
@@ -1158,8 +1160,19 @@ impl ServerSession {
             c.metrics.transaction_ended();
         }
         let storage = self.storage();
-        if let Some(p) = outcome.write(storage.as_deref())? {
-            self.ops.push(p);
+        match outcome.write(storage.as_deref()) {
+            Ok(Some(p)) => self.ops.push(p),
+            Ok(None) => {}
+            // A rollback whose record cannot be written still gives back what
+            // it acknowledged, or those messages would be lost from memory.
+            Err(e) if !defer => {
+                let waits = outcome.apply();
+                if !waits.is_empty() {
+                    lock_replicated(&self.replicated).extend(waits);
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
         }
         if defer && self.broker.storage().is_some() {
             // A send of one of the commit's duplicate IDs before its record
@@ -1691,8 +1704,16 @@ impl ServerSession {
             if let Some(p) = &own_paging {
                 let mut p = transaction::lock(p);
                 lock_replicated(&self.replicated).extend(std::mem::take(&mut p.replicated));
+                // What paging wrote in the send's transaction: a page
+                // transaction to journal, or (the database store) the paged
+                // rows themselves, which wait for its commit.
+                let staged = p.persistent;
                 let mut paging = std::mem::take(&mut p.paging);
-                if !paging.page_txs.is_empty() {
+                if staged
+                    || !paging.page_txs.is_empty()
+                    || !paging.stored.is_empty()
+                    || !paging.waiting.is_empty()
+                {
                     if let (Some(s), Some((jtx, persistent))) = (&storage, &mut own_tx) {
                         // The page transaction is journaled in the send's
                         // transaction, which now has something to commit.

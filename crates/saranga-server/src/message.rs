@@ -724,6 +724,10 @@ pub struct MessageRef {
     /// coming back, it gives the queue its delivery count and lets that
     /// consumer have the message again.
     pub copy_for: Option<crate::queue::ConsumerId>,
+    /// Taken from its page by a management operation, ahead of the queue's
+    /// reading: an operation that fails leaves it there (`move` before
+    /// `iter.remove()`), for the queue to read in its turn.
+    pub scanned: bool,
 }
 
 impl MessageRef {
@@ -738,6 +742,7 @@ impl MessageRef {
             rejected_consumers: Vec::new(),
             sequence: 0,
             copy_for: None,
+            scanned: false,
         }
     }
 

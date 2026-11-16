@@ -833,7 +833,7 @@ impl Queue {
             let mut paging = TxPaging::default();
             paging.manager = store.manager();
             position.ack_record = store.store_ack_tx(sub, tx, position, &mut paging.updates)?;
-            if position.ack_record < 0 && paging.updates.is_empty() {
+            if position.ack_record < 0 && !paging.journals_updates() {
                 return Ok(None);
             }
             paging.before_commit(s, tx)?;
@@ -868,7 +868,10 @@ impl Queue {
                 paging.manager = store.manager();
             }
             position.ack_record = store.store_ack_tx(sub, tx, position, &mut paging.updates)?;
-            return Ok(position.ack_record >= 0 || position.tx_id > 0);
+            // Written now: the cursor's acknowledgement (a durable queue).
+            // A page transaction's update is written at the commit
+            // (`TxPaging::journals_updates`); a rollback has none to end.
+            return Ok(position.ack_record >= 0);
         }
         if self.is_durable_ref(r)
             && let Some(s) = self.0.ids.storage()
@@ -1816,7 +1819,8 @@ impl Actor {
     /// `addSorted`: a returned reference goes back in queue order, or
     /// waits out its redelivery delay. A last-value queue keeps a newer
     /// value over it; a full ring queue drops it.
-    fn add_sorted(&mut self, r: MessageRef) {
+    fn add_sorted(&mut self, mut r: MessageRef) {
+        r.scanned = false;
         if r.scheduled_time > 0 {
             self.schedule(r, false);
             return;
@@ -2282,14 +2286,18 @@ impl Actor {
         let mut committed = None;
         let mut paging = TxPaging::default();
         if let (Some(s), Some(move_tx)) = (self.shared.ids.storage(), &move_tx) {
-            let (tx, taken) = {
+            let (tx, taken, staged) = {
                 let mut t = crate::transaction::lock(move_tx);
-                (t.id, std::mem::take(&mut t.paging))
+                (t.id, std::mem::take(&mut t.paging), t.persistent)
             };
             paging = taken;
             // The copy's paging must commit even when nothing is journaled
-            // (a non-durable message paged to a full address).
-            let mut persistent = !paging.page_txs.is_empty();
+            // (a non-durable message paged to a full address), and so must
+            // the rows the database store paged it in.
+            let mut persistent = staged
+                || !paging.page_txs.is_empty()
+                || !paging.stored.is_empty()
+                || !paging.waiting.is_empty();
             let result = (|| -> crate::storage::StoreResult<Option<crate::storage::Pending>> {
                 for (m, targets) in &routed {
                     for q in targets.iter().filter(|q| q.is_durable_ref(m)) {
@@ -2305,6 +2313,7 @@ impl Actor {
                 {
                     persistent = true;
                 }
+                persistent |= paging.journals_updates();
                 // `addDuplicateID`: a reject-duplicates move journals the
                 // destination's duplicate ID in the same transaction, so
                 // `persist-id-cache` keeps it across a restart rather than
@@ -2390,8 +2399,12 @@ impl Actor {
             settle(false);
         }
         self.write_failed(e);
-        if let Some(r) = r {
-            self.add_sorted(r);
+        match r {
+            // Taken from its page by the operation: left there, not kept in
+            // memory ahead of the messages before it (and read again).
+            Some(r) if r.scanned => self.unclaim(r),
+            Some(r) => self.add_sorted(r),
+            None => {}
         }
     }
 
@@ -2588,8 +2601,10 @@ impl Actor {
                     self.return_refs(vec![r]);
                 }
             }
+            // `deliveringRefs.addFirst`: ahead of what was delivered since, so a
+            // cumulative acknowledgement reaches it first.
             Cmd::BackToDelivering { id, r } => match self.consumer_mut(id) {
-                Some(c) => c.delivering.push_back(r),
+                Some(c) => c.delivering.push_front(r),
                 None => self.return_refs(vec![r]),
             },
             Cmd::Reject {

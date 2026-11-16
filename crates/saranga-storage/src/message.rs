@@ -163,7 +163,7 @@ impl AmqpLargeMessageRecord {
             message_format: r.i64()?,
             address: r.nullable_simple_string()?,
             extra_properties: read_sized_properties(r)?,
-            saved_encoding: r.bytes(r.remaining())?.to_vec(),
+            saved_encoding: read_saved_encoding(r)?,
         })
     }
 
@@ -175,6 +175,23 @@ impl AmqpLargeMessageRecord {
         write_sized_properties(w, self.extra_properties.as_ref());
         w.bytes(&self.saved_encoding);
     }
+}
+
+/// `readSavedEncoding`, then the expiration when 8 bytes are left and the
+/// re-encoded flag when one is (`AMQPLargeMessagePersister.decode`), kept as
+/// they were written. Only what is the record's is read: in a page the
+/// message's queue IDs follow it.
+fn read_saved_encoding(r: &mut Reader<'_>) -> Result<Vec<u8>> {
+    let start = r.rest();
+    let before = r.remaining();
+    saranga_message::read_amqp_saved_encoding(r)?;
+    if r.remaining() >= 8 {
+        r.i64()?;
+    }
+    if r.remaining() > 0 {
+        r.bool()?;
+    }
+    Ok(start[..before - r.remaining()].to_vec())
 }
 
 /// An i32 size, then (when not 0) `TypedProperties` of that size.
@@ -234,6 +251,15 @@ impl PersistedMessage {
 
     pub fn is_large(&self) -> bool {
         matches!(self, Self::AmqpLarge(_))
+    }
+
+    /// Whether the message is durable, where its record says.
+    pub fn is_durable(&self) -> bool {
+        match self {
+            Self::Core(m) => m.message.durable,
+            Self::Amqp(_) => true,
+            Self::AmqpLarge(m) => m.durable,
+        }
     }
 }
 
@@ -356,7 +382,18 @@ mod tests {
             message_format: 0,
             address: None,
             extra_properties: Some(extra),
-            saved_encoding: vec![0, 0, 0, 1, 2, 3],
+            // `saveEncoding`: 2, 3, 1 and 2 ints, each followed by a value
+            // (null here), then the expiration and the re-encoded flag.
+            saved_encoding: [2, 3, 1, 2]
+                .into_iter()
+                .flat_map(|ints| {
+                    let mut part = vec![0u8; 4 * ints];
+                    part.push(0x40);
+                    part
+                })
+                .chain(5i64.to_be_bytes())
+                .chain([1])
+                .collect(),
         });
         assert_eq!(PersistedMessage::decode(&large.encode()).unwrap(), large);
         assert!(PersistedMessage::decode(&[9, 0]).is_err());

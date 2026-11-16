@@ -528,48 +528,9 @@ impl Codec for AmqpLargeMessageRecord {
     }
 }
 
-/// Reads the `AMQPLargeMessage.saveEncoding` layout as raw bytes:
-/// 2 ints, value, 3 ints, value, int, value, 2 ints, value.
+/// Reads the `AMQPLargeMessage.saveEncoding` layout as raw bytes.
 fn read_amqp_saved_encoding(r: &mut Reader<'_>) -> Result<Vec<u8>> {
-    let start = r.rest();
-    let before = r.remaining();
-    for ints in [2, 3, 1, 2] {
-        r.bytes(4 * ints)?;
-        skip_amqp_value(r)?;
-    }
-    Ok(start[..before - r.remaining()].to_vec())
-}
-
-/// Skips one AMQP 1.0 encoded value (its format code determines its size):
-/// its descriptors, then the value they describe, as the AMQP codec skips
-/// one.
-fn skip_amqp_value(r: &mut Reader<'_>) -> Result<()> {
-    let mut code = r.u8()?;
-    while code == 0x00 {
-        let descriptor = r.u8()?;
-        if descriptor == 0x00 {
-            return invalid("described descriptor in an AMQP value".to_owned());
-        }
-        skip_amqp_primitive(r, descriptor)?;
-        code = r.u8()?;
-    }
-    skip_amqp_primitive(r, code)
-}
-
-fn skip_amqp_primitive(r: &mut Reader<'_>, code: u8) -> Result<()> {
-    let n = match code >> 4 {
-        0x4 => 0,
-        0x5 => 1,
-        0x6 => 2,
-        0x7 => 4,
-        0x8 => 8,
-        0x9 => 16,
-        0xA | 0xC | 0xE => r.u8()? as usize,
-        0xB | 0xD | 0xF => r.len("AMQP value")?,
-        _ => return invalid(format!("invalid AMQP format code 0x{code:02x}")),
-    };
-    r.bytes(n)?;
-    Ok(())
+    saranga_message::read_amqp_saved_encoding(r).map(<[u8]>::to_vec)
 }
 
 impl PersistedMessage {

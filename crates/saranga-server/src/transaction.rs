@@ -273,9 +273,14 @@ impl Transaction {
         self.state = TxState::RollbackOnly;
     }
 
-    /// `isEffective`: committed or rolled back.
+    /// `isEffective`: prepared, committed or rolled back. A prepared branch
+    /// is the transaction manager's to end: a failed client or a failure
+    /// elsewhere does not make it rollback-only.
     pub fn is_effective(&self) -> bool {
-        matches!(self.state, TxState::Committed | TxState::RolledBack)
+        matches!(
+            self.state,
+            TxState::Prepared | TxState::Committed | TxState::RolledBack
+        )
     }
 
     /// `internalRollback`. A rollback record is journaled for persistent
@@ -346,6 +351,7 @@ impl Transaction {
         // page transaction among it), or to end a prepared branch.
         let journaled = self.persistent
             || !self.paging.page_txs.is_empty()
+            || self.paging.journals_updates()
             || (self.xid.is_some() && self.state == TxState::Prepared);
         self.state = TxState::Committed;
         self.browsed.clear();

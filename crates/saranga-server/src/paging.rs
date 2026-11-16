@@ -1324,6 +1324,11 @@ impl PagingStore {
         sub.counter_add(-1, -persistent_size(message));
     }
 
+    /// Undoes [`Self::claim_stored`]: the message stays paged in the store.
+    pub fn unclaim_stored(&self, sub: &PageSubscription, message: &ServerMessage) {
+        sub.counter_add(1, persistent_size(message));
+    }
+
     /// The next of a queue's paged messages in the store, left paged.
     fn scan_stored(
         manager: &PagingManager,
@@ -1376,8 +1381,12 @@ impl PagingStore {
             // file as soon as the first delivery acknowledged. The file goes
             // with the message's row instead, deleted once no reference is left
             // on it (the database store's reference-guarded message delete).
+            let durable = match &stored {
+                crate::storage::StoredMessage::Core(m) => m.durable,
+                crate::storage::StoredMessage::Native(r) => r.is_durable(),
+            };
             let body = |id| {
-                let b = manager.large.existing(id);
+                let b = manager.large.existing_as(id, durable);
                 b.set_keep(true);
                 b
             };
@@ -1772,6 +1781,18 @@ impl PagingStore {
         if let Some(r) = &replicator {
             replicate_page_write(r, &self.address, current.id, &record);
         }
+        let subs: Vec<Arc<PageSubscription>> = paged
+            .queue_ids
+            .iter()
+            .filter_map(|id| st.subscriptions.get(id).cloned())
+            .collect();
+        // Before the entry can be read (`next`) or its page found complete
+        // (`cleanup`): its transaction is known, so a reader holds it until
+        // the commit rather than skipping it, and its queues are not empty.
+        let page_tx = tx.map(|_| manager.install_transaction(tx_id).0);
+        for sub in &subs {
+            lock(&sub.state).empty = false;
+        }
         let current = st.current.as_mut().expect("a current page");
         current.size += record.len() as u64;
         let nr = current.entries.len() as i32;
@@ -1787,18 +1808,10 @@ impl PagingStore {
             // The page holds it now: its file goes with the page.
             body.set_keep(true);
         }
-        let subs: Vec<Arc<PageSubscription>> = paged
-            .queue_ids
-            .iter()
-            .filter_map(|id| st.subscriptions.get(id).cloned())
-            .collect();
         drop(st);
         let size = persistent_size(message);
-        for sub in &subs {
-            lock(&sub.state).empty = false;
-        }
-        let pending = match tx {
-            None => {
+        let pending = match (tx, page_tx) {
+            (None, _) | (_, None) => {
                 for sub in &subs {
                     sub.counter_add(1, size);
                 }
@@ -1815,14 +1828,15 @@ impl PagingStore {
                         .map(|r| manager.replicated(&r))
                 }
             }
-            Some(tx) => {
-                let (page_tx, _) = manager.install_transaction(tx_id);
+            (Some(tx), Some(page_tx)) => {
                 {
                     let mut p = lock(&page_tx.state);
-                    let durable = queues
-                        .iter()
-                        .filter(|q| q.is_durable_ref_of(message))
-                        .count() as i32;
+                    // `getNumberOfDurableQueues`: each durable queue counts,
+                    // whatever the message's durability, as each of its
+                    // acknowledgements is journaled against the record (a
+                    // non-durable message paged is read again after a
+                    // restart too).
+                    let durable = queues.iter().filter(|q| q.is_durable()).count() as i32;
                     p.persistent += durable;
                     p.messages += queues.len() as i32;
                     p.pending_counters
@@ -1871,6 +1885,7 @@ impl PagingStore {
             .into_iter()
             .enumerate()
             .map(|(nr, m)| {
+                let durable = m.is_durable();
                 let message = match (m.body, &manager) {
                     (PagedBody::Message(PersistedMessage::Core(c)), _) => {
                         Some(ServerMessage::new(c.to_message()))
@@ -1894,7 +1909,7 @@ impl PagingStore {
                         }
                     }
                     (PagedBody::OtherLarge(record), Some(manager)) => {
-                        let body = manager.large.existing(record.message_id());
+                        let body = manager.large.existing_as(record.message_id(), durable);
                         body.set_keep(true);
                         let decoders = manager.decoders.get_or_init(MessageDecoders::default);
                         match decoders.decode_large(&record, body) {
@@ -1906,7 +1921,7 @@ impl PagingStore {
                         }
                     }
                     (PagedBody::CoreLarge(core), Some(manager)) => {
-                        let body = manager.large.existing(core.message_id);
+                        let body = manager.large.existing_as(core.message_id, durable);
                         body.set_keep(true);
                         Some(ServerMessage::new_large(core, body))
                     }
@@ -2460,7 +2475,11 @@ impl PagingStore {
                     .flatten();
                 for qid in &e.queue_ids {
                     let Some(sub) = subs.get(qid) else { continue };
-                    if sub.is_acked(page, e.nr) {
+                    // Acknowledged for good only: one in a prepared
+                    // transaction still counts, and holds its page, until
+                    // the transaction commits (`isAck` checks the page's
+                    // acknowledgements, not the transactions in flight).
+                    if sub.is_acked_for_good(page, e.nr) {
                         continue;
                     }
                     match &tx {
@@ -2646,13 +2665,13 @@ impl PagingStore {
         for (page, path) in deleted {
             let Some(path) = path else { continue };
             if let Ok(data) = fs::read(&path) {
-                let large: Vec<i64> = saranga_paging::read_page(&data)
-                    .messages
-                    .iter()
-                    .filter(|m| m.is_large())
-                    .map(PagedMessage::message_id)
-                    .collect();
-                manager.large.delete_files(large);
+                // Each large body goes once nothing else holds it: the same
+                // message routed to a queue that does not page reads it.
+                for m in saranga_paging::read_page(&data).messages {
+                    if m.is_large() {
+                        manager.large.release(m.message_id(), m.is_durable());
+                    }
+                }
             }
             if let Err(e) = fs::remove_file(&path)
                 && e.kind() != io::ErrorKind::NotFound
@@ -2917,6 +2936,16 @@ impl PageSubscription {
         s.in_memory_bytes += size;
     }
 
+    /// A message [`Self::read_in`] ahead of the queue's reading goes back to
+    /// its page: no longer in memory, and not acknowledged by the
+    /// transaction that failed.
+    pub fn unclaim(&self, page: i64, nr: i32, size: i64) {
+        let mut s = lock(&self.state);
+        s.in_memory -= 1;
+        s.in_memory_bytes -= size;
+        s.removed.remove(&(page, nr));
+    }
+
     /// (messages, bytes) of paged messages the queue holds in memory.
     pub fn in_memory(&self) -> (i64, i64) {
         let s = lock(&self.state);
@@ -2926,6 +2955,15 @@ impl PageSubscription {
     fn is_acked(&self, page: i64, nr: i32) -> bool {
         let s = lock(&self.state);
         s.removed.contains(&(page, nr)) || s.consumed.get(&page).is_some_and(|i| i.is_acked(nr))
+    }
+
+    /// Acknowledged by a committed acknowledgement, not one a transaction
+    /// still holds (`removed`).
+    fn is_acked_for_good(&self, page: i64, nr: i32) -> bool {
+        lock(&self.state)
+            .consumed
+            .get(&page)
+            .is_some_and(|i| i.is_acked(nr))
     }
 
     /// The page is complete or about to be deleted for this queue.
@@ -3249,6 +3287,19 @@ impl TxPaging {
         Ok(())
     }
 
+    /// Whether [`Self::before_commit`] journals updates of page
+    /// transactions (those that have a record): the commit then has a
+    /// record to complete, though nothing else was written in it.
+    pub fn journals_updates(&self) -> bool {
+        let Some(m) = &self.manager else {
+            return false;
+        };
+        self.updates.iter().any(|(page_tx, _)| {
+            m.transaction(*page_tx)
+                .is_some_and(|t| lock(&t.state).record >= 0)
+        })
+    }
+
     /// `afterCommit`.
     pub fn after_commit(self) {
         for p in self.page_txs {
@@ -3317,4 +3368,69 @@ fn write_page(file: &File, path: &Path, record: &[u8]) -> io::Result<()> {
 fn sync_page(file: &File, path: &Path) -> io::Result<()> {
     saranga_fault::check(saranga_fault::Op::Sync, path)?;
     file.sync_data()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::postoffice::{QueueSpec, SelectorFilters};
+
+    /// A message paged in a transaction is not readable before the
+    /// transaction is known: a reader finding its entry with no transaction
+    /// would skip it for good (`position_ignored`), and the committed message
+    /// would be lost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transactional_page_entry_is_not_visible_before_its_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = saranga_config::BrokerConfig::parse(
+            r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+                 <persistence-enabled>true</persistence-enabled>
+                 <journal-pool-files>2</journal-pool-files>
+                 <journal-file-size>65536</journal-file-size>
+                 <address-settings><address-setting match="q">
+                   <max-size-bytes>1</max-size-bytes>
+                   <address-full-policy>PAGE</address-full-policy>
+                 </address-setting></address-settings>
+               </core></configuration>"#,
+        )
+        .unwrap();
+        let config =
+            crate::BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path())
+                .unwrap();
+        let broker = crate::Broker::start(config).await.unwrap();
+        let po = broker.post_office();
+        let mut spec = QueueSpec::new("q", "q");
+        spec.auto_create_address = Some(true);
+        spec.durable = true;
+        po.create_queue(spec, false).unwrap();
+        let queue = po.queue("q").unwrap();
+        let store = po.paging_store("q");
+        store.start_paging();
+        let manager = store.manager.upgrade().unwrap();
+        let tx = crate::transaction::Transaction::new_ref(77, None);
+        let message = ServerMessage::new(saranga_message::CoreMessage {
+            message_id: 5,
+            address: Some("q".into()),
+            durable: true,
+            ..Default::default()
+        });
+
+        let held = lock(&manager.transactions);
+        let paging = {
+            let (store, tx, queue) = (store.clone(), tx.clone(), queue.clone());
+            std::thread::spawn(move || store.page(&message, Some(&tx), &[queue]).is_ok())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if let Ok(st) = store.state.try_lock() {
+            let visible = st
+                .current
+                .as_ref()
+                .is_some_and(|c| c.entries.iter().any(|e| e.tx_id == 77));
+            assert!(!visible, "the entry was readable before its transaction");
+        }
+        drop(held);
+        assert!(paging.join().unwrap());
+        assert!(manager.transaction(77).is_some());
+        broker.stop().unwrap();
+    }
 }

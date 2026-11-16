@@ -82,6 +82,16 @@ impl PagedMessage {
         !matches!(self.body, PagedBody::Message(_))
     }
 
+    /// Whether the message is durable: a large one's body is then in a
+    /// `.msg` file, else in a `.tmp` one.
+    pub fn is_durable(&self) -> bool {
+        match &self.body {
+            PagedBody::CoreLarge(m) => m.durable,
+            PagedBody::OtherLarge(PersistedMessage::AmqpLarge(m)) => m.durable,
+            PagedBody::OtherLarge(m) | PagedBody::Message(m) => m.is_durable(),
+        }
+    }
+
     /// Whether it was paged within a transaction.
     pub fn in_transaction(&self) -> bool {
         self.transaction_id > 0
@@ -301,6 +311,45 @@ mod tests {
         let page = read_page(&tail);
         assert_eq!(page.messages, vec![regular]);
         assert!(!page.suspect);
+    }
+
+    /// An AMQP large message's record in a page is followed by its queue
+    /// IDs: its saved encoding is read by its structure, as Artemis reads it,
+    /// not to the end of the record.
+    #[test]
+    fn a_paged_amqp_large_message_keeps_its_queue_ids() {
+        use saranga_storage::message::AmqpLargeMessageRecord;
+        // 2 ints, a value, 3 ints, a value, 1 int, a value, 2 ints, a value
+        // (null each), then the expiration and the re-encoded flag.
+        let mut saved = Vec::new();
+        for ints in [2, 3, 1, 2] {
+            saved.extend(vec![0u8; 4 * ints]);
+            saved.push(0x40);
+        }
+        saved.extend(1234i64.to_be_bytes());
+        saved.push(0);
+        let amqp = PagedMessage {
+            transaction_id: -1,
+            body: PagedBody::OtherLarge(PersistedMessage::AmqpLarge(AmqpLargeMessageRecord {
+                message_id: 42,
+                durable: true,
+                message_format: 0,
+                address: Some("a".into()),
+                extra_properties: None,
+                saved_encoding: saved,
+            })),
+            queue_ids: vec![7, 8],
+        };
+        let after = PagedMessage {
+            transaction_id: -1,
+            body: PagedBody::Message(PersistedMessage::Core(CoreMessageRecord::new(core(43)))),
+            queue_ids: vec![7],
+        };
+        let mut file = amqp.encode_record();
+        file.extend(after.encode_record());
+        let page = read_page(&file);
+        assert!(!page.suspect);
+        assert_eq!(page.messages, vec![amqp, after]);
     }
 
     #[test]

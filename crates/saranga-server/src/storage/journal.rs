@@ -76,6 +76,7 @@ impl JournalStorage {
             id: p.id,
             xid,
             sends: Vec::new(),
+            paged_sends: Vec::new(),
             acks: Vec::new(),
             duplicates: Vec::new(),
             page_txs: Vec::new(),

@@ -597,6 +597,24 @@ impl Actor {
         }
     }
 
+    /// Undoes [`Self::claim`] for a reference an operation failed on: it
+    /// stays in its page, read again in its turn.
+    pub(crate) fn unclaim(&mut self, r: MessageRef) {
+        let Some(sub) = self.shared.paging.clone() else {
+            return;
+        };
+        if let Some(p) = &r.paged {
+            sub.unclaim(p.page, p.message_nr, p.size);
+        } else if r.stored
+            && let Some(store) = sub.store()
+        {
+            store.unclaim_stored(&sub, &r.message);
+            r.message.durable_down();
+            self.shared.message_count.fetch_sub(1, Ordering::SeqCst);
+            self.queue().ref_down(&r);
+        }
+    }
+
     /// Up to `max` queued messages matching `filter`, including those still in
     /// pages, so a paging queue's export sees them all. The in-memory and
     /// scheduled references come first, then the paged references not already
@@ -1059,6 +1077,7 @@ fn group_key(group_buckets: i32, group: &str) -> GroupKey {
 fn scanned(p: PagedRef) -> MessageRef {
     let in_store = p.position.page == IN_STORE;
     let mut r = MessageRef::new(p.message);
+    r.scanned = true;
     if in_store {
         r.stored = true;
     } else {

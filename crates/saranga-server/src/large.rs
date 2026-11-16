@@ -379,6 +379,15 @@ impl LargeMessageStore {
     /// goes now, or with the last body in memory (a non-durable queue's
     /// reference, a reader's copy of a paged message).
     pub fn row_deleted(&self, id: i64) {
+        self.release(id, true);
+    }
+
+    /// What held large message `id`'s file for good (its stored row, the
+    /// page it was paged in) is gone: the file goes now, or with the last
+    /// body in memory, which another queue routed the same message may
+    /// still read (`RefCountMessage`: the file is deleted once nothing
+    /// refers to the message).
+    pub fn release(&self, id: i64, durable: bool) {
         {
             let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(o) = open.get_mut(&id) {
@@ -386,7 +395,7 @@ impl LargeMessageStore {
                 return;
             }
         }
-        if let Some(path) = self.path(id, true) {
+        if let Some(path) = self.path(id, durable) {
             self.remove(id, &path, |e| deletion_failed(&path, &e));
         }
     }
@@ -430,7 +439,14 @@ impl LargeMessageStore {
     /// The body of a large message recovered from the journal. Its size is
     /// the file's; a missing file reads as empty.
     pub fn existing(self: &Arc<Self>, id: i64) -> Arc<LargeBody> {
-        let path = self.path(id, true);
+        self.existing_as(id, true)
+    }
+
+    /// The body of a large message read again from where it was kept: a
+    /// durable one's `.msg` file, a non-durable one's `.tmp` (`LargeBody`'s
+    /// file is chosen by `message.isDurable()`).
+    pub fn existing_as(self: &Arc<Self>, id: i64, durable: bool) -> Arc<LargeBody> {
+        let path = self.path(id, durable);
         let size = path
             .as_ref()
             .and_then(|p| fs::metadata(p).ok())

@@ -356,7 +356,7 @@ pub async fn load_messages(
     for (address, ids) in by_address {
         let cache = post_office.duplicate_cache(&address);
         let mut c = crate::duplicate::lock(&cache);
-        if c.is_persistent() {
+        if c.has_storage() {
             c.load(ids, || post_office.ids().next())
                 .map_err(|e| corrupt("duplicate IDs", e))?;
         }
@@ -393,6 +393,7 @@ pub async fn load_messages(
                 rejected_consumers: Vec::new(),
                 sequence: 0,
                 copy_for: None,
+                scanned: false,
             });
         }
     }
@@ -420,6 +421,21 @@ pub async fn load_messages(
             // Counted as a routed reference is, until the branch ends.
             q.ref_up(&r);
             tx.sends.push((q.clone(), r));
+        }
+        // Paged in the store: counted, and their queues told, once the
+        // branch commits, as a live transaction's paged sends are.
+        for (queue_id, message_id) in p.paged_sends {
+            let (Some(q), Some(m)) = (by_id.get(&queue_id), messages.get(&message_id)) else {
+                continue;
+            };
+            if let Some(sub) = q.page_subscription() {
+                tx.paging
+                    .stored
+                    .push((sub.clone(), crate::paging::persistent_size(m)));
+            }
+            if !tx.paging.waiting.iter().any(|w| w.id() == q.id()) {
+                tx.paging.waiting.push(q.clone());
+            }
         }
         for (queue_id, message_id) in p.acks {
             let Some(q) = by_id.get(&queue_id) else {
