@@ -8,15 +8,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use saranga_message::CoreMessage;
 use saranga_security::{Authenticated, SecurityError};
 use saranga_server::interceptor::Log;
 use saranga_server::postoffice::{AutoCreate, QueueSpec, split_fqqn};
-use saranga_server::protocol::{Connection as Accepted, DirectOut, Written};
-use saranga_server::queue::{AckResult, DeliverySink, Queue};
+use saranga_server::protocol::{Connection as Accepted, DirectOut, Writability, Written};
+use saranga_server::queue::{AckResult, DeliverySink, Queue, WeakQueue};
 use saranga_server::session::{
     AckPending, ClientConnection, Completion, ServerSession, SessionOptions, Transport,
 };
@@ -144,6 +144,9 @@ enum Out {
 struct Outbound {
     tx: mpsc::UnboundedSender<Out>,
     direct: DirectOut,
+    /// What the writer has yet to write: deliveries wait past its
+    /// high-water mark.
+    writability: Arc<Writability>,
     destroyed: AtomicBool,
     remote: String,
     /// For the outgoing interceptors.
@@ -213,7 +216,10 @@ impl Outbound {
             return false;
         }
         let tx = &self.tx;
-        self.direct.write(bytes, |b| tx.send(Out::Bytes(b)).is_ok())
+        self.direct.write(bytes, |b| {
+            self.writability.queued(b.len());
+            tx.send(Out::Bytes(b)).is_ok()
+        })
     }
 }
 
@@ -221,6 +227,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
     mut wr: W,
     mut rx: mpsc::UnboundedReceiver<Out>,
     written: Written,
+    writability: Arc<Writability>,
 ) {
     let mut buf = Vec::with_capacity(64 * 1024);
     while let Some(first) = rx.recv().await {
@@ -241,6 +248,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
         if !buf.is_empty() && wr.write_all(&buf).await.is_err() {
             break;
         }
+        writability.written(buf.len());
         buf.clear();
         written.done(held);
         if close {
@@ -437,6 +445,8 @@ struct StompSink {
     subscription: Arc<Subscription>,
     kind: Kind,
     to_ack: ToAck,
+    /// The subscription's queue, prompted once the connection drains.
+    queue: OnceLock<WeakQueue>,
 }
 
 impl StompSession {
@@ -532,6 +542,15 @@ impl DeliverySink for StompSink {
 
     fn deliver_continuation(&self, _consumer_id: i64, _chunk: Vec<u8>, _continues: bool) -> i64 {
         0
+    }
+
+    /// `StompSession.isWritable`: nothing more goes out while the client
+    /// is not reading what was sent (an auto-acknowledged delivery is
+    /// acknowledged as it is handed to the writer).
+    fn has_credits(&self, _message: &saranga_server::message::ServerMessage) -> bool {
+        self.queue
+            .get()
+            .is_none_or(|q| self.out.writability.is_writable(q))
     }
 
     fn chunk_size(&self) -> usize {
@@ -636,10 +655,12 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
     let (mut rd, wr) = saranga_server::protocol::split(c.stream);
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     let (direct, written) = DirectOut::new(&wr);
-    let writer = tokio::spawn(write_loop(wr, out_rx, written));
+    let writability = Arc::new(Writability::of(&c.acceptor));
+    let writer = tokio::spawn(write_loop(wr, out_rx, written, writability.clone()));
     let out = Arc::new(Outbound {
         tx: out_tx,
         direct,
+        writability,
         destroyed: AtomicBool::new(false),
         remote,
         broker: broker.clone(),
@@ -1830,6 +1851,7 @@ impl Connection {
             subscription: subscription.clone(),
             kind,
             to_ack: session.to_ack.clone(),
+            queue: OnceLock::new(),
         });
         let filter = if multicast { None } else { selector };
         session
@@ -1840,7 +1862,10 @@ impl Connection {
                 filter,
                 0,
                 false,
-                move |_: &Queue| sink as Arc<dyn DeliverySink>,
+                move |q: &Queue| {
+                    let _ = sink.queue.set(q.downgrade());
+                    sink as Arc<dyn DeliverySink>
+                },
             )
             .await
             .map_err(|e| creating(e.message))?;

@@ -448,3 +448,76 @@ async fn a_cumulative_ack_on_a_non_destructive_queue_credits_every_message() {
         "the whole window back: {first:?} then {second:?}"
     );
 }
+
+/// An auto-acknowledged subscription whose client reads nothing: as Netty's
+/// writability holds Artemis's consumer, deliveries stop once the writer has
+/// the high-water mark's worth to write, and the rest stay on the queue
+/// rather than being acknowledged into memory and lost with the connection.
+#[tokio::test]
+async fn an_auto_ack_subscriber_that_does_not_read_holds_deliveries_back() {
+    let mut config = BrokerConfig::new(Arc::new(SelectorFilters));
+    config.protocols = vec![Arc::new(StompProtocol)];
+    let broker = Broker::start(config).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(broker.clone().serve_acceptor(listener, Acceptor::default()));
+
+    const COUNT: usize = 2000;
+    let body = "x".repeat(4096);
+    let mut producer = Client::connect(address, "1.2").await;
+    for i in 0..COUNT {
+        let receipt = if i + 1 == COUNT { "receipt:done\n" } else { "" };
+        producer
+            .send(&format!(
+                "SEND\ndestination:slow\ndestination-type:ANYCAST\n{receipt}\n{body}"
+            ))
+            .await;
+    }
+    let r = producer.frame().await;
+    assert_eq!(header(&r, "receipt-id"), Some("done"), "{r}");
+    let queue = broker.post_office().queue("slow").unwrap();
+    assert_eq!(queue.message_count(), COUNT as i64);
+
+    // A consumer with a small receive buffer that never reads.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let stream = socket.connect(address).await.unwrap();
+    let mut consumer = Client {
+        stream,
+        buf: Vec::new(),
+    };
+    consumer
+        .send("CONNECT\naccept-version:1.2\nhost:localhost\n\n")
+        .await;
+    consumer
+        .send("SUBSCRIBE\ndestination:slow\nsubscription-type:ANYCAST\nid:s\nack:auto\n\n")
+        .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let left = queue.message_count();
+    assert!(
+        left > (COUNT / 2) as i64,
+        "only what the socket and the writer hold may be acknowledged: {left} left"
+    );
+    // Reading, the client drains the connection and the queue delivers
+    // again: every message arrives.
+    let connected = consumer.frame().await;
+    assert!(
+        connected.starts_with(
+            "CONNECTED
+"
+        ),
+        "{connected}"
+    );
+    for _ in 0..COUNT {
+        let m = consumer.frame().await;
+        assert!(
+            m.starts_with(
+                "MESSAGE
+"
+            ),
+            "{m}"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(queue.message_count(), 0);
+}

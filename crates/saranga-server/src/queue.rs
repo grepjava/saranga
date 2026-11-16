@@ -494,7 +494,25 @@ impl PartialEq for Queue {
 
 impl Eq for Queue {}
 
+/// A queue held without keeping it alive: a connection's ready listeners.
+#[derive(Clone)]
+pub struct WeakQueue(std::sync::Weak<Shared>);
+
+impl WeakQueue {
+    pub fn upgrade(&self) -> Option<Queue> {
+        self.0.upgrade().map(Queue)
+    }
+
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::sync::Weak::ptr_eq(&self.0, &other.0)
+    }
+}
+
 impl Queue {
+    pub fn downgrade(&self) -> WeakQueue {
+        WeakQueue(Arc::downgrade(&self.0))
+    }
+
     /// Creates the queue and spawns its actor on the current runtime.
     pub fn spawn(
         id: i64,

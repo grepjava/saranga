@@ -359,6 +359,8 @@ pub struct DatabaseStorage {
     read_from: Mutex<HashMap<i64, i64>>,
     /// The connections queues read paged messages on.
     readers: Arc<Readers>,
+    /// Where the writers hand deleted large messages' files.
+    large: crate::large::LargeFiles,
 }
 
 /// Takes a queue's next paged references out of paging, and returns their
@@ -479,13 +481,14 @@ impl DatabaseStorage {
             .build()
             .map_err(|e| JournalError::Io(Arc::new(e)))?;
         let critical: Arc<OnceLock<CriticalListener>> = Arc::new(OnceLock::new());
+        let large = crate::large::LargeFiles::new(cfg.large_messages.clone());
         let settings = Settings {
             config: connection.clone(),
             connections: database.connections.max(1) as usize,
             max_retries: database.max_retries.max(0) as u32,
             retry_interval: Duration::from_millis(database.retry_interval_millis.max(0) as u64),
             max_pending_writes: database.max_pending_writes.max(1) as usize,
-            large_dir: cfg.large_messages.clone(),
+            large: large.clone(),
         };
         let listener = critical.clone();
         let on_failure: Arc<dyn Fn(&JournalError) + Send + Sync> = Arc::new(move |e| {
@@ -546,6 +549,7 @@ impl DatabaseStorage {
             sides: Mutex::new(HashMap::new()),
             read_from: Mutex::new(HashMap::new()),
             readers,
+            large,
         })
     }
 
@@ -982,6 +986,33 @@ fn queue_binding_of(json: &str, name: &str) -> StoreResult<PersistentQueueBindin
         Some("ANYCAST") => ANYCAST,
         _ => MULTICAST,
     };
+    // A null key is left out of the JSON, but the record had it whenever
+    // a later field is there: decoded as absent, the encoding's tail
+    // would end at it and drop every field after it.
+    let any = |keys: &[&str]| keys.iter().any(|k| j.get(k).is_some());
+    let nullable = |k: &str, later: &[&str]| match simple(k) {
+        Some(v) => Some(Some(v)),
+        None if any(later) => Some(None),
+        None => None,
+    };
+    const AFTER_GROUP_FIRST_KEY: &[&str] = &[
+        "ring-size",
+        "enabled",
+        "group-rebalance-pause-dispatch",
+        "internal",
+    ];
+    let after_last_value_key: Vec<&str> = [
+        "non-destructive",
+        "group-rebalance",
+        "group-buckets",
+        "auto-delete",
+        "auto-delete-delay",
+        "auto-delete-message-count",
+        "group-first-key",
+    ]
+    .into_iter()
+    .chain(AFTER_GROUP_FIRST_KEY.iter().copied())
+    .collect();
     Ok(PersistentQueueBindingEncoding {
         name: simple("name").unwrap_or_else(|| name.into()),
         address: simple("address").unwrap_or_else(|| name.into()),
@@ -1000,14 +1031,14 @@ fn queue_binding_of(json: &str, name: &str) -> StoreResult<PersistentQueueBindin
         configuration_managed: boolean("configuration-managed"),
         consumers_before_dispatch: int("consumers-before-dispatch"),
         delay_before_dispatch: long("delay-before-dispatch"),
-        last_value_key: simple("last-value-key").map(Some),
+        last_value_key: nullable("last-value-key", &after_last_value_key),
         non_destructive: boolean("non-destructive"),
         group_rebalance: boolean("group-rebalance"),
         group_buckets: int("group-buckets"),
         auto_delete: boolean("auto-delete"),
         auto_delete_delay: long("auto-delete-delay"),
         auto_delete_message_count: long("auto-delete-message-count"),
-        group_first_key: simple("group-first-key").map(Some),
+        group_first_key: nullable("group-first-key", AFTER_GROUP_FIRST_KEY),
         ring_size: long("ring-size"),
         enabled: boolean("enabled"),
         group_rebalance_pause_dispatch: boolean("group-rebalance-pause-dispatch"),
@@ -1705,6 +1736,10 @@ impl Store for DatabaseStorage {
 
     fn is_history(&self) -> bool {
         false
+    }
+
+    fn set_large_messages(&self, store: &Arc<crate::large::LargeMessageStore>) {
+        self.large.attach(store);
     }
 
     fn page_write_history(&self, _message: &ServerMessage, _queue_ids: &[i64]) {}

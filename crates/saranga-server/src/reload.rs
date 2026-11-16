@@ -20,8 +20,8 @@ use crate::{AddressDeployment, Broker};
 pub struct Reload {
     pub address_settings: cfg::HierarchicalRepository<cfg::AddressSettings>,
     pub security_settings: cfg::HierarchicalRepository<cfg::SecuritySetting>,
-    /// The core's `<addresses>`: those of a legacy `<jms>` are not read
-    /// again, as `reloadConfigurationFile` reads only the core.
+    /// The core's `<addresses>`, then those of a legacy `<jms>`, which
+    /// `reloadConfigurationFile` reads again (`LegacyJMSConfiguration`).
     pub addresses: Vec<AddressDeployment>,
     /// The deprecated `<queues>`.
     pub queues: Vec<crate::QueueSpec>,
@@ -51,6 +51,7 @@ impl Reload {
             addresses: config
                 .addresses
                 .iter()
+                .chain(&config.jms_addresses)
                 .map(crate::config::deployment)
                 .collect(),
             queues: crate::config::legacy_queues(config),

@@ -7,7 +7,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -16,7 +16,125 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
+use crate::queue::WeakQueue;
 use crate::{Acceptor, Broker};
+
+/// `TransportConstants.DEFAULT_WRITE_BUFFER_HIGH_WATER_MARK`.
+pub const DEFAULT_WRITE_BUFFER_HIGH_WATER_MARK: usize = 128 * 1024;
+/// `TransportConstants.DEFAULT_WRITE_BUFFER_LOW_WATER_MARK`.
+pub const DEFAULT_WRITE_BUFFER_LOW_WATER_MARK: usize = 32 * 1024;
+
+/// A connection's writability (Netty's, as `NettyConnection.isWritable` and
+/// `fireReady` see it): the bytes handed to its writer and not yet written.
+/// Past the high-water mark its consumers are busy (`ServerConsumerImpl`
+/// returns `BUSY` while `isWritable` is false); once the writer brings it
+/// down to the low-water mark, the queues turned away deliver again.
+#[derive(Default)]
+pub struct Writability {
+    pending: AtomicUsize,
+    high: usize,
+    low: usize,
+    unwritable: AtomicBool,
+    /// The ready listeners: queues that found the connection unwritable.
+    waiting: std::sync::Mutex<Vec<WeakQueue>>,
+}
+
+impl Writability {
+    pub fn new(high: usize, low: usize) -> Self {
+        Self {
+            high: high.max(1),
+            low: low.min(high),
+            ..Default::default()
+        }
+    }
+
+    /// The acceptor's `writeBufferHighWaterMark` and
+    /// `writeBufferLowWaterMark`.
+    pub fn of(acceptor: &Acceptor) -> Self {
+        let mark = |k: &str, default: usize| {
+            acceptor
+                .params
+                .get(k)
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(default)
+        };
+        Self::new(
+            mark(
+                "writeBufferHighWaterMark",
+                DEFAULT_WRITE_BUFFER_HIGH_WATER_MARK,
+            ),
+            mark(
+                "writeBufferLowWaterMark",
+                DEFAULT_WRITE_BUFFER_LOW_WATER_MARK,
+            ),
+        )
+    }
+
+    /// Bytes handed to the writer.
+    pub fn queued(&self, n: usize) {
+        self.pending.fetch_add(n, Ordering::SeqCst);
+    }
+
+    /// Bytes the writer wrote.
+    pub fn written(&self, n: usize) {
+        let before = self
+            .pending
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |p| {
+                Some(p.saturating_sub(n))
+            })
+            .unwrap_or(0);
+        if before.saturating_sub(n) > self.low || !self.unwritable.load(Ordering::SeqCst) {
+            return;
+        }
+        let ready = {
+            let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+            if self.pending.load(Ordering::SeqCst) > self.low
+                || !self.unwritable.swap(false, Ordering::SeqCst)
+            {
+                return;
+            }
+            std::mem::take(&mut *waiting)
+        };
+        prompt(ready);
+    }
+
+    /// `isWritable(readyListener)`: whether `queue` may deliver now; if
+    /// not, it is prompted once the connection drains.
+    pub fn is_writable(&self, queue: &WeakQueue) -> bool {
+        if !self.unwritable.load(Ordering::SeqCst)
+            && self.pending.load(Ordering::SeqCst) < self.high
+        {
+            return true;
+        }
+        let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.unwritable.load(Ordering::SeqCst)
+            && self.pending.load(Ordering::SeqCst) < self.high
+        {
+            return true;
+        }
+        self.unwritable.store(true, Ordering::SeqCst);
+        // Drained since: the writer may have looked before the flag was set.
+        if self.pending.load(Ordering::SeqCst) <= self.low {
+            self.unwritable.store(false, Ordering::SeqCst);
+            let ready = std::mem::take(&mut *waiting);
+            drop(waiting);
+            prompt(ready);
+            return true;
+        }
+        if !waiting.iter().any(|w| w.ptr_eq(queue)) {
+            waiting.push(queue.clone());
+        }
+        false
+    }
+}
+
+fn prompt(ready: Vec<WeakQueue>) {
+    for q in ready {
+        if let Some(q) = q.upgrade() {
+            q.prompt_delivery();
+        }
+    }
+}
 
 /// A connection's byte stream: TCP, or TLS over TCP.
 pub trait Stream: AsyncRead + AsyncWrite + Send + Unpin + Any + 'static {}

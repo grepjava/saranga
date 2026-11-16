@@ -540,14 +540,23 @@ fn read_amqp_saved_encoding(r: &mut Reader<'_>) -> Result<Vec<u8>> {
     Ok(start[..before - r.remaining()].to_vec())
 }
 
-/// Skips one AMQP 1.0 encoded value (its format code determines its size).
+/// Skips one AMQP 1.0 encoded value (its format code determines its size):
+/// its descriptors, then the value they describe, as the AMQP codec skips
+/// one.
 fn skip_amqp_value(r: &mut Reader<'_>) -> Result<()> {
-    let code = r.u8()?;
-    if code == 0x00 {
-        // Described type: descriptor, then the value.
-        skip_amqp_value(r)?;
-        return skip_amqp_value(r);
+    let mut code = r.u8()?;
+    while code == 0x00 {
+        let descriptor = r.u8()?;
+        if descriptor == 0x00 {
+            return invalid("described descriptor in an AMQP value".to_owned());
+        }
+        skip_amqp_primitive(r, descriptor)?;
+        code = r.u8()?;
     }
+    skip_amqp_primitive(r, code)
+}
+
+fn skip_amqp_primitive(r: &mut Reader<'_>, code: u8) -> Result<()> {
     let n = match code >> 4 {
         0x4 => 0,
         0x5 => 1,

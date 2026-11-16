@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use saranga_buffer::{PropertyValue, Reader};
@@ -19,8 +19,8 @@ use saranga_security::Authenticated;
 use saranga_server::interceptor::Log;
 use saranga_server::message::{ServerMessage, now_millis};
 use saranga_server::postoffice::{QueueSpec, RoutingTypes};
-use saranga_server::protocol::{Connection as Accepted, DirectOut, Written};
-use saranga_server::queue::{AckResult, DeliverySink, Queue};
+use saranga_server::protocol::{Connection as Accepted, DirectOut, Writability, Written};
+use saranga_server::queue::{AckResult, DeliverySink, Queue, WeakQueue};
 use saranga_server::session::{
     AckPending, ClientConnection, Completion, ServerSession, SessionOptions, Transport,
 };
@@ -56,6 +56,9 @@ enum Out {
 pub struct Outbound {
     tx: mpsc::UnboundedSender<Out>,
     direct: DirectOut,
+    /// What the writer has yet to write: deliveries wait past its
+    /// high-water mark.
+    writability: Arc<Writability>,
     /// For the outgoing interceptors.
     broker: Arc<Broker>,
     client: Arc<ClientConnection>,
@@ -68,12 +71,14 @@ impl Outbound {
     fn new(
         tx: mpsc::UnboundedSender<Out>,
         direct: DirectOut,
+        writability: Arc<Writability>,
         broker: Arc<Broker>,
         client: Arc<ClientConnection>,
     ) -> Self {
         Self {
             tx,
             direct,
+            writability,
             broker,
             client,
             level: AtomicU8::new(0),
@@ -138,6 +143,7 @@ impl Outbound {
             // to write, rather than waking it on another thread.
             Some(bytes) if wait.is_empty() => {
                 self.direct.write(bytes, |bytes| {
+                    self.writability.queued(bytes.len());
                     tx.send(Out::Send {
                         wait: Completion::default(),
                         bytes: Some(bytes),
@@ -146,6 +152,7 @@ impl Outbound {
                 });
             }
             bytes => {
+                self.writability.queued(bytes.as_ref().map_or(0, Vec::len));
                 self.direct
                     .queue(|| tx.send(Out::Send { wait, bytes }).is_ok());
             }
@@ -162,6 +169,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
     mut wr: W,
     mut rx: mpsc::UnboundedReceiver<Out>,
     written: Written,
+    writability: Arc<Writability>,
 ) {
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     // How many of the items taken are in `buf`, to count off once written.
@@ -179,6 +187,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
                         if !broken && !buf.is_empty() {
                             broken = wr.write_all(&buf).await.is_err();
                         }
+                        writability.written(buf.len());
                         buf.clear();
                         written.done(std::mem::take(&mut held));
                         done.await
@@ -190,9 +199,12 @@ async fn write_loop<W: AsyncWrite + Unpin>(
                             buf.extend_from_slice(&b);
                         }
                     }
-                    Err(e) => tracing::error!(
-                        "AMQ834016: Storage operation failed. Error code: 0; message: {e}"
-                    ),
+                    Err(e) => {
+                        writability.written(bytes.as_ref().map_or(0, Vec::len));
+                        tracing::error!(
+                            "AMQ834016: Storage operation failed. Error code: 0; message: {e}"
+                        )
+                    }
                 }
                 held += 1;
                 false
@@ -203,6 +215,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
             if !broken && !buf.is_empty() {
                 broken = wr.write_all(&buf).await.is_err();
             }
+            writability.written(buf.len());
             buf.clear();
             written.done(std::mem::take(&mut held));
         }
@@ -316,6 +329,8 @@ pub struct Shared {
 struct MqttSink {
     shared: Arc<Shared>,
     consumer_id: i64,
+    /// The subscription's queue, prompted once the connection drains.
+    queue: OnceLock<WeakQueue>,
 }
 
 impl DeliverySink for MqttSink {
@@ -374,6 +389,12 @@ impl DeliverySink for MqttSink {
     /// reservation is never left unspent.
     fn has_credits(&self, message: &ServerMessage) -> bool {
         let s = &self.shared;
+        // `MQTTSessionCallback.isWritable`, before any slot is reserved.
+        if let Some(q) = self.queue.get()
+            && !s.out.writability.is_writable(q)
+        {
+            return false;
+        }
         let max = if s.receive_maximum > 0 {
             s.receive_maximum
         } else {
@@ -1349,9 +1370,11 @@ impl Core {
         let sink = Arc::new(MqttSink {
             shared: self.shared.clone(),
             consumer_id: cid,
+            queue: OnceLock::new(),
         });
         self.session
-            .create_consumer(cid, queue.name(), filter, 0, false, move |_: &Queue| {
+            .create_consumer(cid, queue.name(), filter, 0, false, move |q: &Queue| {
+                let _ = sink.queue.set(q.downgrade());
                 sink as Arc<dyn DeliverySink>
             })
             .await?;
@@ -1971,7 +1994,8 @@ pub async fn serve(
     let (mut rd, wr) = saranga_server::protocol::split(c.stream);
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     let (direct, written) = DirectOut::new(&wr);
-    let writer = tokio::spawn(write_loop(wr, out_rx, written));
+    let writability = Arc::new(Writability::of(&c.acceptor));
+    let writer = tokio::spawn(write_loop(wr, out_rx, written, writability.clone()));
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     // createConnectionEntry: the server's keep-alive until CONNECT says.
@@ -1982,6 +2006,7 @@ pub async fn serve(
     let out = Arc::new(Outbound::new(
         out_tx,
         direct,
+        writability,
         broker.clone(),
         client.clone(),
     ));

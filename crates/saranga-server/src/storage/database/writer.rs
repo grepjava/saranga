@@ -273,9 +273,8 @@ pub struct Settings {
     pub max_retries: u32,
     pub retry_interval: Duration,
     pub max_pending_writes: usize,
-    /// Where large-message bodies are kept, so a deleted large message's file
-    /// goes with its row.
-    pub large_dir: std::path::PathBuf,
+    /// Where a deleted large message's file goes with its row.
+    pub large: crate::large::LargeFiles,
 }
 
 pub fn io_error(e: impl std::fmt::Display) -> JournalError {
@@ -314,7 +313,7 @@ pub async fn start(
 ) -> Result<Writes, JournalError> {
     let mut writers = Vec::with_capacity(settings.connections);
     for _ in 0..settings.connections.max(1) {
-        writers.push(Writer::connect(settings.config.clone(), settings.large_dir.clone()).await?);
+        writers.push(Writer::connect(settings.config.clone(), settings.large.clone()).await?);
     }
     let (sender, receiver) = mpsc::unbounded_channel();
     let pending = Arc::new(Credits {
@@ -716,7 +715,7 @@ struct Writer {
     connection: Option<Prepared>,
     /// Where large-message bodies live: a committed message delete takes the
     /// file with it.
-    large_dir: std::path::PathBuf,
+    large: crate::large::LargeFiles,
 }
 
 struct Prepared {
@@ -924,13 +923,16 @@ impl Prepared {
 type Step<'a> = Pin<Box<dyn Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>>;
 
 impl Writer {
-    async fn connect(config: Target, large_dir: std::path::PathBuf) -> Result<Self, JournalError> {
+    async fn connect(
+        config: Target,
+        large: crate::large::LargeFiles,
+    ) -> Result<Self, JournalError> {
         let client = connect(&config).await.map_err(io_error)?;
         let connection = Some(Prepared::new(client).await.map_err(io_error)?);
         Ok(Self {
             config,
             connection,
-            large_dir,
+            large,
         })
     }
 
@@ -1123,20 +1125,16 @@ impl Writer {
         let result = futures_util::future::try_join_all(steps).await.map(|_| ());
         match &result {
             // The large bodies of the messages the commit deleted are files of
-            // their own; they go now the rows are gone. A missing file (the
-            // body was kept in the row, or already deleted) is no error.
+            // their own; they go now the rows are gone, or once no body in
+            // memory reads them (a non-durable queue may still hold the
+            // message).
             Ok(()) => {
                 for id in deleted_large
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .iter()
                 {
-                    let path = self.large_dir.join(format!("{id}.msg"));
-                    if let Err(e) = std::fs::remove_file(&path)
-                        && e.kind() != std::io::ErrorKind::NotFound
-                    {
-                        crate::large::deletion_failed(&path, &e);
-                    }
+                    self.large.row_deleted(*id);
                 }
             }
             Err(_) => {
@@ -1164,7 +1162,7 @@ mod tests {
                 max_retries: 0,
                 retry_interval: Duration::ZERO,
                 max_pending_writes: 100,
-                large_dir: std::path::PathBuf::new(),
+                large: Default::default(),
             },
             pending: Arc::new(Credits {
                 count: AtomicUsize::new(pending),

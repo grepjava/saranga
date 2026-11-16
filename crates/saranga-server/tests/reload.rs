@@ -253,6 +253,58 @@ async fn reload_keeps_a_configured_legacy_queue_under_force_delete() {
     assert_eq!(after.message_count(), 1, "its message is not lost");
 }
 
+/// A reload reads the legacy `<jms>` again, as `reloadConfigurationFile`
+/// does: its destinations are still configured, so FORCE must not delete
+/// them, and one added to the file is deployed.
+#[tokio::test]
+async fn reload_keeps_configured_jms_destinations_under_force_delete() {
+    use saranga_message::CoreMessage;
+    use saranga_server::message::{MessageRef, ServerMessage};
+
+    let file = |extra: &str| {
+        cfg::BrokerConfig::parse(&format!(
+            r##"<configuration xmlns="urn:activemq">
+                 <core xmlns="urn:activemq:core">
+                   <persistence-enabled>false</persistence-enabled>
+                   <address-settings>
+                     <address-setting match="#">
+                       <config-delete-addresses>FORCE</config-delete-addresses>
+                       <config-delete-queues>FORCE</config-delete-queues>
+                     </address-setting>
+                   </address-settings>
+                 </core>
+                 <jms xmlns="urn:activemq:jms">
+                   <queue name="jq"/>
+                   <topic name="jt"/>
+                   {extra}
+                 </jms>
+               </configuration>"##
+        ))
+        .unwrap()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(&file(""), dir.path()).await;
+    let po = broker.post_office();
+    let jq = po.queue("jq").expect("jms queue deployed at start");
+    let id = jq.id();
+    jq.add(MessageRef::new(ServerMessage::new(CoreMessage {
+        message_id: 1,
+        address: Some("jq".into()),
+        ..Default::default()
+    })));
+
+    broker
+        .reload(Reload::from_file_config(&file(r#"<queue name="jq2"/>"#)).unwrap())
+        .await
+        .unwrap();
+
+    let after = po.queue("jq").expect("the jms queue survives the reload");
+    assert_eq!(after.id(), id, "kept, not deleted and recreated");
+    assert_eq!(after.message_count(), 1, "its message is not lost");
+    assert!(po.address_info("jt").is_some(), "the jms topic survives");
+    assert!(po.queue("jq2").is_some(), "a jms queue added is deployed");
+}
+
 /// A port nothing listens on.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")

@@ -11,12 +11,12 @@
 //! crash are removed on the next start (`cleanupIncompleteFiles`,
 //! `rebuildCounters`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak};
 
 use saranga_core_protocol::packets::replication::{
     ReplicationLargeMessageBeginMessage, ReplicationLargeMessageEndMessage,
@@ -54,6 +54,52 @@ pub struct LargeMessageStore {
     /// Bodies deleted while the backup copies them, deleted once it has
     /// (`largeMessagesToDelete`).
     deferred: Mutex<Vec<(i64, PathBuf)>>,
+    /// Per message, the bodies in memory on a file, and whether its stored
+    /// row is gone: the file is the message's, deleted once neither is left.
+    open: Mutex<HashMap<i64, Open>>,
+}
+
+#[derive(Debug, Default)]
+struct Open {
+    bodies: usize,
+    row_gone: bool,
+}
+
+/// Where the database store hands the bodies of the large messages whose
+/// rows it deleted: to the broker's large-message store once it has one,
+/// which keeps a file a body in memory still reads.
+#[derive(Debug, Clone, Default)]
+pub struct LargeFiles {
+    dir: PathBuf,
+    store: Arc<OnceLock<Weak<LargeMessageStore>>>,
+}
+
+impl LargeFiles {
+    pub fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            store: Arc::default(),
+        }
+    }
+
+    pub fn attach(&self, store: &Arc<LargeMessageStore>) {
+        let _ = self.store.set(Arc::downgrade(store));
+    }
+
+    /// The row of large message `id` is deleted.
+    pub fn row_deleted(&self, id: i64) {
+        match self.store.get().and_then(Weak::upgrade) {
+            Some(store) => store.row_deleted(id),
+            None => {
+                let path = self.dir.join(format!("{id}.{DURABLE}"));
+                if let Err(e) = fs::remove_file(&path)
+                    && e.kind() != io::ErrorKind::NotFound
+                {
+                    deletion_failed(&path, &e);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -104,6 +150,7 @@ impl LargeMessageStore {
             critical: std::sync::OnceLock::new(),
             replication: RwLock::default(),
             deferred: Mutex::default(),
+            open: Mutex::default(),
         })
     }
 
@@ -125,6 +172,7 @@ impl LargeMessageStore {
             critical: std::sync::OnceLock::new(),
             replication: RwLock::default(),
             deferred: Mutex::default(),
+            open: Mutex::default(),
         })
     }
 
@@ -294,6 +342,55 @@ impl LargeMessageStore {
         self.live.load(Ordering::SeqCst)
     }
 
+    /// A body in memory, counted against its message's file.
+    fn body(self: &Arc<Self>, id: i64, size: u64, backing: Backing) -> Arc<LargeBody> {
+        if matches!(backing, Backing::File(_)) {
+            self.open
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(id)
+                .or_default()
+                .bodies += 1;
+        }
+        Arc::new(LargeBody {
+            store: self.clone(),
+            id,
+            size,
+            backing,
+            keep: AtomicBool::new(false),
+        })
+    }
+
+    /// A body on a file is dropped: whether it was the last one of a
+    /// message whose row is gone.
+    fn closed(&self, id: i64) -> bool {
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(o) = open.get_mut(&id) else {
+            return false;
+        };
+        o.bodies = o.bodies.saturating_sub(1);
+        if o.bodies > 0 {
+            return false;
+        }
+        open.remove(&id).is_some_and(|o| o.row_gone)
+    }
+
+    /// The database store deleted the row of large message `id`: its file
+    /// goes now, or with the last body in memory (a non-durable queue's
+    /// reference, a reader's copy of a paged message).
+    pub fn row_deleted(&self, id: i64) {
+        {
+            let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(o) = open.get_mut(&id) {
+                o.row_gone = true;
+                return;
+            }
+        }
+        if let Some(path) = self.path(id, true) {
+            self.remove(id, &path, |e| deletion_failed(&path, &e));
+        }
+    }
+
     /// Starts a new body (`createCoreLargeMessage` and `LargeBody.createFile`).
     pub fn create(self: &Arc<Self>, id: i64, durable: bool) -> io::Result<LargeWriter> {
         let replication = self.replication();
@@ -338,16 +435,11 @@ impl LargeMessageStore {
             .as_ref()
             .and_then(|p| fs::metadata(p).ok())
             .map_or(0, |m| m.len());
-        Arc::new(LargeBody {
-            store: self.clone(),
-            id,
-            size,
-            backing: match path {
-                Some(p) => Backing::File(p),
-                None => Backing::Memory(Arc::from(Vec::new())),
-            },
-            keep: AtomicBool::new(false),
-        })
+        let backing = match path {
+            Some(p) => Backing::File(p),
+            None => Backing::Memory(Arc::from(Vec::new())),
+        };
+        self.body(id, size, backing)
     }
 }
 
@@ -421,13 +513,7 @@ impl LargeWriter {
             }
             None => Backing::Memory(Arc::from(std::mem::take(&mut self.memory))),
         };
-        Ok(Arc::new(LargeBody {
-            store: self.store.clone(),
-            id: self.id,
-            size: self.size,
-            backing,
-            keep: AtomicBool::new(false),
-        }))
+        Ok(self.store.body(self.id, self.size, backing))
     }
 }
 
@@ -579,13 +665,7 @@ impl LargeBody {
                 Backing::Memory(Arc::from(bytes))
             }
         };
-        Ok(Arc::new(LargeBody {
-            store: self.store.clone(),
-            id: new_id,
-            size: self.size,
-            backing,
-            keep: AtomicBool::new(false),
-        }))
+        Ok(self.store.body(new_id, self.size, backing))
     }
 }
 
@@ -598,11 +678,11 @@ pub(crate) fn deletion_failed(path: &Path, e: &io::Error) {
 
 impl Drop for LargeBody {
     fn drop(&mut self) {
-        if let Backing::File(p) = &self.backing
-            && self.store.is_live()
-            && !self.keep.load(Ordering::SeqCst)
-        {
-            self.store.remove(self.id, p, |e| deletion_failed(p, &e));
+        if let Backing::File(p) = &self.backing {
+            let row_gone = self.store.closed(self.id);
+            if self.store.is_live() && (row_gone || !self.keep.load(Ordering::SeqCst)) {
+                self.store.remove(self.id, p, |e| deletion_failed(p, &e));
+            }
         }
     }
 }
@@ -653,6 +733,57 @@ mod tests {
         let d = std::env::temp_dir().join(format!("saranga-large-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         d
+    }
+
+    /// The database store deletes a large message's row once its durable
+    /// references are gone; a non-durable queue may still hold the message,
+    /// whose body must keep its file until it is dropped too.
+    #[test]
+    fn a_deleted_row_keeps_the_file_a_body_in_memory_reads() {
+        let d = dir("row-gone");
+        let store = LargeMessageStore::new(d.clone(), false);
+        let files = LargeFiles::new(d.clone());
+        files.attach(&store);
+        let mut w = store.create(7, true).unwrap();
+        w.append(b"body").unwrap();
+        let body = w.finish().unwrap();
+        let path = d.join("7.msg");
+
+        files.row_deleted(7);
+        assert!(path.exists(), "still read by the body in memory");
+        assert_eq!(body.reader().unwrap().read_chunk(4).unwrap(), b"body");
+        drop(body);
+        assert!(!path.exists(), "the last body takes the file with it");
+
+        // Paged copies keep their file when dropped, but not once the row
+        // is gone.
+        let mut w = store.create(8, true).unwrap();
+        w.append(b"paged").unwrap();
+        let written = w.finish().unwrap();
+        written.set_keep(true);
+        drop(written);
+        let (a, b) = (store.existing(8), store.existing(8));
+        a.set_keep(true);
+        b.set_keep(true);
+        let path = d.join("8.msg");
+        drop(a);
+        assert!(path.exists());
+        files.row_deleted(8);
+        assert!(path.exists(), "the other copy still reads it");
+        drop(b);
+        assert!(!path.exists());
+
+        // No body in memory: the file goes with the row.
+        let mut w = store.create(9, true).unwrap();
+        w.append(b"x").unwrap();
+        let c = w.finish().unwrap();
+        c.set_keep(true);
+        drop(c);
+        assert!(d.join("9.msg").exists());
+        files.row_deleted(9);
+        assert!(!d.join("9.msg").exists());
+        assert!(store.open.lock().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -218,6 +218,24 @@ fn queue_configuration_goes_through_json() {
         "{json}"
     );
     assert_eq!(queue_binding_of(&json, "q").unwrap(), b);
+
+    // The usual queue: no last-value or group-first key. The fields after
+    // them (non-destructive, ring size...) must come back too.
+    let plain = PersistentQueueBindingEncoding {
+        last_value_key: Some(None),
+        group_first_key: Some(None),
+        ..b.clone()
+    };
+    let json = queue_json(13, &plain);
+    let back = queue_binding_of(&json, "q").unwrap();
+    assert_eq!(back, plain);
+    assert_eq!(back.encode(), plain.encode());
+    // Only the last fields after the group-first key.
+    let tail = PersistentQueueBindingEncoding {
+        group_first_key: Some(None),
+        ..b.clone()
+    };
+    assert_eq!(queue_binding_of(&queue_json(14, &tail), "q").unwrap(), tail);
 }
 
 #[test]

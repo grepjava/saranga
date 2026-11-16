@@ -2283,3 +2283,44 @@ async fn a_will_found_due_does_not_send_the_next_connections_will() {
     broker.stop().unwrap();
     task.abort();
 }
+
+/// A QoS 0 subscriber that reads nothing: QoS 0 deliveries are acknowledged
+/// as they are sent, so, as Netty's writability holds Artemis's consumer, they
+/// stop once the writer has the high-water mark's worth to write, and the
+/// rest stay queued; reading again lets them all through.
+#[tokio::test]
+async fn a_qos0_subscriber_that_does_not_read_holds_deliveries_back() {
+    let (broker, address, _task) = start(None).await;
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut sub = Client(socket.connect(address).await.unwrap());
+    sub.send(&connect("slow-sub", true)).await;
+    assert_eq!(sub.packet().await.unwrap()[0], 0x20);
+    sub.subscribe("slow", 0).await;
+    let queue = broker
+        .post_office()
+        .queue("slow-sub.slow")
+        .expect("the subscription queue");
+
+    const COUNT: usize = 2000;
+    let body = vec![b'x'; 4096];
+    let (mut publisher, _) = Client::open(address, "slow-pub", true).await;
+    for i in 0..COUNT {
+        publisher
+            .publish("slow", &body, (i % 60000 + 1) as u16)
+            .await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let left = queue.message_count();
+    assert!(
+        left > (COUNT / 2) as i64,
+        "only what the socket and the writer hold may be acknowledged: {left} left"
+    );
+    for _ in 0..COUNT {
+        let p = sub.packet().await.expect("a PUBLISH");
+        assert_eq!(p[0] & 0xF0, 0x30);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(queue.message_count(), 0);
+    broker.stop().unwrap();
+}

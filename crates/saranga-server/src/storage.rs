@@ -344,6 +344,10 @@ pub trait Store: Send + Sync {
     /// `isHistory`: journal retention keeps a copy of each journal file.
     fn is_history(&self) -> bool;
 
+    /// The broker's large-message bodies, for a store that deletes a large
+    /// message's file with its record.
+    fn set_large_messages(&self, _store: &Arc<crate::large::LargeMessageStore>) {}
+
     /// `pageWrite` with retention: a paged message and its references are
     /// written to the journal as events, so its history holds them too.
     fn page_write_history(&self, message: &ServerMessage, queue_ids: &[i64]);

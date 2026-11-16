@@ -727,6 +727,7 @@ impl Broker {
         };
         if let Some(storage) = &storage {
             large_messages.set_history(storage.clone());
+            storage.set_large_messages(&large_messages);
         }
         // recoverLargeMessagesOnFolder: the files there before loading.
         let mut stored_large = large_messages

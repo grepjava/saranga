@@ -173,11 +173,31 @@ impl Instance {
     }
 
     fn new(etc: PathBuf, broker_xml: PathBuf, options: Options) -> Self {
-        // `<instance>/etc` -> `<instance>`.
-        let dir = etc
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| etc.clone());
+        Self::in_dirs(
+            etc,
+            broker_xml,
+            options,
+            crate::client::instance_dir(),
+            crate::client::instance_data_dir(),
+        )
+    }
+
+    /// `bin/artemis` passes `ARTEMIS_INSTANCE` and `ARTEMIS_DATA_DIR` as
+    /// `artemis.instance` and `data.dir`, wherever `etc` is (`--etc` may
+    /// put it outside the instance); without them, `<instance>/etc` ->
+    /// `<instance>`.
+    fn in_dirs(
+        etc: PathBuf,
+        broker_xml: PathBuf,
+        options: Options,
+        instance: Option<PathBuf>,
+        data: Option<PathBuf>,
+    ) -> Self {
+        let dir = instance.map(|d| absolute(&d)).unwrap_or_else(|| {
+            etc.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| etc.clone())
+        });
         let slash = |p: &Path| p.display().to_string().replace('\\', "/");
         let mut properties = HashMap::new();
         properties.insert("artemis.instance", slash(&dir));
@@ -190,7 +210,10 @@ impl Instance {
         );
         properties.insert("artemis.instance.etc", slash(&etc));
         properties.insert("artemis.URI.instance", uri_path(&dir));
-        properties.insert("data.dir", slash(&dir.join("data")));
+        let data = data
+            .map(|d| absolute(&d))
+            .unwrap_or_else(|| dir.join("data"));
+        properties.insert("data.dir", slash(&data));
         // bin/artemis sets it to the instance's tmp; artemis.cmd leaves
         // Java's, the user's temporary directory.
         let tmp = if cfg!(windows) {
@@ -734,6 +757,42 @@ fn uri_path(p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An instance created with `--etc` outside it: bin/artemis's
+    /// ARTEMIS_INSTANCE and ARTEMIS_DATA_DIR, not etc's parent, place the
+    /// data and the lock `run` holds against the data tools.
+    #[test]
+    fn the_instance_directory_is_artemis_instance_not_etc_s_parent() {
+        let root = std::env::temp_dir().join(format!("saranga-etc-out-{}", std::process::id()));
+        let etc = root.join("conf");
+        let inst = root.join("broker");
+        let instance = Instance::in_dirs(
+            etc.clone(),
+            etc.join("broker.xml"),
+            Options::default(),
+            Some(inst.clone()),
+            Some(root.join("store")),
+        );
+        assert_eq!(instance.dir, absolute(&inst));
+        let slash = |p: &Path| absolute(p).display().to_string().replace('\\', "/");
+        assert_eq!(instance.lookup("artemis.instance"), Some(slash(&inst)));
+        assert_eq!(
+            instance.lookup("data.dir"),
+            Some(slash(&root.join("store")))
+        );
+        assert_eq!(instance.lookup("artemis.instance.etc"), Some(slash(&etc)));
+
+        // Outside bin/artemis: etc's parent, and its data.
+        let plain = Instance::in_dirs(
+            etc.clone(),
+            etc.join("broker.xml"),
+            Options::default(),
+            None,
+            None,
+        );
+        assert_eq!(plain.dir, root);
+        assert_eq!(plain.lookup("data.dir"), Some(slash(&root.join("data"))));
+    }
 
     fn broker_xml(name: &str, max_delivery_attempts: u32) -> String {
         format!(

@@ -404,6 +404,11 @@ pub fn instance_dir() -> Option<PathBuf> {
     env_path("ARTEMIS_INSTANCE")
 }
 
+/// `ARTEMIS_DATA_DIR`, which `bin/artemis` passes as `data.dir`.
+pub fn instance_data_dir() -> Option<PathBuf> {
+    env_path("ARTEMIS_DATA_DIR")
+}
+
 /// A path from the environment, without the quotes a Windows script's
 /// `set NAME="path"` leaves on it.
 fn env_path(name: &str) -> Option<PathBuf> {
