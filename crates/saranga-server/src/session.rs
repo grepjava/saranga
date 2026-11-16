@@ -1733,7 +1733,24 @@ impl ServerSession {
                 if let Some(tx) = &tx {
                     transaction::lock(tx).mark_rollback_only(&e);
                 }
-                if let Some(paging) = paged_in_own {
+                // Paging that failed on one address may have paged on
+                // another already: its page transaction goes too, or its
+                // page would wait for it for good.
+                // With the database store, the rows it staged go with the
+                // send's transaction.
+                let mut own_tx = own_tx;
+                let paging = paged_in_own.or_else(|| {
+                    own_paging.map(|p| {
+                        let mut p = transaction::lock(&p);
+                        if p.persistent
+                            && let Some((_, persistent)) = &mut own_tx
+                        {
+                            *persistent = true;
+                        }
+                        std::mem::take(&mut p.paging)
+                    })
+                });
+                if let Some(paging) = paging {
                     paging.after_rollback();
                 }
                 undo_reserved(own_tx, reserved, storage.as_deref());

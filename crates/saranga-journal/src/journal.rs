@@ -982,7 +982,9 @@ impl Journal {
         let files = {
             let mut inner = self.lock();
             inner.check_loaded()?;
-            inner.move_next_file(&self.writer, false)?;
+            inner
+                .move_next_file(&self.writer, false)
+                .map_err(|e| self.writer.critical(e, None))?;
             let files: Vec<JournalFileInfo> = inner
                 .data_files
                 .iter()
@@ -1126,6 +1128,12 @@ impl Journal {
     /// file): the journal takes no more writes, as after one of its own.
     pub fn stop_writes(&self, e: JournalError) {
         self.writer.stop_writes(e);
+    }
+
+    /// [`stop_writes`](Self::stop_writes), for a listener of another
+    /// journal's critical I/O errors.
+    pub fn write_stopper(&self) -> impl Fn(JournalError) + Send + Sync + 'static {
+        self.writer.stopper()
     }
 }
 

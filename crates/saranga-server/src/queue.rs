@@ -2273,8 +2273,15 @@ impl Actor {
                 Ok(paged) => (paged.routed, paged.replicated),
                 Err(e) => {
                     if let Some(move_tx) = &move_tx {
-                        std::mem::take(&mut crate::transaction::lock(move_tx).paging)
-                            .after_rollback();
+                        let (tx, paging, staged) = {
+                            let mut t = crate::transaction::lock(move_tx);
+                            (t.id, std::mem::take(&mut t.paging), t.persistent)
+                        };
+                        paging.after_rollback();
+                        // The rows the database store paged it in so far.
+                        if staged && let Some(s) = self.shared.ids.storage() {
+                            let _ = s.rollback(tx);
+                        }
                     }
                     let what = format!("{verb} message {id} to {address}: {e}");
                     self.move_failed(r, what, settle);

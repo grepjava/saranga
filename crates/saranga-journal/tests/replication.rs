@@ -217,3 +217,21 @@ fn a_synchronous_append_waits_for_the_backup() {
     }
     j.stop().unwrap();
 }
+
+/// A file that cannot be opened as replication starts is a critical I/O
+/// error, as it is for an append: the journal takes no more writes.
+#[test]
+fn a_failed_file_switch_at_replication_start_is_critical() {
+    let dir = tempfile::tempdir().unwrap();
+    let j = Journal::open(config(dir.path())).unwrap();
+    j.load_all().unwrap();
+    j.append_add(1, 30, vec![1; 10], true, None).unwrap();
+    // The file made at this switch, for the next, cannot be.
+    let fault = saranga_fault::Fault::new(saranga_fault::Op::Open, dir.path()).arm();
+    j.force_move_next_file().unwrap();
+    let started = j.start_replication(Arc::new(Collect::default()), |_| {});
+    drop(fault);
+    assert!(started.is_err());
+    assert!(j.failure().is_some(), "a critical I/O error");
+    assert!(j.append_add(2, 30, vec![2; 10], true, None).is_err());
+}

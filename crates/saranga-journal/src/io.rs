@@ -317,6 +317,20 @@ impl Writer {
         self.shared.done.notify_all();
     }
 
+    /// [`stop_writes`](Self::stop_writes), kept apart from the writer.
+    pub fn stopper(&self) -> impl Fn(JournalError) + Send + Sync + 'static {
+        let shared = self.shared.clone();
+        move |e| {
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .failed
+                .get_or_insert(e);
+            shared.done.notify_all();
+        }
+    }
+
     pub fn set_critical_listener(&self, listener: Option<CriticalListener>) {
         *self
             .shared

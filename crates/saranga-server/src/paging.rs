@@ -55,6 +55,10 @@ type SyncRequest = (Arc<File>, PathBuf, Completion);
 /// `PageCache` size: decoded pages kept for the cursors.
 const PAGE_CACHE: usize = 5;
 
+/// The message count of a page that could not be read: more than any
+/// subscription has acknowledged, so the page is never found finished.
+const UNREADABLE_PAGE: i64 = i64::MAX;
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -300,14 +304,17 @@ impl PagingManager {
         if self.is_global_full() {
             return;
         }
-        let blocked = std::mem::take(&mut *lock(&self.blocked));
-        if blocked.is_empty() {
-            return;
-        }
-        // memoryReleased
+        // memoryReleased. What waits for the broker's memory or disk alone
+        // (an anonymous AMQP producer) runs whether or not a store is
+        // blocked. (Artemis runs it only with a blocked store, leaving it
+        // waiting for good.)
         let callbacks = std::mem::take(&mut *lock(&self.memory_callbacks));
         for grant in callbacks {
             grant();
+        }
+        let blocked = std::mem::take(&mut *lock(&self.blocked));
+        if blocked.is_empty() {
+            return;
         }
         // Those still blocking stay (`removeIf`).
         let still: Vec<_> = blocked
@@ -559,7 +566,7 @@ impl PagingManager {
     }
 
     /// `onIOError`: a page file could not be written.
-    fn critical_io(&self, e: &io::Error, path: &Path) {
+    pub(crate) fn critical_io(&self, e: &io::Error, path: &Path) {
         if let Some(s) = &self.storage {
             s.critical_io(e, Some(path));
         }
@@ -792,6 +799,8 @@ struct PageLimits {
 enum Lookup {
     Entry(Arc<PageEntry>),
     End,
+    /// The page could not be read: the cursor stays where it is.
+    Unreadable,
 }
 
 impl PagingStore {
@@ -969,7 +978,24 @@ impl PagingStore {
             enforced.address_full_policy = p;
             settings = Arc::new(enforced);
         }
+        let limits = |l: Option<PageLimits>| l.map(|l| (l.max_pages, l.max_messages));
+        let (was_full, old_limits) = (self.is_full(), limits(self.page_limits()));
         *self.settings.write().unwrap_or_else(|e| e.into_inner()) = settings;
+        drop(enforced_lock);
+        // `checkClearPageLimit` when the page limits changed.
+        let new_limits = limits(self.page_limits());
+        if new_limits != old_limits {
+            let st = lock(&self.state);
+            if old_limits.map(|l| l.0) != new_limits.map(|l| l.0) {
+                self.check_number_of_pages(st.number_of_pages);
+            }
+            self.check_page_limit(&st);
+        }
+        // `size.setMax`: under the new limits, what was blocked goes on
+        // (`underSized`).
+        if was_full && !self.is_full() {
+            self.check_released_memory();
+        }
     }
 
     /// `isPaging`, as the routing sees it.
@@ -1507,7 +1533,7 @@ impl PagingStore {
     /// `checkReleasedMemory`: below the limit, what waits for memory runs.
     /// False while the store still blocks its producers.
     fn check_released_memory(&self) -> bool {
-        if !self.blocked_via_management.load(Ordering::SeqCst) && !self.is_full() {
+        if !self.blocked_via_management.load(Ordering::SeqCst) && !self.holds_producers() {
             // memoryReleased
             let waiting = std::mem::take(&mut *lock(&self.blocked));
             for (cancelled, grant) in waiting {
@@ -1525,6 +1551,20 @@ impl PagingStore {
             }
         }
         !self.blocking.load(Ordering::SeqCst)
+    }
+
+    /// Whether the store's producers still wait: under BLOCK or FAIL while
+    /// it is full, under PAGE or DROP (blocked through management, or by a
+    /// full disk) while the disk is full. (Artemis waits for room under PAGE
+    /// and DROP too, which a paging or dropping address may never have.)
+    fn holds_producers(&self) -> bool {
+        let s = self.settings();
+        match s.address_full_policy {
+            AddressFullPolicy::Block | AddressFullPolicy::Fail => self.is_full_with(&s),
+            AddressFullPolicy::Page | AddressFullPolicy::Drop => {
+                self.manager.upgrade().is_some_and(|m| m.is_disk_full())
+            }
+        }
     }
 
     /// `addToBlockList`.
@@ -1567,6 +1607,10 @@ impl PagingStore {
                     if run_on_failure {
                         self.add_to_block_list(grant, list);
                         m.add_blocked_store(&self.me);
+                        // The disk may have room again meanwhile.
+                        if !m.is_disk_full() {
+                            self.check_released_memory();
+                        }
                     }
                     return false;
                 }
@@ -1599,6 +1643,10 @@ impl PagingStore {
                         if let Some(m) = &manager {
                             m.add_blocked_store(&self.me);
                         }
+                        // The memory may have been freed meanwhile.
+                        if !self.is_full() {
+                            self.check_released_memory();
+                        }
                     }
                     return false;
                 }
@@ -1611,9 +1659,10 @@ impl PagingStore {
                     if !self.is_full() {
                         self.check_released_memory();
                     } else {
-                        // usingGlobalMaxSize
+                        // usingGlobalMaxSize, or the broker's message limit
+                        // alone: released as the broker's memory is.
                         if let Some(m) = &manager
-                            && m.global_max_size > 0
+                            && (m.global_max_size >= 0 || m.global_max_messages >= 0)
                         {
                             m.add_blocked_store(&self.me);
                         }
@@ -1939,14 +1988,24 @@ impl PagingStore {
 
     /// A page's messages: the current page's from memory, others from the
     /// cache or the file.
-    fn load_page(&self, st: &mut StoreState, id: i64) -> Arc<LoadedPage> {
+    /// None when the page's file could not be read.
+    fn load_page(&self, st: &mut StoreState, id: i64) -> Option<Arc<LoadedPage>> {
         if let Some(i) = st.cache.iter().position(|p| p.id == id) {
             let page = st.cache.remove(i).expect("position");
             st.cache.push_back(page.clone());
-            return page;
+            return Some(page);
         }
-        let entries = match self.page_path(st, id).map(fs::read) {
+        let path = self.page_path(st, id);
+        let entries = match path.as_ref().map(fs::read) {
             Some(Ok(data)) => self.entries_of(saranga_paging::read_page(&data).messages),
+            Some(Err(e)) if e.kind() != io::ErrorKind::NotFound => {
+                // An unreadable page is not an empty one: not cached, so
+                // nothing takes it for read or finished (the file factory's
+                // `onIOError`).
+                self.read_failed(&e, path.as_deref());
+                return None;
+            }
+            // `Page.read` of a file that is gone: no messages.
             _ => Vec::new(),
         };
         let page = Arc::new(LoadedPage { id, entries });
@@ -1954,7 +2013,7 @@ impl PagingStore {
         while st.cache.len() > PAGE_CACHE {
             st.cache.pop_front();
         }
-        page
+        Some(page)
     }
 
     fn lookup(&self, st: &mut StoreState, page: i64, nr: i32) -> Lookup {
@@ -1966,7 +2025,10 @@ impl PagingStore {
                 None => Lookup::End,
             };
         }
-        match self.load_page(st, page).entries.get(nr as usize) {
+        let Some(loaded) = self.load_page(st, page) else {
+            return Lookup::Unreadable;
+        };
+        match loaded.entries.get(nr as usize) {
             Some(e) => Lookup::Entry(e.clone()),
             None => Lookup::End,
         }
@@ -1982,9 +2044,27 @@ impl PagingStore {
         if let Some(p) = st.cache.iter().find(|p| p.id == page) {
             return p.entries.len() as i64;
         }
-        match self.page_path(st, page).map(fs::read) {
+        let path = self.page_path(st, page);
+        match path.as_ref().map(fs::read) {
             Some(Ok(data)) => saranga_paging::count_messages(&data) as i64,
+            Some(Err(e)) if e.kind() != io::ErrorKind::NotFound => {
+                self.read_failed(&e, path.as_deref());
+                UNREADABLE_PAGE
+            }
             _ => 0,
+        }
+    }
+
+    /// A page file that could not be read: a critical I/O error, as the
+    /// file factory's `onIOError` makes it.
+    fn read_failed(&self, e: &io::Error, path: Option<&Path>) {
+        let Some(path) = path else { return };
+        tracing::warn!(
+            "AMQ222010: Critical IO Error reading page {}: {e}",
+            path.display()
+        );
+        if let Some(manager) = self.manager.upgrade() {
+            manager.critical_io(e, path);
         }
     }
 
@@ -2104,6 +2184,7 @@ impl PagingStore {
                         it.nr = 0;
                         continue;
                     }
+                    Lookup::Unreadable => return None,
                 }
             };
             let nr = entry.nr;
@@ -2186,6 +2267,7 @@ impl PagingStore {
                         it.nr = 0;
                         continue;
                     }
+                    Lookup::Unreadable => return None,
                 }
             };
             let nr = entry.nr;
@@ -2461,7 +2543,9 @@ impl PagingStore {
             if !self.page_exists(&st, page) {
                 continue;
             }
-            let loaded = self.load_page(&mut st, page);
+            let Some(loaded) = self.load_page(&mut st, page) else {
+                continue;
+            };
             for e in &loaded.entries {
                 if let Some(m) = &e.message
                     && m.is_large()
@@ -2664,13 +2748,22 @@ impl PagingStore {
         // finishCleanup
         for (page, path) in deleted {
             let Some(path) = path else { continue };
-            if let Ok(data) = fs::read(&path) {
-                // Each large body goes once nothing else holds it: the same
-                // message routed to a queue that does not page reads it.
-                for m in saranga_paging::read_page(&data).messages {
-                    if m.is_large() {
-                        manager.large.release(m.message_id(), m.is_durable());
+            match fs::read(&path) {
+                Ok(data) => {
+                    // Each large body goes once nothing else holds it: the same
+                    // message routed to a queue that does not page reads it.
+                    for m in saranga_paging::read_page(&data).messages {
+                        if m.is_large() {
+                            manager.large.release(m.message_id(), m.is_durable());
+                        }
                     }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    // Deleted unread, its large bodies would stay for good;
+                    // kept, so are its acknowledgements, as below.
+                    self.read_failed(&e, Some(&path));
+                    continue;
                 }
             }
             if let Err(e) = fs::remove_file(&path)
@@ -2811,7 +2904,7 @@ impl PageCursorInfo {
         let n = match self.number_of_messages {
             Some(n) => n,
             None => {
-                if cache {
+                if cache && messages != UNREADABLE_PAGE {
                     self.number_of_messages = Some(messages);
                 }
                 messages
@@ -3089,6 +3182,9 @@ struct PageTxState {
     persistent: i32,
     /// Messages a cursor reached before the commit (`lateDeliveries`).
     late: Vec<(Arc<PageSubscription>, PagedRef)>,
+    /// A cursor reached one before the commit (`useRedelivery`): the
+    /// transaction's later messages go after it, through the redeliveries.
+    use_redelivery: bool,
     /// Counter increments due when the transaction commits.
     pending_counters: Vec<(Arc<PageSubscription>, i64)>,
 }
@@ -3116,6 +3212,7 @@ impl PageTx {
                 messages: 0,
                 persistent: 0,
                 late: Vec::new(),
+                use_redelivery: false,
                 pending_counters: Vec::new(),
             }),
         }
@@ -3133,19 +3230,16 @@ impl PageTx {
 
     /// `commit`: messages reached before the commit are delivered, and the
     /// queues count them.
+    /// They go back while the transaction is locked, as Artemis's
+    /// `synchronized commit`: a cursor reading the transaction's next
+    /// message meanwhile waits, and puts it after them.
     pub fn commit(&self) {
-        let (late, counters) = {
-            let mut st = lock(&self.state);
-            st.committed = true;
-            (
-                std::mem::take(&mut st.late),
-                std::mem::take(&mut st.pending_counters),
-            )
-        };
-        for (sub, size) in counters {
+        let mut st = lock(&self.state);
+        st.committed = true;
+        for (sub, size) in std::mem::take(&mut st.pending_counters) {
             sub.counter_add(1, size);
         }
-        for (sub, r) in late {
+        for (sub, r) in std::mem::take(&mut st.late) {
             sub.redeliver(r);
         }
     }
@@ -3206,6 +3300,12 @@ impl PageTx {
         r: &PagedRef,
     ) -> bool {
         let mut st = lock(&self.state);
+        if st.committed && st.use_redelivery {
+            // After the messages that waited for the commit.
+            lock(&sub.state).info(r.position.page).pending_tx += 1;
+            sub.redeliver(r.clone());
+            return true;
+        }
         if st.committed {
             return false;
         }
@@ -3217,6 +3317,7 @@ impl PageTx {
             }
             return true;
         }
+        st.use_redelivery = true;
         lock(&sub.state).info(r.position.page).pending_tx += 1;
         st.late.push((sub.clone(), r.clone()));
         true
@@ -3431,6 +3532,56 @@ mod tests {
         drop(held);
         assert!(paging.join().unwrap());
         assert!(manager.transaction(77).is_some());
+        broker.stop().unwrap();
+    }
+
+    /// A transaction's message a cursor reached before the commit goes back
+    /// at the commit; its next message, read after the commit, goes after
+    /// it, not straight to the queue ahead of it (`useRedelivery`).
+    #[tokio::test]
+    async fn a_late_transaction_keeps_its_messages_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = saranga_config::BrokerConfig::parse(
+            r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+                 <persistence-enabled>true</persistence-enabled>
+                 <journal-pool-files>2</journal-pool-files>
+                 <journal-file-size>65536</journal-file-size>
+               </core></configuration>"#,
+        )
+        .unwrap();
+        let config =
+            crate::BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path())
+                .unwrap();
+        let broker = crate::Broker::start(config).await.unwrap();
+        let store = broker.post_office().paging_store("q");
+        // A cursor with no queue reading it.
+        let sub = store.subscribe(999, false);
+        let paged = |nr: i32| PagedRef {
+            position: PagePosition {
+                page: 1,
+                message_nr: nr,
+                tx_id: 78,
+                size: 10,
+                ack_record: -1,
+            },
+            message: ServerMessage::new(saranga_message::CoreMessage {
+                message_id: 100 + nr as i64,
+                ..Default::default()
+            }),
+        };
+        let tx = PageTx::new(78);
+        assert!(tx.deliver_after_commit(&store, &sub, &paged(0)), "late");
+        tx.commit();
+        assert!(
+            tx.deliver_after_commit(&store, &sub, &paged(1)),
+            "after the late one"
+        );
+        let order: Vec<i32> = lock(&sub.state)
+            .redeliveries
+            .iter()
+            .map(|r| r.position.message_nr)
+            .collect();
+        assert_eq!(order, [0, 1]);
         broker.stop().unwrap();
     }
 }

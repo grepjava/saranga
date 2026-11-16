@@ -359,3 +359,176 @@ async fn a_commit_has_every_page_it_wrote_synced() {
     s.close(true).await;
     let _ = b.stop();
 }
+
+/// A page file that cannot be read is a critical I/O error, not an empty
+/// page: the queue's cursor stops there instead of going on to the pages
+/// after it, and the page is not found finished and deleted.
+#[tokio::test]
+async fn a_page_that_cannot_be_read_is_not_skipped() {
+    use saranga_server::message::ServerMessage;
+    use saranga_server::postoffice::QueueSpec;
+    use saranga_server::queue::DeliverySink;
+    use saranga_server::session::{ClientConnection, ServerSession, SessionOptions, Transport};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Sink(Mutex<Vec<i64>>);
+    impl DeliverySink for Sink {
+        fn deliver(&self, _: i64, message: &Arc<ServerMessage>, _: i32) -> i64 {
+            self.0.lock().unwrap().push(message.message_id());
+            1
+        }
+        fn deliver_large(&self, _: i64, _: &ServerMessage, _: i64, _: i32) -> i64 {
+            1
+        }
+        fn deliver_continuation(&self, _: i64, _: Vec<u8>, _: bool) -> i64 {
+            0
+        }
+        fn chunk_size(&self) -> usize {
+            64 * 1024
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = saranga_config::BrokerConfig::parse(
+        r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+             <persistence-enabled>true</persistence-enabled>
+             <journal-file-size>102400</journal-file-size>
+             <address-settings>
+               <address-setting match="q">
+                 <max-size-bytes>1</max-size-bytes>
+                 <page-size-bytes>4096</page-size-bytes>
+                 <address-full-policy>PAGE</address-full-policy>
+               </address-setting>
+             </address-settings>
+           </core></configuration>"#,
+    )
+    .unwrap();
+    let b = Broker::start(
+        BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut spec = QueueSpec::new("q", "q");
+    spec.auto_create_address = Some(true);
+    spec.durable = true;
+    b.post_office().create_queue(spec, false).unwrap();
+    let conn = Arc::new(ClientConnection::new(
+        Transport::internal("test"),
+        Arc::new(Default::default()),
+        vec![],
+    ));
+    let mut s = ServerSession::new(
+        b.clone(),
+        conn,
+        SessionOptions {
+            name: "s".into(),
+            username: None,
+            password: None,
+            xa: false,
+            auto_commit_sends: true,
+            auto_commit_acks: true,
+            pre_acknowledge: false,
+            default_address: None,
+        },
+        Default::default(),
+    );
+    // Enough pages that the second is out of the page cache.
+    for _ in 0..24 {
+        s.send(
+            saranga_message::CoreMessage {
+                address: Some("q".into()),
+                durable: true,
+                body: vec![1; 1500].into(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        s.take_completion().wait().await.unwrap();
+    }
+    fn pages(p: &std::path::Path, out: &mut Vec<(i64, std::path::PathBuf)>) {
+        for e in std::fs::read_dir(p).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                pages(&p, out);
+            } else if p.extension().is_some_and(|e| e == "page") {
+                let n = p.file_stem().unwrap().to_str().unwrap().parse().unwrap();
+                out.push((n, p));
+            }
+        }
+    }
+    let mut paths = vec![];
+    pages(dir.path(), &mut paths);
+    paths.sort();
+    assert!(paths.len() > 7, "paged: {paths:?}");
+    // In memory before the first page: what the queue held when paging began.
+    let in_memory = b.post_office().queue("q").unwrap().message_count() as usize
+        - paths
+            .iter()
+            .map(|(_, p)| saranga_paging::count_messages(&std::fs::read(p).unwrap()))
+            .sum::<usize>();
+    // A later page, not read yet: a directory where its file was, which
+    // cannot be read.
+    let at = paths.len() - 3;
+    let before = in_memory
+        + paths[..at]
+            .iter()
+            .map(|(_, p)| saranga_paging::count_messages(&std::fs::read(p).unwrap()))
+            .sum::<usize>();
+    let broken = &paths[at].1;
+    let aside = broken.with_extension("aside");
+    std::fs::rename(broken, &aside).unwrap();
+    std::fs::create_dir(broken).unwrap();
+
+    let sink = Arc::new(Sink::default());
+    let c = sink.clone();
+    s.create_consumer(1, "q", None, 0, false, move |_| c.clone())
+        .await
+        .unwrap();
+    s.consumer_credits(1, -1);
+    s.set_started(true).await;
+    let mut acked = 0;
+    for _ in 0..500 {
+        let next = sink.0.lock().unwrap().get(acked).copied();
+        match next {
+            Some(id) => {
+                let _ = s.acknowledge(1, id, true).await;
+                acked += 1;
+            }
+            None if b.is_critical_io_failed() && acked >= before => break,
+            None => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(b.is_critical_io_failed(), "a critical I/O error");
+    let got = sink.0.lock().unwrap().len();
+    assert_eq!(got, before, "nothing past the unreadable page is delivered");
+    assert!(broken.is_dir(), "the unreadable page is not deleted");
+    let _ = b.stop();
+}
+
+/// A critical I/O error in one journal stops the other's writes too: a
+/// failed bindings write leaves the message journal taking no more.
+#[tokio::test]
+async fn a_failed_bindings_write_stops_the_message_journal() {
+    use saranga_fault::{Fault, Op};
+    let dir = tempfile::tempdir().unwrap();
+    let b = broker(dir.path()).await;
+    let storage = b.storage().unwrap();
+    let fault = Fault::new(Op::Write, dir.path().join("data").join("bindings")).arm();
+    assert!(storage.add_binding(90021, 44, vec![1]).is_err());
+    drop(fault);
+    assert!(b.is_critical_io_failed());
+    let message = saranga_server::message::ServerMessage::new(saranga_message::CoreMessage {
+        message_id: 90022,
+        durable: true,
+        address: Some("q".into()),
+        ..Default::default()
+    });
+    assert!(
+        storage.store_message(&message).is_err(),
+        "the message journal takes no more writes"
+    );
+}

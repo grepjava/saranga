@@ -8,7 +8,7 @@ use crate::paging::PagingManager;
 /// The fraction of the file store holding `path` that is used, between 0
 /// and 1 (`getDiskStoreUsage`), or `None` if it cannot be read.
 pub fn usage(path: &Path) -> Option<f64> {
-    let (total, free) = space(path)?;
+    let (total, free) = space(path).ok()?;
     if total == 0 {
         return None;
     }
@@ -91,19 +91,46 @@ pub fn spawn_monitor(config: MonitorConfig, dirs: Vec<PathBuf>, paging: &Arc<Pag
             let Some(paging) = paging.upgrade() else {
                 break;
             };
-            let (usable, total, ok) = tick(&config.limit, &dirs);
+            let (usable, total, ok, errors) = tick(&config.limit, &dirs);
+            // An I/O error reading a store is a critical I/O error, as
+            // Artemis's `tick` makes it, not room on the disk.
+            for (e, dir) in errors {
+                tracing::warn!(
+                    "IO Error while calculating disk usage of {}: {e}",
+                    dir.display()
+                );
+                paging.critical_io(&e, &dir);
+            }
             paging.disk_tick(usable, total, ok, config.limit);
         }
     });
 }
 
+/// What a store could not be read for, and where.
+type TickErrors = Vec<(std::io::Error, PathBuf)>;
+
 /// `FileStoreMonitor.tick`: whether every store is within the limit, with
-/// the space of the last one read.
-fn tick(limit: &Limit, dirs: &[PathBuf]) -> (u64, u64, bool) {
+/// the space of the last one read, and the stores that could not be read.
+/// A directory gone since the start is passed over: Artemis reads the file
+/// store it found then, which is still there.
+fn tick(limit: &Limit, dirs: &[PathBuf]) -> (u64, u64, bool, TickErrors) {
     let (mut usable, mut total, mut ok) = (0, 0, true);
+    let mut errors = Vec::new();
     for dir in dirs {
-        let Some((t, u)) = space(dir) else {
-            continue;
+        let (t, u) = match space(dir) {
+            Ok(s) => s,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => {
+                errors.push((e, dir.clone()));
+                continue;
+            }
         };
         (usable, total) = (u, t);
         ok = match *limit {
@@ -114,41 +141,76 @@ fn tick(limit: &Limit, dirs: &[PathBuf]) -> (u64, u64, bool) {
             break;
         }
     }
-    (usable, total, ok)
+    (usable, total, ok, errors)
 }
 
 /// Total and usable bytes of the file store holding `path`.
 #[cfg(unix)]
-fn space(path: &Path) -> Option<(u64, u64)> {
+fn space(path: &Path) -> std::io::Result<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: `c` is a valid NUL-terminated path and `st` is written by
     // statvfs before it is read.
     let st = unsafe {
         if libc::statvfs(c.as_ptr(), st.as_mut_ptr()) != 0 {
-            return None;
+            return Err(std::io::Error::last_os_error());
         }
         st.assume_init()
     };
     let frsize = st.f_frsize as u64;
-    Some((st.f_blocks as u64 * frsize, st.f_bavail as u64 * frsize))
+    Ok((st.f_blocks as u64 * frsize, st.f_bavail as u64 * frsize))
 }
 
 /// Total and usable bytes of the file store holding `path`.
 #[cfg(windows)]
-fn space(path: &Path) -> Option<(u64, u64)> {
+fn space(path: &Path) -> std::io::Result<(u64, u64)> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-    let dir = if path.exists() { path } else { path.parent()? };
+    let dir = if path.exists() {
+        path
+    } else {
+        path.parent()
+            .filter(|p| p.exists())
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?
+    };
     let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
     let (mut available, mut total, mut free) = (0u64, 0u64, 0u64);
     // SAFETY: `wide` is NUL-terminated and the out-pointers are valid.
     let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut free) };
-    (ok != 0).then_some((total, available))
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((total, available))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn space(_path: &Path) -> Option<(u64, u64)> {
-    None
+fn space(_path: &Path) -> std::io::Result<(u64, u64)> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store that cannot be read is an error, not a store with room: the
+    /// monitor makes it a critical I/O error. A directory gone is passed
+    /// over.
+    #[test]
+    fn a_store_that_cannot_be_read_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        // Under a file: not a directory, on every platform.
+        let (_, _, ok, errors) = tick(&Limit::MinFree(0), &[file.join("d")]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(ok, "no verdict from a store not read");
+
+        let (_, _, _, errors) = tick(&Limit::MinFree(0), &[dir.path().join("gone").join("d")]);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let (_, total, ok, errors) = tick(&Limit::MinFree(0), &[dir.path().to_owned()]);
+        assert!(errors.is_empty() && ok && total > 0);
+    }
 }

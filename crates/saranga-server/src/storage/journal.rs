@@ -139,8 +139,19 @@ impl Store for JournalStorage {
     }
 
     fn set_critical_listener(&self, listener: CriticalListener) {
-        self.messages.set_critical_listener(Some(listener.clone()));
-        self.bindings.set_critical_listener(Some(listener.clone()));
+        // A critical I/O error in either journal stops the other's writes
+        // too, as one elsewhere stops both (`critical_io`).
+        let both = |sibling: Box<dyn Fn(JournalError) + Send + Sync>| -> CriticalListener {
+            let listener = listener.clone();
+            Arc::new(move |e: &JournalError, file: Option<&Path>| {
+                sibling(e.clone());
+                listener(e, file);
+            })
+        };
+        self.messages
+            .set_critical_listener(Some(both(Box::new(self.bindings.write_stopper()))));
+        self.bindings
+            .set_critical_listener(Some(both(Box::new(self.messages.write_stopper()))));
         let _ = self.critical.set(listener);
     }
 
