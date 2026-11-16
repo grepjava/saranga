@@ -1516,12 +1516,18 @@ async fn delete_address(broker: &Arc<Broker>, name: &str, force: bool) -> Outcom
     let Some(st) = po.address_status(name) else {
         return Err(format!("AMQ229203: Address Does Not Exist: {name}"));
     };
-    if !force && (!st.queues.is_empty() || !st.diverts.is_empty()) {
+    let remote = po.remote_bindings(name);
+    if !force && (!st.queues.is_empty() || !st.diverts.is_empty() || !remote.is_empty()) {
         return Err(format!("AMQ229205: Address {name} has bindings"));
     }
     for q in st.queues {
         broker.disconnect_consumers(&q).await;
         let _ = po.delete_queue(q.name(), false, false);
+    }
+    // Other brokers' queues go too (`removeBinding` of each
+    // `RemoteQueueBinding`).
+    for b in remote {
+        po.remove_remote_binding(b.unique_name());
     }
     if !po.remove_address(name) {
         return Err(format!("AMQ229205: Address {name} has bindings"));

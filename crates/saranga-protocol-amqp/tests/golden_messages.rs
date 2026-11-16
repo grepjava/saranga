@@ -87,7 +87,7 @@ fn persisting_and_broker_changes_match_artemis() {
 
         // QueueImpl.makeCopy to a dead-letter address.
         let before = native.view();
-        let after = m::make_copy(&before, 200, "DLA", "q", true, 1234);
+        let after = m::make_copy(&before, 200, "DLA", "q", true, true, 1234);
         let dla = native.updated(&before, &after);
         failures.extend(diff(&case, "dla", &kinds["dla"], &persisted(&*dla)));
 

@@ -164,29 +164,34 @@ pub fn make_copy(
     new_address: &str,
     queue: &str,
     expiry: bool,
+    copy_original_headers: bool,
     now: i64,
 ) -> CoreMessage {
     let mut copy = original.clone();
     copy.message_id = new_id;
     copy.address = Some(SimpleString::from(new_address));
     let p = &mut copy.properties;
-    p.insert(
-        HDR_ORIGINAL_QUEUE.into(),
-        PropertyValue::String(SimpleString::from(queue)),
-    );
-    p.insert(
-        HDR_ORIGINAL_ADDRESS.into(),
-        PropertyValue::String(original.address.clone().unwrap_or_default()),
-    );
-    p.insert(
-        HDR_ORIG_MESSAGE_ID.into(),
-        PropertyValue::Long(original.message_id),
-    );
-    if let Some(t) = routing_type(original) {
+    // `referenceOriginalMessage`, for a move; a copy keeps the headers the
+    // original has (a dead letter's, say), so it can still be retried.
+    if copy_original_headers {
         p.insert(
-            HDR_ORIG_ROUTING_TYPE.into(),
-            PropertyValue::Byte(t.to_byte()),
+            HDR_ORIGINAL_QUEUE.into(),
+            PropertyValue::String(SimpleString::from(queue)),
         );
+        p.insert(
+            HDR_ORIGINAL_ADDRESS.into(),
+            PropertyValue::String(original.address.clone().unwrap_or_default()),
+        );
+        p.insert(
+            HDR_ORIG_MESSAGE_ID.into(),
+            PropertyValue::Long(original.message_id),
+        );
+        if let Some(t) = routing_type(original) {
+            p.insert(
+                HDR_ORIG_ROUTING_TYPE.into(),
+                PropertyValue::Byte(t.to_byte()),
+            );
+        }
     }
     copy.expiration = 0;
     p.remove(&SimpleString::from(HDR_ROUTING_TYPE));

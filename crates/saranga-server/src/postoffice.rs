@@ -415,6 +415,18 @@ struct AddressEntry {
     pause_record: i64,
 }
 
+impl State {
+    /// `getDirectBindings(address)` not empty.
+    fn direct_bindings(&self, address: &str) -> bool {
+        self.free_diverts.contains_key(address)
+            || self.remote.get(address).is_some_and(|r| !r.is_empty())
+            || self
+                .addresses
+                .get(address)
+                .is_some_and(|e| !e.queues.is_empty() || !e.diverts.is_empty())
+    }
+}
+
 impl AddressEntry {
     fn new(info: AddressInfo) -> Self {
         Self {
@@ -1084,10 +1096,13 @@ impl PostOffice {
         self.duplicates.exists(name)
     }
 
-    /// `deleteDuplicateCache`.
+    /// `deleteDuplicateCache`: the address's cache and its bridges'
+    /// (`BRIDGE.<address>`), with their records.
     pub fn delete_duplicate_cache(&self, name: &str) {
         let ids = self.ids.clone();
-        self.duplicates.delete(name, move || ids.next());
+        self.duplicates.delete(name, || ids.next());
+        self.duplicates
+            .delete(&format!("BRIDGE.{name}"), || ids.next());
     }
 
     /// The duplicate-ID cache of `address` (`getDuplicateIDCache`).
@@ -1379,9 +1394,9 @@ impl PostOffice {
     /// Removes an address that has no queues (`removeAddressInfo`).
     pub fn remove_address(&self, name: &str) -> bool {
         let mut state = self.write();
-        let free = state.free_diverts.contains_key(name);
+        let bound = state.direct_bindings(name);
         match state.addresses.get(name) {
-            Some(entry) if entry.queues.is_empty() && entry.diverts.is_empty() && !free => {
+            Some(entry) if !bound => {
                 if !entry.info.temporary
                     && let Some(s) = self.ids.storage()
                     && let Err(e) = s.delete_binding(entry.info.id)
@@ -1392,6 +1407,7 @@ impl PostOffice {
                 drop(state);
                 // deletePageStore.
                 self.paging().delete_store(name);
+                self.delete_duplicate_cache(name);
                 self.plugins
                     .each(|p| p.after_remove_address(name, info.as_ref()));
                 if let Some(info) = &info {
@@ -1726,6 +1742,12 @@ impl PostOffice {
         {
             tracing::warn!("deleting queue {name}: {e}");
         }
+        // `removeBinding` with `deleteData`: once nothing routes from the
+        // address, its duplicate IDs go, so a queue made there again
+        // takes what the old one had seen.
+        if !self.has_bindings(&address) {
+            self.delete_duplicate_cache(&address);
+        }
         self.notify_queue_binding(
             crate::notifications::NotificationType::BindingRemoved,
             &queue,
@@ -1767,7 +1789,7 @@ impl PostOffice {
     /// or messages sent to it are still held (by queues of other addresses,
     /// such as wildcard ones), its size above 0.
     pub fn is_address_bound(&self, address: &str) -> bool {
-        self.has_bindings(address)
+        self.has_direct_bindings(address)
             || self
                 .paging
                 .existing_store(address)
@@ -1831,7 +1853,7 @@ impl PostOffice {
                 .is_some_and(|s| s.address_size() > 0);
             let remove = {
                 let mut state = self.write();
-                let free = state.free_diverts.contains_key(&name);
+                let bound = state.direct_bindings(&name);
                 let Some(entry) = state.addresses.get_mut(&name) else {
                     continue;
                 };
@@ -1844,9 +1866,7 @@ impl PostOffice {
                     entry.binding_removed_at != -1 || s.auto_delete_addresses_skip_usage_check;
                 let removable = s.auto_delete_addresses
                     && entry.info.auto_created
-                    && entry.queues.is_empty()
-                    && entry.diverts.is_empty()
-                    && !free
+                    && !bound
                     && !held
                     && (initial || used)
                     && (initial || delay_passed);
@@ -2655,15 +2675,27 @@ impl PostOffice {
         true
     }
 
-    /// Whether anything is bound to `address`
-    /// (`lookupBindingsForAddress` not empty).
+    /// Whether a message sent to `address` has bindings to go to
+    /// (`lookupBindingsForAddress` not empty): those of its address (the
+    /// queue name of an FQQN aside), of the wildcard addresses matching it,
+    /// and of other brokers. Where the dead-letter and expiry addresses
+    /// are checked.
     pub fn has_bindings(&self, address: &str) -> bool {
+        let (real, _) = split_fqqn(address);
         let state = self.read();
-        state.free_diverts.contains_key(address)
-            || state
-                .addresses
-                .get(address)
-                .is_some_and(|e| !e.queues.is_empty() || !e.diverts.is_empty())
+        state.remote.get(real).is_some_and(|r| !r.is_empty())
+            || self
+                .routing_entries(&state, real)
+                .iter()
+                .any(|e| !e.queues.is_empty() || !e.diverts.is_empty())
+    }
+
+    /// `getDirectBindings` not empty: queues, diverts or other brokers'
+    /// queues bound to the address itself.
+    pub fn has_direct_bindings(&self, address: &str) -> bool {
+        let (real, _) = split_fqqn(address);
+        let state = self.read();
+        state.direct_bindings(real)
     }
 
     /// The diverts bound to addresses, existing or not.

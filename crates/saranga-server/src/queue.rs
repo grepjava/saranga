@@ -2205,6 +2205,7 @@ impl Actor {
             address,
             &self.shared.name,
             expiry,
+            true,
             now,
         );
         message::apply_expiry_delay(&mut copy, &po.settings(address), now);
@@ -2327,6 +2328,16 @@ impl Actor {
                             s.store_message_tx(tx, &m.message)?;
                         }
                         s.store_reference_tx(tx, q.id(), m.message_id())?;
+                        // `addReferences`: a copy for later has its time
+                        // journaled with it, or would be due at the start.
+                        if m.scheduled_time > 0 {
+                            s.update_scheduled_delivery_time_tx(
+                                tx,
+                                q.id(),
+                                m.message_id(),
+                                m.scheduled_time,
+                            )?;
+                        }
                         persistent = true;
                     }
                 }

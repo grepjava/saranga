@@ -284,21 +284,45 @@ impl PendingId {
     /// returned, and none is taken. The guards are dropped once
     /// [`Self::apply`] has given the IDs their slots, or when the commit's
     /// record could not be written.
+    ///
+    /// Every cache involved is locked, in one order, before any ID is
+    /// checked: two transactions committing the same IDs in different
+    /// orders cannot each take one and both fail on the other's.
     pub fn hold(ids: &[PendingId]) -> Result<Vec<Reservation>, Vec<u8>> {
-        let mut held = Vec::with_capacity(ids.len());
+        let key = |c: &CacheRef| Arc::as_ptr(c) as usize;
+        let mut caches: Vec<&CacheRef> = ids.iter().map(|d| &d.cache).collect();
+        caches.sort_by_key(|c| key(c));
+        caches.dedup_by_key(|c| key(c));
+        let mut guards: Vec<(usize, std::sync::MutexGuard<'_, DuplicateIdCache>)> =
+            caches.iter().map(|c| (key(c), lock(c))).collect();
+        let mut taken: Vec<(usize, &[u8])> = Vec::with_capacity(ids.len());
         for d in ids {
-            let mut c = lock(&d.cache);
-            if c.contains(&d.id) {
+            let k = key(&d.cache);
+            let g = &mut guards
+                .iter_mut()
+                .find(|(gk, _)| *gk == k)
+                .expect("locked above")
+                .1;
+            if g.contains(&d.id) {
+                // Nothing taken stays taken.
+                for (k, id) in taken {
+                    if let Some((_, g)) = guards.iter_mut().find(|(gk, _)| *gk == k) {
+                        g.release(id);
+                    }
+                }
                 return Err(d.id.clone());
             }
-            c.reserve(&d.id);
-            drop(c);
-            held.push(Reservation {
+            g.reserve(&d.id);
+            taken.push((k, &d.id));
+        }
+        drop(guards);
+        Ok(ids
+            .iter()
+            .map(|d| Reservation {
                 cache: d.cache.clone(),
                 id: d.id.clone(),
-            });
-        }
-        Ok(held)
+            })
+            .collect())
     }
 }
 
@@ -379,6 +403,37 @@ impl DuplicateIdCaches {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two transactions committing the same two IDs in opposite orders:
+    /// one of them gets both, never neither.
+    #[test]
+    fn crossed_holds_never_both_fail() {
+        let a: CacheRef = Arc::new(Mutex::new(DuplicateIdCache::new("a", 100, None)));
+        let b: CacheRef = Arc::new(Mutex::new(DuplicateIdCache::new("b", 100, None)));
+        let pending = |c: &CacheRef, id: &[u8]| PendingId {
+            cache: c.clone(),
+            id: id.to_vec(),
+            record: 1,
+        };
+        let one = vec![pending(&a, b"1"), pending(&b, b"2")];
+        let two = vec![pending(&b, b"2"), pending(&a, b"1")];
+        for _ in 0..20_000 {
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let (b1, b2) = (barrier.clone(), barrier);
+            let (o, t) = (one.clone(), two.clone());
+            let h1 = std::thread::spawn(move || {
+                b1.wait();
+                PendingId::hold(&o).is_ok()
+            });
+            let h2 = std::thread::spawn(move || {
+                b2.wait();
+                PendingId::hold(&t).is_ok()
+            });
+            let (r1, r2) = (h1.join().unwrap(), h2.join().unwrap());
+            assert!(r1 || r2, "both transactions failed");
+            assert!(!lock(&a).contains(b"1") && !lock(&b).contains(b"2"));
+        }
+    }
 
     #[test]
     fn ring_evicts_the_oldest() {

@@ -815,12 +815,12 @@ impl Actor {
         for r in copies {
             self.act_on(r, action);
         }
-        // Scheduled messages (`scheduledDeliveryHandler.cancel`).
+        // Scheduled messages (`scheduledDeliveryHandler.cancel`). A copy
+        // leaves its original scheduled: Artemis's `iterQueue` takes it out
+        // of the schedule and, the copy not acting on it, drops it.
         let scheduled_too = !matches!(
             action,
-            SelectionAction::Expire
-                | SelectionAction::ChangePriority(_)
-                | SelectionAction::Copy { .. }
+            SelectionAction::Expire | SelectionAction::ChangePriority(_)
         );
         if scheduled_too && !sel.reached(hits) {
             let keys: Vec<_> = self
@@ -835,6 +835,12 @@ impl Actor {
                 }
                 hits += 1;
                 if matches!(action, SelectionAction::Retry) && !can_retry {
+                    continue;
+                }
+                if matches!(action, SelectionAction::Copy { .. }) {
+                    if let Some(r) = self.scheduled.get(&k).cloned() {
+                        self.act_on(r, action);
+                    }
                     continue;
                 }
                 let Some(mut r) = self.scheduled.remove(&k) else {
@@ -1067,14 +1073,18 @@ impl Actor {
             return;
         };
         let now = now_millis();
-        let copy = message::make_copy(
+        // `makeCopy(ref, false, false, address)`, routed as a sent message
+        // is: its expiry delay, and its scheduled time.
+        let mut copy = message::make_copy(
             r.message.core(),
             self.shared.ids.next(),
             address,
             &self.shared.name,
             false,
+            false,
             now,
         );
+        message::apply_expiry_delay(&mut copy, &po.settings(address), now);
         let Some(copy) = r.message.copy(copy) else {
             // A large body that cannot be copied leaves the original in place
             // rather than add a copy with no recoverable body, and the
@@ -1087,7 +1097,9 @@ impl Actor {
             self.write_failed(e);
             return;
         };
-        let routed = match po.route_moved(&MessageRef::new(copy), target.clone()) {
+        let mut copy = MessageRef::new(copy);
+        copy.scheduled_time = message::scheduled_delivery_time(copy.message.core());
+        let routed = match po.route_moved(&copy, target.clone()) {
             Ok(routed) => routed,
             Err(e) => {
                 let e = format!(

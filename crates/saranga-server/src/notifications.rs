@@ -434,7 +434,10 @@ impl QueueInfos {
             if filtered && queue.filter().is_some_and(|f| !f.matches(&*m)) {
                 return;
             }
-            queue.add(MessageRef::new(m));
+            // `routeQueueInfo` → `processRoute`: behind what the queue has
+            // paged, when its address pages, so the snapshot comes after
+            // the notifications before it.
+            po.route_to_queue(MessageRef::new(m), &queue);
         };
         let reset = |key: &str| {
             let mut m = CoreMessage {
@@ -591,11 +594,13 @@ impl PostOffice {
         let Ok(routed) = self.route_internal(&r, address) else {
             return;
         };
-        let routed = match self.page_routed(routed.clone(), None) {
+        // Refused by an address's limits (FAIL), the notification is not
+        // sent, as Artemis's `route` throws: neither paged nor queued.
+        let routed = match self.page_routed(routed, None) {
             Ok((routed, _)) => routed,
             Err(e) => {
                 tracing::debug!("notification to {address}: {e}");
-                routed
+                return;
             }
         };
         let mut waits = Vec::new();
