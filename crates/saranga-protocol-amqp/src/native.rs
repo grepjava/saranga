@@ -429,8 +429,17 @@ impl NativeMessage for AmqpNative {
                 HDR_ROUTING_TYPE
                 | HDR_GROUP_ID
                 | HDR_GROUP_SEQUENCE
-                | HDR_VALIDATED_USER
                 | HDR_SCHEDULED_DELIVERY_TIME => {}
+                // The user the client gave, dropped by `populate-validated-user`
+                // when no user was validated: its `user-id` and the
+                // properties a consumer would read it from go.
+                HDR_VALIDATED_USER => {
+                    m.clear_user_id();
+                    m.remove_property(JMSX_USER_ID);
+                    m.remove_property(HDR_VALIDATED_USER);
+                    m.remove_extra_property(HDR_VALIDATED_USER);
+                    reencode = true;
+                }
                 k if k.starts_with(HDR_ROUTE_TO_IDS) || k.starts_with("_AMQ_") => {
                     m.remove_extra_property(k);
                 }

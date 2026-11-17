@@ -17,6 +17,7 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **`populate-validated-user` without a validated user** (security disabled) drops the user a producer claimed on its message, so `reject-empty-validated-user` refuses it instead of letting it through.
 - **A depaged message being delivered or waiting for its time is counted once** in a queue's `DurableMessageCount`, `PersistentSize` and `DurablePersistentSize` (and their metrics), not again with the page subscription that still counts it.
 - **`deliverScheduledMessages` and `deliverScheduledMessage`** put the messages at the head of the queue in delivery-time order, and honour the queue's ring size and last value as a message falling due does.
 - **A last-value queue forgets a key when its message leaves the queue**, delivered or otherwise, as Artemis does, instead of keeping every key it ever saw.

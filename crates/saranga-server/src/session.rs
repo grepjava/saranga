@@ -1602,13 +1602,26 @@ impl ServerSession {
             }
             return Err(e);
         }
-        if self.broker.populate_validated_user()
-            && let Some(user) = &self.validated_user
-        {
-            message.properties.insert(
-                crate::message::HDR_VALIDATED_USER.into(),
-                saranga_buffer::PropertyValue::String(user.as_str().into()),
-            );
+        if self.broker.populate_validated_user() {
+            match &self.validated_user {
+                Some(user) => {
+                    message.properties.insert(
+                        crate::message::HDR_VALIDATED_USER.into(),
+                        saranga_buffer::PropertyValue::String(user.as_str().into()),
+                    );
+                }
+                // No user was validated (security is off): the broker
+                // populates the user, so one the client gave is dropped,
+                // and `reject-empty-validated-user` sees none. Artemis keeps
+                // the client's. A bridge's or the broker's own send keeps
+                // the user its message carries.
+                None if !self.direct && !self.internal => {
+                    message
+                        .properties
+                        .remove(&SimpleString::from(crate::message::HDR_VALIDATED_USER));
+                }
+                None => {}
+            }
         }
         if !self.direct
             && !self.internal

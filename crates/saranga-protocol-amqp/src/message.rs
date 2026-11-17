@@ -1031,6 +1031,13 @@ impl AmqpMessage {
         self.properties_mut().user_id = Some(user);
     }
 
+    /// The message's `user-id`, taken off.
+    pub fn clear_user_id(&mut self) {
+        if self.properties().is_some_and(|p| p.user_id.is_some()) {
+            self.properties_mut().user_id = None;
+        }
+    }
+
     /// `removeProperty`.
     pub fn remove_property(&mut self, key: &str) -> Option<Value> {
         let props = self.application_properties_mut();
