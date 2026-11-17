@@ -542,15 +542,17 @@ impl BrokerPlugin for MessageAuthorization {
         else {
             return true;
         };
-        // The subject of the consumer's session (getSessionSubject).
-        let subject = self
+        // The subject of the consumer's own session (getSessionSubject).
+        let broker = self
             .broker
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .upgrade()
-            .and_then(|b| b.registry().session(&consumer.session))
-            .and_then(|s| s.connection.upgrade())
-            .and_then(|c| c.subject());
+            .upgrade();
+        let subject = broker.as_ref().and_then(|b| {
+            // Whether or not security is enabled, as Artemis looks it up.
+            let store = b.security_store()?;
+            b.registry().session(&consumer.session)?.subject(store)
+        });
         let Some(subject) = subject else {
             tracing::debug!("Subject not found for consumer: {}", consumer.id);
             return false;

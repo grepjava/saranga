@@ -186,6 +186,9 @@ pub struct SessionEntry {
     closer: Mutex<Option<SessionCloser>>,
     /// A send or an acknowledgement under way, for the critical analyzer.
     pub critical: crate::critical::Measure,
+    /// The session's credentials, which its subject is found by
+    /// (`getSessionSubject`): each session of a connection its own.
+    auth: Mutex<Option<saranga_security::SecurityAuth>>,
 }
 
 /// `ServerLegacyProducersImpl.MAX_PRODUCER_METRIC_SIZE`.
@@ -214,7 +217,22 @@ impl SessionEntry {
             legacy_producers: AtomicBool::new(false),
             closer: Mutex::default(),
             critical: Default::default(),
+            auth: Mutex::default(),
         }
+    }
+
+    pub(crate) fn set_auth(&self, auth: saranga_security::SecurityAuth) {
+        *lock(&self.auth) = Some(auth);
+    }
+
+    /// `getSessionSubject`: the subject the session's credentials log in as,
+    /// from the authentication cache or a new login.
+    pub fn subject(
+        &self,
+        store: &saranga_security::SecurityStore,
+    ) -> Option<Arc<saranga_security::jaas::Subject>> {
+        let auth = lock(&self.auth).clone()?;
+        store.session_subject(&auth)
     }
 
     pub fn connection(&self) -> Option<Arc<ClientConnection>> {

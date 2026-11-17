@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1132,7 +1132,10 @@ struct Large {
     /// as its copy starts (`LargeServerMessageInSync` opens lazily), not
     /// all at once when the primary lists them.
     unstarted: HashSet<i64>,
-    appended: HashMap<i64, Vec<u8>>,
+    /// What the primary appends to a body while it is copied, kept in a
+    /// `<id>.sync` file until the copy is done (`LargeServerMessageInSync`'s
+    /// `LargeMessageExtension.SYNC` file).
+    appended: HashMap<i64, File>,
 }
 
 impl Large {
@@ -1148,6 +1151,20 @@ impl Large {
 
     fn path(&self, id: i64) -> PathBuf {
         self.dir.join(format!("{id}.msg"))
+    }
+
+    fn sync_path(&self, id: i64) -> PathBuf {
+        self.dir.join(format!("{id}.sync"))
+    }
+
+    fn remove_sync_file(&mut self, id: i64) -> io::Result<()> {
+        if self.appended.remove(&id).is_none() {
+            return Ok(());
+        }
+        match fs::remove_file(self.sync_path(id)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
     }
 
     fn create(&mut self, id: i64) -> io::Result<()> {
@@ -1187,8 +1204,17 @@ impl Large {
 
     fn write(&mut self, id: i64, data: &[u8]) -> io::Result<()> {
         if self.syncing.contains(&id) {
-            self.appended.entry(id).or_default().extend_from_slice(data);
-            return Ok(());
+            if !self.appended.contains_key(&id) {
+                fs::create_dir_all(&self.dir)?;
+                let f = OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(self.sync_path(id))?;
+                self.appended.insert(id, f);
+            }
+            return self.appended.get_mut(&id).expect("opened").write_all(data);
         }
         self.file(id)?.write_all(data)
     }
@@ -1221,7 +1247,7 @@ impl Large {
         self.open.remove(&id);
         self.syncing.remove(&id);
         self.unstarted.remove(&id);
-        self.appended.remove(&id);
+        self.remove_sync_file(id)?;
         match fs::remove_file(self.path(id)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
@@ -1233,11 +1259,19 @@ impl Large {
         let ids: Vec<i64> = self.syncing.drain().collect();
         for id in ids {
             let unstarted = self.unstarted.remove(&id);
-            if let Some(data) = self.appended.remove(&id) {
-                if unstarted {
-                    self.create(id)?;
-                }
-                self.file(id)?.write_all(&data)?;
+            let Some(mut appended) = self.appended.remove(&id) else {
+                continue;
+            };
+            if unstarted {
+                self.create(id)?;
+            }
+            // Copied through a bounded buffer, then the sync file goes.
+            appended.seek(io::SeekFrom::Start(0))?;
+            io::copy(&mut appended, self.file(id)?)?;
+            drop(appended);
+            match fs::remove_file(self.sync_path(id)) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
             }
         }
         Ok(())
@@ -1246,6 +1280,11 @@ impl Large {
     fn close_all(&mut self) {
         for (_, f) in self.open.drain() {
             let _ = f.sync_all();
+        }
+        // A sync that did not finish leaves nothing behind.
+        let pending: Vec<i64> = self.appended.keys().copied().collect();
+        for id in pending {
+            let _ = self.remove_sync_file(id);
         }
     }
 }

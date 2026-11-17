@@ -11,6 +11,56 @@ pub const MAX_GROUPS: usize = 10;
 /// `jdk.xml.xpathExprOpLimit`'s default: the most operators.
 pub const MAX_OPERATORS: usize = 100;
 
+/// The most operators an expression may hold, however they are written:
+/// `sxd_xpath` nests a node per operator, and the JDK's parser cannot go
+/// much deeper either.
+pub const MAX_NESTING: usize = 1024;
+
+/// Refuses an expression with more than [`MAX_NESTING`] operators, counted
+/// outside literals: every operator word wherever it ends, and every
+/// operator character (a `-` in a name too, which only over-counts).
+pub(super) fn within_nesting(pattern: &str) -> Result<(), String> {
+    let mut operators = 0usize;
+    let mut word = String::new();
+    let mut chars = pattern.chars();
+    let end_word = |word: &mut String, operators: &mut usize| {
+        if matches!(word.as_str(), "and" | "or" | "div" | "mod") {
+            *operators += 1;
+        }
+        word.clear();
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '"' | '\'' => {
+                end_word(&mut word, &mut operators);
+                for d in chars.by_ref() {
+                    if d == c {
+                        break;
+                    }
+                }
+            }
+            c if c.is_alphanumeric() || c == '_' || c == '.' => word.push(c),
+            c => {
+                end_word(&mut word, &mut operators);
+                if matches!(
+                    c,
+                    '=' | '<' | '>' | '+' | '-' | '*' | '|' | '/' | '[' | '(' | '!'
+                ) {
+                    operators += 1;
+                }
+            }
+        }
+        if operators > MAX_NESTING {
+            return Err(format!("more than {MAX_NESTING} operators"));
+        }
+    }
+    end_word(&mut word, &mut operators);
+    if operators > MAX_NESTING {
+        return Err(format!("more than {MAX_NESTING} operators"));
+    }
+    Ok(())
+}
+
 /// `Lexer.tokenize`'s counting of groups and operators, as the JDK counts
 /// them, refusing an expression past [`MAX_GROUPS`] or [`MAX_OPERATORS`].
 /// The limits also bound how deeply `sxd_xpath`, which recurses on every

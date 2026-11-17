@@ -471,6 +471,12 @@ impl SecurityStore {
         }
     }
 
+    /// `getSessionSubject`: the subject a session's credentials log in as,
+    /// whether or not security is enabled.
+    pub fn session_subject(&self, auth: &SecurityAuth) -> Option<Arc<Subject>> {
+        self.subject_for_authorization(auth)
+    }
+
     /// `getSubjectForAuthorization`: the cached subject for the session's
     /// credentials, or a fresh login.
     fn subject_for_authorization(&self, auth: &SecurityAuth) -> Option<Arc<Subject>> {

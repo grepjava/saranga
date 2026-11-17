@@ -893,6 +893,10 @@ pub struct BrokerConfig {
     /// `persist-delivery-count-before-delivery`: a durable message's
     /// delivery count is journaled as it is delivered.
     pub persist_delivery_count_before_delivery: bool,
+    /// `uuid-namespace` (or `temporary-queue-namespace`): settings for an
+    /// address or queue named by a UUID, as temporary ones are, are looked
+    /// up under `<namespace>.<uuid>`.
+    pub uuid_namespace: String,
     /// `large-message-sync`: a large message's file is synced before it is
     /// routed.
     pub large_message_sync: bool,
@@ -1114,8 +1118,9 @@ impl BrokerConfig {
     /// syntax and literal markers, fully qualified names reduced to their
     /// address, and an empty `AddressSettings` as the default.
     pub fn address_settings_repository(&self) -> Result<HierarchicalRepository<AddressSettings>> {
+        let uuid = self.uuid_match();
         let mut repo = HierarchicalRepository::new(self.wildcard_addresses)
-            .with_match_modifier(|s: &str| extract_address_name(s).to_owned());
+            .with_match_modifier(move |s: &str| uuid(extract_address_name(s)));
         if let Some((start, end)) = self.literal_match_markers {
             repo = repo.with_literal_markers(start, end);
         }
@@ -1128,11 +1133,28 @@ impl BrokerConfig {
 }
 
 impl BrokerConfig {
+    /// `modifyMatchForUUID`: a name that is a UUID (or an OpenWire
+    /// temporary destination's ID) is matched as `<namespace>.<name>` when a
+    /// UUID namespace is set.
+    fn uuid_match(&self) -> impl Fn(&str) -> String + Send + Sync + 'static {
+        let namespace = self.uuid_namespace.clone();
+        let delimiter = self.wildcard_addresses.delimiter;
+        move |s: &str| {
+            if !namespace.is_empty() && (is_uuid(s) || is_openwire_uuid(s)) {
+                format!("{namespace}{delimiter}{s}")
+            } else {
+                s.to_owned()
+            }
+        }
+    }
+
     /// The security-settings repository, set up as `ActiveMQServerImpl`
     /// does: this config's wildcard syntax, no literal markers, and no
     /// roles as the default.
     pub fn security_repository(&self) -> Result<HierarchicalRepository<SecuritySetting>> {
-        let mut repo = HierarchicalRepository::new(self.wildcard_addresses);
+        let uuid = self.uuid_match();
+        let mut repo =
+            HierarchicalRepository::new(self.wildcard_addresses).with_match_modifier(uuid);
         repo.set_default(Some(SecuritySetting::default()));
         for (m, setting) in &self.security_settings {
             repo.add_match(m, setting.clone())?;
@@ -1181,6 +1203,7 @@ impl Default for BrokerConfig {
             id_cache_size: Self::DEFAULT_ID_CACHE_SIZE,
             persist_id_cache: Self::DEFAULT_PERSIST_ID_CACHE,
             persist_delivery_count_before_delivery: false,
+            uuid_namespace: String::new(),
             large_message_sync: true,
             database_store: None,
             configuration_file_refresh_period: Self::DEFAULT_CONFIGURATION_FILE_REFRESH_PERIOD,
@@ -1268,5 +1291,120 @@ pub(crate) fn well_formed(text: &str, print_warnings: bool) -> Result<String> {
             }
             Err(ConfigError::Decode(crate::DecodeError::from_dom(&failure)))
         }
+    }
+}
+
+/// `UUID.isUUID`: 36 characters, hyphens at 8, 13, 18 and 23, lower-case
+/// hex between.
+fn is_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, &c)| match i {
+            8 | 13 | 18 | 23 => c == b'-',
+            _ => c.is_ascii_digit() || (b'a'..=b'f').contains(&c),
+        })
+}
+
+/// `OpenWireUUIDUtil.isUUID`: an OpenWire ID, `<anything>-<n>-<n>-<n>:<n>:<n>`
+/// in digits. Where Java would index before the start of the name (and
+/// throw), it is not one.
+fn is_openwire_uuid(s: &str) -> bool {
+    let digits = |s: &str| s.bytes().all(|c| c.is_ascii_digit());
+    if s.trim().is_empty() || !s.contains(':') {
+        return false;
+    }
+    let Some(last_dash) = s.rfind('-') else {
+        return false;
+    };
+    let end: Vec<&str> = s[last_dash + 1..].split(':').collect();
+    // Java's `split` drops trailing empty strings.
+    let mut end = end;
+    while end.last() == Some(&"") {
+        end.pop();
+    }
+    if end.len() != 3 || !end.iter().all(|g| digits(g)) {
+        return false;
+    }
+    let mut looper = s;
+    let mut dash = Some(last_dash);
+    for _ in 0..2 {
+        let Some(d) = dash else {
+            return false;
+        };
+        let remainder = &looper[..d];
+        dash = remainder.rfind('-');
+        if !digits(&remainder[dash.map_or(0, |d| d + 1)..]) {
+            return false;
+        }
+        looper = remainder;
+    }
+    true
+}
+
+#[cfg(test)]
+mod uuid_namespace_tests {
+    use super::*;
+
+    #[test]
+    fn uuids_are_recognised_as_artemis_recognises_them() {
+        assert!(is_uuid("0b1ea5c4-24f0-11ef-a2b4-0a0027000005"));
+        assert!(
+            !is_uuid("0B1EA5C4-24F0-11EF-A2B4-0A0027000005"),
+            "lower case only"
+        );
+        assert!(!is_uuid("0b1ea5c4-24f0-11ef-a2b4-0a002700000"));
+        assert!(is_openwire_uuid(
+            "ID:localhost-45187-1745501083698-10000:1:10001"
+        ));
+        assert!(is_openwire_uuid("x-1-2-3:4:5"));
+        assert!(!is_openwire_uuid("ID:localhost-45187-abc-10000:1:10001"));
+        assert!(!is_openwire_uuid("2-3:4:5"), "Java throws");
+        assert!(is_openwire_uuid("1-2-3:4:5"));
+        assert!(!is_openwire_uuid("orders"));
+    }
+
+    #[test]
+    fn a_uuid_address_takes_the_namespace_s_settings() {
+        let mut config = BrokerConfig {
+            uuid_namespace: "temp".into(),
+            ..Default::default()
+        };
+        config.address_settings.push((
+            "temp.#".into(),
+            AddressSettings {
+                max_delivery_attempts: Some(3),
+                ..Default::default()
+            },
+        ));
+        let repo = config.address_settings_repository().unwrap();
+        let of = |a: &str| repo.get_match(a).unwrap().max_delivery_attempts;
+        assert_eq!(of("0b1ea5c4-24f0-11ef-a2b4-0a0027000005"), Some(3));
+        assert_eq!(of("0b1ea5c4-24f0-11ef-a2b4-0a0027000005::q"), Some(3));
+        assert_eq!(of("orders"), None);
+        config.uuid_namespace = String::new();
+        let repo = config.address_settings_repository().unwrap();
+        assert_eq!(
+            repo.get_match("0b1ea5c4-24f0-11ef-a2b4-0a0027000005")
+                .unwrap()
+                .max_delivery_attempts,
+            None
+        );
+    }
+
+    #[test]
+    fn the_namespace_is_read_under_both_names() {
+        let parse = |xml: &str| {
+            BrokerConfig::parse(&format!(
+                r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">{xml}</core></configuration>"#
+            ))
+            .unwrap()
+            .uuid_namespace
+        };
+        assert_eq!(
+            parse("<temporary-queue-namespace>t</temporary-queue-namespace>"),
+            "t"
+        );
+        assert_eq!(parse("<uuid-namespace>u</uuid-namespace>"), "u");
+        assert_eq!(parse(""), "");
     }
 }

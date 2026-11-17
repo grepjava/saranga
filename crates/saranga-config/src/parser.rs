@@ -880,6 +880,12 @@ fn parse_scalars(
     if let Some(v) = s.bool("persist-delivery-count-before-delivery") {
         config.persist_delivery_count_before_delivery = v;
     }
+    // `temporary-queue-namespace` is the older name of `uuid-namespace`.
+    for name in ["temporary-queue-namespace", "uuid-namespace"] {
+        if let Some(v) = s.non_empty_string(name)? {
+            config.uuid_namespace = v;
+        }
+    }
     if let Some(v) = s.non_empty_string("management-address")? {
         config.management_address = v;
     }

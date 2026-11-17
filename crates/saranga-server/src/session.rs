@@ -687,6 +687,10 @@ pub struct ServerSession {
     pending_writes: Arc<std::sync::atomic::AtomicUsize>,
     /// Permission checks are off (a send the broker makes).
     unchecked: bool,
+    /// Sending a management reply (`doSend`): the session's own send
+    /// permission applies, but nothing is auto-created and it is not the
+    /// session's send for plugins, metrics or the audit log.
+    replying: bool,
     /// Routing a message the broker took from elsewhere
     /// ([`ServerSession::route_direct`]): no auto-creation permission or
     /// validated-user checks either.
@@ -730,6 +734,7 @@ impl ServerSession {
     /// it is authorized as the subject it authenticated as.
     pub(crate) fn on_management_connection(&mut self) {
         self.auth.management = true;
+        self.entry.set_auth(self.auth.clone());
     }
 
     pub fn new(
@@ -768,6 +773,14 @@ impl ServerSession {
             &conn,
             options.default_address.clone(),
         ));
+        entry.set_auth(SecurityAuth {
+            username: options.username.clone(),
+            password: options.password.clone(),
+            connection: security_info.clone(),
+            subject: authenticated.subject.clone(),
+            management: false,
+            credential: Default::default(),
+        });
         conn.add_session(entry.clone());
         broker.registry().session_created();
         session_notification(&broker, &conn, &entry, NotificationType::SessionCreated);
@@ -808,6 +821,7 @@ impl ServerSession {
             failed: Vec::new(),
             pending_writes: Arc::default(),
             unchecked: false,
+            replying: false,
             direct: false,
             internal: false,
             mirroring: crate::mirror::Mirroring::Enabled,
@@ -868,6 +882,7 @@ impl ServerSession {
             failed: Vec::new(),
             pending_writes: Arc::default(),
             unchecked: false,
+            replying: false,
             direct: false,
             internal: false,
             mirroring: crate::mirror::Mirroring::Enabled,
@@ -1106,6 +1121,12 @@ impl ServerSession {
                 .map(|s| (&**s, &self.auth)),
             user: self.validated_user.as_deref(),
         }
+    }
+
+    /// A send the broker makes, not the session: a management reply or one
+    /// no permission stops.
+    fn broker_send(&self) -> bool {
+        self.unchecked || self.replying
     }
 
     /// `ServerSessionImpl.securityCheck`.
@@ -1457,7 +1478,7 @@ impl ServerSession {
         let entry = self.entry.clone();
         let _critical = entry.critical.enter();
         // A session's own sends, not the replies the broker sends for it.
-        let plugins = (!self.unchecked)
+        let plugins = (!self.broker_send())
             .then(|| self.broker.post_office().plugins().clone())
             .filter(|p| !p.is_empty());
         let Some(plugins) = plugins else {
@@ -1527,7 +1548,7 @@ impl ServerSession {
             let po = self.broker.post_office();
             let paging = po.paging();
             if paging.is_disk_full()
-                && (self.unchecked || *address != *self.broker.management().address())
+                && (self.broker_send() || *address != *self.broker.management().address())
                 && po
                     .settings(crate::postoffice::split_fqqn(&address).0)
                     .disk_full_policy
@@ -1549,7 +1570,7 @@ impl ServerSession {
         }
         // handleManagementMessage: a message to the management address is
         // a request, answered on its reply-to address.
-        if !self.unchecked && *address == *self.broker.management().address() {
+        if !self.broker_send() && *address == *self.broker.management().address() {
             let request = match &outgoing {
                 Outgoing::Native(native, ..) => native.to_core(),
                 Outgoing::Core(_) => message,
@@ -1651,7 +1672,7 @@ impl ServerSession {
         });
         r.scheduled_time = scheduled_time;
         // updateProducerMetrics, with the size before routing.
-        if !self.unchecked && self.entry.tracks_producer(self.sender.as_deref()) {
+        if !self.broker_send() && self.entry.tracks_producer(self.sender.as_deref()) {
             let size = match r.message.large() {
                 Some(body) => body.size() as i64,
                 None => r.message.encode_size() as i64,
@@ -1744,10 +1765,13 @@ impl ServerSession {
                 }
             }
         }
-        let routed = self
-            .broker
-            .post_office()
-            .route(&r, &address, routing_type, self.creator());
+        let routed = self.broker.post_office().route_with(
+            &r,
+            &address,
+            routing_type,
+            self.creator(),
+            !self.replying,
+        );
         // A send with a journal transaction of its own (for its duplicate
         // ID) pages in it too, as Artemis pages in the transaction it
         // starts for the ID: if the send fails, no page record of it
@@ -1909,11 +1933,11 @@ impl ServerSession {
         );
         if let Some(reply_to) = &reply_to {
             reply.address = Some(SimpleString::from(reply_to.as_str()));
-            self.unchecked = true;
+            self.replying = true;
             let sent = self
                 .send_message(reply, Outgoing::Core(None), tx.clone())
                 .await;
-            self.unchecked = false;
+            self.replying = false;
             sent?;
         }
         // The request is logged as sent once handled, as any other message;
@@ -1979,7 +2003,7 @@ impl ServerSession {
         // The broker's own sends (a management reply, an advisory) are not
         // the session's.
         if crate::audit::message_enabled()
-            && !self.unchecked
+            && !self.broker_send()
             && let Some((r, _)) = routed.first()
         {
             // The message as sent; its divert copies are not logged.

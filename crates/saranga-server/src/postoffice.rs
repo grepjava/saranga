@@ -2241,6 +2241,19 @@ impl PostOffice {
         routing_type: Option<RoutingType>,
         creator: Creator<'_>,
     ) -> Result<Routed> {
+        self.route_with(message, address, routing_type, creator, true)
+    }
+
+    /// [`route`](Self::route), auto-creating only with `auto_create`: a
+    /// session's management reply (`doSend`) creates nothing.
+    pub fn route_with(
+        &self,
+        message: &MessageRef,
+        address: &str,
+        routing_type: Option<RoutingType>,
+        creator: Creator<'_>,
+        auto_create: bool,
+    ) -> Result<Routed> {
         let mut out = Vec::new();
         let plugins = &self.plugins;
         plugins.check(|p| p.before_message_route(&message.message))?;
@@ -2250,7 +2263,10 @@ impl PostOffice {
             message,
             address,
             routing_type,
-            Hop::client(creator),
+            Hop {
+                auto_create,
+                ..Hop::client(creator)
+            },
             &mut out,
         ) {
             Ok(()) => {

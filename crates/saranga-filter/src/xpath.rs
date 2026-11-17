@@ -30,6 +30,7 @@ pub const MAX_DEPTH: usize = 1024;
 pub(crate) fn compile(expression: &str) -> Result<sxd_xpath::XPath, String> {
     let invalid = |e: String| format!("invalid XPath expression {expression:?}: {e}");
     lexer::within_jdk_limits(expression).map_err(invalid)?;
+    lexer::within_nesting(expression).map_err(invalid)?;
     let expression = lexer::check_calls(expression).map_err(invalid)?;
     match sxd_xpath::Factory::new().build(&expression) {
         Ok(Some(xpath)) => Ok(xpath),
@@ -53,12 +54,21 @@ pub(crate) fn matches(expression: &str, body: Option<&str>) -> bool {
     let document = package.as_document();
     let root = document.root();
     let mut elements = Vec::new();
+    let mut kept = Vec::new();
+    let mut dropped = false;
     for child in root.children() {
         match child {
-            ChildOfRoot::Comment(c) => c.remove_from_parent(),
-            ChildOfRoot::Element(e) => elements.push((e, 1)),
-            ChildOfRoot::ProcessingInstruction(_) => {}
+            ChildOfRoot::Comment(_) => dropped = true,
+            ChildOfRoot::Element(e) => {
+                elements.push((e, 1));
+                kept.push(child);
+            }
+            ChildOfRoot::ProcessingInstruction(_) => kept.push(child),
         }
+    }
+    // Rebuilt in one pass.
+    if dropped {
+        root.replace_children(kept);
     }
     if !drop_comments_within_depth(elements) {
         return false;
@@ -77,28 +87,53 @@ pub(crate) fn matches(expression: &str, body: Option<&str>) -> bool {
 /// Text left next to text, where a comment was or around a CDATA section,
 /// is joined into one node, as XPath's data model has it and Java's
 /// evaluator gives it.
+///
+/// Each element's children are rebuilt in one pass, and each run of text
+/// joined once (the document keeps every string it is given).
 fn drop_comments_within_depth(mut elements: Vec<(Element<'_>, usize)>) -> bool {
     while let Some((element, depth)) = elements.pop() {
         if depth > MAX_DEPTH {
             return false;
         }
-        let mut text: Option<sxd_document::dom::Text<'_>> = None;
-        for child in element.children() {
+        let children = element.children();
+        let mut changed = false;
+        let mut kept: Vec<ChildOfElement<'_>> = Vec::with_capacity(children.len());
+        // The run of text being read: its first node and the pieces after.
+        let mut run: Option<(sxd_document::dom::Text<'_>, String)> = None;
+        let end_run = |run: &mut Option<(sxd_document::dom::Text<'_>, String)>| {
+            if let Some((first, rest)) = run.take()
+                && !rest.is_empty()
+            {
+                first.set_text(&(first.text().to_owned() + &rest));
+            }
+        };
+        for child in children {
             match child {
-                ChildOfElement::Comment(c) => c.remove_from_parent(),
-                ChildOfElement::Text(t) => match text {
-                    Some(first) => {
-                        first.set_text(&(first.text().to_owned() + t.text()));
-                        t.remove_from_parent();
+                ChildOfElement::Comment(_) => changed = true,
+                ChildOfElement::Text(t) => match &mut run {
+                    Some((_, rest)) => {
+                        rest.push_str(t.text());
+                        changed = true;
                     }
-                    None => text = Some(t),
+                    None => {
+                        run = Some((t, String::new()));
+                        kept.push(child);
+                    }
                 },
                 ChildOfElement::Element(e) => {
-                    text = None;
+                    end_run(&mut run);
                     elements.push((e, depth + 1));
+                    kept.push(child);
                 }
-                ChildOfElement::ProcessingInstruction(_) => text = None,
+                ChildOfElement::ProcessingInstruction(_) => {
+                    end_run(&mut run);
+                    kept.push(child);
+                }
             }
+        }
+        end_run(&mut run);
+        if changed {
+            element.replace_children(kept);
         }
     }
     true
