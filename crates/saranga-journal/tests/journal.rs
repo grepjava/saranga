@@ -504,3 +504,39 @@ fn retention_storage_limit_below_one_file_keeps_no_copy() {
     j.stop().unwrap();
     assert_eq!(copy_ids(&history), Vec::<i64>::new());
 }
+
+/// Updates a type tells apart by their leading bytes (a message's delivery
+/// count, per queue) each keep their last on compaction: one queue's does
+/// not replace another's.
+#[test]
+fn replaceable_updates_are_kept_per_key_on_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path());
+    let j = Journal::open(cfg.clone()).unwrap();
+    j.replaceable_record_per(34, 8);
+    j.load_all().unwrap();
+    j.append_add(1, 45, vec![0; 100], false, None).unwrap();
+    let update = |queue: i64, count: u8| {
+        let mut data = queue.to_be_bytes().to_vec();
+        data.push(count);
+        data
+    };
+    for n in 0..5u8 {
+        j.append_update(1, 34, update(10, n), false, true, None)
+            .unwrap();
+        j.append_update(1, 34, update(20, n + 100), false, true, None)
+            .unwrap();
+    }
+    j.compact().unwrap();
+    j.stop().unwrap();
+    drop(j);
+    let r = reload(&cfg);
+    let mut upd: Vec<_> = r
+        .committed
+        .iter()
+        .filter(|r| r.is_update)
+        .map(|r| r.data.clone())
+        .collect();
+    upd.sort();
+    assert_eq!(upd, vec![update(10, 4), update(20, 104)]);
+}

@@ -521,6 +521,8 @@ pub struct PostOffice {
     stopped: AtomicBool,
     /// `getInternalNamingPrefix`.
     internal_prefix: std::sync::OnceLock<String>,
+    /// `persist-delivery-count-before-delivery` (`strictUpdateDeliveryCount`).
+    strict_delivery_count: AtomicBool,
     /// The mirror sources installed.
     mirrors: crate::mirror::Mirrors,
     /// What the last deployment of the configured addresses wrote into
@@ -564,6 +566,7 @@ impl PostOffice {
             large: std::sync::OnceLock::new(),
             stopped: AtomicBool::new(false),
             internal_prefix: std::sync::OnceLock::new(),
+            strict_delivery_count: AtomicBool::new(false),
             mirrors: crate::mirror::Mirrors::default(),
             deployed: Mutex::default(),
         })
@@ -586,6 +589,17 @@ impl PostOffice {
     /// `internal-naming-prefix`, set once at start.
     pub fn set_internal_prefix(&self, prefix: String) {
         let _ = self.internal_prefix.set(prefix);
+    }
+
+    /// `persist-delivery-count-before-delivery`, set at start: a durable
+    /// message's delivery count is journaled as it is delivered, not when
+    /// it comes back.
+    pub fn set_strict_delivery_count(&self, on: bool) {
+        self.strict_delivery_count.store(on, Ordering::Relaxed);
+    }
+
+    pub fn strict_delivery_count(&self) -> bool {
+        self.strict_delivery_count.load(Ordering::Relaxed)
     }
 
     /// `getInternalNamingPrefix`.

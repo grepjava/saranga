@@ -35,7 +35,8 @@ pub(super) async fn attribute(
         "PersistentSize" => {
             let s = q.stats().await;
             let paged = q.page_subscription().map_or(0, |s| s.persistent_size());
-            Json::from(s.pending_size + s.scheduled_size + s.delivering_size + paged)
+            let n = s.non_paged;
+            Json::from(s.pending_size + n.scheduled_size + n.delivering_size + paged)
         }
         "DurableMessageCount" => {
             if !q.is_durable() {
@@ -43,10 +44,11 @@ pub(super) async fn attribute(
             } else {
                 let s = q.stats().await;
                 let paged = q.page_subscription().map_or(0, |s| s.message_count());
+                let n = s.non_paged;
                 Json::from(
                     s.durable_pending_count
-                        + s.durable_scheduled_count
-                        + i64::from(s.durable_delivering_count)
+                        + n.durable_scheduled_count
+                        + n.durable_delivering_count
                         + paged,
                 )
             }
@@ -57,10 +59,13 @@ pub(super) async fn attribute(
             } else {
                 let s = q.stats().await;
                 let paged = q.page_subscription().map_or(0, |s| s.persistent_size());
+                // Artemis adds the pending durable size with its depaged
+                // messages, counting those twice; Saranga does not.
+                let n = s.non_paged;
                 Json::from(
                     s.durable_pending_size
-                        + s.durable_scheduled_size
-                        + s.durable_delivering_size
+                        + n.durable_scheduled_size
+                        + n.durable_delivering_size
                         + paged,
                 )
             }

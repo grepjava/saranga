@@ -269,6 +269,8 @@ pub struct BrokerConfig {
     pub id_cache_size: i32,
     /// `persist-id-cache`.
     pub persist_id_cache: bool,
+    /// `persist-delivery-count-before-delivery`.
+    pub persist_delivery_count_before_delivery: bool,
     /// `global-max-size`: the memory all addresses' messages may take
     /// before addresses page (or block, fail, drop); -1 for no limit.
     pub global_max_size: i64,
@@ -360,6 +362,7 @@ impl BrokerConfig {
             address_queue_scan_period: 30000,
             id_cache_size: 20000,
             persist_id_cache: true,
+            persist_delivery_count_before_delivery: false,
             global_max_size: -1,
             global_max_messages: -1,
             purge_page_folders: false,
@@ -825,6 +828,7 @@ impl Broker {
         if let Some(f) = &config.management.file {
             post_office.set_internal_prefix(f.internal_naming_prefix.clone());
         }
+        post_office.set_strict_delivery_count(config.persist_delivery_count_before_delivery);
         // registerBrokerPlugins: before anything is loaded, so the plugins
         // see the addresses and queues recovered and deployed.
         for p in &config.plugins {

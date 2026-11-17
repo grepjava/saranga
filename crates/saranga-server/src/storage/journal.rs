@@ -48,8 +48,9 @@ impl JournalStorage {
     /// yet.
     pub fn open(cfg: StorageConfig) -> StoreResult<Self> {
         let messages = Journal::open(cfg.messages.clone())?;
-        messages.replaceable_record(ids::UPDATE_DELIVERY_COUNT);
-        messages.replaceable_record(ids::SET_SCHEDULED_DELIVERY_TIME);
+        // Both are kept per queue, the queue ID leading their data.
+        messages.replaceable_record_per(ids::UPDATE_DELIVERY_COUNT, 8);
+        messages.replaceable_record_per(ids::SET_SCHEDULED_DELIVERY_TIME, 8);
         let bindings = Arc::new(Journal::open(cfg.bindings.clone())?);
         Ok(Self {
             cfg,

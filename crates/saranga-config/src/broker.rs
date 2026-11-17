@@ -890,6 +890,9 @@ pub struct BrokerConfig {
     pub id_cache_size: i32,
     /// `persist-id-cache`: duplicate IDs are journaled.
     pub persist_id_cache: bool,
+    /// `persist-delivery-count-before-delivery`: a durable message's
+    /// delivery count is journaled as it is delivered.
+    pub persist_delivery_count_before_delivery: bool,
     /// `large-message-sync`: a large message's file is synced before it is
     /// routed.
     pub large_message_sync: bool,
@@ -1177,6 +1180,7 @@ impl Default for BrokerConfig {
             address_queue_scan_period: Self::DEFAULT_ADDRESS_QUEUE_SCAN_PERIOD,
             id_cache_size: Self::DEFAULT_ID_CACHE_SIZE,
             persist_id_cache: Self::DEFAULT_PERSIST_ID_CACHE,
+            persist_delivery_count_before_delivery: false,
             large_message_sync: true,
             database_store: None,
             configuration_file_refresh_period: Self::DEFAULT_CONFIGURATION_FILE_REFRESH_PERIOD,

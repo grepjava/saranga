@@ -457,7 +457,20 @@ pub async fn load_messages(
                 continue;
             };
             match q.remove_reference(message_id).await {
-                Some(r) => tx.acks.push((q.clone(), r)),
+                Some(mut r) => {
+                    // It was delivered to be acknowledged: that delivery
+                    // counts if the branch rolls back, as it would have
+                    // before the restart. Artemis restores the journaled
+                    // count, which has it only if it was journaled before
+                    // delivery.
+                    let journaled_on_delivery = post_office.strict_delivery_count()
+                        && !q.config().internal
+                        && q.is_durable_ref(&r);
+                    if !journaled_on_delivery {
+                        r.delivery_count += 1;
+                    }
+                    tx.acks.push((q.clone(), r));
+                }
                 None => tracing::warn!("AMQ222036: Unable to remove reference {message_id}"),
             }
         }

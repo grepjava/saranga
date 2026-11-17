@@ -2563,11 +2563,20 @@ impl ServerSession {
                 .into()),
                 TxState::RolledBack => {
                     self.tx = None;
-                    Err(XaError::new(
-                        xa_code::XAER_PROTO,
-                        "Cannot end, transaction is rolled back",
-                    )
-                    .into())
+                    // Rolled back by the timeout reaper: XA_RBTIMEOUT, as
+                    // Artemis means to answer (its `hasTimedOut` asks for a
+                    // rollback-only state the branch has left, so it always
+                    // answers XAER_PROTO).
+                    let timed_out = transaction::lock(&tx)
+                        .exception
+                        .as_ref()
+                        .is_some_and(|e| e.kind == ErrorType::TransactionTimeout);
+                    let code = if timed_out {
+                        xa_code::XA_RBTIMEOUT
+                    } else {
+                        xa_code::XAER_PROTO
+                    };
+                    Err(XaError::new(code, "Cannot end, transaction is rolled back").into())
                 }
                 _ => {
                     self.pending_tx = self.tx.take();
@@ -2873,16 +2882,23 @@ impl ServerSession {
     /// `xaForget`: a branch management completed is forgotten and its
     /// record deleted.
     pub fn xa_forget(&mut self, xid: Xid) -> Result<(), TxError> {
-        let Some(record) = self.broker.resource_manager().remove_heuristic(&xid) else {
+        let rm = self.broker.resource_manager();
+        let Some(record) = rm.heuristic_record(&xid) else {
             return Err(XaError {
                 code: xa_code::XAER_NOTA,
                 message: None,
             }
             .into());
         };
+        // Forgotten once its record is deleted: a failed delete leaves it
+        // known, so the client may forget it again (Artemis forgets it
+        // first, leaving the record to bring it back at the next start).
         if let Some(s) = self.storage() {
             match s.delete_heuristic_completion(record) {
-                Ok(p) => self.ops.push(p),
+                Ok(p) => {
+                    rm.remove_heuristic(&xid);
+                    self.ops.push(p);
+                }
                 Err(e) => {
                     tracing::warn!(
                         "AMQ222182: Unable to delete heuristic completion from storage manager: {e}"
@@ -2894,6 +2910,8 @@ impl ServerSession {
                     .into());
                 }
             }
+        } else {
+            rm.remove_heuristic(&xid);
         }
         Ok(())
     }
@@ -2908,6 +2926,30 @@ impl ServerSession {
                 xa_code::XAER_PROTO,
                 format!(
                     "Cannot join tx, it is suspended {}",
+                    transaction::xid_string(&xid)
+                ),
+            )
+            .into());
+        }
+        // Artemis joins a prepared branch, taking work into it after its
+        // prepare, and joins over the session's own transaction, which is
+        // then lost. Both are protocol errors (as `xaResume` refuses the
+        // second).
+        if transaction::lock(&tx).state == TxState::Prepared {
+            return Err(XaError::new(
+                xa_code::XAER_PROTO,
+                format!(
+                    "Cannot join tx, it is prepared {}",
+                    transaction::xid_string(&xid)
+                ),
+            )
+            .into());
+        }
+        if self.tx.as_ref().is_some_and(|t| !Arc::ptr_eq(t, &tx)) {
+            return Err(XaError::new(
+                xa_code::XAER_PROTO,
+                format!(
+                    "Cannot join tx, session is currently doing work in a transaction {}",
                     transaction::xid_string(&xid)
                 ),
             )
@@ -3005,8 +3047,26 @@ impl ServerSession {
         }
     }
 
+    /// `xaGetTimeout`: the session's timeout, or the resource manager's
+    /// when it has none (`XAResource.getTransactionTimeout`; Artemis always
+    /// answers the resource manager's).
+    pub fn xa_timeout(&self) -> i32 {
+        match self.timeout_seconds {
+            -1 => self.broker.resource_manager().timeout_seconds(),
+            t => t,
+        }
+    }
+
     /// `xaSetTimeout`.
     pub fn xa_set_timeout(&mut self, timeout_seconds: i32) {
+        // 0 is the resource manager's default (`XAResource
+        // .setTransactionTimeout`); Artemis takes it as no time at all, so
+        // every branch times out at the reaper's next scan.
+        let timeout_seconds = if timeout_seconds == 0 {
+            -1
+        } else {
+            timeout_seconds
+        };
         self.timeout_seconds = timeout_seconds;
         if let Some(tx) = &self.tx {
             transaction::lock(tx).timeout_seconds = timeout_seconds;
@@ -3404,10 +3464,15 @@ impl ServerSession {
         // `destroyQueue(forceAutoDeleteAddress)`: a client's delete takes an
         // auto-created address along whatever `auto-delete-addresses` says,
         // if the user may delete it.
-        if post_office.address_auto_deletable(&address, durable) {
-            if check_security {
-                self.security_check(&address, None, CheckType::DeleteAddress)?;
-            }
+        // The queue is gone whatever happens to its address: a user who
+        // may not delete the address keeps it, and is not told the delete
+        // failed (Artemis's refusal escapes to the client).
+        if post_office.address_auto_deletable(&address, durable)
+            && (!check_security
+                || self
+                    .security_check(&address, None, CheckType::DeleteAddress)
+                    .is_ok())
+        {
             post_office.remove_address(&address);
         }
         Ok(())

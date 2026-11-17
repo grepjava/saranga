@@ -1128,6 +1128,10 @@ struct Large {
     dir: PathBuf,
     open: HashMap<i64, File>,
     syncing: HashSet<i64>,
+    /// Bodies announced for copying whose file is not made yet: it is made
+    /// as its copy starts (`LargeServerMessageInSync` opens lazily), not
+    /// all at once when the primary lists them.
+    unstarted: HashSet<i64>,
     appended: HashMap<i64, Vec<u8>>,
 }
 
@@ -1137,6 +1141,7 @@ impl Large {
             dir,
             open: HashMap::new(),
             syncing: HashSet::new(),
+            unstarted: HashSet::new(),
             appended: HashMap::new(),
         }
     }
@@ -1158,8 +1163,8 @@ impl Large {
 
     fn start_sync(&mut self, ids: &[i64]) -> io::Result<()> {
         for id in ids {
-            self.create(*id)?;
             self.syncing.insert(*id);
+            self.unstarted.insert(*id);
         }
         Ok(())
     }
@@ -1189,6 +1194,9 @@ impl Large {
     }
 
     fn write_synced(&mut self, id: i64, data: &[u8]) -> io::Result<()> {
+        if self.unstarted.remove(&id) {
+            self.create(id)?;
+        }
         self.file(id)?.write_all(data)
     }
 
@@ -1197,6 +1205,10 @@ impl Large {
     /// the primary does not count on a body the backup did not keep.
     fn close(&mut self, id: i64) -> io::Result<()> {
         if self.syncing.contains(&id) {
+            // The end of a copy that sent nothing: an empty body.
+            if self.unstarted.remove(&id) {
+                self.create(id)?;
+            }
             return Ok(());
         }
         let Some(f) = self.open.remove(&id) else {
@@ -1208,6 +1220,7 @@ impl Large {
     fn delete(&mut self, id: i64) -> io::Result<()> {
         self.open.remove(&id);
         self.syncing.remove(&id);
+        self.unstarted.remove(&id);
         self.appended.remove(&id);
         match fs::remove_file(self.path(id)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
@@ -1219,7 +1232,11 @@ impl Large {
     fn finish_sync(&mut self) -> io::Result<()> {
         let ids: Vec<i64> = self.syncing.drain().collect();
         for id in ids {
+            let unstarted = self.unstarted.remove(&id);
             if let Some(data) = self.appended.remove(&id) {
+                if unstarted {
+                    self.create(id)?;
+                }
                 self.file(id)?.write_all(&data)?;
             }
         }
@@ -1339,6 +1356,29 @@ mod tests {
     use saranga_core_protocol::packets::replication::{
         ReplicationAddMessage, ReplicationPrimaryIsStoppingMessage,
     };
+
+    /// The bodies the primary lists for copying are not all opened at
+    /// once: each file is made as its copy starts, an empty body's as its
+    /// copy ends, and one with only appended data at the end of the sync.
+    #[test]
+    fn large_bodies_in_sync_are_opened_as_their_copy_starts() {
+        let d = tempfile::tempdir().unwrap();
+        let mut l = Large::new(d.path().to_path_buf());
+        let ids: Vec<i64> = (1..=256).collect();
+        l.start_sync(&ids).unwrap();
+        assert_eq!(l.open.len(), 0, "nothing opened when listed");
+        l.write_synced(1, b"abc").unwrap();
+        l.close(1).unwrap();
+        l.close(2).unwrap();
+        l.write(3, b"late").unwrap();
+        assert_eq!(l.open.len(), 2);
+        l.finish_sync().unwrap();
+        l.close_all();
+        assert_eq!(fs::read(l.path(1)).unwrap(), b"abc");
+        assert_eq!(fs::read(l.path(2)).unwrap(), b"");
+        assert_eq!(fs::read(l.path(3)).unwrap(), b"late");
+        assert!(!l.path(4).exists(), "a body never copied has no file");
+    }
 
     #[test]
     fn old_data_moves_aside_keeping_at_most_the_maximum() {

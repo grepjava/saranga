@@ -445,6 +445,7 @@ impl BrokerConfig {
             address_queue_scan_period: config.address_queue_scan_period,
             id_cache_size: config.id_cache_size,
             persist_id_cache: config.persist_id_cache,
+            persist_delivery_count_before_delivery: config.persist_delivery_count_before_delivery,
             // When unset, a share of the heap of the JVM Artemis would run
             // in (`ConfigurationImpl.getGlobalMaxSize`): 1 GiB with the 2
             // GiB of an instance `artemis create` makes.

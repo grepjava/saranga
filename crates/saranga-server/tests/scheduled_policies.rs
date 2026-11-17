@@ -87,3 +87,68 @@ async fn a_ring_counts_what_it_drops_as_replaced() {
     assert_eq!(q.messages_killed(), 0);
     broker.stop().unwrap();
 }
+
+/// `deliverScheduledMessages`, through management.
+async fn deliver_scheduled(broker: &Arc<Broker>) {
+    broker
+        .management()
+        .invoke(
+            broker,
+            "queue.q",
+            "deliverScheduledMessages",
+            &[saranga_server::management::Json::from("")],
+            Default::default(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn ids(q: &Queue) -> Vec<i64> {
+    q.browse()
+        .await
+        .iter()
+        .map(MessageRef::message_id)
+        .collect()
+}
+
+/// Messages delivered early through management go to the head of the
+/// queue in delivery order, as the timer puts them (Artemis's management
+/// operation reverses them).
+#[tokio::test]
+async fn messages_delivered_early_keep_their_order() {
+    let (broker, q) = queue(|_| {}).await;
+    let later = now_millis() + 3_600_000;
+    q.add(message(1, later));
+    q.add(message(2, later + 1));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    deliver_scheduled(&broker).await;
+    assert_eq!(ids(&q).await, vec![1, 2]);
+    broker.stop().unwrap();
+}
+
+/// A full ring queue drops a message delivered early through management,
+/// as it drops one falling due.
+#[tokio::test]
+async fn a_full_ring_drops_a_message_delivered_early() {
+    let (broker, q) = queue(|s| s.ring_size = Some(1)).await;
+    q.add(message(1, 0));
+    q.add(message(2, now_millis() + 3_600_000));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    deliver_scheduled(&broker).await;
+    assert_eq!(ids(&q).await, vec![1]);
+    assert_eq!(q.messages_replaced(), 1, "acknowledged as replaced");
+    broker.stop().unwrap();
+}
+
+/// A message delivered early through management replaces the last value
+/// with its key, as one falling due does.
+#[tokio::test]
+async fn a_message_delivered_early_replaces_the_last_value() {
+    let (broker, q) = queue(|s| s.last_value = Some(true)).await;
+    q.add(message(1, 0));
+    q.add(message(2, now_millis() + 3_600_000));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    deliver_scheduled(&broker).await;
+    assert_eq!(ids(&q).await, vec![2]);
+    broker.stop().unwrap();
+}

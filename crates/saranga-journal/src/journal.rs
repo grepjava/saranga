@@ -323,7 +323,10 @@ pub(crate) struct Books {
     next_key: FileKey,
     pub(crate) records: IntMap<i64, RecordPos>,
     pub(crate) transactions: IntMap<i64, Tx>,
-    pub(crate) replaceable: HashSet<u8>,
+    /// Replaceable user record types, each with how many leading bytes of
+    /// an update's data tell its updates apart (see
+    /// [`Journal::replaceable_record_per`]).
+    pub(crate) replaceable: HashMap<u8, usize>,
 }
 
 impl Books {
@@ -622,7 +625,17 @@ impl Journal {
     /// `replaceableRecord`: updates of this user record type only need their
     /// last value, so compaction keeps only the last one.
     pub fn replaceable_record(&self, user_type: u8) {
-        self.lock().books.replaceable.insert(user_type);
+        self.replaceable_record_per(user_type, 0);
+    }
+
+    /// [`replaceable_record`](Self::replaceable_record) for a type whose
+    /// updates of one record are told apart by the first `key_len` bytes of
+    /// their data: compaction keeps the last update of each. A message's
+    /// delivery count and scheduled time are kept per queue, the queue ID
+    /// leading the data; Artemis keeps one update per message, losing every
+    /// other queue's.
+    pub fn replaceable_record_per(&self, user_type: u8, key_len: usize) {
+        self.lock().books.replaceable.insert(user_type, key_len);
     }
 
     pub fn set_auto_reclaim(&self, on: bool) {
@@ -1382,7 +1395,7 @@ impl Inner {
                     user_record_type: user_type,
                     data,
                     is_update,
-                    replaceable_update: is_update && books.replaceable.contains(&user_type),
+                    replaceable_update: is_update && books.replaceable.contains_key(&user_type),
                     compact_count: cc,
                 };
                 match sr.record {

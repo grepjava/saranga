@@ -18,11 +18,26 @@ pub struct QueueStats {
     pub scheduled_size: i64,
     pub durable_scheduled_count: i64,
     pub durable_scheduled_size: i64,
+    /// Delivering and scheduled messages that were never paged: a depaged
+    /// one is still counted by the page subscription until it is
+    /// acknowledged (Artemis's `getNonPaged*` metrics).
+    pub non_paged: NonPagedStats,
     /// Queued (neither delivering nor scheduled), paged ones aside.
     pub pending_size: i64,
     pub durable_pending_count: i64,
     pub durable_pending_size: i64,
     pub group_count: i32,
+}
+
+/// See [`QueueStats::non_paged`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NonPagedStats {
+    pub delivering_size: i64,
+    pub durable_delivering_count: i64,
+    pub durable_delivering_size: i64,
+    pub scheduled_size: i64,
+    pub durable_scheduled_count: i64,
+    pub durable_scheduled_size: i64,
 }
 
 /// A consumer as the queue knows it, for `listConsumersAsJSON`.
@@ -141,6 +156,7 @@ impl MessageList {
             }
             *level = keep;
         }
+        out.iter().for_each(|r| self.removed(r));
         out
     }
 }
@@ -743,6 +759,13 @@ impl Actor {
                 s.durable_delivering_count += 1;
                 s.durable_delivering_size += size(r);
             }
+            if r.paged.is_none() {
+                s.non_paged.delivering_size += size(r);
+                if durable(r) {
+                    s.non_paged.durable_delivering_count += 1;
+                    s.non_paged.durable_delivering_size += size(r);
+                }
+            }
         }
         for r in self.scheduled.values() {
             s.scheduled_count += 1;
@@ -750,6 +773,13 @@ impl Actor {
             if durable(r) {
                 s.durable_scheduled_count += 1;
                 s.durable_scheduled_size += size(r);
+            }
+            if r.paged.is_none() {
+                s.non_paged.scheduled_size += size(r);
+                if durable(r) {
+                    s.non_paged.durable_scheduled_count += 1;
+                    s.non_paged.durable_scheduled_size += size(r);
+                }
             }
         }
         for r in self.messages.iter().filter(|r| r.paged.is_none()) {
@@ -855,6 +885,7 @@ impl Actor {
             action,
             SelectionAction::Expire | SelectionAction::ChangePriority(_)
         );
+        let mut due = Vec::new();
         if scheduled_too && !sel.reached(hits) {
             let keys: Vec<_> = self
                 .scheduled
@@ -883,8 +914,12 @@ impl Actor {
                     continue;
                 };
                 if matches!(action, SelectionAction::DeliverScheduled) {
+                    // `deliverScheduledMessages`: what is taken goes to the
+                    // head together, as the timer's do. Artemis adds them one
+                    // by one at the head, reversing them; Saranga keeps
+                    // their delivery order.
                     r.scheduled_time = 0;
-                    self.messages.push_front(r);
+                    due.push(r);
                 } else {
                     r.scheduled_time = 0;
                     self.act_on(r, action);
@@ -892,6 +927,7 @@ impl Actor {
             }
         }
         if matches!(action, SelectionAction::DeliverScheduled) {
+            self.add_head_scheduled(due);
             return hits;
         }
         // Messages still in pages, through an iterator of the operation's
@@ -1097,7 +1133,7 @@ impl Actor {
                 let r = self.reprioritised(r, action);
                 self.messages.insert_sorted(r);
             }
-            SelectionAction::DeliverScheduled => self.messages.push_front(r),
+            SelectionAction::DeliverScheduled => self.add_head_scheduled(vec![r]),
         }
     }
 

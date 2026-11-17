@@ -565,7 +565,7 @@ impl Queue {
         }));
         let actor = Actor {
             shared: queue.0.clone(),
-            messages: MessageList::for_queue(queue.0.config().internal),
+            messages: MessageList::for_queue(&queue.0.config()),
             consumers: Vec::new(),
             browsers: Vec::new(),
             round_robin: HashMap::new(),
@@ -574,7 +574,6 @@ impl Queue {
             expiry_warned: false,
             groups: HashMap::new(),
             exclusive_consumer: None,
-            last_values: HashMap::new(),
             dispatching: false,
             dispatch_start: None,
             delivered_at: 0,
@@ -1317,13 +1316,62 @@ struct MessageList {
     /// its events go in the order they came (`getPriority`: a mirror's
     /// acknowledgement must not overtake the send it follows).
     flat: bool,
+    /// A last-value queue's keys (`LastValueQueue.map`).
+    last_values: Option<LastValues>,
+}
+
+/// A last-value queue's current reference for each key, among those in the
+/// list: a reference taken off the list, to a consumer or otherwise, is no
+/// longer its key's (`refRemoved` then `removeIfCurrent`).
+#[derive(Default)]
+struct LastValues {
+    /// The queue's `last-value-key`, if it names one.
+    key: Option<String>,
+    current: HashMap<String, i64>,
 }
 
 impl MessageList {
-    fn for_queue(internal: bool) -> Self {
+    fn for_queue(config: &QueueConfig) -> Self {
+        let key = config.last_value_key.clone().filter(|k| !k.is_empty());
+        // A last-value key alone makes a last-value queue
+        // (`QueueFactoryImpl.lastValueKey`).
+        let last_values = (config.last_value || key.is_some()).then(|| LastValues {
+            key,
+            current: HashMap::new(),
+        });
         Self {
-            flat: internal,
+            flat: config.internal,
+            last_values,
             ..Self::default()
+        }
+    }
+
+    /// `MessageReference.getLastValueProperty`: the queue's last-value key,
+    /// falling back to `_AMQ_LVQ_NAME`; none on a queue that is not a
+    /// last-value queue.
+    fn last_value_of(&self, r: &MessageRef) -> Option<String> {
+        let lv = self.last_values.as_ref()?;
+        let core = r.message.core();
+        lv.key
+            .as_deref()
+            .and_then(|k| message::string_property(core, k))
+            .or_else(|| message::string_property(core, message::HDR_LAST_VALUE_NAME))
+    }
+
+    /// `removeIfCurrent`.
+    fn forget_last_value(&mut self, r: &MessageRef) {
+        if let Some(key) = self.last_value_of(r)
+            && let Some(lv) = self.last_values.as_mut()
+            && lv.current.get(&key) == Some(&r.message_id())
+        {
+            lv.current.remove(&key);
+        }
+    }
+
+    /// A reference leaves the list (`refRemoved`).
+    fn removed(&mut self, r: &MessageRef) {
+        if self.last_values.is_some() {
+            self.forget_last_value(r);
         }
     }
 
@@ -1353,7 +1401,9 @@ impl MessageList {
 
     /// `poll`: the head, from the highest priority.
     fn take_first(&mut self) -> Option<MessageRef> {
-        self.levels.iter_mut().rev().find_map(VecDeque::pop_front)
+        let r = self.levels.iter_mut().rev().find_map(VecDeque::pop_front)?;
+        self.removed(&r);
+        Some(r)
     }
 
     fn push_front(&mut self, r: MessageRef) {
@@ -1375,6 +1425,7 @@ impl MessageList {
             }
             *level = keep;
         }
+        out.iter().for_each(|r| self.removed(r));
         out
     }
 
@@ -1397,9 +1448,11 @@ impl MessageList {
     }
 
     fn remove(&mut self, (level, index): (usize, usize)) -> MessageRef {
-        self.levels[level]
+        let r = self.levels[level]
             .remove(index)
-            .expect("position from find")
+            .expect("position from find");
+        self.removed(&r);
+        r
     }
 
     fn iter(&self) -> impl Iterator<Item = &MessageRef> {
@@ -1670,8 +1723,6 @@ struct Actor {
     groups: HashMap<GroupKey, ConsumerId>,
     /// The consumer an exclusive queue delivers to (`exclusiveConsumer`).
     exclusive_consumer: Option<ConsumerId>,
-    /// Last-value queue: the current message ID for each key.
-    last_values: HashMap<String, i64>,
     /// Where the queue is in its address's pages.
     page_iter: PageIterator,
     /// `dispatching`: false while consumers-before-dispatch,
@@ -1832,6 +1883,14 @@ impl Actor {
             r.scheduled_time = 0;
             due.push(r);
         }
+        self.add_head_scheduled(due);
+    }
+
+    /// `addHead(refs, true)` for scheduled references, `due` in delivery
+    /// order: they go to the head of the queue in that order, a full ring
+    /// queue dropping each that does not fit and a last-value queue taking
+    /// each as its key's value.
+    pub(crate) fn add_head_scheduled(&mut self, due: Vec<MessageRef>) {
         let ring = self.shared.config().ring_size;
         for r in due.into_iter().rev() {
             if ring != -1 && self.messages.len() as i64 + 1 > ring {
@@ -1885,46 +1944,33 @@ impl Actor {
         self.messages.insert_sorted(r);
     }
 
-    /// `MessageReference.getLastValueProperty`: the queue's last-value key,
-    /// falling back to `_AMQ_LVQ_NAME`.
-    /// A last-value key alone makes a last-value queue
-    /// (`QueueFactoryImpl.lastValueKey`).
-    fn last_value_of(&self, r: &MessageRef) -> Option<String> {
-        let c = self.shared.config();
-        let key = c.last_value_key.as_deref().filter(|k| !k.is_empty());
-        if !c.last_value && key.is_none() {
-            return None;
-        }
-        let core = r.message.core();
-        key.and_then(|k| message::string_property(core, k))
-            .or_else(|| message::string_property(core, message::HDR_LAST_VALUE_NAME))
-    }
-
     /// Records `r` as its key's current value. With `replace` an older
     /// queued value is dropped (`trackLastValue` then `pruneLastValues`);
     /// without, `r` only becomes current if its key has none
     /// (`trackLastValueIfAbsent`). Returns whether `r` is current.
     fn track_last_value(&mut self, r: &MessageRef, replace: bool) -> bool {
-        let Some(key) = self.last_value_of(r) else {
+        let Some(key) = self.messages.last_value_of(r) else {
             return true;
         };
         let id = r.message_id();
-        match self.last_values.get(&key).copied() {
+        let Some(lv) = self.messages.last_values.as_mut() else {
+            return true;
+        };
+        // Only references on the list are current, so a current one other
+        // than `r` is queued.
+        match lv.current.get(&key).copied() {
             Some(current) if current != id => {
                 if !replace {
-                    let queued = self.messages.find(|m| m.message_id() == current).is_some();
-                    if queued {
-                        return false;
-                    }
+                    return false;
                 }
-                self.last_values.insert(key, id);
+                lv.current.insert(key, id);
                 if let Some(at) = self.messages.find(|m| m.message_id() == current) {
                     let old = self.messages.remove(at);
                     self.kill_for(old, AckReason::Replaced);
                 }
             }
             _ => {
-                self.last_values.insert(key, id);
+                lv.current.insert(key, id);
             }
         }
         true
@@ -1932,11 +1978,7 @@ impl Actor {
 
     /// `removeIfCurrent`.
     fn forget_last_value(&mut self, r: &MessageRef) {
-        if let Some(key) = self.last_value_of(r)
-            && self.last_values.get(&key) == Some(&r.message_id())
-        {
-            self.last_values.remove(&key);
-        }
+        self.messages.forget_last_value(r);
     }
 
     /// `canDispatch`.
@@ -3172,8 +3214,20 @@ impl Actor {
             }
             _ => None,
         };
-        let c = &mut self.consumers[index];
         r.delivery_count += 1;
+        // `strictUpdateDeliveryCount`: journaled before it goes, for a
+        // durable reference of a queue that is not internal.
+        if !cfg.internal
+            && self.queue().is_durable_ref(&r)
+            && self
+                .shared
+                .post_office
+                .upgrade()
+                .is_some_and(|po| po.strict_delivery_count())
+        {
+            crate::transaction::persist_delivery_count(&self.queue(), &mut r);
+        }
+        let c = &mut self.consumers[index];
         if !c.send(flagged.as_ref().unwrap_or(&r.message), r.delivery_count) {
             // Held by the failed consumer until it is closed, then put back
             // (`cancel`), never acknowledged unread.
@@ -3458,7 +3512,7 @@ mod tests {
     use super::*;
 
     fn list(ids: impl IntoIterator<Item = i64>) -> MessageList {
-        let mut l = MessageList::for_queue(false);
+        let mut l = MessageList::default();
         for id in ids {
             l.push_back(MessageRef::new(ServerMessage::new(
                 saranga_message::CoreMessage {
@@ -3490,6 +3544,44 @@ mod tests {
             ..s
         };
         assert_eq!(redelivery_delay(&set, 2), 7_000);
+    }
+
+    /// A last-value queue's key is forgotten once its reference leaves the
+    /// list, however it leaves (`refRemoved`), so the keys of consumed
+    /// messages do not pile up.
+    #[test]
+    fn a_last_value_leaves_with_its_reference() {
+        let mut l = MessageList {
+            last_values: Some(LastValues::default()),
+            ..MessageList::default()
+        };
+        let lv = |id: i64, key: &str| {
+            let mut core = saranga_message::CoreMessage {
+                message_id: id,
+                ..Default::default()
+            };
+            core.properties.insert(
+                saranga_buffer::SimpleString::from(message::HDR_LAST_VALUE_NAME),
+                saranga_buffer::PropertyValue::String(key.into()),
+            );
+            MessageRef::new(ServerMessage::new(core))
+        };
+        for (id, key) in [(1, "a"), (2, "b"), (3, "c")] {
+            l.last_values
+                .as_mut()
+                .unwrap()
+                .current
+                .insert(key.into(), id);
+            l.push_back(lv(id, key));
+        }
+        let current = |l: &MessageList| l.last_values.as_ref().unwrap().current.len();
+        l.take_first();
+        assert_eq!(current(&l), 2, "delivered");
+        let at = l.find(|r| r.message_id() == 2).unwrap();
+        l.remove(at);
+        assert_eq!(current(&l), 1, "removed");
+        l.take_where(|_| true);
+        assert_eq!(current(&l), 0, "taken");
     }
 
     /// A consumer of a bounded queue remembers what the queue holds, not

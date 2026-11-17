@@ -633,6 +633,15 @@ impl ResourceManager {
             .map(|h| h.commit)
     }
 
+    /// The record of `xid`'s heuristic completion, if management completed
+    /// it.
+    pub fn heuristic_record(&self, xid: &Xid) -> Option<i64> {
+        self.heuristic_list()
+            .iter()
+            .find(|h| &h.xid == xid)
+            .map(|h| h.record)
+    }
+
     /// `removeHeuristicCompletion`: the record to delete, if `xid` was
     /// completed by management.
     pub fn remove_heuristic(&self, xid: &Xid) -> Option<i64> {

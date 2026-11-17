@@ -35,7 +35,11 @@ pub fn run(args: &DataDirArgs) -> anyhow::Result<()> {
     });
     compact(
         messages,
-        &[ids::UPDATE_DELIVERY_COUNT, ids::SET_SCHEDULED_DELIVERY_TIME],
+        // Kept per queue, the queue ID leading their data.
+        &[
+            (ids::UPDATE_DELIVERY_COUNT, 8),
+            (ids::SET_SCHEDULED_DELIVERY_TIME, 8),
+        ],
     )?;
     println!(
         "Compactation succeeded for {}",
@@ -53,7 +57,7 @@ pub fn run(args: &DataDirArgs) -> anyhow::Result<()> {
 }
 
 /// `compactJournal`: load, compact, stop.
-fn compact(mut config: JournalConfig, replaceable: &[u8]) -> anyhow::Result<()> {
+fn compact(mut config: JournalConfig, replaceable: &[(u8, usize)]) -> anyhow::Result<()> {
     config.remove_extra_files_on_load = true;
     let dir = config.directory.clone();
     if !dir.is_dir() {
@@ -67,8 +71,8 @@ fn compact(mut config: JournalConfig, replaceable: &[u8]) -> anyhow::Result<()> 
         }
     }
     let journal = Journal::open(config).with_context(|| format!("opening {}", dir.display()))?;
-    for &r in replaceable {
-        journal.replaceable_record(r);
+    for &(r, key_len) in replaceable {
+        journal.replaceable_record_per(r, key_len);
     }
     journal
         .load_all()

@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -85,7 +85,15 @@ struct Started {
     /// Turned true for good once the session is `LOST`.
     unavailable: watch::Sender<bool>,
     locks: Locks,
+    /// True once this start is stopped: its mutable longs no longer read
+    /// or write (Artemis's are closed with their file lock's channel).
+    stopped: Stopped,
 }
+
+/// See [`Started::stopped`]. A mutable long's operation holds it shared for
+/// its whole file access, so a stop waits for one in progress and none
+/// starts after.
+type Stopped = Arc<RwLock<bool>>;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -251,6 +259,7 @@ impl LockManager {
             backend,
             unavailable,
             locks,
+            stopped: Arc::default(),
         });
         true
     }
@@ -262,6 +271,7 @@ impl LockManager {
         let Some(s) = lock(&self.started).take() else {
             return;
         };
+        *s.stopped.write().unwrap_or_else(|e| e.into_inner()) = true;
         let locks: Vec<_> = lock(&s.locks).drain().map(|(_, l)| l).collect();
         for l in locks {
             l.close_silently();
@@ -278,7 +288,7 @@ impl LockManager {
             .map(|s| s.unavailable.subscribe())
     }
 
-    fn started(&self) -> Result<(Backend, watch::Receiver<bool>, Locks), Unavailable> {
+    fn started(&self) -> Result<(Backend, watch::Receiver<bool>, Locks, Stopped), Unavailable> {
         let s = lock(&self.started);
         let s = s
             .as_ref()
@@ -287,12 +297,13 @@ impl LockManager {
             s.backend.clone(),
             s.unavailable.subscribe(),
             s.locks.clone(),
+            s.stopped.clone(),
         ))
     }
 
     /// `getDistributedLock`: one per ID while it is open.
     pub fn distributed_lock(&self, id: &str) -> Result<DistributedLock, Unavailable> {
-        let (backend, unavailable, locks) = self.started()?;
+        let (backend, unavailable, locks, _) = self.started()?;
         let mut map = lock(&locks);
         if let Some(l) = map.get(id) {
             return Ok(DistributedLock(l.clone()));
@@ -319,11 +330,12 @@ impl LockManager {
 
     /// `getMutableLong`.
     pub fn mutable_long(&self, id: &str) -> Result<MutableLong, Unavailable> {
-        let (backend, unavailable, _) = self.started()?;
+        let (backend, unavailable, _, stopped) = self.started()?;
         Ok(MutableLong {
             id: id.to_owned(),
             backend,
             unavailable,
+            stopped,
         })
     }
 }
@@ -491,12 +503,20 @@ impl DistributedLock {
 
     /// `close`: a lease held is returned.
     pub async fn close(&self) {
-        lock(&self.0.locks).remove(&self.0.id);
         let (lease, unavailable) = {
+            // Under the manager's map, as `getDistributedLock` and `stop`
+            // work: a lock closed already is not this ID's any more, and
+            // only this lock is taken out of the map, never one that
+            // replaced it.
+            let mut map = lock(&self.0.locks);
             let mut s = lock(&self.0.state);
             if s.closed {
                 return;
             }
+            if map.get(&self.0.id).is_some_and(|l| Arc::ptr_eq(l, &self.0)) {
+                map.remove(&self.0.id);
+            }
+            drop(map);
             s.closed = true;
             s.file = None;
             (
@@ -516,6 +536,7 @@ pub struct MutableLong {
     id: String,
     backend: Backend,
     unavailable: watch::Receiver<bool>,
+    stopped: Stopped,
 }
 
 impl MutableLong {
@@ -524,7 +545,7 @@ impl MutableLong {
     }
 
     fn check(&self) -> Result<(), Unavailable> {
-        if *self.unavailable.borrow() {
+        if *self.unavailable.borrow() || *self.stopped.read().unwrap_or_else(|e| e.into_inner()) {
             return Err(Unavailable(format!(
                 "mutableLong with id = {} isn't available",
                 self.id
@@ -546,12 +567,25 @@ impl MutableLong {
         format!("/{}/activation-sequence", self.id)
     }
 
+    /// Holds off a stop for a file access, refused once stopped.
+    fn live(&self) -> Result<std::sync::RwLockReadGuard<'_, bool>, Unavailable> {
+        let g = self.stopped.read().unwrap_or_else(|e| e.into_inner());
+        if *g {
+            return Err(Unavailable(format!(
+                "mutableLong with id = {} isn't available",
+                self.id
+            )));
+        }
+        Ok(g)
+    }
+
     pub async fn get(&self) -> Result<i64, Unavailable> {
         self.check()?;
         match &self.backend {
             Backend::Curator(c) => Ok(c.get_long(&self.path()).await?),
             Backend::File(folder) => {
                 use std::io::{Read, Seek};
+                let _live = self.live()?;
                 let mut f = Self::file(folder, &self.id).map_err(|e| Unavailable(e.to_string()))?;
                 let mut b = [0u8; 8];
                 f.seek(std::io::SeekFrom::Start(0))
@@ -575,6 +609,7 @@ impl MutableLong {
             Backend::Curator(c) => Ok(c.force_set_long(&self.path(), value).await?),
             Backend::File(folder) => {
                 use std::io::{Seek, Write};
+                let _live = self.live()?;
                 let mut f = Self::file(folder, &self.id).map_err(|e| Unavailable(e.to_string()))?;
                 f.seek(std::io::SeekFrom::Start(0))
                     .and_then(|_| f.write_all(&value.to_be_bytes()))
@@ -641,5 +676,45 @@ mod tests {
         assert_eq!(n.get().await.unwrap(), -4);
         a.stop().await;
         b.stop().await;
+    }
+
+    /// Closing a lock a second time leaves the lock that replaced it alone,
+    /// so stopping the manager still releases that one.
+    #[tokio::test]
+    async fn a_second_close_leaves_the_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = props(&[("locks-folder", dir.path().to_str().unwrap())]);
+        let a = LockManager::new(FILE_CLASS, &p).unwrap();
+        let b = LockManager::new(FILE_CLASS, &p).unwrap();
+        assert!(a.start(None).await && b.start(None).await);
+        let old = a.distributed_lock("node").unwrap();
+        old.close().await;
+        let new = a.distributed_lock("node").unwrap();
+        assert!(new.try_lock().await.unwrap());
+        old.close().await;
+        a.stop().await;
+        let other = b.distributed_lock("node").unwrap();
+        assert!(
+            other.try_lock().await.unwrap(),
+            "the stopped manager still holds the lock"
+        );
+        b.stop().await;
+    }
+
+    /// A mutable long of a stopped manager neither reads nor writes.
+    #[tokio::test]
+    async fn a_mutable_long_stops_with_its_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = props(&[("locks-folder", dir.path().to_str().unwrap())]);
+        let a = LockManager::new(FILE_CLASS, &p).unwrap();
+        assert!(a.start(None).await);
+        let n = a.mutable_long("seq").unwrap();
+        n.set(7).await.unwrap();
+        a.stop().await;
+        assert!(n.set(99).await.is_err());
+        assert!(n.get().await.is_err());
+        assert!(a.start(None).await);
+        assert_eq!(a.mutable_long("seq").unwrap().get().await.unwrap(), 7);
+        a.stop().await;
     }
 }

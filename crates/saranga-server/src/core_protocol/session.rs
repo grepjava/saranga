@@ -962,7 +962,7 @@ impl CoreSession {
                 true,
                 Ok(Some(
                     SessionXAGetTimeoutResponseMessage {
-                        timeout_seconds: self.broker.resource_manager().timeout_seconds(),
+                        timeout_seconds: self.session.xa_timeout(),
                     }
                     .into(),
                 )),

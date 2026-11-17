@@ -17,6 +17,15 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **A depaged message being delivered or waiting for its time is counted once** in a queue's `DurableMessageCount`, `PersistentSize` and `DurablePersistentSize` (and their metrics), not again with the page subscription that still counts it.
+- **`deliverScheduledMessages` and `deliverScheduledMessage`** put the messages at the head of the queue in delivery-time order, and honour the queue's ring size and last value as a message falling due does.
+- **A last-value queue forgets a key when its message leaves the queue**, delivered or otherwise, as Artemis does, instead of keeping every key it ever saw.
+- **Journal compaction keeps a message's delivery count and scheduled time for every queue it is on**, in the broker and in `data compact`, not only the last queue's.
+- **`<persist-delivery-count-before-delivery>` is honoured**: a durable message's delivery count is journaled as it is delivered, so a crash counts the delivery. A message acknowledged in a prepared XA branch counts that delivery when the branch is rolled back after a restart.
+- **XA:** a prepared branch cannot be joined, nor a branch joined by a session already in a transaction; a transaction timeout of 0 is the default, and the session's timeout is the one reported; a branch the timeout rolled back ends with `XA_RBTIMEOUT`; a heuristic completion whose record cannot be deleted is not forgotten.
+- **Deleting a queue whose address the user may not delete** succeeds and keeps the address.
+- **A file-based lock manager's mutable longs stop with it**, so a stopped broker cannot overwrite the activation sequence, and closing an old lock a second time no longer unregisters the lock that replaced it, which stopping then left held.
+- **A backup synchronizing large messages** opens each body's file as its copy starts, not every listed body's at once.
 - **A queue made non-destructive, or destructive again, acknowledges each delivery as it was sent**: an acknowledgement, rejection or expiry of a delivery made before the change no longer takes the wrong message's records, and a queue made non-exclusive forgets its exclusive consumer.
 - **A large message a consumer was given early (forced delivery) and then cancelled** no longer leaves the forced-delivery marker behind.
 - **A large message kept in another protocol's encoding is converted whole** for an MQTT retained-message replay and for management's message views, not from its first chunk.

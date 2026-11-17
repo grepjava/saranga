@@ -26,12 +26,18 @@ const COMPACT_SPLIT_LINE: i16 = 2;
 
 type FileKey = u64;
 
+/// A replaceable update's record ID and the leading bytes of its data that
+/// tell it from the record's other updates of its type.
+type UpdateKey = (i64, Vec<u8>);
+
 struct Compactor<'a> {
     inner: &'a mut Inner,
     records_snapshot: HashSet<i64>,
     pending_transactions: HashSet<i64>,
     pending_writes_on_tx: HashMap<i64, Vec<(Record, i16, bool)>>,
-    pending_updates: HashMap<u8, BTreeMap<i64, (Record, i16, bool)>>,
+    /// The last update of each replaceable record, by type, record ID and
+    /// the leading bytes that tell its updates apart.
+    pending_updates: HashMap<u8, BTreeMap<UpdateKey, (Record, i16, bool)>>,
     split: bool,
     next_ordering_id: i64,
     current: Option<FileKey>,
@@ -78,7 +84,7 @@ impl Inner {
             buf: Vec::new(),
             new_data_files: Vec::new(),
         };
-        let replaceable: Vec<u8> = c.inner.books.replaceable.iter().copied().collect();
+        let replaceable: Vec<u8> = c.inner.books.replaceable.keys().copied().collect();
         for t in replaceable {
             c.pending_updates.insert(t, BTreeMap::new());
         }
@@ -148,7 +154,7 @@ impl Compactor<'_> {
     }
 
     fn on_read(&mut self, record: Record, cc: i16) -> Result<()> {
-        let replaceable = |b: &Books, t: u8| b.replaceable.contains(&t);
+        let replaceable = |b: &Books, t: u8| b.replaceable.contains_key(&t);
         match record {
             Record::Event { .. } => {}
             Record::Add { id, .. } => {
@@ -248,12 +254,19 @@ impl Compactor<'_> {
                     }
                 }
             }
-            Record::Update { id, user_type, .. } => {
+            Record::Update {
+                id,
+                user_type,
+                ref data,
+            } => {
                 if self.contains_record(id) {
                     let repl = replaceable(&self.inner.books, user_type);
+                    let key_len = self.inner.books.replaceable.get(&user_type).copied();
                     match self.pending_updates.get_mut(&user_type) {
                         Some(latest) => {
-                            latest.insert(id, (record, cc, repl));
+                            let n = key_len.unwrap_or(0).min(data.len());
+                            let key = (id, data[..n].to_vec());
+                            latest.insert(key, (record, cc, repl));
                         }
                         None => self.produce_update(record, cc, repl)?,
                     }
