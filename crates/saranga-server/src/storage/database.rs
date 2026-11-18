@@ -188,8 +188,17 @@ pub fn client_config(d: &DatabaseConfig) -> Result<writer::Target, String> {
     if let Some(password) = &d.password {
         config.password(password);
     }
+    // A database that vanished, or a connection left half open, ends the
+    // connection within a minute: else its writer or reader waits on it for
+    // good. The driver's `networkTimeout` bounds unacknowledged writes too.
+    config
+        .keepalives(true)
+        .keepalives_idle(Duration::from_secs(15))
+        .keepalives_interval(Duration::from_secs(5))
+        .keepalives_retries(3);
     if d.network_timeout_millis > 0 {
-        config.connect_timeout(Duration::from_millis(d.network_timeout_millis as u64));
+        let timeout = Duration::from_millis(d.network_timeout_millis as u64);
+        config.connect_timeout(timeout).tcp_user_timeout(timeout);
     }
     // As the JDBC driver: encrypted if the server can, unless told otherwise.
     let (mode, check) = match ssl.as_deref().unwrap_or("prefer") {
@@ -354,9 +363,10 @@ pub struct DatabaseStorage {
     prepared: Mutex<HashSet<i64>>,
     addresses: Mutex<HashMap<String, i64>>,
     sides: Mutex<HashMap<(i64, i64), Side>>,
-    /// Per queue, the last paged message read. An index scan from the start
-    /// would step over every row already read and not yet vacuumed.
-    read_from: Mutex<HashMap<i64, i64>>,
+    /// Per queue, the last paged message read and the `Readable` generation
+    /// it was read in. An index scan from the start would step over every
+    /// row already read and not yet vacuumed.
+    read_from: Mutex<HashMap<i64, (i64, u64)>>,
     /// The connections queues read paged messages on.
     readers: Arc<Readers>,
     /// Where the writers hand deleted large messages' files.
@@ -1297,9 +1307,10 @@ impl Store for DatabaseStorage {
     }
 
     fn generate_id(&self) -> i64 {
+        // Stopped with the storage: still unique, never written.
         self.ids
             .generate_id()
-            .unwrap_or_else(|_| self.ids.current_id())
+            .unwrap_or_else(|_| self.ids.generate_unrecorded())
     }
 
     fn load_bindings(&self) -> StoreResult<Vec<RecordInfo>> {
@@ -1557,7 +1568,7 @@ impl Store for DatabaseStorage {
                     failed.insert(t, format!("Cannot find message with id {message}"));
                     continue;
                 }
-                tracing::warn!("AMQ222031: Cannot find message {message}");
+                tracing::error!("AMQ224009: Cannot find message {message}");
                 continue;
             }
             if let Some(t) = tx.and_then(|t| prepared.get_mut(&t)) {
@@ -1744,7 +1755,7 @@ impl Store for DatabaseStorage {
             .filter(|id| !referenced.contains(id))
             .collect();
         for id in unreferenced {
-            tracing::warn!("AMQ222129: Message {id} has no references, it will be deleted");
+            crate::storage::log_unreferenced(id, out.large.contains(&id));
             out.messages.remove(&id);
             out.large.remove(&id);
             cleanup.push(Op::DeleteMessage { id });
@@ -1838,22 +1849,32 @@ impl Store for DatabaseStorage {
     }
 
     fn read_paged(&self, queue_id: i64, limit: i64) -> StoreResult<Vec<(StoredMessage, bool)>> {
-        let after = self
+        // What was written or committed late, under the last ID read, is
+        // read from below it.
+        let (lowest, generation) = self.writes.readable().take(queue_id);
+        let after = match self
             .read_from
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&queue_id)
             .copied()
-            .unwrap_or(i64::MIN);
+        {
+            Some((after, seen)) if seen == generation => match lowest {
+                Some(low) if low <= after => low.saturating_sub(1),
+                _ => after,
+            },
+            _ => i64::MIN,
+        };
         let mut read = self.read_paged_after(queue_id, limit, after)?;
-        // A transaction that committed late may hold lower IDs.
+        // Whatever else may have been missed is found once nothing is left
+        // after it.
         if read.is_empty() && after != i64::MIN {
             read = self.read_paged_after(queue_id, limit, i64::MIN)?;
         }
         let mut from = self.read_from.lock().unwrap_or_else(|e| e.into_inner());
         match read.last() {
             Some((m, _)) => {
-                from.insert(queue_id, m.message_id());
+                from.insert(queue_id, (m.message_id(), generation));
             }
             None => {
                 from.remove(&queue_id);
@@ -2086,8 +2107,7 @@ impl Store for DatabaseStorage {
     }
 
     fn store_heuristic_completion(&self, id: i64, xid: &Xid, commit: bool) -> StoreResult<Pending> {
-        let mut body = encode_xid(xid);
-        body.push(u8::from(commit));
+        let body = crate::storage::encode_heuristic_completion(xid, commit);
         self.add_record(id, ids::HEURISTIC_COMPLETION, body, true)
     }
 

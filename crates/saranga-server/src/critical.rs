@@ -49,9 +49,14 @@ impl Default for CriticalConfig {
 }
 
 impl CriticalConfig {
-    /// From `broker.xml`: a check period of 0 is half the timeout.
+    /// From `broker.xml`: a timeout of 0 is the default two minutes
+    /// (`CriticalAnalyzerImpl.getTimeout`), and a check period of 0 is half
+    /// the timeout.
     pub fn from_file(f: &saranga_config::BrokerConfig) -> Self {
-        let timeout = f.critical_analyzer_timeout.max(0) as u64;
+        let timeout = match f.critical_analyzer_timeout {
+            t if t > 0 => t as u64,
+            _ => 120_000,
+        };
         let period = match f.critical_analyzer_check_period {
             p if p > 0 => p as u64,
             _ => timeout / 2,
@@ -237,6 +242,23 @@ fn thread_dump(broker: &Broker, timeout: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_zero_timeout_is_the_default_two_minutes() {
+        let mut f = saranga_config::BrokerConfig {
+            critical_analyzer_timeout: 0,
+            critical_analyzer_check_period: 0,
+            ..Default::default()
+        };
+        let c = CriticalConfig::from_file(&f);
+        assert_eq!(c.timeout, Duration::from_millis(120_000));
+        assert_eq!(c.check_period, Duration::from_millis(60_000));
+        f.critical_analyzer_timeout = 10;
+        assert_eq!(
+            CriticalConfig::from_file(&f).timeout,
+            Duration::from_millis(10)
+        );
+    }
 
     #[test]
     fn measures_expire_once() {

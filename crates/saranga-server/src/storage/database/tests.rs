@@ -125,6 +125,12 @@ fn urls() {
     assert_eq!(c.get_password(), Some(&b"p"[..]));
     assert_eq!(c.get_dbname(), Some("broker"));
     assert_eq!(c.get_ports(), &[6000]);
+    // A connection left half open ends: keepalives, and unacknowledged
+    // writes bounded by the network timeout.
+    assert!(c.get_keepalives());
+    assert_eq!(c.get_keepalives_idle(), Duration::from_secs(15));
+    let timeout = Duration::from_millis(database().network_timeout_millis as u64);
+    assert_eq!(c.get_tcp_user_timeout(), Some(&timeout));
     assert_eq!(
         of("jdbc:postgresql:broker").unwrap().get_dbname(),
         Some("broker")

@@ -294,11 +294,11 @@ pub fn page(data: &[u8]) {
     assert!(read.valid_size <= data.len(), "valid past the file");
     let _ = saranga_paging::count_messages(data);
     for message in &read.messages {
-        let first = message.encode_record();
+        let first = message.encode_record().expect("it was read");
         let again = saranga_paging::read_page(&first);
         assert_eq!(again.messages.len(), 1, "{message:?} did not read back");
         assert_eq!(
-            again.messages[0].encode_record(),
+            again.messages[0].encode_record().expect("it was read"),
             first,
             "the record changed"
         );

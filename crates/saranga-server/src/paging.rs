@@ -699,12 +699,59 @@ impl PagingManager {
     /// (`PageCounterRebuildManager`), and finished pages are cleaned up.
     /// The IDs of large messages found in pages leave `stored_large`.
     pub fn after_load(&self, stored_large: &mut HashSet<i64>) {
+        // Page transactions some paged message names.
+        let mut named = HashSet::new();
+        let mut read_all = true;
         for store in self.stores() {
             store.process_reload();
-            store.rebuild_counters(stored_large);
+            read_all &= store.rebuild_counters(stored_large, &mut named);
             store.cleanup();
         }
+        if read_all {
+            self.remove_orphaned_page_transactions(&named);
+        }
         self.set_loaded();
+    }
+
+    /// `cleanupPageTransactions`: a committed page transaction no paged
+    /// message names any more goes. Not after a page could not be read, as
+    /// its messages may be there.
+    fn remove_orphaned_page_transactions(&self, named: &HashSet<i64>) {
+        const PRINT_LIMIT: u64 = 1000;
+        let Some(storage) = self.storage.clone() else {
+            return;
+        };
+        // In the database the paged messages are rows, not page files.
+        if storage.pages_in_store() {
+            return;
+        }
+        let orphaned: Vec<Arc<PageTx>> = {
+            let mut txs = lock(&self.transactions);
+            let ids: Vec<i64> = txs
+                .iter()
+                .filter(|(id, t)| !named.contains(id) && lock(&t.state).committed)
+                .map(|(id, _)| *id)
+                .collect();
+            ids.iter().filter_map(|id| txs.remove(id)).collect()
+        };
+        let mut removed: u64 = 0;
+        for t in orphaned {
+            let record = lock(&t.state).record;
+            if record >= 0
+                && let Err(e) = storage.delete_record(record)
+            {
+                tracing::warn!("AMQ222034: Can not delete page transaction id={record}: {e}");
+            }
+            removed += 1;
+            if removed < PRINT_LIMIT {
+                tracing::info!("AMQ224131: Removing orphaned page transaction {}", t.tx_id);
+            } else if removed.is_multiple_of(PRINT_LIMIT) {
+                tracing::info!("AMQ224133: {removed} orphaned page transactions have been removed");
+            }
+        }
+        if removed > 0 {
+            tracing::info!("AMQ224132: {removed} orphaned page transactions were removed");
+        }
     }
 
     /// Stops the page sync thread.
@@ -714,6 +761,23 @@ impl PagingManager {
 }
 
 // -------------------------------------------------------------------- store
+
+/// Taken from a cursor by a cleanup until the journal has it: the
+/// subscription, the page, and its acknowledgements.
+type Taken = (Arc<PageSubscription>, i64, Option<HashMap<i32, i64>>);
+
+/// `markFileAsSuspect`: a page read stopped at a record cut short or that
+/// does not decode.
+fn log_suspect(path: &Path, page: &saranga_paging::ReadPage) {
+    tracing::warn!(
+        "AMQ222033: Page file {} had incomplete records at position {} at record number {}",
+        path.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
+        page.valid_size,
+        page.messages.len() + 1
+    );
+}
 
 /// A message in a page.
 #[derive(Debug)]
@@ -1134,6 +1198,9 @@ impl PagingStore {
         let path = self.page_path(st, id).expect("folder set");
         let data = fs::read(&path)?;
         let page = saranga_paging::read_page(&data);
+        if page.suspect {
+            log_suspect(&path, &page);
+        }
         let entries = self.entries_of(page.messages);
         if page.valid_size != data.len() {
             st.cache.push_back(Arc::new(LoadedPage { id, entries }));
@@ -1910,7 +1977,12 @@ impl PagingStore {
             },
             queue_ids: queues.iter().map(|q| q.id()).collect(),
         };
-        let record = paged.encode_record();
+        let record = paged.encode_record().map_err(|e| {
+            BrokerError::new(
+                saranga_core_protocol::ErrorType::InternalError,
+                e.to_string(),
+            )
+        })?;
         // directWritePage
         let page_size = s.page_size_bytes.max(1) as u64;
         let roll = match &st.current {
@@ -2103,7 +2175,15 @@ impl PagingStore {
         }
         let path = self.page_path(st, id);
         let entries = match path.as_ref().map(fs::read) {
-            Some(Ok(data)) => self.entries_of(saranga_paging::read_page(&data).messages),
+            Some(Ok(data)) => {
+                let page = saranga_paging::read_page(&data);
+                if page.suspect
+                    && let Some(path) = &path
+                {
+                    log_suspect(path, &page);
+                }
+                self.entries_of(page.messages)
+            }
             Some(Err(e)) if e.kind() != io::ErrorKind::NotFound => {
                 // An unreadable page is not an empty one: not cached, so
                 // nothing takes it for read or finished (the file factory's
@@ -2633,15 +2713,17 @@ impl PagingStore {
 
     /// `PageCounterRebuildManager`: counts, per queue, the paged messages
     /// neither acknowledged nor of an unfinished transaction. Large messages
-    /// found in the pages leave `stored_large`.
-    fn rebuild_counters(&self, stored_large: &mut HashSet<i64>) {
+    /// found in the pages leave `stored_large`, and the page transactions
+    /// their messages name join `named`. Whether every page could be read.
+    fn rebuild_counters(&self, stored_large: &mut HashSet<i64>, named: &mut HashSet<i64>) -> bool {
         let Some(manager) = self.manager.upgrade() else {
-            return;
+            return false;
         };
         let mut st = lock(&self.state);
         if !st.paging {
-            return;
+            return true;
         }
+        let mut read_all = true;
         let (first, current) = (st.first_page.min(st.current_page_id), st.current_page_id);
         let subs = st.subscriptions.clone();
         let mut counts: HashMap<i64, (i64, i64)> = HashMap::new();
@@ -2650,9 +2732,13 @@ impl PagingStore {
                 continue;
             }
             let Some(loaded) = self.load_page(&mut st, page) else {
+                read_all = false;
                 continue;
             };
             for e in &loaded.entries {
+                if e.tx_id > 0 {
+                    named.insert(e.tx_id);
+                }
                 if let Some(m) = &e.message
                     && m.is_large()
                 {
@@ -2709,6 +2795,7 @@ impl PagingStore {
                 s.empty = false;
             }
         }
+        read_all
     }
 
     // ------------------------------------------------------------ cleanup
@@ -2739,9 +2826,11 @@ impl PagingStore {
             }
             subs = st.subscriptions.values().cloned().collect();
             let current = st.current.as_ref().map(|c| c.id);
-            // cleanupEntries, per subscription.
+            // cleanupEntries, per subscription. What is taken from a cursor
+            // goes back if the journal does not take it.
             let tx = storage.generate_id();
             let mut wrote = false;
+            let mut taken: Vec<Taken> = Vec::new();
             for sub in &subs {
                 let pages: Vec<i64> = lock(&sub.state).consumed.keys().copied().collect();
                 for page in pages {
@@ -2761,8 +2850,10 @@ impl PagingStore {
                         s.consumed.remove(&page);
                         continue;
                     }
-                    info.pending_delete = true;
                     if sub.persistent {
+                        // Without its complete record, the page keeps its
+                        // acknowledgements: deleted, its messages would come
+                        // back at the next start.
                         match storage.store_page_complete_tx(
                             tx,
                             sub.queue_id,
@@ -2773,18 +2864,32 @@ impl PagingStore {
                                 info.complete = Some(r);
                                 wrote = true;
                             }
-                            Err(e) => tracing::warn!("AMQ222016: Cannot cleanup page: {e}"),
+                            Err(e) => {
+                                tracing::warn!("AMQ222026: Error on cleaning up cursor pages: {e}");
+                                continue;
+                            }
                         }
                     }
-                    for r in info.acks.take().into_iter().flat_map(|a| a.into_values()) {
+                    info.pending_delete = true;
+                    let acks = info.acks.take();
+                    for &r in acks.iter().flat_map(|a| a.values()) {
                         if r >= 0 && storage.delete_record_tx(tx, r).is_ok() {
                             wrote = true;
                         }
                     }
+                    taken.push((sub.clone(), page, acks));
                 }
             }
             if wrote && let Err(e) = storage.commit(tx) {
-                tracing::warn!("AMQ222016: Cannot cleanup page: {e}");
+                tracing::warn!("AMQ222026: Error on cleaning up cursor pages: {e}");
+                for (sub, page, acks) in taken {
+                    let mut s = lock(&sub.state);
+                    if let Some(info) = s.consumed.get_mut(&page) {
+                        info.acks = acks;
+                        info.complete = None;
+                        info.pending_delete = false;
+                    }
+                }
             }
             // The first page some subscription has not finished.
             let min_page = subs
@@ -2854,11 +2959,14 @@ impl PagingStore {
         // finishCleanup
         for (page, path) in deleted {
             let Some(path) = path else { continue };
+            let mut suspect = false;
             match fs::read(&path) {
                 Ok(data) => {
                     // Each large body goes once nothing else holds it: the same
                     // message routed to a queue that does not page reads it.
-                    for m in saranga_paging::read_page(&data).messages {
+                    let read = saranga_paging::read_page(&data);
+                    suspect = read.suspect;
+                    for m in read.messages {
                         if m.is_large() {
                             manager.large.release(m.message_id(), m.is_durable());
                         }
@@ -2872,7 +2980,20 @@ impl PagingStore {
                     continue;
                 }
             }
-            if let Err(e) = fs::remove_file(&path)
+            let removed = if suspect {
+                // Kept for whoever looks into it, under another name.
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                let name = name.unwrap_or_default();
+                tracing::warn!(
+                    "AMQ222030: File {name} being renamed to {name}.invalidPage as it was loaded partially. Please verify your data."
+                );
+                let mut invalid = path.clone().into_os_string();
+                invalid.push(".invalidPage");
+                fs::rename(&path, invalid)
+            } else {
+                fs::remove_file(&path)
+            };
+            if let Err(e) = removed
                 && e.kind() != io::ErrorKind::NotFound
             {
                 // The page stays, so its acknowledgements must too: deleted,

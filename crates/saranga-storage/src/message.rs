@@ -135,8 +135,9 @@ impl AmqpMessageRecord {
         if self.persister_id >= persister::AMQP_MESSAGE_V2 {
             write_sized_properties(w, self.extra_properties.as_ref());
         }
-        if let Some(e) = self.expiration {
-            w.i64(e);
+        // Only V3 has the field, so only V3 writes it.
+        if self.persister_id == persister::AMQP_MESSAGE_V3 {
+            w.i64(self.expiration.unwrap_or(0));
         }
     }
 }
@@ -200,12 +201,17 @@ fn read_sized_properties(r: &mut Reader<'_>) -> Result<Option<TypedProperties>> 
     if size == 0 {
         return Ok(None);
     }
-    let start = r.position();
-    let props = TypedProperties::decode(r)?;
-    if r.position() - start != size as usize {
-        return Err(DecodeError::Invalid(format!(
+    let mismatch = || {
+        DecodeError::Invalid(format!(
             "extra properties size {size} does not match their encoding"
-        )));
+        ))
+    };
+    // Read within the size given, never into what follows.
+    let len = usize::try_from(size).map_err(|_| mismatch())?;
+    let mut within = Reader::new(r.bytes(len)?);
+    let props = TypedProperties::decode(&mut within)?;
+    if !within.is_empty() {
+        return Err(mismatch());
     }
     Ok(Some(props))
 }
@@ -329,6 +335,64 @@ mod tests {
         };
         m.properties.insert("k".into(), PropertyValue::Int(1));
         m
+    }
+
+    fn amqp(persister_id: u8, expiration: Option<i64>) -> AmqpMessageRecord {
+        AmqpMessageRecord {
+            persister_id,
+            message_id: 1,
+            message_format: 0,
+            address: None,
+            data: vec![0x00, 0x53, 0x77, 0x40],
+            extra_properties: None,
+            expiration,
+        }
+    }
+
+    /// The expiration is V3's field: written by V3 only, always.
+    #[test]
+    fn only_v3_writes_the_expiration() {
+        let v3 = PersistedMessage::Amqp(amqp(persister::AMQP_MESSAGE_V3, None));
+        let back = PersistedMessage::decode(&v3.encode()).unwrap();
+        let PersistedMessage::Amqp(a) = back else {
+            unreachable!()
+        };
+        assert_eq!(a.expiration, Some(0));
+        let v2 = PersistedMessage::Amqp(amqp(persister::AMQP_MESSAGE_V2, Some(5)));
+        let PersistedMessage::Amqp(a) = PersistedMessage::decode(&v2.encode()).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(a.expiration, None);
+    }
+
+    /// Extra properties are read within their size, not into the expiration
+    /// that follows them.
+    #[test]
+    fn extra_properties_are_read_within_their_size() {
+        let mut props = TypedProperties::default();
+        props.insert("k".into(), PropertyValue::Int(1));
+        let mut rec = amqp(persister::AMQP_MESSAGE_V3, Some(9));
+        rec.extra_properties = Some(props);
+        let mut bytes = PersistedMessage::Amqp(rec.clone()).encode();
+        assert_eq!(
+            PersistedMessage::decode(&bytes).unwrap(),
+            PersistedMessage::Amqp(rec)
+        );
+        // The size field sits right before the properties: one too small.
+        let at = bytes.len() - 8 - (props_len(&bytes) as usize) - 4;
+        let size = i32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+        bytes[at..at + 4].copy_from_slice(&(size - 1).to_be_bytes());
+        assert!(PersistedMessage::decode(&bytes).is_err());
+        bytes[at..at + 4].copy_from_slice(&(-1i32).to_be_bytes());
+        assert!(PersistedMessage::decode(&bytes).is_err());
+    }
+
+    fn props_len(_bytes: &[u8]) -> i32 {
+        let mut props = TypedProperties::default();
+        props.insert("k".into(), PropertyValue::Int(1));
+        let mut w = Writer::new();
+        props.encode(&mut w);
+        w.as_slice().len() as i32
     }
 
     #[test]

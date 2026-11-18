@@ -97,6 +97,7 @@ impl PagedMessage {
         self.transaction_id > 0
     }
 
+    /// Writes the message. Lengths are checked by [`Self::encode_record`].
     pub fn write(&self, w: &mut Writer) {
         w.i64(self.transaction_id);
         match &self.body {
@@ -152,15 +153,28 @@ impl PagedMessage {
     }
 
     /// The record as written to a page file (`PageReadWriter.writeMessage`).
-    pub fn encode_record(&self) -> Vec<u8> {
+    /// A record whose size does not fit the frame's i32 is refused.
+    pub fn encode_record(&self) -> Result<Vec<u8>> {
+        let too_big = |what: &str| DecodeError::Invalid(format!("{what} too large to page"));
+        if i32::try_from(self.queue_ids.len()).is_err() {
+            return Err(too_big("queue IDs"));
+        }
+        if let PagedBody::CoreLarge(m) = &self.body {
+            let mut headers = Writer::new();
+            m.encode_headers_and_properties(&mut headers);
+            if i32::try_from(headers.len()).is_err() {
+                return Err(too_big("large message headers"));
+            }
+        }
         let mut body = Writer::new();
         self.write(&mut body);
+        let size = i32::try_from(body.len()).map_err(|_| too_big("message"))?;
         let mut w = Writer::with_capacity(body.len() + SIZE_RECORD);
         w.u8(START_BYTE)
-            .i32(body.len() as i32)
+            .i32(size)
             .bytes(body.as_slice())
             .u8(END_BYTE);
-        w.into_vec()
+        Ok(w.into_vec())
     }
 }
 
@@ -185,26 +199,20 @@ pub fn read_page(data: &[u8]) -> ReadPage {
         |m| out.messages.push(m),
         &mut out.valid_size,
         &mut out.suspect,
-        true,
     );
     out
 }
 
-/// The number of records in a page file, without decoding them
-/// (`Page.readNumberOfMessages`).
+/// The number of records in a page file (`Page.readNumberOfMessages`):
+/// those [`read_page`] reads, so a page is finished once they are. A record
+/// that does not decode ends both, and makes the page suspect.
 pub fn count_messages(data: &[u8]) -> usize {
     let (mut n, mut size, mut suspect) = (0, 0, false);
-    scan(data, |_| n += 1, &mut size, &mut suspect, false);
+    scan(data, |_| n += 1, &mut size, &mut suspect);
     n
 }
 
-fn scan(
-    data: &[u8],
-    mut f: impl FnMut(PagedMessage),
-    valid: &mut usize,
-    suspect: &mut bool,
-    decode: bool,
-) {
+fn scan(data: &[u8], mut f: impl FnMut(PagedMessage), valid: &mut usize, suspect: &mut bool) {
     let mut at = 0;
     while data.len() - at >= SIZE_RECORD {
         if data[at] != START_BYTE {
@@ -216,31 +224,22 @@ fn scan(
             *suspect = true;
             return;
         };
-        let end = at + 5 + size;
-        if end >= data.len() {
+        let Some(end) = (at + 5).checked_add(size).filter(|e| *e < data.len()) else {
             // Cut short: the last record was not completely written.
             *suspect = true;
             return;
-        }
+        };
         if data[end] != END_BYTE {
             *suspect = true;
             return;
         }
-        if decode {
-            let mut r = Reader::new(&data[at + 5..end]);
-            match PagedMessage::read(&mut r) {
-                Ok(m) => f(m),
-                Err(_) => {
-                    *suspect = true;
-                    return;
-                }
+        let mut r = Reader::new(&data[at + 5..end]);
+        match PagedMessage::read(&mut r) {
+            Ok(m) => f(m),
+            Err(_) => {
+                *suspect = true;
+                return;
             }
-        } else {
-            f(PagedMessage {
-                transaction_id: 0,
-                body: PagedBody::CoreLarge(CoreMessage::default()),
-                queue_ids: Vec::new(),
-            });
         }
         at = end + 1;
         *valid = at;
@@ -290,8 +289,8 @@ mod tests {
             body: PagedBody::CoreLarge(large_core),
             queue_ids: vec![3],
         };
-        let mut file = regular.encode_record();
-        file.extend(large.encode_record());
+        let mut file = regular.encode_record().unwrap();
+        file.extend(large.encode_record().unwrap());
         let page = read_page(&file);
         assert_eq!(page.messages, vec![regular.clone(), large.clone()]);
         assert_eq!(page.valid_size, file.len());
@@ -306,11 +305,27 @@ mod tests {
         assert_eq!(page.messages, vec![regular.clone()]);
         assert!(page.suspect);
         // A few stray bytes at the end do not.
-        let mut tail = regular.encode_record();
+        let mut tail = regular.encode_record().unwrap();
         tail.extend([b'{', 0, 0]);
         let page = read_page(&tail);
-        assert_eq!(page.messages, vec![regular]);
+        assert_eq!(page.messages, vec![regular.clone()]);
         assert!(!page.suspect);
+
+        // A whole frame whose message does not decode ends the page for the
+        // count as for the read: else the page is never finished.
+        let mut damaged = regular.encode_record().unwrap();
+        damaged.extend([START_BYTE, 0, 0, 0, 3, 0xff, 0xff, 0xff, END_BYTE]);
+        damaged.extend(regular.encode_record().unwrap());
+        let page = read_page(&damaged);
+        assert_eq!(page.messages, vec![regular]);
+        assert!(page.suspect);
+        assert_eq!(count_messages(&damaged), 1);
+        // A size past the end of the file is a record cut short.
+        let mut huge = vec![START_BYTE];
+        huge.extend(i32::MAX.to_be_bytes());
+        huge.extend([0; 8]);
+        assert!(read_page(&huge).suspect);
+        assert_eq!(count_messages(&huge), 0);
     }
 
     /// An AMQP large message's record in a page is followed by its queue
@@ -345,8 +360,8 @@ mod tests {
             body: PagedBody::Message(PersistedMessage::Core(CoreMessageRecord::new(core(43)))),
             queue_ids: vec![7],
         };
-        let mut file = amqp.encode_record();
-        file.extend(after.encode_record());
+        let mut file = amqp.encode_record().unwrap();
+        file.extend(after.encode_record().unwrap());
         let page = read_page(&file);
         assert!(!page.suspect);
         assert_eq!(page.messages, vec![amqp, after]);
@@ -387,7 +402,7 @@ mod tests {
             let again: Vec<u8> = page
                 .messages
                 .iter()
-                .flat_map(PagedMessage::encode_record)
+                .flat_map(|m| m.encode_record().unwrap())
                 .collect();
             assert_eq!(again, data, "{name}");
             pages += 1;

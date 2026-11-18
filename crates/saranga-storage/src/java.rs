@@ -217,14 +217,14 @@ pub fn bytes_to_hex(bytes: &[u8], group_size: usize) -> String {
     s
 }
 
-/// `ByteUtil.maxString`.
+/// `ByteUtil.maxString`: lengths in UTF-16 units, as Java's `String`.
 pub fn max_string(value: &str, size: usize) -> String {
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() < size {
+    let units: Vec<u16> = value.encode_utf16().collect();
+    if units.len() < size {
         value.to_owned()
     } else {
-        let head: String = chars[..size / 2].iter().collect();
-        let tail: String = chars[chars.len() - size / 2..].iter().collect();
+        let head = String::from_utf16_lossy(&units[..size / 2]);
+        let tail = String::from_utf16_lossy(&units[units.len() - size / 2..]);
         format!("{head} ... {tail}")
     }
 }
@@ -479,6 +479,11 @@ mod tests {
         assert_eq!(base64_url(b""), "");
         assert_eq!(max_string("abcdef", 4), "ab ... ef");
         assert_eq!(max_string("abc", 4), "abc");
+        // A supplementary character is two units in Java.
+        assert_eq!(
+            max_string("\u{1F600}\u{1F600}", 4),
+            "\u{1F600} ... \u{1F600}"
+        );
         assert_eq!(utf16([0x61, 0xd800, 0x62]), "a?b");
     }
 }

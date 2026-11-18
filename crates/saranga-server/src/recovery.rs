@@ -97,7 +97,8 @@ pub fn queue_config(b: &PersistentQueueBindingEncoding) -> QueueConfig {
         group_rebalance_pause_dispatch: b.group_rebalance_pause_dispatch.unwrap_or(false),
         group_buckets: b.group_buckets.unwrap_or(-1),
         group_first_key: b.group_first_key.clone().flatten().as_ref().map(text),
-        auto_delete: b.auto_delete.unwrap_or(false),
+        // A record older than the field: `getDefaultQueueAutoDelete(autoCreated)`.
+        auto_delete: b.auto_delete.unwrap_or(b.auto_created),
         auto_delete_delay: b.auto_delete_delay.unwrap_or(0),
         auto_delete_message_count: b.auto_delete_message_count.unwrap_or(0),
         ring_size: b.ring_size.unwrap_or(-1),
@@ -360,14 +361,28 @@ pub async fn load_messages(
         if c.has_storage() {
             c.load(ids, || post_office.ids().next())
                 .map_err(|e| corrupt("duplicate IDs", e))?;
+        } else {
+            // `persist-id-cache` off: what an earlier start stored goes
+            // (`removeOldDuplicates`).
+            for (_, record) in ids {
+                if let Err(e) = storage.delete_record(record) {
+                    tracing::warn!("{e}");
+                }
+            }
         }
     }
     let now = message::now_millis();
+    // References to queues that no longer exist: their messages go once
+    // nothing else holds them.
+    let mut orphans: Vec<(i64, i64)> = Vec::new();
     for (queue_id, refs) in queues {
         let Some(queue) = by_id.get(&queue_id) else {
             if !refs.is_empty() {
-                tracing::warn!("AMQ222033: Cannot find queue {queue_id} to load messages into");
+                tracing::warn!(
+                    "AMQ222043: Message for queue {queue_id} which does not exist. This message will be ignored."
+                );
             }
+            orphans.extend(refs.iter().map(|r| (queue_id, r.message_id)));
             continue;
         };
         for r in refs {
@@ -420,7 +435,7 @@ pub async fn load_messages(
         for (queue_id, message_id) in p.sends {
             let (Some(q), Some(m)) = (by_id.get(&queue_id), messages.get(&message_id)) else {
                 tracing::warn!(
-                    "AMQ222034: Cannot find queue {queue_id} for a message in a prepared transaction"
+                    "AMQ222045: Message in prepared tx for queue {queue_id} which does not exist. This message will be ignored."
                 );
                 continue;
             };
@@ -452,7 +467,7 @@ pub async fn load_messages(
         for (queue_id, message_id) in p.acks {
             let Some(q) = by_id.get(&queue_id) else {
                 tracing::warn!(
-                    "AMQ222035: Cannot find queue {queue_id} for an acknowledgement in a prepared transaction"
+                    "AMQ222702: Message ack in prepared tx for queue {queue_id} which does not exist. This ack will be ignored."
                 );
                 continue;
             };
@@ -471,7 +486,7 @@ pub async fn load_messages(
                     }
                     tx.acks.push((q.clone(), r));
                 }
-                None => tracing::warn!("AMQ222036: Unable to remove reference {message_id}"),
+                None => tracing::warn!("AMQ222046: Failed to remove reference for {message_id}"),
             }
         }
         // Its duplicate IDs are held until it ends, as they were from its
@@ -494,7 +509,7 @@ pub async fn load_messages(
             let (Some(q), Some(sub)) = (by_id.get(&a.queue_id), paging.subscription(a.queue_id))
             else {
                 tracing::warn!(
-                    "AMQ222035: Cannot find queue {} for an acknowledgement in a prepared transaction",
+                    "AMQ222702: Message ack in prepared tx for queue {} which does not exist. This ack will be ignored.",
                     a.queue_id
                 );
                 continue;
@@ -518,6 +533,29 @@ pub async fn load_messages(
     for (record, xid, commit) in heuristics {
         resource_manager.put_heuristic(record, xid, commit);
     }
+    // `handleNoMessageReferences`: a message whose references were all on
+    // queues that are gone is deleted, a large one with its file. In the
+    // database those references are rows of their own, deleted first.
+    let in_store = storage.pages_in_store();
+    let mut gone = std::collections::HashSet::new();
+    for (queue_id, message_id) in orphans {
+        if in_store && let Err(e) = storage.store_acknowledge(queue_id, message_id) {
+            tracing::warn!("{e}");
+        }
+        let Some(m) = messages.get(&message_id) else {
+            continue;
+        };
+        if m.durable_refs() > 0 || !gone.insert(message_id) {
+            continue;
+        }
+        crate::storage::log_unreferenced(message_id, m.is_large());
+        if m.is_large() {
+            stored.insert(message_id);
+        }
+        if let Err(e) = storage.delete_message(message_id) {
+            tracing::warn!("{e}");
+        }
+    }
     // `failedToPrepareException`.
     for (id, why) in failed_prepared {
         tracing::warn!(
@@ -533,4 +571,26 @@ pub async fn load_messages(
 /// Persists a new address (`addAddressInfo` → `addAddressBinding`).
 pub fn store_address(storage: &Storage, info: &AddressInfo) -> StoreResult<()> {
     storage.add_binding(info.id, ids::ADDRESS_BINDING_RECORD, address_binding(info))
+}
+
+#[cfg(test)]
+mod legacy_binding_tests {
+    use super::*;
+
+    /// A binding written before `autoDelete` was recorded:
+    /// `applyStaticDefaults` makes an auto-created queue auto-delete.
+    #[test]
+    fn a_legacy_auto_created_queue_is_auto_delete() {
+        let mut b = PersistentQueueBindingEncoding {
+            name: SimpleString::from("q"),
+            address: SimpleString::from("q"),
+            auto_created: true,
+            ..Default::default()
+        };
+        assert!(queue_config(&b).auto_delete);
+        b.auto_created = false;
+        assert!(!queue_config(&b).auto_delete);
+        b.auto_delete = Some(true);
+        assert!(queue_config(&b).auto_delete);
+    }
 }

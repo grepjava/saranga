@@ -10,6 +10,8 @@ use saranga_storage::codec::{
 };
 use saranga_storage::{BatchingIdGenerator, CHECKPOINT_BATCH_SIZE, IdCounterStore};
 
+use crate::storage::log_unreferenced;
+
 use super::*;
 
 /// Where `BatchingIDGenerator` keeps its counter: `ID_COUNTER_RECORD`s in
@@ -177,10 +179,10 @@ impl Store for JournalStorage {
     }
 
     fn generate_id(&self) -> i64 {
-        // The generator only stops with the storage.
+        // Stopped with the storage: still unique, never written.
         self.ids
             .generate_id()
-            .unwrap_or_else(|_| self.ids.current_id())
+            .unwrap_or_else(|_| self.ids.generate_unrecorded())
     }
 
     fn load_bindings(&self) -> StoreResult<Vec<saranga_journal::RecordInfo>> {
@@ -211,6 +213,8 @@ impl Store for JournalStorage {
         // Page counter records: Saranga rebuilds the counters from the
         // pages, as Artemis does on every start, so they are deleted.
         let mut counters = Vec::new();
+        // Legacy pending large-message records, deleted on load.
+        let mut pending_large = Vec::new();
         for r in loaded.committed {
             match r.user_record_type {
                 ids::ADD_MESSAGE_PROTOCOL => {
@@ -221,6 +225,7 @@ impl Store for JournalStorage {
                         .insert(r.id, StoredMessage::Core(decode_large_message(&r.data)?));
                     out.large.insert(r.id);
                 }
+                ids::ADD_LARGE_MESSAGE_PENDING => pending_large.push(r.id),
                 ids::ADD_MESSAGE => {
                     return Err(JournalError::Corrupt(
                         "This is using old journal data, export your data and import at the correct version".into(),
@@ -229,7 +234,7 @@ impl Store for JournalStorage {
                 ids::ADD_REF => {
                     let queue = ref_queue(&r.data)?;
                     if !out.messages.contains_key(&r.id) {
-                        tracing::warn!("AMQ222031: Cannot find message {}", r.id);
+                        tracing::error!("AMQ224009: Cannot find message {}", r.id);
                         continue;
                     }
                     let q = refs.entry(queue).or_default();
@@ -240,13 +245,13 @@ impl Store for JournalStorage {
                 ids::ACKNOWLEDGE_REF => {
                     let queue = ref_queue(&r.data)?;
                     match refs.get_mut(&queue) {
-                        None => tracing::warn!(
-                            "AMQ222030: Cannot find queue {queue} while reloading ACKNOWLEDGE_REF for message {}",
+                        None => tracing::error!(
+                            "AMQ224010: Cannot find queue messages for queueID={queue} on ack for messageID={}",
                             r.id
                         ),
                         Some(q) => {
                             if q.remove(&r.id).is_none() {
-                                tracing::warn!("AMQ222031: Cannot find message {}", r.id);
+                                tracing::error!("AMQ224009: Cannot find message {}", r.id);
                             }
                         }
                     }
@@ -269,7 +274,7 @@ impl Store for JournalStorage {
                         ),
                         Some(q) => match q.get_mut(&r.id) {
                             Some(c) => c.1 = s.scheduled_delivery_time,
-                            None => tracing::warn!("AMQ222031: Cannot find message {}", r.id),
+                            None => tracing::error!("AMQ224009: Cannot find message {}", r.id),
                         },
                     }
                 }
@@ -325,6 +330,12 @@ impl Store for JournalStorage {
                     });
                 }
             }
+        }
+        // What an upgrade can leave (`deletePendingLargeMessage`): the record
+        // goes, as nothing writes or reads it any more.
+        for id in pending_large {
+            tracing::debug!("Removing pending large message record: {id}");
+            let _ = self.messages.append_delete(id, false, None);
         }
         // A page transaction whose messages were all consumed goes.
         for p in page_txs {
@@ -389,7 +400,7 @@ impl Store for JournalStorage {
             .filter(|id| !referenced.contains(id))
             .collect();
         for id in unreferenced {
-            tracing::warn!("AMQ222129: Message {id} has no references, it will be deleted");
+            log_unreferenced(id, out.large.contains(&id));
             out.messages.remove(&id);
             out.large.remove(&id);
             let _ = self.messages.append_delete(id, false, None);
@@ -482,7 +493,9 @@ impl Store for JournalStorage {
             c,
         )?;
         if !found {
-            tracing::warn!("AMQ222178: Cannot find message {message_id} on the journal");
+            tracing::warn!(
+                "AMQ222153: Cannot locate record for message id = {message_id} on Journal"
+            );
         }
         Ok(p.expect("pending"))
     }
@@ -663,8 +676,7 @@ impl Store for JournalStorage {
     }
 
     fn store_heuristic_completion(&self, id: i64, xid: &Xid, commit: bool) -> StoreResult<Pending> {
-        let mut body = encode_xid(xid);
-        body.push(u8::from(commit));
+        let body = crate::storage::encode_heuristic_completion(xid, commit);
         self.add_record(id, ids::HEURISTIC_COMPLETION, body, true)
     }
 
@@ -870,6 +882,34 @@ mod tests {
         assert_eq!(decode_message(&ours).unwrap(), StoredMessage::Core(m));
     }
 
+    /// A legacy `ADD_LARGE_MESSAGE_PENDING` record goes on load, as
+    /// Artemis's `deletePendingLargeMessage` does.
+    #[test]
+    fn a_pending_large_message_record_is_deleted_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = JournalStorage::open(config(dir.path())).unwrap();
+        s.load_bindings().unwrap();
+        s.load_messages().unwrap();
+        s.messages
+            .append_add(
+                77,
+                ids::ADD_LARGE_MESSAGE_PENDING,
+                5i64.to_be_bytes().to_vec(),
+                true,
+                None,
+            )
+            .unwrap();
+        s.stop().unwrap();
+        drop(s);
+        for _ in 0..2 {
+            let s = JournalStorage::open(config(dir.path())).unwrap();
+            s.load_bindings().unwrap();
+            let out = s.load_messages().unwrap();
+            assert!(out.extra.iter().all(|e| e.id != 77), "record kept");
+            s.stop().unwrap();
+        }
+    }
+
     #[test]
     fn ids_continue_after_a_clean_stop_and_jump_after_a_crash() {
         let dir = tempfile::tempdir().unwrap();
@@ -879,6 +919,9 @@ mod tests {
         let first: Vec<i64> = (0..5).map(|_| s.generate_id()).collect();
         assert_eq!(first, vec![0, 2, 3, 4, 5]);
         s.stop().unwrap();
+        // Taken while stopping: never the same ID twice.
+        let (a, b) = (s.generate_id(), s.generate_id());
+        assert_ne!(a, b);
         drop(s);
 
         let s = JournalStorage::open(config(dir.path())).unwrap();

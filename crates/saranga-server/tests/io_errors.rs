@@ -532,3 +532,109 @@ async fn a_failed_bindings_write_stops_the_message_journal() {
         "the message journal takes no more writes"
     );
 }
+
+/// A page with a record that does not decode is read up to it, finished
+/// once what was read is consumed, and kept as `.invalidPage` rather than
+/// deleted, as Artemis keeps a suspect page.
+#[tokio::test]
+async fn a_damaged_page_is_finished_and_kept_as_invalid() {
+    use saranga_server::postoffice::QueueSpec;
+    use saranga_server::session::{ClientConnection, ServerSession, SessionOptions, Transport};
+    let dir = tempfile::tempdir().unwrap();
+    let file = saranga_config::BrokerConfig::parse(
+        r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+             <persistence-enabled>true</persistence-enabled>
+             <journal-file-size>102400</journal-file-size>
+             <address-settings>
+               <address-setting match="q">
+                 <max-size-bytes>1</max-size-bytes>
+                 <page-size-bytes>10240</page-size-bytes>
+                 <address-full-policy>PAGE</address-full-policy>
+               </address-setting>
+             </address-settings>
+           </core></configuration>"#,
+    )
+    .unwrap();
+    let config =
+        || BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path()).unwrap();
+    let b = Broker::start(config()).await.unwrap();
+    let mut spec = QueueSpec::new("q", "q");
+    spec.auto_create_address = Some(true);
+    spec.durable = true;
+    b.post_office().create_queue(spec, false).unwrap();
+    let conn = Arc::new(ClientConnection::new(
+        Transport::internal("test"),
+        Arc::new(Default::default()),
+        vec![],
+    ));
+    let mut s = ServerSession::new(
+        b.clone(),
+        conn,
+        SessionOptions {
+            name: "s".into(),
+            username: None,
+            password: None,
+            xa: false,
+            auto_commit_sends: true,
+            auto_commit_acks: true,
+            pre_acknowledge: false,
+            default_address: None,
+        },
+        Default::default(),
+    );
+    for _ in 0..8 {
+        s.send(
+            saranga_message::CoreMessage {
+                address: Some("q".into()),
+                durable: true,
+                body: vec![1; 2000].into(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        s.take_completion().wait().await.unwrap();
+    }
+    s.close(true).await;
+    b.stop().unwrap();
+    drop(s);
+    drop(b);
+
+    fn files(p: &std::path::Path, ext: &str, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(p).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                files(&p, ext, out);
+            } else if p.to_string_lossy().ends_with(ext) {
+                out.push(p);
+            }
+        }
+    }
+    let mut pages = vec![];
+    files(dir.path(), ".page", &mut pages);
+    pages.sort();
+    assert!(pages.len() >= 2, "two pages at least: {pages:?}");
+    // A whole frame whose message is three bytes of nothing.
+    let first = pages[0].clone();
+    let mut data = std::fs::read(&first).unwrap();
+    data.extend([b'{', 0, 0, 0, 3, 0xff, 0xff, 0xff, b'}']);
+    std::fs::write(&first, data).unwrap();
+
+    let b = Broker::start(config()).await.unwrap();
+    let q = b.post_office().queue("q").unwrap();
+    for _ in 0..20 {
+        q.delete_matching(None).await;
+        b.post_office().paging_store("q").cleanup();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        if !first.exists() {
+            break;
+        }
+    }
+    assert!(!first.exists(), "the damaged page is never finished");
+    let mut invalid = vec![];
+    files(dir.path(), ".invalidPage", &mut invalid);
+    assert_eq!(invalid.len(), 1, "kept as invalid: {invalid:?}");
+    assert!(!b.is_critical_io_failed());
+    b.stop().unwrap();
+}

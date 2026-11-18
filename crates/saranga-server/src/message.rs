@@ -629,6 +629,11 @@ impl ServerMessage {
         self.counts.durable_refs.fetch_sub(1, Ordering::SeqCst) - 1
     }
 
+    /// `getDurableCount`.
+    pub fn durable_refs(&self) -> i32 {
+        self.counts.durable_refs.load(Ordering::SeqCst)
+    }
+
     /// `Message.getEncodeSize`, the size counted for memory accounting.
     pub fn encode_size(&self) -> usize {
         match &self.native {

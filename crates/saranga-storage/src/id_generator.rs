@@ -91,7 +91,8 @@ impl<S: IdCounterStore> BatchingIdGenerator<S> {
             .unwrap_or_else(|e| e.into_inner())
             .get_or_insert_with(Vec::new)
             .push(journal_id);
-        let next = encoding.id + 1;
+        // Java's long arithmetic: wraps.
+        let next = encoding.id.wrapping_add(1);
         self.next_id.store(next, Ordering::SeqCst);
         self.counter.store(next, Ordering::SeqCst);
         *started = true;
@@ -128,6 +129,13 @@ impl<S: IdCounterStore> BatchingIdGenerator<S> {
         Ok(id)
     }
 
+    /// For a caller that cannot fail where `generateID` throws: the next ID,
+    /// unique, but never checkpointed. Only used once the generator has
+    /// stopped with its storage, when nothing is written any more.
+    pub fn generate_unrecorded(&self) -> i64 {
+        self.counter.fetch_add(1, Ordering::SeqCst)
+    }
+
     /// `getCurrentID`: the next ID to be generated.
     pub fn current_id(&self) -> i64 {
         self.counter.load(Ordering::SeqCst)
@@ -139,7 +147,7 @@ impl<S: IdCounterStore> BatchingIdGenerator<S> {
         let _guard = self.checkpoint.lock().unwrap_or_else(|e| e.into_inner());
         let next = self.next_id.load(Ordering::SeqCst);
         if id >= next {
-            let next = next + self.checkpoint_size;
+            let next = next.wrapping_add(self.checkpoint_size);
             self.next_id.store(next, Ordering::SeqCst);
             if self.store.is_started() {
                 let journal_id = self.counter.fetch_add(1, Ordering::SeqCst);
@@ -150,13 +158,13 @@ impl<S: IdCounterStore> BatchingIdGenerator<S> {
 
     /// `persistCurrentID`: stores the current ID under a fresh record ID.
     pub fn persist_current_id(&self) {
-        let record_id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let record_id = self.counter.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
         self.store.store_id(record_id, record_id);
     }
 
     /// `forceNextID`: continue from `next_id`, recording it.
     pub fn force_next_id(&self, next_id: i64) {
-        let journal_id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let journal_id = self.counter.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
         self.counter.store(next_id, Ordering::SeqCst);
         self.store.store_id(journal_id, next_id);
     }
@@ -242,6 +250,41 @@ mod tests {
         g.cleanup();
         assert!(log(&g).is_empty(), "cleanup runs once");
         assert!(g.load_state(1, &[0; 3]).is_err());
+    }
+
+    /// Java's long arithmetic wraps; a checkpoint near `i64::MAX` must not
+    /// panic.
+    #[test]
+    fn ids_near_the_maximum_wrap_as_java_longs_do() {
+        let g = BatchingIdGenerator::new(0, CHECKPOINT_BATCH_SIZE, Recorder::default());
+        g.load_state(1, &i64::MAX.to_be_bytes()).unwrap();
+        assert_eq!(g.current_id(), i64::MIN);
+        let g = BatchingIdGenerator::new(i64::MAX - 1, CHECKPOINT_BATCH_SIZE, Recorder::default());
+        assert_eq!(g.generate_id(), Ok(i64::MAX - 1));
+        assert_eq!(
+            log(&g),
+            [format!(
+                "store {}={}",
+                i64::MAX,
+                (i64::MAX - 1).wrapping_add(CHECKPOINT_BATCH_SIZE)
+            )]
+        );
+        g.persist_current_id();
+        g.force_next_id(5);
+    }
+
+    /// Once stopped, the IDs a caller still takes are unique, and nothing is
+    /// recorded for them.
+    #[test]
+    fn ids_taken_after_stop_stay_unique() {
+        let g = BatchingIdGenerator::new(0, CHECKPOINT_BATCH_SIZE, Recorder::default());
+        g.generate_id().unwrap();
+        g.stop();
+        log(&g);
+        let a = g.generate_unrecorded();
+        let b = g.generate_unrecorded();
+        assert_ne!(a, b);
+        assert!(log(&g).is_empty());
     }
 
     #[test]

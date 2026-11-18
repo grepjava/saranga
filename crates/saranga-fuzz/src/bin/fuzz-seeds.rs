@@ -355,7 +355,7 @@ fn page(seeds: &mut Seeds, file: &[u8]) {
     let read = saranga_paging::read_page(file);
     let mut seed = Vec::new();
     for (i, m) in read.messages.iter().enumerate() {
-        let record = m.encode_record();
+        let record = m.encode_record().expect("read back");
         if seed.len() + record.len() > MAX_SEED {
             break;
         }

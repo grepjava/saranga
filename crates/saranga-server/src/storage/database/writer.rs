@@ -189,6 +189,67 @@ pub struct Writes {
     /// Operations sent and not yet committed (`max-pending-writes`).
     pending: Arc<Credits>,
     failed: Arc<AtomicBool>,
+    readable: Arc<Readable>,
+}
+
+/// Paged references that became readable once their write or commit was
+/// done. IDs are taken before writes land, and writes land out of order, so
+/// a queue reading on from its last ID would pass over them for good.
+#[derive(Default)]
+pub struct Readable {
+    state: Mutex<ReadableState>,
+}
+
+#[derive(Default)]
+struct ReadableState {
+    /// Per queue, the lowest message ID made readable since it last looked.
+    lowest: HashMap<i64, i64>,
+    /// Bumped when a prepared transaction commits: which queues its
+    /// references are on is not known here, so every queue reads again
+    /// from the start.
+    generation: u64,
+}
+
+impl Readable {
+    fn add(&self, lowest: &HashMap<i64, i64>, every_queue: bool) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if every_queue {
+            s.generation += 1;
+        }
+        for (&queue, &id) in lowest {
+            let low = s.lowest.entry(queue).or_insert(id);
+            *low = (*low).min(id);
+        }
+    }
+
+    /// For a queue: the lowest ID made readable since it last looked, and
+    /// the generation now.
+    pub fn take(&self, queue: i64) -> (Option<i64>, u64) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (s.lowest.remove(&queue), s.generation)
+    }
+
+    /// What a unit makes readable once it is done.
+    fn of(ops: &[Op]) -> (HashMap<i64, i64>, bool) {
+        let mut lowest: HashMap<i64, i64> = HashMap::new();
+        let mut every_queue = false;
+        for op in ops {
+            match *op {
+                Op::Reference {
+                    message,
+                    queue,
+                    tx: None,
+                    paged: true,
+                } => {
+                    let low = lowest.entry(queue).or_insert(message);
+                    *low = (*low).min(message);
+                }
+                Op::Finish { commit: true, .. } => every_queue = true,
+                _ => {}
+            }
+        }
+        (lowest, every_queue)
+    }
 }
 
 struct Credits {
@@ -209,6 +270,11 @@ impl Credits {
 }
 
 impl Writes {
+    /// The paged references made readable.
+    pub fn readable(&self) -> &Arc<Readable> {
+        &self.readable
+    }
+
     /// A critical I/O error outside the store (a page or large message
     /// file): no more writes are taken, as after one of the store's own.
     pub fn stop(&self) {
@@ -218,11 +284,14 @@ impl Writes {
     }
 
     /// Queues a unit, waiting while too much is unwritten.
-    pub fn send(&self, unit: Unit) -> Result<(), JournalError> {
-        if self.failed.load(Ordering::Acquire) {
-            return Err(JournalError::IllegalState(
+    pub fn send(&self, mut unit: Unit) -> Result<(), JournalError> {
+        let failed = || {
+            Err(JournalError::IllegalState(
                 "the database store has failed".into(),
-            ));
+            ))
+        };
+        if self.failed.load(Ordering::Acquire) {
+            return failed();
         }
         let credits = &self.pending;
         if credits.count.load(Ordering::Acquire) >= credits.max {
@@ -236,6 +305,23 @@ impl Writes {
                     .unwrap_or_else(|e| e.into_inner())
                     .0;
             }
+            // Woken by the failure, not by room.
+            if self.failed.load(Ordering::Acquire) {
+                return failed();
+            }
+        }
+        let (lowest, every_queue) = Readable::of(&unit.ops);
+        if !lowest.is_empty() || every_queue {
+            let readable = self.readable.clone();
+            let done = unit.done.take();
+            unit.done = Some(Box::new(move |r| {
+                if r.is_ok() {
+                    readable.add(&lowest, every_queue);
+                }
+                if let Some(done) = done {
+                    done(r);
+                }
+            }));
         }
         credits
             .count
@@ -343,6 +429,7 @@ pub async fn start(
         sender,
         pending,
         failed,
+        readable: Arc::new(Readable::default()),
     })
 }
 
@@ -1224,6 +1311,76 @@ mod tests {
             done: None,
             barrier: false,
         }
+    }
+
+    fn writes(count: usize, max: usize) -> (Writes, mpsc::UnboundedReceiver<Unit>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let writes = Writes {
+            sender,
+            pending: Arc::new(Credits {
+                count: AtomicUsize::new(count),
+                max,
+                lock: Mutex::new(()),
+                freed: Condvar::new(),
+            }),
+            failed: Arc::new(AtomicBool::new(false)),
+            readable: Arc::new(Readable::default()),
+        };
+        (writes, receiver)
+    }
+
+    /// A send waiting for room is refused when the store fails meanwhile.
+    #[test]
+    fn a_send_woken_by_the_failure_is_refused() {
+        let (writes, mut receiver) = writes(1, 1);
+        let writes = Arc::new(writes);
+        let stopper = writes.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            stopper.stop();
+        });
+        assert!(
+            writes
+                .send(unit(vec![Op::DeleteMessage { id: 1 }]))
+                .is_err()
+        );
+        t.join().unwrap();
+        assert!(receiver.try_recv().is_err(), "nothing queued");
+    }
+
+    /// A paged reference written late, below what its queue has read, is
+    /// reported once its write is done; a prepared commit sends every queue
+    /// back to the start.
+    #[test]
+    fn late_paged_references_are_reported_once_written() {
+        let (writes, mut receiver) = writes(0, 100);
+        let paged = |message| Op::Reference {
+            message,
+            queue: 5,
+            tx: None,
+            paged: true,
+        };
+        writes.send(unit(vec![paged(9), paged(4)])).unwrap();
+        assert_eq!(writes.readable().take(5), (None, 0), "not yet written");
+        let u = receiver.try_recv().unwrap();
+        (u.done.unwrap())(Ok(()));
+        assert_eq!(writes.readable().take(5), (Some(4), 0));
+        assert_eq!(writes.readable().take(5), (None, 0), "reported once");
+
+        writes.send(unit(vec![paged(2)])).unwrap();
+        let u = receiver.try_recv().unwrap();
+        (u.done.unwrap())(Err(JournalError::IllegalState("x".into())));
+        assert_eq!(writes.readable().take(5), (None, 0), "not written");
+
+        writes
+            .send(unit(vec![Op::Finish {
+                tx: 3,
+                commit: true,
+            }]))
+            .unwrap();
+        let u = receiver.try_recv().unwrap();
+        (u.done.unwrap())(Ok(()));
+        assert_eq!(writes.readable().take(5), (None, 1));
     }
 
     /// Deleting a binding deletes its queue's paged references: it waits

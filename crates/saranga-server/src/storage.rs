@@ -180,6 +180,28 @@ pub fn encode_xid(xid: &Xid) -> Vec<u8> {
     w.into_vec()
 }
 
+/// A message no reference is left on, as it is deleted at start:
+/// `largeMessageWithNoRef` for a large one, `journalUnreferencedMessage` else.
+pub fn log_unreferenced(id: i64, large: bool) {
+    if large {
+        tracing::info!(
+            "AMQ221018: Large message: {id} did not have any associated reference, file will be deleted"
+        );
+    } else {
+        tracing::info!("AMQ221019: Deleting unreferenced message id={id} from the journal");
+    }
+}
+
+/// `HeuristicCompletionEncoding`: the Xid, then `isCommit` written as
+/// `ActiveMQBuffer.writeBoolean` writes it (`0xFF` for true).
+pub fn encode_heuristic_completion(xid: &Xid, commit: bool) -> Vec<u8> {
+    use saranga_buffer::Codec;
+    let mut w = Writer::new();
+    xid.write(&mut w);
+    w.bool(commit);
+    w.into_vec()
+}
+
 pub fn decode_xid(data: &[u8]) -> StoreResult<Xid> {
     use saranga_buffer::Codec;
     Xid::read(&mut Reader::new(data)).map_err(|e| JournalError::Corrupt(format!("xid: {e}")))
@@ -619,5 +641,26 @@ impl std::ops::Deref for Storage {
 
     fn deref(&self) -> &Self::Target {
         &*self.0
+    }
+}
+
+#[cfg(test)]
+mod heuristic_completion_tests {
+    use saranga_storage::codec::{HeuristicCompletionEncoding, RecordCodec};
+
+    #[test]
+    fn a_heuristic_commit_is_written_as_artemis_writes_a_boolean() {
+        let xid = super::Xid {
+            format_id: 7,
+            branch_qualifier: b"b".to_vec(),
+            global_transaction_id: b"g".to_vec(),
+        };
+        let body = super::encode_heuristic_completion(&xid, true);
+        assert_eq!(body.last(), Some(&0xFF));
+        let back = HeuristicCompletionEncoding::decode(&body).unwrap();
+        assert!(back.is_commit);
+        assert_eq!(back.xid.format_id, 7);
+        let body = super::encode_heuristic_completion(&xid, false);
+        assert_eq!(body.last(), Some(&0x00));
     }
 }

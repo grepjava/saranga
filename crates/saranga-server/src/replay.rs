@@ -54,7 +54,13 @@ pub async fn replay(
         filter,
         bodies: HashMap::new(),
     };
-    for file in history_files(&retention.directory) {
+    // Read off the broker's own threads: a retention directory holds many
+    // journal files.
+    let dir = retention.directory.clone();
+    let files = tokio::task::spawn_blocking(move || history_files(&dir))
+        .await
+        .unwrap_or_default();
+    for file in files {
         if start.is_some() || end.is_some() {
             let Some(t) =
                 saranga_journal::history_file_millis(PREFIX, &file.name, retention.local_offset)
@@ -67,7 +73,7 @@ pub async fn replay(
             }
         }
         tracing::debug!("Reading retention file {}", file.name);
-        for record in file.records() {
+        for record in file.records().await {
             replay.read(&file, record).await;
         }
     }
@@ -89,8 +95,9 @@ struct HistoryFile {
 
 impl HistoryFile {
     /// `readJournalFile`: its records, events included.
-    fn records(&self) -> Vec<Record> {
-        let Ok(bytes) = std::fs::read(&self.path) else {
+    async fn records(&self) -> Vec<Record> {
+        let path = self.path.clone();
+        let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || std::fs::read(path)).await else {
             return Vec::new();
         };
         let Ok(header) = FileHeader::decode(&bytes, 0) else {
@@ -228,7 +235,7 @@ impl Replay<'_> {
             let id = self.broker.post_office().ids().next();
             // `_AMQ_LARGE_SIZE`: the bytes the body was stored with.
             let size = crate::message::long_property(&core, crate::message::HDR_LARGE_BODY_SIZE);
-            let Some(body) = self.body(original, id, core.durable, size) else {
+            let Some(body) = self.body(original, id, core.durable, size).await else {
                 return;
             };
             ServerMessage::new_large(core, body)
@@ -264,7 +271,7 @@ impl Replay<'_> {
                 }
             }
             let id = self.broker.post_office().ids().next();
-            let Some(body) = self.body(original, id, record.is_durable(), None) else {
+            let Some(body) = self.body(original, id, record.is_durable(), None).await else {
                 return;
             };
             // Its record keeps no size, but it says how the file begins: a
@@ -297,7 +304,7 @@ impl Replay<'_> {
     /// earlier file with some of it was removed): fewer bytes than `size`,
     /// the size it was stored with, when known, or none at all. Artemis
     /// replays whatever part is left as if it were the message.
-    fn body(
+    async fn body(
         &mut self,
         original: i64,
         id: i64,
@@ -313,21 +320,39 @@ impl Replay<'_> {
         };
         let mut read: i64 = 0;
         for file in self.bodies.remove(&original).unwrap_or_default().values() {
-            for r in file.records() {
-                if let Record::Event {
-                    id,
-                    user_type: ids::ADD_MESSAGE_BODY,
-                    data,
-                } = r
-                    && id == original
-                {
-                    if let Err(e) = writer.append(&data) {
-                        tracing::warn!("replay: large message {original}: {e}");
-                        return None;
-                    }
-                    read += data.len() as i64;
+            let chunks: Vec<Vec<u8>> = file
+                .records()
+                .await
+                .into_iter()
+                .filter_map(|r| match r {
+                    Record::Event {
+                        id,
+                        user_type: ids::ADD_MESSAGE_BODY,
+                        data,
+                    } if id == original => Some(data),
+                    _ => None,
+                })
+                .collect();
+            read += chunks.iter().map(|c| c.len() as i64).sum::<i64>();
+            // Written off the broker's own threads, a file's worth at a time.
+            let written = tokio::task::spawn_blocking(move || {
+                for c in &chunks {
+                    writer.append(c)?;
                 }
-            }
+                Ok::<_, std::io::Error>(writer)
+            })
+            .await;
+            writer = match written {
+                Ok(Ok(w)) => w,
+                Ok(Err(e)) => {
+                    tracing::warn!("replay: large message {original}: {e}");
+                    return None;
+                }
+                Err(e) => {
+                    tracing::warn!("replay: large message {original}: {e}");
+                    return None;
+                }
+            };
         }
         let whole = match size {
             Some(size) => read == size,
