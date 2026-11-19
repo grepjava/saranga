@@ -898,7 +898,18 @@ impl DatabaseStorage {
             }
             ops
         } else if commit {
-            let mut ops = open.ops;
+            // An acknowledgement takes its reference's side records
+            // (delivery count, scheduled time) with it, as outside a
+            // transaction: now, as a rollback keeps them.
+            let mut ops = Vec::with_capacity(open.ops.len() + open.deletes.len());
+            for op in open.ops {
+                match op {
+                    Op::Unreference { message, queue } => {
+                        ops.extend(self.unreference(queue, message));
+                    }
+                    other => ops.push(other),
+                }
+            }
             ops.extend(open.deletes);
             ops
         } else {
@@ -1771,8 +1782,10 @@ impl Store for DatabaseStorage {
             .values()
             .flat_map(|q| q.iter().map(|r| r.message_id))
             .collect();
+        // A prepared branch's paged sends are its own until it ends.
         for p in &out.prepared {
             referenced.extend(p.sends.iter().map(|(_, m)| *m));
+            referenced.extend(p.paged_sends.iter().map(|(_, m)| *m));
             referenced.extend(p.acks.iter().map(|(_, m)| *m));
         }
         let unreferenced: Vec<i64> = out

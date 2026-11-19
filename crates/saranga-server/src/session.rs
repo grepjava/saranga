@@ -1250,8 +1250,8 @@ impl ServerSession {
         Ok(())
     }
 
-    /// Gives back what came to a transaction after it was rolled back
-    /// ([`Transaction::sweep_rolled_back`]).
+    /// Gives back what came to a transaction after it ended
+    /// ([`Transaction::sweep_ended`]).
     fn apply_swept(&mut self, outcome: Outcome) {
         let waits = outcome.apply();
         if !waits.is_empty() {
@@ -1436,13 +1436,17 @@ impl ServerSession {
     /// manager rolled back (its XA timeout) goes in a new one rolled back
     /// at once: the message is dropped and nothing stays counted, as
     /// Artemis's `addOperation` on a rolled-back transaction runs the
-    /// operation's `afterRollback` at once.
+    /// operation's `afterRollback` at once. One in a transaction another
+    /// session committed already goes on its own, as `addOperation` on a
+    /// committed transaction runs `afterCommit` at once: delivered, not
+    /// left counted in a transaction that never commits again.
     async fn send_message(
         &mut self,
         message: CoreMessage,
         outgoing: Outgoing,
         tx: Option<TxRef>,
     ) -> Result<()> {
+        let tx = tx.filter(|t| transaction::lock(t).state != TxState::Committed);
         let dead = self.dead_tx(tx.as_ref());
         let tx = dead.clone().or(tx);
         let sent = self.send_message_in(message, outgoing, tx).await;
@@ -1453,11 +1457,17 @@ impl ServerSession {
     }
 
     /// A new transaction for work given `tx` once the resource manager
-    /// rolled it back (an XA timeout): the session keeps the transaction
-    /// until the client ends it, but nothing may join it any more.
+    /// rolled it back (an XA timeout), or another session committed it: the
+    /// session keeps the transaction until the client ends it, but nothing
+    /// may join it any more.
     fn dead_tx(&self, tx: Option<&TxRef>) -> Option<TxRef> {
-        tx.filter(|tx| transaction::lock(tx).state == TxState::RolledBack)
-            .map(|_| self.new_tx(None))
+        tx.filter(|tx| {
+            matches!(
+                transaction::lock(tx).state,
+                TxState::RolledBack | TxState::Committed
+            )
+        })
+        .map(|_| self.new_tx(None))
     }
 
     /// Rolls back a [`dead_tx`](Self::dead_tx)'s replacement.
@@ -2135,6 +2145,12 @@ impl ServerSession {
             }
             Some(tx) => {
                 let mut t = transaction::lock(&tx);
+                // Committed by another session since the send looked at it:
+                // the message goes on its own (see `send_message`).
+                if t.state == TxState::Committed {
+                    drop(t);
+                    return self.deliver_routed(routed, None, own_tx);
+                }
                 for (r, queues) in routed {
                     let message = &r.message;
                     for q in queues.iter().filter(|q| q.is_durable_ref(&r)) {
@@ -2163,7 +2179,7 @@ impl ServerSession {
                 }
                 // The reaper may have rolled the transaction back since the
                 // send looked at it: what it added goes as the rollback's.
-                let swept = t.sweep_rolled_back();
+                let swept = t.sweep_ended();
                 drop(t);
                 if let Some(o) = swept {
                     self.apply_swept(o);
@@ -2407,7 +2423,7 @@ impl ServerSession {
                             }
                         }
                         t.acks.extend(refs.into_iter().map(|r| (queue.clone(), r)));
-                        let swept = t.sweep_rolled_back();
+                        let swept = t.sweep_ended();
                         drop(t);
                         if let Some(o) = swept {
                             self.apply_swept(o);
@@ -4214,18 +4230,18 @@ mod tests {
         let q = broker.post_office().create_queue(spec, false).unwrap();
         let tx = Transaction::new_ref(1, None);
         let mut t = transaction::lock(&tx);
-        assert!(t.sweep_rolled_back().is_none(), "active");
+        assert!(t.sweep_ended().is_none(), "active");
         t.state = TxState::RolledBack;
-        assert!(t.sweep_rolled_back().is_none(), "nothing came");
+        assert!(t.sweep_ended().is_none(), "nothing came");
         let r = MessageRef::new(ServerMessage::new(CoreMessage::default()));
         t.acks.push((q.clone(), r.clone()));
         q.ref_up(&r);
         t.sends.push((q.clone(), r));
-        let o = t.sweep_rolled_back().unwrap();
+        let o = t.sweep_ended().unwrap();
         assert!(o.record.is_none() && o.add.is_empty());
         assert_eq!(o.cancel.len(), 1);
         assert!(t.sends.is_empty() && t.acks.is_empty());
-        assert!(t.sweep_rolled_back().is_none(), "swept once");
+        assert!(t.sweep_ended().is_none(), "swept once");
         drop(t);
         broker.stop().unwrap();
     }

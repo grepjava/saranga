@@ -326,21 +326,27 @@ impl Transaction {
     /// already (`addOperation` on a `ROLLEDBACK` transaction runs the
     /// operation's `afterRollback` at once): the sends go, what was
     /// acknowledged or browsed goes back to its queues, its paging is rolled
-    /// back. The rollback's record was written already. `None` if the
-    /// transaction is not rolled back, or nothing came since.
-    pub fn sweep_rolled_back(&mut self) -> Option<Outcome> {
+    /// back. The rollback's record was written already. The same for one
+    /// another session committed meanwhile, which keeps its state: its
+    /// commit is written, and what came after it is not in it (Artemis
+    /// leaves such an acknowledgement in a transaction that never ends, the
+    /// message neither acknowledged nor delivered again). `None` if the
+    /// transaction has not ended, or nothing came since.
+    pub fn sweep_ended(&mut self) -> Option<Outcome> {
         let p = &self.paging;
         let paged = !p.page_txs.is_empty()
             || !p.stores.is_empty()
             || !p.updates.is_empty()
             || !p.stored.is_empty()
             || !p.waiting.is_empty();
-        if self.state != TxState::RolledBack
+        if !matches!(self.state, TxState::RolledBack | TxState::Committed)
             || (self.sends.is_empty() && self.acks.is_empty() && self.browsed.is_empty() && !paged)
         {
             return None;
         }
+        let state = self.state;
         let mut outcome = self.internal_rollback();
+        self.state = state;
         outcome.record = None;
         Some(outcome)
     }

@@ -476,6 +476,7 @@ async fn serve<S>(
         shared,
         sessions: HashMap::new(),
         session_tasks: Vec::new(),
+        replaced: Vec::new(),
         ttl,
         topology_subscribed: false,
         acceptor,
@@ -572,6 +573,11 @@ struct Connection {
     shared: Arc<ConnShared>,
     sessions: HashMap<i64, SessionLink>,
     session_tasks: Vec<JoinHandle<()>>,
+    /// Sessions a CreateSession on their channel replaced: no packet
+    /// reaches them any more, but they live on until the connection fails,
+    /// as Artemis's replaced `ServerSessionImpl` does (a failure listener
+    /// of the connection).
+    replaced: Vec<mpsc::UnboundedSender<SessionInput>>,
     /// The connection TTL in milliseconds; -1 never expires.
     ttl: i64,
     topology_subscribed: bool,
@@ -1243,14 +1249,16 @@ impl Connection {
             context,
             session.run(rx, backlog.clone()),
         )));
-        self.sessions.insert(
+        if let Some(old) = self.sessions.insert(
             channel_id,
             SessionLink {
                 tx,
                 backlog,
                 blocked,
             },
-        );
+        ) {
+            self.replaced.push(old.tx);
+        }
         self.shared.send(
             CHANNEL_SESSION,
             CreateSessionResponseMessage {
@@ -1419,6 +1427,9 @@ impl Connection {
         }
         for (_, session) in self.sessions.drain() {
             let _ = session.tx.send(SessionInput::ConnectionFailed);
+        }
+        for tx in self.replaced.drain(..) {
+            let _ = tx.send(SessionInput::ConnectionFailed);
         }
         for task in self.session_tasks.drain(..) {
             let _ = task.await;

@@ -17,6 +17,12 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **Journal retention and replication**: the journal file closed when a backup starts to synchronize is copied to the retention directory at once, so the name the backup is sent stays the file's name; before, a rollover under load renamed the file back while it was being sent, and the backup could not synchronize.
+- **Database store**: a message acknowledged in a local transaction takes its delivery-count and scheduled-time rows with it at the commit, as one acknowledged outside a transaction does, instead of leaving them (and their bookkeeping in memory) until a restart. A prepared XA branch's paged messages are no longer deleted as unreferenced when the broker starts, which rolled the branch back.
+- **Routing**: the round-robin positions of an address's bindings go with the address, and with the last binding of a routing name, instead of piling up for every address routed to (an MQTT or JMS wildcard subscription with many topics, say).
+- **XA**: a message sent in a branch another session has already committed is delivered, as Artemis delivers it, instead of being lost while still counted against its address; a message acknowledged in such a branch goes back to its queue (issue 125).
+- **Core**: a second CreateSession on a session channel in use no longer leaves the session it replaced running after the connection closes, which kept the connection's teardown (its temporary queues, its registration) from finishing.
+- **TLS**: `sslHandshakeTimeout=0` means no timeout, as in Artemis, instead of failing every handshake.
 - **Paging**: a page removed from the middle of the stream (all its messages consumed or removed) is no longer counted out a second time when the regular cleanup reaches it, which stopped paging with messages left in the current page.
 - **A move whose source queue is deleted while its journal write is on its way** (an expiry, a dead-letter move, redistribution, a management move or copy) reaches its target: the queue finishes the move before it stops, instead of the copies appearing only after a restart.
 - **`_AMQ_ROUTE_TO` and wildcard addresses**: a message naming a queue bound to a wildcard address that matches its address reaches it, and an exclusive divert on such a wildcard address takes it first, as for a plain message; another broker's queue on a wildcard address takes the matching addresses' messages, and redistributes them, too.

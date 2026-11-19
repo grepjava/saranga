@@ -259,3 +259,40 @@ fn a_record_that_cannot_be_stored_is_not_replicated() {
     assert!(j.append_add(1, 30, vec![0; size], true, None).is_err());
     assert_eq!(collect.0.lock().unwrap().len(), before, "not replicated");
 }
+
+/// With journal retention, the file closed at replication start is renamed
+/// `<name>.bkp` until copied, and renamed back at the next rollover: the
+/// names handed to the sync are those the files keep while it sends them.
+#[test]
+fn file_names_handed_to_a_sync_stay_with_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let history = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.compact_min_files = 0;
+    cfg.retention = Some(saranga_journal::Retention {
+        directory: history.path().into(),
+        max_bytes: -1,
+        period_millis: -1,
+        local_offset: |_| 0,
+    });
+    let j = Journal::open(cfg).unwrap();
+    j.load_all().unwrap();
+    for i in 0..10 {
+        j.append_add(i, 1, vec![0; 1000], false, None).unwrap();
+    }
+    let files = j
+        .start_replication(Arc::new(Collect::default()), |_| {})
+        .unwrap();
+    // The primary keeps taking appends (and rolls its file) while the
+    // files are being sent.
+    for i in 100..300 {
+        j.append_add(i, 1, vec![0; 1000], false, None).unwrap();
+    }
+    for f in &files {
+        assert!(
+            dir.path().join(&f.name).exists(),
+            "{} handed to the sync is gone",
+            f.name
+        );
+    }
+}

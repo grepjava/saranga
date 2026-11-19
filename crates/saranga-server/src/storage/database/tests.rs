@@ -352,6 +352,72 @@ fn scheduled_time_survives_and_goes_with_the_reference() {
     assert!(r.queues.is_empty() && r.messages.is_empty() && r.extra.is_empty());
 }
 
+/// An acknowledgement in a transaction takes the reference's side records
+/// with it at the commit, as one outside a transaction does; a rollback
+/// keeps them.
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn a_transactional_ack_takes_the_side_records() {
+    let f = Fixture::new();
+    let (s, _) = f.start();
+    for id in [30, 31] {
+        s.store_message(&message(id)).unwrap();
+        wait(s.store_reference(1, id, true).unwrap());
+        assert!(s.update_delivery_count(1, id, 2, 0).unwrap());
+        wait(
+            s.update_scheduled_delivery_time(1, id, 1234, 0)
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    // Rolled back: kept.
+    let tx = s.generate_id();
+    s.store_acknowledge_tx(tx, 1, 31).unwrap();
+    wait(s.rollback(tx).unwrap());
+    // Committed: gone.
+    let tx = s.generate_id();
+    s.store_acknowledge_tx(tx, 1, 30).unwrap();
+    wait(s.commit(tx).unwrap());
+    assert!(!s.sides.lock().unwrap().contains_key(&(30, 1)));
+    assert!(s.sides.lock().unwrap().contains_key(&(31, 1)));
+    s.delete_message(30).unwrap();
+    s.settle().unwrap();
+    assert_eq!(
+        side_rows(&s, 30),
+        0,
+        "the acknowledged reference's records are left"
+    );
+    assert_eq!(side_rows(&s, 31), 2);
+    s.stop().unwrap();
+    drop(s);
+
+    let (_s, r) = f.start();
+    assert_eq!(counted(&r, 1), vec![(31, 2)]);
+    assert_eq!(r.queues[&1][0].scheduled_time, 1234);
+}
+
+/// The side records (delivery count, scheduled time) of a message's
+/// references.
+fn side_rows(s: &DatabaseStorage, message: i64) -> i64 {
+    let connection = s.connection.clone();
+    s.run(async move {
+        let client = writer::connect(&connection).await.map_err(io_error)?;
+        let row = client
+            .query_one(
+                "SELECT COUNT(*) FROM DB_BROKER_DATA WHERE RECORD_TYPE IN ($1, $2)                  AND substring(DATA_RECORD from 1 for 8) = $3",
+                &[
+                    &i16::from(ids::UPDATE_DELIVERY_COUNT),
+                    &i16::from(ids::SET_SCHEDULED_DELIVERY_TIME),
+                    &message.to_be_bytes().to_vec(),
+                ],
+            )
+            .await
+            .map_err(io_error)?;
+        Ok(row.get(0))
+    })
+    .unwrap()
+}
+
 #[test]
 #[ignore = "needs PostgreSQL"]
 fn a_transaction_is_all_or_nothing() {

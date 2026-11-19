@@ -53,7 +53,8 @@ pub struct TlsSettings {
     pub enabled_cipher_suites: Option<Vec<String>>,
     pub sni_host: Option<String>,
     pub auto_reload: bool,
-    pub handshake_timeout: Duration,
+    /// `sslHandshakeTimeout`; 0 is none, as Netty's `SslHandler` takes it.
+    pub handshake_timeout: Option<Duration>,
 }
 
 impl TlsSettings {
@@ -124,7 +125,7 @@ impl TlsSettings {
             enabled_cipher_suites: list("enabledCipherSuites"),
             sni_host: param("sniHost"),
             auto_reload: flag("sslAutoReload"),
-            handshake_timeout: Duration::from_secs(timeout),
+            handshake_timeout: (timeout > 0).then(|| Duration::from_secs(timeout)),
         }))
     }
 
@@ -337,7 +338,10 @@ impl TlsAcceptor {
     /// The TLS handshake, within `sslHandshakeTimeout`.
     pub async fn accept(&self, stream: TcpStream) -> std::io::Result<TlsStream<TcpStream>> {
         let acceptor = tokio_rustls::TlsAcceptor::from(self.config());
-        match tokio::time::timeout(self.settings.handshake_timeout, acceptor.accept(stream)).await {
+        let Some(limit) = self.settings.handshake_timeout else {
+            return acceptor.accept(stream).await;
+        };
+        match tokio::time::timeout(limit, acceptor.accept(stream)).await {
             Ok(result) => result,
             Err(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,

@@ -259,3 +259,16 @@ async fn auto_reload() {
     acceptor.reload_if_changed();
     assert!(connect(acceptor, None, "localhost").await.ok);
 }
+
+/// `sslHandshakeTimeout=0` is no timeout (Netty's `SslHandler` takes 0 or
+/// less as none; Artemis refuses only a negative value), not one that every
+/// handshake misses.
+#[tokio::test]
+async fn a_zero_handshake_timeout_is_none() {
+    let mut p = server_params();
+    p.push(("sslHandshakeTimeout", "0".into()));
+    let s = settings(&p);
+    assert_eq!(s.handshake_timeout, None);
+    let o = connect(TlsAcceptor::new(s).unwrap(), None, "localhost").await;
+    assert!(o.ok);
+}

@@ -1480,6 +1480,7 @@ impl PostOffice {
                 }
                 let info = state.addresses.remove(name).map(|e| e.info);
                 drop(state);
+                self.forget_positions(|k| *k.0 != *name);
                 // deletePageStore.
                 self.paging().delete_store(name);
                 self.remove_retroactive_resources(name);
@@ -1492,6 +1493,13 @@ impl PostOffice {
                     }
                 }
                 true
+            }
+            // Positions a route to it left, as Artemis's lazily made
+            // Bindings of an address that never was go with it.
+            None => {
+                drop(state);
+                self.forget_positions(|k| *k.0 != *name);
+                false
             }
             _ => false,
         }
@@ -1844,6 +1852,18 @@ impl PostOffice {
             if let Some(entry) = state.addresses.get_mut(&address) {
                 entry.queues.retain(|q| q != &queue);
                 entry.binding_removed_at = crate::message::now_millis();
+            }
+            let routing = self::routing_name(&queue);
+            let still_bound = state.addresses.get(&address).is_some_and(|e| {
+                e.queues.iter().any(|q| self::routing_name(q) == routing)
+                    || e.diverts.iter().any(|d| *d.routing_name == *routing)
+            }) || self
+                .bound_remote(&state, &address)
+                .iter()
+                .any(|r| **r.routing_name() == *routing);
+            drop(state);
+            if !still_bound {
+                self.forget_positions(|k| *k.0 != *address || *k.1 != *routing);
             }
         }
         if queue.is_durable()
@@ -3467,8 +3487,27 @@ impl PostOffice {
         if position != 0 {
             self.balanced.store(true, Ordering::Relaxed);
         }
-        positions.insert(key.clone(), position);
+        set_position(&mut positions, key, position);
         Some(i)
+    }
+
+    /// How many round-robin positions are kept (for tests).
+    #[doc(hidden)]
+    pub fn routing_positions(&self) -> usize {
+        self.positions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// The round-robin positions of an address go with it (Artemis keeps
+    /// them in the address's `Bindings`), and those of a routing name with
+    /// its last binding there.
+    fn forget_positions(&self, keep: impl Fn(&(Name, Name)) -> bool) {
+        self.positions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| keep(k));
     }
 
     /// `routeUsingStrictOrdering` for one routing name: the binding the
@@ -3627,7 +3666,7 @@ impl PostOffice {
         let mut copy = MessageRef::new(copied);
         copy.scheduled_time = message.scheduled_time;
         let copy = clear_internal_properties(&copy).unwrap_or(copy);
-        positions.insert(key, position);
+        set_position(&mut positions, &key, position);
         match chosen {
             Bound::Local(q) => Some(vec![(copy, vec![q.clone()])]),
             Bound::Remote(r) => Some(vec![(
@@ -3745,6 +3784,16 @@ pub struct PageRouted {
 
 fn routing_type_of(message: &saranga_message::CoreMessage) -> Option<RoutingType> {
     routing_type(message)
+}
+
+/// A round-robin position: 0, where every group starts, is not kept, so
+/// a routing name with one binding (the usual case) leaves nothing.
+fn set_position(positions: &mut HashMap<(Name, Name), usize>, key: &(Name, Name), at: usize) {
+    if at == 0 {
+        positions.remove(key);
+    } else {
+        positions.insert(key.clone(), at);
+    }
 }
 
 /// `LocalQueueBinding.getRoutingName`: an anycast queue's address, a

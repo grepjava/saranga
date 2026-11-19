@@ -998,6 +998,13 @@ impl Journal {
             inner
                 .move_next_file(&self.writer, false)
                 .map_err(|e| self.writer.critical(e, None))?;
+            // With retention, the file just closed is `<name>.bkp` until it
+            // is copied, and a later rollover renames it back: the copy is
+            // made now, so every name handed out stays the file's name
+            // (`checkRetentionFile`).
+            inner
+                .process_backup(&self.writer)
+                .map_err(|e| self.writer.critical(e, None))?;
             let files: Vec<JournalFileInfo> = inner
                 .data_files
                 .iter()
