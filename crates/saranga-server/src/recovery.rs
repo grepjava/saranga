@@ -174,7 +174,7 @@ pub fn load_bindings(
                 let d = saranga_storage::codec::PersistedDivertConfiguration::decode(&r.data)
                     .map_err(|e| corrupt("divert", e))?;
                 let d = crate::postoffice::DivertDeployment::from_record(&d);
-                post_office.reload_divert_record(r.id, &d.name);
+                post_office.reload_divert_record(r.id, &d);
                 out.diverts.push(d);
             }
             ids::BRIDGE_RECORD => {

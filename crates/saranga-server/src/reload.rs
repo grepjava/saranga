@@ -374,8 +374,11 @@ pub(crate) fn undeploy_not_configured(
 }
 
 /// The divert part of `deployReloadableConfigFromConfiguration`: new
-/// diverts are deployed, changed ones replaced and those no longer
-/// configured destroyed.
+/// diverts are deployed; one whose address and exclusivity are the same is
+/// updated in place (so it never stops routing), another replaced; the
+/// rest are unbound, their records kept, and then `recoverStoredDiverts`
+/// deploys again every journaled divert the file does not have (one that
+/// management made, say), unless its address deletes them.
 fn reconcile_diverts(
     post_office: &PostOffice,
     diverts: &[DivertDeployment],
@@ -390,17 +393,47 @@ fn reconcile_diverts(
         to_remove.retain(|n| **n != *d.name);
         let mut d = d.clone();
         if let Some(existing) = post_office.divert(&d.name) {
+            if existing.exclusive == d.exclusive && *existing.address == *d.address {
+                if let Err(e) = post_office.update_divert(d.clone(), transformers) {
+                    tracing::warn!("divert {}: {e}", d.name);
+                }
+                continue;
+            }
             // `updateDivert` keeps the divert's routing name.
             if d.routing_name.as_deref().is_none_or(str::is_empty) {
                 d.routing_name = Some(existing.routing_name.to_string());
             }
-            post_office.destroy_divert(&d.name);
+            post_office.unbind_divert(&d.name);
         }
         if let Err(e) = post_office.deploy_divert_persisted(&d, transformers) {
             tracing::warn!("divert {}: {e}", d.name);
         }
     }
     for name in to_remove {
-        post_office.destroy_divert(&name);
+        post_office.unbind_divert(&name);
+    }
+    recover_stored_diverts(post_office, diverts, transformers);
+}
+
+/// `recoverStoredDiverts`: a journaled divert the configuration does not
+/// have is deployed again, or forgotten under `config-delete-diverts`
+/// FORCE.
+pub fn recover_stored_diverts(
+    post_office: &PostOffice,
+    configured: &[DivertDeployment],
+    transformers: &HashMap<String, TransformerFactory>,
+) {
+    for d in post_office.stored_diverts() {
+        if configured.iter().any(|c| c.name == d.name) || post_office.divert(&d.name).is_some() {
+            continue;
+        }
+        if post_office.settings(&d.address).config_delete_diverts {
+            post_office.forget_divert_record(&d.name);
+        } else if let Err(e) = post_office.deploy_divert(&d, transformers) {
+            tracing::warn!(
+                "AMQ222314: Failed to recover stored divert configuration {}: {e}",
+                d.name
+            );
+        }
     }
 }

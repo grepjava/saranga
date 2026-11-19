@@ -7,7 +7,7 @@
 
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -504,6 +504,10 @@ pub struct WebSocketStream<S> {
     /// A close frame came: no more data.
     closed: bool,
     eof: bool,
+    /// The writer waiting for `out` to drain. Reading flushes `out` too,
+    /// and the socket keeps one write waker: a read whose flush took the
+    /// writer's place wakes it, so it is never left waiting.
+    writer: Option<Waker>,
 }
 
 impl<S> WebSocketStream<S> {
@@ -523,6 +527,7 @@ impl<S> WebSocketStream<S> {
             fragments: 0,
             closed: false,
             eof: false,
+            writer: None,
         }
     }
 
@@ -559,6 +564,27 @@ fn close_frame(out: &mut Vec<u8>, code: u16, reason: &str) {
 
 impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
     /// Writes what is queued. Ready once it is all out.
+    /// [`poll_flush_out`](Self::poll_flush_out) for the writer: a wait is
+    /// noted, for a read to wake it.
+    fn writer_flush_out(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let r = self.poll_flush_out(cx);
+        if r.is_pending() {
+            self.writer = Some(cx.waker().clone());
+        }
+        r
+    }
+
+    /// [`poll_flush_out`](Self::poll_flush_out) for the reader: a writer
+    /// waiting is woken, as this flush may have taken its place on the
+    /// socket (or drained `out` for it).
+    fn reader_flush_out(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let r = self.poll_flush_out(cx);
+        if let Some(w) = self.writer.take() {
+            w.wake();
+        }
+        r
+    }
+
     fn poll_flush_out(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.out_at < self.out.len() {
             match Pin::new(&mut self.inner).poll_write(cx, &self.out[self.out_at..]) {
@@ -799,7 +825,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WebSocketStream<S> {
         loop {
             // Pongs and close replies go out as soon as they can.
             if !me.out.is_empty() {
-                let _ = me.poll_flush_out(cx);
+                let _ = me.reader_flush_out(cx);
             }
             if me.data_at < me.data.len() {
                 let n = (me.data.len() - me.data_at).min(buf.remaining());
@@ -809,7 +835,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WebSocketStream<S> {
             }
             if me.closed || me.eof {
                 if !me.out.is_empty() {
-                    return me.poll_flush_out(cx).map(|r| r.map(|_| ()));
+                    return me.reader_flush_out(cx).map(|r| r.map(|_| ()));
                 }
                 return Poll::Ready(Ok(()));
             }
@@ -818,7 +844,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WebSocketStream<S> {
                 continue;
             }
             if !me.out.is_empty() {
-                let _ = me.poll_flush_out(cx);
+                let _ = me.reader_flush_out(cx);
             }
             if me.data_at < me.data.len() || me.closed {
                 continue;
@@ -848,7 +874,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
     ) -> Poll<io::Result<usize>> {
         let me = &mut *self;
         if !me.out.is_empty() {
-            match me.poll_flush_out(cx) {
+            match me.writer_flush_out(cx) {
                 Poll::Ready(Ok(())) => {}
                 other => return other.map(|r| r.map(|_| 0)),
             }
@@ -873,13 +899,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
             me.out.extend_from_slice(c);
             opcode = 0x0;
         }
-        let _ = me.poll_flush_out(cx);
+        // What the socket does not take now goes with the next write or
+        // the flush the writer makes after it.
+        let _ = me.writer_flush_out(cx);
         Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let me = &mut *self;
-        match me.poll_flush_out(cx) {
+        match me.writer_flush_out(cx) {
             Poll::Ready(Ok(())) => Pin::new(&mut me.inner).poll_flush(cx),
             other => other,
         }
@@ -887,7 +915,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let me = &mut *self;
-        match me.poll_flush_out(cx) {
+        match me.writer_flush_out(cx) {
             Poll::Ready(Ok(())) => Pin::new(&mut me.inner).poll_shutdown(cx),
             other => other,
         }

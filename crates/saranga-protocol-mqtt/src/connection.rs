@@ -8,7 +8,7 @@
 //! client's subscriptions add to it too.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -185,7 +185,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
                     Some(r) => r,
                     None => {
                         if !broken && !buf.is_empty() {
-                            broken = wr.write_all(&buf).await.is_err();
+                            broken = wr.write_all(&buf).await.is_err() || wr.flush().await.is_err();
                         }
                         writability.written(buf.len());
                         buf.clear();
@@ -213,7 +213,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
         };
         if close || rx.is_empty() || buf.len() > 256 * 1024 {
             if !broken && !buf.is_empty() {
-                broken = wr.write_all(&buf).await.is_err();
+                broken = wr.write_all(&buf).await.is_err() || wr.flush().await.is_err();
             }
             writability.written(buf.len());
             buf.clear();
@@ -323,6 +323,9 @@ pub struct Shared {
     default_max_in_flight: i32,
     /// The session stopped: deliveries in flight are dropped.
     closed: AtomicBool,
+    /// Acknowledgements sent to their queue whose answer (`Event::Acked`,
+    /// which commits their transaction) is still to be handled.
+    acks_waiting: AtomicUsize,
 }
 
 /// `MQTTSessionCallback` for one consumer.
@@ -1657,6 +1660,8 @@ impl Core {
             let events = self.shared.events.clone();
             let held = tx.clone();
             let consumer = info.consumer_id;
+            self.shared.acks_waiting.fetch_add(1, Ordering::SeqCst);
+            let waiting = self.shared.clone();
             self.session.acknowledge_in_then(
                 consumer,
                 info.key.message_id,
@@ -1675,6 +1680,7 @@ impl Core {
                         pending, result, ..
                     })) = events.send(acked)
                     {
+                        waiting.acks_waiting.fetch_sub(1, Ordering::SeqCst);
                         pending.finish_alone(result);
                     }
                 },
@@ -1984,6 +1990,8 @@ struct Conn {
     closing: bool,
     /// A DISCONNECT with reason 0x04 asked for the will to be published.
     disconnect_with_will: bool,
+    /// What the queues tell the connection.
+    events_rx: mpsc::UnboundedReceiver<Event>,
 }
 
 /// Serves an MQTT connection until it closes.
@@ -2009,7 +2017,7 @@ pub async fn serve(
     let (direct, written) = DirectOut::new(&wr);
     let writability = Arc::new(Writability::of(&c.acceptor));
     let writer = tokio::spawn(write_loop(wr, out_rx, written, writability.clone()));
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     // createConnectionEntry: the server's keep-alive until CONNECT says.
     let ttl = match settings.server_keep_alive {
@@ -2043,6 +2051,7 @@ pub async fn serve(
         stopped: false,
         closing: false,
         disconnect_with_will: false,
+        events_rx,
     };
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut last_read = tokio::time::Instant::now();
@@ -2064,7 +2073,7 @@ pub async fn serve(
                     conn.disconnect(true).await;
                     break;
                 }
-                Some(event) = events_rx.recv() => conn.on_event(event).await,
+                Some(event) = conn.events_rx.recv() => conn.on_event(event).await,
                 Some(control) = control_rx.recv() => match control {
                     Control::TakeOver { done } => {
                         conn.taken_over().await;
@@ -2106,8 +2115,8 @@ pub async fn serve(
     .await;
     // Acknowledgements the queues answered are finished; any answering
     // later find the channel closed and finish on their own.
-    events_rx.close();
-    while let Ok(event) = events_rx.try_recv() {
+    conn.events_rx.close();
+    while let Ok(event) = conn.events_rx.try_recv() {
         if matches!(event, Event::Acked { .. } | Event::AckedAlone { .. }) {
             conn.on_event(event).await;
         }
@@ -2376,6 +2385,11 @@ impl Conn {
     }
 
     async fn on_event(&mut self, event: Event) {
+        if matches!(event, Event::Acked { .. })
+            && let Some(core) = &self.core
+        {
+            core.shared.acks_waiting.fetch_sub(1, Ordering::SeqCst);
+        }
         let Some(core) = &mut self.core else {
             // The session went before the queue answered.
             match event {
@@ -2729,6 +2743,7 @@ impl Conn {
             receive_maximum,
             default_max_in_flight: self.settings.default_maximum_in_flight,
             closed: AtomicBool::new(false),
+            acks_waiting: AtomicUsize::new(0),
         });
         let mut core = Core {
             session,
@@ -2856,6 +2871,20 @@ impl Conn {
             return;
         }
         self.stopped = true;
+        // Acknowledgements answered after the session went would finish
+        // without their transaction (the PUBREC cache entry, the deleted
+        // packet ID record): as Artemis commits it with the acknowledgement,
+        // their answers are handled first, and what came with them.
+        while self
+            .core
+            .as_ref()
+            .is_some_and(|c| c.shared.acks_waiting.load(Ordering::SeqCst) > 0)
+        {
+            match tokio::time::timeout(Duration::from_secs(10), self.events_rx.recv()).await {
+                Ok(Some(event)) => Box::pin(self.on_event(event)).await,
+                _ => break,
+            }
+        }
         let will = self.disconnect_with_will;
         self.disconnect_with_will = false;
         if let Some(mut core) = self.core.take() {

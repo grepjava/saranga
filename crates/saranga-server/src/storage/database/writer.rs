@@ -283,6 +283,11 @@ impl Writes {
         self.pending.freed.notify_all();
     }
 
+    /// Whether the store takes no more writes.
+    pub fn is_stopped(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
     /// Queues a unit, waiting while too much is unwritten.
     pub fn send(&self, mut unit: Unit) -> Result<(), JournalError> {
         let failed = || {

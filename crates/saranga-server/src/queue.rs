@@ -479,6 +479,15 @@ impl Shared {
     }
 }
 
+/// Why [`Queue::close_for_delete`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseRefused {
+    /// It has this many consumers.
+    Consumers(i32),
+    /// Another deletion has it.
+    Closed,
+}
+
 /// A handle to a queue actor.
 #[derive(Clone)]
 pub struct Queue(Arc<Shared>);
@@ -1007,12 +1016,16 @@ impl Queue {
     /// Closes the queue to new consumers for its deletion. With
     /// `check_consumers`, refused (with the count) while it has any; the
     /// check and the closing are one step against
-    /// [`add_consumer`](Self::add_consumer).
-    pub fn close_for_delete(&self, check_consumers: bool) -> std::result::Result<(), i32> {
+    /// [`add_consumer`](Self::add_consumer). Refused too for a queue another
+    /// deletion has closed already: one deletion takes it.
+    pub fn close_for_delete(&self, check_consumers: bool) -> std::result::Result<(), CloseRefused> {
         let mut closed = self.0.closed.lock().unwrap_or_else(|e| e.into_inner());
+        if *closed {
+            return Err(CloseRefused::Closed);
+        }
         let count = self.0.consumer_count.load(Ordering::SeqCst);
         if check_consumers && count > 0 {
-            return Err(count);
+            return Err(CloseRefused::Consumers(count));
         }
         *closed = true;
         Ok(())
@@ -2835,6 +2848,19 @@ impl Actor {
             }
             Cmd::Manage(op) => op(self),
             Cmd::Shutdown(then) => {
+                // A move or copy whose commit is on its way finishes first:
+                // its copies reach their queues, its originals are
+                // acknowledged. Its last step is queued to this actor before
+                // the commit counts as handed, so the shutdown sent again
+                // then comes after it.
+                if let Some(handed) = self.last_commit.take() {
+                    let queue = self.queue();
+                    tokio::spawn(async move {
+                        let _ = handed.await;
+                        queue.send(Cmd::Shutdown(then));
+                    });
+                    return true;
+                }
                 let durable = self.delete_all_references();
                 if let Some(then) = then {
                     then(durable);

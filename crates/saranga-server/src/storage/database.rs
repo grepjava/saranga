@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -509,7 +510,22 @@ impl DatabaseStorage {
         });
         let schema = connection.clone();
         let client_lock = LOCK_WAIT;
-        let lost = on_failure.clone();
+        // Losing the lock stops the writes before anything else: another
+        // broker may take the database at once. The writes may not be made
+        // yet when it goes; then they stop as soon as they are.
+        let lock_lost = Arc::new(AtomicBool::new(false));
+        let stopper: Arc<OnceLock<std::sync::Weak<Writes>>> = Arc::new(OnceLock::new());
+        let lost: Arc<dyn Fn(&JournalError) + Send + Sync> = {
+            let (lock_lost, stopper, on_failure) =
+                (lock_lost.clone(), stopper.clone(), on_failure.clone());
+            Arc::new(move |e| {
+                lock_lost.store(true, Ordering::Release);
+                if let Some(w) = stopper.get().and_then(std::sync::Weak::upgrade) {
+                    w.stop();
+                }
+                on_failure(e);
+            })
+        };
         let (started, setup) = std::sync::mpsc::channel();
         runtime.spawn(async move {
             let work = async move {
@@ -533,6 +549,10 @@ impl DatabaseStorage {
         let writes = Arc::new(setup.recv().unwrap_or_else(|_| {
             Err(JournalError::IllegalState("the store did not start".into()))
         })?);
+        let _ = stopper.set(Arc::downgrade(&writes));
+        if lock_lost.load(Ordering::Acquire) {
+            writes.stop();
+        }
         let readers: Arc<Readers> = Arc::new(
             (0..read_connections_of(database))
                 .map(|_| tokio::sync::Mutex::new(None))
@@ -772,6 +792,13 @@ impl DatabaseStorage {
         limit: i64,
         after: i64,
     ) -> StoreResult<Vec<(StoredMessage, bool)>> {
+        // Reading flips rows: none once the store has stopped (its lock may
+        // be another broker's by now).
+        if self.writes.is_stopped() {
+            return Err(JournalError::IllegalState(
+                "the database store has failed".into(),
+            ));
+        }
         let rows = {
             let (done, result) = std::sync::mpsc::channel();
             let readers = &self.readers;

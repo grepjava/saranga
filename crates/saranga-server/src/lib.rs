@@ -852,19 +852,7 @@ impl Broker {
         reload::deploy_queue_specs(&post_office, &config.legacy_queues);
         // recoverStoredDiverts: a journaled divert no longer configured is
         // deployed again, or forgotten under config-delete-diverts FORCE.
-        for d in &recovered.diverts {
-            if config.diverts.iter().any(|c| c.name == d.name) {
-                continue;
-            }
-            if post_office.settings(&d.address).config_delete_diverts {
-                post_office.forget_divert_record(&d.name);
-            } else if let Err(e) = post_office.deploy_divert(d, &config.transformers) {
-                tracing::warn!(
-                    "AMQ222314: Failed to recover stored divert configuration {}: {e}",
-                    d.name
-                );
-            }
-        }
+        reload::recover_stored_diverts(&post_office, &config.diverts, &config.transformers);
         for d in &config.diverts {
             if let Err(e) = post_office.deploy_divert_persisted(d, &config.transformers) {
                 tracing::warn!("divert {}: {e}", d.name);

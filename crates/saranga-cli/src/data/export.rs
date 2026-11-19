@@ -70,6 +70,7 @@ pub fn run(args: ExportArgs) -> anyhow::Result<()> {
         messages: BTreeMap::new(),
         refs: HashMap::new(),
         cursor_acks: HashMap::new(),
+        page_completes: HashMap::new(),
         page_txs: HashSet::new(),
         xml: Xml::new(std::io::BufWriter::new(out)),
         amqp: saranga_protocol_amqp::native::decoder(),
@@ -102,6 +103,7 @@ fn from_tables(
         messages: BTreeMap::new(),
         refs: HashMap::new(),
         cursor_acks: HashMap::new(),
+        page_completes: HashMap::new(),
         page_txs: HashSet::new(),
         xml: Xml::new(std::io::BufWriter::new(out)),
         amqp: saranga_protocol_amqp::native::decoder(),
@@ -143,6 +145,9 @@ struct Exporter<'a> {
     /// By message: the queue IDs referring to it, as first put.
     refs: HashMap<i64, Vec<i64>>,
     cursor_acks: HashMap<i64, HashSet<(i64, i32)>>,
+    /// The pages each queue has consumed whole (`PAGE_CURSOR_COMPLETE`),
+    /// whose individual cursor acknowledgements were deleted then.
+    page_completes: HashMap<i64, HashSet<i64>>,
     page_txs: HashSet<i64>,
     xml: Xml<std::io::BufWriter<Box<dyn Write + 'a>>>,
     amqp: std::sync::Arc<saranga_server::message::NativeDecoder>,
@@ -321,6 +326,13 @@ impl Exporter<'_> {
                         .entry(e.queue_id)
                         .or_default()
                         .insert((e.page_nr, e.message_nr));
+                }
+                ids::PAGE_CURSOR_COMPLETE => {
+                    let e = CursorAckRecordEncoding::decode(&r.data)?;
+                    self.page_completes
+                        .entry(e.queue_id)
+                        .or_default()
+                        .insert(e.page_nr);
                 }
                 ids::PAGE_TRANSACTION => {
                     let e = PageTransactionEncoding::decode(&r.data)?;
@@ -528,7 +540,11 @@ impl Exporter<'_> {
                         let acked = self
                             .cursor_acks
                             .get(q)
-                            .is_some_and(|s| s.contains(&(page_id, nr as i32)));
+                            .is_some_and(|s| s.contains(&(page_id, nr as i32)))
+                            || self
+                                .page_completes
+                                .get(q)
+                                .is_some_and(|s| s.contains(&page_id));
                         if acked {
                             continue;
                         }
@@ -816,5 +832,125 @@ impl<W: Write> Xml<W> {
     /// The output, unflushed.
     pub fn into_inner(self) -> W {
         self.out
+    }
+}
+
+#[cfg(test)]
+mod page_complete_tests {
+    use std::sync::Arc;
+
+    use clap::Parser;
+    use saranga_message::CoreMessage;
+    use saranga_server::management::Json;
+    use saranga_server::postoffice::{QueueSpec, SelectorFilters};
+    use saranga_server::session::{ClientConnection, ServerSession, SessionOptions, Transport};
+    use saranga_server::{Broker, BrokerConfig, RoutingType};
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: super::ExportArgs,
+    }
+
+    /// A queue that consumed whole pages has their cursor acknowledgements
+    /// replaced by `PAGE_CURSOR_COMPLETE`: their messages are not exported
+    /// for it, and another queue still holding them keeps them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn messages_of_a_completed_page_are_not_exported_for_the_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = saranga_config::BrokerConfig::parse(
+            r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+                 <persistence-enabled>true</persistence-enabled>
+                 <journal-file-size>102400</journal-file-size>
+                 <address-settings>
+                   <address-setting match="t">
+                     <max-size-bytes>1</max-size-bytes>
+                     <page-size-bytes>5000</page-size-bytes>
+                     <address-full-policy>PAGE</address-full-policy>
+                   </address-setting>
+                 </address-settings>
+               </core></configuration>"#,
+        )
+        .unwrap();
+        let config =
+            BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir.path()).unwrap();
+        let broker = Broker::start(config).await.unwrap();
+        let po = broker.post_office();
+        for q in ["s1", "s2"] {
+            let mut spec = QueueSpec::new(q, "t");
+            spec.auto_create_address = Some(true);
+            spec.routing_type = Some(RoutingType::Multicast);
+            spec.durable = true;
+            po.create_queue(spec, false).unwrap();
+        }
+        let conn = Arc::new(ClientConnection::new(
+            Transport::internal("test"),
+            Arc::new(Default::default()),
+            Vec::new(),
+        ));
+        let mut s = ServerSession::new(
+            broker.clone(),
+            conn,
+            SessionOptions {
+                name: "s".into(),
+                username: None,
+                password: None,
+                xa: false,
+                auto_commit_sends: true,
+                auto_commit_acks: true,
+                pre_acknowledge: false,
+                default_address: None,
+            },
+            Default::default(),
+        );
+        for _ in 0..40 {
+            let m = CoreMessage {
+                address: Some("t".into()),
+                durable: true,
+                body: vec![1u8; 1000].into(),
+                ..Default::default()
+            };
+            s.send(m, None).await.unwrap();
+            s.take_completion().wait().await.unwrap();
+        }
+        assert!(po.paging_store("t").is_paging());
+        broker
+            .management()
+            .invoke(
+                &broker,
+                "queue.s1",
+                "removeMessages",
+                &[Json::from("")],
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        s.close(false).await;
+        broker.stop().unwrap();
+        drop(broker);
+
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(data.join("large-messages")).unwrap();
+        let out = dir.path().join("out.xml");
+        let cli = Cli::parse_from([
+            "exp".as_ref(),
+            "--f".as_ref(),
+            "--bindings".as_ref(),
+            data.join("bindings").as_os_str(),
+            "--journal".as_ref(),
+            data.join("journal").as_os_str(),
+            "--paging".as_ref(),
+            data.join("paging").as_os_str(),
+            "--large-messages".as_ref(),
+            data.join("large-messages").as_os_str(),
+            "--output".as_ref(),
+            out.as_os_str(),
+        ]);
+        super::run(cli.args).unwrap();
+        let xml = std::fs::read_to_string(&out).unwrap();
+        let count = |q: &str| xml.matches(&format!("<queue name=\"{q}\"/>")).count();
+        assert_eq!(count("s1"), 0, "consumed messages exported");
+        assert_eq!(count("s2"), 40);
     }
 }

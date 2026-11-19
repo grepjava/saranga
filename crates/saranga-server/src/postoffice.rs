@@ -470,6 +470,9 @@ struct State {
     /// Remote queue bindings by address, in the order they came; an
     /// address need not exist here for the other broker's queues to.
     remote: HashMap<Name, Vec<Arc<crate::remote_binding::RemoteBinding>>>,
+    /// How many of `remote`'s addresses are wildcard addresses: only then
+    /// are they looked through for an address they match.
+    wild_remote: usize,
     /// `BindingsImpl.messageLoadBalancingType` by address: `OFF` until a
     /// remote binding brings its cluster connection's.
     load_balancing: HashMap<Name, saranga_config::MessageLoadBalancing>,
@@ -533,7 +536,9 @@ pub struct PostOffice {
 #[derive(Default)]
 struct Persisted {
     address_settings: HashMap<String, i64>,
-    diverts: HashMap<String, i64>,
+    /// Each journaled divert's record and configuration
+    /// (`mapPersistedDivertConfigurations`).
+    diverts: HashMap<String, (i64, DivertDeployment)>,
 }
 
 impl PostOffice {
@@ -746,9 +751,13 @@ impl PostOffice {
             state
                 .load_balancing
                 .insert(binding.address().clone(), binding.load_balancing());
+            let address = binding.address().clone();
+            if !state.remote.contains_key(&address) && self.wildcard.is_wild(&address) {
+                state.wild_remote += 1;
+            }
             state
                 .remote
-                .entry(binding.address().clone())
+                .entry(address)
                 .or_default()
                 .push(binding.clone());
         }
@@ -787,6 +796,9 @@ impl PostOffice {
             let b = bindings.remove(i);
             if bindings.is_empty() {
                 state.remote.remove(&address);
+                if self.wildcard.is_wild(&address) {
+                    state.wild_remote -= 1;
+                }
             }
             b
         };
@@ -1807,8 +1819,15 @@ impl PostOffice {
         self.plugins.check(|p| p.before_destroy_queue(name))?;
         // Checked again with the queue closed to new consumers: one that
         // came since the check above keeps it.
-        if let Err(n) = queue.close_for_delete(check_consumers) {
-            return Err(BrokerError::cannot_delete_queue_with_consumers(name, n));
+        match queue.close_for_delete(check_consumers) {
+            Ok(()) => {}
+            Err(crate::queue::CloseRefused::Consumers(n)) => {
+                return Err(BrokerError::cannot_delete_queue_with_consumers(name, n));
+            }
+            // Another deletion took it (`removeBinding` finds nothing).
+            Err(crate::queue::CloseRefused::Closed) => {
+                return Err(BrokerError::no_such_queue(name));
+            }
         }
         for m in self.mirrors.all() {
             m.delete_queue(&queue);
@@ -1818,7 +1837,10 @@ impl PostOffice {
             .each(|p| p.before_remove_binding(name, &address));
         {
             let mut state = self.write();
-            state.queues.remove(name);
+            // This queue, not one made again under its name since.
+            if state.queues.get(name).is_some_and(|q| q == &queue) {
+                state.queues.remove(name);
+            }
             if let Some(entry) = state.addresses.get_mut(&address) {
                 entry.queues.retain(|q| q != &queue);
                 entry.binding_removed_at = crate::message::now_millis();
@@ -2585,20 +2607,18 @@ impl PostOffice {
     /// Whether an exclusive divert of `address` takes the message.
     fn has_exclusive_divert(&self, message: &MessageRef, address: &str) -> bool {
         let state = self.read();
-        [
-            state.addresses.get(address),
-            state.free_diverts.get(address),
-        ]
-        .into_iter()
-        .flatten()
-        .flat_map(|e| e.diverts.iter())
-        .any(|d| {
-            d.exclusive
-                && !d.forwards_only_to(address)
-                && d.filter
-                    .as_ref()
-                    .is_none_or(|f| f.matches(&*message.message))
-        })
+        // A wildcard address's diverts are the matching address's too
+        // (WildcardAddressManager), as in bindings_route.
+        self.routing_entries(&state, address)
+            .into_iter()
+            .flat_map(|e| e.diverts.iter())
+            .any(|d| {
+                d.exclusive
+                    && !d.forwards_only_to(address)
+                    && d.filter
+                        .as_ref()
+                        .is_none_or(|f| f.matches(&*message.message))
+            })
     }
 
     /// The queues of `address` with these IDs, in their order; an ID bound
@@ -2611,13 +2631,13 @@ impl PostOffice {
         message: &MessageRef,
     ) -> Vec<Queue> {
         let state = self.read();
-        let bound: &[Queue] = state
-            .addresses
-            .get(address)
-            .map_or(&[], |e| e.queues.as_slice());
+        // The queues bound to it, a matching wildcard address's included
+        // (the Bindings WildcardAddressManager gives the address).
+        let entries = self.routing_entries(&state, address);
+        let bound = || entries.iter().flat_map(|e| e.queues.iter());
         let mut out = Vec::new();
         for &id in ids {
-            match bound.iter().find(|q| q.id() == id) {
+            match bound().find(|q| q.id() == id) {
                 Some(q) if only.is_some_and(|n| &**q.name() != n) => tracing::warn!(
                     "Message {} sent to {address}::{} names queue {} in _AMQ_ROUTE_TO; not routed there",
                     message.message_id(),
@@ -2785,7 +2805,7 @@ impl PostOffice {
     pub fn has_bindings(&self, address: &str) -> bool {
         let (real, _) = split_fqqn(address);
         let state = self.read();
-        state.remote.get(real).is_some_and(|r| !r.is_empty())
+        !self.bound_remote(&state, real).is_empty()
             || self
                 .routing_entries(&state, real)
                 .iter()
@@ -2838,8 +2858,18 @@ impl PostOffice {
         }
     }
 
-    /// `destroyDivert`: unbinds a divert. False if there is none.
+    /// `destroyDivert(name, true)`: unbinds a divert and deletes its
+    /// journal record. False if there is none.
     pub fn destroy_divert(&self, name: &str) -> bool {
+        let found = self.unbind_divert(name);
+        // deleteDivertConfiguration.
+        self.forget_divert_record(name);
+        found
+    }
+
+    /// `destroyDivert(name, false)`: unbinds a divert, keeping its journal
+    /// record. False if there is none.
+    pub fn unbind_divert(&self, name: &str) -> bool {
         let address = self.divert(name).map(|d| d.address.to_string());
         if let Some(address) = &address {
             self.plugins
@@ -2864,13 +2894,6 @@ impl PostOffice {
             state.free_diverts.retain(|_, e| !e.diverts.is_empty());
             found
         };
-        // deleteDivertConfiguration.
-        let old = self.persisted().diverts.remove(name);
-        if let (Some(old), Some(s)) = (old, self.ids.storage())
-            && let Err(e) = s.delete_binding_record(old)
-        {
-            tracing::warn!("deleting the record of divert {name}: {e}");
-        }
         if found && let Some(address) = &address {
             self.plugins.each(|p| p.after_remove_binding(name, address));
         }
@@ -2894,24 +2917,37 @@ impl PostOffice {
         let Some(s) = self.ids.storage() else {
             return Ok(());
         };
-        let old = self.persisted().diverts.get(&d.name).copied();
+        let old = self.persisted().diverts.get(&d.name).map(|(id, _)| *id);
         let body = saranga_storage::RecordCodec::encode(&d.record());
         let id = s
             .store_configuration(crate::storage::ids::DIVERT_RECORD, body, old)
             .map_err(Self::io)?;
-        self.persisted().diverts.insert(d.name.clone(), id);
+        self.persisted()
+            .diverts
+            .insert(d.name.clone(), (id, d.clone()));
         Ok(())
     }
 
     /// A divert's journal record, recovered (`recoverDivertConfigurations`).
-    pub fn reload_divert_record(&self, record: i64, name: &str) {
-        self.persisted().diverts.insert(name.to_owned(), record);
+    pub fn reload_divert_record(&self, record: i64, d: &DivertDeployment) {
+        self.persisted()
+            .diverts
+            .insert(d.name.clone(), (record, d.clone()));
+    }
+
+    /// The journaled diverts' configurations (`recoverDivertConfigurations`).
+    pub fn stored_diverts(&self) -> Vec<DivertDeployment> {
+        self.persisted()
+            .diverts
+            .values()
+            .map(|(_, d)| d.clone())
+            .collect()
     }
 
     /// Deletes a recovered divert record without deploying the divert
     /// (`config-delete-diverts` FORCE).
     pub fn forget_divert_record(&self, name: &str) {
-        let old = self.persisted().diverts.remove(name);
+        let old = self.persisted().diverts.remove(name).map(|(id, _)| id);
         if let (Some(old), Some(s)) = (old, self.ids.storage())
             && let Err(e) = s.delete_binding_record(old)
         {
@@ -3102,6 +3138,43 @@ impl PostOffice {
 
     /// The local bindings of `address` and of every wildcard address
     /// matching it.
+    /// Other brokers' queues bound to `real`, and to a wildcard address
+    /// matching it (WildcardAddressManager puts those in its Bindings too).
+    fn bound_remote<'s>(&self, state: &'s State, real: &str) -> Vec<&'s Arc<RemoteBinding>> {
+        let mut out: Vec<&Arc<RemoteBinding>> =
+            state.remote.get(real).into_iter().flatten().collect();
+        if state.wild_remote > 0 && self.wildcard.routing_enabled && !self.wildcard.is_wild(real) {
+            for (address, bindings) in &state.remote {
+                if &**address != real
+                    && self.wildcard.is_wild(address)
+                    && self.wildcard.matches(real, address)
+                {
+                    out.extend(bindings);
+                }
+            }
+        }
+        out
+    }
+
+    /// The load balancing of `real`'s bindings: its remote bindings', or
+    /// else a matching wildcard address's (whose bindings it shares).
+    fn load_balancing_of(&self, state: &State, real: &str) -> MessageLoadBalancing {
+        if let Some(lb) = state.load_balancing.get(real) {
+            return *lb;
+        }
+        if state.wild_remote > 0 && self.wildcard.routing_enabled && !self.wildcard.is_wild(real) {
+            for address in state.remote.keys() {
+                if self.wildcard.is_wild(address)
+                    && self.wildcard.matches(real, address)
+                    && let Some(lb) = state.load_balancing.get(address)
+                {
+                    return *lb;
+                }
+            }
+        }
+        MessageLoadBalancing::Off
+    }
+
     fn routing_entries<'s>(&self, state: &'s State, real: &str) -> Vec<&'s AddressEntry> {
         let mut entries: Vec<&AddressEntry> = state
             .addresses
@@ -3159,9 +3232,9 @@ impl PostOffice {
         let (real, fqqn_queue) = split_fqqn(address);
         let state = self.read();
         // `MessageLoadBalancingType.LOCAL_ONLY`: no remote binding.
-        let remote: &[Arc<RemoteBinding>] = match local_only {
-            true => &[],
-            false => state.remote.get(real).map_or(&[], Vec::as_slice),
+        let remote: Vec<&Arc<RemoteBinding>> = match local_only {
+            true => Vec::new(),
+            false => self.bound_remote(&state, real),
         };
         let target: &crate::message::ServerMessage = &message.message;
         let accepts = |q: &Queue| {
@@ -3236,11 +3309,7 @@ impl PostOffice {
                 ..Routes::default()
             });
         }
-        let lb = state
-            .load_balancing
-            .get(real)
-            .copied()
-            .unwrap_or(MessageLoadBalancing::Off);
+        let lb = self.load_balancing_of(&state, real);
         let message_routing_type = routing_type_of(target.core());
         // The groups, by routing name: an anycast queue's is its address,
         // a multicast queue's its name, a remote queue's what its broker
@@ -3477,11 +3546,7 @@ impl PostOffice {
         let full = message.message.core().address.as_ref()?.to_string_lossy();
         let (real, fqqn_queue) = split_fqqn(&full);
         let state = self.read();
-        let lb = state
-            .load_balancing
-            .get(real)
-            .copied()
-            .unwrap_or(MessageLoadBalancing::Off);
+        let lb = self.load_balancing_of(&state, real);
         // Only STRICT and OFF refuse it.
         if matches!(lb, MessageLoadBalancing::Strict | MessageLoadBalancing::Off) {
             tracing::debug!(
@@ -3506,14 +3571,12 @@ impl PostOffice {
                     .map(|q| Bound::Local(q.clone())),
             );
         }
-        if let Some(remote) = state.remote.get(real) {
-            group.extend(
-                remote
-                    .iter()
-                    .filter(|b| *b.routing_name() == routing_name)
-                    .map(|b| Bound::Remote(Arc::clone(b))),
-            );
-        }
+        group.extend(
+            self.bound_remote(&state, real)
+                .into_iter()
+                .filter(|b| *b.routing_name() == routing_name)
+                .map(|b| Bound::Remote(Arc::clone(b))),
+        );
         if group.is_empty() {
             return None;
         }

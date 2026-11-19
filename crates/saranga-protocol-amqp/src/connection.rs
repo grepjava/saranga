@@ -244,10 +244,14 @@ async fn write_loop<W: AsyncWrite + Unpin>(
                         done.await
                     }
                 };
-                if let Err(e) = result {
-                    tracing::error!("AMQ119031: storage operation failed: {e}");
+                match result {
+                    Ok(()) => buf.extend_from_slice(&bytes),
+                    // What waited for the write (an Accepted disposition, a
+                    // discharge's answer, a settle) would tell the peer it
+                    // is stored: it does not go (afterIO's onError sends no
+                    // outcome), and the broker stops on the error.
+                    Err(e) => tracing::error!("AMQ119031: storage operation failed: {e}"),
                 }
-                buf.extend_from_slice(&bytes);
                 held += 1;
                 false
             }
@@ -331,19 +335,28 @@ impl<R: AsyncRead + Unpin> Reader<R> {
 
 /// What the queues tell the connection's task.
 enum Event {
-    /// A message for a link the client receives on.
+    /// A message for a link the client receives on. `link` is the link's
+    /// credit, which no other link shares: the handle may be another
+    /// link's by the time this is handled, and then it is not for it.
     Deliver {
         channel: u16,
         handle: u32,
+        link: Arc<Mutex<Credit>>,
         message: Arc<ServerMessage>,
         delivery_count: i32,
     },
     /// A drain the client asked for is done: no more messages now.
-    Drained { channel: u16, handle: u32 },
+    Drained {
+        channel: u16,
+        handle: u32,
+        link: Arc<Mutex<Credit>>,
+    },
     /// The queue's answer to an acknowledgement the client's
-    /// disposition made (`acknowledge_then`).
+    /// disposition made (`acknowledge_then`), for the session named, not
+    /// one begun on its channel since.
     Acked {
         channel: u16,
+        session: Arc<str>,
         pending: saranga_server::session::AckPending,
         result: saranga_server::queue::AckResult,
     },
@@ -351,6 +364,7 @@ enum Event {
     Disconnect {
         channel: u16,
         handle: u32,
+        link: Arc<Mutex<Credit>>,
         reason: String,
     },
     /// A broker connection attaches a link on its session.
@@ -495,6 +509,7 @@ impl DeliverySink for Sink {
             let _ = self.events.send(Event::Drained {
                 channel: self.channel,
                 handle: self.handle,
+                link: self.credit.clone(),
             });
             return 0;
         }
@@ -507,6 +522,7 @@ impl DeliverySink for Sink {
         let _ = self.events.send(Event::Deliver {
             channel: self.channel,
             handle: self.handle,
+            link: self.credit.clone(),
             message,
             delivery_count,
         });
@@ -533,6 +549,7 @@ impl DeliverySink for Sink {
         let _ = self.events.send(Event::Disconnect {
             channel: self.channel,
             handle: self.handle,
+            link: self.credit.clone(),
             reason: reason.to_owned(),
         });
     }
@@ -1088,11 +1105,12 @@ where
     while let Ok(ev) = events_rx.try_recv() {
         if let Event::Acked {
             channel,
+            session,
             pending,
             result,
         } = ev
         {
-            conn.acked(channel, pending, result);
+            conn.acked(channel, &session, pending, result);
         }
     }
     conn.shutdown().await;
@@ -4513,25 +4531,34 @@ impl Conn {
             Event::Deliver {
                 channel,
                 handle,
+                link,
                 message,
                 delivery_count,
-            } => self.deliver(channel, handle, message, delivery_count).await,
+            } => {
+                self.deliver(channel, handle, &link, message, delivery_count)
+                    .await
+            }
             Event::Acked {
                 channel,
+                session,
                 pending,
                 result,
             } => {
-                self.acked(channel, pending, result);
+                self.acked(channel, &session, pending, result);
                 Ok(())
             }
-            Event::Drained { channel, handle } => {
+            Event::Drained {
+                channel,
+                handle,
+                link,
+            } => {
                 let Some(s) = self.sessions.get_mut(&channel) else {
                     return Ok(());
                 };
                 let Some(Link::Sender(sl)) = s.links.get_mut(&handle) else {
                     return Ok(());
                 };
-                if !sl.draining {
+                if !Arc::ptr_eq(&sl.credit, &link) || !sl.draining {
                     return Ok(());
                 }
                 sl.draining = false;
@@ -4548,8 +4575,15 @@ impl Conn {
             Event::Disconnect {
                 channel,
                 handle,
+                link,
                 reason,
             } => {
+                // Only for the link it was for, not one on its handle since.
+                if !self.sessions.get(&channel).is_some_and(|s| {
+                    matches!(s.links.get(&handle), Some(Link::Sender(sl)) if Arc::ptr_eq(&sl.credit, &link))
+                }) {
+                    return Ok(());
+                }
                 // ProtonServerSenderContext.close(RESOURCE_DELETED).
                 let Some(mut s) = self.sessions.remove(&channel) else {
                     return Ok(());
@@ -4982,6 +5016,7 @@ impl Conn {
         &mut self,
         channel: u16,
         handle: u32,
+        link: &Arc<Mutex<Credit>>,
         message: Arc<ServerMessage>,
         delivery_count: i32,
     ) -> Handled {
@@ -4989,7 +5024,14 @@ impl Conn {
         let Some(s) = self.sessions.get_mut(&channel) else {
             return Ok(());
         };
-        let Some(Link::Sender(sl)) = s.links.get_mut(&handle) else {
+        // A delivery for a link detached since, whose handle a new link
+        // has: not the new link's. The old link's consumer has closed and
+        // given its messages back.
+        let Some(Link::Sender(sl)) = s
+            .links
+            .get_mut(&handle)
+            .filter(|l| matches!(l, Link::Sender(sl) if Arc::ptr_eq(&sl.credit, link)))
+        else {
             return Ok(());
         };
         let da = sl
@@ -5111,10 +5153,15 @@ impl Conn {
     fn acked(
         &mut self,
         channel: u16,
+        session: &str,
         pending: saranga_server::session::AckPending,
         result: saranga_server::queue::AckResult,
     ) {
-        match self.sessions.get_mut(&channel) {
+        match self
+            .sessions
+            .get_mut(&channel)
+            .filter(|s| s.server.name() == session)
+        {
             Some(s) => {
                 if let Err(e) = s.server.acknowledged(pending, result) {
                     tracing::debug!("AMQ119007: error acknowledging message, {}", e.message);
@@ -5877,9 +5924,11 @@ fn ack_settled(
     message_id: i64,
 ) -> saranga_server::Result<()> {
     let events = events.clone();
+    let session: Arc<str> = server.name().into();
     server.acknowledge_then(consumer, message_id, true, move |pending, result| {
         let acked = Event::Acked {
             channel,
+            session,
             pending,
             result,
         };

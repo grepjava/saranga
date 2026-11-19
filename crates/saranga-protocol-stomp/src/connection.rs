@@ -245,7 +245,8 @@ async fn write_loop<W: AsyncWrite + Unpin>(
             }
             held += 1;
         }
-        if !buf.is_empty() && wr.write_all(&buf).await.is_err() {
+        // Flushed too: a WebSocket or TLS stream may hold bytes back.
+        if !buf.is_empty() && (wr.write_all(&buf).await.is_err() || wr.flush().await.is_err()) {
             break;
         }
         writability.written(buf.len());

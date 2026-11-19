@@ -428,7 +428,12 @@ pub(super) fn read_message<R: std::io::BufRead>(
     loop {
         match reader.next_event()? {
             Event::Start { name, attributes } => match name.as_str() {
-                "body" => message.body = body(reader, text)?.into(),
+                // A large body is Base64 pieces whatever the message's
+                // type (as `consumer --data` and `data exp` write it).
+                "body" => {
+                    let large = attribute(&attributes, "isLarge") == Some("true");
+                    message.body = body(reader, text && !large)?.into();
+                }
                 "property" => property(&mut message, &attributes)?,
                 "queue" => {
                     if let Some(q) = attribute(&attributes, "name") {

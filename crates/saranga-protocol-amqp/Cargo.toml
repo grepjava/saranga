@@ -24,5 +24,6 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 saranga-client = { path = "../saranga-client" }
+saranga-fault = { path = "../saranga-fault", features = ["inject"] }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

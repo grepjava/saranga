@@ -17,6 +17,16 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **Paging**: a page removed from the middle of the stream (all its messages consumed or removed) is no longer counted out a second time when the regular cleanup reaches it, which stopped paging with messages left in the current page.
+- **A move whose source queue is deleted while its journal write is on its way** (an expiry, a dead-letter move, redistribution, a management move or copy) reaches its target: the queue finishes the move before it stops, instead of the copies appearing only after a restart.
+- **`_AMQ_ROUTE_TO` and wildcard addresses**: a message naming a queue bound to a wildcard address that matches its address reaches it, and an exclusive divert on such a wildcard address takes it first, as for a plain message; another broker's queue on a wildcard address takes the matching addresses' messages, and redistributes them, too.
+- **Deletions of one queue that overlap**: one deletes it and the other finds no such queue, instead of both succeeding, and a deletion never removes a queue created again under the same name meanwhile.
+- **AMQP**: a message whose journal write or sync failed is no longer answered Accepted (nor a discharge or a settle that waited for the write); a delivery for a link the client detached never goes out on the next link attached with the same handle, and an acknowledgement answered after its session ended does not finish on a session begun on the same channel.
+- **WebSocket connections** no longer stall: the writer is woken when a read flushes the frames it waits on, and frames held back are flushed after each write, for every protocol.
+- **MQTT**: a PUBREC or PUBACK followed at once by DISCONNECT (or the socket closing) keeps its effect: the QoS 2 exchange gets its PUBREL when the session resumes, and an acknowledged QoS 1 packet ID is not held after a restart.
+- **Configuration reload and diverts**: a reload keeps the diverts management made and those the file no longer lists (deployed again from the journal unless `config-delete-diverts` is FORCE), and updates in place a divert whose address and exclusivity are unchanged, so it never stops routing.
+- **With the database store, losing the database lock stops the store's writes** at once, so that a second broker that takes the database is the only one writing.
+- **`producer --data` reads a large text message back whole** from what `consumer --data` wrote, and **`data exp` leaves out paged messages of pages a queue has consumed whole** (issue 124).
 - **An AMQP map key that repeats reads as its last value.** Application properties and annotations with a key given twice are seen by selectors, grouping and conversion with the value the later entry gives, as proton's decode makes it, instead of the earlier one.
 - **A connection whose handling fails unexpectedly still closes cleanly.** For every protocol, its sessions close, its consumers leave their queues and give back what they held, and its temporary queues go, instead of staying behind.
 - **Messages with many properties convert in time linear in their number** between Core, AMQP and OpenWire.

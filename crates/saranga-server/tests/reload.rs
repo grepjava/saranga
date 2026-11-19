@@ -425,3 +425,57 @@ async fn acceptors_are_reconciled() {
         "{e}"
     );
 }
+
+/// A reload keeps the journaled diverts its file does not have, one made
+/// through management and one the file no longer lists, as
+/// `recoverStoredDiverts` deploys them again (config-delete-diverts OFF),
+/// and they are there after a restart too.
+#[tokio::test]
+async fn reload_keeps_journaled_diverts() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(&xml(true, BEFORE), dir.path()).await;
+    let s = saranga_server::management::Json::from;
+    broker
+        .management()
+        .invoke(
+            &broker,
+            "broker",
+            "createDivert",
+            &[
+                s("m"),
+                s("m"),
+                s("orders"),
+                s("kept"),
+                saranga_server::management::Json::from(false),
+                saranga_server::management::Json::Null,
+                saranga_server::management::Json::Null,
+                s("ANYCAST"),
+            ],
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let names = |b: &Arc<Broker>| {
+        let mut n: Vec<String> = b
+            .post_office()
+            .diverts()
+            .iter()
+            .map(|d| d.name.to_string())
+            .collect();
+        n.sort();
+        n
+    };
+    assert_eq!(names(&broker), ["d1", "d2", "m"]);
+    broker
+        .reload(Reload::from_file_config(&xml(true, AFTER)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(names(&broker), ["d1", "d2", "d3", "m"]);
+    let d1 = broker.post_office().divert("d1").unwrap();
+    assert!(d1.exclusive, "d1 replaced with the file's");
+    broker.stop().unwrap();
+    drop(broker);
+    let broker = start(&xml(true, AFTER), dir.path()).await;
+    assert_eq!(names(&broker), ["d1", "d2", "d3", "m"]);
+    broker.stop().unwrap();
+}

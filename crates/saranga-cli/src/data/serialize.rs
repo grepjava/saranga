@@ -226,6 +226,27 @@ mod tests {
         assert!(r.read().unwrap().is_none());
     }
 
+    /// A large text message is written as Base64 pieces, and read back as
+    /// its body, not as text: the text comes back whole.
+    #[test]
+    fn a_large_text_message_reads_back_whole() {
+        let text: String = (0..150_000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let m = text_message(&text);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.xml");
+        let mut w = MessageWriter::create(&path).unwrap();
+        w.start().unwrap();
+        w.write(&m, true).unwrap();
+        w.stop().unwrap();
+        let mut r = MessageReader::open(&path).unwrap();
+        r.start().unwrap();
+        let back = r.read().unwrap().unwrap();
+        assert_eq!(back.body, m.body);
+        assert_eq!(back.text().unwrap().as_deref(), Some(text.as_str()));
+    }
+
     #[test]
     fn a_missing_file_is_javas_message() {
         let dir = tempfile::tempdir().unwrap();

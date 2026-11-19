@@ -3043,11 +3043,22 @@ impl PagingStore {
                 tracing::warn!("opening a new page on {}: {e}", self.address);
             }
             st.cache.retain(|c| c.id != current.id);
+            Self::recount_gone(st, Some(&current.path));
             return Some((current.id, Some(current.path)));
         }
         let page = st.first_page;
         st.first_page += 1;
-        Some((page, self.page_path(st, page)))
+        let path = self.page_path(st, page);
+        Self::recount_gone(st, path.as_ref());
+        Some((page, path))
+    }
+
+    /// A page whose file is already gone (a middle-stream cleanup removed
+    /// it, and counted it out then) does not count out again.
+    fn recount_gone(st: &mut StoreState, path: Option<&PathBuf>) {
+        if path.is_some_and(|p| !p.exists()) {
+            st.number_of_pages += 1;
+        }
     }
 }
 
