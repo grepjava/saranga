@@ -222,6 +222,11 @@ pub struct SessionState {
     server_topic_aliases: HashMap<String, i32>,
     core_delivery_infos: HashMap<i32, CoreDeliveryInfo>,
     pub send_quota: i32,
+    /// The QoS each admitted message (consumer, message ID) was given a
+    /// Receive Maximum slot for: its delivery publishes at that QoS, decided
+    /// once, so a re-SUBSCRIBE in between cannot strand the slot or spend
+    /// one never reserved.
+    pub reserved: HashMap<(i64, i64), i32>,
     /// Outbound QoS 2 packet IDs that hold a Receive Maximum slot on the
     /// current connection awaiting PUBCOMP. Unlike the durable PUBREC cache,
     /// this is reset when the connection drops, so a PUBCOMP for an exchange
@@ -258,6 +263,7 @@ impl SessionState {
             server_topic_aliases: HashMap::new(),
             core_delivery_infos: HashMap::new(),
             send_quota: 0,
+            reserved: HashMap::new(),
             pubcomp_slots: HashSet::new(),
             stored: false,
             session: None,

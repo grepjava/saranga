@@ -423,17 +423,31 @@ impl Broker {
             if current.as_ref().is_some_and(|c| Arc::ptr_eq(c, r)) {
                 *current = None;
             } else {
+                // Stopped already (its backup went before the sync got to
+                // the stores, say): whatever the sync started since is
+                // stopped too, or reclaim, compaction and page cleanup
+                // stay paused for good. Not if another backup replicates
+                // now; under the lock, so none registers meanwhile.
+                if current.is_none() {
+                    self.stop_store_replication();
+                }
                 r.stop();
                 return;
             }
         }
+        self.stop_store_replication();
+        r.stop();
+    }
+
+    /// The journals, paging and large messages are no longer replicated
+    /// (`stopReplication`).
+    fn stop_store_replication(&self) {
         if let Some((messages, bindings)) = self.storage.as_ref().and_then(|s| s.journals()) {
             messages.stop_replication();
             bindings.stop_replication();
         }
         self.post_office.paging().stop_replication();
         self.large_messages.stop_replication();
-        r.stop();
     }
 
     /// `NodeManager.getNodeActivationSequence`: the coordinated one with a

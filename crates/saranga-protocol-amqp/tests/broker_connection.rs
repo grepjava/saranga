@@ -276,6 +276,39 @@ fn consumers(n: &Node, queue: &str) -> i32 {
         .map_or(0, |q| q.consumer_count())
 }
 
+/// A stop and a start at once (well within the second the stopped run's
+/// task has to end): the old run's end leaves the new run's connection in
+/// place, so it is reported connected and a later stop closes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_and_start_at_once_keeps_the_new_connection_in_hand() {
+    let d = dirs();
+    let (peer, me) = pair(&d, r#"<receiver address-match="in"/>"#).await;
+    let c = connection(&me);
+    wait_until("connected", || {
+        c.is_connected() && consumers(&peer, "in") == 1
+    })
+    .await;
+    // The race between the old run's end and the new run's connection
+    // goes either way: a few rounds.
+    for _ in 0..20 {
+        c.stop();
+        c.start();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_until("connected again", || {
+            c.is_connected() && consumers(&peer, "in") == 1
+        })
+        .await;
+        assert_eq!(peer.broker.registry().connections().len(), 1);
+    }
+    c.stop();
+    wait_until("the connection gone from the peer", || {
+        peer.broker.registry().connections().is_empty() && consumers(&peer, "in") == 0
+    })
+    .await;
+    stop(me).await;
+    stop(peer).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reload_remakes_changed_broker_connections_and_keeps_mirrors() {
     let d = dirs();

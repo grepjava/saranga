@@ -2927,19 +2927,24 @@ impl Connection {
         if acked.is_empty() && remove && !m.temporary_queue() {
             return Ok(());
         }
+        // An expired acknowledgement expires the messages whether or not
+        // the scan took them (a non-destructive queue's, which the queue
+        // then takes off for good), as `AMQConsumer.acknowledge` checks it
+        // first.
+        if ack.ack_type == 6 {
+            let session = self.sessions.get_mut(sid).ok_or_else(OwError::npe)?;
+            for d in &acked {
+                let _ = session.session.expire(m.core_id, d.core);
+                m.replenish(1, false);
+            }
+            return Ok(());
+        }
         if !remove {
             m.replenish(count, false);
             return Ok(());
         }
         let session = self.sessions.get_mut(sid).ok_or_else(OwError::npe)?;
         match ack.ack_type {
-            6 => {
-                for d in &acked {
-                    let _ = session.session.expire(m.core_id, d.core);
-                    m.replenish(1, false);
-                }
-                return Ok(());
-            }
             2 | 4 if tx.is_none() => {
                 // Outside a transaction nothing waits for the queue's
                 // answer (its failure only marks a transaction): each

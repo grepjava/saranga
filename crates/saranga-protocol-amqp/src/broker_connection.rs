@@ -488,6 +488,10 @@ struct State {
     /// (`senders`, `receivers`), by name and ID.
     senders: HashSet<(String, i64)>,
     receivers: HashSet<(String, i64)>,
+    /// Which start this is: a run of an earlier one (stopped, its task
+    /// aborted only a second later) neither reconnects nor touches what
+    /// the current run set up.
+    run: u64,
 }
 
 /// One `<amqp-connection>` (`AMQPBrokerConnection`).
@@ -553,7 +557,8 @@ impl AmqpBrokerConnection {
         for b in &self.bridges {
             b.start();
         }
-        st.task = Some(tokio::spawn(me.clone().run()));
+        st.run += 1;
+        st.task = Some(tokio::spawn(me.clone().run(st.run)));
     }
 
     /// `stop`: the plugin goes, the connection fails and is not made
@@ -608,17 +613,23 @@ impl AmqpBrokerConnection {
         lock(&self.state).started
     }
 
+    /// Started, and by the start that made run `run`.
+    fn is_current(&self, run: u64) -> bool {
+        let st = lock(&self.state);
+        st.started && st.run == run
+    }
+
     fn host_port(&self, e: &Endpoint) -> String {
         format!("{}:{}", e.host, e.port)
     }
 
     /// `doConnect` and `retryConnection`, until stopped or out of
     /// attempts.
-    async fn run(self: Arc<Self>) {
+    async fn run(self: Arc<Self>, run: u64) {
         let mut retry_counter: i32 = 0;
         let mut last_retry_counter: i32;
         loop {
-            if !self.is_started_now() {
+            if !self.is_current(run) {
                 return;
             }
             let endpoint = self.endpoints[retry_counter as usize % self.endpoints.len()].clone();
@@ -626,7 +637,9 @@ impl AmqpBrokerConnection {
             if let Ok(stream) = connect(&endpoint).await {
                 last_retry_counter = retry_counter;
                 retry_counter = 0;
-                let ended = self.connected(stream, &endpoint, last_retry_counter).await;
+                let ended = self
+                    .connected(stream, &endpoint, last_retry_counter, run)
+                    .await;
                 match ended {
                     Ended::Stopped => return,
                     // A link failed: the attempts made before count.
@@ -638,7 +651,7 @@ impl AmqpBrokerConnection {
             }
             // retryConnection
             last_retry_counter = retry_counter;
-            if !self.is_started_now() {
+            if !self.is_current(run) {
                 return;
             }
             let attempts = self.config.reconnect_attempts;
@@ -663,7 +676,10 @@ impl AmqpBrokerConnection {
                     host_port,
                     last_retry_counter
                 );
-                lock(&self.state).started = false;
+                let mut st = lock(&self.state);
+                if st.run == run {
+                    st.started = false;
+                }
                 return;
             }
         }
@@ -671,7 +687,13 @@ impl AmqpBrokerConnection {
 
     /// A connection is up: SASL, Open and Begin go out, then a link for
     /// each matching queue. Returns how it ended.
-    async fn connected(&self, stream: Connected, endpoint: &Endpoint, retries: i32) -> Ended {
+    async fn connected(
+        &self,
+        stream: Connected,
+        endpoint: &Endpoint,
+        retries: i32,
+        run: u64,
+    ) -> Ended {
         let Some(broker) = self.broker.upgrade() else {
             return Ended::Stopped;
         };
@@ -744,6 +766,14 @@ impl AmqpBrokerConnection {
         );
         {
             let mut st = lock(&self.state);
+            if st.run != run {
+                // Stopped, and started again since: the current run makes
+                // its own connection.
+                handle.fail("Stopping Broker Connection");
+                drop(st);
+                tokio::spawn(task);
+                return Ended::Stopped;
+            }
             if !st.started {
                 handle.fail("Stopping Broker Connection");
             }
@@ -772,6 +802,11 @@ impl AmqpBrokerConnection {
             retries
         );
         let ended = task.await.unwrap_or(Ended::Closed);
+        // A run a stop and a start replaced leaves the new run's
+        // connection, federation and bridges alone.
+        if lock(&self.state).run != run {
+            return ended;
+        }
         if let Some(f) = &self.federation {
             f.connection_interrupted();
         }
@@ -779,8 +814,10 @@ impl AmqpBrokerConnection {
             b.connection_interrupted();
         }
         let mut st = lock(&self.state);
-        st.connected = false;
-        st.handle = None;
+        if st.run == run {
+            st.connected = false;
+            st.handle = None;
+        }
         ended
     }
 

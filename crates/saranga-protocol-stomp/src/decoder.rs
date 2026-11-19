@@ -335,12 +335,14 @@ fn put(headers: &mut HeaderList, name: String, value: String, first_wins: bool) 
     }
 }
 
-fn content_length(value: &str) -> Result<usize, DecodeError> {
-    // `Integer.parseInt`; a negative length reads as no length.
+/// `Integer.parseInt`: -1 is no length, the body read up to its NUL, as
+/// Artemis's decoders take it; another negative length is refused (Artemis
+/// fails the frame on it with a `NegativeArraySizeException`).
+fn content_length(value: &str) -> Result<Option<usize>, DecodeError> {
     match value.parse::<i32>() {
-        Ok(n) if n >= 0 => Ok(n as usize),
-        Ok(_) => Ok(usize::MAX),
-        Err(_) => Err(DecodeError::ContentLength(value.to_owned())),
+        Ok(-1) => Ok(None),
+        Ok(n) if n >= 0 => Ok(Some(n as usize)),
+        _ => Err(DecodeError::ContentLength(value.to_owned())),
     }
 }
 
@@ -371,7 +373,7 @@ fn parse_headers_v10(buf: &[u8], s: &mut HeaderState) -> Result<bool, DecodeErro
                 let value = String::from_utf8_lossy(&buf[s.start..s.pos - 1]).into_owned();
                 if let Some(n) = &s.name_v10 {
                     if n == names::CONTENT_LENGTH {
-                        s.length = Some(content_length(&value)?);
+                        s.length = content_length(&value)?;
                     }
                     put(&mut s.headers, n.clone(), value, false);
                 }
@@ -430,7 +432,7 @@ fn parse_headers_v11(
                 s.name = text(&line[..c]);
                 let value = text(&line[c + 1..]);
                 if s.name == names::CONTENT_LENGTH {
-                    s.length = Some(content_length(&value)?);
+                    s.length = content_length(&value)?;
                 }
                 put(&mut s.headers, s.name.clone(), value, v12);
                 if s.pos == buf.len() {
@@ -483,7 +485,7 @@ fn parse_headers_v11(
                 let value = text(&s.holder);
                 s.holder.clear();
                 if s.name == names::CONTENT_LENGTH {
-                    s.length = Some(content_length(&value)?);
+                    s.length = content_length(&value)?;
                 }
                 put(&mut s.headers, s.name.clone(), value, v12);
                 s.whitespace_only = true;
@@ -687,6 +689,24 @@ mod tests {
         }
         // 1.0 takes the byte after the body as the NUL, as Artemis does.
         assert_eq!(one(Rules::V10, b"SEND\ncontent-length:2\n\nab\0").1, 26);
+    }
+
+    /// `content-length:-1` is no length: the body runs to its NUL, as in
+    /// Artemis's decoders. Another negative length is refused, not waited
+    /// on for bytes that never come.
+    #[test]
+    fn a_negative_content_length() {
+        for rules in [Rules::V10, Rules::V11, Rules::V12] {
+            let whole = b"SEND\ncontent-length:-1\n\nab\0SEND\n\n\0";
+            let (f, n) = one(rules, whole);
+            assert_eq!(f.body, b"ab", "{rules:?}");
+            assert_eq!(one(rules, &whole[n..]).0.command, "SEND");
+            assert_eq!(
+                decode(rules, b"SEND\ncontent-length:-2\n\nab\0"),
+                Err(DecodeError::ContentLength("-2".into())),
+                "{rules:?}"
+            );
+        }
     }
 
     #[test]

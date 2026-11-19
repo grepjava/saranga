@@ -4086,6 +4086,11 @@ impl Conn {
                     "transfer on a sending link",
                 ));
             }
+            // A link this end detached (a drain that timed out, a refusal,
+            // a close) whose peer sent this before it saw the detach: the
+            // peer's handle is bound until its own detach, as in Proton-J,
+            // and the transfer is dropped with the link, not the connection.
+            None if s.detaching.contains(&t.handle) => return Ok(()),
             None => {
                 return Err(Fatal::new(
                     condition::UNATTACHED_HANDLE,

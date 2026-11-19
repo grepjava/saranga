@@ -17,6 +17,12 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **Replication**: a backup whose connection is lost before its synchronization gets going no longer leaves the journals, paging and large messages in replication mode, where no journal file was reclaimed or compacted and no page file deleted until another backup synchronized fully.
+- **AMQP broker connections**: stopping and starting a connection at once no longer loses track of the new connection (reported as not connected, and left open on the peer by every later stop), and the stopped run no longer interrupts the new run's federation and bridges.
+- **AMQP**: a transfer the client sent before it saw the broker detach its link (a drain that timed out, a refused or closed link) is dropped with the link instead of closing the whole connection with `unattached-handle`.
+- **STOMP**: `content-length:-1` reads the body up to its NUL, as in Artemis, instead of stalling the connection for good; another negative length is refused.
+- **MQTT**: a message that cannot be made into a PUBLISH (a malformed TEXT body, malformed ordered user property names) is discarded and its Receive Maximum slot freed, instead of stranding the slot and every later QoS 1 and 2 message (issue 126). A re-SUBSCRIBE that changes a subscription's QoS while a message is being delivered no longer leaks a slot or lets more than the Receive Maximum be in flight.
+- **OpenWire**: an expired acknowledgement on a non-destructive queue expires the message, as on any other queue.
 - **Journal retention and replication**: the journal file closed when a backup starts to synchronize is copied to the retention directory at once, so the name the backup is sent stays the file's name; before, a rollover under load renamed the file back while it was being sent, and the backup could not synchronize.
 - **Database store**: a message acknowledged in a local transaction takes its delivery-count and scheduled-time rows with it at the commit, as one acknowledged outside a transaction does, instead of leaving them (and their bookkeeping in memory) until a restart. A prepared XA branch's paged messages are no longer deleted as unreferenced when the broker starts, which rolled the branch back.
 - **Routing**: the round-robin positions of an address's bindings go with the address, and with the last binding of a routing name, instead of piling up for every address routed to (an MQTT or JMS wildcard subscription with many topics, say).

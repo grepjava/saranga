@@ -416,6 +416,8 @@ impl DeliverySink for MqttSink {
             return false;
         }
         st.send_quota += 1;
+        st.reserved
+            .insert((self.consumer_id, message.delivery_core().message_id), qos);
         true
     }
 }
@@ -462,9 +464,39 @@ fn string_value(v: &PropertyValue) -> Option<String> {
     }
 }
 
+/// The QoS a delivery goes out at: the one its Receive Maximum slot was
+/// reserved for (Artemis decides it once, with `incrementSendQuota`, in
+/// `publishToClient`). If the subscription has gone since, the slot is
+/// freed and the message goes back (-1). A QoS 1 or 2 delivery that found
+/// no reservation (the subscription's QoS was raised after admission)
+/// takes its slot now, so the quota its acknowledgement gives back was
+/// counted.
+fn delivery_qos(shared: &Shared, message: &CoreMessage, consumer: i64) -> i32 {
+    let now = decide_qos(shared, message, consumer);
+    let max = if shared.receive_maximum > 0 {
+        shared.receive_maximum
+    } else {
+        shared.default_max_in_flight
+    };
+    let mut st = lock(&shared.state);
+    match st.reserved.remove(&(consumer, message.message_id)) {
+        Some(qos) if now >= 0 => qos,
+        Some(_) => {
+            st.send_quota -= 1;
+            -1
+        }
+        None => {
+            if now >= 1 && max > 0 {
+                st.send_quota += 1;
+            }
+            now
+        }
+    }
+}
+
 /// `MQTTPublishManager.publishToClient`.
 fn publish_to_client(shared: &Shared, message: &CoreMessage, consumer: i64) -> Result<(), String> {
-    let qos = decide_qos(shared, message, consumer);
+    let qos = delivery_qos(shared, message, consumer);
     match qos {
         0 => {
             // [MQTT-2.2.1-2] and [MQTT-3.3.1-2]: no packet ID, no DUP.
@@ -579,9 +611,12 @@ fn publish_after(
             // failing the publish and stranding the reserved Receive Maximum
             // slot. (Artemis passes the null to `ByteBufUtil.utf8Bytes` and
             // throws, leaking the slot.)
-            match r.nullable_simple_string().map_err(|e| e.to_string())? {
-                Some(text) => saranga_storage::java::simple_string(&text).into_bytes(),
-                None => Vec::new(),
+            match r.nullable_simple_string() {
+                Ok(Some(text)) => saranga_storage::java::simple_string(&text).into_bytes(),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    return undeliverable(shared, wait, packet_id, qos, message, &e.to_string());
+                }
             }
         }
         _ => message.body.to_vec(),
@@ -597,7 +632,13 @@ fn publish_after(
         // The lock is held across the alias decision and the size check, so a
         // discarded message's alias is never left in the state.
         let mut s = lock(&shared.state);
-        properties = publish_properties(&s, message, &topic)?;
+        properties = match publish_properties(&s, message, &topic) {
+            Ok(p) => p,
+            Err(e) => {
+                drop(s);
+                return undeliverable(shared, wait, packet_id, qos, message, &e);
+            }
+        };
         if !is_retain && bool_value(message.properties.get_str(util::MQTT_MESSAGE_RETAIN_KEY)) {
             // Retain As Published belongs to the subscription that delivered
             // this message, found by its consumer, not by the topic (a
@@ -702,6 +743,27 @@ fn discard_unrepresentable(
     }
     let _ = shared.events.send(Event::Discard { packet_id });
     Ok(false)
+}
+
+/// A message that cannot be made into a PUBLISH (a malformed TEXT body,
+/// malformed `mqtt.ordered.user.property.*` names): logged as Artemis logs
+/// it, then discarded as an unrepresentable one is, so its reserved Receive
+/// Maximum slot is freed and the message settled rather than left delivering
+/// for good. (Artemis throws after `incrementSendQuota`, leaking the slot.)
+fn undeliverable(
+    shared: &Shared,
+    wait: Completion,
+    packet_id: i32,
+    qos: i32,
+    message: &CoreMessage,
+    why: &str,
+) -> Result<bool, String> {
+    tracing::warn!(
+        "AMQ832000: Unable to send message to MQTT client {}: {}: {why}",
+        shared.client_id,
+        message.message_id
+    );
+    discard_unrepresentable(shared, wait, packet_id, qos)
 }
 
 /// The encoded size of the PUBLISH, to compare against the client's Maximum
@@ -1841,6 +1903,7 @@ impl Core {
             s.disconnected_time = now_millis();
             s.clear_topic_aliases();
             s.send_quota = 0;
+            s.reserved.clear();
             s.clear_core_delivery_info();
             (
                 s.client_session_expiry_interval,

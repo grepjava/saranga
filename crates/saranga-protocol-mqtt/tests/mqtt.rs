@@ -1627,6 +1627,54 @@ async fn a_null_text_body_is_delivered_empty_and_frees_its_slot() {
     broker.stop().unwrap();
 }
 
+/// A Core message whose MQTT user properties are malformed (an ordered
+/// user property with no numeric index) cannot be published: it is
+/// discarded, its Receive Maximum slot freed, so the next message on the
+/// connection is not stranded behind it.
+#[tokio::test]
+async fn a_message_with_malformed_user_properties_frees_its_slot() {
+    let (broker, address, _task) = start(None).await;
+    let (mut s, _) =
+        Client::open_with(address, &connect5_props("badprops", &[0x21, 0, 1], None)).await;
+    s.send(&subscribe_option("orders", 1)).await;
+    assert_eq!(s.packet().await.unwrap()[0], 0x90);
+    let mut producer = core_producer(&broker, "bad-producer").await;
+    let mut bad = saranga_message::CoreMessage {
+        address: Some("orders".into()),
+        body: b"first".to_vec().into(),
+        ..Default::default()
+    };
+    bad.properties.insert(
+        "mqtt.user.property.exists".into(),
+        saranga_buffer::PropertyValue::Int(1),
+    );
+    bad.properties.insert(
+        "mqtt.ordered.user.property.x.k".into(),
+        saranga_buffer::PropertyValue::String("v".into()),
+    );
+    send_core(&mut producer, bad).await;
+    send_core(
+        &mut producer,
+        saranga_message::CoreMessage {
+            address: Some("orders".into()),
+            body: b"second".to_vec().into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    use saranga_protocol_mqtt::codec::{Decoder, Packet, Version};
+    let mut next = s.packet().await.expect("the second PUBLISH");
+    let Packet::Publish(msg) = Decoder::for_version(Version::V5)
+        .decode(&mut next)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("a PUBLISH");
+    };
+    assert_eq!(&msg.payload[..], b"second");
+    broker.stop().unwrap();
+}
+
 /// Overlapping subscriptions keep their packet IDs across a reconnect. One
 /// message routed to two overlapping subscriptions is delivered twice, each
 /// exchange with its own packet ID; after a reconnect without acknowledging
