@@ -106,7 +106,10 @@ impl BootstrapConfig {
                     config.server_configuration = uri.or_else(|| value(child, "configuration"));
                 }
                 "web" if config.web.is_none() => {
-                    config.web = Some(WebConfig::parse(child, &|v| crate::dto::filter(v, &lookup)))
+                    let web = WebConfig::parse(child, &|v| crate::dto::filter(v, &lookup));
+                    // Logged with the bootstrap's own.
+                    config.warnings.extend(web.warnings.iter().cloned());
+                    config.web = Some(web);
                 }
                 // Further web servers and components (`ExternalComponent`
                 // classes) are started by Artemis.
@@ -192,6 +195,12 @@ pub struct WebConfig {
     /// `path`: the directory of the web applications.
     pub path: String,
     pub root_redirect_location: Option<String>,
+    /// `maxRequestHeaderSize`: the most bytes a request's line and headers
+    /// may take (Jetty's `HttpConfiguration.requestHeaderSize`, 8 KiB by
+    /// default).
+    pub max_request_header_size: Option<i32>,
+    /// `maxResponseHeaderSize` (`responseHeaderSize`, 8 KiB by default).
+    pub max_response_header_size: Option<i32>,
     /// `<binding>`s, or the one the legacy `bind` attribute and the
     /// `<web>`-level TLS attributes and `<app>`s make.
     pub bindings: Vec<WebBinding>,
@@ -269,11 +278,33 @@ impl WebConfig {
             ssl_auto_reload: flag(n, "sslAutoReload"),
             apps,
         };
+        // JAXB's `xs:int`: a value that is not one is left unset.
+        let int = |n: Node, a: &str| attr(n, a).and_then(|v| v.trim().parse::<i32>().ok());
         let mut config = Self {
             path: attr(node, "path").unwrap_or_default(),
             root_redirect_location: attr(node, "rootRedirectLocation"),
+            max_request_header_size: int(node, "maxRequestHeaderSize"),
+            max_response_header_size: int(node, "maxResponseHeaderSize"),
             ..Self::default()
         };
+        // What Jetty does with these Saranga's web server has no part for.
+        for (name, reason) in IGNORED_WEB_ATTRIBUTES {
+            if node.attribute(*name).is_some() {
+                config.warnings.push(Warning::Unsupported {
+                    name: format!("web {name}"),
+                    reason,
+                });
+            }
+        }
+        if node
+            .children()
+            .any(|c| c.is_element() && c.tag_name().name() == "request-log")
+        {
+            config.warnings.push(Warning::Unsupported {
+                name: "web request-log".to_owned(),
+                reason: "Saranga's web server writes no request log",
+            });
+        }
         // `<app>`s are the legacy `bind`'s; the schema allows nothing else
         // but `<request-log>`.
         for child in node
@@ -324,9 +355,16 @@ impl WebConfig {
             _ => Err(format!("{v:?} is not a boolean")),
         };
         let some = || Some(value.to_owned());
+        let int = |v: &str| {
+            v.trim()
+                .parse::<i32>()
+                .map_err(|_| format!("{v:?} is not an integer"))
+        };
         match path {
             ["path"] => self.path = value.to_owned(),
             ["rootRedirectLocation"] => self.root_redirect_location = some(),
+            ["maxRequestHeaderSize"] => self.max_request_header_size = Some(int(value)?),
+            ["maxResponseHeaderSize"] => self.max_response_header_size = Some(int(value)?),
             ["bindings", name, rest @ ..] if !rest.is_empty() => {
                 let i = match self
                     .bindings
@@ -390,6 +428,40 @@ impl WebConfig {
         Ok(())
     }
 }
+
+/// `<web>` attributes Artemis gives Jetty that Saranga's web server has no
+/// part for: each is logged as not acted on.
+const IGNORED_WEB_ATTRIBUTES: &[(&str, &str)] = &[
+    (
+        "maxThreads",
+        "Saranga's web server has no thread pool of its own",
+    ),
+    (
+        "minThreads",
+        "Saranga's web server has no thread pool of its own",
+    ),
+    (
+        "idleThreadTimeout",
+        "Saranga's web server has no thread pool of its own",
+    ),
+    (
+        "scanPeriod",
+        "Saranga does not redeploy changed web applications",
+    ),
+    ("customizer", "Saranga runs no Java classes"),
+    (
+        "webContentEnabled",
+        "Saranga serves no web content directory",
+    ),
+    (
+        "compressionEnabled",
+        "Saranga compresses only the console pages, as the client accepts",
+    ),
+    (
+        "compressionLevel",
+        "Saranga compresses only the console pages, as the client accepts",
+    ),
+];
 
 /// `ActiveMQDefaultConfiguration.DEFAULT_SYSTEM_WEB_PROPERTY_PREFIX`.
 pub const SYSTEM_WEB_PROPERTY_PREFIX: &str = "webconfig.";
@@ -635,5 +707,43 @@ mod tests {
         );
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].to_string().contains("bindings.artemis.nosuch"));
+    }
+
+    /// `maxRequestHeaderSize` and `maxResponseHeaderSize` are read, from
+    /// the file and from `webconfig.` properties; the attributes Saranga's
+    /// web server has no part for are logged as not acted on.
+    #[test]
+    fn web_header_sizes_and_ignored_attributes() {
+        let xml = r#"<broker xmlns="http://activemq.apache.org/schema">
+   <jaas-security domain="activemq"/>
+   <server configuration="file:broker.xml"/>
+   <web path="web" maxRequestHeaderSize="16384" maxThreads="50" compressionEnabled="true">
+       <binding uri="http://localhost:8161"/>
+       <request-log filename="log"/>
+   </web>
+</broker>"#;
+        let config = BootstrapConfig::parse(xml, |_| None).unwrap();
+        let mut web = config.web.unwrap();
+        assert_eq!(web.max_request_header_size, Some(16384));
+        assert_eq!(web.max_response_header_size, None);
+        let logged: Vec<String> = config.warnings.iter().map(ToString::to_string).collect();
+        for name in ["maxThreads", "compressionEnabled", "request-log"] {
+            assert!(
+                logged.iter().any(|w| w.contains(name)),
+                "{name} not logged: {logged:?}"
+            );
+        }
+        assert_eq!(logged.len(), 3, "{logged:?}");
+        let system = vec![
+            (
+                "webconfig.maxResponseHeaderSize".to_owned(),
+                "4096".to_owned(),
+            ),
+            ("webconfig.maxRequestHeaderSize".to_owned(), "x".to_owned()),
+        ];
+        let warnings = web.apply_system(&system);
+        assert_eq!(web.max_response_header_size, Some(4096));
+        assert_eq!(web.max_request_header_size, Some(16384));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 }

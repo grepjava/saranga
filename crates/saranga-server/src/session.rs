@@ -1172,7 +1172,6 @@ impl ServerSession {
     /// (`ResourceManager.putTransaction` of a new `TransactionImpl`).
     pub fn begin_xa(&self, xid: Xid) -> Result<TxRef, TxError> {
         let tx = self.new_tx(Some(xid.clone()));
-        transaction::lock(&tx).timeout_seconds = self.timeout_seconds;
         if !self.broker.resource_manager().put(xid.clone(), tx.clone()) {
             return Err(XaError::new(
                 xa_code::XAER_DUPID,
@@ -1190,9 +1189,11 @@ impl ServerSession {
         self.broker.post_office().ids().storage().cloned()
     }
 
-    /// `newTransaction`, with its journal ID.
+    /// `newTransaction`, with its journal ID and the session's timeout.
     fn new_tx(&self, xid: Option<Xid>) -> TxRef {
-        Transaction::new_ref(self.broker.post_office().ids().next(), xid)
+        let tx = Transaction::new_ref(self.broker.post_office().ids().next(), xid);
+        transaction::lock(&tx).timeout_seconds = self.timeout_seconds;
+        tx
     }
 
     /// Journals a finished transaction's record, then applies it to the
@@ -2586,7 +2587,6 @@ impl ServerSession {
             }
         }
         let tx = self.new_tx(Some(xid.clone()));
-        transaction::lock(&tx).timeout_seconds = self.timeout_seconds;
         if !self.broker.resource_manager().put(xid.clone(), tx.clone()) {
             // Refused: the transaction under this Xid is another's.
             self.tx = None;
@@ -3083,8 +3083,8 @@ impl ServerSession {
     pub fn xa_failed(&mut self, xid: Xid) {
         let rm = self.broker.resource_manager();
         let tx = rm.get(&xid).unwrap_or_else(|| {
-            let tx =
-                Transaction::new_ref(self.broker.post_office().ids().next(), Some(xid.clone()));
+            // `newTransaction(xid)`: with the session's timeout.
+            let tx = self.new_tx(Some(xid.clone()));
             rm.put(xid, tx.clone());
             tx
         });

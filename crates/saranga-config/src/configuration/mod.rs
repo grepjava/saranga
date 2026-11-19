@@ -1262,6 +1262,7 @@ pub fn read_configuration(
     let text = crate::substitute::replace_system_props(xml, &lookup);
     let text = crate::broker::well_formed(&text, true)?;
     let text = crate::xinclude::expand(&text, None, &lookup)?;
+    let text = crate::substitute::replace_in_document(&text, &lookup)?;
     crate::parser::validate_document(&text, validation)?;
     let options = roxmltree::ParsingOptions {
         allow_dtd: true,

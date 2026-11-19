@@ -132,8 +132,9 @@ const STATUS: &[&str] = &[
 
 /// The largest page a listing serves.
 const MAX_PAGE_SIZE: i64 = 10_000;
-/// The most checks one `POST /me/can` answers.
-const MAX_CHECKS: usize = 1_000;
+/// The most checks one `POST /me/can` answers, and the most attributes
+/// one read or live view names.
+pub(crate) const MAX_CHECKS: usize = 1_000;
 
 pub(crate) struct ApiState {
     pub agent: Agent,

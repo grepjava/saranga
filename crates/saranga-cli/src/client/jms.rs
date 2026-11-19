@@ -236,6 +236,12 @@ pub struct JmsSession {
     client_id: Option<String>,
 }
 
+/// `CompositeAddress.extractAddressName` and `extractQueueName`: an FQQN
+/// `address::queue` as its two names, any other name as itself twice.
+pub fn split_fqqn(name: &str) -> (&str, &str) {
+    name.split_once("::").unwrap_or((name, name))
+}
+
 /// `ActiveMQDestination.createQueueNameForSubscription` for a durable
 /// subscription: `<clientID>.<name>`, each with `\` and `.` escaped.
 pub fn subscription_queue(client_id: &str, name: &str) -> String {
@@ -476,16 +482,20 @@ impl JmsSession {
                 address.clone()
             }
             Destination::Topic(address) => {
-                let query = s.address_query(address).await?;
+                let query = s.address_query(split_fqqn(address).0).await?;
                 if !query.exists {
                     if query.auto_create_addresses {
-                        s.create_address(address, &[RoutingType::Multicast], true)
+                        s.create_address(split_fqqn(address).0, &[RoutingType::Multicast], true)
                             .await?;
                     } else {
                         bail!("Topic {address} does not exist");
                     }
                 }
                 match subscription {
+                    None if split_fqqn(address).0 != address => {
+                        self.fqqn_subscription(address, filter.as_deref(), &query)
+                            .await?
+                    }
                     None => {
                         let name =
                             saranga_client::uuid::to_string(&saranga_client::uuid::time_based());
@@ -562,26 +572,61 @@ impl JmsSession {
         .await?)
     }
 
-    /// `AutoCreateUtil.autoCreateQueue` for a JMS queue.
-    async fn auto_create_queue(&self, address: &str) -> anyhow::Result<()> {
+    /// `AutoCreateUtil.autoCreateQueue` for a JMS queue. An FQQN
+    /// (`address::queue`) names the queue (`getCoreQueueName`), made on
+    /// its address, and is not held to JMS queue semantics.
+    async fn auto_create_queue(&self, destination: &str) -> anyhow::Result<()> {
         let s = &self.session;
+        let (address, queue) = split_fqqn(destination);
         let query = s.address_query(address).await?;
-        if !query.exists || !query.queue_names.iter().any(|q| q == address) {
+        if !query.exists || !query.queue_names.iter().any(|q| q == queue) {
             if query.auto_create_queues {
                 let config = self
-                    .queue_config(address, address, RoutingType::Anycast, None, true, &query)
+                    .queue_config(queue, address, RoutingType::Anycast, None, true, &query)
                     .auto_created(true);
                 ignore_exists(s.create_queue(config).await)?;
             } else {
-                bail!("Destination {address} does not exist");
+                bail!("Destination {destination} does not exist");
             }
         } else {
-            let q = s.queue_query(address).await?;
-            if q.routing_type.is_some_and(|t| t != RoutingType::Anycast) {
-                bail!("Destination {address} does not support JMS queue semantics");
+            let q = s.queue_query(queue).await?;
+            if q.routing_type.is_some_and(|t| t != RoutingType::Anycast) && address == destination {
+                bail!("Destination {destination} does not support JMS queue semantics");
             }
         }
         Ok(())
+    }
+
+    /// `createFQQNSubscription`: a non-durable topic consumer of an FQQN
+    /// takes its queue, made multicast and auto-created if it is not there,
+    /// and never deleted with the consumer.
+    async fn fqqn_subscription(
+        &self,
+        destination: &str,
+        filter: Option<&str>,
+        query: &saranga_client::AddressQuery,
+    ) -> anyhow::Result<String> {
+        let s = &self.session;
+        let (address, queue) = split_fqqn(destination);
+        if !query.exists || !query.queue_names.iter().any(|q| q == queue) {
+            if !query.auto_create_queues {
+                bail!("Destination {destination} does not exist");
+            }
+            let config = self
+                .queue_config(queue, address, RoutingType::Multicast, filter, true, query)
+                .auto_created(true);
+            ignore_exists(s.create_queue(config).await)?;
+        }
+        let q = s.queue_query(queue).await?;
+        if !q.exists {
+            bail!("Destination {queue} does not exist");
+        }
+        if let (Some(f), Some(existing)) = (filter, q.filter_string.as_deref())
+            && f != existing
+        {
+            bail!("{queue} filter mismatch [{f}] is different than existing filter [{existing}]");
+        }
+        Ok(queue.to_owned())
     }
 
     /// `ActiveMQSession.createBrowser`: a browse-only consumer, made when
@@ -801,5 +846,64 @@ mod tests {
             "ActiveMQTopic[t]"
         );
         assert_eq!(subscription_queue("c.i", "s\\1"), "c\\.i.s\\\\1");
+    }
+
+    /// An FQQN destination names its queue, as Artemis's JMS client takes
+    /// it: `queue://A::Q` (consumer or browser) makes queue `Q` on `A`, and
+    /// a non-durable `topic://T::S` consumer takes queue `S` on `T`, made
+    /// multicast and not temporary, rather than a queue of its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fqqn_destinations_name_their_queues() {
+        use std::sync::Arc;
+        let broker = saranga_server::Broker::start(saranga_server::BrokerConfig::new(Arc::new(
+            saranga_server::postoffice::SelectorFilters,
+        )))
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        tokio::spawn(
+            broker
+                .clone()
+                .serve_acceptor(listener, saranga_server::Acceptor::default()),
+        );
+        let conn = super::JmsConnection::connect(&url, None, None, None)
+            .await
+            .unwrap();
+        let session = conn.session(false).await.unwrap();
+        let po = broker.post_office();
+
+        let c = session
+            .consumer(&Destination::parse("queue://A::Q"), None, None)
+            .await
+            .unwrap();
+        let q = po.queue("Q").expect("queue Q");
+        assert_eq!(&*q.config().address, "A");
+        assert!(po.queue("A::Q").is_none(), "a queue named A::Q");
+        c.close().await;
+
+        let b = session.browser("B::R", None).await.unwrap();
+        assert_eq!(&*po.queue("R").expect("queue R").config().address, "B");
+        b.close().await;
+
+        let c = session
+            .consumer(&Destination::parse("topic://T::S"), None, None)
+            .await
+            .unwrap();
+        let s = po.queue("S").expect("queue S");
+        assert_eq!(&*s.config().address, "T");
+        assert_eq!(
+            s.config().routing_type,
+            saranga_server::RoutingType::Multicast
+        );
+        assert!(!s.config().temporary);
+        c.close().await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            po.queue("S").is_some(),
+            "the FQQN queue went with its consumer"
+        );
+        conn.close().await;
+        broker.stop().unwrap();
     }
 }

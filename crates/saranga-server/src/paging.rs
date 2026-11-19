@@ -3583,6 +3583,10 @@ pub struct TxPaging {
     pub stored: Vec<(Arc<PageSubscription>, i64)>,
     /// Their queues, which look for them after the commit.
     pub waiting: Vec<crate::queue::Queue>,
+    /// A queue for each message paged to it in the transaction: counted in
+    /// `messagesAdded` at the commit, as the page counter's `increment(tx)`
+    /// is, and not at all when it rolls back.
+    pub added: Vec<crate::queue::Queue>,
 }
 
 impl std::fmt::Debug for PageSubscription {
@@ -3655,6 +3659,7 @@ impl TxPaging {
         self.waiting
             .iter()
             .for_each(crate::queue::Queue::paged_written);
+        self.added.iter().for_each(crate::queue::Queue::paged_added);
     }
 
     /// `afterRollback`.

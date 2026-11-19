@@ -171,6 +171,12 @@ impl Rbac {
         name: &ObjectName,
         method: &str,
     ) -> bool {
+        // The parameter list is stripped (`op(java.lang.String)` is `op`),
+        // as `ArtemisRbacInvocationHandler.canInvoke` does.
+        let method = match method.find('(') {
+            Some(i) if i > 0 => &method[..i],
+            _ => method,
+        };
         Self::unchecked(name)
             || has_permission(
                 broker.security_store(),
@@ -268,5 +274,55 @@ mod tests {
             address("java.lang:type=Memory", Some("gc")),
             "mops.java.lang.Memory.gc"
         );
+    }
+
+    /// `canInvoke` with a signature (`op(java.lang.String)`, as hawtio's
+    /// `ArtemisJMXSecurity.canInvoke` passes it) is answered for the
+    /// operation: the parameter list is stripped before the address is made.
+    #[tokio::test]
+    async fn can_invoke_strips_the_signature() {
+        let file = saranga_config::BrokerConfig::parse(
+            r##"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+                 <persistence-enabled>false</persistence-enabled>
+                 <security-enabled>true</security-enabled>
+                 <security-settings>
+                   <security-setting match="mops.#">
+                     <permission type="edit" roles="admin"/>
+                     <permission type="view" roles="admin"/>
+                   </security-setting>
+                   <security-setting match="mops.broker.listAddresses">
+                     <permission type="edit" roles="ops"/>
+                     <permission type="view" roles="ops"/>
+                   </security-setting>
+                 </security-settings>
+               </core></configuration>"##,
+        )
+        .unwrap();
+        let mut config = saranga_server::BrokerConfig::from_file_config(
+            &file,
+            Arc::new(saranga_server::postoffice::SelectorFilters),
+            &std::env::temp_dir(),
+        )
+        .unwrap();
+        config.security = Some(Arc::new(SecurityStore::new(
+            saranga_security::SecurityStoreConfig::from_broker(&file),
+            file.security_repository().unwrap(),
+            Arc::new(saranga_security::JaasSecurityManager::new(
+                saranga_security::LoginConfig::default(),
+                None,
+                "activemq",
+                None,
+            )),
+        )));
+        let broker = saranga_server::Broker::start(config).await.unwrap();
+        let mut subject = Subject::default();
+        subject.add(saranga_security::jaas::Principal::Role("ops".to_owned()));
+        let subject = Some(Arc::new(subject));
+        let name = ObjectName::parse("org.apache.activemq.artemis:broker=\"0.0.0.0\"").unwrap();
+        let can = |method: &str| rbac().can_invoke(&broker, subject.clone(), &name, method);
+        assert!(can("listAddresses"));
+        assert!(can("listAddresses(java.lang.String)"), "with a signature");
+        assert!(!can("forceFailover()"), "another operation");
+        broker.stop().unwrap();
     }
 }

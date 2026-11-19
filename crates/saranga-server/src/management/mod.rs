@@ -176,7 +176,105 @@ enum Resource {
     ConnectionRouter(Arc<crate::routing::ConnectionRouter>),
 }
 
+/// The attributes of each kind of resource read through an `is` method,
+/// as the Artemis control interfaces declare them; every other attribute
+/// is read through `get` (`getAttribute` finds the method before calling
+/// it). saranga-management's tests check this against its catalog.
+pub const IS_GETTERS: &[(&str, &[&str])] = &[
+    (
+        "broker",
+        &[
+            "Active",
+            "AsyncConnectionExecutionEnabled",
+            "Backup",
+            "Clustered",
+            "CreateBindingsDir",
+            "CreateJournalDir",
+            "EmbeddedWebServerStarted",
+            "FailoverOnServerShutdown",
+            "JournalSyncNonTransactional",
+            "JournalSyncTransactional",
+            "MessageCounterEnabled",
+            "PersistDeliveryCountBeforeDelivery",
+            "PersistIDCache",
+            "PersistenceEnabled",
+            "ReplicaSync",
+            "SecurityEnabled",
+            "SharedStore",
+            "Started",
+            "WildcardRoutingEnabled",
+        ],
+    ),
+    (
+        "address",
+        &[
+            "AutoCreated",
+            "BlockedViaManagement",
+            "Internal",
+            "Paging",
+            "Paused",
+            "RetroactiveResource",
+            "Temporary",
+        ],
+    ),
+    (
+        "queue",
+        &[
+            "AutoDelete",
+            "ConfigurationManaged",
+            "Durable",
+            "Enabled",
+            "Exclusive",
+            "GroupRebalance",
+            "GroupRebalancePauseDispatch",
+            "InternalQueue",
+            "LastValue",
+            "Paused",
+            "PersistedPause",
+            "PurgeOnNoConsumers",
+            "RetroactiveResource",
+            "Temporary",
+        ],
+    ),
+    ("divert", &["Exclusive", "RetroactiveResource"]),
+    ("acceptor", &["Started"]),
+    ("broadcastgroup", &["Started"]),
+    (
+        "bridge",
+        &["Connected", "HA", "Started", "UseDuplicateDetection"],
+    ),
+    ("brokerconnection", &["Connected", "Started"]),
+    ("clusterconnection", &["DuplicateDetection", "Started"]),
+    ("connectionrouter", &[]),
+];
+
 impl Resource {
+    /// Its kind, as [`IS_GETTERS`] names it.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Broker => "broker",
+            Self::Address(_) => "address",
+            Self::Queue(_) => "queue",
+            Self::Divert(_) => "divert",
+            Self::Acceptor(_) => "acceptor",
+            Self::BroadcastGroup(_) => "broadcastgroup",
+            Self::Bridge(_) => "bridge",
+            Self::BrokerConnection(_) => "brokerconnection",
+            Self::ClusterConnection(_) => "clusterconnection",
+            Self::ConnectionRouter(_) => "connectionrouter",
+        }
+    }
+
+    /// The method an attribute is read through: `is<Attribute>` for a
+    /// boolean one the control declares so, else `get<Attribute>`.
+    fn getter(&self, upper: &str) -> String {
+        let is = IS_GETTERS
+            .iter()
+            .find(|(k, _)| *k == self.kind())
+            .is_some_and(|(_, names)| names.contains(&upper));
+        format!("{}{upper}", if is { "is" } else { "get" })
+    }
+
     /// The control that audits calls on it, and its name.
     fn audited(&self) -> (crate::audit::Control, String) {
         use crate::audit::Control;
@@ -329,6 +427,12 @@ impl Management {
             Some(c) => c.to_uppercase().chain(chars).collect(),
             None => return Err(problem()),
         };
+        // `getAttribute`: the getter is checked before it is called, so a
+        // refused caller neither works the value out nor has it audited.
+        let method = r.getter(&upper);
+        if self.security_check(caller, resource, &method).is_err() {
+            return Err(problem());
+        }
         let found = match &r {
             Resource::Broker => server::attribute(self, broker, &upper).await,
             Resource::Address(a) => address::attribute(broker, a, &upper).await,
@@ -342,32 +446,23 @@ impl Management {
             Resource::ConnectionRouter(r) => Ok(router_attribute(r, &upper)),
         };
         match found {
-            // A boolean attribute is read through its `is` method.
             Ok(Some(v)) => {
-                let getter = if matches!(v, Json::Bool(_)) {
-                    "is"
-                } else {
-                    "get"
-                };
-                let method = format!("{getter}{upper}");
-                match self.security_check(caller, resource, &method) {
-                    Ok(()) => {
-                        let (control, name) = r.audited();
-                        crate::audit::management_call(
-                            broker,
-                            control,
-                            &name,
-                            &method,
-                            &[],
-                            caller.who,
-                        );
-                        Ok(v)
-                    }
-                    Err(_) => Err(problem()),
-                }
+                let (control, name) = r.audited();
+                crate::audit::management_call(broker, control, &name, &method, &[], caller.who);
+                Ok(v)
             }
             Ok(None) | Err(_) => Err(problem()),
         }
+    }
+
+    /// The method `attribute` reads an attribute of a resource through
+    /// (`getX`, or `isX`), without reading it: what a caller needs the
+    /// permission for. `None` for no such resource or an empty name.
+    pub fn getter(&self, broker: &Broker, resource: &str, attribute: &str) -> Option<String> {
+        let r = self.resource(broker, resource)?;
+        let mut chars = attribute.chars();
+        let upper: String = chars.next()?.to_uppercase().chain(chars).collect();
+        Some(r.getter(&upper))
     }
 
     /// `QueueControl.browse`, whose composite data only the web API can

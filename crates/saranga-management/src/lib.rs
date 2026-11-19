@@ -98,6 +98,97 @@ pub struct Options {
     /// Whether Saranga's own console is served (`saranga.console.enabled`,
     /// true by default).
     pub saranga_console: bool,
+    /// `<web maxRequestHeaderSize maxResponseHeaderSize>`.
+    pub header_limits: HeaderLimits,
+}
+
+/// The most bytes a request's line and headers, and a response's status
+/// line and headers, may take: Jetty's `HttpConfiguration`
+/// `requestHeaderSize` and `responseHeaderSize`, which `bootstrap.xml`'s
+/// `maxRequestHeaderSize` and `maxResponseHeaderSize` set. A request over
+/// its limit is answered `431`, a response over its limit is replaced by a
+/// `500`, as Jetty answers them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderLimits {
+    pub request: usize,
+    pub response: usize,
+}
+
+impl Default for HeaderLimits {
+    /// Jetty's defaults.
+    fn default() -> Self {
+        Self {
+            request: 8 * 1024,
+            response: 8 * 1024,
+        }
+    }
+}
+
+impl HeaderLimits {
+    /// `bootstrap.xml`'s values, each Jetty's default when not set; 0 or
+    /// less is no limit.
+    pub fn of(request: Option<i32>, response: Option<i32>) -> Self {
+        let d = Self::default();
+        let size = |v: Option<i32>, default: usize| match v {
+            None => default,
+            Some(v) if v <= 0 => usize::MAX,
+            Some(v) => v as usize,
+        };
+        Self {
+            request: size(request, d.request),
+            response: size(response, d.response),
+        }
+    }
+}
+
+/// The bytes of a request's line and headers as they came:
+/// `METHOD target HTTP/1.1\r\n`, each `name: value\r\n`, and the blank line.
+fn request_head_size<B>(r: &axum::http::Request<B>) -> usize {
+    let target = r
+        .uri()
+        .path_and_query()
+        .map_or(r.uri().path().len(), |p| p.as_str().len());
+    r.method().as_str().len()
+        + 1
+        + target
+        + " HTTP/1.1\r\n".len()
+        + r.headers()
+            .iter()
+            .map(|(n, v)| n.as_str().len() + 2 + v.len() + 2)
+            .sum::<usize>()
+        + 2
+}
+
+/// The bytes of a response's status line and headers.
+fn response_head_size<B>(r: &axum::http::Response<B>) -> usize {
+    "HTTP/1.1 200 \r\n".len()
+        + r.status().canonical_reason().map_or(0, str::len)
+        + r.headers()
+            .iter()
+            .map(|(n, v)| n.as_str().len() + 2 + v.len() + 2)
+            .sum::<usize>()
+        + 2
+}
+
+/// [`HeaderLimits`] applied to each exchange.
+async fn limit_headers(
+    limits: HeaderLimits,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if request_head_size(&request) > limits.request {
+        return axum::http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE.into_response();
+    }
+    let response = next.run(request).await;
+    if response_head_size(&response) > limits.response {
+        tracing::warn!(
+            "web server: a response's headers are over {} bytes (maxResponseHeaderSize)",
+            limits.response
+        );
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    response
 }
 
 /// `jolokia-access.xml`'s `<cors>`: allowed origins, and whether a
@@ -366,7 +457,12 @@ pub async fn start(
             });
             router = router.merge(api::router(state));
         }
-        tokio::spawn(serve(listener, b.tls.clone(), router));
+        tokio::spawn(serve(
+            listener,
+            b.tls.clone(),
+            router,
+            options.header_limits,
+        ));
     }
     Ok(())
 }
@@ -380,10 +476,22 @@ const WEB_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// broker's acceptors share with it.
 const MAX_WEB_CONNECTIONS: usize = 1024;
 
-async fn serve(listener: TcpListener, tls: Option<Arc<TlsAcceptor>>, router: Router) {
+async fn serve(
+    listener: TcpListener,
+    tls: Option<Arc<TlsAcceptor>>,
+    router: Router,
+    limits: HeaderLimits,
+) {
     use hyper_util::rt::{TokioIo, TokioTimer};
     use hyper_util::service::TowerToHyperService;
     use tower::ServiceExt;
+    let router = router.layer(axum::middleware::from_fn(move |request, next| {
+        limit_headers(limits, request, next)
+    }));
+    // A head too large for the read buffer is answered 431 by hyper; one
+    // that fits but is over the limit, by `limit_headers`. hyper's buffer
+    // is at least 8 KiB.
+    let read_buffer = limits.request.saturating_add(1).max(8 * 1024);
     let open = Arc::new(tokio::sync::Semaphore::new(MAX_WEB_CONNECTIONS));
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -411,7 +519,8 @@ async fn serve(listener: TcpListener, tls: Option<Arc<TlsAcceptor>>, router: Rou
             let service = TowerToHyperService::new(service);
             let mut http = hyper::server::conn::http1::Builder::new();
             http.timer(TokioTimer::new())
-                .header_read_timeout(WEB_IDLE_TIMEOUT);
+                .header_read_timeout(WEB_IDLE_TIMEOUT)
+                .max_buf_size(read_buffer);
             let result = match tls {
                 Some(tls) => match tokio::time::timeout(WEB_IDLE_TIMEOUT, tls.accept(stream)).await
                 {
@@ -742,5 +851,58 @@ mod tests {
         assert_eq!(base64_decode("YQ==").unwrap(), b"a");
         assert_eq!(percent_decode("broker=%220.0.0.0%22"), "broker=\"0.0.0.0\"");
         assert_eq!(percent_decode("%"), "%");
+    }
+
+    /// The status line of the answer to `request`, sent raw.
+    async fn status_of(addr: std::net::SocketAddr, request: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            s.read_to_end(&mut answer),
+        )
+        .await;
+        let answer = String::from_utf8_lossy(&answer).into_owned();
+        answer.lines().next().unwrap_or_default().to_owned()
+    }
+
+    /// `maxRequestHeaderSize` and `maxResponseHeaderSize`: a request head
+    /// over its limit is answered 431, a response head over its limit is
+    /// replaced by a 500, and heads within them are served.
+    #[tokio::test]
+    async fn header_sizes_are_limited() {
+        let router = axum::Router::new()
+            .route("/small", axum::routing::get(|| async { "ok" }))
+            .route(
+                "/big",
+                axum::routing::get(|| async { ([("x-big", "y".repeat(600))], "ok") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let limits = super::HeaderLimits::of(Some(512), Some(400));
+        tokio::spawn(super::serve(listener, None, router, limits));
+        let get = |path: &str, extra: usize| {
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: x\r\nX-Pad: {}\r\nConnection: close\r\n\r\n",
+                "p".repeat(extra)
+            )
+        };
+        assert!(status_of(addr, get("/small", 10)).await.contains(" 200"));
+        assert!(
+            status_of(addr, get("/small", 600)).await.contains(" 431"),
+            "a request head over 512 bytes"
+        );
+        assert!(
+            status_of(addr, get("/big", 10)).await.contains(" 500"),
+            "a response head over 400 bytes"
+        );
+        // Jetty's 8 KiB by default; 0 or less is no limit.
+        assert_eq!(super::HeaderLimits::of(None, None).request, 8192);
+        assert_eq!(
+            super::HeaderLimits::of(Some(0), Some(-1)).response,
+            usize::MAX
+        );
     }
 }

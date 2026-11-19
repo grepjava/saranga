@@ -631,4 +631,39 @@ mod tests {
         assert!(glob("a*c", "abbc"));
         assert!(!glob("a?c", "abbc"));
     }
+
+    /// The server reads an attribute's getter from its own table before
+    /// it reads the value (`Management::getter`): the table names the
+    /// boolean attributes the Artemis control interfaces read with `is`.
+    #[test]
+    fn the_servers_is_getters_are_the_catalogs() {
+        use crate::catalog;
+        for (kind, control) in [
+            ("broker", &catalog::BROKER),
+            ("address", &catalog::ADDRESS),
+            ("queue", &catalog::QUEUE),
+            ("divert", &catalog::DIVERT),
+            ("acceptor", &catalog::ACCEPTOR),
+            ("broadcastgroup", &catalog::BROADCAST_GROUP),
+            ("bridge", &catalog::BRIDGE),
+            ("brokerconnection", &catalog::BROKER_CONNECTION),
+            ("clusterconnection", &catalog::CLUSTER_CONNECTION),
+            ("connectionrouter", &catalog::CONNECTION_ROUTER),
+        ] {
+            let mut catalogued: Vec<&str> = control
+                .attrs
+                .iter()
+                .filter(|a| a.readable && a.is)
+                .map(|a| a.name)
+                .collect();
+            catalogued.sort_unstable();
+            let mut server: Vec<&str> = saranga_server::management::IS_GETTERS
+                .iter()
+                .find(|(k, _)| *k == kind)
+                .map(|(_, names)| names.to_vec())
+                .unwrap_or_else(|| panic!("no {kind} in the server's table"));
+            server.sort_unstable();
+            assert_eq!(server, catalogued, "{kind}");
+        }
+    }
 }

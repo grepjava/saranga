@@ -1143,14 +1143,23 @@ fn spawn_config_reloader(
         tick.tick().await;
         loop {
             tick.tick().await;
-            let mut due = 0;
-            for (path, last) in registry.iter_mut() {
-                let modified = last_modified(path);
-                if (*last > 0 && modified > *last) || (modified > 0 && *last == 0) {
-                    due += 1;
+            // The files' times are read off the runtime workers.
+            let Ok((checked, due)) = tokio::task::spawn_blocking(move || {
+                let mut due = 0;
+                for (path, last) in registry.iter_mut() {
+                    let modified = last_modified(path);
+                    if (*last > 0 && modified > *last) || (modified > 0 && *last == 0) {
+                        due += 1;
+                    }
+                    *last = modified;
                 }
-                *last = modified;
-            }
+                (registry, due)
+            })
+            .await
+            else {
+                break;
+            };
+            registry = checked;
             for _ in 0..due {
                 reload_from_files(&instance, &current, period, with_acceptors).await;
             }
@@ -1161,12 +1170,23 @@ fn spawn_config_reloader(
 /// One reload callback: the configuration read again and reloaded, or why
 /// not logged.
 async fn reload_from_files(
-    instance: &instance::Instance,
+    instance: &Arc<instance::Instance>,
     current: &saranga_server::Current,
     period: std::time::Duration,
     with_acceptors: bool,
 ) {
-    match read_reload(instance, period, with_acceptors) {
+    // Read and parsed off the runtime workers.
+    let files = instance.clone();
+    let read =
+        tokio::task::spawn_blocking(move || read_reload(&files, period, with_acceptors)).await;
+    let read = match read {
+        Ok(read) => read,
+        Err(e) => {
+            tracing::warn!("configuration not reloaded: {e}");
+            return;
+        }
+    };
+    match read {
         Ok(reload) => {
             if let Err(e) = current.get().reload(reload).await {
                 tracing::error!(

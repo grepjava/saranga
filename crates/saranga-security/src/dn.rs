@@ -117,12 +117,28 @@ pub fn rfc2253(name: &X509Name<'_>) -> String {
     rdns.into_iter().rev().collect::<Vec<_>>().join(",")
 }
 
+/// `AVA.toRFC2253String`: the special characters escaped wherever they
+/// are and a NUL written `\00`, then every leading and trailing space (or
+/// carriage return) escaped.
 fn escape_rfc2253(v: &str) -> String {
-    let mut out = String::with_capacity(v.len());
-    let chars: Vec<char> = v.chars().collect();
-    for (i, &c) in chars.iter().enumerate() {
-        let edge = (i == 0 && (c == ' ' || c == '#')) || (i == chars.len() - 1 && c == ' ');
-        if ",+<>;\"\\".contains(c) || edge {
+    let mut body = String::with_capacity(v.len());
+    for c in v.chars() {
+        if c == '\0' {
+            body.push_str("\\00");
+            continue;
+        }
+        if ",=+<>#;\"\\".contains(c) {
+            body.push('\\');
+        }
+        body.push(c);
+    }
+    let chars: Vec<char> = body.chars().collect();
+    let blank = |c: &&char| **c == ' ' || **c == '\r';
+    let lead = chars.iter().take_while(blank).count();
+    let trail = chars.len() - chars.iter().rev().take_while(blank).count();
+    let mut out = String::with_capacity(chars.len() + 4);
+    for (i, c) in chars.into_iter().enumerate() {
+        if i < lead || i >= trail {
             out.push('\\');
         }
         out.push(c);
@@ -158,6 +174,8 @@ fn quote_legacy(v: &str) -> String {
     let special = v.chars().any(|c| ",+=\n<>#;\\\"".contains(c))
         || v.starts_with(' ')
         || v.ends_with(' ')
+        // `AVA.toKeywordValueString`: "multiple internal whitespace".
+        || v.contains("  ")
         || v.is_empty();
     if special && !v.is_empty() {
         format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
@@ -177,5 +195,29 @@ mod tests {
         assert_eq!(escape_rfc2253("#1"), "\\#1");
         assert_eq!(quote_legacy("a,b"), "\"a,b\"");
         assert_eq!(quote_legacy("plain"), "plain");
+    }
+
+    /// The values as Java 25's `X500Principal` writes them,
+    /// `getName(RFC2253)` and `toString()` (`X500Name.toString`).
+    #[test]
+    fn as_java_writes_them() {
+        for (value, rfc2253, legacy) in [
+            ("a=b", "a\\=b", "\"a=b\""),
+            ("a#b", "a\\#b", "\"a#b\""),
+            ("#a", "\\#a", "\"#a\""),
+            ("  a  ", "\\ \\ a\\ \\ ", "\"  a  \""),
+            ("a  b", "a  b", "\"a  b\""),
+            ("a   b  c", "a   b  c", "\"a   b  c\""),
+            ("a,b", "a\\,b", "\"a,b\""),
+            ("x+y", "x\\+y", "\"x+y\""),
+            ("a<b>c;d", "a\\<b\\>c\\;d", "\"a<b>c;d\""),
+            ("q\"q", "q\\\"q", "\"q\\\"q\""),
+            ("back\\slash", "back\\\\slash", "\"back\\\\slash\""),
+            ("a\tb", "a\tb", "a\tb"),
+            (" a", "\\ a", "\" a\""),
+        ] {
+            assert_eq!(escape_rfc2253(value), rfc2253, "RFC 2253 of {value:?}");
+            assert_eq!(quote_legacy(value), legacy, "legacy of {value:?}");
+        }
     }
 }

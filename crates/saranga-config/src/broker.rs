@@ -1068,6 +1068,7 @@ impl BrokerConfig {
         let text = crate::substitute::replace_system_props(xml, &lookup);
         let text = well_formed(&text, false)?;
         let text = crate::xinclude::expand(&text, None, &lookup)?;
+        let text = crate::substitute::replace_in_document(&text, &lookup)?;
         crate::parser::validate_document(&text, crate::Validation::Deploy { jms: true })?;
         crate::parser::parse_document(&text)
     }
@@ -1084,6 +1085,7 @@ impl BrokerConfig {
         let text = crate::substitute::replace_system_props(xml, &lookup);
         let text = well_formed(&text, true)?;
         let text = crate::xinclude::expand(&text, None, &lookup)?;
+        let text = crate::substitute::replace_in_document(&text, &lookup)?;
         match crate::parser::schema_error(&text, validation)? {
             Some(message) => Err(ConfigError::Invalid(message)),
             None => Ok(()),
@@ -1100,6 +1102,7 @@ impl BrokerConfig {
         let text = crate::substitute::replace_system_props(xml, &lookup);
         let text = well_formed(&text, true)?;
         let text = crate::xinclude::expand(&text, None, &lookup)?;
+        let text = crate::substitute::replace_in_document(&text, &lookup)?;
         crate::parser::validate_document(&text, validation)?;
         crate::parser::parse_document(&text)
     }

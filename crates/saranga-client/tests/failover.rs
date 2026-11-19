@@ -274,3 +274,60 @@ async fn the_initial_connectors_are_tried_in_turn() {
     assert!(err.to_string().starts_with("AMQ219007"), "{err}");
     stop(running).await;
 }
+
+/// A non-durable queue the restarted server no longer has is recreated
+/// with every attribute its queue query gave, as
+/// `recreateConsumerOnServer` sends them: its last-value key, group,
+/// dispatch and auto-delete settings too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recreated_queue_keeps_its_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let (running, port) = start(dir.path(), 0).await;
+    let conn = Connection::connect_to(vec![Connector::new("127.0.0.1", port)], reconnecting())
+        .await
+        .unwrap();
+    let events = listen(&conn);
+    let session = conn
+        .create_session(SessionOptions::default())
+        .await
+        .unwrap();
+    let mut config = QueueConfiguration::new("kept")
+        .routing_type(RoutingType::Anycast)
+        .durable(false);
+    config.last_value_key = Some("k".to_owned());
+    config.group_buckets = Some(7);
+    config.group_rebalance = Some(true);
+    config.group_first_key = Some("first".to_owned());
+    config.consumers_before_dispatch = Some(1);
+    config.delay_before_dispatch = Some(1234);
+    config.auto_delete = Some(false);
+    config.auto_delete_delay = Some(99);
+    config.auto_delete_message_count = Some(5);
+    session.create_queue(config).await.unwrap();
+    let consumer = session.create_consumer("kept", None, false).await.unwrap();
+    session.start().await.unwrap();
+
+    stop(running).await;
+    let (running, _) = start(dir.path(), port).await;
+    wait_for(&events, FailoverEvent::FailoverCompleted).await;
+    let mut queue = None;
+    for _ in 0..(WAIT.as_millis() / 10) {
+        queue = running.broker.post_office().queue("kept");
+        if queue.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let c = queue.expect("the queue was recreated").config();
+    assert_eq!(c.last_value_key.as_deref(), Some("k"));
+    assert_eq!(c.group_buckets, 7);
+    assert!(c.group_rebalance);
+    assert_eq!(c.group_first_key.as_deref(), Some("first"));
+    assert_eq!(c.consumers_before_dispatch, 1);
+    assert_eq!(c.delay_before_dispatch, 1234);
+    assert_eq!(c.auto_delete_delay, 99);
+    assert_eq!(c.auto_delete_message_count, 5);
+    consumer.close().await;
+    conn.close().await;
+    stop(running).await;
+}

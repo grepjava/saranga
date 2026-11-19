@@ -190,12 +190,18 @@ fn exchange(
     stream.write_all(request).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
     let mut data = Vec::new();
+    let mut reading = Reading::default();
     let mut buf = [0u8; 8192];
     loop {
         stream.wait_at_most(remaining(deadline)?);
         match stream.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => data.extend_from_slice(&buf[..n]),
+            Ok(n) => {
+                data.extend_from_slice(&buf[..n]);
+                if data.len() > MAX_RESPONSE {
+                    return Err(format!("the response is over {MAX_RESPONSE} bytes"));
+                }
+            }
             // A TLS peer that closes without close_notify.
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e)
@@ -206,22 +212,124 @@ fn exchange(
             }
             Err(e) => return Err(e.to_string()),
         }
-        if let Some(r) = complete(&data, false)? {
+        if let Some(r) = reading.advance(&data, false)? {
             remaining(deadline)?;
             return Ok(r);
         }
     }
-    let r = complete(&data, true)?;
+    let r = reading.advance(&data, true)?;
     remaining(deadline)?;
     r.ok_or_else(|| "the connection closed before the response ended".into())
 }
 
-/// The response, once `data` holds all of it.
+/// The most bytes a response may take, its head included: the metadata,
+/// keys and reviews the login modules fetch are far smaller.
+const MAX_RESPONSE: usize = 8 * 1024 * 1024;
+
+/// The longest chunk-size line read (`size[;extensions]`).
+const MAX_CHUNK_LINE: usize = 4096;
+
+/// The response, once `data` holds all of it, read at once.
+#[cfg(test)]
 fn complete(data: &[u8], eof: bool) -> Result<Option<Response>, String> {
-    let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return Ok(None);
-    };
-    let head = String::from_utf8_lossy(&data[..end]);
+    Reading::default().advance(data, eof)
+}
+
+/// A response as its bytes come: each call goes on from where the last
+/// stopped, so a body is decoded once however it arrives.
+#[derive(Default)]
+struct Reading {
+    /// How far the search for the end of the head has gone.
+    searched: usize,
+    head: Option<Head>,
+    /// A chunked body decoded so far, and where its next chunk starts.
+    decoded: Vec<u8>,
+    next_chunk: usize,
+}
+
+struct Head {
+    status: u16,
+    length: Option<usize>,
+    chunked: bool,
+    /// Where the body starts.
+    body: usize,
+}
+
+impl Reading {
+    /// The response, once `data` (everything read so far) holds all of it.
+    fn advance(&mut self, data: &[u8], eof: bool) -> Result<Option<Response>, String> {
+        if self.head.is_none() {
+            let from = self.searched.saturating_sub(3);
+            let Some(at) = data[from..].windows(4).position(|w| w == b"\r\n\r\n") else {
+                self.searched = data.len();
+                return Ok(None);
+            };
+            let end = from + at;
+            let head = parse_head(&data[..end])?;
+            self.next_chunk = end + 4;
+            self.head = Some(Head {
+                body: end + 4,
+                ..head
+            });
+        }
+        let head = self.head.as_ref().expect("read above");
+        let (status, start) = (head.status, head.body);
+        if head.chunked {
+            return Ok(self.dechunk(data)?.map(|body| Response { status, body }));
+        }
+        let body = &data[start..];
+        match head.length {
+            Some(n) if body.len() >= n => Ok(Some(Response {
+                status,
+                body: body[..n].to_vec(),
+            })),
+            Some(_) => Ok(None),
+            // Read to the end of the connection.
+            None => Ok(eof.then(|| Response {
+                status,
+                body: body.to_vec(),
+            })),
+        }
+    }
+
+    /// The chunks of `data` from [`Self::next_chunk`] on: the whole body
+    /// once its last chunk is there, an error for one that cannot be read.
+    fn dechunk(&mut self, data: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        loop {
+            let rest = &data[self.next_chunk..];
+            let line = &rest[..rest.len().min(MAX_CHUNK_LINE + 2)];
+            let Some(line_end) = line.windows(2).position(|w| w == b"\r\n") else {
+                if rest.len() > MAX_CHUNK_LINE {
+                    return Err("invalid chunk: its size line is too long".into());
+                }
+                return Ok(None);
+            };
+            let size_line = String::from_utf8_lossy(&rest[..line_end]);
+            let size_text = size_line.split(';').next().unwrap_or_default().trim();
+            // The chunk and the CRLF after it must fit in an address.
+            let size = usize::from_str_radix(size_text, 16)
+                .ok()
+                .filter(|s| s.checked_add(2).is_some())
+                .ok_or_else(|| format!("invalid chunk size {size_text}"))?;
+            let chunk = &rest[line_end + 2..];
+            if size == 0 {
+                return Ok(Some(std::mem::take(&mut self.decoded)));
+            }
+            if chunk.len() < size + 2 {
+                return Ok(None);
+            }
+            if &chunk[size..size + 2] != b"\r\n" {
+                return Err("invalid chunk: no CRLF after its data".into());
+            }
+            self.decoded.extend_from_slice(&chunk[..size]);
+            self.next_chunk += line_end + 2 + size + 2;
+        }
+    }
+}
+
+/// A response's status line and headers.
+fn parse_head(head: &[u8]) -> Result<Head, String> {
+    let head = String::from_utf8_lossy(head);
     let mut lines = head.split("\r\n");
     let status_line = lines.next().unwrap_or_default();
     let status: u16 = status_line
@@ -243,52 +351,12 @@ fn complete(data: &[u8], eof: bool) -> Result<Option<Response>, String> {
             }
         }
     }
-    let body = &data[end + 4..];
-    if chunked {
-        return Ok(dechunk(body)?.map(|body| Response { status, body }));
-    }
-    match length {
-        Some(n) if body.len() >= n => Ok(Some(Response {
-            status,
-            body: body[..n].to_vec(),
-        })),
-        Some(_) => Ok(None),
-        // Read to the end of the connection.
-        None => Ok(eof.then(|| Response {
-            status,
-            body: body.to_vec(),
-        })),
-    }
-}
-
-/// A chunked body: `None` until all of it is there, an error for one that
-/// cannot be read.
-fn dechunk(mut body: &[u8]) -> Result<Option<Vec<u8>>, String> {
-    let mut out = Vec::new();
-    loop {
-        let Some(line_end) = body.windows(2).position(|w| w == b"\r\n") else {
-            return Ok(None);
-        };
-        let size_line = String::from_utf8_lossy(&body[..line_end]);
-        let size_text = size_line.split(';').next().unwrap_or_default().trim();
-        // The chunk and the CRLF after it must fit in an address.
-        let size = usize::from_str_radix(size_text, 16)
-            .ok()
-            .filter(|s| s.checked_add(2).is_some())
-            .ok_or_else(|| format!("invalid chunk size {size_text}"))?;
-        body = &body[line_end + 2..];
-        if size == 0 {
-            return Ok(Some(out));
-        }
-        if body.len() < size + 2 {
-            return Ok(None);
-        }
-        if &body[size..size + 2] != b"\r\n" {
-            return Err("invalid chunk: no CRLF after its data".into());
-        }
-        out.extend_from_slice(&body[..size]);
-        body = &body[size + 2..];
-    }
+    Ok(Head {
+        status,
+        length,
+        chunked,
+        body: 0,
+    })
 }
 
 pub(crate) fn tls_config(
@@ -423,5 +491,73 @@ mod tests {
             took < Duration::from_millis(270),
             "gave up at the timeout, not later: {took:?}"
         );
+    }
+
+    /// A chunked response of `size` bytes in 1 KiB chunks.
+    fn chunked(size: usize) -> Vec<u8> {
+        let mut data = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for _ in 0..size / 1024 {
+            data.extend_from_slice(b"400\r\n");
+            data.extend_from_slice(&[b'x'; 1024]);
+            data.extend_from_slice(b"\r\n");
+        }
+        data.extend_from_slice(b"0\r\n\r\n");
+        data
+    }
+
+    /// The time to read `data` as it comes in 8 KiB reads.
+    fn read_in_pieces(data: &[u8], size: usize) -> Duration {
+        let start = Instant::now();
+        let mut reading = Reading::default();
+        let mut done = None;
+        for end in (8192..data.len()).step_by(8192).chain([data.len()]) {
+            if let Some(r) = reading.advance(&data[..end], false).unwrap() {
+                done = Some(r);
+                break;
+            }
+        }
+        assert_eq!(done.expect("read").body.len(), size);
+        start.elapsed()
+    }
+
+    /// A chunked body is decoded once as it comes: eight times the body
+    /// takes about eight times as long, not sixty-four.
+    #[test]
+    fn a_chunked_body_is_read_in_linear_time() {
+        let small = chunked(512 * 1024);
+        let large = chunked(4 * 1024 * 1024);
+        let (mut a, mut b) = (Duration::MAX, Duration::MAX);
+        for _ in 0..3 {
+            a = a.min(read_in_pieces(&small, 512 * 1024));
+            b = b.min(read_in_pieces(&large, 4 * 1024 * 1024));
+        }
+        assert!(b < a * 24, "512 KiB took {a:?}, 4 MiB took {b:?}");
+    }
+
+    /// A response over `MAX_RESPONSE` bytes is refused, however it is
+    /// framed, rather than held in memory.
+    #[test]
+    fn a_response_too_large_is_refused() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut buf).unwrap();
+                seen.extend_from_slice(&buf[..n]);
+            }
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n");
+            let piece = vec![b'x'; 64 * 1024];
+            for _ in 0..(MAX_RESPONSE / piece.len() + 8) {
+                if s.write_all(&piece).is_err() {
+                    break;
+                }
+            }
+        });
+        let result = HttpClient::new(10_000, None, None).get(&format!("http://127.0.0.1:{port}/"));
+        let e = result.err().expect("refused");
+        assert!(e.contains("over"), "{e}");
     }
 }

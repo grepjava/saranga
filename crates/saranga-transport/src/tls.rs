@@ -385,7 +385,13 @@ impl TlsAcceptor {
             loop {
                 tokio::time::sleep(period).await;
                 let Some(a) = this.upgrade() else { break };
-                a.reload_if_changed();
+                // The stores are read and parsed off the runtime workers.
+                if tokio::task::spawn_blocking(move || a.reload_if_changed())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
         });
     }

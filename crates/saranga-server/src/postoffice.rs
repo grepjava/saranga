@@ -1002,7 +1002,7 @@ impl PostOffice {
                         ..PageRouted::default()
                     }),
                     crate::paging::Paged::Yes(p) => {
-                        queues.iter().for_each(Queue::paged_added);
+                        paged_added(tx, queues);
                         Ok(PageRouted {
                             pending: p.into_iter().collect(),
                             ..PageRouted::default()
@@ -1032,7 +1032,7 @@ impl PostOffice {
                 match self.paging_store(&address).page(&r.message, tx, &group)? {
                     crate::paging::Paged::No => keep.extend(group),
                     crate::paging::Paged::Yes(p) => {
-                        group.iter().for_each(Queue::paged_added);
+                        paged_added(tx, &group);
                         out.pending.extend(p);
                         paged = true;
                     }
@@ -1061,7 +1061,7 @@ impl PostOffice {
                         match store.page(&copy.message, tx, std::slice::from_ref(&snf))? {
                             crate::paging::Paged::No => copies.push((copy, vec![snf])),
                             crate::paging::Paged::Yes(p) => {
-                                snf.paged_added();
+                                paged_added(tx, std::slice::from_ref(&snf));
                                 out.pending.extend(p);
                             }
                             crate::paging::Paged::Dropped => continue,
@@ -4107,4 +4107,17 @@ fn route_to(message: &MessageRef) -> Option<(Vec<i64>, MessageRef)> {
     let mut r = MessageRef::new(message.message.with_core(stripped));
     r.scheduled_time = message.scheduled_time;
     Some((ids, r))
+}
+
+/// A message paged to `queues` counts in their `messagesAdded`: at once
+/// without a transaction, else when it commits (`TxPaging::after_commit`),
+/// as Artemis's page counter counts it (`increment(tx, ...)`).
+fn paged_added(tx: Option<&crate::transaction::TxRef>, queues: &[Queue]) {
+    match tx {
+        None => queues.iter().for_each(Queue::paged_added),
+        Some(tx) => crate::transaction::lock(tx)
+            .paging
+            .added
+            .extend(queues.iter().cloned()),
+    }
 }

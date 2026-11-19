@@ -268,7 +268,9 @@ fn included_document(
     relative_base: String,
     parent_language: &str,
 ) -> Result<String> {
-    let content = crate::substitute::replace_system_props(content, lookup);
+    // Read untouched: its `${...}` are replaced with the including
+    // document's, once it is parsed (`replace_in_document`).
+    let content = content.to_owned();
     let dir = path.parent().map(Path::to_path_buf);
     let scope = Scope {
         relative_base: Some(relative_base.clone()),
@@ -524,6 +526,10 @@ mod tests {
         );
         let lookup = |k: &str| (k == "n").then(|| "q".to_owned());
         let out = expand(&doc, None, &lookup).unwrap();
+        // The included document's `${n}` is the including one's to
+        // replace, once parsed.
+        assert!(out.contains(r#"name="${n}""#), "{out}");
+        let out = crate::substitute::replace_in_document(&out, lookup).unwrap();
         // A nested include's base is its path when the scheme (here the
         // drive, on Windows) is its parent's.
         let path = d.split_once(':').map_or(d.as_str(), |(_, p)| p);
@@ -606,5 +612,51 @@ mod tests {
         )
         .unwrap();
         assert!(expand(doc, Some(dir.path()), &none).is_err());
+    }
+
+    /// `${...}` in an included file is replaced in the parsed values, as
+    /// `replaceSystemPropsInXml` replaces it: a value with markup
+    /// characters is taken as it is, in text and in attributes, and an
+    /// entity-escaped `&#36;{X}` in broker.xml is replaced too.
+    #[test]
+    fn included_values_are_replaced_as_values() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pw.xml"),
+            r#"<address-settings xmlns="urn:activemq:core"><address-setting match="${M}"><dead-letter-address>${PW}</dead-letter-address></address-setting></address-settings>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("addr.xml"),
+            r#"<addresses xmlns="urn:activemq:core"><address name="${A}"><anycast/></address></addresses>"#,
+        )
+        .unwrap();
+        let d = dir.path().display().to_string().replace('\\', "/");
+        let xml = format!(
+            r#"<configuration xmlns="urn:activemq" xmlns:xi="http://www.w3.org/2001/XInclude">
+                 <core xmlns="urn:activemq:core">
+                   <name>&#36;{{N}}</name>
+                   <xi:include href="{d}/pw.xml"/>
+                   <xi:include href="{d}/addr.xml"/>
+                 </core>
+               </configuration>"#
+        );
+        let lookup = |k: &str| match k {
+            "PW" => Some("a&b<c\"x".to_owned()),
+            "A" => Some("q'\"<&>".to_owned()),
+            "N" => Some("named".to_owned()),
+            "M" => Some("m&<\"".to_owned()),
+            _ => None,
+        };
+        let c = crate::BrokerConfig::parse_with(&xml, lookup).unwrap();
+        let (m, s) = &c.address_settings[0];
+        assert_eq!(m, "m&<\"");
+        assert_eq!(s.dead_letter_address.as_deref(), Some("a&b<c\"x"));
+        assert_eq!(c.name, "named");
+        assert!(
+            c.addresses.iter().any(|a| a.name == "q'\"<&>"),
+            "{:?}",
+            c.addresses.iter().map(|a| &a.name).collect::<Vec<_>>()
+        );
     }
 }

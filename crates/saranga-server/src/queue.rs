@@ -8,7 +8,7 @@
 //! `ScheduledDeliveryHandlerImpl`, with redelivery, dead-letter and expiry
 //! handling (`checkRedelivery`, `sendToDeadLetterAddress`, `expire`, `move`).
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
@@ -27,6 +27,9 @@ use crate::postoffice::{PostOffice, QueueSpec};
 use crate::settings::AddressSettings;
 use crate::storage::{Pending, StoreResult};
 use crate::{IdGenerator, Name, RoutingType};
+
+#[path = "queue_lists.rs"]
+mod lists;
 
 #[path = "queue_control.rs"]
 mod control;
@@ -578,7 +581,7 @@ impl Queue {
             consumers: Vec::new(),
             browsers: Vec::new(),
             round_robin: HashMap::new(),
-            scheduled: BTreeMap::new(),
+            scheduled: lists::Scheduled::default(),
             scheduled_seq: 0,
             expiry_warned: false,
             groups: HashMap::new(),
@@ -1331,6 +1334,9 @@ struct MessageList {
     flat: bool,
     /// A last-value queue's keys (`LastValueQueue.map`).
     last_values: Option<LastValues>,
+    /// What the list holds, counted as references join it ([`Self::added`])
+    /// and leave it ([`Self::removed`]).
+    tally: lists::Tally,
 }
 
 /// A last-value queue's current reference for each key, among those in the
@@ -1383,9 +1389,27 @@ impl MessageList {
 
     /// A reference leaves the list (`refRemoved`).
     fn removed(&mut self, r: &MessageRef) {
+        self.tally.sub(r);
         if self.last_values.is_some() {
             self.forget_last_value(r);
         }
+    }
+
+    /// A reference joins the list.
+    fn added(&mut self, r: &MessageRef) {
+        self.tally.add(r);
+    }
+
+    /// Takes every reference out, from the highest priority down.
+    fn take_all(&mut self) -> Vec<MessageRef> {
+        let out: Vec<MessageRef> = self
+            .levels
+            .iter_mut()
+            .rev()
+            .flat_map(|l| l.drain(..))
+            .collect();
+        out.iter().for_each(|r| self.removed(r));
+        out
     }
 
     fn level(&self, r: &MessageRef) -> usize {
@@ -1400,6 +1424,7 @@ impl MessageList {
     fn push_back(&mut self, mut r: MessageRef) {
         self.sequence += 1;
         r.sequence = self.sequence;
+        self.added(&r);
         let level = self.level(&r);
         self.levels[level].push_back(r);
     }
@@ -1420,6 +1445,7 @@ impl MessageList {
     }
 
     fn push_front(&mut self, r: MessageRef) {
+        self.added(&r);
         let level = self.level(&r);
         self.levels[level].push_front(r);
     }
@@ -1445,6 +1471,7 @@ impl MessageList {
     /// `addSorted`: inserts in queue order (the sequence each reference
     /// took as it joined the list) within its priority.
     fn insert_sorted(&mut self, r: MessageRef) {
+        self.added(&r);
         let level = self.level(&r);
         let level = &mut self.levels[level];
         let pos = level
@@ -1505,7 +1532,7 @@ struct Consumer {
     /// `availableCredits`; `None` when flow control is off.
     credits: Option<i64>,
     started: bool,
-    delivering: VecDeque<MessageRef>,
+    delivering: lists::Delivering,
     /// Messages already sent to a browser.
     browsed: HashSet<i64>,
     /// The large message being sent (`largeMessageDeliverer`): nothing
@@ -1532,7 +1559,7 @@ impl Consumer {
         Self {
             credits: Some(0),
             started: reg.started || reg.browse_only,
-            delivering: VecDeque::new(),
+            delivering: lists::Delivering::default(),
             browsed: HashSet::new(),
             large: None,
             forced: Vec::new(),
@@ -1728,7 +1755,7 @@ struct Actor {
     /// References waiting for their delivery time, ordered by time, then
     /// redeliveries before new messages, then arrival
     /// (`ScheduledDeliveryHandlerImpl`).
-    scheduled: BTreeMap<(i64, bool, u64), MessageRef>,
+    scheduled: lists::Scheduled,
     scheduled_seq: u64,
     /// AMQ222147 is logged once per queue.
     expiry_warned: bool,
@@ -1888,11 +1915,7 @@ impl Actor {
         }
         let now = now_millis();
         let mut due = Vec::new();
-        while let Some(entry) = self.scheduled.first_entry() {
-            if entry.key().0 > now {
-                break;
-            }
-            let mut r = entry.remove();
+        while let Some(mut r) = self.scheduled.pop_due(now) {
             r.scheduled_time = 0;
             due.push(r);
         }
@@ -3400,15 +3423,18 @@ impl Actor {
     fn delete_all_references(&mut self) -> bool {
         let queue = Queue(self.shared.clone());
         let storage = self.shared.ids.storage().cloned();
-        let mut refs: Vec<MessageRef> = std::mem::take(&mut self.scheduled).into_values().collect();
-        for level in &mut self.messages.levels {
-            refs.extend(level.drain(..));
-        }
+        let mut refs: Vec<MessageRef> = self.scheduled.take_all();
+        refs.extend(self.messages.take_all());
         // A non-destructive queue's deliveries are copies of references it
         // still holds, owning nothing of their own: acknowledged with those,
         // they would take the message's records and counts down twice.
         for c in self.consumers.iter_mut() {
-            refs.extend(c.delivering.drain(..).filter(|r| r.copy_for.is_none()));
+            refs.extend(
+                c.delivering
+                    .take_all()
+                    .into_iter()
+                    .filter(|r| r.copy_for.is_none()),
+            );
         }
         let _ = storage;
         if crate::audit::message_enabled() {
@@ -3513,13 +3539,14 @@ fn rand_unit() -> f64 {
 /// had not reached the application, so their count is undone unless the
 /// client failed.
 fn cancel(
-    delivering: VecDeque<MessageRef>,
+    delivering: lists::Delivering,
     metrics: &ConsumerMetrics,
     last_as_delivered: bool,
     failed: bool,
 ) -> Vec<MessageRef> {
     let mut keep_first = last_as_delivered;
     delivering
+        .into_refs()
         .into_iter()
         .map(|mut r| {
             metrics.add_acknowledge(r.message.encode_size() as i64, false);

@@ -389,6 +389,14 @@ fn what(j: &Json) -> Result<What, String> {
             let Some(Json::Array(names)) = j.get("names") else {
                 return Err("an attributes view needs names".into());
             };
+            // As `GET /resources/{r}/attributes`: each tick reads, checks
+            // and audits every name.
+            if names.len() > api::MAX_CHECKS {
+                return Err(format!(
+                    "an attributes view names at most {} attributes",
+                    api::MAX_CHECKS
+                ));
+            }
             let names = names
                 .iter()
                 .map(|n| n.as_str().map(str::to_owned))
@@ -954,6 +962,25 @@ mod tests {
         assert!(view(r#"{"kind":"listing","listing":"nope"}"#).is_err());
         assert!(view(r#"{"kind":"attributes","resource":"q"}"#).is_err());
         assert!(view(r#"{}"#).is_err());
+    }
+
+    /// An attributes view names at most `MAX_CHECKS` attributes, as an
+    /// attribute read does: each tick reads, checks and audits every name.
+    #[test]
+    fn an_attributes_view_is_capped() {
+        let names = |n: usize| {
+            let names: Vec<String> = (0..n).map(|i| format!("\"A{i}\"")).collect();
+            format!(
+                r#"{{"kind":"attributes","resource":"queue.q","names":[{}]}}"#,
+                names.join(",")
+            )
+        };
+        let at_most = crate::api::MAX_CHECKS;
+        assert!(view(&Json::parse(&names(at_most)).unwrap(), "me").is_ok());
+        let e = view(&Json::parse(&names(at_most + 1)).unwrap(), "me")
+            .err()
+            .expect("one name too many is refused");
+        assert!(e.contains("at most 1000"), "{e}");
     }
 
     #[test]

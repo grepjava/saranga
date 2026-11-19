@@ -1484,7 +1484,8 @@ impl Broker {
     }
 
     /// `reloadConfigurationFile`: the configuration is read again and
-    /// reloaded now.
+    /// reloaded now. The files are read and parsed off the runtime
+    /// workers, as `export_config_as_properties` writes them.
     pub async fn reload_configuration_file(self: &Arc<Self>) -> std::result::Result<(), String> {
         let loader = self
             .config_loader
@@ -1492,7 +1493,10 @@ impl Broker {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if let Some(load) = loader {
-            self.reload(load()?).await?;
+            let reload = tokio::task::spawn_blocking(move || load())
+                .await
+                .map_err(|e| e.to_string())??;
+            self.reload(reload).await?;
         }
         Ok(())
     }

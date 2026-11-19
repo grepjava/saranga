@@ -240,9 +240,17 @@ impl Broker {
                 self.stop_running(&r).await;
             }
         }
+        // Made off the runtime workers: making one reads its TLS stores.
+        let create = plan.create;
+        let names = to_create.clone();
+        let made = tokio::task::spawn_blocking(move || {
+            names.iter().map(|name| create(name)).collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| e.to_string())?;
         let mut to_start = Vec::new();
-        for name in &to_create {
-            match (plan.create)(name) {
+        for (name, made) in to_create.iter().zip(made) {
+            match made {
                 Ok(Some(n)) => {
                     let running = Running::new(name, &n.address, n.acceptor);
                     self.acceptors.push(running.clone());
@@ -390,8 +398,12 @@ impl Broker {
     pub async fn reload_acceptor(self: &Arc<Self>, name: &str) -> Result<(), String> {
         let r = self.acceptors.find(name).ok_or_else(|| unknown(name))?;
         let was_listening = unbind(&r).await;
-        if let Some(tls) = &r.acceptor.tls {
-            tls.reload().map_err(|e| e.to_string())?;
+        if let Some(tls) = r.acceptor.tls.clone() {
+            // The stores are read and parsed off the runtime workers.
+            tokio::task::spawn_blocking(move || tls.reload())
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
         }
         if was_listening {
             let loops = crate::event_loops::remoting_threads(&r.acceptor.params)

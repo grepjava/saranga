@@ -747,7 +747,84 @@ impl Actor {
         self.queue().is_paused()
     }
 
+    /// The queue's statistics, from the counts its lists keep as references
+    /// come and go (`QueuePendingMessageMetrics`): a read costs a sum over
+    /// the consumers, not a walk of every message. Debug builds check the
+    /// counts against a walk.
     fn stats(&self) -> QueueStats {
+        let delivering = self
+            .consumers
+            .iter()
+            .fold(super::lists::Tally::default(), |t, c| {
+                t.plus(c.delivering.tally())
+            });
+        let s = Self::stats_of(
+            self.queue().is_durable(),
+            &delivering,
+            self.scheduled.tally(),
+            &self.messages.tally,
+            self.groups.len(),
+        );
+        // Up to a depth only, so tests of deep queues still measure the
+        // counted cost.
+        #[cfg(debug_assertions)]
+        if self.messages.len()
+            + self.scheduled.len()
+            + self
+                .consumers
+                .iter()
+                .map(|c| c.delivering.len())
+                .sum::<usize>()
+            <= 4096
+        {
+            let walked = self.walked_stats();
+            debug_assert_eq!(
+                format!("{s:?}"),
+                format!("{walked:?}"),
+                "queue {}: counted statistics differ from the messages held",
+                self.shared.name
+            );
+        }
+        s
+    }
+
+    fn stats_of(
+        durable_queue: bool,
+        delivering: &super::lists::Tally,
+        scheduled: &super::lists::Tally,
+        pending: &super::lists::Tally,
+        groups: usize,
+    ) -> QueueStats {
+        // A message counts as durable only on a durable queue.
+        let d = |n: i64| if durable_queue { n } else { 0 };
+        QueueStats {
+            delivering_count: delivering.count as i32,
+            delivering_size: delivering.size,
+            durable_delivering_count: d(delivering.durable_count) as i32,
+            durable_delivering_size: d(delivering.durable_size),
+            scheduled_count: scheduled.count,
+            scheduled_size: scheduled.size,
+            durable_scheduled_count: d(scheduled.durable_count),
+            durable_scheduled_size: d(scheduled.durable_size),
+            non_paged: NonPagedStats {
+                delivering_size: delivering.non_paged_size,
+                durable_delivering_count: d(delivering.non_paged_durable_count),
+                durable_delivering_size: d(delivering.non_paged_durable_size),
+                scheduled_size: scheduled.non_paged_size,
+                durable_scheduled_count: d(scheduled.non_paged_durable_count),
+                durable_scheduled_size: d(scheduled.non_paged_durable_size),
+            },
+            pending_size: pending.non_paged_size,
+            durable_pending_count: d(pending.non_paged_durable_count),
+            durable_pending_size: d(pending.non_paged_durable_size),
+            group_count: groups as i32,
+        }
+    }
+
+    /// [`Self::stats`] by walking every message held: what the counts
+    /// must equal.
+    #[cfg(debug_assertions)]
+    fn walked_stats(&self) -> QueueStats {
         let queue = self.queue();
         let size = |r: &MessageRef| crate::paging::persistent_size(&r.message);
         let durable = |r: &MessageRef| queue.is_durable() && r.message.is_durable();
@@ -831,7 +908,10 @@ impl Actor {
                         hits += 1;
                         let mut core = r.message.core().clone();
                         core.priority = *p;
+                        // The new message is counted in place of the old.
+                        self.messages.tally.sub(r);
                         q.reprioritise(r, core);
+                        self.messages.tally.add(r);
                     }
                 }
             }

@@ -1292,6 +1292,13 @@ pub(crate) fn apply_scalar(config: &mut BrokerConfig, element: &str, value: &str
     if !SCALAR_ELEMENTS.contains(&element) {
         return Ok(CORE_ELEMENTS.contains(&element));
     }
+    // `setClusterPassword`: the value as given. The element is unmasked as
+    // `mask-password` says; a property only when it is `ENC(...)`, which
+    // the caller has done already.
+    if element == "cluster-password" {
+        config.cluster_password = value.to_owned();
+        return Ok(true);
+    }
     let text = format!("<core><{element}>{}</{element}></core>", xml_escape(value));
     let doc = Document::parse(&text)?;
     parse_scalars(doc.root_element(), config, &mut Vec::new())?;

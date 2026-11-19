@@ -175,29 +175,20 @@ async fn read(
     if !m.exists(broker, resource) {
         return not_found(format!("no resource {resource}"));
     }
+    let Some(getter) = m.getter(broker, resource, attribute) else {
+        return not_found(format!("no attribute {attribute} on {resource}"));
+    };
+    // The getter is checked before the value is worked out and the read
+    // audited, as `getAttribute` checks it before calling it.
+    if let Err(e) = m.permits(caller(broker, auth, remote), resource, &getter) {
+        return error(StatusCode::FORBIDDEN, e);
+    }
     let Ok(value) = m
         .attribute(broker, resource, attribute, checked(broker, auth, remote))
         .await
     else {
         return not_found(format!("no attribute {attribute} on {resource}"));
     };
-    let mut chars = attribute.chars();
-    let upper: String = chars
-        .next()
-        .map(|c| c.to_uppercase().chain(chars).collect())
-        .unwrap_or_default();
-    let getter = if matches!(value, Json::Bool(_)) {
-        "is"
-    } else {
-        "get"
-    };
-    if let Err(e) = m.permits(
-        caller(broker, auth, remote),
-        resource,
-        &format!("{getter}{upper}"),
-    ) {
-        return error(StatusCode::FORBIDDEN, e);
-    }
     reply(StatusCode::OK, value)
 }
 
@@ -442,5 +433,94 @@ mod tests {
             ticked < std::time::Duration::from_millis(300),
             "the runtime was held for {ticked:?} by the login"
         );
+    }
+
+    /// Every event's message.
+    #[derive(Clone, Default)]
+    struct Events(Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct Message<'a>(&'a mut String);
+
+    impl tracing::field::Visit for Message<'_> {
+        fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+            if f.name() == "message" {
+                *self.0 = format!("{v:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for Events {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, e: &tracing::Event<'_>) {
+            let mut m = String::new();
+            e.record(&mut Message(&mut m));
+            self.0.lock().unwrap().push(m);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A REST attribute read is refused before the value is worked out
+    /// and the read audited, as `getAttribute` checks the getter first.
+    #[tokio::test]
+    async fn a_refused_attribute_read_is_not_audited() {
+        let file = saranga_config::BrokerConfig::parse(
+            r##"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+                 <persistence-enabled>false</persistence-enabled>
+                 <security-enabled>true</security-enabled>
+                 <management-message-rbac>true</management-message-rbac>
+                 <security-settings>
+                   <security-setting match="mops.#">
+                     <permission type="edit" roles="admin"/>
+                     <permission type="view" roles="admin"/>
+                   </security-setting>
+                 </security-settings>
+               </core></configuration>"##,
+        )
+        .unwrap();
+        let mut config = saranga_server::BrokerConfig::from_file_config(
+            &file,
+            Arc::new(saranga_server::postoffice::SelectorFilters),
+            &std::env::temp_dir(),
+        )
+        .unwrap();
+        config.security = Some(Arc::new(saranga_security::SecurityStore::new(
+            saranga_security::SecurityStoreConfig::from_broker(&file),
+            file.security_repository().unwrap(),
+            Arc::new(saranga_security::JaasSecurityManager::new(
+                saranga_security::LoginConfig::default(),
+                None,
+                "activemq",
+                None,
+            )),
+        )));
+        let broker = Broker::start(config).await.unwrap();
+        let mut spec = saranga_server::postoffice::QueueSpec::new("q", "q");
+        spec.auto_create_address = Some(true);
+        broker.post_office().create_queue(spec, false).unwrap();
+        let mut subject = saranga_security::jaas::Subject::default();
+        subject.add(saranga_security::jaas::Principal::User("u".to_owned()));
+        let auth = Some(SecurityAuth {
+            subject: Some(Arc::new(subject)),
+            management: true,
+            ..SecurityAuth::default()
+        });
+        let events = Events::default();
+        let _guard = tracing::subscriber::set_default(events.clone());
+        let r = read(&broker, &auth, "test", "queue.q", "messageCount").await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let seen = events.0.lock().unwrap().clone();
+        assert!(
+            !seen.iter().any(|e| e.contains("is getting message count")),
+            "a refused read was audited as run: {seen:?}"
+        );
+        broker.stop().unwrap();
     }
 }

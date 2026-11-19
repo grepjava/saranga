@@ -849,6 +849,26 @@ mod tests {
         })
     }
 
+    /// `clusterPassword` is set as given (`setClusterPassword`), whatever
+    /// `mask-password` says: only an `ENC(...)` value is unmasked.
+    #[test]
+    fn cluster_password_is_set_as_given() {
+        let mut config = BrokerConfig {
+            mask_password: Some(true),
+            ..BrokerConfig::default()
+        };
+        let warnings = apply_str(&mut config, "clusterPassword=plainsecret");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.cluster_password, "plainsecret");
+        let masked = crate::mask::Codec::from_desc(None)
+            .unwrap()
+            .encode("secret2")
+            .unwrap();
+        let warnings = apply_str(&mut config, &format!("clusterPassword=ENC({masked})"));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.cluster_password, "secret2");
+    }
+
     #[test]
     fn status() {
         let dir = std::env::temp_dir().join(format!("saranga-bps-{}", std::process::id()));

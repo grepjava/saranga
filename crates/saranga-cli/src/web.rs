@@ -237,6 +237,10 @@ pub async fn start(
         saranga_console: instance
             .lookup("saranga.console.enabled")
             .is_none_or(|v| !v.trim().eq_ignore_ascii_case("false")),
+        header_limits: saranga_management::HeaderLimits::of(
+            web.max_request_header_size,
+            web.max_response_header_size,
+        ),
     };
     saranga_management::start(current.clone(), bindings, options)
         .await

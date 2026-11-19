@@ -148,3 +148,25 @@ async fn an_acknowledgement_after_the_timeout_returns_the_message() {
     let again = deliveries(2).await.expect("the message delivered again");
     assert_eq!(again[1], id);
 }
+
+/// `xaFailed`'s new branch takes the session's `xaSetTimeout` value, as
+/// `xa_start`'s does (`newTransaction(xid)`), not the resource manager's.
+#[tokio::test]
+async fn a_failed_branch_takes_the_session_timeout() {
+    let broker = broker().await;
+    let mut s = session(&broker, "xa", true);
+    s.xa_set_timeout(7);
+    s.xa_failed(xid("failed"));
+    let failed = broker.resource_manager().get(&xid("failed")).unwrap();
+    assert_eq!(transaction::lock(&failed).timeout_seconds, 7, "xa_failed");
+    s.close(false).await;
+
+    let mut s = session(&broker, "xa2", true);
+    s.xa_set_timeout(9);
+    s.xa_start(xid("started")).unwrap();
+    let started = broker.resource_manager().get(&xid("started")).unwrap();
+    assert_eq!(transaction::lock(&started).timeout_seconds, 9, "xa_start");
+    let _ = s.xa_end(xid("started"));
+    let _ = s.xa_rollback(xid("started")).await;
+    s.close(false).await;
+}

@@ -479,3 +479,71 @@ async fn reload_keeps_journaled_diverts() {
     assert_eq!(names(&broker), ["d1", "d2", "d3", "m"]);
     broker.stop().unwrap();
 }
+
+/// Counts 10 ms ticks on the runtime until stopped: on a current-thread
+/// runtime it counts only while nothing blocks the runtime's one worker.
+fn ticker() -> (
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = ticks.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    (ticks, task)
+}
+
+/// `reloadConfigurationFile` reads and parses the files off the runtime
+/// workers: other tasks keep running while a slow read goes on.
+#[tokio::test]
+async fn reload_configuration_file_reads_off_the_workers() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(&xml(false, ""), dir.path()).await;
+    broker.set_config_loader(Arc::new(|| {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        Err("not read".to_owned())
+    }));
+    let (ticks, task) = ticker();
+    tokio::task::yield_now().await;
+    let e = broker.reload_configuration_file().await.unwrap_err();
+    task.abort();
+    assert_eq!(e, "not read");
+    let ticks = ticks.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        ticks >= 5,
+        "the runtime stalled during the read: {ticks} ticks"
+    );
+    broker.stop().unwrap();
+}
+
+/// A reload makes its new acceptors off the runtime workers (making one
+/// reads its TLS stores): other tasks keep running meanwhile.
+#[tokio::test]
+async fn reload_makes_acceptors_off_the_workers() {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = start(&xml(false, ""), dir.path()).await;
+    let port = free_port();
+    let a = cfg::AcceptorConfig::parse(Some("slow"), &format!("tcp://127.0.0.1:{port}")).unwrap();
+    let mut reload = Reload::from_file_config(&xml(false, "")).unwrap();
+    reload.acceptors = Some(saranga_server::acceptors::AcceptorPlan {
+        configured: vec![("slow".to_owned(), a.transport_params())],
+        create: Box::new(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            Ok(None)
+        }),
+    });
+    let (ticks, task) = ticker();
+    tokio::task::yield_now().await;
+    broker.reload(reload).await.unwrap();
+    task.abort();
+    let ticks = ticks.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        ticks >= 5,
+        "the runtime stalled making the acceptor: {ticks} ticks"
+    );
+    broker.stop().unwrap();
+}
