@@ -829,6 +829,7 @@ fn property_value(v: &PropertyValue) -> Value {
 /// property names.
 fn property_names(core: &CoreMessage) -> Vec<String> {
     let mut names = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for (k, _) in core.properties.entries() {
         let name = k.to_string_lossy();
         let mapped = match name.as_str() {
@@ -844,11 +845,11 @@ fn property_names(core: &CoreMessage) -> Vec<String> {
             }
             _ => continue,
         };
-        if !names.contains(&mapped) {
+        if seen.insert(mapped.clone()) {
             names.push(mapped);
         }
     }
-    if !names.iter().any(|n| n == JMSX_DELIVERY_COUNT) {
+    if !seen.contains(JMSX_DELIVERY_COUNT) {
         names.push(JMSX_DELIVERY_COUNT.to_owned());
     }
     // A HashSet<String>.
@@ -1019,10 +1020,12 @@ fn core_body(core: &CoreMessage, properties: &mut Properties) -> (i8, Option<(u6
     }
 }
 
-/// Decodes a value Core kept encoded (`decodeEmbeddedAMQPType`).
+/// Decodes a value Core kept encoded (`decodeEmbeddedAMQPType`), as one a
+/// section's map holds: a described section, its map, then the value.
 fn decode_embedded(v: &PropertyValue) -> Value {
+    const IN_A_SECTION: usize = 2;
     match v {
-        PropertyValue::Bytes(b) => codec::from_slice(b).unwrap_or(Value::Null),
+        PropertyValue::Bytes(b) => codec::from_slice_within(b, IN_A_SECTION).unwrap_or(Value::Null),
         _ => Value::Null,
     }
 }
@@ -1241,7 +1244,18 @@ pub fn from_core(core: &CoreMessage, now: i64) -> AmqpMessage {
     if let Some(f) = &footer {
         encode_section(section::FOOTER, symbol_map(f), &mut data);
     }
-    let mut m = AmqpMessage::new(0, data, now).expect("a message this module encoded decodes");
+    let mut m = match AmqpMessage::new(0, data, now) {
+        Ok(m) => m,
+        Err(e) => {
+            // Not expected: every value above was decoded to fit. Rather
+            // than fail the consumer, the message goes without its sections.
+            tracing::warn!(
+                "message {}: its AMQP form does not decode ({e}); sent without its sections",
+                core.message_id
+            );
+            AmqpMessage::new(0, Vec::new(), now).expect("a message of no sections decodes")
+        }
+    };
     m.set_message_id(core.message_id);
     m
 }

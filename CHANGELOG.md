@@ -17,6 +17,9 @@ Each release of Saranga, newest first. Saranga is inspired by Apache ActiveMQ Ar
 
 ### Fixes
 
+- **An AMQP map key that repeats reads as its last value.** Application properties and annotations with a key given twice are seen by selectors, grouping and conversion with the value the later entry gives, as proton's decode makes it, instead of the earlier one.
+- **A connection whose handling fails unexpectedly still closes cleanly.** For every protocol, its sessions close, its consumers leave their queues and give back what they held, and its temporary queues go, instead of staying behind.
+- **Messages with many properties convert in time linear in their number** between Core, AMQP and OpenWire.
 - With the **database store**, paged messages whose write or commit lands after higher-numbered ones are read once it does, instead of waiting until nothing else is left to read; a send that waited for room while the store failed is refused instead of accepted.
 - **At start**, a message left with no reference (its queue is gone) is deleted with its large-message file, duplicate IDs stored before `persist-id-cache` was turned off are deleted, legacy pending large-message records are deleted, and page transactions no paged message names any more are deleted, as Artemis does; the start-up messages of this path carry Artemis's IDs and texts.
 - **Page files**: a page with a record that does not decode is finished once what was read before it is consumed, and kept as `.invalidPage`; a record too large for a page frame is refused instead of written with a wrapped size; a page's acknowledgements are kept when its complete record or the cleanup's commit cannot be written.

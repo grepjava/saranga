@@ -802,3 +802,49 @@ async fn upgrade(
 
 /// `TransportConstants.DEFAULT_HANDSHAKE_TIMEOUT`, in seconds.
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runs a connection's work so that a panic in it ends the work, not the
+/// whole task: what the connection does after (close its sessions, take its
+/// consumers off their queues, remove its temporary queues) still runs, as
+/// Netty's `exceptionCaught` fails the connection in Artemis. `None` when the
+/// work panicked.
+pub async fn unwinding<F: Future>(work: F) -> Option<F::Output> {
+    use futures_util::FutureExt;
+    match std::panic::AssertUnwindSafe(work).catch_unwind().await {
+        Ok(out) => Some(out),
+        Err(panic) => {
+            let text = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panicked".to_owned());
+            tracing::error!("connection failed: {text}; closing it");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod unwinding_tests {
+    use super::unwinding;
+
+    /// A connection's work that panics ends with `None`, and what follows
+    /// it still runs.
+    #[tokio::test]
+    async fn work_that_panics_ends_and_what_follows_runs() {
+        let mut state = vec!["open"];
+        let out = unwinding(async {
+            state.push("working");
+            tokio::task::yield_now().await;
+            if state.len() > 1 {
+                panic!("a defect");
+            }
+            1
+        })
+        .await;
+        assert_eq!(out, None);
+        state.push("closed");
+        assert_eq!(state, ["open", "working", "closed"]);
+        assert_eq!(unwinding(async { 2 }).await, Some(2));
+    }
+}

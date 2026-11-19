@@ -617,7 +617,7 @@ struct Connection {
     handler: Version,
     /// How far into the frame still arriving its body's NUL is known not to
     /// be ([`decoder::decode_from`]).
-    scanned: usize,
+    scanned: decoder::Progress,
     /// The version agreed at CONNECT (`version`).
     negotiated: Option<Version>,
     /// A login succeeded (`valid`).
@@ -686,7 +686,7 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
         settings,
         id: uuid::Uuid::new_v4().simple().to_string()[..8].to_owned(),
         handler: Version::V10,
-        scanned: 0,
+        scanned: decoder::Progress::default(),
         negotiated: None,
         valid: false,
         login: None,
@@ -701,39 +701,42 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
     };
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut last_read = tokio::time::Instant::now();
-    loop {
-        // Only bytes from the client keep the connection alive
-        // (`checkDataReceived`), not what goes to it meanwhile.
-        let deadline = last_read + Duration::from_millis(conn.ttl.max(1) as u64);
-        tokio::select! {
-            // Management failed the connection; a failure the client was
-            // told of closes after its last reply instead.
-            () = failed.failed(), if !conn.failure_reported => {
-                conn.report_failure();
-                break;
-            }
-            event = events_rx.recv() => match event {
-                Some(Event::AutoAck { consumer, message }) => conn.auto_ack(consumer, message).await,
-                Some(Event::AutoAcked { tx, pending, result }) => conn.auto_acked(tx, pending, result),
-                Some(Event::Disconnected { consumer }) => conn.disconnected(consumer).await,
-                Some(Event::CloseSession { name }) => conn.close_session(&name).await,
-                Some(Event::Close) | None => break,
-            },
-            () = tokio::time::sleep_until(deadline), if !conn.closing => {
-                conn.fail_ttl();
-                break;
-            }
-            read = rd.read_buf(&mut buf), if !conn.closing => match read {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    last_read = tokio::time::Instant::now();
-                    if !conn.process(&mut buf).await {
-                        break;
-                    }
+    saranga_server::protocol::unwinding(async {
+        loop {
+            // Only bytes from the client keep the connection alive
+            // (`checkDataReceived`), not what goes to it meanwhile.
+            let deadline = last_read + Duration::from_millis(conn.ttl.max(1) as u64);
+            tokio::select! {
+                // Management failed the connection; a failure the client was
+                // told of closes after its last reply instead.
+                () = failed.failed(), if !conn.failure_reported => {
+                    conn.report_failure();
+                    break;
                 }
-            },
+                event = events_rx.recv() => match event {
+                    Some(Event::AutoAck { consumer, message }) => conn.auto_ack(consumer, message).await,
+                    Some(Event::AutoAcked { tx, pending, result }) => conn.auto_acked(tx, pending, result),
+                    Some(Event::Disconnected { consumer }) => conn.disconnected(consumer).await,
+                    Some(Event::CloseSession { name }) => conn.close_session(&name).await,
+                    Some(Event::Close) | None => break,
+                },
+                () = tokio::time::sleep_until(deadline), if !conn.closing => {
+                    conn.fail_ttl();
+                    break;
+                }
+                read = rd.read_buf(&mut buf), if !conn.closing => match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        last_read = tokio::time::Instant::now();
+                        if !conn.process(&mut buf).await {
+                            break;
+                        }
+                    }
+                },
+            }
         }
-    }
+    })
+    .await;
     // Acknowledgements the queues answered are committed; any answering
     // later find the channel closed and finish on their own.
     events_rx.close();
@@ -789,7 +792,7 @@ impl Connection {
             let decoded = decoder::decode_from(self.handler.rules(), rest, &mut self.scanned);
             if !matches!(decoded, Ok(None)) {
                 // A frame decoded, or an error: what follows is a new frame.
-                self.scanned = 0;
+                self.scanned = decoder::Progress::default();
             }
             match decoded {
                 Ok(Some((decoded, used))) => {

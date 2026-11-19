@@ -495,11 +495,13 @@ pub fn decode_command(
                                 "AMQ{control}: Encoded queue policy entry was must contain an even number of elements : {key}"
                             ));
                         }
+                        // Each pair once, in time linear in their number.
+                        let mut seen = std::collections::HashSet::new();
                         let mut out: Vec<(String, String)> = Vec::new();
                         for pair in l.chunks(2) {
                             let s = |v: &Value| v.as_str().unwrap_or_default().to_owned();
                             let e = (s(&pair[0]), s(&pair[1]));
-                            if !out.contains(&e) {
+                            if seen.insert(e.clone()) {
                                 out.push(e);
                             }
                         }
@@ -539,11 +541,13 @@ pub fn decode_command(
                     format!("AMQ{control}: Message body did not carry the required max hops configuration")
                 })? as i32;
             let list = |key: &str| -> Vec<String> {
+                // Each name once, in time linear in their number.
+                let mut seen = std::collections::HashSet::new();
                 let mut out = Vec::new();
                 if let Some(Value::List(l)) = get(&map, key) {
                     for v in l {
                         let s = v.as_str().unwrap_or_default().to_owned();
-                        if !out.contains(&s) {
+                        if seen.insert(s.clone()) {
                             out.push(s);
                         }
                     }

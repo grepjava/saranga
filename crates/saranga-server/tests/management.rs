@@ -482,12 +482,17 @@ async fn security_violations_are_notified() {
         sni_host: None,
     };
     assert!(store.authenticate(Some("bob"), Some("x"), &info).is_err());
+    // Logged in already (as a management caller is), with no roles: a
+    // permission violation. (A session whose login fails now is an
+    // authentication one, as in Artemis.)
+    let mut carol = saranga_security::Subject::default();
+    carol.add(saranga_security::Principal::User("carol".into()));
     let auth = saranga_security::SecurityAuth {
-        username: Some("carol".into()),
+        username: None,
         password: None,
         connection: Arc::new(info),
-        subject: None,
-        management: false,
+        subject: Some(Arc::new(carol)),
+        management: true,
         credential: Default::default(),
     };
     assert!(

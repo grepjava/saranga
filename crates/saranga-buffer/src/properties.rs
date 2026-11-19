@@ -92,8 +92,26 @@ impl PropertyValue {
 /// Entries keep their decode order. Artemis iterates a `HashMap`, so
 /// preserving the order we read is what makes re-encoding byte-exact.
 /// `None` is the NULL encoding; `Some(vec![])` is NOT_NULL with zero entries.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct TypedProperties(Option<Vec<(SimpleString, PropertyValue)>>);
+#[derive(Debug, Clone, Default)]
+pub struct TypedProperties {
+    entries: Option<Vec<(SimpleString, PropertyValue)>>,
+    /// Where each key is, once there are [`INDEXED`] or more, so that a put
+    /// takes constant time; dropped whenever entries move.
+    // Boxed: one pointer in every map, which is mostly small and unindexed.
+    #[allow(clippy::box_collection)]
+    index: Option<Box<std::collections::HashMap<SimpleString, usize>>>,
+}
+
+/// How many entries a map has before its keys are indexed.
+const INDEXED: usize = 32;
+
+impl PartialEq for TypedProperties {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for TypedProperties {}
 
 impl TypedProperties {
     pub fn new() -> Self {
@@ -101,7 +119,7 @@ impl TypedProperties {
     }
 
     pub fn entries(&self) -> &[(SimpleString, PropertyValue)] {
-        self.0.as_deref().unwrap_or_default()
+        self.entries.as_deref().unwrap_or_default()
     }
 
     pub fn get(&self, key: &SimpleString) -> Option<&PropertyValue> {
@@ -142,29 +160,50 @@ impl TypedProperties {
     /// a NULL encoding NULL.
     pub fn reserve_exact(&mut self, n: usize) {
         if n > 0 {
-            self.0.get_or_insert_with(Vec::new).reserve_exact(n);
+            self.entries.get_or_insert_with(Vec::new).reserve_exact(n);
         }
     }
 
     /// NULL again if room was reserved and nothing was put.
     pub fn unreserve(&mut self) {
-        if matches!(&self.0, Some(v) if v.is_empty() && v.capacity() > 0) {
-            self.0 = None;
+        if matches!(&self.entries, Some(v) if v.is_empty() && v.capacity() > 0) {
+            self.entries = None;
         }
     }
 
     /// Inserts or replaces a property, keeping the position of an existing key.
     pub fn insert(&mut self, key: SimpleString, value: PropertyValue) {
-        let entries = self.0.get_or_insert_with(Vec::new);
-        match entries.iter_mut().find(|(k, _)| *k == key) {
-            Some(slot) => slot.1 = value,
-            None => entries.push((key, value)),
+        let Self { entries, index } = self;
+        let entries = entries.get_or_insert_with(Vec::new);
+        if entries.len() < INDEXED {
+            match entries.iter_mut().find(|(k, _)| *k == key) {
+                Some(slot) => slot.1 = value,
+                None => entries.push((key, value)),
+            }
+            return;
+        }
+        let index = index.get_or_insert_with(|| {
+            Box::new(
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (k, _))| (k.clone(), i))
+                    .collect(),
+            )
+        });
+        match index.get(&key) {
+            Some(&i) => entries[i].1 = value,
+            None => {
+                index.insert(key.clone(), entries.len());
+                entries.push((key, value));
+            }
         }
     }
 
     pub fn remove(&mut self, key: &SimpleString) -> Option<PropertyValue> {
-        let entries = self.0.as_mut()?;
+        let entries = self.entries.as_mut()?;
         let i = entries.iter().position(|(k, _)| k == key)?;
+        self.index = None;
         Some(entries.remove(i).1)
     }
 
@@ -172,7 +211,7 @@ impl TypedProperties {
     /// `TypedProperties` keeps them: a `new HashMap<>()` of those puts, as
     /// the Java client encodes a message it made.
     pub fn sort_as_java_hash_map(&mut self) {
-        let Some(entries) = self.0.as_mut() else {
+        let Some(entries) = self.entries.as_mut() else {
             return;
         };
         let hashes: Vec<i32> = entries
@@ -187,11 +226,12 @@ impl TypedProperties {
         let mut taken: Vec<Option<(SimpleString, PropertyValue)>> =
             std::mem::take(entries).into_iter().map(Some).collect();
         *entries = order.into_iter().filter_map(|i| taken[i].take()).collect();
+        self.index = None;
     }
 
     pub fn decode(r: &mut Reader<'_>) -> Result<Self> {
         if !r.not_null()? {
-            return Ok(Self(None));
+            return Ok(Self::default());
         }
         let count = r.len("properties")?;
         let mut entries = Vec::with_capacity(count.min(r.remaining()));
@@ -199,11 +239,14 @@ impl TypedProperties {
             let key = r.simple_string()?;
             entries.push((key, PropertyValue::decode(r)?));
         }
-        Ok(Self(Some(entries)))
+        Ok(Self {
+            entries: Some(last_of_each(entries)),
+            index: None,
+        })
     }
 
     pub fn encode(&self, w: &mut Writer) {
-        match &self.0 {
+        match &self.entries {
             None => {
                 w.u8(c::NULL);
             }
@@ -221,7 +264,7 @@ impl TypedProperties {
     /// [`encode`](Self::encode) wrote these properties from `at`, in place
     /// of copies of their own.
     pub fn share(&mut self, encoded: &bytes::Bytes, mut at: usize) {
-        let Some(entries) = &mut self.0 else {
+        let Some(entries) = &mut self.entries else {
             return;
         };
         let share = |s: &mut SimpleString, at: usize| {
@@ -242,7 +285,7 @@ impl TypedProperties {
 
     /// The length of [`encode`](Self::encode)'s output, without encoding.
     pub fn encode_size(&self) -> usize {
-        match &self.0 {
+        match &self.entries {
             None => 1,
             Some(entries) => {
                 5 + entries
@@ -252,6 +295,40 @@ impl TypedProperties {
             }
         }
     }
+}
+
+/// A key that repeats keeps one entry, at the place of its first, with the
+/// value of its last: Java's `TypedProperties` decodes into a `HashMap`, so
+/// a later put of a key replaces the earlier. Every other part of the
+/// broker (and a consumer) then sees the one value Artemis would.
+fn last_of_each(entries: Vec<(SimpleString, PropertyValue)>) -> Vec<(SimpleString, PropertyValue)> {
+    // Few entries: compared pairwise, as cheap as hashing them.
+    const SMALL: usize = 16;
+    let repeats = if entries.len() <= SMALL {
+        entries
+            .iter()
+            .enumerate()
+            .any(|(i, (k, _))| entries[..i].iter().any(|(e, _)| e == k))
+    } else {
+        let mut seen = std::collections::HashSet::with_capacity(entries.len());
+        !entries.iter().all(|(k, _)| seen.insert(k))
+    };
+    if !repeats {
+        return entries;
+    }
+    let mut first: std::collections::HashMap<SimpleString, usize> =
+        std::collections::HashMap::with_capacity(entries.len());
+    let mut kept: Vec<(SimpleString, PropertyValue)> = Vec::with_capacity(entries.len());
+    for (k, v) in entries {
+        match first.get(&k) {
+            Some(&at) => kept[at].1 = v,
+            None => {
+                first.insert(k.clone(), kept.len());
+                kept.push((k, v));
+            }
+        }
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -304,5 +381,41 @@ mod tests {
             let (written, sized) = size(&p);
             assert_eq!(written, sized);
         }
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    /// Past a few entries keys are found through an index: a put replaces
+    /// in place, a removal or a reordering leaves the rest findable, and
+    /// many puts take time linear in their number.
+    #[test]
+    fn many_puts_stay_one_per_key() {
+        let key = |i: usize| SimpleString::from(format!("k{i}").as_str());
+        let mut p = TypedProperties::new();
+        let started = std::time::Instant::now();
+        for i in 0..60_000 {
+            p.insert(key(i), PropertyValue::Int(i as i32));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        p.insert(key(7), PropertyValue::Int(-7));
+        assert_eq!(p.entries().len(), 60_000);
+        assert_eq!(p.entries()[7], (key(7), PropertyValue::Int(-7)));
+        assert_eq!(p.remove(&key(3)), Some(PropertyValue::Int(3)));
+        p.insert(key(100), PropertyValue::Int(-100));
+        p.insert(key(3), PropertyValue::Int(-3));
+        assert_eq!(p.entries().len(), 60_000);
+        assert_eq!(p.get(&key(100)), Some(&PropertyValue::Int(-100)));
+        p.sort_as_java_hash_map();
+        p.insert(key(5), PropertyValue::Int(-5));
+        assert_eq!(p.entries().len(), 60_000);
+        assert_eq!(p.entries().iter().filter(|(k, _)| *k == key(5)).count(), 1);
+        assert_eq!(p.get(&key(5)), Some(&PropertyValue::Int(-5)));
     }
 }

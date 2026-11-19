@@ -506,7 +506,8 @@ impl SecurityStore {
         }
     }
 
-    /// `hasPermission`.
+    /// `hasPermission`: false also when the session's login no longer
+    /// succeeds.
     pub fn has_permission(
         &self,
         address: &str,
@@ -514,15 +515,47 @@ impl SecurityStore {
         check: CheckType,
         auth: &SecurityAuth,
     ) -> bool {
+        self.permission(address, queue, check, auth)
+            .unwrap_or(false)
+    }
+
+    /// `hasPermission`, with `AMQ229031` when the session's credentials no
+    /// longer log in: the subject is looked up (and the login made again
+    /// once its cache entry has gone) before any granted permission is,
+    /// so that a login that stopped working stops at once.
+    fn permission(
+        &self,
+        address: &str,
+        queue: Option<&str>,
+        check: CheckType,
+        auth: &SecurityAuth,
+    ) -> Result<bool, SecurityError> {
         if !self.config.enabled {
-            return true;
+            return Ok(true);
         }
         let user = auth.username.as_deref();
         match self.check_cluster_credentials(user, auth.password.as_deref()) {
-            ClusterCheck::Valid => return true,
-            ClusterCheck::Invalid => return false,
+            ClusterCheck::Valid => return Ok(true),
+            ClusterCheck::Invalid => return Ok(false),
             ClusterCheck::Ignore => {}
         }
+        // A user may log in at first and later, once the cached subject has
+        // gone, not (removed, or a token expired): then authorization would
+        // always fail, and it is an authentication failure.
+        let Some(subject) = self.subject_for_authorization(auth) else {
+            self.counters
+                .authentication_failure
+                .fetch_add(1, Ordering::Relaxed);
+            self.authentication_failed(user, &auth.connection);
+            let e = unable_to_validate(
+                &auth.connection,
+                user,
+                Some(auth.connection.cert_subject_dn()),
+            );
+            tracing::warn!("AMQ222216: Security problem while authenticating: {e}");
+            audit_failed_authentication(&auth.connection, &e);
+            return Err(e);
+        };
         let bare_address = saranga_config::extract_address_name(address);
         let bare_queue = queue.map(extract_queue_name);
         let fqqn = bare_queue.map(|q| format!("{bare_address}::{q}"));
@@ -533,7 +566,7 @@ impl SecurityStore {
                 cache.test(key, |granted| granted.contains(target))
             })
         {
-            return true;
+            return Ok(true);
         }
 
         // Read before the roles: a change after it keeps this check's grant
@@ -546,9 +579,6 @@ impl SecurityStore {
                 _ => repo.get_most_specific(bare_address),
             };
             setting.map(|s| s.roles.clone()).unwrap_or_default()
-        };
-        let Some(subject) = self.subject_for_authorization(auth) else {
-            return false;
         };
         let validated = self.manager.authorize(&subject, &roles, check, target);
         if validated && let (Some(_), Some(cache)) = (user, &self.authorization_cache) {
@@ -563,7 +593,7 @@ impl SecurityStore {
                 });
             }
         }
-        validated
+        Ok(validated)
     }
 
     /// `check`: `has_permission`, or `AMQ229032`/`AMQ229213`.
@@ -577,7 +607,7 @@ impl SecurityStore {
         if !self.config.enabled {
             return Ok(());
         }
-        if self.has_permission(address, queue, check, auth) {
+        if self.permission(address, queue, check, auth)? {
             self.counters
                 .authorization_success
                 .fetch_add(1, Ordering::Relaxed);

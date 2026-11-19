@@ -33,6 +33,8 @@ impl SecurityManager for Fixed {
                 s.add(Principal::Role("a".into()));
                 return Ok(Some(s));
             }
+            // A password alone logs in with no roles and no user.
+            None => return Ok(Some(Subject::default())),
             _ => return Ok(None),
         };
         let mut s = Subject::default();
@@ -274,7 +276,7 @@ fn caller_falls_back_to_the_subject() {
     subject.add(Principal::User("guest".into()));
     let a = SecurityAuth {
         username: None,
-        password: None,
+        password: Some("pw".into()),
         connection: Arc::default(),
         subject: Some(Arc::new(subject)),
         management: false,
@@ -282,6 +284,14 @@ fn caller_falls_back_to_the_subject() {
     };
     let e = store.check("x", None, CheckType::Send, &a).unwrap_err();
     assert!(e.0.starts_with("AMQ229032: User: guest does"), "{e}");
+    // With credentials that do not log in, an authentication failure.
+    let fresh = self::store(true).0;
+    let a = SecurityAuth {
+        password: None,
+        ..a
+    };
+    let e = fresh.check("x", None, CheckType::Send, &a).unwrap_err();
+    assert!(e.0.starts_with("AMQ229031"), "{e}");
 }
 
 #[test]

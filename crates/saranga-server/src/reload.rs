@@ -95,6 +95,12 @@ impl Broker {
         reloading("security settings");
         if let Some(security) = &self.security {
             security.set_repository(reload.security_settings);
+            // recoverStoredSecuritySettings: what management stored stays.
+            for (address_match, (_, setting)) in self.security_records().iter() {
+                if let Err(e) = security.add_match(address_match, setting.clone()) {
+                    tracing::warn!("security setting {address_match}: {e}");
+                }
+            }
         }
 
         reloading("address settings");

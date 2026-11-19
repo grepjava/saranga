@@ -201,6 +201,37 @@ async fn read(
     reply(StatusCode::OK, value)
 }
 
+/// A request a browser sent for a page of another site: its `Origin` is not
+/// this server, or it says so itself (`Sec-Fetch-Site`). An operation is
+/// refused for one, so that a page cannot use the browser's login, or the
+/// lack of one, to run it; a client that is no browser sends neither.
+fn cross_site(headers: &HeaderMap) -> Result<(), Box<Response>> {
+    let refused = || {
+        Box::new(error(
+            StatusCode::FORBIDDEN,
+            "an operation is not run for a page of another site",
+        ))
+    };
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok())
+        && !matches!(site, "same-origin" | "none")
+    {
+        return Err(refused());
+    }
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+        let origin_host = origin
+            .to_str()
+            .ok()
+            .and_then(|o| o.split_once("://"))
+            .map(|(_, rest)| rest.trim_end_matches('/'));
+        match (origin_host, host) {
+            (Some(o), Some(h)) if o.eq_ignore_ascii_case(h) => {}
+            _ => return Err(refused()),
+        }
+    }
+    Ok(())
+}
+
 async fn call(
     broker: &Arc<Broker>,
     auth: &Option<SecurityAuth>,
@@ -320,6 +351,9 @@ async fn post3(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(r) = cross_site(&headers) {
+        return *r;
+    }
     let broker = current.get();
     let auth = match login(&broker, &headers, peer).await {
         Ok(a) => a,
@@ -357,6 +391,9 @@ async fn post4(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(r) = cross_site(&headers) {
+        return *r;
+    }
     let broker = current.get();
     let auth = match login(&broker, &headers, peer).await {
         Ok(a) => a,

@@ -1,6 +1,9 @@
 //! Maps that iterate the way the Java maps Artemis keeps them in do, so
 //! that what the broker re-encodes matches Artemis byte for byte.
 
+use std::collections::HashMap;
+use std::hash::Hash;
+
 use saranga_buffer::SimpleString;
 use saranga_storage::java;
 
@@ -37,17 +40,32 @@ pub enum Kind {
 
 /// A map keeping its entries in insertion order and iterating as the Java
 /// map it stands for.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct JavaMap<K, V> {
     entries: Vec<(K, V)>,
     kind: Kind,
+    /// Where each key is, once there are [`INDEXED`] or more, so that a put
+    /// takes constant time; dropped whenever entries move.
+    // Boxed: one pointer in every map, which is mostly small and unindexed.
+    #[allow(clippy::box_collection)]
+    index: Option<Box<HashMap<K, usize>>>,
 }
 
-impl<K: PartialEq + JavaHash + Clone, V: Clone> JavaMap<K, V> {
+/// How many entries a map has before its keys are indexed.
+const INDEXED: usize = 32;
+
+impl<K: PartialEq, V: PartialEq> PartialEq for JavaMap<K, V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries && self.kind == other.kind
+    }
+}
+
+impl<K: Eq + Hash + JavaHash + Clone, V: Clone> JavaMap<K, V> {
     pub fn new(kind: Kind) -> Self {
         Self {
             entries: Vec::new(),
             kind,
+            index: None,
         }
     }
 
@@ -56,6 +74,7 @@ impl<K: PartialEq + JavaHash + Clone, V: Clone> JavaMap<K, V> {
         Self {
             entries,
             kind: Kind::Linked,
+            index: None,
         }
     }
 
@@ -66,6 +85,7 @@ impl<K: PartialEq + JavaHash + Clone, V: Clone> JavaMap<K, V> {
         Self {
             entries,
             kind: Kind::Hash(Some((n, 1.0))),
+            index: None,
         }
     }
 
@@ -78,6 +98,7 @@ impl<K: PartialEq + JavaHash + Clone, V: Clone> JavaMap<K, V> {
         Self {
             entries: self.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             kind: Kind::Hash(Some((capacity, 0.75))),
+            index: None,
         }
     }
 
@@ -100,10 +121,30 @@ impl<K: PartialEq + JavaHash + Clone, V: Clone> JavaMap<K, V> {
 
     /// `put`: a new key goes last, an existing one keeps its place.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        match self.entries.iter_mut().find(|(k, _)| *k == key) {
-            Some(e) => Some(std::mem::replace(&mut e.1, value)),
+        let Self { entries, index, .. } = self;
+        if entries.len() < INDEXED {
+            return match entries.iter_mut().find(|(k, _)| *k == key) {
+                Some(e) => Some(std::mem::replace(&mut e.1, value)),
+                None => {
+                    entries.push((key, value));
+                    None
+                }
+            };
+        }
+        let index = index.get_or_insert_with(|| {
+            Box::new(
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (k, _))| (k.clone(), i))
+                    .collect(),
+            )
+        });
+        match index.get(&key) {
+            Some(&i) => Some(std::mem::replace(&mut entries[i].1, value)),
             None => {
-                self.entries.push((key, value));
+                index.insert(key.clone(), entries.len());
+                entries.push((key, value));
                 None
             }
         }
@@ -111,6 +152,7 @@ impl<K: PartialEq + JavaHash + Clone, V: Clone> JavaMap<K, V> {
 
     pub fn remove(&mut self, key: &K) -> Option<V> {
         let i = self.entries.iter().position(|(k, _)| k == key)?;
+        self.index = None;
         Some(self.entries.remove(i).1)
     }
 
@@ -166,5 +208,33 @@ mod tests {
                 "x-opt-ORIG-ADDRESS"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    /// Many puts take time linear in their number, and each key stays one
+    /// entry, at its place, after a removal too.
+    #[test]
+    fn many_puts_stay_one_per_key() {
+        let mut m: JavaMap<String, i32> = JavaMap::new(Kind::Hash(None));
+        let started = std::time::Instant::now();
+        for i in 0..60_000 {
+            m.insert(format!("k{i}"), i);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(m.insert("k7".into(), -7), Some(7));
+        assert_eq!(m.remove(&"k3".to_owned()), Some(3));
+        assert_eq!(m.insert("k9".into(), -9), Some(9));
+        assert_eq!(m.insert("k3".into(), -3), None);
+        assert_eq!(m.len(), 60_000);
+        assert_eq!(m.get(&"k7".to_owned()), Some(&-7));
+        assert_eq!(m.get(&"k9".to_owned()), Some(&-9));
     }
 }

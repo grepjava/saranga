@@ -490,7 +490,9 @@ async fn serve<S>(
         replication: None,
         federations: Vec::new(),
     };
-    let ended = conn.read_loop(&mut rd).await;
+    let ended = crate::protocol::unwinding(conn.read_loop(&mut rd))
+        .await
+        .unwrap_or(Err(ConnError::Panicked));
     if let Some(r) = conn.replication.take() {
         conn.broker.backup_connection_lost(&r, ended.is_err());
     }
@@ -605,6 +607,8 @@ enum ConnError {
     TimedOut,
     #[error("closed by management")]
     Failed,
+    #[error("failed handling a packet")]
+    Panicked,
     #[error("{0}")]
     Protocol(String),
 }

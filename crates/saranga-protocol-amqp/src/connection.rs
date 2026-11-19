@@ -1068,17 +1068,20 @@ where
         rd,
         buf: ::bytes::BytesMut::new(),
     };
-    let shaken = if conn.outgoing.is_some() {
-        conn.client_handshake(&mut reader).await
-    } else {
-        conn.handshake(&mut reader).await
-    };
-    if shaken {
-        if conn.outgoing.is_some() {
-            conn.open_out().await;
+    saranga_server::protocol::unwinding(async {
+        let shaken = if conn.outgoing.is_some() {
+            conn.client_handshake(&mut reader).await
+        } else {
+            conn.handshake(&mut reader).await
+        };
+        if shaken {
+            if conn.outgoing.is_some() {
+                conn.open_out().await;
+            }
+            conn.run(&mut reader, &mut events_rx).await;
         }
-        conn.run(&mut reader, &mut events_rx).await;
-    }
+    })
+    .await;
     // Acknowledgements on their way finish before the sessions close; one
     // answered from now on finishes alone.
     events_rx.close();

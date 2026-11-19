@@ -643,9 +643,10 @@ pub struct Broker {
     routers: routing::RouterManager,
     /// The bindings journal's key-value pairs, for the routers' caches.
     key_values: Arc<routing::store::KeyValuePairs>,
-    /// The records of the security settings management added, by match
-    /// (`mapPersistedSecuritySettings`).
-    security_records: Mutex<HashMap<String, i64>>,
+    /// The records of the security settings management added, by match,
+    /// with the settings (`mapPersistedSecuritySettings`): a reload puts
+    /// them back over the file's.
+    security_records: Mutex<HashMap<String, (i64, saranga_config::SecuritySetting)>>,
     stopped: std::sync::atomic::AtomicBool,
     /// [`Broker::stop_services`] ran.
     services_stopped: std::sync::atomic::AtomicBool,
@@ -1031,13 +1032,15 @@ impl Broker {
         // recoverStoredSecuritySettings.
         for (id, s) in &recovered.security_settings {
             let address_match = s.address_match.to_string_lossy();
+            let setting = management::recovered_security_setting(s);
             if let Some(store) = &broker.security
-                && let Err(e) =
-                    store.add_match(&address_match, management::recovered_security_setting(s))
+                && let Err(e) = store.add_match(&address_match, setting.clone())
             {
                 tracing::warn!("security setting {address_match}: {e}");
             }
-            broker.security_records().insert(address_match, *id);
+            broker
+                .security_records()
+                .insert(address_match, (*id, setting));
         }
         spawn_transaction_reaper(&broker, config.transaction_timeout_scan_period);
         // The mirror targets' acknowledgements still to retry
@@ -1537,7 +1540,9 @@ impl Broker {
         self.users.as_ref()
     }
 
-    pub(crate) fn security_records(&self) -> std::sync::MutexGuard<'_, HashMap<String, i64>> {
+    pub(crate) fn security_records(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, (i64, saranga_config::SecuritySetting)>> {
         self.security_records
             .lock()
             .unwrap_or_else(|e| e.into_inner())

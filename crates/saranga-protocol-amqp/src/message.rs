@@ -1338,14 +1338,16 @@ pub fn section_code(d: &Descriptor) -> Option<u64> {
 /// A map with symbol keys (annotations).
 fn symbol_map(v: Value) -> Result<Vec<(Symbol, Value)>> {
     match v {
-        Value::Map(entries) => Ok(entries
-            .into_iter()
-            .filter_map(|(k, v)| match k {
-                Value::Symbol(s) => Some((s, v)),
-                Value::String(s) => Some((Symbol(s), v)),
+        Value::Map(entries) => Ok(
+            last_of_each(entries.into_iter().filter_map(|(k, v)| match k {
+                Value::Symbol(s) => Some(((true, s.0), v)),
+                Value::String(s) => Some(((false, s), v)),
                 _ => None,
-            })
-            .collect()),
+            }))
+            .into_iter()
+            .map(|((_, k), v)| (Symbol(k), v))
+            .collect(),
+        ),
         Value::Null => Ok(Vec::new()),
         other => codec::invalid(format!("annotations {other:?}")),
     }
@@ -1354,17 +1356,51 @@ fn symbol_map(v: Value) -> Result<Vec<(Symbol, Value)>> {
 /// A map with string keys (application properties).
 fn string_map(v: Value) -> Result<Vec<(String, Value)>> {
     match v {
-        Value::Map(entries) => Ok(entries
-            .into_iter()
-            .filter_map(|(k, v)| match k {
-                Value::String(s) => Some((s, v)),
-                Value::Symbol(s) => Some((s.0, v)),
+        Value::Map(entries) => Ok(
+            last_of_each(entries.into_iter().filter_map(|(k, v)| match k {
+                Value::String(s) => Some(((false, s), v)),
+                Value::Symbol(s) => Some(((true, s.0), v)),
                 _ => None,
-            })
-            .collect()),
+            }))
+            .into_iter()
+            .map(|((_, k), v)| (k, v))
+            .collect(),
+        ),
         Value::Null => Ok(Vec::new()),
         other => codec::invalid(format!("application properties {other:?}")),
     }
+}
+
+/// Proton decodes a map with a `put` for each entry, so a key that repeats
+/// is one entry, at the place of its first, with the value of its last.
+/// Keys are (is a symbol, text): a symbol and a string of the same text
+/// are two keys in Java.
+fn last_of_each(
+    entries: impl Iterator<Item = ((bool, String), Value)>,
+) -> Vec<((bool, String), Value)> {
+    let entries: Vec<_> = entries.collect();
+    // Few entries: compared pairwise, as cheap as hashing them.
+    if entries.len() <= 16
+        && !entries
+            .iter()
+            .enumerate()
+            .any(|(i, (k, _))| entries[..i].iter().any(|(e, _)| e == k))
+    {
+        return entries;
+    }
+    let mut first: std::collections::HashMap<(bool, String), usize> =
+        std::collections::HashMap::with_capacity(entries.len());
+    let mut kept: Vec<((bool, String), Value)> = Vec::with_capacity(entries.len());
+    for (k, v) in entries {
+        match first.get(&k) {
+            Some(&at) => kept[at].1 = v,
+            None => {
+                first.insert(k.clone(), kept.len());
+                kept.push((k, v));
+            }
+        }
+    }
+    kept
 }
 
 /// Writes annotations in their Java map's order.
@@ -1403,4 +1439,42 @@ pub fn property_to_value(v: &PropertyValue) -> Value {
 /// Encodes one section.
 pub fn encode_section(code: u64, body: Value, out: &mut Vec<u8>) {
     codec::encode(&Value::described(Descriptor::Code(code), body), out);
+}
+
+#[cfg(test)]
+mod repeated_key_tests {
+    use super::*;
+
+    /// A map key that repeats reads as its last value, as proton's decode
+    /// makes it, in the application properties and the annotations alike.
+    #[test]
+    fn a_repeated_map_key_reads_as_its_last_value() {
+        let s = |t: &str| Value::String(t.into());
+        let sym = |t: &str| Value::Symbol(Symbol(t.into()));
+        let mut data = Vec::new();
+        encode_section(
+            section::MESSAGE_ANNOTATIONS,
+            Value::Map(vec![
+                (sym("x-opt-a"), s("first")),
+                (sym("x-opt-b"), s("b")),
+                (sym("x-opt-a"), s("last")),
+            ]),
+            &mut data,
+        );
+        encode_section(
+            section::APPLICATION_PROPERTIES,
+            Value::Map(vec![
+                (s("k"), s("first")),
+                (s("other"), s("o")),
+                (s("k"), s("last")),
+            ]),
+            &mut data,
+        );
+        encode_section(section::AMQP_VALUE, s("body"), &mut data);
+        let m = AmqpMessage::new(0, data, 0).unwrap();
+        assert_eq!(m.application_property("k"), Some(s("last")));
+        assert_eq!(m.application_properties().len(), 2);
+        assert_eq!(m.annotation("x-opt-a"), Some(s("last")));
+        assert_eq!(m.message_annotations().unwrap().len(), 2);
+    }
 }

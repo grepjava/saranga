@@ -173,12 +173,13 @@ fn add_security_settings(broker: &Broker, address_match: &str, text: &str) -> Ou
     if !matches!(o, Json::Object(_)) {
         return Err("Not a JSON object".to_owned());
     }
+    let setting = from_json(&o);
     if let Some(store) = broker.security_store() {
-        store.add_match(address_match, from_json(&o))?;
+        store.add_match(address_match, setting.clone())?;
     }
     if let Some(storage) = broker.storage() {
         let mut records = broker.security_records();
-        let old = records.get(address_match).copied();
+        let old = records.get(address_match).map(|(id, _)| *id);
         let id = storage
             .store_configuration(
                 ids::SECURITY_SETTING_RECORD,
@@ -186,7 +187,7 @@ fn add_security_settings(broker: &Broker, address_match: &str, text: &str) -> Ou
                 old,
             )
             .map_err(|e| e.to_string())?;
-        records.insert(address_match.to_owned(), id);
+        records.insert(address_match.to_owned(), (id, setting));
     }
     Ok(Json::Null)
 }
@@ -626,7 +627,7 @@ pub(super) async fn invoke(
         if let Some(store) = broker.security_store() {
             store.remove_match(&address_match);
         }
-        if let (Some(storage), Some(id)) = (
+        if let (Some(storage), Some((id, _))) = (
             broker.storage(),
             broker.security_records().remove(&address_match),
         ) && let Err(e) = storage.delete_binding_record(id)

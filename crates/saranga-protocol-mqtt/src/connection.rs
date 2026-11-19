@@ -418,13 +418,15 @@ impl DeliverySink for MqttSink {
 }
 
 /// `decideQoS`: the lower of the subscription's and the message's; -1
-/// when the subscription is gone.
+/// when the subscription is gone. A message's level outside 0 to 2 (any
+/// producer can set the property) is taken as the nearest one, so that it
+/// is never mistaken for a subscription gone.
 fn decide_qos(shared: &Shared, message: &CoreMessage, consumer: i64) -> i32 {
     let Some(sub) = lock(&shared.consumer_qos).get(&consumer).copied() else {
         return -1;
     };
     let qos = match message.properties.get_str(util::MQTT_QOS_LEVEL_KEY) {
-        Some(v) => int_value(v).unwrap_or(2),
+        Some(v) => int_value(v).unwrap_or(2).clamp(0, 2),
         None => 2,
     };
     sub.min(qos)
@@ -2044,61 +2046,64 @@ pub async fn serve(
     };
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut last_read = tokio::time::Instant::now();
-    loop {
-        // The connection TTL check (`FailureCheckAndFlushThread`); a TTL of
-        // 0 fails a connection idle for one check period. Only bytes from
-        // the client keep it alive (`checkDataReceived`), not what goes to
-        // it meanwhile.
-        let deadline = match conn.ttl {
-            t if t < 0 => None,
-            0 => Some(last_read + Duration::from_millis(2000)),
-            t => Some(last_read + Duration::from_millis(t as u64)),
-        };
-        tokio::select! {
-            // Management failed the connection: a failure, as if the
-            // client had gone.
-            () = failed.failed() => {
-                conn.disconnect(true).await;
-                break;
-            }
-            Some(event) = events_rx.recv() => conn.on_event(event).await,
-            Some(control) = control_rx.recv() => match control {
-                Control::TakeOver { done } => {
-                    conn.taken_over().await;
-                    let _ = done.send(());
-                    break;
-                }
-                Control::Destroy => {
+    saranga_server::protocol::unwinding(async {
+        loop {
+            // The connection TTL check (`FailureCheckAndFlushThread`); a TTL of
+            // 0 fails a connection idle for one check period. Only bytes from
+            // the client keep it alive (`checkDataReceived`), not what goes to
+            // it meanwhile.
+            let deadline = match conn.ttl {
+                t if t < 0 => None,
+                0 => Some(last_read + Duration::from_millis(2000)),
+                t => Some(last_read + Duration::from_millis(t as u64)),
+            };
+            tokio::select! {
+                // Management failed the connection: a failure, as if the
+                // client had gone.
+                () = failed.failed() => {
                     conn.disconnect(true).await;
                     break;
                 }
-            },
-            () = tokio::time::sleep_until(deadline.unwrap_or(last_read)),
-                if !conn.closing && deadline.is_some() =>
-            {
-                tracing::warn!(
-                    "AMQ222067: Connection failure has been detected: AMQ229014: Did not receive data from {} within the {}ms connection TTL. The connection will now be closed. [code=CONNECTION_TIMEDOUT]",
-                    conn.remote, conn.ttl
-                );
-                conn.disconnect(true).await;
-                break;
-            }
-            read = rd.read_buf(&mut buf), if !conn.closing => match read {
-                // The client went without DISCONNECT: a failure.
-                Ok(0) | Err(_) => {
+                Some(event) = events_rx.recv() => conn.on_event(event).await,
+                Some(control) = control_rx.recv() => match control {
+                    Control::TakeOver { done } => {
+                        conn.taken_over().await;
+                        let _ = done.send(());
+                        break;
+                    }
+                    Control::Destroy => {
+                        conn.disconnect(true).await;
+                        break;
+                    }
+                },
+                () = tokio::time::sleep_until(deadline.unwrap_or(last_read)),
+                    if !conn.closing && deadline.is_some() =>
+                {
+                    tracing::warn!(
+                        "AMQ222067: Connection failure has been detected: AMQ229014: Did not receive data from {} within the {}ms connection TTL. The connection will now be closed. [code=CONNECTION_TIMEDOUT]",
+                        conn.remote, conn.ttl
+                    );
                     conn.disconnect(true).await;
                     break;
                 }
-                Ok(_) => {
-                    last_read = tokio::time::Instant::now();
-                    conn.process(&mut buf).await
-                }
-            },
+                read = rd.read_buf(&mut buf), if !conn.closing => match read {
+                    // The client went without DISCONNECT: a failure.
+                    Ok(0) | Err(_) => {
+                        conn.disconnect(true).await;
+                        break;
+                    }
+                    Ok(_) => {
+                        last_read = tokio::time::Instant::now();
+                        conn.process(&mut buf).await
+                    }
+                },
+            }
+            if conn.closing {
+                break;
+            }
         }
-        if conn.closing {
-            break;
-        }
-    }
+    })
+    .await;
     // Acknowledgements the queues answered are finished; any answering
     // later find the channel closed and finish on their own.
     events_rx.close();

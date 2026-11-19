@@ -626,6 +626,10 @@ struct TempResource {
     queue: bool,
 }
 
+/// The most a frame may be before the connection logs in: its wire format
+/// and connection info, with room to spare.
+const MAX_FRAME_BEFORE_LOGIN: usize = 64 * 1024;
+
 struct Connection {
     broker: Arc<Broker>,
     manager: Arc<Manager>,
@@ -637,6 +641,10 @@ struct Connection {
     remote: String,
     local: String,
     in_wf: WireFormat,
+    /// What is left to drop of a frame larger than the wire format allows,
+    /// and the size it declared: its bytes are dropped as they come rather
+    /// than held, and the client told once the frame has passed.
+    oversized: Option<(usize, i64)>,
     /// The `ConnectionInfo` that logged in (`state`).
     info: Option<ConnectionInfo>,
     authenticated: Authenticated,
@@ -716,6 +724,7 @@ pub async fn serve(broker: Arc<Broker>, manager: Arc<Manager>, c: Accepted) {
         remote,
         local,
         in_wf: WireFormat::new(crate::codec::DEFAULT_WIRE_VERSION),
+        oversized: None,
         info: None,
         authenticated: Authenticated::default(),
         internal: None,
@@ -749,36 +758,39 @@ pub async fn serve(broker: Arc<Broker>, manager: Arc<Manager>, c: Accepted) {
     // `connection-ttl-check-interval`: pings and the TTL.
     let mut tick = tokio::time::interval(Duration::from_millis(2000));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            () = failed.failed() => break,
-            event = events_rx.recv() => match event {
-                Some(Event::Stop) | None => break,
-                Some(Event::Acked { session, pending, result }) => conn.acked(&session, pending, result),
-                Some(Event::Released) => conn.send_released().await,
-                Some(Event::RestoreAutoRead) => conn.restore_auto_read(),
-                Some(Event::CloseSession { name }) => conn.close_server_session(&name).await,
-                Some(Event::SlowConsumer { id, destination }) => {
-                    conn.slow_consumer(id, &destination).await
-                }
-            },
-            _ = tick.tick() => {
-                if !conn.check_ttl() {
-                    break;
-                }
-                conn.check_inactivity();
-            },
-            read = rd.read_buf(&mut buf), if conn.auto_read => match read {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    conn.data_received = true;
-                    if !conn.process(&mut buf).await {
+    saranga_server::protocol::unwinding(async {
+        loop {
+            tokio::select! {
+                () = failed.failed() => break,
+                event = events_rx.recv() => match event {
+                    Some(Event::Stop) | None => break,
+                    Some(Event::Acked { session, pending, result }) => conn.acked(&session, pending, result),
+                    Some(Event::Released) => conn.send_released().await,
+                    Some(Event::RestoreAutoRead) => conn.restore_auto_read(),
+                    Some(Event::CloseSession { name }) => conn.close_server_session(&name).await,
+                    Some(Event::SlowConsumer { id, destination }) => {
+                        conn.slow_consumer(id, &destination).await
+                    }
+                },
+                _ = tick.tick() => {
+                    if !conn.check_ttl() {
                         break;
                     }
-                }
-            },
+                    conn.check_inactivity();
+                },
+                read = rd.read_buf(&mut buf), if conn.auto_read => match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        conn.data_received = true;
+                        if !conn.process(&mut buf).await {
+                            break;
+                        }
+                    }
+                },
+            }
         }
-    }
+    })
+    .await;
     // Acknowledgements the queues answered are finished; any answering
     // later find the channel closed and finish on their own.
     events_rx.close();
@@ -912,11 +924,42 @@ impl Connection {
     async fn process(&mut self, buf: &mut Vec<u8>) -> bool {
         let mut at = 0;
         let mut keep_going = true;
-        while buf.len() - at >= 4 {
+        loop {
+            if let Some((left, size)) = self.oversized {
+                let dropped = left.min(buf.len() - at);
+                at += dropped;
+                if dropped < left {
+                    self.oversized = Some((left - dropped, size));
+                    break;
+                }
+                self.oversized = None;
+                let e = crate::codec::CodecError::FrameSize(size, self.in_wf.max_frame_size);
+                self.send_exception(0, &OwError::io(e.to_string()));
+            }
+            if buf.len() - at < 4 {
+                break;
+            }
             let size = i32::from_be_bytes(buf[at..at + 4].try_into().expect("4 bytes"));
             if size < 0 {
                 keep_going = false;
                 break;
+            }
+            // Before it logs in, a client sends only its wire format and
+            // connection info: a frame larger than those could be closes the
+            // connection. After, one larger than the wire format allows is
+            // refused, as unmarshalling it would be, without being held.
+            if self.info.is_none() && size as usize > MAX_FRAME_BEFORE_LOGIN {
+                tracing::debug!(
+                    remote = self.remote,
+                    "OpenWire frame of {size} bytes before login; closing"
+                );
+                keep_going = false;
+                break;
+            }
+            if self.in_wf.max_frame_size_enabled && i64::from(size) > self.in_wf.max_frame_size {
+                at += 4;
+                self.oversized = Some((size as usize, i64::from(size)));
+                continue;
             }
             let end = at + 4 + size as usize;
             if buf.len() < end {

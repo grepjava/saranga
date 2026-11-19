@@ -81,11 +81,25 @@ impl Primitive {
 
 /// A `java.util.HashMap<String, Object>`: entries in insertion order,
 /// iterated in the map's bucket order.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PrimitiveMap {
     entries: Vec<(String, Primitive)>,
     /// The constructor's initial capacity (`None`: the default).
     capacity: Option<usize>,
+    /// Where each key is, once there are [`INDEXED`] or more, so that a put
+    /// takes constant time; dropped whenever entries move.
+    // Boxed: one pointer in every map, which is mostly small and unindexed.
+    #[allow(clippy::box_collection)]
+    index: Option<Box<std::collections::HashMap<String, usize>>>,
+}
+
+/// How many entries a map has before its keys are indexed.
+const INDEXED: usize = 32;
+
+impl PartialEq for PrimitiveMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries && self.capacity == other.capacity
+    }
 }
 
 impl PrimitiveMap {
@@ -99,13 +113,57 @@ impl PrimitiveMap {
         PrimitiveMap {
             entries: Vec::new(),
             capacity: Some(capacity),
+            index: None,
+        }
+    }
+
+    /// `new HashMap<>(capacity)` with each of these put in turn, in time
+    /// linear in their number: a key that repeats keeps the place of its
+    /// first put and the value of its last.
+    pub fn decoded(entries: Vec<(String, Primitive)>, capacity: usize) -> Self {
+        let mut first: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::with_capacity(entries.len());
+        let mut kept: Vec<(String, Primitive)> = Vec::with_capacity(entries.len());
+        for (k, v) in entries {
+            match first.get(&k) {
+                Some(&at) => kept[at].1 = v,
+                None => {
+                    first.insert(k.clone(), kept.len());
+                    kept.push((k, v));
+                }
+            }
+        }
+        PrimitiveMap {
+            entries: kept,
+            capacity: Some(capacity),
+            index: None,
         }
     }
 
     pub fn insert(&mut self, key: String, value: Primitive) {
-        match self.entries.iter_mut().find(|(k, _)| *k == key) {
-            Some(e) => e.1 = value,
-            None => self.entries.push((key, value)),
+        let Self { entries, index, .. } = self;
+        if entries.len() < INDEXED {
+            match entries.iter_mut().find(|(k, _)| *k == key) {
+                Some(e) => e.1 = value,
+                None => entries.push((key, value)),
+            }
+            return;
+        }
+        let index = index.get_or_insert_with(|| {
+            Box::new(
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (k, _))| (k.clone(), i))
+                    .collect(),
+            )
+        });
+        match index.get(&key) {
+            Some(&i) => entries[i].1 = value,
+            None => {
+                index.insert(key.clone(), entries.len());
+                entries.push((key, value));
+            }
         }
     }
 
@@ -115,6 +173,7 @@ impl PrimitiveMap {
 
     pub fn remove(&mut self, key: &str) -> Option<Primitive> {
         let i = self.entries.iter().position(|(k, _)| k == key)?;
+        self.index = None;
         Some(self.entries.remove(i).1)
     }
 
@@ -167,14 +226,17 @@ fn read_map_at(input: &mut Input<'_>, force: bool, depth: u32) -> R<Option<Primi
     if size < 0 {
         return Ok(None);
     }
-    let mut map = PrimitiveMap::with_capacity((size as usize).min(128));
+    let mut entries = Vec::with_capacity((size as usize).min(128));
     for _ in 0..size {
         let len = input.i16()? as u16 as i32;
         let name = utf8_buffer(read_bytes(input, len)?);
         let value = read_primitive(input, force, depth + 1)?;
-        map.insert(name, value);
+        entries.push((name, value));
     }
-    Ok(Some(map))
+    Ok(Some(PrimitiveMap::decoded(
+        entries,
+        (size as usize).min(128),
+    )))
 }
 
 fn read_list(input: &mut Input<'_>, force: bool, depth: u32) -> R<Vec<Primitive>> {
@@ -347,6 +409,29 @@ pub fn write_utf8(out: &mut Vec<u8>, s: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Many puts take time linear in their number, and each key stays one
+    /// entry, after a removal too.
+    #[test]
+    fn many_puts_stay_one_per_key() {
+        let mut m = PrimitiveMap::new();
+        let started = std::time::Instant::now();
+        for i in 0..60_000 {
+            m.insert(format!("k{i}"), Primitive::Int(i));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        m.insert("k7".into(), Primitive::Int(-7));
+        assert_eq!(m.remove("k3"), Some(Primitive::Int(3)));
+        m.insert("k9".into(), Primitive::Int(-9));
+        m.insert("k3".into(), Primitive::Int(-3));
+        assert_eq!(m.len(), 60_000);
+        assert_eq!(m.get("k7"), Some(&Primitive::Int(-7)));
+        assert_eq!(m.get("k9"), Some(&Primitive::Int(-9)));
+    }
 
     #[test]
     fn maps_round_trip_in_hash_order() {

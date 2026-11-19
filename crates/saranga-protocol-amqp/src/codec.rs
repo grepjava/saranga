@@ -650,7 +650,14 @@ fn canonical(c: u8) -> u8 {
 
 /// Decodes exactly one value filling `bytes`.
 pub fn from_slice(bytes: &[u8]) -> Result<Value> {
+    from_slice_within(bytes, 0)
+}
+
+/// [`from_slice`] for a value that will sit `depth` levels down in another:
+/// it may nest only as deep as the rest of [`MAX_DEPTH`].
+pub fn from_slice_within(bytes: &[u8], depth: usize) -> Result<Value> {
     let mut d = Decoder::new(bytes);
+    d.depth = depth;
     let v = d.read()?;
     if d.has_remaining() {
         return invalid("trailing bytes after value");

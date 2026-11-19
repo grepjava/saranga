@@ -41,6 +41,7 @@ pub mod rest;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -370,27 +371,52 @@ pub async fn start(
     Ok(())
 }
 
+/// How long a web connection may take over its TLS handshake or a request
+/// head, and stay idle between requests: Jetty's `ServerConnector`
+/// `idleTimeout`.
+const WEB_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The most web connections served at once; one past it is closed as it
+/// comes, so that the web server cannot take every file descriptor the
+/// broker's acceptors share with it.
+const MAX_WEB_CONNECTIONS: usize = 1024;
+
 async fn serve(listener: TcpListener, tls: Option<Arc<TlsAcceptor>>, router: Router) {
-    use hyper_util::rt::TokioIo;
+    use hyper_util::rt::{TokioIo, TokioTimer};
     use hyper_util::service::TowerToHyperService;
     use tower::ServiceExt;
+    let open = Arc::new(tokio::sync::Semaphore::new(MAX_WEB_CONNECTIONS));
     loop {
-        let Ok((stream, peer)) = listener.accept().await else {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                // Out of descriptors, say: accepting again at once would
+                // fail at once, and spin.
+                tracing::warn!("web server: accept failed: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = open.clone().try_acquire_owned() else {
+            tracing::debug!("web connection from {peer} refused: {MAX_WEB_CONNECTIONS} open");
             continue;
         };
         let router = router.clone();
         let tls = tls.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let service = router.map_request(move |mut r: axum::http::Request<_>| {
                 r.extensions_mut().insert(Peer(peer));
                 r
             });
             let service = TowerToHyperService::new(service);
-            let http = hyper::server::conn::http1::Builder::new();
+            let mut http = hyper::server::conn::http1::Builder::new();
+            http.timer(TokioTimer::new())
+                .header_read_timeout(WEB_IDLE_TIMEOUT);
             let result = match tls {
-                Some(tls) => match tls.accept(stream).await {
-                    Ok(s) => http.serve_connection(TokioIo::new(s), service).await,
-                    Err(_) => return,
+                Some(tls) => match tokio::time::timeout(WEB_IDLE_TIMEOUT, tls.accept(stream)).await
+                {
+                    Ok(Ok(s)) => http.serve_connection(TokioIo::new(s), service).await,
+                    _ => return,
                 },
                 None => http.serve_connection(TokioIo::new(stream), service).await,
             };

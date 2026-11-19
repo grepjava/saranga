@@ -1,9 +1,9 @@
 //! Frame decoding (`StompDecoder`, `StompDecoderV11`, `StompDecoderV12`).
 //!
 //! Every connection starts with the 1.0 rules; the version negotiated at
-//! `CONNECT` picks the rules for the rest. Parsing starts over from the
-//! frame's first byte whenever more bytes arrive, which reaches the same
-//! result as Artemis's incremental decoder.
+//! `CONNECT` picks the rules for the rest. A frame still arriving is read
+//! on from where the last bytes left it ([`Progress`]), as Artemis's
+//! incremental decoder keeps its position and header state.
 
 use std::collections::HashMap;
 
@@ -53,19 +53,35 @@ pub enum DecodeError {
 /// (heart-beats) before a frame are skipped; `Ok(None)` with only those
 /// in `buf` means nothing is pending.
 pub fn decode(rules: Rules, buf: &[u8]) -> Result<Option<(Decoded, usize)>, DecodeError> {
-    decode_lines(rules, buf, true, &mut 0)
+    decode_lines(rules, buf, true, &mut Progress::default())
 }
 
-/// [`decode`] of a frame still arriving: `scanned` is how far into `buf`
-/// the body's NUL is known not to be, kept by the caller between reads of
-/// the same frame (0 for a new one), so that each read searches only the
-/// bytes that came since, as `StompDecoder` keeps its `pos` between reads.
+/// How far a frame still arriving has been read: kept by the caller between
+/// reads of the same frame, and a new one (`Progress::default()`) for the
+/// next frame or after an error. Each read then parses only the bytes that
+/// came since, as `StompDecoder` keeps its `pos` and header state.
+#[derive(Debug, Default)]
+pub struct Progress {
+    /// How far into the frame the body's NUL is known not to be.
+    scanned: usize,
+    /// The command and the headers read so far.
+    headers: Option<HeaderState>,
+}
+
+impl Progress {
+    /// How far the frame's bytes have been searched for the body's NUL.
+    pub fn scanned(&self) -> usize {
+        self.scanned
+    }
+}
+
+/// [`decode`] of a frame still arriving, read on from `progress`.
 pub fn decode_from(
     rules: Rules,
     buf: &[u8],
-    scanned: &mut usize,
+    progress: &mut Progress,
 ) -> Result<Option<(Decoded, usize)>, DecodeError> {
-    decode_lines(rules, buf, true, scanned)
+    decode_lines(rules, buf, true, progress)
 }
 
 /// [`decode_from`], taking plain header lines whole (`fast`) or not.
@@ -73,21 +89,40 @@ fn decode_lines(
     rules: Rules,
     buf: &[u8],
     fast: bool,
-    scanned: &mut usize,
+    progress: &mut Progress,
 ) -> Result<Option<(Decoded, usize)>, DecodeError> {
-    let Some((command, mut pos)) = parse_command(rules, buf)? else {
-        return Ok(None);
+    let Progress { scanned, headers } = progress;
+    let state = match headers {
+        Some(h) if h.rules == rules => h,
+        _ => {
+            let Some((command, pos)) = parse_command(rules, buf)? else {
+                return Ok(None);
+            };
+            headers.insert(HeaderState::new(rules, command, pos, fast))
+        }
     };
-    let Some((headers, content_length)) = parse_headers(rules, buf, &mut pos, fast)? else {
-        return Ok(None);
-    };
-    let Some(body) = parse_body(rules, buf, &mut pos, content_length, scanned) else {
+    // (Rules change only between frames, with a new `Progress`.)
+    if !state.done {
+        let done = match rules {
+            Rules::V10 => parse_headers_v10(buf, state)?,
+            Rules::V11 | Rules::V12 => parse_headers_v11(rules, buf, state, fast)?,
+        };
+        if !done {
+            return Ok(None);
+        }
+        state.done = true;
+    }
+    let mut pos = state.pos;
+    let Some(body) = parse_body(rules, buf, &mut pos, state.length, scanned) else {
         return Ok(None);
     };
     // A newline after the NUL belongs to the frame.
     if buf.get(pos) == Some(&b'\n') {
         pos += 1;
     }
+    let command = state.command;
+    let headers = std::mem::take(&mut state.headers.list);
+    *progress = Progress::default();
     Ok(Some((
         Decoded {
             command,
@@ -213,27 +248,90 @@ fn parse_command(rules: Rules, buf: &[u8]) -> Result<Option<(&'static str, usize
     Ok(Some((command(name), pos)))
 }
 
-type Headers = (Vec<(String, String)>, Option<usize>);
+/// The headers of a frame, one per name: looked up in a list while they
+/// are few, in an index once they are many.
+#[derive(Debug, Default)]
+struct HeaderList {
+    list: Vec<(String, String)>,
+    index: HashMap<String, usize>,
+}
 
-fn parse_headers(
+/// The command, the headers read so far, and where the line being read
+/// stands: what [`Progress`] keeps between reads.
+#[derive(Debug)]
+struct HeaderState {
     rules: Rules,
-    buf: &[u8],
-    pos: &mut usize,
-    fast: bool,
-) -> Result<Option<Headers>, DecodeError> {
-    match rules {
-        Rules::V10 => parse_headers_v10(buf, pos),
-        Rules::V11 | Rules::V12 => parse_headers_v11(rules, buf, pos, fast),
+    command: &'static str,
+    /// Where reading goes on.
+    pos: usize,
+    /// Whether the header block has ended.
+    done: bool,
+    headers: HeaderList,
+    length: Option<usize>,
+    // The line being read (1.1 and 1.2).
+    holder: Vec<u8>,
+    escaping: bool,
+    in_name: bool,
+    whitespace_only: bool,
+    name: String,
+    cr: bool,
+    line_start: bool,
+    // The line being read (1.0).
+    start: usize,
+    value_whitespace: bool,
+    name_v10: Option<String>,
+}
+
+impl HeaderState {
+    fn new(rules: Rules, command: &'static str, pos: usize, fast: bool) -> Self {
+        HeaderState {
+            rules,
+            command,
+            pos,
+            done: false,
+            headers: HeaderList {
+                list: Vec::with_capacity(8),
+                index: HashMap::new(),
+            },
+            length: None,
+            holder: Vec::with_capacity(64),
+            escaping: false,
+            in_name: true,
+            whitespace_only: true,
+            name: String::new(),
+            cr: false,
+            line_start: fast,
+            start: pos,
+            value_whitespace: false,
+            name_v10: None,
+        }
     }
 }
 
 /// One header per name, the later replacing the earlier
 /// (`HashMap.put`) or, with `first_wins`, the earlier kept.
-fn put(headers: &mut Vec<(String, String)>, name: String, value: String, first_wins: bool) {
-    match headers.iter_mut().find(|(k, _)| *k == name) {
+fn put(headers: &mut HeaderList, name: String, value: String, first_wins: bool) {
+    // Up to this many, the list is searched; past it, the index.
+    const LISTED: usize = 16;
+    let HeaderList { list, index } = headers;
+    let at = if list.len() <= LISTED {
+        list.iter().position(|(k, _)| *k == name)
+    } else {
+        if index.len() != list.len() {
+            index.clear();
+            index.extend(list.iter().enumerate().map(|(i, (k, _))| (k.clone(), i)));
+        }
+        index.get(&name).copied()
+    };
+    match at {
         Some(_) if first_wins => {}
-        Some(slot) => slot.1 = value,
-        None => headers.push((name, value)),
+        Some(i) => list[i].1 = value,
+        None => {
+            if !index.is_empty() {
+                index.insert(name.clone(), list.len());
+            }
+            list.push((name, value));
+        }
     }
 }
 
@@ -247,92 +345,80 @@ fn content_length(value: &str) -> Result<usize, DecodeError> {
 }
 
 /// `StompDecoder.parseHeaders`: raw names and values; spaces and tabs at
-/// the start of a value are dropped.
-fn parse_headers_v10(buf: &[u8], pos: &mut usize) -> Result<Option<Headers>, DecodeError> {
-    let mut headers = Vec::with_capacity(8);
-    let mut length = None;
-    let mut start = *pos;
-    let mut in_name = true;
-    let mut value_whitespace = false;
-    let mut whitespace_only = true;
-    let mut name: Option<String> = None;
+/// the start of a value are dropped. `false` while the header block has not
+/// ended in `buf`: reading goes on from `s` once more has come.
+fn parse_headers_v10(buf: &[u8], s: &mut HeaderState) -> Result<bool, DecodeError> {
     loop {
-        let Some(&b) = buf.get(*pos) else {
-            return Ok(None);
+        let Some(&b) = buf.get(s.pos) else {
+            return Ok(false);
         };
-        *pos += 1;
+        s.pos += 1;
         match b {
             b':' => {
-                if in_name {
-                    name = Some(String::from_utf8_lossy(&buf[start..*pos - 1]).into_owned());
-                    in_name = false;
-                    start = *pos;
-                    value_whitespace = true;
+                if s.in_name {
+                    s.name_v10 =
+                        Some(String::from_utf8_lossy(&buf[s.start..s.pos - 1]).into_owned());
+                    s.in_name = false;
+                    s.start = s.pos;
+                    s.value_whitespace = true;
                 }
-                whitespace_only = false;
+                s.whitespace_only = false;
             }
             b'\n' => {
-                if whitespace_only {
+                if s.whitespace_only {
                     break;
                 }
-                let value = String::from_utf8_lossy(&buf[start..*pos - 1]).into_owned();
-                if let Some(n) = &name {
+                let value = String::from_utf8_lossy(&buf[s.start..s.pos - 1]).into_owned();
+                if let Some(n) = &s.name_v10 {
                     if n == names::CONTENT_LENGTH {
-                        length = Some(content_length(&value)?);
+                        s.length = Some(content_length(&value)?);
                     }
-                    put(&mut headers, n.clone(), value, false);
+                    put(&mut s.headers, n.clone(), value, false);
                 }
-                whitespace_only = true;
-                start = *pos;
-                in_name = true;
-                value_whitespace = false;
+                s.whitespace_only = true;
+                s.start = s.pos;
+                s.in_name = true;
+                s.value_whitespace = false;
             }
             b' ' | b'\t' => {
-                if value_whitespace {
-                    start += 1;
+                if s.value_whitespace {
+                    s.start += 1;
                 }
             }
             _ => {
-                whitespace_only = false;
-                value_whitespace = false;
+                s.whitespace_only = false;
+                s.value_whitespace = false;
             }
         }
-        if *pos == buf.len() {
-            return Ok(None);
+        if s.pos == buf.len() {
+            return Ok(false);
         }
     }
-    Ok(Some((headers, length)))
+    Ok(true)
 }
 
 /// `StompDecoderV11.parseHeaders` and `StompDecoderV12.parseHeaders`.
-/// A `:` after the first in a line is dropped, as Artemis does.
+/// A `:` after the first in a line is dropped, as Artemis does. `false`
+/// while the header block has not ended in `buf`: reading goes on from `s`
+/// once more has come.
 fn parse_headers_v11(
     rules: Rules,
     buf: &[u8],
-    pos: &mut usize,
+    s: &mut HeaderState,
     fast: bool,
-) -> Result<Option<Headers>, DecodeError> {
+) -> Result<bool, DecodeError> {
     let v12 = rules == Rules::V12;
-    let mut headers = Vec::with_capacity(8);
-    let mut length = None;
-    let mut holder: Vec<u8> = Vec::with_capacity(64);
-    let mut escaping = false;
-    let mut in_name = true;
-    let mut whitespace_only = true;
-    let mut name = String::new();
-    let mut cr = false;
     let text = |h: &[u8]| String::from_utf8_lossy(h).into_owned();
-    let mut line_start = fast;
     loop {
         // A whole line with one `:` and nothing escaped or carriage
         // returned but its end is taken at once; anything else, byte by
         // byte below.
-        if line_start
-            && !escaping
-            && let Some(n) = buf[*pos..].iter().position(|&b| b == b'\n')
+        if s.line_start
+            && !s.escaping
+            && let Some(n) = buf[s.pos..].iter().position(|&b| b == b'\n')
         {
-            let end = *pos + n;
-            let mut line = &buf[*pos..end];
+            let end = s.pos + n;
+            let mut line = &buf[s.pos..end];
             if v12 && line.last() == Some(&b'\r') {
                 line = &line[..line.len() - 1];
             }
@@ -340,82 +426,82 @@ fn parse_headers_v11(
             if let (Some((c, _)), None) = (colons.next(), colons.next())
                 && !line.iter().any(|&b| b == b'\\' || (v12 && b == b'\r'))
             {
-                *pos = end + 1;
-                name = text(&line[..c]);
+                s.pos = end + 1;
+                s.name = text(&line[..c]);
                 let value = text(&line[c + 1..]);
-                if name == names::CONTENT_LENGTH {
-                    length = Some(content_length(&value)?);
+                if s.name == names::CONTENT_LENGTH {
+                    s.length = Some(content_length(&value)?);
                 }
-                put(&mut headers, name.clone(), value, v12);
-                if *pos == buf.len() {
-                    return Ok(None);
+                put(&mut s.headers, s.name.clone(), value, v12);
+                if s.pos == buf.len() {
+                    return Ok(false);
                 }
                 continue;
             }
         }
-        let Some(&b) = buf.get(*pos) else {
-            return Ok(None);
+        let Some(&b) = buf.get(s.pos) else {
+            return Ok(false);
         };
-        *pos += 1;
-        line_start = fast && b == b'\n';
+        s.pos += 1;
+        s.line_start = fast && b == b'\n';
         match b {
             b'\\' => {
-                if escaping {
-                    holder.push(b);
-                    escaping = false;
+                if s.escaping {
+                    s.holder.push(b);
+                    s.escaping = false;
                 } else {
-                    escaping = true;
+                    s.escaping = true;
                 }
             }
             b':' => {
-                if in_name {
-                    name = text(&holder);
-                    holder.clear();
-                    in_name = false;
+                if s.in_name {
+                    s.name = text(&s.holder);
+                    s.holder.clear();
+                    s.in_name = false;
                 }
-                whitespace_only = false;
+                s.whitespace_only = false;
             }
-            b'n' | b'c' | b'r' if escaping && (b != b'r' || v12) => {
-                holder.push(match b {
+            b'n' | b'c' | b'r' if s.escaping && (b != b'r' || v12) => {
+                s.holder.push(match b {
                     b'n' => b'\n',
                     b'c' => b':',
                     _ => b'\r',
                 });
-                escaping = false;
+                s.escaping = false;
             }
             b'\r' if v12 => {
-                if cr {
+                if s.cr {
                     return Err(DecodeError::TwoCrs);
                 }
-                cr = true;
+                s.cr = true;
             }
             b'\n' => {
-                cr = false;
-                if whitespace_only {
+                s.cr = false;
+                if s.whitespace_only {
                     break;
                 }
-                let value = text(&holder);
-                holder.clear();
-                if name == names::CONTENT_LENGTH {
-                    length = Some(content_length(&value)?);
+                let value = text(&s.holder);
+                s.holder.clear();
+                if s.name == names::CONTENT_LENGTH {
+                    s.length = Some(content_length(&value)?);
                 }
-                put(&mut headers, name.clone(), value, v12);
-                whitespace_only = true;
-                in_name = true;
+                put(&mut s.headers, s.name.clone(), value, v12);
+                s.whitespace_only = true;
+                s.in_name = true;
             }
             _ => {
-                whitespace_only = false;
-                if escaping {
+                s.whitespace_only = false;
+                if s.escaping {
                     return Err(DecodeError::UndefinedEscape(format!("\\{}", b as char)));
                 }
-                holder.push(b);
+                s.holder.push(b);
             }
         }
-        if *pos == buf.len() {
-            return Ok(None);
+        if s.pos == buf.len() {
+            return Ok(false);
         }
     }
-    Ok(Some((headers, length)))
+    Ok(true)
 }
 
 /// The first NUL in `buf` from `from`, searching only past `scanned`; when
@@ -637,8 +723,8 @@ mod tests {
             }
             for rules in [Rules::V11, Rules::V12] {
                 assert_eq!(
-                    decode_lines(rules, &frame, true, &mut 0),
-                    decode_lines(rules, &frame, false, &mut 0),
+                    decode_lines(rules, &frame, true, &mut Progress::default()),
+                    decode_lines(rules, &frame, false, &mut Progress::default()),
                     "{:?} {rules:?}",
                     String::from_utf8_lossy(&frame)
                 );
@@ -660,14 +746,18 @@ mod tests {
                 None => b"SEND\ndestination:q\n\n".to_vec(),
             };
             let body = vec![b'x'; 64 * 1024];
-            let mut scanned = 0;
+            let mut progress = Progress::default();
             for chunk in body.chunks(4096) {
                 buf.extend_from_slice(chunk);
-                assert!(decode_from(rules, &buf, &mut scanned).unwrap().is_none());
-                assert_eq!(scanned, buf.len(), "searched up to what has arrived");
+                assert!(decode_from(rules, &buf, &mut progress).unwrap().is_none());
+                assert_eq!(
+                    progress.scanned(),
+                    buf.len(),
+                    "searched up to what has arrived"
+                );
             }
             buf.push(0);
-            let (d, used) = decode_from(rules, &buf, &mut scanned).unwrap().unwrap();
+            let (d, used) = decode_from(rules, &buf, &mut progress).unwrap().unwrap();
             assert_eq!(used, buf.len());
             assert_eq!(d.body, &body[..length.unwrap_or(body.len())]);
         }

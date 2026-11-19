@@ -339,8 +339,13 @@ impl CoreSession {
                     {
                         self.settle(&mut acked).await;
                     }
-                    self.handle(*packet, size).await;
+                    // A packet whose handling panicked fails the session,
+                    // which then closes as a failed one does.
+                    let handled = crate::protocol::unwinding(self.handle(*packet, size)).await;
                     backlog.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
+                    if handled.is_none() {
+                        break;
+                    }
                     if self.session.is_closed() {
                         break;
                     }
