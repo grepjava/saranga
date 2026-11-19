@@ -26,9 +26,23 @@ pub const DEFAULT_CODEC: &str = "org.apache.activemq.artemis.utils.DefaultSensit
 /// The Blowfish key used when none is configured.
 const DEFAULT_TWO_WAY_KEY: &[u8] = b"clusterpassword";
 
+/// `DefaultSensitiveStringCodec.KEY_SYSTEM_PROPERTY`.
+pub const KEY_SYSTEM_PROPERTY: &str = "artemis.default.sensitive.string.codec.key";
+
 /// `DefaultSensitiveStringCodec.KEY_SYSTEM_PROPERTY` as an environment
 /// variable (`envVarNameFromSystemPropertyName`).
 pub const KEY_ENV_VAR: &str = "ARTEMIS_DEFAULT_SENSITIVE_STRING_CODEC_KEY";
+
+/// Where the codec looks for its key: [`KEY_SYSTEM_PROPERTY`] among the
+/// system properties (`-D` in `JAVA_ARGS`), anything else in the
+/// environment.
+pub fn key_lookup(name: &str) -> Option<String> {
+    if name == KEY_SYSTEM_PROPERTY {
+        crate::system::property(name)
+    } else {
+        std::env::var(name).ok()
+    }
+}
 
 const PBKDF2_ITERATIONS: u32 = 1024;
 const PBKDF2_KEY_BYTES: usize = 64;
@@ -79,11 +93,11 @@ impl Codec {
     /// `PasswordMaskingUtil.getCodec`: `class;key=value;...`, or the default
     /// codec when `None`.
     pub fn from_desc(desc: Option<&str>) -> Result<Self, MaskError> {
-        Self::from_desc_with(desc, |name| std::env::var(name).ok())
+        Self::from_desc_with(desc, key_lookup)
     }
 
-    /// As [`from_desc`](Self::from_desc), reading the key's environment
-    /// variable through `env`.
+    /// As [`from_desc`](Self::from_desc), reading the key's system property
+    /// and environment variable through `env` (see [`key_lookup`]).
     pub fn from_desc_with(
         desc: Option<&str>,
         env: impl Fn(&str) -> Option<String>,
@@ -91,7 +105,8 @@ impl Codec {
         let Some(desc) = desc else {
             return Self::init(&[], env);
         };
-        let mut parts = desc.split(';');
+        // `split(";")`: a trailing `;` adds nothing.
+        let mut parts = crate::java_split(desc, ';').into_iter();
         let class = parts.next().unwrap_or_default();
         if class != DEFAULT_CODEC {
             return Err(MaskError::UnknownCodec(class.to_owned()));
@@ -125,11 +140,18 @@ impl Codec {
                 tracing::warn!(
                     "AMQ202017: Algorithm two-way is deprecated and will be removed from the default codec in a future version. Use a custom codec instead. Consult the manual for details."
                 );
+                // `BlowfishAlgorithm`: the parameter, else the system
+                // property (a blank one keeps the built-in key and skips the
+                // environment), else the environment variable.
                 let key = match get("key") {
                     Some(k) => k.as_bytes().to_vec(),
-                    None => match env(KEY_ENV_VAR) {
-                        Some(k) => k.into_bytes(),
-                        None => DEFAULT_TWO_WAY_KEY.to_vec(),
+                    None => match env(KEY_SYSTEM_PROPERTY) {
+                        Some(k) if !k.trim().is_empty() => k.into_bytes(),
+                        Some(_) => DEFAULT_TWO_WAY_KEY.to_vec(),
+                        None => match env(KEY_ENV_VAR) {
+                            Some(k) => k.into_bytes(),
+                            None => DEFAULT_TWO_WAY_KEY.to_vec(),
+                        },
                     },
                 };
                 Algorithm::TwoWay { key }
@@ -388,6 +410,27 @@ mod tests {
         assert_eq!(keyed.encode("secret").unwrap(), "-1425f1ea4cff5d91");
         let from_env = Codec::from_desc_with(None, |_| Some("mykey".into())).unwrap();
         assert_eq!(from_env.decode("-1425f1ea4cff5d91").unwrap(), "secret");
+        // The system property first; a blank one keeps the built-in key and
+        // skips the environment variable.
+        let lookup = |property: Option<&'static str>, var: Option<&'static str>| {
+            move |n: &str| {
+                if n == KEY_SYSTEM_PROPERTY {
+                    property.map(str::to_owned)
+                } else {
+                    var.map(str::to_owned)
+                }
+            }
+        };
+        let from_property = Codec::from_desc_with(None, lookup(Some("mykey"), None)).unwrap();
+        assert_eq!(from_property.decode("-1425f1ea4cff5d91").unwrap(), "secret");
+        let over_env = Codec::from_desc_with(None, lookup(Some("mykey"), Some("other"))).unwrap();
+        assert_eq!(over_env.decode("-1425f1ea4cff5d91").unwrap(), "secret");
+        let blank = Codec::from_desc_with(None, lookup(Some(" "), Some("mykey"))).unwrap();
+        assert_eq!(blank.decode("-41e444c3ed07d6dd").unwrap(), "secret");
+        // `split(";")` drops a trailing empty part.
+        let trailing =
+            Codec::from_desc_with(Some(&format!("{DEFAULT_CODEC};key=mykey;")), |_| None).unwrap();
+        assert_eq!(trailing.decode("-1425f1ea4cff5d91").unwrap(), "secret");
         // `artemis mask --hash`.
         assert!(password_matches(
             "secret",

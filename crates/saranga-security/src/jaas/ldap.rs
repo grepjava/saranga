@@ -359,6 +359,51 @@ fn open(o: &Options) -> Result<LdapConn, Failure> {
     ))
 }
 
+/// A search base as JNDI's context takes it: relative to the DN the
+/// `connectionURL` names (`ldap://host:389/dc=example,dc=com`), if any,
+/// which LDAPLoginModule supports; the empty base is that DN itself.
+fn in_context(o: &Options, base: &str) -> String {
+    let url = o
+        .set("connectionURL")
+        .and_then(|u| u.split_whitespace().next())
+        .unwrap_or_default();
+    let context = url_dn(url);
+    match (base.is_empty(), context.is_empty()) {
+        (_, true) => base.to_owned(),
+        (true, false) => context,
+        (false, false) => format!("{base},{context}"),
+    }
+}
+
+/// The DN of an LDAP URL (RFC 4516: after the host and port, before any
+/// `?`), %-decoded.
+fn url_dn(url: &str) -> String {
+    let Some((_, rest)) = url.split_once("://") else {
+        return String::new();
+    };
+    let Some((_, path)) = rest.split_once('/') else {
+        return String::new();
+    };
+    let dn = path.split('?').next().unwrap_or_default();
+    let bytes = dn.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn timeout<'a>(conn: &'a mut LdapConn, o: &Options) -> &'a mut LdapConn {
     match o.millis("readTimeout") {
         Some(t) => conn.with_timeout(t),
@@ -521,9 +566,9 @@ fn resolve_dn(
         Some(a) => vec![a],
         None => vec!["1.1"],
     };
-    let base = o.get("userBase").unwrap_or_default();
+    let base = in_context(o, o.get("userBase").unwrap_or_default());
     let (entries, _) = timeout(conn, o)
-        .search(base, scope, &filter, attrs)
+        .search(&base, scope, &filter, attrs)
         .and_then(|r| r.success())
         .map_err(|e| {
             Failure::Dir(
@@ -595,7 +640,7 @@ fn add_roles(
     } else {
         Scope::OneLevel
     };
-    let base = o.get("roleBase").unwrap_or_default().to_owned();
+    let base = in_context(o, o.get("roleBase").unwrap_or_default());
     let role_name = o.set("roleName").map(str::to_owned);
     let expand = o.flag("expandRoles");
     let search = |conn: &mut LdapConn, filter: &str| -> Result<Vec<SearchEntry>, Failure> {

@@ -1295,7 +1295,7 @@ fn hash_password(password: &str) -> anyhow::Result<String> {
     }
     let codec = saranga_config::mask::Codec::init(
         &[("algorithm".to_owned(), "one-way".to_owned())],
-        |n| std::env::var(n).ok(),
+        saranga_config::mask::key_lookup,
     )?;
     Ok(format!("ENC({})", codec.encode(password)?))
 }

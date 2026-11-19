@@ -673,3 +673,21 @@ mod unknown_handling_selector_test {
         evaluates_to_unknown("unknownProp - 2 = 0");
     }
 }
+
+/// A long run of `--` or `/*` with no end lexes in linear time: where the
+/// next line end and `*/` are is found once, not again at each position.
+#[test]
+fn unterminated_comment_runs_lex_in_linear_time() {
+    let time = |text: String| {
+        let t = std::time::Instant::now();
+        let _ = saranga_filter::Filter::parse(&text);
+        t.elapsed()
+    };
+    for (what, unit) in [("--", "-"), ("/*", "/*")] {
+        let small = time(format!("a = 1 {}", unit.repeat(20_000)));
+        let large = time(format!("a = 1 {}", unit.repeat(160_000)));
+        // Eight times the input: about eight times the time, not 64.
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
+        assert!(ratio < 24.0, "{what}: {small:?} then {large:?}");
+    }
+}

@@ -198,3 +198,122 @@ async fn a_commit_refused_for_its_phase_keeps_the_consumers_credit() {
     task.abort();
     broker.stop().unwrap();
 }
+
+/// FORGET of a branch management completed heuristically forgets it
+/// (`xaForget`), so the transaction manager's recover no longer lists it.
+#[tokio::test]
+async fn forget_clears_a_heuristic_completion() {
+    let mut cfg = BrokerConfig::new(Arc::new(SelectorFilters));
+    cfg.protocols.push(Arc::new(OpenWireProtocol::new()));
+    let broker = Broker::start(cfg).await.unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let task = tokio::spawn(broker.clone().serve_acceptor(l, Acceptor::default()));
+    let mut c = Client {
+        s: TcpStream::connect(addr).await.unwrap(),
+        wf: WireFormat::new(12),
+    };
+    let mut props = PrimitiveMap::new();
+    props.insert("MaxFrameSize".into(), Primitive::Long(i64::MAX));
+    let mut bytes = Vec::new();
+    primitive::write_map(&mut bytes, Some(&props)).unwrap();
+    c.send(DataStructure::WireFormatInfo(WireFormatInfo {
+        magic: b"ActiveMQ".to_vec(),
+        version: 12,
+        marshalled_properties: Some(bytes),
+    }))
+    .await;
+    c.send(DataStructure::ConnectionInfo(ConnectionInfo {
+        command_id: 1,
+        response_required: true,
+        connection_id: Some(ConnectionId {
+            value: Some("xa".into()),
+        }),
+        client_id: Some("xa-client".into()),
+        ..Default::default()
+    }))
+    .await;
+    assert!(c.answer(1).await);
+    let core_xid = saranga_server::transaction::Xid {
+        format_id: 1,
+        global_transaction_id: b"g".to_vec(),
+        branch_qualifier: b"b".to_vec(),
+    };
+    broker
+        .resource_manager()
+        .put_heuristic(1, core_xid.clone(), true);
+    let xid = TransactionId::Xa(XaTransactionId {
+        format_id: 1,
+        global_transaction_id: Some(b"g".to_vec()),
+        branch_qualifier: Some(b"b".to_vec()),
+    });
+    assert!(c.transaction(2, &xid, 6).await, "forgotten");
+    assert_eq!(broker.resource_manager().heuristic(&core_xid), None);
+    // Forgotten once: a second FORGET does not know it.
+    assert!(!c.transaction(3, &xid, 6).await);
+    task.abort();
+    broker.stop().unwrap();
+}
+
+/// A ROLLBACK of a branch something else completed meanwhile (management,
+/// the timeout reaper) leaves a branch begun under the same Xid since
+/// registered: only this branch is taken out of the resource manager.
+#[tokio::test]
+async fn a_rollback_leaves_a_branch_begun_under_its_xid_since() {
+    use saranga_server::transaction::{self, Transaction, TxState};
+    let mut cfg = BrokerConfig::new(Arc::new(SelectorFilters));
+    cfg.protocols.push(Arc::new(OpenWireProtocol::new()));
+    let broker = Broker::start(cfg).await.unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let task = tokio::spawn(broker.clone().serve_acceptor(l, Acceptor::default()));
+    let mut c = Client {
+        s: TcpStream::connect(addr).await.unwrap(),
+        wf: WireFormat::new(12),
+    };
+    let mut props = PrimitiveMap::new();
+    props.insert("MaxFrameSize".into(), Primitive::Long(i64::MAX));
+    let mut bytes = Vec::new();
+    primitive::write_map(&mut bytes, Some(&props)).unwrap();
+    c.send(DataStructure::WireFormatInfo(WireFormatInfo {
+        magic: b"ActiveMQ".to_vec(),
+        version: 12,
+        marshalled_properties: Some(bytes),
+    }))
+    .await;
+    c.send(DataStructure::ConnectionInfo(ConnectionInfo {
+        command_id: 1,
+        response_required: true,
+        connection_id: Some(ConnectionId {
+            value: Some("xa".into()),
+        }),
+        client_id: Some("xa-client".into()),
+        ..Default::default()
+    }))
+    .await;
+    assert!(c.answer(1).await);
+    let xid = TransactionId::Xa(XaTransactionId {
+        format_id: 1,
+        global_transaction_id: Some(b"g".to_vec()),
+        branch_qualifier: Some(b"b".to_vec()),
+    });
+    assert!(c.transaction(2, &xid, 0).await, "begun");
+    let core_xid = saranga_server::transaction::Xid {
+        format_id: 1,
+        global_transaction_id: b"g".to_vec(),
+        branch_qualifier: b"b".to_vec(),
+    };
+    let rm = broker.resource_manager();
+    // Rolled back elsewhere, and the Xid begun again by another session.
+    let first = rm.remove(&core_xid).expect("registered");
+    transaction::lock(&first).state = TxState::RolledBack;
+    let second = Transaction::new_ref(99, Some(core_xid.clone()));
+    assert!(rm.put(core_xid.clone(), second.clone()));
+    assert!(c.transaction(3, &xid, 4).await, "rolled back already");
+    assert!(
+        rm.get(&core_xid).is_some_and(|t| Arc::ptr_eq(&t, &second)),
+        "the other branch is no longer registered"
+    );
+    task.abort();
+    broker.stop().unwrap();
+}

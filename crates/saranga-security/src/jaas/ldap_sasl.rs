@@ -460,15 +460,23 @@ fn relay(
                 {
                     let mut c = conn.lock().unwrap_or_else(|e| e.into_inner());
                     let mut data = &buf[..n];
+                    // rustls takes at most one record's worth of TLS at a
+                    // time: each piece is processed and its plaintext taken
+                    // before the next, or the rest of the read is lost.
+                    let mut failed = false;
                     while !data.is_empty() {
-                        if c.read_tls(&mut data).is_err() {
+                        match c.read_tls(&mut data) {
+                            Ok(0) | Err(_) => failed = true,
+                            Ok(_) => failed = c.process_new_packets().is_err(),
+                        }
+                        if failed {
                             break;
                         }
+                        let _ = c.reader().read_to_end(&mut plain);
                     }
-                    if c.process_new_packets().is_err() {
+                    if failed {
                         break;
                     }
-                    let _ = c.reader().read_to_end(&mut plain);
                     // Anything TLS needs to send in answer.
                     let mut s = &sock;
                     while c.wants_write() {
@@ -529,6 +537,74 @@ fn relay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// More TLS than one record arriving at once (a large search answer)
+    /// reaches the plain side whole.
+    #[test]
+    fn the_relay_passes_a_large_burst_whole() {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+        let fixture = |n: &str| format!("{}/../../tests/tls/{n}", env!("CARGO_MANIFEST_DIR"));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let cert = CertificateDer::from_pem_file(fixture("server-cert.pem")).unwrap();
+        let key = PrivateKeyDer::from_pem_file(fixture("server-key.pem")).unwrap();
+        let server = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .unwrap(),
+        );
+        let total = 200_000;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(server).unwrap();
+            let mut s = rustls::StreamOwned::new(conn, tcp);
+            let mut b = [0u8; 1];
+            s.read_exact(&mut b).unwrap();
+            let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+            s.write_all(&data).unwrap();
+            s.flush().unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_file(fixture("ca.pem")).unwrap())
+            .unwrap();
+        let client = Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let tcp = TcpStream::connect(addr).unwrap();
+        let conn =
+            rustls::ClientConnection::new(client, ServerName::try_from("localhost").unwrap())
+                .unwrap();
+        let mut stream = rustls::StreamOwned::new(conn, tcp);
+        stream.write_all(b"x").unwrap();
+        stream.flush().unwrap();
+        // The whole answer waits in the socket before the relay reads.
+        std::thread::sleep(Duration::from_millis(500));
+        let mut local = relay(stream).unwrap();
+        local
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65536];
+        while got.len() < total {
+            match local.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+            }
+        }
+        assert_eq!(got.len(), total);
+        assert!(got.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8));
+    }
 
     #[test]
     fn bind_requests_and_responses_are_ber() {

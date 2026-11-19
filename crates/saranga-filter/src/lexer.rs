@@ -78,6 +78,7 @@ pub(crate) struct Token {
 
 pub(crate) fn tokenize(text: &str, hyphenated: bool) -> Result<Vec<Token>, String> {
     let s: Vec<char> = text.chars().collect();
+    let ends = CommentEnds::of(&s);
     let mut tokens = Vec::new();
     let mut i = 0;
     loop {
@@ -85,7 +86,9 @@ pub(crate) fn tokenize(text: &str, hyphenated: bool) -> Result<Vec<Token>, Strin
         while i < s.len() {
             if matches!(s[i], ' ' | '\t' | '\n' | '\r' | '\x0c') {
                 i += 1;
-            } else if let Some(len) = line_comment(&s, i).or_else(|| block_comment(&s, i)) {
+            } else if let Some(len) =
+                line_comment(&s, &ends, i).or_else(|| block_comment(&s, &ends, i))
+            {
                 i += len;
             } else {
                 break;
@@ -107,14 +110,11 @@ pub(crate) fn tokenize(text: &str, hyphenated: bool) -> Result<Vec<Token>, Strin
 
 /// `"--" (~["\n","\r"])* ("\n"|"\r"|"\r\n")`. Without a line terminator
 /// this does not match, and the dashes lex as minus signs.
-fn line_comment(s: &[char], i: usize) -> Option<usize> {
+fn line_comment(s: &[char], ends: &CommentEnds, i: usize) -> Option<usize> {
     if s.get(i) != Some(&'-') || s.get(i + 1) != Some(&'-') {
         return None;
     }
-    let mut j = i + 2;
-    while j < s.len() && s[j] != '\n' && s[j] != '\r' {
-        j += 1;
-    }
+    let j = ends.eol[(i + 2).min(s.len())];
     match s.get(j) {
         Some('\r') if s.get(j + 1) == Some(&'\n') => Some(j + 2 - i),
         Some(_) => Some(j + 1 - i),
@@ -123,18 +123,41 @@ fn line_comment(s: &[char], i: usize) -> Option<usize> {
 }
 
 /// `/* ... */`, ending at the first `*/`.
-fn block_comment(s: &[char], i: usize) -> Option<usize> {
+fn block_comment(s: &[char], ends: &CommentEnds, i: usize) -> Option<usize> {
     if s.get(i) != Some(&'/') || s.get(i + 1) != Some(&'*') {
         return None;
     }
-    let mut j = i + 2;
-    while j + 1 < s.len() {
-        if s[j] == '*' && s[j + 1] == '/' {
-            return Some(j + 2 - i);
+    let j = ends.close[(i + 2).min(s.len())];
+    (j < s.len()).then(|| j + 2 - i)
+}
+
+/// Where, from each position on, the next line terminator and the next
+/// `*/` are: found once for the whole selector, so a long run of `--` or
+/// `/*` with no end does not scan to the end again at each position.
+struct CommentEnds {
+    eol: Vec<usize>,
+    close: Vec<usize>,
+}
+
+impl CommentEnds {
+    fn of(s: &[char]) -> Self {
+        let n = s.len();
+        let mut eol = vec![n; n + 1];
+        let mut close = vec![n; n + 1];
+        for j in (0..n).rev() {
+            eol[j] = if matches!(s[j], '\n' | '\r') {
+                j
+            } else {
+                eol[j + 1]
+            };
+            close[j] = if s[j] == '*' && s.get(j + 1) == Some(&'/') {
+                j
+            } else {
+                close[j + 1]
+            };
         }
-        j += 1;
+        Self { eol, close }
     }
-    None
 }
 
 fn next_token(s: &[char], i: usize, hyphenated: bool) -> Option<(Tok, usize)> {

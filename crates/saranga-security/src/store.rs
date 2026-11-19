@@ -487,11 +487,17 @@ impl SecurityStore {
         if let Some(cached) = self.authentication_cache.as_ref().and_then(|c| c.get(&key)) {
             return cached;
         }
-        match self.manager.authenticate(
-            auth.username.as_deref(),
-            auth.password.as_deref(),
-            &auth.connection,
-        ) {
+        // A login may take network round trips (LDAP, OIDC, Kubernetes):
+        // a permission check made on a runtime worker (a session's send)
+        // hands the worker's other tasks on meanwhile.
+        let login = off_the_workers(|| {
+            self.manager.authenticate(
+                auth.username.as_deref(),
+                auth.password.as_deref(),
+                &auth.connection,
+            )
+        });
+        match login {
             Ok(subject) => {
                 let subject = subject.map(Arc::new);
                 if let Some(c) = &self.authentication_cache {
@@ -769,6 +775,18 @@ fn with_cache_key<R>(check: CheckType, auth: &SecurityAuth, f: impl FnOnce(&str)
 }
 
 /// A bounded map whose entries expire a fixed time after they were written.
+/// Runs `f`, which may block, so that it does not hold up a multi-thread
+/// runtime's worker (`block_in_place`); elsewhere (no runtime, a
+/// current-thread one, a blocking thread) it just runs.
+fn off_the_workers<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 struct TtlCache<K, V> {
     capacity: usize,
     ttl: Duration,
@@ -831,25 +849,25 @@ impl<K: Eq + Hash + Clone, V: Clone> TtlCache<K, V> {
 
     /// Changes the live value under `key` (`None` if absent or expired),
     /// keeping its write time if it was live.
+    /// The value is taken out and put back, not copied: a login's set of
+    /// granted addresses grows in place (Artemis adds to its set), rather
+    /// than costing a copy of the whole set at each grant.
     fn update(&self, key: K, f: impl FnOnce(&mut Option<V>)) {
         let mut entries = self.lock();
         let live = entries
-            .get(&key)
-            .filter(|(at, _)| at.elapsed() < self.ttl)
-            .map(|(at, v)| (*at, v.clone()));
+            .remove(&key)
+            .filter(|(at, _)| at.elapsed() < self.ttl);
+        let was_live = live.is_some();
         let (at, mut value) = match live {
             Some((at, v)) => (at, Some(v)),
             None => (Instant::now(), None),
         };
         f(&mut value);
-        match value {
-            Some(v) => {
+        if let Some(v) = value {
+            if !was_live {
                 self.make_room(&mut entries, &key);
-                entries.insert(key, (at, v));
             }
-            None => {
-                entries.remove(&key);
-            }
+            entries.insert(key, (at, v));
         }
     }
 

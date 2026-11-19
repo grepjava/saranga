@@ -559,7 +559,47 @@ struct MapRecord {
 /// journal stays compatible with Artemis (which keeps only the last).
 #[derive(Default)]
 pub struct Correlations {
-    maps: Mutex<HashMap<String, HashMap<CorrelationKey, Vec<MapRecord>>>>,
+    maps: Mutex<CorrelationMaps>,
+}
+
+/// Each client's records by key, and how many of its records hold each
+/// packet ID, so whether an ID is in use is a lookup, not a scan of every
+/// record (`containsValue`) for each ID tried.
+#[derive(Default)]
+struct CorrelationMaps {
+    by_key: HashMap<String, HashMap<CorrelationKey, Vec<MapRecord>>>,
+    in_use: HashMap<String, HashMap<i32, usize>>,
+}
+
+impl CorrelationMaps {
+    fn add(&mut self, client_id: &str, key: CorrelationKey, record: MapRecord) {
+        *self
+            .in_use
+            .entry(client_id.to_owned())
+            .or_default()
+            .entry(record.packet_id)
+            .or_default() += 1;
+        self.by_key
+            .entry(client_id.to_owned())
+            .or_default()
+            .entry(key)
+            .or_default()
+            .push(record);
+    }
+
+    fn released(&mut self, client_id: &str, packet_id: i32) {
+        if let Some(ids) = self.in_use.get_mut(client_id) {
+            if let Some(n) = ids.get_mut(&packet_id) {
+                *n -= 1;
+                if *n == 0 {
+                    ids.remove(&packet_id);
+                }
+            }
+            if ids.is_empty() {
+                self.in_use.remove(client_id);
+            }
+        }
+    }
 }
 
 impl Correlations {
@@ -586,15 +626,14 @@ impl Correlations {
         let message_id = r.i64().map_err(e)?;
         let address = r.simple_string().map_err(e)?;
         let packet_id = r.i32().map_err(e)?;
-        lock(&self.maps)
-            .entry(client_id)
-            .or_default()
-            .entry(CorrelationKey {
+        lock(&self.maps).add(
+            &client_id,
+            CorrelationKey {
                 message_id,
                 address,
-            })
-            .or_default()
-            .push(MapRecord { id, packet_id });
+            },
+            MapRecord { id, packet_id },
+        );
         Ok(())
     }
 
@@ -604,6 +643,7 @@ impl Correlations {
     /// keeps its own ID.
     pub fn packet_ids(&self, client_id: &str, key: &CorrelationKey) -> Vec<i32> {
         lock(&self.maps)
+            .by_key
             .get(client_id)
             .and_then(|m| m.get(key))
             .map(|v| v.iter().map(|r| r.packet_id).collect())
@@ -632,12 +672,7 @@ impl Correlations {
                 Err(e) => tracing::warn!("{e}"),
             }
         }
-        lock(&self.maps)
-            .entry(client_id.to_owned())
-            .or_default()
-            .entry(key)
-            .or_default()
-            .push(MapRecord { id, packet_id });
+        lock(&self.maps).add(client_id, key, MapRecord { id, packet_id });
         pending
     }
 
@@ -654,7 +689,7 @@ impl Correlations {
     ) -> Result<Option<i32>, BrokerError> {
         let removed = {
             let mut maps = lock(&self.maps);
-            let Some(records) = maps.get_mut(client_id).and_then(|m| m.get_mut(key)) else {
+            let Some(records) = maps.by_key.get_mut(client_id).and_then(|m| m.get_mut(key)) else {
                 return Ok(None);
             };
             let Some(pos) = records.iter().position(|r| r.packet_id == packet_id) else {
@@ -662,8 +697,9 @@ impl Correlations {
             };
             let r = records.remove(pos);
             if records.is_empty() {
-                maps.get_mut(client_id).map(|m| m.remove(key));
+                maps.by_key.get_mut(client_id).map(|m| m.remove(key));
             }
+            maps.released(client_id, r.packet_id);
             r
         };
         session.delete_record_in(tx, removed.id)?;
@@ -673,10 +709,14 @@ impl Correlations {
     /// `clear`: the client's map is emptied and its records deleted.
     /// Artemis 2.57 leaves the records in the journal (see COMPAT.md).
     pub fn clear(&self, broker: &Broker, client_id: &str) {
-        let removed = lock(&self.maps)
-            .get_mut(client_id)
-            .map(std::mem::take)
-            .unwrap_or_default();
+        let removed = {
+            let mut maps = lock(&self.maps);
+            maps.in_use.remove(client_id);
+            maps.by_key
+                .get_mut(client_id)
+                .map(std::mem::take)
+                .unwrap_or_default()
+        };
         if let Some(s) = broker.storage() {
             for r in removed.into_values().flatten() {
                 if let Err(e) = s.delete_record(r.id) {
@@ -688,10 +728,10 @@ impl Correlations {
 
     /// `containsValue`.
     pub fn contains_value(&self, client_id: &str, packet_id: i32) -> bool {
-        lock(&self.maps).get(client_id).is_some_and(|m| {
-            m.values()
-                .any(|v| v.iter().any(|r| r.packet_id == packet_id))
-        })
+        lock(&self.maps)
+            .in_use
+            .get(client_id)
+            .is_some_and(|ids| ids.contains_key(&packet_id))
     }
 }
 
@@ -1024,5 +1064,61 @@ impl StateManager {
 pub async fn wait(completion: Completion) {
     if let Err(e) = completion.wait().await {
         tracing::error!("AMQ834016: Storage operation failed. Error code: 0; message: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(message_id: i64) -> CorrelationKey {
+        CorrelationKey {
+            message_id,
+            address: SimpleString::from("a"),
+        }
+    }
+
+    /// The packet IDs in use follow the records: two records may share an
+    /// ID (overlapping subscriptions), which stays in use until both go.
+    #[test]
+    fn packet_ids_in_use_follow_the_records() {
+        let c = Correlations::default();
+        {
+            let mut maps = lock(&c.maps);
+            maps.add(
+                "c",
+                key(1),
+                MapRecord {
+                    id: 10,
+                    packet_id: 7,
+                },
+            );
+            maps.add(
+                "c",
+                key(2),
+                MapRecord {
+                    id: 11,
+                    packet_id: 7,
+                },
+            );
+            maps.add(
+                "c",
+                key(3),
+                MapRecord {
+                    id: 12,
+                    packet_id: 8,
+                },
+            );
+        }
+        assert!(c.contains_value("c", 7) && c.contains_value("c", 8));
+        assert!(!c.contains_value("c", 9) && !c.contains_value("other", 7));
+        lock(&c.maps).released("c", 7);
+        assert!(c.contains_value("c", 7), "another record holds 7");
+        lock(&c.maps).released("c", 7);
+        assert!(!c.contains_value("c", 7));
+        let mut maps = lock(&c.maps);
+        maps.in_use.remove("c");
+        drop(maps);
+        assert!(!c.contains_value("c", 8));
     }
 }

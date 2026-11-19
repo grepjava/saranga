@@ -186,7 +186,7 @@ impl Instance {
     /// `artemis.instance` and `data.dir`, wherever `etc` is (`--etc` may
     /// put it outside the instance); without them, `<instance>/etc` ->
     /// `<instance>`.
-    fn in_dirs(
+    pub(crate) fn in_dirs(
         etc: PathBuf,
         broker_xml: PathBuf,
         options: Options,

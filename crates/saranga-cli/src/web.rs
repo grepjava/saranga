@@ -18,23 +18,49 @@ fn profile_roles(instance: &Instance) -> Option<Vec<String>> {
         let Ok(text) = std::fs::read_to_string(instance.etc.join(name)) else {
             continue;
         };
+        let text = uncommented(&text);
         // `-Dhawtio.roles=<roles>` in the Windows profile's JAVA_ARGS.
         if let Some(i) = text.find("-Dhawtio.roles=") {
             let rest = &text[i + "-Dhawtio.roles=".len()..];
             let v = rest.split_whitespace().next().unwrap_or("");
-            return Some(v.split(',').map(|r| r.trim().to_owned()).collect());
+            return Some(roles(v));
         }
         for line in text.lines() {
             let line = line.trim();
             let line = line.strip_prefix("set ").unwrap_or(line);
             let line = line.strip_prefix("export ").unwrap_or(line);
             if let Some(v) = line.strip_prefix("HAWTIO_ROLES=") {
-                let v = v.trim().trim_matches(['\'', '"']);
-                return Some(v.split(',').map(|r| r.trim().to_owned()).collect());
+                return Some(roles(v));
             }
         }
     }
     None
+}
+
+/// A roles value: comma-separated, its quotes dropped. Empty, as `*`, checks
+/// no roles (the profile's own comment: "Set to '*' or an empty value to
+/// disable role checking"; `bin/artemis` passes `-Dhawtio.roles=""`).
+fn roles(v: &str) -> Vec<String> {
+    let v = v.trim().trim_matches(['\'', '"']).trim();
+    if v.is_empty() {
+        return vec!["*".to_owned()];
+    }
+    v.split(',').map(|r| r.trim().to_owned()).collect()
+}
+
+/// A profile without its comment lines (`#` in the shell one, `rem` and
+/// `::` in the Windows one), which set nothing.
+fn uncommented(text: &str) -> String {
+    text.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !(t.starts_with('#')
+                || t.starts_with("::")
+                || t.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("rem "))
+                || t.eq_ignore_ascii_case("rem"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A hawtio setting: the system property, else its `-D` in the profile's
@@ -47,7 +73,7 @@ fn hawtio_setting(instance: &Instance, name: &str) -> Option<String> {
     ["artemis.profile", "artemis.profile.cmd"]
         .iter()
         .find_map(|f| {
-            let text = std::fs::read_to_string(instance.etc.join(f)).ok()?;
+            let text = uncommented(&std::fs::read_to_string(instance.etc.join(f)).ok()?);
             let rest = &text[text.find(&define)? + define.len()..];
             let v = rest.split_whitespace().next().unwrap_or("");
             Some(v.trim_end_matches(['"', '\'']).to_owned())
@@ -215,4 +241,44 @@ pub async fn start(
     saranga_management::start(current.clone(), bindings, options)
         .await
         .context("starting the web server")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instance::Options;
+
+    fn roles_of(profile: &str) -> Option<Vec<String>> {
+        let dir = tempfile::tempdir().unwrap();
+        let etc = dir.path().join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(etc.join("artemis.profile"), profile).unwrap();
+        let instance = Instance::in_dirs(
+            etc.clone(),
+            etc.join("broker.xml"),
+            Options::default(),
+            None,
+            None,
+        );
+        profile_roles(&instance)
+    }
+
+    /// An empty `HAWTIO_ROLES` checks no roles, as `*` (what the profile's
+    /// comment says, and what Artemis's `-Dhawtio.roles=""` does), and a
+    /// commented-out line sets nothing.
+    #[test]
+    fn console_roles_from_the_profile() {
+        let all = Some(vec!["*".to_owned()]);
+        assert_eq!(roles_of("HAWTIO_ROLES=''\n"), all);
+        assert_eq!(roles_of("HAWTIO_ROLES=\n"), all);
+        assert_eq!(roles_of("HAWTIO_ROLES='*'\n"), all);
+        assert_eq!(
+            roles_of("HAWTIO_ROLES='amq, other'\n"),
+            Some(vec!["amq".to_owned(), "other".to_owned()])
+        );
+        assert_eq!(
+            roles_of("# JAVA_ARGS=\"-Dhawtio.roles=*\"\nHAWTIO_ROLES='amq'\n"),
+            Some(vec!["amq".to_owned()])
+        );
+    }
 }

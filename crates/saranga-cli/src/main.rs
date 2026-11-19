@@ -1254,7 +1254,7 @@ fn mask(
         let file = instance.broker_config()?;
         Codec::from_desc(Some(&file.password_codec))?
     } else {
-        Codec::init(&params, |n| std::env::var(n).ok())?
+        Codec::init(&params, saranga_config::mask::key_lookup)?
     };
     println!("result: {}", codec.encode(password)?);
     Ok(())

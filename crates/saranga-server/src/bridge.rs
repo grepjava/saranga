@@ -200,8 +200,15 @@ struct Inner {
     /// The forwarding connection's remote address, while connected.
     remote: Mutex<Option<String>>,
     metrics: Metrics,
-    /// Acknowledged message IDs, for the acknowledging task.
-    acks: mpsc::UnboundedSender<i64>,
+    /// Acknowledged message IDs, with the consumer each was delivered to,
+    /// for the acknowledging task.
+    acks: mpsc::UnboundedSender<(u64, i64)>,
+    /// Acknowledgements sent to the acknowledging task and not yet done:
+    /// the bridge's consumer goes only once they are, so a message the
+    /// other broker has is acknowledged, not given back to be sent again
+    /// (Artemis acknowledges in `sendAcknowledged` itself).
+    acking: AtomicI64,
+    acked: Notify,
 }
 
 impl Inner {
@@ -315,7 +322,11 @@ impl SendAcknowledgementHandler for Acks {
             return;
         }
         if inner.remove_ref(message.message_id) {
-            let _ = inner.acks.send(message.message_id);
+            let consumer = inner.consumer_id.load(Ordering::SeqCst);
+            inner.acking.fetch_add(1, Ordering::SeqCst);
+            if inner.acks.send((consumer, message.message_id)).is_err() {
+                inner.acking.fetch_sub(1, Ordering::SeqCst);
+            }
         }
     }
 
@@ -464,7 +475,7 @@ impl Bridge {
             .post_office()
             .filters()
             .create(config.filter.as_deref())?;
-        let (acks_tx, mut acks_rx) = mpsc::unbounded_channel::<i64>();
+        let (acks_tx, mut acks_rx) = mpsc::unbounded_channel::<(u64, i64)>();
         let inner = Arc::new(Inner {
             name: config.name.clone(),
             queue,
@@ -479,20 +490,23 @@ impl Bridge {
             remote: Mutex::new(None),
             metrics: Metrics::default(),
             acks: acks_tx,
+            acking: AtomicI64::new(0),
+            acked: Notify::new(),
         });
         // sendAcknowledged's queue work: the acknowledgement, journaled.
         let acker = {
             let inner = inner.clone();
             let broker = Arc::downgrade(broker);
             tokio::spawn(async move {
-                while let Some(id) = acks_rx.recv().await {
-                    let consumer = inner.consumer_id.load(Ordering::SeqCst);
+                while let Some((consumer, id)) = acks_rx.recv().await {
                     acknowledge(&inner, consumer, id).await;
                     if let Some(b) = broker.upgrade() {
                         b.post_office()
                             .plugins()
                             .each(|p| p.after_acknowledge_bridge(&inner.name, id));
                     }
+                    inner.acking.fetch_sub(1, Ordering::SeqCst);
+                    inner.acked.notify_waiters();
                 }
             })
         };
@@ -1165,6 +1179,23 @@ impl Bridge {
     /// `queue.removeConsumer(this)`: the references being sent go back to
     /// the queue (`cancelRefs`), this delivery not counted.
     async fn remove_consumer(&self) {
+        // The acknowledgements of what the other broker confirmed go first,
+        // under the consumer they were delivered to.
+        let drained = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let done = self.inner.acked.notified();
+                if self.inner.acking.load(Ordering::SeqCst) <= 0 {
+                    break;
+                }
+                done.await;
+            }
+        });
+        if drained.await.is_err() {
+            tracing::warn!(
+                "bridge {}: acknowledgements still in progress as its consumer goes",
+                self.inner.name
+            );
+        }
         let id = self.inner.consumer_id.swap(0, Ordering::SeqCst);
         if id != 0 {
             self.inner.queue.remove_consumer(id, false).await;
@@ -1249,6 +1280,8 @@ async fn disconnected(rx: &mut watch::Receiver<Option<ClientError>>) {
 /// `queue.acknowledge(ref)` for a message the other broker has.
 async fn acknowledge(inner: &Inner, consumer: u64, message_id: i64) {
     if consumer == 0 {
+        // Counted down still, or a stop waits for it for nothing.
+        inner.count_down();
         return;
     }
     match inner.queue.ack(consumer, message_id, true, false).await {

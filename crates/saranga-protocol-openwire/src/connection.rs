@@ -2041,6 +2041,12 @@ impl Connection {
                 PropertyValue::String(convert::message_id_string(id).as_str().into()),
             );
         }
+        // A composite with no members (`,`) goes nowhere: answered as a
+        // send, where Artemis waits for a destination to answer it and the
+        // producer never hears back.
+        if targets.is_empty() {
+            return Ok(());
+        }
         let should_block = producer.window_size > 0 || rr;
         if should_block {
             self.dont_send_response = true;
@@ -3079,12 +3085,10 @@ impl Connection {
                 TransactionId::Local(l) => {
                     self.local_txs.remove(l);
                 }
-                TransactionId::Xa(_) => {
-                    return Err(TxError::Xa(transaction::XaError {
-                        code: xa_code::XAER_NOTA,
-                        message: None,
-                    })
-                    .into());
+                // `xaForget`: a branch management completed is forgotten.
+                TransactionId::Xa(x) => {
+                    let internal = self.internal.as_mut().ok_or_else(OwError::npe)?;
+                    internal.xa_forget(to_xid(x))?;
                 }
             },
             7 => {
@@ -3276,7 +3280,12 @@ impl Connection {
                     ),
                 ));
             }
-            self.broker.resource_manager().remove(&xid);
+            // This branch, not one begun under its Xid since another
+            // completion (management, the timeout reaper) took it out.
+            let own = self.broker.resource_manager().remove_own(&xid, &entry.tx);
+            if !own && transaction::lock(&entry.tx).state != TxState::RolledBack {
+                return Err(Self::not_started(id));
+            }
         }
         let state = transaction::lock(&entry.tx).state;
         if state == TxState::RolledBack {

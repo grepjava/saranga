@@ -326,8 +326,14 @@ fn path_from_file(
     };
     for line in text.lines() {
         let t = line.trim();
-        if t.starts_with(prefix) && t.len() > prefix.len() + 1 {
-            let path = java_file(Path::new(&t[prefix.len() + 1..t.len() - 1]));
+        // `substring(prefix.length() + 1, length() - 1)`, in characters, not
+        // bytes: a path ending in a multi-byte character is cut as Java cuts
+        // it rather than panicking.
+        let chars: Vec<char> = t.chars().collect();
+        let skip = prefix.chars().count() + 1;
+        if t.starts_with(prefix) && chars.len() > skip {
+            let inner: String = chars[skip..chars.len() - 1].iter().collect();
+            let path = java_file(Path::new(&inner));
             println!("{name} found as {}", path.display());
             return Ok(path);
         }
@@ -595,7 +601,28 @@ fn upgrade_logging(etc: &Path, etc_bkp: &Path) -> anyhow::Result<()> {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{parse_new_line, parse_original_args, replace_bootstrap_line};
+    use super::{parse_new_line, parse_original_args, path_from_file, replace_bootstrap_line};
+
+    /// A path ending in a multi-byte character is cut by characters, as
+    /// Java's `substring` cuts it, not by bytes (which panicked).
+    #[test]
+    fn a_path_ending_in_a_multi_byte_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("artemis");
+        std::fs::write(&file, "ARTEMIS_INSTANCE_ETC=/srv/broké\n").unwrap();
+        let path = path_from_file(
+            std::path::PathBuf::from("default"),
+            &file,
+            "ARTEMIS_INSTANCE_ETC",
+            "etc",
+        )
+        .unwrap();
+        assert!(
+            path.display().to_string().ends_with("brok"),
+            "{}",
+            path.display()
+        );
+    }
 
     #[test]
     fn bootstrap_lines() {

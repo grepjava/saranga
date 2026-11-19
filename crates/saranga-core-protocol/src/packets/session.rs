@@ -1114,8 +1114,10 @@ fn decode_message_1x(r: &mut Reader<'_>, trailer: usize) -> Result<(CoreMessage,
         })?;
     let mut mr = Reader::new(&rest[..split]);
     let end_of_body = mr.i32()?;
-    let body_len = usize::try_from(end_of_body - BUFFER_HEADER_SPACE - LEGACY_EXTRA)
-        .map_err(|_| DecodeError::Invalid(format!("bad 1.x end-of-body position {end_of_body}")))?;
+    let body_len = usize::try_from(
+        i64::from(end_of_body) - i64::from(BUFFER_HEADER_SPACE) - i64::from(LEGACY_EXTRA),
+    )
+    .map_err(|_| DecodeError::Invalid(format!("bad 1.x end-of-body position {end_of_body}")))?;
     let body = mr.bytes(body_len)?.to_vec();
     let end_of_message = mr.i32()?;
     let mut message = CoreMessage::decode_headers_and_properties(&mut mr)?;
@@ -1199,6 +1201,22 @@ impl PacketCodec for SessionReceiveMessage1X {
 mod tests {
     use super::*;
     use crate::{Direction, Packet, read_frame};
+
+    /// A 1.x end-of-body position far below the header's size is refused,
+    /// not an arithmetic overflow (which panics a debug build's connection).
+    #[test]
+    fn a_1x_end_of_body_far_out_of_range_is_refused() {
+        let mut w = Writer::new();
+        w.i32(i32::MIN);
+        w.i32(0);
+        let mut bytes = w.into_vec();
+        bytes.push(0);
+        let mut r = Reader::new(&bytes);
+        assert!(matches!(
+            decode_message_1x(&mut r, 1),
+            Err(DecodeError::Invalid(_))
+        ));
+    }
 
     fn fixture(name: &str) -> Vec<u8> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

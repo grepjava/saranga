@@ -404,7 +404,8 @@ fn side_rows(s: &DatabaseStorage, message: i64) -> i64 {
         let client = writer::connect(&connection).await.map_err(io_error)?;
         let row = client
             .query_one(
-                "SELECT COUNT(*) FROM DB_BROKER_DATA WHERE RECORD_TYPE IN ($1, $2)                  AND substring(DATA_RECORD from 1 for 8) = $3",
+                "SELECT COUNT(*) FROM DB_BROKER_DATA WHERE RECORD_TYPE IN ($1, $2) \
+                 AND substring(DATA_RECORD from 1 for 8) = $3",
                 &[
                     &i16::from(ids::UPDATE_DELIVERY_COUNT),
                     &i16::from(ids::SET_SCHEDULED_DELIVERY_TIME),
