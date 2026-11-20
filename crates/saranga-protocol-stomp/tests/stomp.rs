@@ -521,3 +521,58 @@ async fn an_auto_ack_subscriber_that_does_not_read_holds_deliveries_back() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(queue.message_count(), 0);
 }
+
+/// A no-local subscriber does not get its own connection's sends, also
+/// when they are sent in a transaction; another connection's still come.
+#[tokio::test]
+async fn a_no_local_subscriber_skips_its_own_transacted_sends() {
+    let address = start().await;
+    let mut c = Client::connect(address, "1.2").await;
+    c.send("SUBSCRIBE\ndestination:nl\nsubscription-type:MULTICAST\nid:s\nno-local:true\nreceipt:r1\n\n")
+        .await;
+    assert_eq!(header(&c.frame().await, "receipt-id"), Some("r1"));
+    c.send("SEND\ndestination:nl\ndestination-type:MULTICAST\nreceipt:r2\n\nplain")
+        .await;
+    assert_eq!(header(&c.frame().await, "receipt-id"), Some("r2"));
+    c.send("BEGIN\ntransaction:tx1\n\n").await;
+    c.send("SEND\ndestination:nl\ndestination-type:MULTICAST\ntransaction:tx1\n\ntransacted")
+        .await;
+    c.send("COMMIT\ntransaction:tx1\nreceipt:r3\n\n").await;
+    assert_eq!(header(&c.frame().await, "receipt-id"), Some("r3"));
+    c.no_frame().await;
+
+    let mut other = Client::connect(address, "1.2").await;
+    other.send("BEGIN\ntransaction:tx2\n\n").await;
+    other
+        .send("SEND\ndestination:nl\ndestination-type:MULTICAST\ntransaction:tx2\n\nfrom another")
+        .await;
+    other.send("COMMIT\ntransaction:tx2\n\n").await;
+    let m = c.frame().await;
+    assert!(m.starts_with("MESSAGE\n"), "{m}");
+    assert!(m.ends_with("from another"), "{m}");
+}
+
+/// An auto-acknowledged subscription given a consumer window gets its
+/// credits back as its deliveries are acknowledged, so it does not stop
+/// after one window.
+#[tokio::test]
+async fn an_auto_ack_subscription_with_a_window_keeps_receiving() {
+    let address = start().await;
+    let mut c = Client::connect(address, "1.2").await;
+    c.send("SUBSCRIBE\ndestination:aw\nsubscription-type:ANYCAST\nid:s\nack:auto\nconsumer-window-size:500\nreceipt:r1\n\n")
+        .await;
+    assert_eq!(header(&c.frame().await, "receipt-id"), Some("r1"));
+    let mut p = Client::connect(address, "1.2").await;
+    const COUNT: usize = 20;
+    for i in 0..COUNT {
+        p.send(&format!(
+            "SEND\ndestination:aw\ndestination-type:ANYCAST\n\nmessage {i:02} {}",
+            "x".repeat(100)
+        ))
+        .await;
+    }
+    for i in 0..COUNT {
+        let m = c.frame().await;
+        assert!(m.starts_with("MESSAGE\n"), "message {i}: {m}");
+    }
+}

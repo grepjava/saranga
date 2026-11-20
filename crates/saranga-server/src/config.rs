@@ -18,6 +18,13 @@ use crate::storage::{DatabaseConfig, StorageConfig};
 use crate::wildcard::WildcardConfig;
 use crate::{AddressDeployment, BrokerConfig, RoutingType};
 
+/// The most addresses whose resolved settings are kept. Clients choose
+/// address names (temporary queues get a new one each), so a cache of every
+/// name looked up grows for as long as the broker runs; once full it starts
+/// again, at the cost of resolving the names in use once more. (Artemis's
+/// `HierarchicalObjectRepository` caches every name, until a match changes.)
+pub const MAX_CACHED_SETTINGS: usize = 10_000;
+
 /// Address settings resolved through `<address-settings>` match rules,
 /// cached per address until the rules are swapped.
 pub struct ConfiguredSettings {
@@ -41,6 +48,15 @@ impl ConfiguredSettings {
             }),
         }
     }
+
+    /// How many addresses' settings are cached.
+    pub fn cached(&self) -> usize {
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .cache
+            .len()
+    }
 }
 
 impl SettingsRepository for ConfiguredSettings {
@@ -62,6 +78,9 @@ impl SettingsRepository for ConfiguredSettings {
                 .map(|s| resolve(&s))
                 .unwrap_or_default(),
         );
+        if state.cache.len() >= MAX_CACHED_SETTINGS {
+            state.cache.clear();
+        }
         state.cache.insert(address.to_owned(), s.clone());
         s
     }
@@ -509,5 +528,30 @@ impl BrokerConfig {
                 file_path: None,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Looking up ever more address names, as clients and temporary queues
+    /// choose them, keeps the cache within its bound, and every lookup
+    /// still resolves its matches.
+    #[test]
+    fn the_settings_cache_is_bounded() {
+        let mut rules = cfg::HierarchicalRepository::new(cfg::WildcardConfiguration::default());
+        let slow = cfg::AddressSettings {
+            max_delivery_attempts: Some(3),
+            ..Default::default()
+        };
+        rules.add_match("slow.#", slow).unwrap();
+        let settings = ConfiguredSettings::new(rules);
+        for i in 0..3 * MAX_CACHED_SETTINGS {
+            let s = settings.get_match(&format!("slow.{i}"));
+            assert_eq!(s.max_delivery_attempts, 3);
+            assert!(settings.cached() <= MAX_CACHED_SETTINGS);
+        }
+        assert_eq!(settings.get_match("other").max_delivery_attempts, 10);
     }
 }

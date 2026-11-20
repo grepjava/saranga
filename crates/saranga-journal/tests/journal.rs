@@ -224,6 +224,68 @@ fn replaceable_updates_keep_only_the_last_on_compaction() {
     assert_eq!(upd[0].data, vec![19]);
 }
 
+/// A replaceable record updated outside a transaction and then by a
+/// committed one (as a scheduled delivery time is) keeps the committed value
+/// through a compaction; an update written after the commit keeps its own.
+#[test]
+fn a_committed_update_stays_the_last_through_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path());
+    let j = Journal::open(cfg.clone()).unwrap();
+    j.replaceable_record(36);
+    j.load_all().unwrap();
+    // Record 1: plain update, then a committed one.
+    j.append_add(1, 45, b"one".to_vec(), false, None).unwrap();
+    j.append_update(1, 36, b"1-old".to_vec(), false, true, None)
+        .unwrap();
+    j.append_update_tx(7, 1, 36, b"1-new".to_vec()).unwrap();
+    j.append_commit(7, true, None).unwrap();
+    // Record 2: a committed update, then a plain one.
+    j.append_add(2, 45, b"two".to_vec(), false, None).unwrap();
+    j.append_update_tx(8, 2, 36, b"2-old".to_vec()).unwrap();
+    j.append_commit(8, true, None).unwrap();
+    j.append_update(2, 36, b"2-new".to_vec(), false, true, None)
+        .unwrap();
+    // Record 3: a rolled-back update leaves the plain one.
+    j.append_add(3, 45, b"three".to_vec(), false, None).unwrap();
+    j.append_update(3, 36, b"3-new".to_vec(), false, true, None)
+        .unwrap();
+    j.append_update_tx(9, 3, 36, b"3-rolled-back".to_vec())
+        .unwrap();
+    j.append_rollback(9, true, None).unwrap();
+    j.stop().unwrap();
+    drop(j);
+
+    let last = |cfg: &JournalConfig| {
+        let j = Journal::open(cfg.clone()).unwrap();
+        j.replaceable_record(36);
+        let r = j.load_all().unwrap();
+        j.stop().unwrap();
+        (1..=3)
+            .map(|id| {
+                r.committed
+                    .iter()
+                    .filter(|r| r.is_update && r.id == id && r.user_record_type == 36)
+                    .map(|r| String::from_utf8(r.data.clone()).unwrap())
+                    .next_back()
+            })
+            .collect::<Vec<_>>()
+    };
+    let expect = vec![
+        Some("1-new".to_owned()),
+        Some("2-new".to_owned()),
+        Some("3-new".to_owned()),
+    ];
+    assert_eq!(last(&cfg), expect, "before compaction");
+    let j = Journal::open(cfg.clone()).unwrap();
+    j.replaceable_record(36);
+    j.load_all().unwrap();
+    j.compact().unwrap();
+    j.stop().unwrap();
+    drop(j);
+    assert_eq!(last(&cfg), expect, "after compaction");
+}
+
 #[test]
 fn interrupted_compaction_is_finished_on_load() {
     let dir = tempfile::tempdir().unwrap();

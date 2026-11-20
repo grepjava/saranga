@@ -261,8 +261,13 @@ async fn write_loop<W: AsyncWrite + Unpin>(
 
 /// What the connection's task hears besides its client.
 enum Event {
-    /// An auto-acknowledged delivery went out (`afterDeliveryTasks`).
-    AutoAck { consumer: i64, message: i64 },
+    /// An auto-acknowledged delivery of `length` bytes went out
+    /// (`afterDeliveryTasks`).
+    AutoAck {
+        consumer: i64,
+        message: i64,
+        length: i64,
+    },
     /// The queue answered an auto-acknowledgement made in `tx`.
     AutoAcked {
         tx: TxRef,
@@ -521,6 +526,7 @@ impl DeliverySink for StompSink {
                 let _ = self.events.send(Event::AutoAck {
                     consumer: consumer_id,
                     message: core.message_id,
+                    length,
                 });
             }
         } else {
@@ -715,7 +721,11 @@ pub async fn serve(broker: Arc<Broker>, c: Accepted) {
                     break;
                 }
                 event = events_rx.recv() => match event {
-                    Some(Event::AutoAck { consumer, message }) => conn.auto_ack(consumer, message).await,
+                    Some(Event::AutoAck {
+                        consumer,
+                        message,
+                        length,
+                    }) => conn.auto_ack(consumer, message, length).await,
                     Some(Event::AutoAcked { tx, pending, result }) => conn.auto_acked(tx, pending, result),
                     Some(Event::Disconnected { consumer }) => conn.disconnected(consumer).await,
                     Some(Event::CloseSession { name }) => conn.close_session(&name).await,
@@ -1374,8 +1384,17 @@ impl Connection {
         let enable_message_id = self.settings.enable_message_id;
         let min_large = self.settings.min_large_message_size;
         let broker = self.broker.clone();
+        // The connection's no-local subscriptions, whichever session they
+        // are on: a transacted SEND goes through the transaction's session,
+        // which has none. (Artemis asks the transaction's session, so its
+        // no-local subscribers get their own transacted sends.)
+        let no_local = self
+            .main
+            .iter()
+            .chain(self.transacted.values())
+            .any(|s| s.no_local > 0);
         let session = self.session_for(tx.as_deref()).await?;
-        if session.no_local > 0 {
+        if no_local {
             message.properties.insert(
                 convert::CONNECTION_ID_PROPERTY.into(),
                 saranga_buffer::PropertyValue::String(connection_id.as_str().into()),
@@ -1650,7 +1669,7 @@ impl Connection {
     /// of its own, goes to the queue without waiting for it, so that the
     /// next delivery's need not wait either; [`auto_acked`](Self::auto_acked)
     /// commits once the queue answered.
-    async fn auto_ack(&mut self, consumer: i64, message: i64) {
+    async fn auto_ack(&mut self, consumer: i64, message: i64, length: i64) {
         let Some(session) = self.main.as_mut() else {
             return;
         };
@@ -1679,6 +1698,19 @@ impl Connection {
         if let Err(e) = sent {
             let _ = session.session.rollback_tx(&tx);
             tracing::warn!("{}", e.message);
+            return;
+        }
+        // A window given at SUBSCRIBE is given back as each delivery is
+        // acknowledged, as for the client modes; otherwise the subscription
+        // stops after one window. (Artemis's `afterDelivery` gives nothing
+        // back for `ack:auto`.)
+        if session
+            .subscriptions
+            .get(&consumer)
+            .is_some_and(|s| s.window != -1)
+            && let Some(grant) = session.session.credit_granter(consumer)
+        {
+            grant(length as i32);
         }
     }
 

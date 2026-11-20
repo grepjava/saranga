@@ -481,3 +481,40 @@ async fn management_deploys_and_destroys_journaled_bridges() {
     stop(source).await;
     stop(target).await;
 }
+
+/// destroyBridge("foo") takes the bridges deployed as "foo", not a bridge
+/// deployed on its own as "foo-1" (which Artemis's `name-\d+` match takes
+/// too, leaving its record behind).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn destroying_a_bridge_leaves_one_named_like_its_copies() {
+    let target_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let (target, target_port) = start(target_dir.path(), 0, QUEUE).await;
+    let core = format!(
+        r#"<connectors><connector name="target">tcp://127.0.0.1:{target_port}</connector></connectors>{QUEUE}"#
+    );
+    let (source, source_port) = start(source_dir.path(), 0, &core).await;
+    let b = &source.broker;
+    for name in ["foo", "foo-1", "bar"] {
+        let concurrency = if name == "bar" { 2 } else { 1 };
+        invoke(
+            b,
+            "broker",
+            "createBridge",
+            &[Json::from(format!(
+                r#"{{"name":"{name}","queue-name":"src","forwarding-address":"dst","static-connectors":["target"],"concurrency":{concurrency}}}"#
+            ))],
+        )
+        .await;
+    }
+    assert_eq!(names(b), ["bar-0", "bar-1", "foo", "foo-1"]);
+    invoke(b, "broker", "destroyBridge", &[Json::from("foo")]).await;
+    assert_eq!(names(b), ["bar-0", "bar-1", "foo-1"]);
+    invoke(b, "broker", "destroyBridge", &[Json::from("bar")]).await;
+    assert_eq!(names(b), ["foo-1"]);
+    stop(source).await;
+    let (source, _) = start(source_dir.path(), source_port, &core).await;
+    assert_eq!(names(&source.broker), ["foo-1"]);
+    stop(source).await;
+    stop(target).await;
+}

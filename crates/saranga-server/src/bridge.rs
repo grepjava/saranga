@@ -1592,42 +1592,29 @@ impl Broker {
         Ok(true)
     }
 
-    /// `ClusterManager.destroyBridge`: the bridges named `name` or
-    /// `name-<n>` are stopped and forgotten.
-    async fn undeploy_bridge(&self, name: &str) {
+    /// `ActiveMQServerImpl.destroyBridge`: every bridge deployed under the
+    /// name (one per `concurrency`), and its record. They are found by the
+    /// name they were deployed under, not by `name` or `name-<n>` as
+    /// `ClusterManager.destroyBridge` finds them, which also takes a bridge
+    /// deployed separately as "foo-1" when "foo" is destroyed.
+    pub async fn destroy_bridge(&self, name: &str) {
         let removed: Vec<Arc<Bridge>> = {
             let mut deployed = self.bridges.deployed();
-            let (gone, kept) = std::mem::take(&mut *deployed).into_iter().partition(|b| {
-                let n = b.name();
-                n == name
-                    || n.strip_prefix(name)
-                        .and_then(|r| r.strip_prefix('-'))
-                        .is_some_and(|d| !d.is_empty() && d.bytes().all(|c| c.is_ascii_digit()))
-            });
+            let (gone, kept) = std::mem::take(&mut *deployed)
+                .into_iter()
+                .partition(|b| b.config().parent_name == name);
             *deployed = kept;
             gone
         };
+        if removed.is_empty() {
+            return;
+        }
         for b in removed {
             if let Err(e) = b.stop().await {
                 tracing::warn!("{e}");
             }
         }
-    }
-
-    /// `ActiveMQServerImpl.destroyBridge`: every bridge deployed under the
-    /// name, and its record.
-    pub async fn destroy_bridge(&self, name: &str) {
-        let matching: Vec<String> = self
-            .bridges
-            .all()
-            .iter()
-            .filter(|b| b.config().parent_name == name)
-            .map(|b| b.name().to_owned())
-            .collect();
-        for n in matching {
-            self.undeploy_bridge(&n).await;
-            self.delete_bridge_record(name);
-        }
+        self.delete_bridge_record(name);
     }
 
     /// `deleteBridgeConfiguration`.

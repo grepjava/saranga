@@ -383,6 +383,9 @@ pub struct ClusterConnection {
     scanner: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The listener that bridges each primary the topology brings.
     bridging_listener: Mutex<Option<u64>>,
+    /// Run once by the next member update before it takes the topology.
+    #[cfg(test)]
+    before_update: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl ClusterConnection {
@@ -398,6 +401,8 @@ impl ClusterConnection {
             tasks: Mutex::default(),
             scanner: Mutex::default(),
             bridging_listener: Mutex::default(),
+            #[cfg(test)]
+            before_update: Mutex::default(),
         })
     }
 
@@ -774,17 +779,6 @@ impl ClusterConnection {
     /// `Topology.updateMember`, after the split-brain check of
     /// `ClusterConnectionImpl.updateMember`.
     fn update_member(&self, unique_event_id: i64, mut input: Member) {
-        // News from before the node was last removed.
-        if unique_event_id != 0
-            && let Some(deleted) = self.topology().deleted.get(&input.node_id)
-            && unique_event_id < *deleted
-        {
-            tracing::debug!(
-                "Update uniqueEvent={unique_event_id}, nodeId={} being rejected as there was a delete done after that",
-                input.node_id
-            );
-            return;
-        }
         if input.node_id == self.node_id {
             match &input.primary {
                 Some(p) if !same_params(p, &self.config.connector) => {
@@ -799,8 +793,26 @@ impl ClusterConnection {
                 None => input.primary = Some(self.config.connector.clone()),
             }
         }
+        #[cfg(test)]
+        if let Some(f) = self.before_update.lock().unwrap().take() {
+            f();
+        }
         let (member, listeners) = {
             let mut t = self.topology();
+            // News from before the node was last removed, checked under the
+            // lock the update takes: a removal between the check and the
+            // update would let the stale news bring the node back. (Artemis's
+            // `Topology.updateMember` checks `mapDelete` outside its lock.)
+            if unique_event_id != 0
+                && let Some(deleted) = t.deleted.get(&input.node_id)
+                && unique_event_id < *deleted
+            {
+                tracing::debug!(
+                    "Update uniqueEvent={unique_event_id}, nodeId={} being rejected as there was a delete done after that",
+                    input.node_id
+                );
+                return;
+            }
             let Some(current) = t.get(&input.node_id).cloned() else {
                 input.unique_event_id = unique_event_id;
                 t.put(input.clone());
@@ -1318,5 +1330,53 @@ mod tests {
                 ("localhost".to_owned(), 61619)
             ]
         );
+    }
+
+    /// News of a node sent before its removal does not bring it back, also
+    /// when the removal comes while the news is being taken.
+    #[tokio::test]
+    async fn stale_news_does_not_bring_back_a_node_removed_meanwhile() {
+        let cc = ClusterConnection::new(config(61616), "node-a");
+        cc.activate();
+        cc.node_announced(
+            1,
+            "node-b",
+            None,
+            None,
+            Some(connector("b", 61617)),
+            None,
+            false,
+        );
+        assert!(cc.member("node-b").is_some());
+        // News from event 5 is being taken when the removal at event 10
+        // comes in.
+        let remover = cc.clone();
+        *cc.before_update.lock().unwrap() = Some(Box::new(move || {
+            assert!(remover.remove_member(10, "node-b", true));
+        }));
+        cc.node_announced(
+            5,
+            "node-b",
+            None,
+            None,
+            Some(connector("b", 61617)),
+            None,
+            false,
+        );
+        assert!(
+            cc.member("node-b").is_none(),
+            "a node removed at event 10 came back with news from event 5"
+        );
+        // Newer news does bring it back.
+        cc.node_announced(
+            11,
+            "node-b",
+            None,
+            None,
+            Some(connector("b", 61617)),
+            None,
+            false,
+        );
+        assert!(cc.member("node-b").is_some());
     }
 }

@@ -194,6 +194,7 @@ impl Compactor<'_> {
                         "AMQ142024: Inconsistency during compacting: CommitRecord ID = {tx} for an already committed transaction during compacting"
                     );
                 } else {
+                    self.drop_superseded_updates(tx);
                     self.flush_tx(tx)?;
                     if let Some(t) = self.books().transactions.remove(&tx) {
                         let mut t = t;
@@ -312,6 +313,34 @@ impl Compactor<'_> {
             }
         }
         Ok(())
+    }
+
+    /// A transaction committed here comes after every replaceable update held
+    /// so far, so an update it makes to the same record (and key) is the
+    /// later one: the held update is dropped rather than written at the end,
+    /// where a reload would take it as the last. (Artemis's `flushUpdates`
+    /// writes it at the end, after the commit.)
+    fn drop_superseded_updates(&mut self, tx: i64) {
+        let Some(writes) = self.pending_writes_on_tx.get(&tx) else {
+            return;
+        };
+        for (r, _, _) in writes {
+            let Record::UpdateTx {
+                id,
+                user_type,
+                data,
+                ..
+            } = r
+            else {
+                continue;
+            };
+            let Some(latest) = self.pending_updates.get_mut(user_type) else {
+                continue;
+            };
+            let key_len = self.inner.books.replaceable.get(user_type).copied();
+            let n = key_len.unwrap_or(0).min(data.len());
+            latest.remove(&(*id, data[..n].to_vec()));
+        }
     }
 
     /// `flushUpdates`: the last update of each replaceable record.
