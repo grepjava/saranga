@@ -1337,7 +1337,7 @@ fn embed(
                 .read_all()
                 .unwrap_or_else(|e| {
                     tracing::warn!(
-                        "AMQ222110: Error on resetting large message deliver - {message_id}: {e}"
+                        "AMQ222142: Error on resetting large message deliver - {message_id}: {e}"
                     );
                     Vec::new()
                 })

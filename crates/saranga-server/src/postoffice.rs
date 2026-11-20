@@ -1227,7 +1227,7 @@ impl PostOffice {
         }
         if config.name != original {
             tracing::warn!(
-                "AMQ224076: Queue {original} is duplicated during reload. This queue will be renamed as {}",
+                "AMQ222173: Queue {original} is duplicated during reload. This queue will be renamed as {}",
                 config.name
             );
         }
@@ -1965,8 +1965,8 @@ impl PostOffice {
                     c.address
                 );
                 if let Err(e) = self.auto_delete_queue(q.name()) {
-                    tracing::warn!(
-                        "AMQ222241: Unable to remove auto-created queue {}: {e}",
+                    tracing::error!(
+                        "AMQ224065: Failed to remove auto-created queue {}: {e}",
                         q.name()
                     );
                 }
@@ -3044,7 +3044,10 @@ impl PostOffice {
             .chain(state.free_diverts.values())
             .any(|e| e.diverts.iter().any(|d| d.name == divert.name))
         {
-            tracing::warn!("AMQ222017: Divert {} already exists", divert.name);
+            tracing::warn!(
+                "AMQ222006: Binding already exists with name {}, divert will not be deployed",
+                divert.name
+            );
             return Ok(false);
         }
         // `postOffice.addBinding`: the address need not exist.

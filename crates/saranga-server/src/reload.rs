@@ -431,7 +431,7 @@ pub fn recover_stored_diverts(
             post_office.forget_divert_record(&d.name);
         } else if let Err(e) = post_office.deploy_divert(&d, transformers) {
             tracing::warn!(
-                "AMQ222314: Failed to recover stored divert configuration {}: {e}",
+                "AMQ224164: Failed to recover stored configuration for divert named '{}': {e}. To repair this record create a new divert with the same name via the management API.",
                 d.name
             );
         }

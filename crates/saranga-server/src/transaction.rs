@@ -230,7 +230,7 @@ pub fn persist_delivery_count(q: &Queue, r: &mut MessageRef) {
         Ok(true) => r.persisted_count = r.delivery_count,
         Ok(false) => {}
         Err(e) => tracing::warn!(
-            "AMQ222178: Cannot find message {} on the journal: {e}",
+            "AMQ222153: Cannot locate record for message id = {} on Journal: {e}",
             r.message_id()
         ),
     }

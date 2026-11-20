@@ -250,11 +250,11 @@ impl Queue {
             if old >= 0
                 && let Err(e) = s.delete_binding_record(old)
             {
-                tracing::warn!("AMQ222251: Unable to pause a queue: {e}");
+                tracing::warn!("AMQ222240: Unable to pause a Queue: {e}");
             }
             match s.store_queue_status(self.0.id) {
                 Ok(record) => self.0.pause_record.store(record, Ordering::SeqCst),
-                Err(e) => tracing::warn!("AMQ222251: Unable to pause a queue: {e}"),
+                Err(e) => tracing::warn!("AMQ222240: Unable to pause a Queue: {e}"),
             }
         }
         self.0.paused.store(true, Ordering::SeqCst);
@@ -286,7 +286,7 @@ impl Queue {
             && let Some(s) = self.0.ids.storage()
             && let Err(e) = s.delete_binding_record(old)
         {
-            tracing::warn!("AMQ222252: Unable to resume a queue: {e}");
+            tracing::warn!("AMQ222241: Unable to resume a Queue: {e}");
         }
         self.prompt_delivery();
     }
@@ -720,7 +720,7 @@ impl Actor {
         if let Some(s) = self.shared.ids.storage()
             && let Err(e) = s.settle()
         {
-            tracing::warn!("AMQ222037: IO Error reading paged messages: {e}");
+            tracing::warn!("IO Error reading paged messages: {e}");
         }
     }
 

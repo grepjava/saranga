@@ -624,7 +624,9 @@ impl Management {
                         .invoke(broker, &resource, &operation, &params, caller)
                         .await;
                     if let Err(e) = &o {
-                        tracing::warn!("AMQ222140: Error invoking {operation} on {resource}: {e}");
+                        tracing::trace!(
+                            "AMQ222111: exception while invoking {operation} on {resource}: {e}"
+                        );
                     }
                     Some(o)
                 }
@@ -633,7 +635,9 @@ impl Management {
         } else if let Some(attribute) = prop(HDR_ATTRIBUTE) {
             let o = self.attribute(broker, &resource, &attribute, caller).await;
             if let Err(e) = &o {
-                tracing::warn!("AMQ222141: Error getting {attribute} on {resource}: {e}");
+                tracing::trace!(
+                    "AMQ222112: exception while retrieving attribute {attribute} on {resource}: {e}"
+                );
             }
             Some(o)
         } else {

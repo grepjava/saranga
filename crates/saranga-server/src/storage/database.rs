@@ -276,7 +276,7 @@ impl IdCounterStore for DatabaseIdStore {
             data: IdCounterEncoding { id }.encode(),
         };
         if let Err(e) = write(&self.0, vec![op]) {
-            tracing::warn!("AMQ222217: Exception during batching ID: {e}");
+            tracing::error!("AMQ224008: Failed to store id: {e}");
         }
     }
 

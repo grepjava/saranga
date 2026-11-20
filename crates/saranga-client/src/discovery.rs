@@ -147,7 +147,7 @@ impl Broadcaster {
                             break;
                         }
                         Err(e) => tracing::warn!(
-                            "AMQ212057: Error creating broadcast socket on {}, retrying with a different port: {e}",
+                            "AMQ212048: Error creating broadcast socket on {}, retrying with a different port: {e}",
                             SocketAddr::new(local, port)
                         ),
                     }

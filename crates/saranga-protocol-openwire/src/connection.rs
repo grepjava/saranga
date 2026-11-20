@@ -282,7 +282,7 @@ async fn completer(out: Arc<Outbound>, mut rx: mpsc::UnboundedReceiver<Reply>) {
     while let Some(reply) = rx.recv().await {
         match reply.completion.wait().await {
             Err(e) => {
-                tracing::warn!("AMQ222020: error processing IO callback: {e}");
+                tracing::warn!("error processing IO callback: {e}");
                 let correlation = match &reply.command {
                     Some(DataStructure::Response(r)) => r.correlation_id,
                     _ => 0,

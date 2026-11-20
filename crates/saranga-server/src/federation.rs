@@ -471,7 +471,7 @@ impl FederationConnection {
                             .cloned();
                         if found.is_none() {
                             tracing::warn!(
-                                "AMQ222134: No connector defined with name {n}. The bridge will not be deployed."
+                                "AMQ222226: Connection configuration is null for connectorName {n}"
                             );
                         }
                         found
@@ -548,7 +548,7 @@ impl FederationConnection {
     async fn session_factory(&self) -> Result<Connection, ClientError> {
         if !self.is_started() {
             return Err(ClientError::InvalidArgument(
-                "AMQ219034: Session creation failed".to_owned(),
+                "Session creation failed".to_owned(),
             ));
         }
         let mut slot = self.factory.lock().await;

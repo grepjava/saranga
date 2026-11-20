@@ -1184,7 +1184,7 @@ impl Core {
                     Some(_) if native_large => self.session.check_large_message(&mut copy)?,
                     Some(body) => Some(body.copy(copy.message_id, copy.durable).map_err(|e| {
                         tracing::warn!(
-                            "AMQ222181: Unable to copy large message {}: {e}",
+                            "AMQ222053: Error on copying large message {} for DLA or Expiry: {e}",
                             last.message.message_id()
                         );
                         BrokerError::new(ErrorType::IoError, e.to_string())

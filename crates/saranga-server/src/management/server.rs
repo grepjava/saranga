@@ -439,15 +439,15 @@ fn routing_types(list: Option<&str>) -> Result<RoutingTypes, String> {
 /// `QueueConfiguration.fromJSON`: every member as text, `name` required.
 pub fn queue_spec_from_json(text: &str) -> Result<QueueSpec, String> {
     let json = Json::parse(text)
-        .map_err(|e| format!("AMQ229228: Failed to parse JSON queue configuration: {text}: {e}"))?;
+        .map_err(|e| format!("AMQ229229: Failed to parse JSON queue configuration: {text}: {e}"))?;
     let Json::Object(members) = &json else {
         return Err(format!(
-            "AMQ229228: Failed to parse JSON queue configuration: {text}"
+            "AMQ229229: Failed to parse JSON queue configuration: {text}"
         ));
     };
     let Some(name) = json.get("name").map(json_text) else {
         return Err(format!(
-            "AMQ229228: Failed to parse JSON queue configuration: {text}"
+            "AMQ229229: Failed to parse JSON queue configuration: {text}"
         ));
     };
     let mut spec = QueueSpec::new(name.as_str(), name.as_str());
@@ -1600,7 +1600,7 @@ pub fn settings_json(s: Option<saranga_config::AddressSettings>) -> Json {
 
 /// `addAddressSettings(address, json)`.
 fn add_address_settings(broker: &Broker, address: &str, text: &str) -> Outcome {
-    let parse_error = || format!("AMQ229228: Failed to parse JSON queue configuration: {text}");
+    let parse_error = || format!("AMQ229229: Failed to parse JSON queue configuration: {text}");
     let json = Json::parse(text).map_err(|_| parse_error())?;
     let Json::Object(members) = json else {
         return Err(parse_error());

@@ -890,7 +890,7 @@ impl CoreSession {
             Packet::CreateProducerMessage(p) => {
                 if self.producers.contains_key(&p.id) {
                     tracing::warn!(
-                        "AMQ222316: Unable to create producer with ID {}: one already exists in session {}",
+                        "AMQ222310: Trying to add a producer with ID {} that already exists to session {}",
                         p.id,
                         self.session.name()
                     );
@@ -907,7 +907,7 @@ impl CoreSession {
                 match self.producers.remove(&p.id) {
                     Some(name) => self.session.remove_producer(&name),
                     None => tracing::warn!(
-                        "AMQ222317: Unable to remove producer with ID {}: it does not exist in session {}",
+                        "AMQ222309: Trying to remove a producer with ID {} that doesnt exist from session {}",
                         p.id,
                         self.session.name()
                     ),

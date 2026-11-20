@@ -109,7 +109,7 @@ impl ClusterConfig {
                     let found = self::connector(config, name);
                     if found.is_none() {
                         tracing::warn!(
-                            "AMQ222024: Could not find connector {name} for cluster connection {}",
+                            "AMQ222226: Connection configuration is null for connectorName {name} (cluster connection {})",
                             cc.name
                         );
                     }
@@ -1054,9 +1054,9 @@ async fn announce_loop(
             {
                 conn.close().await;
                 return Err(format!(
-                    "AMQ229099: Unable to validate user from {}. Username: {}; SSL certificate subject DN: unavailable",
-                    describe(target),
-                    config.cluster_user
+                    "AMQ229099: Unable to authenticate cluster user: {} (at {})",
+                    config.cluster_user,
+                    describe(target)
                 ));
             }
             conn.node_announce(NodeAnnounceMessage {

@@ -377,7 +377,7 @@ impl DeliverySink for CoreDeliverySink {
             );
         } else {
             tracing::warn!(
-                "AMQ222210: Server is unable to disconnect the consumer of an old client: {reason}"
+                "AMQ222169: Server needs to disconnect the consumer because of ( {reason} ) but you have a legacy client connected and it cannot do so, these consumers may just hang"
             );
         }
     }

@@ -153,7 +153,7 @@ impl DuplicateIdCache {
                 if let Some(s) = &self.storage
                     && let Err(e) = s.delete_record(old_record)
                 {
-                    tracing::warn!("AMQ222057: Error deleting duplicate cache: {e}");
+                    tracing::warn!("AMQ222055: Error on deleting duplicate cache: {e}");
                 }
             }
             self.index.insert(id.clone(), self.pos);
@@ -178,7 +178,7 @@ impl DuplicateIdCache {
             && let Some(s) = &self.storage
             && let Err(e) = s.delete_record(record)
         {
-            tracing::warn!("AMQ222057: Error deleting duplicate cache: {e}");
+            tracing::warn!("AMQ222055: Error on deleting duplicate cache: {e}");
         }
         true
     }
@@ -219,7 +219,7 @@ impl DuplicateIdCache {
             .try_for_each(|r| s.delete_record_tx(tx, r))
             .and_then(|()| s.commit_unsynced(tx, true));
         if let Err(e) = written {
-            tracing::warn!("AMQ222057: Error deleting duplicate cache: {e}");
+            tracing::warn!("AMQ222055: Error on deleting duplicate cache: {e}");
         }
     }
 

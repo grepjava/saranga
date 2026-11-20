@@ -1239,7 +1239,7 @@ impl Inner {
         let max = self.cfg.max_record_size();
         if size > max.saturating_sub(2048) {
             tracing::warn!(
-                "AMQ142033: Message of {size} bytes is bigger than the max record size of {max} bytes. You should try to move large application properties to the message body."
+                "AMQ149005: Message of {size} bytes is bigger than the max record size of {max} bytes. You should try to move large application properties to the message body."
             );
             if size > max {
                 return Err(JournalError::RecordTooLarge { size, max });
@@ -1310,11 +1310,11 @@ impl Inner {
             let left = self.list_files(&ext)?;
             if !left.is_empty() {
                 tracing::warn!(
-                    "AMQ142022: Temporary files were left unattended after a crash on journal directory, deleting invalid files now"
+                    "AMQ142018: Temporary files were left unattended after a crash on journal directory, deleting invalid files now"
                 );
             }
             for f in left {
-                tracing::warn!("AMQ142023: Deleting orphaned file {f}");
+                tracing::warn!("AMQ142019: Deleting orphaned file {f}");
                 let _ = std::fs::remove_file(self.path(&f));
             }
         }
@@ -1335,7 +1335,7 @@ impl Inner {
                 files.push(JFile::new(header.file_id, header.journal_version, name));
             } else {
                 tracing::warn!(
-                    "AMQ142016: Ignoring journal file {name}: file is shorter then minimum header size. This file is being removed."
+                    "AMQ144007: Ignoring journal file {name}: file is shorter then minimum header size. This file is being removed."
                 );
                 let _ = std::fs::remove_file(path);
             }
@@ -1487,7 +1487,7 @@ impl Inner {
                             self.books.tx_prepare(tx, key);
                         } else {
                             tracing::warn!(
-                                "AMQ142019: Prepared transaction {tx} was not considered completed, it will be ignored"
+                                "AMQ142013: Prepared transaction {tx} was not considered completed, it will be ignored"
                             );
                             holders.get_mut(&tx).expect("holder").invalid = true;
                         }
@@ -1513,7 +1513,7 @@ impl Inner {
                                 self.books.tx_commit(t, key);
                             } else {
                                 tracing::warn!(
-                                    "AMQ142020: Transaction {tx} is missing elements so the transaction is being ignored"
+                                    "AMQ142014: Transaction {tx} is missing elements so the transaction is being ignored"
                                 );
                                 self.books.tx_forget(t);
                             }
@@ -1558,7 +1558,7 @@ impl Inner {
             }
             if !h.prepared || h.invalid {
                 tracing::warn!(
-                    "AMQ142021: Uncommitted transaction with id {tx} found and discarded"
+                    "AMQ142015: Uncommitted transaction with id {tx} found and discarded"
                 );
                 // A rollback record, or compaction would trip over the
                 // unknown transaction.
@@ -1907,12 +1907,15 @@ impl Inner {
         let name = path.file_name().expect("file name");
         if count < self.cfg.max_attic_files {
             tracing::warn!(
-                "AMQ142044: Moving data file {} to attic",
+                "AMQ144008: File {}: was moved under attic, please review it and remove it.",
                 name.to_string_lossy()
             );
             fio::rename(path, &attic.join(name)).map_err(JournalError::io)?;
         } else {
-            tracing::warn!("AMQ142045: Deleting {}", name.to_string_lossy());
+            tracing::warn!(
+                "AMQ142009: The File Storage Attic is full, as the file {} does not have the configured size, and the file will be removed",
+                name.to_string_lossy()
+            );
             fio::remove_file(path).map_err(JournalError::io)?;
         }
         Ok(())

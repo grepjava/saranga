@@ -515,7 +515,7 @@ impl ServerMessage {
                     Ok(copy) => Some(Self::new_native_large(n, copy)),
                     Err(e) => {
                         tracing::warn!(
-                            "AMQ222181: Unable to copy large message {}: {e}",
+                            "AMQ222053: Error on copying large message {} for DLA or Expiry: {e}",
                             self.message_id()
                         );
                         None
@@ -529,7 +529,7 @@ impl ServerMessage {
                 Ok(copy) => Some(Self::new_large(core, copy)),
                 Err(e) => {
                     tracing::warn!(
-                        "AMQ222181: Unable to copy large message {}: {e}",
+                        "AMQ222053: Error on copying large message {} for DLA or Expiry: {e}",
                         self.message_id()
                     );
                     None

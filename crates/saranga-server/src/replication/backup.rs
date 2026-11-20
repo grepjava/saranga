@@ -517,7 +517,7 @@ impl Endpoint {
     /// and the primary is answered with the error rather than a response,
     /// so it does not count the packet as replicated.
     fn fail(&mut self, e: io::Error) -> Packet {
-        tracing::warn!("AMQ222185: Error handling replication packet: {e}");
+        tracing::warn!("AMQ222086: error handling packet for replication: {e}");
         self.up_to_date = false;
         let message = e.to_string();
         self.failed.get_or_insert_with(|| message.clone());
@@ -716,7 +716,7 @@ impl Endpoint {
             }
             other => {
                 tracing::warn!(
-                    "AMQ222182: Packet {} can't be processed by the ReplicationEndpoint",
+                    "AMQ222085: Packet {} can not be processed by the ReplicationEndpoint",
                     other.name()
                 );
                 Ok(())

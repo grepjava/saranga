@@ -407,7 +407,7 @@ impl Broker {
             tokio::spawn(async move {
                 if !super::quorum::is_still_active(&broker, &policy).await {
                     tracing::warn!(
-                        "AMQ222200: Could not find a primary or backup in the cluster that agrees this server is active, stopping"
+                        "Could not find a primary or backup in the cluster that agrees this server is active, stopping"
                     );
                     broker.request_shutdown();
                 }

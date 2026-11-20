@@ -250,7 +250,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
                     // discharge's answer, a settle) would tell the peer it
                     // is stored: it does not go (afterIO's onError sends no
                     // outcome), and the broker stops on the error.
-                    Err(e) => tracing::error!("AMQ119031: storage operation failed: {e}"),
+                    Err(e) => tracing::error!("storage operation failed: {e}"),
                 }
                 held += 1;
                 false

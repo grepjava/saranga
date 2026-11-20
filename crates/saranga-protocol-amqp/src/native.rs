@@ -485,7 +485,7 @@ impl NativeMessage for AmqpNative {
             Ok(m) => AmqpNative::arc(m),
             Err(e) => {
                 tracing::warn!(
-                    "AMQ222110: Error on reconstituting large message {}: {e}",
+                    "Error on reconstituting large message {}: {e}",
                     self.message.message_id()
                 );
                 AmqpNative::arc(self.message.clone())

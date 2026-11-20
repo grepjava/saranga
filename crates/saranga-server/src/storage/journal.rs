@@ -27,7 +27,7 @@ impl IdCounterStore for BindingsIdStore {
             true,
             None,
         ) {
-            tracing::warn!("AMQ222217: Exception during batching ID: {e}");
+            tracing::error!("AMQ224008: Failed to store id: {e}");
         }
     }
 

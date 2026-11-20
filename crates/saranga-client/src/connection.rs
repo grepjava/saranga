@@ -1157,7 +1157,7 @@ impl Factory {
             if attempts != -1 && count == attempts {
                 if attempts != 1 {
                     tracing::warn!(
-                        "AMQ212007: Tried {attempts} times to connect. Now giving up on reconnecting it."
+                        "AMQ212005: Tried {attempts} times to connect. Now giving up on reconnecting it."
                     );
                 }
                 return count;
@@ -1186,7 +1186,7 @@ impl Factory {
             let Some((connector, _)) = self.select_connector() else {
                 return Err(Error::amq(
                     ErrorType::IllegalState,
-                    "AMQ219003: Cannot create session factory, no connectors",
+                    "AMQ219024: Could not select a TransportConfiguration to create SessionFactory",
                 ));
             };
             {
@@ -1374,7 +1374,7 @@ impl Factory {
         for session in sessions {
             if ok {
                 if let Err(e) = session.handle_failover(conn, cause).await {
-                    tracing::warn!("AMQ212051: Failed to handle failover: {e}");
+                    tracing::error!("AMQ214003: Failed to handle failover: {e}");
                     ok = false;
                 }
             } else {

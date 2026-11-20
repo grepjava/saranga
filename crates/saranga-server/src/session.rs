@@ -2566,7 +2566,7 @@ impl ServerSession {
             let (prepared, old_xid) = {
                 let t = transaction::lock(&old);
                 tracing::warn!(
-                    "AMQ222210: Session already had a transaction {} when xaStart {} was called",
+                    "AMQ222176: A session that was already doing XA work on {} is replacing the xid by {} . This was most likely caused from a previous communication timeout",
                     t.xid
                         .as_ref()
                         .map(transaction::xid_string)
@@ -2711,8 +2711,8 @@ impl ServerSession {
             )
             .into()),
             TxState::Prepared => {
-                tracing::warn!(
-                    "AMQ222098: Ignoring prepare on xid as already called : {}",
+                tracing::info!(
+                    "AMQ221079: Ignoring prepare on xid as already called : {}",
                     transaction::xid_string(&xid)
                 );
                 Ok(())
@@ -2954,7 +2954,7 @@ impl ServerSession {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "AMQ222182: Unable to delete heuristic completion from storage manager: {e}"
+                        "AMQ222250: Unable to delete heuristic completion from storage manager: {e}"
                     );
                     return Err(XaError {
                         code: xa_code::XAER_RMFAIL,
@@ -3801,7 +3801,7 @@ impl ServerSession {
                 };
                 if let Some(outcome) = outcome {
                     if let Err(e) = self.finish(outcome, false) {
-                        tracing::warn!(session = %self.name, "AMQ222207: Unable to rollback on close: {e}");
+                        tracing::warn!(session = %self.name, "AMQ222246: Unable to rollback on close: {e}");
                     }
                     if let Some(xid) = xid {
                         self.broker.resource_manager().remove_own(&xid, &tx);

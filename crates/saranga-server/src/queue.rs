@@ -783,7 +783,7 @@ impl Queue {
             && let Err(e) = s.delete_message(r.message_id())
         {
             tracing::warn!(
-                "AMQ222178: Cannot find message {} on the journal: {e}",
+                "AMQ222153: Cannot locate record for message id = {} on Journal: {e}",
                 r.message_id()
             );
         }
@@ -1585,9 +1585,9 @@ impl Consumer {
     /// message stays with this consumer, undelivered, until the client
     /// closes it (`callback.disconnect`) and it goes back to the queue.
     fn fail(&mut self, message_id: i64, e: &dyn std::fmt::Display) {
-        tracing::warn!("AMQ222110: Error on resetting large message deliver - {message_id}: {e}");
+        tracing::warn!("AMQ222142: Error on resetting large message deliver - {message_id}: {e}");
         tracing::warn!(
-            "AMQ222061: removing consumer {} which did not handle a message {message_id}: {e}",
+            "AMQ222151: removing consumer which did not handle a message, consumer={}, message={message_id}: {e}",
             self.reg.client_id
         );
         self.failed = true;
@@ -2165,7 +2165,7 @@ impl Actor {
         let queue = self.queue();
         if let Err(e) = queue.store_ack(&mut r) {
             tracing::warn!(
-                "AMQ222178: Cannot find message {} on the journal: {e}",
+                "AMQ222153: Cannot locate record for message id = {} on Journal: {e}",
                 r.message_id()
             );
         }
@@ -3314,7 +3314,7 @@ impl Actor {
         let queue = Queue(self.shared.clone());
         if let Err(e) = queue.store_ack(&mut r) {
             tracing::warn!(
-                "AMQ222178: Cannot find message {} on the journal: {e}",
+                "AMQ222153: Cannot locate record for message id = {} on Journal: {e}",
                 r.message_id()
             );
         }

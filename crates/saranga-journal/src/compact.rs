@@ -123,9 +123,9 @@ impl Inner {
         for (id, t) in compacted {
             match self.books.transactions.get_mut(&id) {
                 Some(live) => live.merge(t),
-                None => tracing::warn!(
-                    "AMQ142026: Compacting error: pending transaction {id} could not be merged back"
-                ),
+                None => {
+                    tracing::warn!("AMQ142012: Couldn't find tx={id} to merge after compacting")
+                }
             }
         }
 
@@ -191,7 +191,7 @@ impl Compactor<'_> {
             Record::Commit { tx, .. } => {
                 if self.pending_transactions.contains(&tx) {
                     tracing::warn!(
-                        "AMQ142024: Inconsistency during compacting: CommitRecord ID = {tx} for an already committed transaction during compacting"
+                        "AMQ142004: Inconsistency during compacting: CommitRecord ID = {tx} for an already committed transaction during compacting"
                     );
                 } else {
                     self.drop_superseded_updates(tx);
@@ -212,7 +212,7 @@ impl Compactor<'_> {
             Record::Delete { id } => {
                 if self.books().records.contains_key(&id) {
                     tracing::warn!(
-                        "AMQ142025: Inconsistency during compacting: Delete record being read on an existent record (id={id})"
+                        "AMQ142005: Inconsistency during compacting: Delete record being read on an existent record (id={id})"
                     );
                 }
             }
@@ -300,7 +300,9 @@ impl Compactor<'_> {
         if self.books().records.contains_key(&id) {
             self.books().add_update(id, cur, size as i64, replaceable);
         } else {
-            tracing::warn!("AMQ142028: Compacting with no add record for id {id}");
+            tracing::warn!(
+                "AMQ142006: Could not find add Record information for record {id} during compacting"
+            );
         }
         self.write(&record, cc + 1)?;
         Ok(())

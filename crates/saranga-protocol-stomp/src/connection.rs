@@ -305,7 +305,7 @@ async fn completer(
     while let Some(reply) = rx.recv().await {
         match reply.completion.wait().await {
             Err(e) => {
-                tracing::warn!("AMQ222020: error processing IO callback: {e}");
+                tracing::warn!("AMQ222063: Error processing IOCallback; message = {e}");
                 let mut err = StompError::bundle("Error sending reply");
                 err.body = Some(e.to_string());
                 out.send(&err.frame(reply.kind));

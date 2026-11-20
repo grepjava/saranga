@@ -935,7 +935,7 @@ impl SessionInner {
             {
                 Err(e) if e.kind() == Some(ErrorType::SessionCreationRejected) => {
                     tracing::warn!(
-                        "AMQ212075: Session {name} was rejected while the server was starting, retrying"
+                        "AMQ212010: Session {name} was rejected while the server was starting, retrying"
                     );
                     if self.state().in_close {
                         return Err(e);

@@ -205,7 +205,7 @@ impl PagingManager {
             let address_file = folder.join(saranga_paging::ADDRESS_FILE);
             let Ok(text) = fs::read_to_string(&address_file) else {
                 tracing::warn!(
-                    "AMQ222068: Directory {} did not have an identification file {}",
+                    "AMQ222035: Directory {} did not have an identification file {}",
                     folder.display(),
                     saranga_paging::ADDRESS_FILE
                 );
@@ -213,7 +213,7 @@ impl PagingManager {
             };
             let Some(address) = text.lines().next().filter(|a| !a.is_empty()) else {
                 tracing::warn!(
-                    "AMQ222184: File {} is empty on {}",
+                    "AMQ222285: File {} at {} is empty. Delete the empty file to stop this message.",
                     saranga_paging::ADDRESS_FILE,
                     folder.display()
                 );
@@ -637,7 +637,7 @@ impl PagingManager {
         for a in cursor_acks {
             let Some((store, sub)) = self.locate(a.queue_id) else {
                 tracing::warn!(
-                    "AMQ222010: Cannot find queue {} while reloading ACKNOWLEDGE_CURSOR, deleting record now",
+                    "AMQ221015: Can not find queue {} while reloading ACKNOWLEDGE_CURSOR, deleting record now",
                     a.queue_id
                 );
                 delete(a.record);
@@ -650,7 +650,7 @@ impl PagingManager {
                     .push((a.page, a.message_nr, a.record));
             } else {
                 tracing::warn!(
-                    "AMQ222295: Cannot find page {} on {} while reloading ack, deleting record {}",
+                    "AMQ224153: Unable to find page {} on Address {} while reloading ACKNOWLEDGE_CURSOR, deleting record {}.",
                     a.page,
                     store.address,
                     a.record
@@ -661,7 +661,7 @@ impl PagingManager {
         for c in page_completes {
             let Some((store, sub)) = self.locate(c.queue_id) else {
                 tracing::warn!(
-                    "AMQ222277: Cannot find queue {} on page complete, deleting record now",
+                    "AMQ221041: Cannot find queue {} while reloading PAGE_CURSOR_COMPLETE, deleting record now",
                     c.queue_id
                 );
                 delete(c.record);
@@ -1438,7 +1438,7 @@ impl PagingStore {
         let rows = match storage.read_paged(sub.queue_id, limit) {
             Ok(rows) => rows,
             Err(e) => {
-                tracing::warn!("AMQ222037: IO Error reading paged messages: {e}");
+                tracing::warn!("IO Error reading paged messages: {e}");
                 return Vec::new();
             }
         };
@@ -1474,7 +1474,7 @@ impl PagingStore {
             let rows = match storage.scan_paged(sub.queue_id, SCAN_CHUNK, it.after) {
                 Ok(rows) => rows,
                 Err(e) => {
-                    tracing::warn!("AMQ222037: IO Error reading paged messages: {e}");
+                    tracing::warn!("IO Error reading paged messages: {e}");
                     return None;
                 }
             };
@@ -1530,7 +1530,7 @@ impl PagingStore {
             };
             match message {
                 Ok(m) => out.push(m),
-                Err(e) => tracing::warn!("AMQ222037: Cannot read paged message {id}: {e}"),
+                Err(e) => tracing::warn!("Cannot read paged message {id}: {e}"),
             }
         }
         out
@@ -2246,7 +2246,7 @@ impl PagingStore {
     fn read_failed(&self, e: &io::Error, path: Option<&Path>) {
         let Some(path) = path else { return };
         tracing::warn!(
-            "AMQ222010: Critical IO Error reading page {}: {e}",
+            "AMQ144011: Critical IO Exception happened: {e} on {}",
             path.display()
         );
         if let Some(manager) = self.manager.upgrade() {
@@ -3000,7 +3000,10 @@ impl PagingStore {
                 // the page's acknowledged messages would come back at the
                 // next start. A critical I/O error stops the broker first.
                 // (Artemis only logs it, and drops the acknowledgements.)
-                tracing::warn!("AMQ222003: Error deleting page {}: {e}", path.display());
+                tracing::warn!(
+                    "AMQ222031: Error while deleting page file {}: {e}",
+                    path.display()
+                );
                 manager.critical_io(&e, &path);
                 continue;
             }
@@ -3527,7 +3530,7 @@ impl PageTx {
                 && let Some(s) = &manager.storage
                 && let Err(e) = s.delete_record(record)
             {
-                tracing::warn!("AMQ222026: Error on deleting page transaction {record}: {e}");
+                tracing::warn!("AMQ222034: Can not delete page transaction id={record}: {e}");
             }
             manager.remove_transaction(self.tx_id);
         }
