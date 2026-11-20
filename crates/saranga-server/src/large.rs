@@ -548,9 +548,11 @@ impl LargeWriter {
         let backing = match self.file.take() {
             Some((f, path)) => {
                 if self.store.sync {
-                    saranga_fault::check(saranga_fault::Op::Sync, &path)
-                        .and_then(|()| f.sync_all())
-                        .inspect_err(|e| self.store.critical_io(e, &path))?;
+                    crate::blocking::off_the_workers(|| {
+                        saranga_fault::check(saranga_fault::Op::Sync, &path)
+                            .and_then(|()| f.sync_all())
+                    })
+                    .inspect_err(|e| self.store.critical_io(e, &path))?;
                 }
                 if self.replicated
                     && let Some(r) = self.store.replication().replicator()
@@ -630,7 +632,7 @@ impl LargeBody {
     /// has to become a regular one.
     pub fn read_all(&self) -> io::Result<Vec<u8>> {
         match &self.backing {
-            Backing::File(p) => fs::read(p),
+            Backing::File(p) => crate::blocking::read_file(p),
             Backing::Memory(m) => Ok(m.to_vec()),
         }
     }
@@ -638,7 +640,19 @@ impl LargeBody {
     /// `LargeBody.copyInto`: the body of a copy with its own ID. As
     /// Artemis writes the copy through `addBytes`, its bytes are recorded
     /// under the new ID for journal retention, so the copy can be replayed.
+    /// A file is copied (and synced) off the runtime's workers: a divert,
+    /// a dead-letter or expiry move and a management copy all copy on a
+    /// task, and the body can be gigabytes.
     pub fn copy(&self, new_id: i64, durable: bool) -> io::Result<Arc<LargeBody>> {
+        match &self.backing {
+            Backing::File(_) => {
+                crate::blocking::off_the_workers(|| self.copy_here(new_id, durable))
+            }
+            Backing::Memory(_) => self.copy_here(new_id, durable),
+        }
+    }
+
+    fn copy_here(&self, new_id: i64, durable: bool) -> io::Result<Arc<LargeBody>> {
         let history = self.store.history.get();
         let backing = match (&self.backing, self.store.path(new_id, durable)) {
             (Backing::File(from), Some(to)) => {
@@ -650,7 +664,9 @@ impl LargeBody {
                     self.store.critical_io(&e, &to);
                     e
                 };
-                if let Err(e) = fs::copy(from, &to) {
+                if let Err(e) = saranga_fault::check(saranga_fault::Op::Read, from)
+                    .and_then(|()| fs::copy(from, &to))
+                {
                     return Err(if from.exists() { critical(e) } else { e });
                 }
                 if self.store.sync {

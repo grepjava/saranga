@@ -1196,7 +1196,7 @@ impl PagingStore {
     /// end is left for recovery and a new page opened.
     fn reload_live_page(&self, st: &mut StoreState, id: i64) -> io::Result<()> {
         let path = self.page_path(st, id).expect("folder set");
-        let data = fs::read(&path)?;
+        let data = crate::blocking::read_file(&path)?;
         let page = saranga_paging::read_page(&data);
         if page.suspect {
             log_suspect(&path, &page);
@@ -2174,7 +2174,7 @@ impl PagingStore {
             return Some(page);
         }
         let path = self.page_path(st, id);
-        let entries = match path.as_ref().map(fs::read) {
+        let entries = match path.as_deref().map(crate::blocking::read_file) {
             Some(Ok(data)) => {
                 let page = saranga_paging::read_page(&data);
                 if page.suspect
@@ -2231,7 +2231,7 @@ impl PagingStore {
             return p.entries.len() as i64;
         }
         let path = self.page_path(st, page);
-        match path.as_ref().map(fs::read) {
+        match path.as_deref().map(crate::blocking::read_file) {
             Some(Ok(data)) => saranga_paging::count_messages(&data) as i64,
             Some(Err(e)) if e.kind() != io::ErrorKind::NotFound => {
                 self.read_failed(&e, path.as_deref());
@@ -2960,7 +2960,7 @@ impl PagingStore {
         for (page, path) in deleted {
             let Some(path) = path else { continue };
             let mut suspect = false;
-            match fs::read(&path) {
+            match crate::blocking::read_file(&path) {
                 Ok(data) => {
                     // Each large body goes once nothing else holds it: the same
                     // message routed to a queue that does not page reads it.

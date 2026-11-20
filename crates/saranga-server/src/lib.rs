@@ -8,6 +8,7 @@
 
 pub mod acceptors;
 pub mod audit;
+mod blocking;
 pub mod bridge;
 pub mod broker_connection;
 pub mod cluster;

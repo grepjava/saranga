@@ -317,12 +317,7 @@ impl GroupingHandler {
                 };
                 // The answer comes on another task: this thread waits for
                 // it without holding up the runtime.
-                let response = match tokio::runtime::Handle::try_current() {
-                    Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                        tokio::task::block_in_place(|| wait(st))
-                    }
-                    _ => wait(st),
-                };
+                let response = crate::blocking::off_the_workers(|| wait(st));
                 if response.is_none() {
                     tracing::warn!("AMQ222161: Group Handler timed-out waiting for sendCondition");
                 }

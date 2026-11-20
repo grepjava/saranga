@@ -7,7 +7,8 @@
 //! files under a directory of its own, so tests running in parallel do not
 //! see each other's faults, and the operation fails as a real disk would:
 //! with `EIO`, or with `ENOSPC` for a full disk, after writing part of its
-//! bytes when the fault tears the write.
+//! bytes when the fault tears the write. A stalling fault fails nothing: the
+//! operation just takes longer, as on a slow disk.
 
 use std::io;
 use std::path::Path;
@@ -27,6 +28,8 @@ pub enum Op {
     Rename,
     /// Removing a file.
     Remove,
+    /// Reading a whole file, or copying one.
+    Read,
 }
 
 /// The error a fault fails with.
@@ -60,6 +63,10 @@ pub fn check(op: Op, path: &Path) -> io::Result<()> {
     #[cfg(feature = "inject")]
     {
         if let Some(hit) = registry::hit(op, path) {
+            if let Some(d) = hit.stall {
+                std::thread::sleep(d);
+                return Ok(());
+            }
             return Err(hit.error.to_io());
         }
     }
@@ -75,6 +82,10 @@ pub fn write(path: &Path, len: usize) -> Result<(), (usize, io::Error)> {
     #[cfg(feature = "inject")]
     {
         if let Some(hit) = registry::hit(Op::Write, path) {
+            if let Some(d) = hit.stall {
+                std::thread::sleep(d);
+                return Ok(());
+            }
             return Err((hit.torn.map_or(0, |t| t.min(len)), hit.error.to_io()));
         }
     }
@@ -93,6 +104,7 @@ pub struct Fault {
     times: Option<u64>,
     error: Error,
     torn: Option<usize>,
+    stall: Option<std::time::Duration>,
 }
 
 #[cfg(feature = "inject")]
@@ -107,7 +119,14 @@ impl Fault {
             times: None,
             error: Error::Io,
             torn: None,
+            stall: None,
         }
+    }
+
+    /// The operation does not fail: it takes `d` longer, as on a slow disk.
+    pub fn stall(mut self, d: std::time::Duration) -> Self {
+        self.stall = Some(d);
+        self
     }
 
     /// Only files whose name contains `part`.
@@ -269,5 +288,17 @@ mod tests {
         let _armed = Fault::new(Op::Write, dir.path()).torn(10).arm();
         assert_eq!(write(&f, 100).unwrap_err().0, 10);
         assert_eq!(write(&f, 4).unwrap_err().0, 4);
+    }
+
+    #[test]
+    fn stalls_succeed_late() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("m.msg");
+        let _armed = Fault::new(Op::Read, dir.path())
+            .stall(std::time::Duration::from_millis(50))
+            .arm();
+        let t = std::time::Instant::now();
+        assert!(check(Op::Read, &f).is_ok());
+        assert!(t.elapsed() >= std::time::Duration::from_millis(50));
     }
 }
