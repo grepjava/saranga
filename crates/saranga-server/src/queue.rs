@@ -360,6 +360,12 @@ enum Cmd {
     Browse {
         reply: oneshot::Sender<Vec<MessageRef>>,
     },
+    /// Which of `ids` the queue holds: queued, scheduled or being
+    /// delivered.
+    Holding {
+        ids: HashSet<i64>,
+        reply: oneshot::Sender<HashSet<i64>>,
+    },
     /// Up to `max` queued messages matching `filter`, including those still in
     /// pages (`totalIterator`): for export, which must not silently drop paged
     /// messages.
@@ -1189,6 +1195,16 @@ impl Queue {
     pub async fn browse_matching(&self, filter: Option<FilterRef>, max: usize) -> Vec<MessageRef> {
         let (reply, wait) = oneshot::channel();
         self.send(Cmd::BrowseMatching { filter, max, reply });
+        wait.await.unwrap_or_default()
+    }
+
+    /// Which of `ids` the queue still holds, queued, scheduled or being
+    /// delivered to a consumer: a message it does not hold can no longer be
+    /// delivered from it. While the queue has paged messages not yet
+    /// acknowledged, all of them, as any may be in a page not read yet.
+    pub async fn holding(&self, ids: HashSet<i64>) -> HashSet<i64> {
+        let (reply, wait) = oneshot::channel();
+        self.send(Cmd::Holding { ids, reply });
         wait.await.unwrap_or_default()
     }
 
@@ -2748,6 +2764,28 @@ impl Actor {
                 let mut refs: Vec<MessageRef> = self.messages.iter().cloned().collect();
                 refs.extend(self.scheduled.values().cloned());
                 let _ = reply.send(refs);
+            }
+            Cmd::Holding { ids, reply } => {
+                // A message may wait in a page not read yet (after a
+                // restart, say): while any paged message is unacknowledged,
+                // the queue may hold any of them.
+                let paged = self
+                    .shared
+                    .paging
+                    .as_ref()
+                    .is_some_and(|p| p.message_count() > 0 || p.has_redeliveries());
+                let held = if paged {
+                    ids
+                } else {
+                    self.messages
+                        .iter()
+                        .chain(self.scheduled.values())
+                        .chain(self.consumers.iter().flat_map(|c| c.delivering.iter()))
+                        .map(MessageRef::message_id)
+                        .filter(|id| ids.contains(id))
+                        .collect()
+                };
+                let _ = reply.send(held);
             }
             Cmd::BrowseMatching { filter, max, reply } => {
                 let refs = self.browse_matching(filter.as_ref(), max);

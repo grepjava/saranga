@@ -372,7 +372,29 @@ pub struct Settings {
     pub max_pending_writes: usize,
     /// Where a deleted large message's file goes with its row.
     pub large: crate::large::LargeFiles,
+    /// The `DB_OWNER` epoch this broker set when it took the database: every
+    /// write checks it (`fence!`).
+    pub epoch: i64,
 }
+
+/// A statement that fails unless `DB_OWNER` still holds this broker's epoch,
+/// `$n` naming the parameter that carries it. The advisory lock lives on a
+/// session of its own and its loss is seen only later, so the writes fence
+/// themselves: one that took the row `FOR SHARE` first makes the next broker's
+/// epoch wait until it commits, and one after that finds the new epoch and
+/// fails, its transaction with it. The `ELSE` reads the column so that it is
+/// not computed before it is chosen.
+macro_rules! fence {
+    ($n:literal) => {
+        concat!(
+            "SELECT CASE WHEN EPOCH = ",
+            $n,
+            " THEN 0 ELSE ('another broker has taken the database, epoch ' || EPOCH)::int END \
+             FROM DB_OWNER FOR SHARE"
+        )
+    };
+}
+pub(super) use fence;
 
 pub fn io_error(e: impl std::fmt::Display) -> JournalError {
     JournalError::Io(Arc::new(std::io::Error::other(e.to_string())))
@@ -410,7 +432,14 @@ pub async fn start(
 ) -> Result<Writes, JournalError> {
     let mut writers = Vec::with_capacity(settings.connections);
     for _ in 0..settings.connections.max(1) {
-        writers.push(Writer::connect(settings.config.clone(), settings.large.clone()).await?);
+        writers.push(
+            Writer::connect(
+                settings.config.clone(),
+                settings.large.clone(),
+                settings.epoch,
+            )
+            .await?,
+        );
     }
     let (sender, receiver) = mpsc::unbounded_channel();
     let pending = Arc::new(Credits {
@@ -574,6 +603,9 @@ async fn execute(mut writer: Writer, mut batch: Vec<Unit>, run: &Run) -> Writer 
         match writer.write(&changes).await {
             Ok(()) => break Ok(()),
             Err(e) if attempt >= run.settings.max_retries => break Err(io_error(e)),
+            // Stopped (the lock lost, or a critical error elsewhere): no
+            // retry, the database may be another broker's by now.
+            Err(e) if run.failed.load(Ordering::Acquire) => break Err(io_error(e)),
             Err(e) => {
                 attempt += 1;
                 tracing::warn!(
@@ -581,6 +613,9 @@ async fn execute(mut writer: Writer, mut batch: Vec<Unit>, run: &Run) -> Writer 
                     run.settings.max_retries
                 );
                 tokio::time::sleep(run.settings.retry_interval).await;
+                if run.failed.load(Ordering::Acquire) {
+                    break Err(io_error(e));
+                }
             }
         }
     };
@@ -820,11 +855,14 @@ struct Writer {
     /// Where large-message bodies live: a committed message delete takes the
     /// file with it.
     large: crate::large::LargeFiles,
+    /// This broker's `DB_OWNER` epoch, checked first in every transaction.
+    epoch: i64,
 }
 
 struct Prepared {
     client: Client,
     begin: Statement,
+    fence: Statement,
     commit: Statement,
     messages: Statement,
     references: Statement,
@@ -888,6 +926,7 @@ impl Prepared {
             .await?;
         let c = &client;
         let begin = c.prepare("BEGIN").await?;
+        let fence = c.prepare(fence!("$1")).await?;
         let commit = c.prepare("COMMIT").await?;
         let messages = c
             .prepare(
@@ -1009,6 +1048,7 @@ impl Prepared {
             .await?;
         Ok(Self {
             begin,
+            fence,
             commit,
             messages,
             references,
@@ -1048,6 +1088,7 @@ impl Writer {
     async fn connect(
         config: Target,
         large: crate::large::LargeFiles,
+        epoch: i64,
     ) -> Result<Self, JournalError> {
         let client = connect(&config).await.map_err(io_error)?;
         let connection = Some(Prepared::new(client).await.map_err(io_error)?);
@@ -1055,6 +1096,7 @@ impl Writer {
             config,
             connection,
             large,
+            epoch,
         })
     }
 
@@ -1076,8 +1118,13 @@ impl Writer {
         // The IDs of large messages whose rows this batch deletes: their body
         // files go once the batch commits.
         let deleted_large: Arc<Mutex<Vec<i64>>> = Arc::default();
-        let mut steps: Vec<Step<'_>> =
-            vec![Box::pin(async move { db.execute(&p.begin, &[]).await })];
+        let epoch = &self.epoch;
+        // The fence comes first: a batch from a broker that no longer owns
+        // the database fails as a whole, retried or not.
+        let mut steps: Vec<Step<'_>> = vec![
+            Box::pin(async move { db.execute(&p.begin, &[]).await }),
+            Box::pin(async move { db.execute(&p.fence, &[epoch]).await }),
+        ];
         if !c.message_ids.is_empty() {
             steps.push(Box::pin(async move {
                 db.execute(
@@ -1298,6 +1345,7 @@ mod tests {
                 retry_interval: Duration::ZERO,
                 max_pending_writes: 100,
                 large: Default::default(),
+                epoch: 0,
             },
             pending: Arc::new(Credits {
                 count: AtomicUsize::new(pending),

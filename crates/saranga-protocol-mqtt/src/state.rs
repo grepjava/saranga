@@ -239,6 +239,16 @@ pub struct SessionState {
     /// once it disconnects to send a delayed will and to clean up when the
     /// session expires.
     pub session: Option<Box<crate::connection::Core>>,
+    /// Packet IDs a new delivery passed over because a correlation alone held
+    /// them (not in flight on this connection, not awaiting PUBREL): the
+    /// connection checks whether their messages can still come back to
+    /// this client, and frees those that cannot.
+    pub reclaim: HashSet<i32>,
+    /// The connection has been asked to check [`Self::reclaim`].
+    pub reclaim_asked: bool,
+    /// Deliveries (consumer, message) that found no packet ID free: they go
+    /// back to their queue once a check frees some.
+    pub stalled: Vec<(i64, i64)>,
 }
 
 impl SessionState {
@@ -267,6 +277,9 @@ impl SessionState {
             pubcomp_slots: HashSet::new(),
             stored: false,
             session: None,
+            reclaim: HashSet::new(),
+            reclaim_asked: false,
+            stalled: Vec::new(),
         }
     }
 
@@ -468,16 +481,23 @@ impl SessionState {
         prefix: &str,
         id: i32,
     ) -> bool {
-        self.core_delivery_info_exists(id)
-            || correlations.contains_value(&self.client_id, id)
-            || self
-                .pubrec_cache
-                .as_mut()
-                .is_some_and(|c| c.contains(broker, id))
-            || {
-                let _ = prefix;
-                false
-            }
+        let _ = prefix;
+        if self.core_delivery_info_exists(id) {
+            return true;
+        }
+        let awaiting_pubrel = self
+            .pubrec_cache
+            .as_mut()
+            .is_some_and(|c| c.contains(broker, id));
+        let correlated = correlations.contains_value(&self.client_id, id);
+        // Only a correlation holds it: one whose message another member of
+        // a shared subscription settled, or that went otherwise, holds it
+        // for good (Artemis removes a correlation only on this client's own
+        // acknowledgement), so it is checked.
+        if correlated && !awaiting_pubrel {
+            self.reclaim.insert(id);
+        }
+        correlated || awaiting_pubrel
     }
 
     /// `serializeState`: the session-store message for this state.
@@ -726,6 +746,62 @@ impl Correlations {
         }
     }
 
+    /// The client's records that hold one of `packet_ids`, as (key, packet
+    /// ID).
+    pub fn holding(
+        &self,
+        client_id: &str,
+        packet_ids: &HashSet<i32>,
+    ) -> Vec<(CorrelationKey, i32)> {
+        lock(&self.maps)
+            .by_key
+            .get(client_id)
+            .map(|m| {
+                m.iter()
+                    .flat_map(|(key, records)| {
+                        records
+                            .iter()
+                            .filter(|r| packet_ids.contains(&r.packet_id))
+                            .map(move |r| (key.clone(), r.packet_id))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Removes the record for this key's `packet_id`, its delete on its own
+    /// (not in a transaction): its message can no longer come back to the
+    /// client.
+    pub fn forget(
+        &self,
+        broker: &Broker,
+        client_id: &str,
+        key: &CorrelationKey,
+        packet_id: i32,
+    ) -> bool {
+        let removed = {
+            let mut maps = lock(&self.maps);
+            let Some(records) = maps.by_key.get_mut(client_id).and_then(|m| m.get_mut(key)) else {
+                return false;
+            };
+            let Some(pos) = records.iter().position(|r| r.packet_id == packet_id) else {
+                return false;
+            };
+            let r = records.remove(pos);
+            if records.is_empty() {
+                maps.by_key.get_mut(client_id).map(|m| m.remove(key));
+            }
+            maps.released(client_id, r.packet_id);
+            r
+        };
+        if let Some(s) = broker.storage()
+            && let Err(e) = s.delete_record(removed.id)
+        {
+            tracing::warn!("{e}");
+        }
+        true
+    }
+
     /// `containsValue`.
     pub fn contains_value(&self, client_id: &str, packet_id: i32) -> bool {
         lock(&self.maps)
@@ -897,6 +973,11 @@ impl StateManager {
             s.attached = true;
             s.disconnected_time = 0;
             s.failed = false;
+            // A check the last connection was asked for went with it, and so
+            // did its stalled deliveries (back to their queues).
+            s.reclaim.clear();
+            s.reclaim_asked = false;
+            s.stalled.clear();
             s.session.take()
         };
         Ok((state, present, previous))

@@ -911,7 +911,8 @@ fn no_statement_walks_the_backlog_whatever_the_statistics() {
                         &format!("{ids}, '{{1,1}}', 20000, 20001"),
                     )
                     .await?,
-                    explain(READ_PAGED, "bigint, bigint, bigint", "1, 200, 150").await?,
+                    explain(READ_PAGED, "bigint, bigint, bigint, bigint", "1, 200, 150, 1")
+                        .await?,
                 ));
             }
             Ok(plans)
@@ -1142,5 +1143,174 @@ fn a_binding_updated_twice_in_a_batch_is_written_once() {
     assert_eq!(
         PersistentQueueBindingEncoding::decode(&of(ids::QUEUE_BINDING_RECORD).data).unwrap(),
         queue(7)
+    );
+}
+
+/// One number from the database, on a session of the test's own.
+fn scalar(s: &DatabaseStorage, sql: &'static str) -> i64 {
+    let connection = s.connection.clone();
+    s.run(async move {
+        let client = writer::connect(&connection).await.map_err(io_error)?;
+        Ok(client.query_one(sql, &[]).await.map_err(io_error)?.get(0))
+    })
+    .unwrap()
+}
+
+/// Another broker took the database while this one had not yet seen its
+/// lock go: `DB_OWNER` holds the other's epoch. From then on this one's
+/// writes, its paged reads (which flip rows) and its load's deletes fail and
+/// change nothing.
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn nothing_is_written_once_another_broker_owns_the_database() {
+    let f = Fixture::new();
+    let (s, _) = f.start();
+    s.store_message(&message(60)).unwrap();
+    wait(s.store_reference(1, 60, true).unwrap());
+    wait(
+        s.store_paged(None, &message(61), &[1], Box::new(|| ()))
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(
+        scalar(
+            &s,
+            "SELECT COUNT(*) FROM DB_MESSAGES WHERE MESSAGE_ID IN (60, 61)"
+        ),
+        2
+    );
+    assert_eq!(
+        scalar(
+            &s,
+            "WITH o AS (UPDATE DB_OWNER SET EPOCH = EPOCH + 1 RETURNING 1) SELECT COUNT(*) FROM o"
+        ),
+        1
+    );
+
+    assert!(s.read_paged(1, 10).is_err(), "a paged read flipped a row");
+    assert_eq!(
+        scalar(
+            &s,
+            "SELECT COUNT(*) FROM DB_REFERENCES WHERE MESSAGE_ID = 61 AND PAGED = 'Y'"
+        ),
+        1
+    );
+    scalar(
+        &s,
+        "INSERT INTO DB_MESSAGES (MESSAGE_ID, IS_LARGE, IS_CORE) VALUES (59, 'N', 'Y') RETURNING 0::bigint",
+    );
+    assert!(s.load_messages().is_err(), "the load deleted an orphan");
+    assert_eq!(
+        scalar(&s, "SELECT COUNT(*) FROM DB_MESSAGES WHERE MESSAGE_ID = 59"),
+        1
+    );
+    let written = s
+        .store_message(&message(62))
+        .and_then(|()| s.store_reference(1, 62, true))
+        .and_then(|p| {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(p.wait())
+        });
+    assert!(written.is_err(), "a write went through");
+    assert_eq!(
+        scalar(&s, "SELECT COUNT(*) FROM DB_MESSAGES WHERE MESSAGE_ID = 62"),
+        0
+    );
+}
+
+/// A write already in the database when the lock goes, held up there, and
+/// the next broker opening meanwhile: the next broker's load and the tables
+/// must agree once the write ends. The write took `DB_OWNER` before the next
+/// broker moved it on, so the next broker waits for it and loads after it.
+/// (An address's row: its table has no index for the next broker's schema
+/// step to wait on.)
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn a_write_in_flight_when_the_lock_goes_ends_before_the_next_broker_loads() {
+    let f = Fixture::new();
+    let (s, _) = f.start();
+    let address = PersistentAddressBindingEncoding {
+        name: "a".into(),
+        routing_types: vec![ANYCAST],
+        auto_created: false,
+        internal: Some(false),
+    };
+    s.add_binding(100, ids::ADDRESS_BINDING_RECORD, address.encode())
+        .unwrap();
+
+    // Another session holds the address's row, so the deletion below waits
+    // in the database, its transaction open.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let holder = rt.block_on(async {
+        let (client, connection) =
+            tokio_postgres::connect(url().trim_start_matches("jdbc:"), tokio_postgres::NoTls)
+                .await
+                .unwrap();
+        tokio::spawn(connection);
+        client
+            .batch_execute("BEGIN; SELECT 1 FROM DB_ADDRESS WHERE ADDRESS_ID = 100 FOR UPDATE")
+            .await
+            .unwrap();
+        client
+    });
+    let until = |done: &dyn Fn() -> bool| {
+        (0..200).any(|_| {
+            done() || {
+                std::thread::sleep(Duration::from_millis(50));
+                false
+            }
+        })
+    };
+    let (records, stored) = std::thread::scope(|scope| {
+        let deleted = scope.spawn(|| s.delete_binding(100));
+        assert!(
+            until(&|| scalar(
+                &s,
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'DELETE FROM DB_ADDRESS%'"
+            ) > 0),
+            "the deletion never reached the database"
+        );
+
+        // The lock's session ends; the next broker opens and loads.
+        assert_eq!(
+            scalar(
+                &s,
+                "SELECT COUNT(pg_terminate_backend(pid)) FROM pg_locks WHERE locktype = 'advisory' AND granted"
+            ),
+            1
+        );
+        let dir = f.dir.path().to_path_buf();
+        let next = scope.spawn(move || {
+            let s = DatabaseStorage::open(config(&dir), &database()).unwrap();
+            let records = s.load_bindings().unwrap();
+            (s, records)
+        });
+        // Until it has loaded, or waits for the deletion.
+        let _ = until(&|| {
+            next.is_finished()
+                || scalar(
+                    &s,
+                    "SELECT COUNT(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'UPDATE DB_OWNER%'",
+                ) > 0
+        });
+        rt.block_on(holder.batch_execute("COMMIT")).unwrap();
+        let (next, records) = next.join().unwrap();
+        let _ = deleted.join().unwrap();
+        let stored = scalar(
+            &next,
+            "SELECT COUNT(*) FROM DB_ADDRESS WHERE ADDRESS_ID = 100",
+        );
+        (records, stored)
+    });
+
+    let loaded = records
+        .iter()
+        .filter(|r| r.id == 100 && r.user_record_type == ids::ADDRESS_BINDING_RECORD)
+        .count() as i64;
+    assert_eq!(
+        loaded, stored,
+        "the next broker loaded {loaded} of the address, the tables hold {stored}"
     );
 }

@@ -2103,6 +2103,7 @@ dependencies = [
  "saranga-server",
  "saranga-storage",
  "saranga-transport",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-postgres",

@@ -68,6 +68,10 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS DB_BROKER_DATA_TX ON DB_BROKER_DATA (TX_ID) WHERE TX_ID IS NOT NULL",
     // A queue reads its paged references in order; only those are indexed.
     "CREATE INDEX IF NOT EXISTS DB_REFERENCES_PAGED ON DB_REFERENCES (QUEUE_ID, MESSAGE_ID) WHERE PAGED = 'Y'",
+    // One row: the epoch of the broker that took the database last, which
+    // every write checks (`writer::fence!`). Artemis has no such table and
+    // ignores it.
+    "CREATE TABLE IF NOT EXISTS DB_OWNER(EPOCH BIGINT NOT NULL)",
 ];
 
 /// Reaching the database, from `<database-store>`.
@@ -372,18 +376,26 @@ pub struct DatabaseStorage {
     readers: Arc<Readers>,
     /// Where the writers hand deleted large messages' files.
     large: crate::large::LargeFiles,
+    /// The `DB_OWNER` epoch this broker set when it took the database.
+    epoch: i64,
 }
 
 /// Takes a queue's next paged references out of paging, and returns their
-/// messages: one round trip, and atomic.
-const READ_PAGED: &str = "WITH picked AS (\
+/// messages: one round trip, and atomic. The flip is a write, so it is
+/// fenced with this broker's epoch (`$4`) as the writers' are: a broker that
+/// lost the database flips nothing the next one reads as paged.
+const READ_PAGED: &str = concat!(
+    "WITH picked AS (\
       SELECT MESSAGE_ID FROM DB_REFERENCES \
       WHERE QUEUE_ID = $1 AND PAGED = 'Y' AND TX_ID IS NULL AND MESSAGE_ID > $3       ORDER BY MESSAGE_ID LIMIT $2), \
     flipped AS (\
       UPDATE DB_REFERENCES r SET PAGED = 'N' FROM picked p \
-      WHERE r.QUEUE_ID = $1 AND r.MESSAGE_ID = p.MESSAGE_ID RETURNING r.MESSAGE_ID) \
+      WHERE r.QUEUE_ID = $1 AND r.MESSAGE_ID = p.MESSAGE_ID AND (",
+    writer::fence!("$4"),
+    ") = 0 RETURNING r.MESSAGE_ID) \
     SELECT m.MESSAGE_ID, m.MESSAGE_RECORD, m.IS_LARGE::text, m.IS_CORE::text, m.LARGE_BODY \
-    FROM flipped f JOIN DB_MESSAGES m ON m.MESSAGE_ID = f.MESSAGE_ID";
+    FROM flipped f JOIN DB_MESSAGES m ON m.MESSAGE_ID = f.MESSAGE_ID"
+);
 
 /// A queue's paged messages, left paged. Sorted as `READ_PAGED`'s are.
 const SCAN_PAGED: &str = "SELECT m.MESSAGE_ID, m.MESSAGE_RECORD, m.IS_LARGE::text, m.IS_CORE::text, m.LARGE_BODY \
@@ -477,6 +489,32 @@ async fn hold_lock(
     Ok(())
 }
 
+/// Moves `DB_OWNER` to a new epoch for this broker, once it holds the lock
+/// and before it loads anything. The update waits for any write of the
+/// broker before (one that lost the lock and has not seen it yet) holding
+/// the row: that write commits first and is loaded; every later one finds
+/// the new epoch and fails.
+async fn take_ownership(client: &tokio_postgres::Client) -> StoreResult<i64> {
+    let e = |e| table_error("taking the database", e);
+    client
+        .batch_execute(
+            "INSERT INTO DB_OWNER (EPOCH) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM DB_OWNER)",
+        )
+        .await
+        .map_err(e)?;
+    let rows = client
+        .query("UPDATE DB_OWNER SET EPOCH = EPOCH + 1 RETURNING EPOCH", &[])
+        .await
+        .map_err(e)?;
+    match rows.as_slice() {
+        [row] => Ok(row.get(0)),
+        _ => Err(JournalError::Corrupt(format!(
+            "DB_OWNER holds {} rows, not one",
+            rows.len()
+        ))),
+    }
+}
+
 fn table_error(what: &str, e: tokio_postgres::Error) -> JournalError {
     io_error(format!("{what}: {e}"))
 }
@@ -493,13 +531,14 @@ impl DatabaseStorage {
             .map_err(|e| JournalError::Io(Arc::new(e)))?;
         let critical: Arc<OnceLock<CriticalListener>> = Arc::new(OnceLock::new());
         let large = crate::large::LargeFiles::new(cfg.large_messages.clone());
-        let settings = Settings {
+        let mut settings = Settings {
             config: connection.clone(),
             connections: database.connections.max(1) as usize,
             max_retries: database.max_retries.max(0) as u32,
             retry_interval: Duration::from_millis(database.retry_interval_millis.max(0) as u64),
             max_pending_writes: database.max_pending_writes.max(1) as usize,
             large: large.clone(),
+            epoch: 0,
         };
         let listener = critical.clone();
         let on_failure: Arc<dyn Fn(&JournalError) + Send + Sync> = Arc::new(move |e| {
@@ -542,13 +581,16 @@ impl DatabaseStorage {
                         .await
                         .map_err(|e| table_error("creating the tables", e))?;
                 }
-                writer::start(settings, on_failure).await
+                settings.epoch = take_ownership(&client).await?;
+                let epoch = settings.epoch;
+                Ok((writer::start(settings, on_failure).await?, epoch))
             };
             let _ = started.send(work.await);
         });
-        let writes = Arc::new(setup.recv().unwrap_or_else(|_| {
+        let (writes, epoch) = setup.recv().unwrap_or_else(|_| {
             Err(JournalError::IllegalState("the store did not start".into()))
-        })?);
+        })?;
+        let writes = Arc::new(writes);
         let _ = stopper.set(Arc::downgrade(&writes));
         if lock_lost.load(Ordering::Acquire) {
             writes.stop();
@@ -580,6 +622,7 @@ impl DatabaseStorage {
             read_from: Mutex::new(HashMap::new()),
             readers,
             large,
+            epoch,
         })
     }
 
@@ -803,6 +846,7 @@ impl DatabaseStorage {
             let (done, result) = std::sync::mpsc::channel();
             let readers = &self.readers;
             let config = &self.connection;
+            let epoch = self.epoch;
             // The reader is the store's own, so this stays on the store's
             // runtime for as long as the query takes.
             self.runtime.block_in(async {
@@ -846,12 +890,14 @@ impl DatabaseStorage {
                     }
                 }
                 let r = slot.as_ref().expect("a reader");
-                let statement = if scan { &r.scan } else { &r.read };
-                let read = r
-                    .client
-                    .query(statement, &[&queue_id, &limit, &after])
-                    .await
-                    .map_err(|e| table_error("reading paged messages", e));
+                let read = if scan {
+                    r.client.query(&r.scan, &[&queue_id, &limit, &after]).await
+                } else {
+                    r.client
+                        .query(&r.read, &[&queue_id, &limit, &after, &epoch])
+                        .await
+                }
+                .map_err(|e| table_error("reading paged messages", e));
                 if let Some(r) = slot.as_mut() {
                     r.used = std::time::Instant::now();
                 }
@@ -1451,6 +1497,7 @@ impl Store for DatabaseStorage {
 
     fn load_messages(&self) -> StoreResult<RecoveredMessages> {
         let config = self.connection.clone();
+        let epoch = self.epoch;
         let rows = self.run(async move {
             let client = writer::connect(&config).await.map_err(io_error)?;
             let q = |e| table_error("reading the messages", e);
@@ -1490,7 +1537,13 @@ impl Store for DatabaseStorage {
                 .iter()
                 .map(|r| (r.get(0), r.get(1), r.get(2)))
                 .collect();
-            // handleOrphanedMessages.
+            // handleOrphanedMessages. These deletes are writes: fenced in one
+            // transaction, as the writers' are.
+            client.batch_execute("BEGIN").await.map_err(q)?;
+            client
+                .execute(writer::fence!("$1"), &[&epoch])
+                .await
+                .map_err(q)?;
             client
                 .execute(
                     "DELETE FROM DB_MESSAGES m WHERE NOT EXISTS \
@@ -1507,6 +1560,7 @@ impl Store for DatabaseStorage {
                 )
                 .await
                 .map_err(q)?;
+            client.batch_execute("COMMIT").await.map_err(q)?;
             let references = client
                 .query(
                     "SELECT MESSAGE_ID, QUEUE_ID, PAGED::text, TX_ID, ACK_TX_ID FROM DB_REFERENCES \

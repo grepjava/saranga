@@ -2372,3 +2372,70 @@ async fn a_qos0_subscriber_that_does_not_read_holds_deliveries_back() {
     assert_eq!(queue.message_count(), 0);
     broker.stop().unwrap();
 }
+
+/// A member of a shared subscription that goes with a delivery outstanding
+/// keeps its packet ID's correlation after another member settles the
+/// message, as Artemis does: nothing removes it but this client's own
+/// acknowledgement. Once such correlations hold every packet ID, the next
+/// delivery to the client still goes out: the IDs whose messages no queue
+/// of the client holds are freed, and the delivery that found none free
+/// goes again.
+#[tokio::test]
+async fn stale_correlations_of_a_shared_subscription_do_not_use_up_packet_ids() {
+    use saranga_protocol_mqtt::state::CorrelationKey;
+    let protocol = Arc::new(MqttProtocol::default());
+    let mut config = BrokerConfig::new(Arc::new(SelectorFilters));
+    config.protocols = vec![protocol.clone()];
+    let broker = Broker::start(config).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(broker.clone().serve_acceptor(listener, Acceptor::default()));
+    let manager = protocol.state_manager().expect("started");
+    let (mut publisher, _) = Client::open(address, "handoff-pub", true).await;
+
+    // Member A takes the message and goes without acknowledging it.
+    let (mut a, _) = Client::open(address, "member-a", false).await;
+    a.subscribe("$share/g/handoff", 1).await;
+    publisher.publish("handoff", b"m1", 1).await;
+    let (_, stale, payload) = parse_publish(&a.packet().await.expect("m1 to A"));
+    assert_eq!(payload, b"m1");
+    drop(a);
+    // Member B gets it and settles it.
+    let (mut b, _) = Client::open(address, "member-b", false).await;
+    b.subscribe("$share/g/handoff", 1).await;
+    let p = b.packet().await.expect("m1 to B");
+    let (_, id, payload) = parse_publish(&p);
+    assert_eq!(payload, b"m1");
+    b.send(&packet(0x40, &id.to_be_bytes())).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(b);
+    let stale = i32::from(stale);
+    assert!(
+        manager.correlations.contains_value("member-a", stale),
+        "A's correlation for the message B settled"
+    );
+
+    // Correlations like it hold every other packet ID of A.
+    for id in (1..=65535).filter(|&id| id != stale) {
+        manager.correlations.put(
+            &broker,
+            "member-a",
+            CorrelationKey {
+                message_id: 1_000_000 + i64::from(id),
+                address: "handoff".into(),
+            },
+            id,
+        );
+    }
+    let (mut a, _) = Client::open(address, "member-a", false).await;
+    publisher.publish("handoff", b"m2", 2).await;
+    let (_, id, payload) = parse_publish(&a.packet().await.expect("m2 to A"));
+    assert_eq!(payload, b"m2");
+    a.send(&packet(0x40, &id.to_be_bytes())).await;
+    assert!(
+        !manager.correlations.contains_value("member-a", stale),
+        "the correlation of the message B settled is freed"
+    );
+    broker.stop().unwrap();
+    task.abort();
+}

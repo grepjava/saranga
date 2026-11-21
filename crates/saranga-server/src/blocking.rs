@@ -3,8 +3,9 @@
 
 /// Runs `f`, which may block, so that it does not hold up the other tasks
 /// of a multi-thread runtime's worker (`block_in_place` hands them to
-/// another worker first). Elsewhere (no runtime, a current-thread one such
-/// as a remoting event loop, a blocking thread) it just runs.
+/// another thread first): the broker's runtime, and the remoting event
+/// loops, which are multi-thread runtimes of one worker for this. Elsewhere
+/// (no runtime, a current-thread one, a blocking thread) it just runs.
 pub(crate) fn off_the_workers<T>(f: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {

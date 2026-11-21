@@ -1,5 +1,5 @@
 //! The event loops connections run on, as Netty's: each connection an
-//! acceptor takes runs on one of its loops, a single-threaded runtime,
+//! acceptor takes runs on one of its loops, a runtime of one worker thread,
 //! chosen in turn (`NettyAcceptor`'s event loop group of `remotingThreads`
 //! threads), with what it spawns. On the work-stealing runtime a delivery
 //! moved between threads at each task it woke (the producer's connection,
@@ -15,7 +15,7 @@ use std::future::Future;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-static LOOPS: Mutex<Vec<tokio::runtime::Handle>> = Mutex::new(Vec::new());
+static LOOPS: Mutex<Vec<tokio::runtime::Runtime>> = Mutex::new(Vec::new());
 
 /// An acceptor's share of the loops.
 pub(crate) struct EventLoops {
@@ -76,7 +76,7 @@ impl EventLoops {
             let next = start(all.len());
             all.push(next);
         }
-        all[i].clone()
+        all[i].handle().clone()
     }
 
     /// Runs a connection's task, given its socket, on the next loop.
@@ -104,26 +104,54 @@ impl EventLoops {
     }
 }
 
-fn start(i: usize) -> tokio::runtime::Handle {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name(format!("saranga-remoting-{i}"))
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("an event loop's runtime");
-            tx.send(rt.handle().clone()).ok();
-            rt.block_on(std::future::pending::<()>());
-        })
-        .expect("an event loop's thread");
-    rx.recv().expect("an event loop's handle")
+/// A loop: one worker thread, so its tasks run one at a time on one thread as
+/// on a current-thread runtime, but a multi-thread runtime's, so that work
+/// that blocks (`blocking::off_the_workers`: a page read, a large body
+/// synced, a login) hands the loop to another thread first
+/// (`block_in_place`) and the loop's other connections go on meanwhile.
+/// Never dropped: it lives in `LOOPS`.
+fn start(i: usize) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name(format!("saranga-remoting-{i}"))
+        .enable_all()
+        .build()
+        .expect("an event loop's runtime")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::remoting_threads;
+    use super::{EventLoops, remoting_threads};
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    /// Work that blocks on a loop (a page read, a large body synced, a
+    /// login) leaves the loop to its other connections meanwhile, as
+    /// Artemis keeps such work off Netty's event loops.
+    #[test]
+    fn work_that_blocks_on_a_loop_does_not_hold_up_its_other_tasks() {
+        let lp = EventLoops::get(0);
+        let blocking = lp.spawn(async {
+            crate::blocking::off_the_workers(|| std::thread::sleep(Duration::from_millis(1500)));
+        });
+        // The blocking task has the loop before the other one is spawned.
+        std::thread::sleep(Duration::from_millis(200));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = Instant::now();
+        lp.spawn(async move {
+            let _ = tx.send(asked.elapsed());
+        });
+        let waited = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            waited < Duration::from_millis(500),
+            "another task on the loop waited {waited:?} for the blocking work"
+        );
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(blocking)
+            .unwrap();
+    }
 
     fn threads(params: &[(&str, &str)]) -> std::io::Result<usize> {
         let p: HashMap<String, String> = params

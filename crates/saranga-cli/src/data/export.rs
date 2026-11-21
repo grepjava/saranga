@@ -372,7 +372,10 @@ impl Exporter<'_> {
         }
         // A large message's body is in its file, whichever record named it.
         let large = large.or_else(|| p.is_large().then(|| p.message_id()));
-        let body = large.map(|id| std::fs::read(self.large_file(id)).unwrap_or_default());
+        let body = match large {
+            Some(id) => Some(Self::read_large(&self.large_file(id))?),
+            None => None,
+        };
         let native = (self.amqp)(&p, body)
             .ok_or_else(|| anyhow::anyhow!("no decoder for message {}", p.message_id()))?
             .map_err(|e| anyhow::anyhow!("message {}: {e}", p.message_id()))?;
@@ -398,6 +401,13 @@ impl Exporter<'_> {
 
     fn large_file(&self, id: i64) -> PathBuf {
         self.large_messages.join(format!("{id}.msg"))
+    }
+
+    /// A large message's body. A missing or unreadable file fails the
+    /// export with exit status 1: Artemis writes an empty body (creating
+    /// the missing file) and exits 0, which loses the body without a word.
+    fn read_large(file: &Path) -> anyhow::Result<Vec<u8>> {
+        std::fs::read(file).map_err(|e| unreadable("the large message body", file, e))
     }
 
     /// `printDataAsXML`.
@@ -513,22 +523,26 @@ impl Exporter<'_> {
         let interval = self.args.log_interval;
         let mut count = 0i64;
         for (_, folder) in saranga_paging::print::store_folders(paging) {
+            // An unreadable folder or page fails the export with exit status
+            // 1: Artemis prints the exception, skips the rest of paging and
+            // exits 0.
             let mut pages: Vec<i64> = std::fs::read_dir(&folder)
-                .map(|entries| {
-                    entries
-                        .flatten()
-                        .filter_map(|e| page_id_of(&e.file_name().to_string_lossy()))
-                        .collect()
-                })
-                .unwrap_or_default();
+                .map_err(|e| unreadable("the page folder", &folder, e))?
+                .flatten()
+                .filter_map(|e| page_id_of(&e.file_name().to_string_lossy()))
+                .collect();
             pages.sort_unstable();
             let Some(&first) = pages.first() else {
                 continue;
             };
             for page_id in first..first + pages.len() as i64 {
                 let path = folder.join(saranga_paging::page_file_name(page_id));
-                let Ok(data) = std::fs::read(&path) else {
-                    continue;
+                // A page missing from the range is empty, as Artemis's
+                // `newPageObject` reads it.
+                let data = match std::fs::read(&path) {
+                    Ok(data) => data,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(unreadable("the page", &path, e)),
                 };
                 for (nr, paged) in read_page(&data).messages.into_iter().enumerate() {
                     count += 1;
@@ -579,16 +593,22 @@ impl Exporter<'_> {
 
     /// `XMLMessageExporter.printSingleMessageAsXML`.
     fn print_message(&mut self, m: &Exported, queues: &[String]) -> anyhow::Result<()> {
-        let large = m
-            .large
-            .as_ref()
-            .map(|file| std::fs::read(file).unwrap_or_default());
+        let large = match &m.large {
+            Some(file) => Some(Self::read_large(file)?),
+            None => None,
+        };
         let body = match &large {
             Some(b) => Body::Large(b),
             None => Body::Base64(&m.message.body),
         };
         print_message(&mut self.xml, &m.message, m.decoded, Some(queues), body)
     }
+}
+
+/// A file the export cannot read, as a `CLIException` (exit status 1) so
+/// that the export does not go on without its contents.
+fn unreadable(what: &str, path: &Path, e: std::io::Error) -> anyhow::Error {
+    crate::client::CliError(format!("Cannot read {what} {}: {e}", path.display())).into()
 }
 
 /// A message body as `printMessageBody` writes it.
@@ -952,5 +972,113 @@ mod page_complete_tests {
         let count = |q: &str| xml.matches(&format!("<queue name=\"{q}\"/>")).count();
         assert_eq!(count("s1"), 0, "consumed messages exported");
         assert_eq!(count("s2"), 40);
+    }
+
+    /// A golden scenario's data directory (written by Artemis 2.57.0),
+    /// unpacked into a temporary directory.
+    fn golden(scenario: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let gz = std::fs::File::open(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/golden")
+                .join(scenario)
+                .join("data.tar.gz"),
+        )
+        .unwrap();
+        tar::Archive::new(flate2::read::GzDecoder::new(gz))
+            .unpack(dir.path())
+            .unwrap();
+        dir
+    }
+
+    /// `data exp` of a data directory as the command runs it (with
+    /// `treat_error`), and the XML it wrote.
+    fn export(dir: &std::path::Path) -> (anyhow::Result<()>, String) {
+        let data = dir.join("data");
+        let out = dir.join("out.xml");
+        let cli = Cli::parse_from([
+            "exp".as_ref(),
+            "--f".as_ref(),
+            "--bindings".as_ref(),
+            data.join("bindings").as_os_str(),
+            "--journal".as_ref(),
+            data.join("journal").as_os_str(),
+            "--paging".as_ref(),
+            data.join("paging").as_os_str(),
+            "--large-messages".as_ref(),
+            data.join("large-messages").as_os_str(),
+            "--output".as_ref(),
+            out.as_os_str(),
+        ]);
+        let result = super::super::treat_error(super::run(cli.args));
+        (result, std::fs::read_to_string(&out).unwrap_or_default())
+    }
+
+    /// The golden scenarios export whole, with every body: the checks below
+    /// fail only on what they remove.
+    #[test]
+    fn golden_data_with_large_messages_and_pages_exports() {
+        for scenario in ["core-large", "amqp-durable", "persist-paging"] {
+            let dir = golden(scenario);
+            let (result, xml) = export(dir.path());
+            result.unwrap_or_else(|e| panic!("{scenario}: {e:#}"));
+            assert!(xml.contains("</activemq-journal>"), "{scenario}");
+        }
+    }
+
+    /// The failure a missing or unreadable file must give: a `CLIException`
+    /// (exit status 1) naming the file, not an empty body or a skipped page.
+    fn assert_fails_naming(result: anyhow::Result<()>, file: &str) {
+        let e = result.expect_err("the export went on without the file");
+        assert!(
+            e.downcast_ref::<crate::client::CliError>().is_some(),
+            "not exit status 1: {e:#}"
+        );
+        assert!(e.to_string().contains(file), "{e:#}");
+    }
+
+    /// A Core large message whose body file is gone: Artemis 2.57.0 exports
+    /// it with an empty body, creates the file empty and exits 0.
+    #[test]
+    fn a_missing_core_large_body_fails_the_export() {
+        let dir = golden("core-large");
+        let body = dir.path().join("data/large-messages/25.msg");
+        std::fs::remove_file(&body).unwrap();
+        let (result, _) = export(dir.path());
+        assert_fails_naming(result, "25.msg");
+        assert!(!body.exists(), "the export created the body file");
+    }
+
+    /// The same for another protocol's large message, which the export
+    /// converts with its body.
+    #[test]
+    fn a_missing_amqp_large_body_fails_the_export() {
+        let dir = golden("amqp-durable");
+        std::fs::remove_file(dir.path().join("data/large-messages/44.msg")).unwrap();
+        let (result, _) = export(dir.path());
+        assert_fails_naming(result, "44.msg");
+    }
+
+    /// And for a paged large message.
+    #[test]
+    fn a_missing_paged_large_body_fails_the_export() {
+        let dir = golden("persist-paging");
+        std::fs::remove_file(dir.path().join("data/large-messages/1467.msg")).unwrap();
+        let (result, _) = export(dir.path());
+        assert_fails_naming(result, "1467.msg");
+    }
+
+    /// A page that is there but cannot be read (a directory in its place):
+    /// Artemis prints the exception, skips the rest of paging and exits 0.
+    #[test]
+    fn an_unreadable_page_fails_the_export() {
+        let dir = golden("persist-paging");
+        let page = dir
+            .path()
+            .join("data/paging/72573e46-c4b9-11f1-a548-5613fc732e75/000000016.page");
+        std::fs::remove_file(&page).unwrap();
+        std::fs::create_dir(&page).unwrap();
+        let (result, _) = export(dir.path());
+        assert_fails_naming(result, "000000016.page");
     }
 }

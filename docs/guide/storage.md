@@ -160,9 +160,9 @@ saranga create mybroker --database-storage \
   --jdbc-connection-url 'jdbc:postgresql://db.example:5432/broker?user=broker&password=secret'
 ```
 
-The broker creates its tables on the first start: `DB_MESSAGES`, `DB_REFERENCES`, `DB_ADDRESS`, `DB_QUEUE`, `DB_BROKER_DATA`, `DB_CONFIG_DATA` and `DB_PREP_TX`. Their names are fixed. Only PostgreSQL is supported, and a URL for another database is refused.
+The broker creates its tables on the first start: `DB_MESSAGES`, `DB_REFERENCES`, `DB_ADDRESS`, `DB_QUEUE`, `DB_BROKER_DATA`, `DB_CONFIG_DATA` and `DB_PREP_TX`, and one table of Saranga's own, `DB_OWNER`, which Artemis ignores. Their names are fixed. Only PostgreSQL is supported, and a URL for another database is refused.
 
-A database holds one broker. The store takes a lock on a database session of its own, and a second broker on the same database stops after five seconds. Losing that session stops the broker too, as a critical I/O error does.
+A database holds one broker. The store takes a lock on a database session of its own, and a second broker on the same database stops after five seconds. Losing that session stops the broker too, as a critical I/O error does. A broker that takes the database also moves `DB_OWNER` on to a number of its own, and every write checks that number in its transaction: a write the previous broker had under way when it lost the lock either commits before the new broker loads or fails, so the previous broker cannot change the tables once the new one has read them.
 
 ### Settings
 

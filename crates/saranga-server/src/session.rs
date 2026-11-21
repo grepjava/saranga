@@ -2404,19 +2404,19 @@ impl ServerSession {
                 let (copies, rest): (Vec<MessageRef>, Vec<MessageRef>) =
                     refs.into_iter().partition(|r| r.copy_for.is_some());
                 refs = rest;
-                if !copies.is_empty()
-                    && let Some(tx) = &tx
-                {
-                    transaction::lock(tx)
-                        .browsed
-                        .extend(copies.into_iter().map(|r| (queue.clone(), r)));
-                }
-                if refs.is_empty() {
+                if tx.is_none() && refs.is_empty() {
                     return Ok(ids);
                 }
                 match tx {
                     Some(tx) => {
+                        // The copies and the references join the transaction
+                        // and it is swept under one lock: a branch the
+                        // timeout rolled back after the session checked it
+                        // gives them back at once, the copies' consumers
+                        // getting them again too.
                         let mut t = transaction::lock(&tx);
+                        t.browsed
+                            .extend(copies.into_iter().map(|r| (queue.clone(), r)));
                         let id = t.id;
                         for r in &mut refs {
                             if queue.store_ack_tx(id, r, &mut t.paging).map_err(io_error)? {
@@ -2451,6 +2451,12 @@ impl ServerSession {
                         t.acks
                             .extend(failed.refs.into_iter().map(|r| (queue.clone(), r)));
                         t.mark_rollback_only(&e);
+                        // As above: a branch already ended gives them back.
+                        let swept = t.sweep_ended();
+                        drop(t);
+                        if let Some(o) = swept {
+                            self.apply_swept(o);
+                        }
                     }
                     None => queue.reinsert(failed.refs),
                 }
@@ -4243,6 +4249,215 @@ mod tests {
         assert!(t.sends.is_empty() && t.acks.is_empty());
         assert!(t.sweep_ended().is_none(), "swept once");
         drop(t);
+        broker.stop().unwrap();
+    }
+
+    /// Records each delivery's message ID.
+    #[derive(Default)]
+    struct Deliveries(std::sync::Mutex<Vec<i64>>);
+
+    impl DeliverySink for Deliveries {
+        fn deliver(&self, _: i64, m: &Arc<ServerMessage>, _: i32) -> i64 {
+            self.0.lock().unwrap().push(m.message_id());
+            1
+        }
+        fn deliver_large(&self, _: i64, m: &ServerMessage, _: i64, _: i32) -> i64 {
+            self.0.lock().unwrap().push(m.message_id());
+            1
+        }
+        fn deliver_continuation(&self, _: i64, _: Vec<u8>, _: bool) -> i64 {
+            1
+        }
+        fn chunk_size(&self) -> usize {
+            1024
+        }
+    }
+
+    /// The XA timeout rolls a branch back after the session found it alive
+    /// and before the acknowledgement of a non-destructive queue's copy
+    /// joined it: the copy is given back at once, as what reaches a
+    /// rolled-back branch is (`afterRollback`), so its consumer gets the
+    /// message again rather than never.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_copy_acknowledged_into_a_branch_the_timeout_ended_comes_back() {
+        let broker = Broker::start(BrokerConfig::new(Arc::new(SelectorFilters)))
+            .await
+            .unwrap();
+        let mut spec = QueueSpec::new("nd", "nd");
+        spec.routing_type = Some(RoutingType::Anycast);
+        spec.auto_create_address = Some(true);
+        spec.non_destructive = Some(true);
+        broker.post_office().create_queue(spec, false).unwrap();
+        let conn = Arc::new(ClientConnection::new(
+            Transport::internal("test"),
+            Arc::default(),
+            Vec::new(),
+        ));
+        let mut session = ServerSession::new(
+            broker.clone(),
+            conn,
+            SessionOptions {
+                name: "s".to_owned(),
+                username: None,
+                password: None,
+                xa: true,
+                auto_commit_sends: true,
+                auto_commit_acks: false,
+                pre_acknowledge: false,
+                default_address: None,
+            },
+            Default::default(),
+        );
+        session
+            .send(
+                CoreMessage {
+                    address: Some(SimpleString::from("nd")),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        session.take_completion().wait().await.unwrap();
+        let sink = Arc::new(Deliveries::default());
+        let s2 = sink.clone();
+        session
+            .create_consumer(1, "nd", None, 0, false, move |_| s2)
+            .await
+            .unwrap();
+        session.consumer_credits(1, -1);
+        session.set_started(true).await;
+        let delivered = |n: usize| {
+            let sink = sink.clone();
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while sink.0.lock().unwrap().len() < n {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .is_ok()
+            }
+        };
+        assert!(delivered(1).await, "delivered");
+        let id = sink.0.lock().unwrap()[0];
+
+        let tx = session.new_tx(None);
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        session
+            .acknowledge_in_then(1, id, true, &tx, move |p, r| {
+                let _ = answer.send((p, r));
+            })
+            .unwrap();
+        let (pending, result) = answered.await.unwrap();
+        // The session found the branch alive; the timeout ends it now.
+        transaction::lock(&tx).state = TxState::RolledBack;
+        session
+            .acknowledged_in_tx(pending, Some(tx.clone()), result)
+            .unwrap();
+        assert!(
+            transaction::lock(&tx).browsed.is_empty(),
+            "the copy stayed in the ended branch"
+        );
+        assert!(
+            delivered(2).await,
+            "the consumer never gets the message again"
+        );
+        session.close(false).await;
+        broker.stop().unwrap();
+    }
+
+    /// The same for an acknowledgement that failed holding references it
+    /// took (a cumulative one whose last message was not found): in a branch
+    /// the timeout ended meanwhile, they go back at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_acknowledgement_into_a_branch_the_timeout_ended_gives_back() {
+        let broker = Broker::start(BrokerConfig::new(Arc::new(SelectorFilters)))
+            .await
+            .unwrap();
+        let mut spec = QueueSpec::new("d", "d");
+        spec.routing_type = Some(RoutingType::Anycast);
+        spec.auto_create_address = Some(true);
+        broker.post_office().create_queue(spec, false).unwrap();
+        let conn = Arc::new(ClientConnection::new(
+            Transport::internal("test"),
+            Arc::default(),
+            Vec::new(),
+        ));
+        let mut session = ServerSession::new(
+            broker.clone(),
+            conn,
+            SessionOptions {
+                name: "s".to_owned(),
+                username: None,
+                password: None,
+                xa: true,
+                auto_commit_sends: true,
+                auto_commit_acks: false,
+                pre_acknowledge: false,
+                default_address: None,
+            },
+            Default::default(),
+        );
+        session
+            .send(
+                CoreMessage {
+                    address: Some(SimpleString::from("d")),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        session.take_completion().wait().await.unwrap();
+        let sink = Arc::new(Deliveries::default());
+        let s2 = sink.clone();
+        session
+            .create_consumer(1, "d", None, 0, false, move |_| s2)
+            .await
+            .unwrap();
+        session.consumer_credits(1, -1);
+        session.set_started(true).await;
+        let delivered = |n: usize| {
+            let sink = sink.clone();
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while sink.0.lock().unwrap().len() < n {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .is_ok()
+            }
+        };
+        assert!(delivered(1).await, "delivered");
+        let id = sink.0.lock().unwrap()[0];
+
+        let tx = session.new_tx(None);
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        session
+            .acknowledge_in_then(1, id, true, &tx, move |p, r| {
+                let _ = answer.send((p, r));
+            })
+            .unwrap();
+        let (pending, result) = answered.await.unwrap();
+        let refs = result.expect("taken");
+        transaction::lock(&tx).state = TxState::RolledBack;
+        let failed = session.acknowledged_in_tx(
+            pending,
+            Some(tx.clone()),
+            Err(crate::queue::AckError { refs }),
+        );
+        assert!(failed.is_err());
+        assert!(
+            transaction::lock(&tx).acks.is_empty(),
+            "the references stayed in the ended branch"
+        );
+        assert!(
+            delivered(2).await,
+            "the consumer never gets the message again"
+        );
+        session.close(false).await;
         broker.stop().unwrap();
     }
 }

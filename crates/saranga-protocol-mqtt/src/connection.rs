@@ -7,7 +7,7 @@
 //! before them (`runAfterStorageOperations`); the queues delivering to the
 //! client's subscriptions add to it too.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -256,6 +256,9 @@ enum Event {
     Disconnect { consumer: i64 },
     /// Management closed the session (`closeSessionWithID`).
     CloseSession { name: String },
+    /// A delivery passed over packet IDs a correlation alone held: check
+    /// them ([`Core::reclaim`]).
+    Reclaim,
 }
 
 /// A packet handler's failure.
@@ -473,11 +476,7 @@ fn string_value(v: &PropertyValue) -> Option<String> {
 /// counted.
 fn delivery_qos(shared: &Shared, message: &CoreMessage, consumer: i64) -> i32 {
     let now = decide_qos(shared, message, consumer);
-    let max = if shared.receive_maximum > 0 {
-        shared.receive_maximum
-    } else {
-        shared.default_max_in_flight
-    };
+    let max = max_in_flight(shared);
     let mut st = lock(&shared.state);
     match st.reserved.remove(&(consumer, message.message_id)) {
         Some(qos) if now >= 0 => qos,
@@ -491,6 +490,25 @@ fn delivery_qos(shared: &Shared, message: &CoreMessage, consumer: i64) -> i32 {
             }
             now
         }
+    }
+}
+
+/// The client's Receive Maximum, else the default: QoS 1 and 2 deliveries
+/// in flight count against it when it is positive.
+fn max_in_flight(shared: &Shared) -> i32 {
+    if shared.receive_maximum > 0 {
+        shared.receive_maximum
+    } else {
+        shared.default_max_in_flight
+    }
+}
+
+/// Asks the connection, once at a time, to check the packet IDs a new
+/// delivery passed over because a correlation alone held them.
+fn ask_reclaim(shared: &Shared, s: &mut crate::state::SessionState) {
+    if !s.reclaim.is_empty() && !s.reclaim_asked {
+        s.reclaim_asked = true;
+        let _ = shared.events.send(Event::Reclaim);
     }
 }
 
@@ -529,11 +547,25 @@ fn publish_to_client(shared: &Shared, message: &CoreMessage, consumer: i64) -> R
                 let chosen = match reuse {
                     Some(id) => (id, true),
                     None => {
-                        let id = s.generate_packet_id(
+                        let generated = s.generate_packet_id(
                             &broker,
                             correlations,
                             &shared.manager.internal_prefix,
-                        )?;
+                        );
+                        ask_reclaim(shared, &mut s);
+                        let id = match generated {
+                            Ok(id) => id,
+                            Err(e) => {
+                                // No ID free (AMQ850001): the delivery waits
+                                // for the check, its quota slot given back
+                                // (Artemis counts it only once an ID is had).
+                                if max_in_flight(shared) > 0 {
+                                    s.send_quota -= 1;
+                                }
+                                s.stalled.push((consumer, message.message_id));
+                                return Err(e);
+                            }
+                        };
                         pending = correlations.put(&broker, &shared.client_id, key.clone(), id);
                         (id, false)
                     }
@@ -1202,6 +1234,64 @@ impl Core {
             Err(e) => {
                 let _ = self.session.rollback_tx(&tx);
                 Err(e)
+            }
+        }
+    }
+
+    /// Frees the packet IDs a delivery passed over for a correlation alone
+    /// whose message can no longer come back to this client: no queue it
+    /// consumes from holds it (another member of a shared subscription
+    /// settled it after this client went, or it expired or was removed).
+    /// Artemis keeps such a correlation, and its packet ID, until this
+    /// client acknowledges the message, which it never will, so enough of
+    /// them leave the session no packet ID to give. A correlation whose
+    /// message a queue still holds stays, so a redelivery reuses its ID.
+    /// Deliveries that found no ID free go back to their queues once one is.
+    async fn reclaim(&mut self) {
+        let ids = {
+            let mut s = lock(&self.state);
+            s.reclaim_asked = false;
+            std::mem::take(&mut s.reclaim)
+        };
+        let client = self.shared.client_id.clone();
+        let correlations = &self.shared.manager.correlations;
+        let records = correlations.holding(&client, &ids);
+        if records.is_empty() {
+            return;
+        }
+        let consumers: Vec<i64> = lock(&self.shared.consumer_qos).keys().copied().collect();
+        let mut queues: Vec<Queue> = Vec::new();
+        for c in consumers {
+            if let Some(q) = self.session.consumer_queue(c)
+                && !queues.iter().any(|known| known.name() == q.name())
+            {
+                queues.push(q.clone());
+            }
+        }
+        let wanted: HashSet<i64> = records.iter().map(|(k, _)| k.message_id).collect();
+        let mut held = HashSet::new();
+        for q in &queues {
+            held.extend(q.holding(wanted.clone()).await);
+        }
+        let Some(broker) = self.shared.manager.broker() else {
+            return;
+        };
+        let mut freed = 0;
+        for (key, packet_id) in records {
+            // Still queued, or out again on this connection meanwhile.
+            if held.contains(&key.message_id)
+                || lock(&self.state).core_delivery_info_exists(packet_id)
+            {
+                continue;
+            }
+            if correlations.forget(&broker, &client, &key, packet_id) {
+                freed += 1;
+            }
+        }
+        if freed > 0 {
+            let stalled = std::mem::take(&mut lock(&self.state).stalled);
+            for (consumer, message) in stalled {
+                self.session.cancel_one(consumer, message, false);
             }
         }
     }
@@ -2508,6 +2598,7 @@ impl Conn {
                 core.session.close(true).await;
             }
             Event::CloseSession { .. } => {}
+            Event::Reclaim => core.reclaim().await,
         }
         core.flush();
     }
