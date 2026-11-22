@@ -1314,3 +1314,80 @@ fn a_write_in_flight_when_the_lock_goes_ends_before_the_next_broker_loads() {
         "the next broker loaded {loaded} of the address, the tables hold {stored}"
     );
 }
+
+/// Pauses the next store opened just before it moves the owner epoch on:
+/// it says it got there, and waits to be told to go on.
+type Pause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+static OWNERSHIP_PAUSE: Mutex<Option<Pause>> = Mutex::new(None);
+
+pub(super) fn pause_before_ownership() {
+    let pause = OWNERSHIP_PAUSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some((reached, go)) = pause {
+        let _ = reached.send(());
+        tokio::task::block_in_place(|| {
+            let _ = go.recv();
+        });
+    }
+}
+
+/// A statement on a session of the test's own, its first column as a number.
+fn sql(statement: &'static str) -> i64 {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let (client, connection) =
+            tokio_postgres::connect(url().trim_start_matches("jdbc:"), tokio_postgres::NoTls)
+                .await
+                .unwrap();
+        tokio::spawn(connection);
+        client.query_one(statement, &[]).await.unwrap().get(0)
+    })
+}
+
+/// A broker that took the lock loses its session before it moves the owner
+/// epoch on, and another broker takes the database meanwhile. The first must
+/// not move the epoch on after the second did (its update goes through the
+/// lock's session, which is gone), so the second goes on writing.
+#[test]
+#[ignore = "needs PostgreSQL"]
+fn a_broker_that_lost_the_lock_before_taking_the_database_does_not_take_it() {
+    let f = Fixture::new();
+    let (reached, at_pause) = std::sync::mpsc::channel();
+    let (go, wait_go) = std::sync::mpsc::channel();
+    *OWNERSHIP_PAUSE.lock().unwrap() = Some((reached, wait_go));
+    let dir = f.dir.path().to_path_buf();
+    let first = std::thread::spawn(move || DatabaseStorage::open(config(&dir), &database()));
+    at_pause
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the first broker took the lock");
+    // Its lock's session ends; the second broker takes the database.
+    assert_eq!(
+        sql(
+            "SELECT COUNT(pg_terminate_backend(pid)) FROM pg_locks WHERE locktype = 'advisory' AND granted"
+        ),
+        1
+    );
+    let (second, _) = f.start();
+    // The first goes on.
+    go.send(()).unwrap();
+    let first = first.join().unwrap();
+    assert!(
+        first.is_err(),
+        "the first broker took the database without its lock"
+    );
+    drop(first);
+    let written = second
+        .store_message(&message(80))
+        .and_then(|()| second.store_reference(1, 80, true))
+        .and_then(|p| {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(p.wait())
+        });
+    assert!(
+        written.is_ok(),
+        "the broker that holds the lock cannot write: {written:?}"
+    );
+}

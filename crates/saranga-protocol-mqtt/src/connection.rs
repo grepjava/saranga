@@ -259,6 +259,9 @@ enum Event {
     /// A delivery passed over packet IDs a correlation alone held: check
     /// them ([`Core::reclaim`]).
     Reclaim,
+    /// Deliveries that found no packet ID free go again
+    /// ([`Core::retry_stalled`]).
+    RetryStalled,
 }
 
 /// A packet handler's failure.
@@ -1289,11 +1292,26 @@ impl Core {
             }
         }
         if freed > 0 {
-            let stalled = std::mem::take(&mut lock(&self.state).stalled);
-            for (consumer, message) in stalled {
-                self.session.cancel_one(consumer, message, false);
-            }
+            lock(&self.state).stall_retry_ms = 0;
+            self.retry_stalled();
+            return;
         }
+        // Nothing freed (a queue with paged messages holds them all, say):
+        // stalled deliveries go again later, the wait doubling, in case the
+        // acknowledgement that frees an ID never comes on this connection.
+        let delay = {
+            let mut s = lock(&self.state);
+            if s.stalled.is_empty() {
+                return;
+            }
+            s.stall_retry_ms = (s.stall_retry_ms * 2).clamp(1000, 30_000);
+            s.stall_retry_ms
+        };
+        let events = self.shared.events.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            let _ = events.send(Event::RetryStalled);
+        });
     }
 
     /// `MQTTSubscriptionManager.start`: the stored subscriptions get their
@@ -1931,7 +1949,21 @@ impl Core {
         if !needs_pubrel && let Some(c) = wake {
             self.session.prompt_delivery(c);
         }
+        // A QoS 1 packet ID is free now (a QoS 2 one at PUBCOMP): a delivery
+        // that found none goes again.
+        if !needs_pubrel {
+            self.retry_stalled();
+        }
         self.ack_reply(packet_id, reason::SUCCESS, needs_pubrel);
+    }
+
+    /// Deliveries that found no packet ID free go back to their queues, to
+    /// be delivered again now that one may be.
+    fn retry_stalled(&mut self) {
+        let stalled = std::mem::take(&mut lock(&self.state).stalled);
+        for (consumer, message) in stalled {
+            self.session.cancel_one(consumer, message, false);
+        }
     }
 
     /// Releases the Receive Maximum slot a QoS 2 exchange held until PUBCOMP
@@ -2510,6 +2542,9 @@ impl Conn {
                 // if this connection actually reserved the slot (see
                 // `release_send_slot`).
                 core.release_send_slot(packet_id);
+                // The packet ID is free now: a delivery that found none goes
+                // again.
+                core.retry_stalled();
                 Ok(())
             }
             Packet::Subscribe {
@@ -2599,6 +2634,7 @@ impl Conn {
             }
             Event::CloseSession { .. } => {}
             Event::Reclaim => core.reclaim().await,
+            Event::RetryStalled => core.retry_stalled(),
         }
         core.flush();
     }

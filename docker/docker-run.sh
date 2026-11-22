@@ -13,10 +13,18 @@ else
 fi
 
 if ! [ -f ./etc/broker.xml ]; then
-    CREATE_ARGUMENTS="--user ${ARTEMIS_USER} --password ${ARTEMIS_PASSWORD} --silent ${LOGIN_OPTION} ${EXTRA_ARGS}"
-    /opt/saranga/bin/saranga create ${CREATE_ARGUMENTS} .
+    # The user and password are one argument each, whatever they hold
+    # (Artemis's script splits them at spaces and expands wildcards in them).
+    # EXTRA_ARGS is options, split at spaces but not expanded.
+    read -r -a EXTRA <<< "${EXTRA_ARGS}"
+    /opt/saranga/bin/saranga create --user "${ARTEMIS_USER}" --password "${ARTEMIS_PASSWORD}" \
+        --silent "${LOGIN_OPTION}" "${EXTRA[@]}" .
     if [ -d ./etc-override ]; then
-        for file in `ls ./etc-override`; do echo copying file to etc folder: $file; cp ./etc-override/$file ./etc || :; done
+        for file in ./etc-override/*; do
+            [ -e "$file" ] || continue
+            echo "copying file to etc folder: ${file##*/}"
+            cp "$file" ./etc || :
+        done
     fi
 else
     echo "skipping broker instance creation; instance already exists"

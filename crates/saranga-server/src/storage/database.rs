@@ -449,12 +449,10 @@ const READER_SESSION: &str = "SET synchronous_commit = off; SET jit = off;     S
 /// open: the database gives the lock back if the session ends, however the
 /// broker ended. Artemis keeps a primary only with a local file lock, so
 /// nothing stops two brokers on two hosts; this stops two of these. Losing
-/// the session loses the lock, and the store stops.
-async fn hold_lock(
-    wait: Duration,
-    config: &writer::Target,
-    lost: Arc<dyn Fn(&JournalError) + Send + Sync>,
-) -> StoreResult<()> {
+/// the session loses the lock, and the store stops. The session is returned:
+/// the tables are made and the owner epoch moved on through it, so that if it
+/// ends first they fail with it (see [`watch_lock`]).
+async fn hold_lock(wait: Duration, config: &writer::Target) -> StoreResult<tokio_postgres::Client> {
     let client = writer::connect(config).await.map_err(io_error)?;
     // A host that vanished is noticed in under a minute, not hours.
     client
@@ -480,13 +478,18 @@ async fn hold_lock(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    Ok(client)
+}
+
+/// Watches the lock's session once the broker has taken the database: when
+/// it ends, the lock is another broker's to take, and the store stops.
+fn watch_lock(client: tokio_postgres::Client, lost: Arc<dyn Fn(&JournalError) + Send + Sync>) {
     tokio::spawn(async move {
         while !client.is_closed() {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         lost(&io_error("the database lock's session ended"));
     });
-    Ok(())
 }
 
 /// Moves `DB_OWNER` to a new epoch for this broker, once it holds the lock
@@ -568,8 +571,11 @@ impl DatabaseStorage {
         let (started, setup) = std::sync::mpsc::channel();
         runtime.spawn(async move {
             let work = async move {
-                let client = writer::connect(&schema).await.map_err(io_error)?;
-                hold_lock(client_lock, &schema, lost).await?;
+                // The tables and the owner epoch go through the session that
+                // holds the lock: if it ends before the epoch moves on, the
+                // update fails with it, and cannot overwrite the epoch of a
+                // broker that took the lock meanwhile.
+                let client = hold_lock(client_lock, &schema).await?;
                 // `IF NOT EXISTS` otherwise notes every table already there.
                 client
                     .batch_execute("SET client_min_messages = warning")
@@ -581,7 +587,10 @@ impl DatabaseStorage {
                         .await
                         .map_err(|e| table_error("creating the tables", e))?;
                 }
+                #[cfg(test)]
+                tests::pause_before_ownership();
                 settings.epoch = take_ownership(&client).await?;
+                watch_lock(client, lost);
                 let epoch = settings.epoch;
                 Ok((writer::start(settings, on_failure).await?, epoch))
             };

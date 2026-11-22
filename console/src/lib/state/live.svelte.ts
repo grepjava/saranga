@@ -13,6 +13,7 @@ import {
 	type View
 } from '#lib/api/index.js';
 import { queryParams, type ListQuery } from '#lib/query.js';
+import { Latest } from '#lib/latest.js';
 import { session } from './session.svelte.js';
 
 /** A view's value, or why it could not be read. */
@@ -65,6 +66,11 @@ class Live {
 	#pending: ReturnType<typeof setTimeout> | undefined;
 	#retry: ReturnType<typeof setTimeout> | undefined;
 	#running = false;
+	// One PUT at a time per tab, the latest set last: each replaces the
+	// stream's whole set, so an older one arriving late would undo a newer.
+	#watches = new Latest(({ stream, views }: { stream: string; views: Record<string, View> }) =>
+		api.watch(stream, views)
+	);
 
 	/** Opens the stream, which first replays the notifications the broker kept. */
 	start() {
@@ -153,9 +159,8 @@ class Live {
 		const stream = this.#stream;
 		if (!stream) return;
 		const views = Object.fromEntries([...this.#views].map(([k, w]) => [k, w.view]));
-		api.watch(stream, views).catch(() => {
-			// A stream that is gone comes back with a hello, which sends them again.
-		});
+		// A stream that is gone comes back with a hello, which sends them again.
+		this.#watches.push({ stream, views });
 	}
 
 	/**

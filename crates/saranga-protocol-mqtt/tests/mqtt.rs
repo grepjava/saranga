@@ -2439,3 +2439,130 @@ async fn stale_correlations_of_a_shared_subscription_do_not_use_up_packet_ids() 
     broker.stop().unwrap();
     task.abort();
 }
+
+/// A broker whose address `stall` pages from the first message (so its
+/// queues hold every message asked about), with `protocol`.
+async fn paging_broker(
+    dir: &Path,
+    protocol: Arc<MqttProtocol>,
+) -> (
+    Arc<Broker>,
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<()>,
+) {
+    let file = cfg::BrokerConfig::parse(
+        r#"<configuration xmlns="urn:activemq"><core xmlns="urn:activemq:core">
+             <persistence-enabled>true</persistence-enabled>
+             <journal-file-size>65536</journal-file-size>
+             <address-settings>
+               <address-setting match="stall">
+                 <max-size-bytes>1</max-size-bytes>
+                 <page-size-bytes>5000</page-size-bytes>
+                 <address-full-policy>PAGE</address-full-policy>
+               </address-setting>
+             </address-settings>
+           </core></configuration>"#,
+    )
+    .unwrap();
+    let mut config = BrokerConfig::from_file_config(&file, Arc::new(SelectorFilters), dir).unwrap();
+    config.protocols = vec![protocol];
+    let broker = Broker::start(config).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn({
+        let broker = broker.clone();
+        async move {
+            let _ = broker.serve_acceptor(listener, Acceptor::default()).await;
+        }
+    });
+    (broker, address, task)
+}
+
+/// Correlations of messages no queue holds take `ids` of `client`.
+fn hold_ids(
+    protocol: &MqttProtocol,
+    broker: &Broker,
+    client: &str,
+    ids: impl Iterator<Item = i32>,
+) {
+    let manager = protocol.state_manager().expect("started");
+    for id in ids {
+        manager.correlations.put(
+            broker,
+            client,
+            saranga_protocol_mqtt::state::CorrelationKey {
+                message_id: 1_000_000 + i64::from(id),
+                address: "stall".into(),
+            },
+            id,
+        );
+    }
+}
+
+/// A delivery that found no packet ID free, where the check frees none (the
+/// queue pages, so it may hold every message asked about), goes out once
+/// the client's acknowledgement of another delivery frees one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivery_that_found_no_packet_id_goes_when_an_acknowledgement_frees_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let protocol = Arc::new(MqttProtocol::default());
+    let (broker, address, task) = paging_broker(dir.path(), protocol.clone()).await;
+    let (mut publisher, _) = Client::open(address, "stall-pub", true).await;
+    let (mut a, _) = Client::open(address, "stall-a", false).await;
+    a.subscribe("stall", 1).await;
+    hold_ids(&protocol, &broker, "stall-a", 2..=65535);
+    publisher.publish("stall", b"m1", 1).await;
+    let (_, id1, payload) = parse_publish(&a.packet().await.expect("m1"));
+    assert_eq!((id1, payload.as_slice()), (1, &b"m1"[..]));
+    // Every packet ID is held now: m2 waits.
+    publisher.publish("stall", b"m2", 2).await;
+    assert!(
+        a.silent_for(200).await,
+        "m2 went out with no packet ID free"
+    );
+    a.send(&packet(0x40, &id1.to_be_bytes())).await;
+    let p = tokio::time::timeout(Duration::from_millis(600), a.packet())
+        .await
+        .expect("m2 once the acknowledgement freed a packet ID")
+        .expect("m2");
+    let (_, id2, payload) = parse_publish(&p);
+    assert_eq!((id2, payload.as_slice()), (1, &b"m2"[..]));
+    broker.stop().unwrap();
+    task.abort();
+}
+
+/// The same with no acknowledgement to come: a packet ID freed otherwise
+/// (here directly) is taken by a later retry of the stalled delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivery_that_found_no_packet_id_is_tried_again_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let protocol = Arc::new(MqttProtocol::default());
+    let (broker, address, task) = paging_broker(dir.path(), protocol.clone()).await;
+    let (mut publisher, _) = Client::open(address, "retry-pub", true).await;
+    let (mut a, _) = Client::open(address, "retry-a", false).await;
+    a.subscribe("stall", 1).await;
+    // m0 is out (packet ID 1) and unacknowledged; what comes after it pages.
+    publisher.publish("stall", b"m0", 1).await;
+    let (_, id0, _) = parse_publish(&a.packet().await.expect("m0"));
+    assert_eq!(id0, 1);
+    hold_ids(&protocol, &broker, "retry-a", 2..=65535);
+    publisher.publish("stall", b"m1", 2).await;
+    assert!(
+        a.silent_for(300).await,
+        "m1 went out with no packet ID free"
+    );
+    let manager = protocol.state_manager().expect("started");
+    assert!(manager.correlations.forget(
+        &broker,
+        "retry-a",
+        &saranga_protocol_mqtt::state::CorrelationKey {
+            message_id: 1_000_000 + 7,
+            address: "stall".into(),
+        },
+        7,
+    ));
+    let (_, id, payload) = parse_publish(&a.packet().await.expect("m1, tried again"));
+    assert_eq!((id, payload.as_slice()), (7, &b"m1"[..]));
+    broker.stop().unwrap();
+    task.abort();
+}

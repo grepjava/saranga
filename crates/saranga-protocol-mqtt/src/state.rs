@@ -249,6 +249,9 @@ pub struct SessionState {
     /// Deliveries (consumer, message) that found no packet ID free: they go
     /// back to their queue once a check frees some.
     pub stalled: Vec<(i64, i64)>,
+    /// How long stalled deliveries last waited before going again, when a
+    /// check freed nothing (doubling, at most 30 s).
+    pub stall_retry_ms: u64,
 }
 
 impl SessionState {
@@ -280,6 +283,7 @@ impl SessionState {
             reclaim: HashSet::new(),
             reclaim_asked: false,
             stalled: Vec::new(),
+            stall_retry_ms: 0,
         }
     }
 
@@ -978,6 +982,7 @@ impl StateManager {
             s.reclaim.clear();
             s.reclaim_asked = false;
             s.stalled.clear();
+            s.stall_retry_ms = 0;
             s.session.take()
         };
         Ok((state, present, previous))
